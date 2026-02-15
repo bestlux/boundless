@@ -21,11 +21,31 @@ pub struct PeerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiTransport {
+    Tcp,
+    NamedPipe,
+}
+
+impl ApiTransport {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::NamedPipe => "named_pipe",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
     pub config_version: String,
     pub machine_id: String,
     pub device_name: String,
     pub api_bind: String,
+    #[serde(default = "default_api_transport")]
+    pub api_transport: ApiTransport,
+    #[serde(default = "default_api_pipe_name")]
+    pub api_pipe_name: String,
     pub protocol_version: String,
     pub layout_matrix: String,
     pub auto_start: bool,
@@ -67,6 +87,8 @@ impl Default for RuntimeConfig {
             machine_id: Uuid::new_v4().to_string(),
             device_name: hostname(),
             api_bind: "127.0.0.1:50051".to_string(),
+            api_transport: default_api_transport(),
+            api_pipe_name: default_api_pipe_name(),
             protocol_version: PROTOCOL_CURRENT.to_string(),
             layout_matrix: "A,B;C,D".to_string(),
             auto_start: true,
@@ -77,6 +99,18 @@ impl Default for RuntimeConfig {
             updated_at: now,
         }
     }
+}
+
+fn default_api_transport() -> ApiTransport {
+    if cfg!(windows) {
+        ApiTransport::NamedPipe
+    } else {
+        ApiTransport::Tcp
+    }
+}
+
+fn default_api_pipe_name() -> String {
+    "boundlessd-api".to_string()
 }
 
 pub fn config_path() -> PathBuf {

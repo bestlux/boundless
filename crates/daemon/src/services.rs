@@ -57,6 +57,8 @@ impl DaemonService for DaemonApi {
             peer_count: snapshot.peers.len() as u32,
             protocol_version: snapshot.protocol_version,
             api_bind: snapshot.api_bind,
+            api_transport: snapshot.api_transport.as_str().to_string(),
+            api_pipe_name: snapshot.api_pipe_name,
         }))
     }
 }

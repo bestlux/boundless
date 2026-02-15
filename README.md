@@ -50,6 +50,8 @@ Query status:
 cargo run -p boundless-cli -- daemon status
 ```
 
+On Windows, the daemon now defaults to a local named pipe control endpoint (`npipe://./pipe/boundlessd-api`) and the CLI default endpoint matches that. Use `--endpoint http://127.0.0.1:50051` to target loopback TCP explicitly.
+
 Generate pairing code:
 
 ```bash
@@ -68,6 +70,8 @@ Two-node smoke test (PowerShell):
 ```powershell
 ./scripts/dev/two-node-smoke.ps1
 ```
+
+The smoke harness forces daemon control API transport to TCP for deterministic multi-node testing.
 
 Queue transport payloads and inspect events:
 
