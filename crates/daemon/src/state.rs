@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -373,6 +373,18 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    pub async fn requeue_outgoing_front(&self, peer_id: &str, payloads: Vec<OutboundPayload>) {
+        if payloads.is_empty() {
+            return;
+        }
+
+        let mut queue_map = self.outgoing_payloads.write().await;
+        let queue = queue_map.entry(peer_id.to_string()).or_default();
+        for payload in payloads.into_iter().rev() {
+            queue.push_front(payload);
+        }
+    }
+
     pub async fn record_transport_event(&self, event: TransportEventRecord) {
         let mut events = self.transport_events.write().await;
         events.push_back(event);
@@ -418,11 +430,15 @@ impl AppState {
         bytes: Vec<u8>,
     ) -> Result<PathBuf> {
         validate_transfer_size(bytes.len() as u64)?;
+        let sanitized_name = sanitize_incoming_file_name(file_name)?;
 
         let peer_dir = self.inbox_root.join(peer_id);
         tokio::fs::create_dir_all(&peer_dir).await?;
 
-        let final_path = resolve_conflict_path(&peer_dir, file_name);
+        let final_path = resolve_conflict_path(&peer_dir, &sanitized_name);
+        if !final_path.starts_with(&peer_dir) {
+            anyhow::bail!("incoming file path escaped inbox root");
+        }
         tokio::fs::write(&final_path, bytes).await?;
 
         self.record_transport_event(TransportEventRecord {
@@ -588,6 +604,27 @@ fn validate_ca_cert_pem(ca_cert_pem: &str) -> Result<()> {
     Ok(())
 }
 
+fn sanitize_incoming_file_name(file_name: &str) -> Result<String> {
+    let mut components = Path::new(file_name).components();
+    let Some(component) = components.next() else {
+        anyhow::bail!("incoming file name must not be empty");
+    };
+    if components.next().is_some() {
+        anyhow::bail!("incoming file name must not include path separators");
+    }
+
+    let Component::Normal(name) = component else {
+        anyhow::bail!("incoming file name must be a plain file name");
+    };
+
+    let sanitized = name.to_string_lossy().trim().to_string();
+    if sanitized.is_empty() {
+        anyhow::bail!("incoming file name must not be empty");
+    }
+
+    Ok(sanitized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,6 +688,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn sanitize_incoming_file_name_rejects_paths() {
+        let err = sanitize_incoming_file_name("../evil.txt").expect_err("must reject");
+        assert!(err.to_string().contains("path separators"));
+    }
+
+    #[test]
+    fn sanitize_incoming_file_name_accepts_plain_name() {
+        let name = sanitize_incoming_file_name("report.txt").expect("must accept");
+        assert_eq!(name, "report.txt");
+    }
+
     #[tokio::test]
     async fn join_peer_requires_issued_code_and_consumes_it() {
         let root =
@@ -712,6 +761,30 @@ mod tests {
         let after = std::fs::read_to_string(&config_path).expect("read after");
 
         assert_eq!(before, after, "touch should not write config file");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn store_incoming_file_rejects_unsafe_name() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-incoming-file-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let err = state
+            .store_incoming_file("peer-a", "../evil.txt", b"bad".to_vec())
+            .await
+            .expect_err("must reject unsafe file name");
+        assert!(err.to_string().contains("path separators"));
+
+        let escaped_path = root.join("evil.txt");
+        assert!(!escaped_path.exists(), "unsafe path must never be created");
 
         let _ = std::fs::remove_dir_all(&root);
     }

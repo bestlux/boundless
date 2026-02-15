@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -504,48 +504,72 @@ where
         return Ok(());
     };
 
-    for payload in state.drain_outgoing(peer_id).await {
-        match payload {
-            OutboundPayload::ClipboardText { text } => {
-                let message = WireMessage::ClipboardText {
-                    machine_id: local_machine_id.to_string(),
-                    text: text.clone(),
-                };
-                send_message(writer, &message).await?;
-                state.record_outgoing_clipboard_text(peer_id, &text).await;
-            }
-            OutboundPayload::File { file_name, bytes } => {
-                let total_bytes = bytes.len() as u64;
-                validate_transfer_size(total_bytes)?;
+    let mut pending = VecDeque::from(state.drain_outgoing(peer_id).await);
+    while let Some(payload) = pending.pop_front() {
+        if let Err(error) =
+            send_outbound_payload(state, local_machine_id, peer_id, &payload, writer).await
+        {
+            let mut unsent = Vec::with_capacity(pending.len() + 1);
+            unsent.push(payload);
+            unsent.extend(pending.into_iter());
+            state.requeue_outgoing_front(peer_id, unsent).await;
+            return Err(error);
+        }
+    }
 
-                let transfer_id = uuid::Uuid::new_v4().to_string();
+    Ok(())
+}
+
+async fn send_outbound_payload<W>(
+    state: &AppState,
+    local_machine_id: &str,
+    peer_id: &str,
+    payload: &OutboundPayload,
+    writer: &mut W,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match payload {
+        OutboundPayload::ClipboardText { text } => {
+            let message = WireMessage::ClipboardText {
+                machine_id: local_machine_id.to_string(),
+                text: text.clone(),
+            };
+            send_message(writer, &message).await?;
+            state.record_outgoing_clipboard_text(peer_id, text).await;
+        }
+        OutboundPayload::File { file_name, bytes } => {
+            let total_bytes = bytes.len() as u64;
+            validate_transfer_size(total_bytes)?;
+
+            let transfer_id = uuid::Uuid::new_v4().to_string();
+            send_message(
+                writer,
+                &WireMessage::FileStart {
+                    machine_id: local_machine_id.to_string(),
+                    transfer_id: transfer_id.clone(),
+                    file_name: file_name.clone(),
+                    total_bytes,
+                },
+            )
+            .await?;
+
+            for chunk in bytes.chunks(FILE_CHUNK_BYTES) {
                 send_message(
                     writer,
-                    &WireMessage::FileStart {
-                        machine_id: local_machine_id.to_string(),
+                    &WireMessage::FileChunk {
                         transfer_id: transfer_id.clone(),
-                        file_name: file_name.clone(),
-                        total_bytes,
+                        data_b64: encode_bytes_b64(chunk),
                     },
                 )
                 .await?;
-
-                for chunk in bytes.chunks(FILE_CHUNK_BYTES) {
-                    send_message(
-                        writer,
-                        &WireMessage::FileChunk {
-                            transfer_id: transfer_id.clone(),
-                            data_b64: encode_bytes_b64(chunk),
-                        },
-                    )
-                    .await?;
-                }
-
-                send_message(writer, &WireMessage::FileEnd { transfer_id }).await?;
-                state
-                    .record_outgoing_file(peer_id, &file_name, total_bytes)
-                    .await;
             }
+
+            send_message(writer, &WireMessage::FileEnd { transfer_id }).await?;
+            state
+                .record_outgoing_file(peer_id, file_name, total_bytes)
+                .await;
         }
     }
 
@@ -651,9 +675,68 @@ fn parse_server_name(address: &str) -> Result<ServerName<'static>> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
     use super::*;
     use chrono::Utc;
     use core_security::{SecurityPaths, TrustRecord, ensure_device_identity};
+    use tokio::io::AsyncWrite;
+
+    struct FailAfterCallsWriter {
+        calls: usize,
+        fail_after_calls: usize,
+    }
+
+    impl FailAfterCallsWriter {
+        fn new(fail_after_calls: usize) -> Self {
+            Self {
+                calls: 0,
+                fail_after_calls,
+            }
+        }
+    }
+
+    impl AsyncWrite for FailAfterCallsWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            self.calls += 1;
+            if self.calls >= self.fail_after_calls {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "forced write failure",
+                )));
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            self.calls += 1;
+            if self.calls >= self.fail_after_calls {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "forced flush failure",
+                )));
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn extracts_server_name_from_ipv4_socket() {
@@ -734,6 +817,95 @@ mod tests {
             .expect("parse cert");
         let mapped = machine_id_from_presented_ca(&records, &presented).expect("mapping");
         assert!(mapped.is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn state_with_peer_for_queue_test() -> (AppState, String, std::path::PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("boundless-queue-test-{}", uuid::Uuid::new_v4()));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+
+        let state = AppState::load_or_create_with_paths(config_path, security_root).expect("state");
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join");
+
+        (state, peer_id, root)
+    }
+
+    #[tokio::test]
+    async fn flush_requeues_all_payloads_when_first_write_fails() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+
+        state
+            .queue_clipboard_text(&peer_id, "one".to_string())
+            .await
+            .expect("queue one");
+        state
+            .queue_clipboard_text(&peer_id, "two".to_string())
+            .await
+            .expect("queue two");
+
+        let mut writer = FailAfterCallsWriter::new(1);
+        let _err = flush_outgoing_payloads(&state, "local", Some(&peer_id), &mut writer)
+            .await
+            .expect_err("must fail");
+
+        let queued = state.drain_outgoing(&peer_id).await;
+        assert_eq!(queued.len(), 2);
+        assert!(matches!(
+            queued.first(),
+            Some(OutboundPayload::ClipboardText { text }) if text == "one"
+        ));
+        assert!(matches!(
+            queued.get(1),
+            Some(OutboundPayload::ClipboardText { text }) if text == "two"
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn flush_requeues_remaining_payloads_on_mid_flush_failure() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+
+        state
+            .queue_clipboard_text(&peer_id, "one".to_string())
+            .await
+            .expect("queue one");
+        state
+            .queue_clipboard_text(&peer_id, "two".to_string())
+            .await
+            .expect("queue two");
+        state
+            .queue_clipboard_text(&peer_id, "three".to_string())
+            .await
+            .expect("queue three");
+
+        // Each successful payload costs write+flush (2 calls). Fail on second payload write.
+        let mut writer = FailAfterCallsWriter::new(3);
+        let _ = flush_outgoing_payloads(&state, "local", Some(&peer_id), &mut writer)
+            .await
+            .expect_err("must fail");
+
+        let queued = state.drain_outgoing(&peer_id).await;
+        assert_eq!(queued.len(), 2);
+        assert!(matches!(
+            queued.first(),
+            Some(OutboundPayload::ClipboardText { text }) if text == "two"
+        ));
+        assert!(matches!(
+            queued.get(1),
+            Some(OutboundPayload::ClipboardText { text }) if text == "three"
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }
