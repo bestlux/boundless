@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
+    sync::oneshot,
     task::JoinHandle,
     time,
 };
@@ -64,12 +65,22 @@ async fn listener_loop(state: AppState, listener: TcpListener) {
     loop {
         match listener.accept().await {
             Ok((socket, remote)) => {
-                let state = state.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = handle_incoming_connection(state, socket).await {
+                let task_state = state.clone();
+                let registration_state = state.clone();
+                let (session_id_tx, session_id_rx) = oneshot::channel::<u64>();
+                let task = tokio::spawn(async move {
+                    let session_id = session_id_rx.await.ok();
+                    if let Err(error) =
+                        handle_incoming_connection(task_state, socket, session_id).await
+                    {
                         warn!(error = ?error, remote = %remote, "incoming session ended with error");
                     }
                 });
+
+                let session_id = registration_state
+                    .register_pending_transport_session(task.abort_handle())
+                    .await;
+                let _ = session_id_tx.send(session_id);
             }
             Err(error) => {
                 warn!(%error, "transport accept failed");
@@ -140,9 +151,25 @@ pub async fn prepare_listener(state: &AppState) -> Option<TcpListener> {
 
 async fn supervisor_loop(state: AppState) {
     let mut workers: HashMap<String, JoinHandle<()>> = HashMap::new();
+    let mut worker_session_ids: HashMap<String, u64> = HashMap::new();
 
     loop {
-        workers.retain(|_, handle| !handle.is_finished());
+        let finished_peers = workers
+            .iter()
+            .filter_map(|(peer_id, handle)| {
+                if handle.is_finished() {
+                    Some(peer_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for peer_id in finished_peers {
+            workers.remove(&peer_id);
+            if let Some(session_id) = worker_session_ids.remove(&peer_id) {
+                state.clear_transport_session_registration(session_id).await;
+            }
+        }
 
         let snapshot = state.snapshot().await;
         for peer in snapshot.peers {
@@ -160,12 +187,17 @@ async fn supervisor_loop(state: AppState) {
                 continue;
             }
 
-            let state = state.clone();
+            let worker_state = state.clone();
+            let registration_state = state.clone();
             let peer_id = peer.peer_id.clone();
             let handle = tokio::spawn(async move {
-                peer_worker(state, peer_id).await;
+                peer_worker(worker_state, peer_id).await;
             });
-            workers.insert(peer.peer_id, handle);
+            let session_id = registration_state
+                .register_transport_session_for_peer(&peer.peer_id, handle.abort_handle())
+                .await;
+            workers.insert(peer.peer_id.clone(), handle);
+            worker_session_ids.insert(peer.peer_id, session_id);
         }
 
         time::sleep(SUPERVISOR_TICK).await;
@@ -258,14 +290,32 @@ async fn connect_and_run_outbound(state: AppState, peer_id: &str, address: &str)
         Some(peer_id.to_string()),
         tokio_rustls::TlsStream::Client(stream),
         true,
+        None,
     )
     .await
 }
 
-async fn handle_incoming_connection(state: AppState, socket: TcpStream) -> Result<()> {
+async fn handle_incoming_connection(
+    state: AppState,
+    socket: TcpStream,
+    session_registration_id: Option<u64>,
+) -> Result<()> {
     let acceptor = build_tls_acceptor(&state).await?;
     let stream = acceptor.accept(socket).await.context("tls accept")?;
-    run_session(state, None, tokio_rustls::TlsStream::Server(stream), false).await
+    let result = run_session(
+        state.clone(),
+        None,
+        tokio_rustls::TlsStream::Server(stream),
+        false,
+        session_registration_id,
+    )
+    .await;
+
+    if let Some(session_id) = session_registration_id {
+        state.clear_transport_session_registration(session_id).await;
+    }
+
+    result
 }
 
 async fn run_session<S>(
@@ -273,11 +323,17 @@ async fn run_session<S>(
     peer_hint: Option<String>,
     stream: tokio_rustls::TlsStream<S>,
     is_outbound: bool,
+    session_registration_id: Option<u64>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let authenticated_peer_id = authenticated_peer_machine_id(&state, &stream).await?;
+    if let Some(session_id) = session_registration_id {
+        state
+            .bind_pending_transport_session_to_peer(session_id, &authenticated_peer_id)
+            .await;
+    }
     if let Some(expected_peer_id) = peer_hint.as_deref()
         && expected_peer_id != authenticated_peer_id
     {

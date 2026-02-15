@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
-use tokio::sync::RwLock;
+use tokio::{sync::RwLock, task::AbortHandle};
 use tracing::info;
 
 use core_clipboard::{
@@ -104,6 +104,10 @@ pub struct AppState {
     pending_inject_input_frames: Arc<RwLock<VecDeque<PendingInjectInputFrame>>>,
     input_capture_target_peer_id: Arc<RwLock<Option<String>>>,
     reconnect_generation_by_peer: Arc<RwLock<HashMap<String, u64>>>,
+    pending_transport_session_abort_handles: Arc<RwLock<HashMap<u64, AbortHandle>>>,
+    transport_session_abort_handles_by_peer:
+        Arc<RwLock<HashMap<String, HashMap<u64, AbortHandle>>>>,
+    next_transport_session_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AppState {
@@ -176,6 +180,9 @@ impl AppState {
             pending_inject_input_frames: Arc::new(RwLock::new(VecDeque::new())),
             input_capture_target_peer_id: Arc::new(RwLock::new(None)),
             reconnect_generation_by_peer: Arc::new(RwLock::new(HashMap::new())),
+            pending_transport_session_abort_handles: Arc::new(RwLock::new(HashMap::new())),
+            transport_session_abort_handles_by_peer: Arc::new(RwLock::new(HashMap::new())),
+            next_transport_session_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
     }
 
@@ -375,6 +382,7 @@ impl AppState {
                 .write()
                 .await
                 .remove(peer_id);
+            self.abort_transport_sessions_for_peer(peer_id).await;
             let mut capture_target = self.input_capture_target_peer_id.write().await;
             if capture_target.as_deref() == Some(peer_id) {
                 *capture_target = None;
@@ -492,6 +500,103 @@ impl AppState {
             .await
             .get(peer_id)
             .unwrap_or(&0)
+    }
+
+    fn next_transport_session_id(&self) -> u64 {
+        self.next_transport_session_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub async fn register_pending_transport_session(&self, abort_handle: AbortHandle) -> u64 {
+        let session_id = self.next_transport_session_id();
+        self.pending_transport_session_abort_handles
+            .write()
+            .await
+            .insert(session_id, abort_handle);
+        session_id
+    }
+
+    pub async fn register_transport_session_for_peer(
+        &self,
+        peer_id: &str,
+        abort_handle: AbortHandle,
+    ) -> u64 {
+        let session_id = self.next_transport_session_id();
+        self.transport_session_abort_handles_by_peer
+            .write()
+            .await
+            .entry(peer_id.to_string())
+            .or_default()
+            .insert(session_id, abort_handle);
+        session_id
+    }
+
+    pub async fn bind_pending_transport_session_to_peer(
+        &self,
+        session_id: u64,
+        peer_id: &str,
+    ) -> bool {
+        let abort_handle = self
+            .pending_transport_session_abort_handles
+            .write()
+            .await
+            .remove(&session_id);
+        let Some(abort_handle) = abort_handle else {
+            return false;
+        };
+
+        self.transport_session_abort_handles_by_peer
+            .write()
+            .await
+            .entry(peer_id.to_string())
+            .or_default()
+            .insert(session_id, abort_handle);
+        true
+    }
+
+    pub async fn clear_transport_session_registration(&self, session_id: u64) {
+        if self
+            .pending_transport_session_abort_handles
+            .write()
+            .await
+            .remove(&session_id)
+            .is_some()
+        {
+            return;
+        }
+
+        let mut by_peer = self.transport_session_abort_handles_by_peer.write().await;
+        let mut empty_peers = Vec::<String>::new();
+        for (peer_id, sessions) in by_peer.iter_mut() {
+            if sessions.remove(&session_id).is_some() && sessions.is_empty() {
+                empty_peers.push(peer_id.clone());
+            }
+        }
+        for peer_id in empty_peers {
+            by_peer.remove(&peer_id);
+        }
+    }
+
+    pub async fn abort_transport_sessions_for_peer(&self, peer_id: &str) -> usize {
+        let sessions = self
+            .transport_session_abort_handles_by_peer
+            .write()
+            .await
+            .remove(peer_id)
+            .unwrap_or_default();
+        let aborted = sessions.len();
+        for handle in sessions.into_values() {
+            handle.abort();
+        }
+        aborted
+    }
+
+    pub async fn abort_transport_sessions_for_peers(&self, peer_ids: &[String]) -> usize {
+        let mut total = 0usize;
+        for peer_id in peer_ids {
+            total += self.abort_transport_sessions_for_peer(peer_id).await;
+        }
+        total
     }
 
     pub async fn mark_all_peers_disconnected(&self) -> Result<usize> {
@@ -1177,6 +1282,14 @@ impl AppState {
         self.pending_inject_input_frames.write().await.clear();
         *self.input_capture_target_peer_id.write().await = None;
         self.reconnect_generation_by_peer.write().await.clear();
+        self.pending_transport_session_abort_handles
+            .write()
+            .await
+            .clear();
+        self.transport_session_abort_handles_by_peer
+            .write()
+            .await
+            .clear();
 
         save_config_at(&self.config_path, &config)
     }
@@ -1964,6 +2077,42 @@ mod tests {
             state.input_capture_target().await.is_none(),
             "removed peer should clear capture target"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn abort_transport_sessions_for_peer_cancels_registered_tasks() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-transport-abort-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        let session = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        state
+            .register_transport_session_for_peer(&peer_id, session.abort_handle())
+            .await;
+
+        let aborted = state.abort_transport_sessions_for_peer(&peer_id).await;
+        assert_eq!(aborted, 1);
+        let join_error = session.await.expect_err("session should be aborted");
+        assert!(join_error.is_cancelled());
 
         let _ = std::fs::remove_dir_all(&root);
     }
