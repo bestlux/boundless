@@ -16,6 +16,7 @@
   - input ownership claim/release control-plane behavior
   - synthetic input frame transport + router processing path
   - queued clipboard text/file payload transfer and inbox materialization
+- The smoke harness runs daemon API in TCP mode (`--api-transport tcp`) even though Windows default is named pipe, to keep two-node automation deterministic
 - Run `scripts/dev/validate.ps1` for fmt/test/clippy plus smoke in one command
 
 ## Test cases

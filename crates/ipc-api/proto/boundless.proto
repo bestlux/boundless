@@ -12,6 +12,8 @@ message StatusReply {
   uint32 peer_count = 4;
   string protocol_version = 5;
   string api_bind = 6;
+  string api_transport = 7;
+  string api_pipe_name = 8;
 }
 
 message PairCreateCodeRequest {

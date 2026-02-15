@@ -20,7 +20,7 @@ use core_security::{
 use core_transfer::{resolve_conflict_path, validate_transfer_size};
 
 use crate::config::{
-    PeerConfig, RuntimeConfig, config_path, load_or_create_config_at, save_config_at,
+    ApiTransport, PeerConfig, RuntimeConfig, config_path, load_or_create_config_at, save_config_at,
 };
 
 const MAX_TRANSPORT_EVENTS: usize = 512;
@@ -211,6 +211,20 @@ impl AppState {
 
         let mut config = self.config.write().await;
         config.api_bind = bind;
+        save_config_at(&self.config_path, &config)
+    }
+
+    pub async fn update_api_transport(&self, api_transport: ApiTransport) -> Result<()> {
+        let mut config = self.config.write().await;
+        config.api_transport = api_transport;
+        save_config_at(&self.config_path, &config)
+    }
+
+    pub async fn update_api_pipe_name(&self, pipe_name: String) -> Result<()> {
+        validate_pipe_name(&pipe_name)?;
+
+        let mut config = self.config.write().await;
+        config.api_pipe_name = pipe_name;
         save_config_at(&self.config_path, &config)
     }
 
@@ -651,6 +665,19 @@ fn validate_bind_address(bind: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_pipe_name(pipe_name: &str) -> Result<()> {
+    let trimmed = pipe_name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("pipe name must not be empty");
+    }
+
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        anyhow::bail!("pipe name must not contain path separators");
+    }
+
+    Ok(())
+}
+
 fn validate_and_consume_pairing_code(
     pairing_codes: &mut HashMap<String, DateTime<Utc>>,
     code: &str,
@@ -729,6 +756,23 @@ mod tests {
     #[test]
     fn validate_bind_address_accepts_socket_addr() {
         validate_bind_address("127.0.0.1:50051").expect("valid bind");
+    }
+
+    #[test]
+    fn validate_pipe_name_rejects_empty() {
+        let err = validate_pipe_name("   ").expect_err("must fail");
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn validate_pipe_name_rejects_path_separators() {
+        let err = validate_pipe_name("bad/name").expect_err("must fail");
+        assert!(err.to_string().contains("path separators"));
+    }
+
+    #[test]
+    fn validate_pipe_name_accepts_plain_name() {
+        validate_pipe_name("boundlessd-api").expect("must accept");
     }
 
     #[test]
