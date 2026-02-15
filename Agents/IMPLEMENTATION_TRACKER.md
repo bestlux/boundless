@@ -23,6 +23,8 @@
 - [x] Added transport diagnostics API/CLI for payload enqueue and event inspection
 - [x] Extended two-node smoke harness to validate clipboard/file payload transfer
 - [x] Added local validation helper script (`scripts/dev/validate.ps1`)
+- [x] Added input control-plane primitives (owner claim/release/query) for deterministic routing prep
+- [x] Expanded smoke harness to validate input owner claim/release flow
 
 ## Next (priority order)
 
@@ -30,4 +32,5 @@
 - [ ] Implement mDNS discovery runtime with manual fallback integration
 - [ ] Implement real clipboard/text-image sync pipeline
 - [ ] Implement real input capture/injection pipeline
+- [ ] Wire core-input frame routing into transport/runtime with no-op sink backend
 - [ ] Add richer multi-machine integration assertions beyond payload smoke

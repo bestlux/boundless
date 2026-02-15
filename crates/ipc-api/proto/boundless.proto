@@ -122,6 +122,17 @@ message TransportEventsReply {
   repeated TransportEvent events = 1;
 }
 
+message InputOwnerRequest {
+  string peer_id = 1;
+  bool force = 2;
+}
+
+message InputOwnerReply {
+  bool ok = 1;
+  string owner_peer_id = 2;
+  string message = 3;
+}
+
 service DaemonService {
   rpc GetStatus(StatusRequest) returns (StatusReply);
 }
@@ -152,4 +163,7 @@ service DiagnosticsService {
   rpc SendClipboardText(SendClipboardTextRequest) returns (OperationReply);
   rpc SendFile(SendFileRequest) returns (OperationReply);
   rpc ListTransportEvents(Empty) returns (TransportEventsReply);
+  rpc GetInputOwner(Empty) returns (InputOwnerReply);
+  rpc ClaimInputOwner(InputOwnerRequest) returns (InputOwnerReply);
+  rpc ReleaseInputOwner(InputOwnerRequest) returns (InputOwnerReply);
 }

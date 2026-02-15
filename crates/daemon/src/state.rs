@@ -50,6 +50,7 @@ pub struct AppState {
     outgoing_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
     transport_events: Arc<RwLock<VecDeque<TransportEventRecord>>>,
     inbox_root: Arc<PathBuf>,
+    input_owner_peer_id: Arc<RwLock<Option<String>>>,
 }
 
 impl AppState {
@@ -113,6 +114,7 @@ impl AppState {
             outgoing_payloads: Arc::new(RwLock::new(HashMap::new())),
             transport_events: Arc::new(RwLock::new(VecDeque::new())),
             inbox_root: Arc::new(inbox_root),
+            input_owner_peer_id: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -271,6 +273,13 @@ impl AppState {
 
         if changed {
             save_config_at(&self.config_path, &config)?;
+        }
+
+        if !connected {
+            let mut owner = self.input_owner_peer_id.write().await;
+            if owner.as_deref() == Some(peer_id) {
+                *owner = None;
+            }
         }
 
         Ok(())
@@ -435,6 +444,42 @@ impl AppState {
         .await;
     }
 
+    pub async fn claim_input_owner(&self, peer_id: &str, force: bool) -> Result<bool> {
+        if self.get_peer(peer_id).await.is_none() {
+            anyhow::bail!("unknown peer {peer_id}");
+        }
+
+        let mut owner = self.input_owner_peer_id.write().await;
+        let acquired = match owner.as_deref() {
+            None => {
+                *owner = Some(peer_id.to_string());
+                true
+            }
+            Some(current) if current == peer_id => true,
+            Some(_) if force => {
+                *owner = Some(peer_id.to_string());
+                true
+            }
+            Some(_) => false,
+        };
+
+        Ok(acquired)
+    }
+
+    pub async fn release_input_owner(&self, peer_id: &str) -> bool {
+        let mut owner = self.input_owner_peer_id.write().await;
+        if owner.as_deref() == Some(peer_id) {
+            *owner = None;
+            return true;
+        }
+
+        false
+    }
+
+    pub async fn input_owner(&self) -> Option<String> {
+        self.input_owner_peer_id.read().await.clone()
+    }
+
     pub async fn safe_reset(&self, network_only: bool, all: bool) -> Result<()> {
         let mut config = self.config.write().await;
 
@@ -450,6 +495,7 @@ impl AppState {
 
         self.outgoing_payloads.write().await.clear();
         self.transport_events.write().await.clear();
+        *self.input_owner_peer_id.write().await = None;
 
         save_config_at(&self.config_path, &config)
     }
@@ -475,14 +521,19 @@ impl AppState {
             .map(|items| items.len())
             .unwrap_or(0);
         let event_count = self.transport_events.read().await.len();
+        let input_owner = self
+            .input_owner()
+            .await
+            .unwrap_or_else(|| "none".to_string());
 
         let report = format!(
-            "Boundless Diagnostics\nMachine: {}\nFingerprint: {}\nPeers: {}\nTrusted CAs: {}\nTransport Events: {}\nAPI: {}\nTransport Port: {}\nProtocol: {}\n",
+            "Boundless Diagnostics\nMachine: {}\nFingerprint: {}\nPeers: {}\nTrusted CAs: {}\nTransport Events: {}\nInput Owner: {}\nAPI: {}\nTransport Port: {}\nProtocol: {}\n",
             snapshot.machine_id,
             self.fingerprint(),
             snapshot.peers.len(),
             trust_count,
             event_count,
+            input_owner,
             snapshot.api_bind,
             snapshot.network_port,
             snapshot.protocol_version

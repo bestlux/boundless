@@ -77,6 +77,14 @@ cargo run -p boundless-cli -- transport send-file <peer_id> ./path/to/file.txt
 cargo run -p boundless-cli -- transport events --limit 100
 ```
 
+Manage input ownership control-plane:
+
+```bash
+cargo run -p boundless-cli -- input owner
+cargo run -p boundless-cli -- input claim <peer_id>
+cargo run -p boundless-cli -- input release <peer_id>
+```
+
 ## Release model
 
 - Conventional Commits drive semver intent
@@ -85,4 +93,4 @@ cargo run -p boundless-cli -- transport events --limit 100
 
 ## Notes
 
-Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, and queued clipboard/file payload transfer primitives. Windows input injection, OS clipboard integration, and mDNS runtime discovery are upcoming slices.
+Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, queued clipboard/file payload transfer primitives, and an input ownership control-plane. Windows input injection, OS clipboard integration, and mDNS runtime discovery are upcoming slices.

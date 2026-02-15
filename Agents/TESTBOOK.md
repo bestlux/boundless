@@ -13,6 +13,7 @@
   - trust bundle export/import
   - TLS transport session establishment
   - heartbeat-driven connected state reporting
+  - input ownership claim/release control-plane behavior
   - queued clipboard text/file payload transfer and inbox materialization
 - Run `scripts/dev/validate.ps1` for fmt/test/clippy plus smoke in one command
 
@@ -49,6 +50,13 @@
 - On Machine A: `transport send-file <peer_id> <path>`
 - On both machines: `transport events --limit 100`
 - Confirm outgoing/incoming events are present and file appears in receiver inbox root
+
+8. Input owner arbitration
+- On Machine A: `input owner` (expect none)
+- On Machine A: `input claim <peer_id>`
+- On Machine A: `input owner` (expect claimed peer)
+- On Machine A: `input release <peer_id>`
+- On Machine A: `input owner` (expect none)
 
 ## Exit criteria for this stage
 

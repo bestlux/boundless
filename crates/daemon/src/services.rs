@@ -4,10 +4,11 @@ use tonic::{Request, Response, Status};
 
 use ipc_api::boundless::v1::{
     DiagnosticsDumpReply, DiagnosticsDumpRequest, Empty, FeatureListReply, FeatureSetRequest,
-    HotkeySetRequest, ImportTrustBundleRequest, LayoutReply, LayoutSetRequest, OperationReply,
-    PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply, PairJoinRequest, PeerInfo,
-    PeerListReply, RemovePeerRequest, SafeResetRequest, SendClipboardTextRequest, SendFileRequest,
-    StatusReply, StatusRequest, TransportEvent, TransportEventsReply, TrustBundleReply,
+    HotkeySetRequest, ImportTrustBundleRequest, InputOwnerReply, InputOwnerRequest, LayoutReply,
+    LayoutSetRequest, OperationReply, PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply,
+    PairJoinRequest, PeerInfo, PeerListReply, RemovePeerRequest, SafeResetRequest,
+    SendClipboardTextRequest, SendFileRequest, StatusReply, StatusRequest, TransportEvent,
+    TransportEventsReply, TrustBundleReply,
     daemon_service_server::{DaemonService, DaemonServiceServer},
     diagnostics_service_server::{DiagnosticsService, DiagnosticsServiceServer},
     feature_service_server::{FeatureService, FeatureServiceServer},
@@ -359,5 +360,58 @@ impl DiagnosticsService for DiagnosticsApi {
             .collect();
 
         Ok(Response::new(TransportEventsReply { events }))
+    }
+
+    async fn get_input_owner(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<InputOwnerReply>, Status> {
+        let owner = self.0.input_owner().await.unwrap_or_default();
+        Ok(Response::new(InputOwnerReply {
+            ok: true,
+            owner_peer_id: owner,
+            message: "input owner fetched".to_string(),
+        }))
+    }
+
+    async fn claim_input_owner(
+        &self,
+        request: Request<InputOwnerRequest>,
+    ) -> Result<Response<InputOwnerReply>, Status> {
+        let request = request.into_inner();
+        let acquired = self
+            .0
+            .claim_input_owner(&request.peer_id, request.force)
+            .await
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let owner = self.0.input_owner().await.unwrap_or_default();
+        Ok(Response::new(InputOwnerReply {
+            ok: acquired,
+            owner_peer_id: owner.clone(),
+            message: if acquired {
+                format!("input owner set to {owner}")
+            } else {
+                format!("input owner remains {owner}")
+            },
+        }))
+    }
+
+    async fn release_input_owner(
+        &self,
+        request: Request<InputOwnerRequest>,
+    ) -> Result<Response<InputOwnerReply>, Status> {
+        let request = request.into_inner();
+        let released = self.0.release_input_owner(&request.peer_id).await;
+        let owner = self.0.input_owner().await.unwrap_or_default();
+        Ok(Response::new(InputOwnerReply {
+            ok: released,
+            owner_peer_id: owner,
+            message: if released {
+                "input owner released".to_string()
+            } else {
+                "peer did not hold input owner".to_string()
+            },
+        }))
     }
 }

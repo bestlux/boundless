@@ -17,7 +17,7 @@ Deliver MWB-style cross-machine control in Rust with stronger reliability, diagn
 - Peer health + reconnect strategy
 
 3. Phase 2: Input switching core
-- Keyboard/mouse capture + injection
+- Keyboard/mouse capture + injection (in progress: input ownership control-plane and router model in place)
 - Edge switching + layout matrix semantics
 - Core hotkeys and easy mouse behavior
 
