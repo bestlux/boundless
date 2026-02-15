@@ -3,7 +3,7 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::time;
 use tracing::warn;
 
@@ -465,7 +465,7 @@ fn mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> INPUT {
 fn keyboard_input(scan_code: u16, key_up: bool) -> INPUT {
     let mut flags = KEYEVENTF_SCANCODE;
     let mut normalized_scan_code = scan_code;
-    if (scan_code & 0xFF00) == 0xE000 {
+    if is_extended_scan_code(scan_code) {
         flags |= KEYEVENTF_EXTENDEDKEY;
         normalized_scan_code = scan_code & 0x00FF;
     }
@@ -493,20 +493,33 @@ fn send_input_records(inputs: &[INPUT]) -> Result<()> {
         return Ok(());
     }
 
-    let sent = unsafe {
-        SendInput(
-            inputs.len() as u32,
-            inputs.as_ptr(),
-            std::mem::size_of::<INPUT>() as i32,
-        )
-    };
+    send_input_records_with_sender(inputs, |record| {
+        let sent = unsafe { SendInput(1, record.as_ptr(), std::mem::size_of::<INPUT>() as i32) };
+        if sent == 0 {
+            return Err(std::io::Error::last_os_error()).context("SendInput returned 0");
+        }
+        Ok(sent)
+    })
+}
 
-    if sent != inputs.len() as u32 {
-        let error = std::io::Error::last_os_error();
-        return Err(error).context(format!("sent {sent} / {} input records", inputs.len()));
+#[cfg(windows)]
+fn send_input_records_with_sender<F>(inputs: &[INPUT], mut sender: F) -> Result<()>
+where
+    F: FnMut(&[INPUT]) -> Result<u32>,
+{
+    for (index, input) in inputs.iter().enumerate() {
+        let sent = sender(std::slice::from_ref(input))
+            .with_context(|| format!("send input record at index {index}"))?;
+        if sent != 1 {
+            bail!("partial send at index {index}: sent {sent} / 1 input records");
+        }
     }
-
     Ok(())
+}
+
+#[cfg(windows)]
+fn is_extended_scan_code(scan_code: u16) -> bool {
+    matches!(scan_code & 0xFF00, 0xE000 | 0xE100)
 }
 
 fn input_event_kind(event: &InputEvent) -> &'static str {
@@ -762,6 +775,23 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn maps_e1_prefixed_scan_code_with_extended_flag() {
+        let records = input_records_for_event(&InputEvent::Key {
+            scan_code: 0xE11D,
+            state: core_input::KeyState::Down,
+        });
+        assert_eq!(records.len(), 1);
+
+        let record = unsafe { records[0].Anonymous.ki };
+        assert_eq!(record.wScan, 0x1D);
+        assert_eq!(
+            record.dwFlags & KEYEVENTF_EXTENDEDKEY,
+            KEYEVENTF_EXTENDEDKEY
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn maps_wheel_event_to_two_records_when_both_axes_present() {
         let records = input_records_for_event(&InputEvent::MouseWheel {
             delta_x: 120,
@@ -775,5 +805,43 @@ mod tests {
         let horizontal = unsafe { records[1].Anonymous.mi };
         assert_eq!(vertical.dwFlags, MOUSEEVENTF_WHEEL);
         assert_eq!(horizontal.dwFlags, MOUSEEVENTF_HWHEEL);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn send_input_records_with_sender_sends_one_record_per_call() {
+        let records = input_records_for_event(&InputEvent::MouseWheel {
+            delta_x: 120,
+            delta_y: -120,
+        });
+        let mut call_count = 0usize;
+
+        send_input_records_with_sender(&records, |chunk| {
+            call_count += 1;
+            assert_eq!(chunk.len(), 1);
+            Ok(1)
+        })
+        .expect("send should succeed");
+
+        assert_eq!(call_count, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn send_input_records_with_sender_stops_after_first_failed_record() {
+        let records = input_records_for_event(&InputEvent::MouseWheel {
+            delta_x: 120,
+            delta_y: -120,
+        });
+        let mut call_count = 0usize;
+
+        let err = send_input_records_with_sender(&records, |_chunk| {
+            call_count += 1;
+            if call_count == 1 { Ok(1) } else { Ok(0) }
+        })
+        .expect_err("second record failure should surface");
+
+        assert_eq!(call_count, 2, "must not replay successfully sent prefix");
+        assert!(err.to_string().contains("index 1"));
     }
 }
