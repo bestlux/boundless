@@ -49,6 +49,15 @@ impl DaemonService for DaemonApi {
         _request: Request<StatusRequest>,
     ) -> Result<Response<StatusReply>, Status> {
         let snapshot = self.0.snapshot().await;
+        let effective_api_transport = snapshot.api_transport.effective();
+        let api_pipe_name = if matches!(
+            effective_api_transport,
+            crate::config::ApiTransport::NamedPipe
+        ) {
+            snapshot.api_pipe_name
+        } else {
+            String::new()
+        };
 
         Ok(Response::new(StatusReply {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -57,8 +66,8 @@ impl DaemonService for DaemonApi {
             peer_count: snapshot.peers.len() as u32,
             protocol_version: snapshot.protocol_version,
             api_bind: snapshot.api_bind,
-            api_transport: snapshot.api_transport.as_str().to_string(),
-            api_pipe_name: snapshot.api_pipe_name,
+            api_transport: effective_api_transport.as_str().to_string(),
+            api_pipe_name,
         }))
     }
 }
