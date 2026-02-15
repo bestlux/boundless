@@ -99,6 +99,29 @@ message SafeResetRequest {
   bool all = 2;
 }
 
+message SendClipboardTextRequest {
+  string peer_id = 1;
+  string text = 2;
+}
+
+message SendFileRequest {
+  string peer_id = 1;
+  string file_path = 2;
+}
+
+message TransportEvent {
+  string timestamp = 1;
+  string direction = 2;
+  string kind = 3;
+  string peer_id = 4;
+  string detail = 5;
+  uint64 size_bytes = 6;
+}
+
+message TransportEventsReply {
+  repeated TransportEvent events = 1;
+}
+
 service DaemonService {
   rpc GetStatus(StatusRequest) returns (StatusReply);
 }
@@ -126,4 +149,7 @@ service FeatureService {
 service DiagnosticsService {
   rpc Dump(DiagnosticsDumpRequest) returns (DiagnosticsDumpReply);
   rpc SafeReset(SafeResetRequest) returns (OperationReply);
+  rpc SendClipboardText(SendClipboardTextRequest) returns (OperationReply);
+  rpc SendFile(SendFileRequest) returns (OperationReply);
+  rpc ListTransportEvents(Empty) returns (TransportEventsReply);
 }

@@ -19,12 +19,15 @@
 - [x] Implemented initial inter-machine transport listener/session loop
 - [x] Added heartbeat and reconnect worker scaffolding for peer links
 - [x] Added two-node scripted smoke harness (`scripts/dev/two-node-smoke.ps1`)
+- [x] Implemented queued clipboard-text and file payload wire frames over TLS sessions
+- [x] Added transport diagnostics API/CLI for payload enqueue and event inspection
+- [x] Extended two-node smoke harness to validate clipboard/file payload transfer
+- [x] Added local validation helper script (`scripts/dev/validate.ps1`)
 
 ## Next (priority order)
 
 - [ ] Replace loopback gRPC transport with Windows named pipe transport adapter
 - [ ] Implement mDNS discovery runtime with manual fallback integration
 - [ ] Implement real clipboard/text-image sync pipeline
-- [ ] Implement file transfer pipeline and chunking protocol
 - [ ] Implement real input capture/injection pipeline
-- [ ] Add richer multi-machine integration assertions beyond connectivity smoke
+- [ ] Add richer multi-machine integration assertions beyond payload smoke

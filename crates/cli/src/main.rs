@@ -6,7 +6,8 @@ use tonic::transport::Channel;
 use ipc_api::boundless::v1::{
     DiagnosticsDumpRequest, Empty, FeatureSetRequest, HotkeySetRequest, ImportTrustBundleRequest,
     LayoutSetRequest, PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest, SafeResetRequest,
-    StatusRequest, daemon_service_client::DaemonServiceClient,
+    SendClipboardTextRequest, SendFileRequest, StatusRequest,
+    daemon_service_client::DaemonServiceClient,
     diagnostics_service_client::DiagnosticsServiceClient,
     feature_service_client::FeatureServiceClient, pairing_service_client::PairingServiceClient,
     topology_service_client::TopologyServiceClient,
@@ -48,6 +49,10 @@ enum Command {
     Feature {
         #[command(subcommand)]
         command: FeatureCommand,
+    },
+    Transport {
+        #[command(subcommand)]
+        command: TransportCommand,
     },
     Hotkey {
         action: String,
@@ -113,6 +118,22 @@ enum FeatureCommand {
     Set { name: String, value: ToggleValue },
 }
 
+#[derive(Debug, Subcommand)]
+enum TransportCommand {
+    SendText {
+        peer_id: String,
+        text: String,
+    },
+    SendFile {
+        peer_id: String,
+        path: String,
+    },
+    Events {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ToggleValue {
     On,
@@ -170,6 +191,15 @@ async fn main() -> Result<()> {
         Command::Feature { command } => match command {
             FeatureCommand::List => feature_list(&cli.endpoint).await,
             FeatureCommand::Set { name, value } => feature_set(&cli.endpoint, name, value).await,
+        },
+        Command::Transport { command } => match command {
+            TransportCommand::SendText { peer_id, text } => {
+                transport_send_text(&cli.endpoint, peer_id, text).await
+            }
+            TransportCommand::SendFile { peer_id, path } => {
+                transport_send_file(&cli.endpoint, peer_id, path).await
+            }
+            TransportCommand::Events { limit } => transport_events(&cli.endpoint, limit).await,
         },
         Command::Hotkey { action, combo } => hotkey_set(&cli.endpoint, action, combo).await,
         Command::Diagnostics { command } => match command {
@@ -362,6 +392,63 @@ async fn hotkey_set(endpoint: &str, action: String, combo: String) -> Result<()>
         .await?
         .into_inner();
     println!("ok={} message={}", response.ok, response.message);
+    Ok(())
+}
+
+async fn transport_send_text(endpoint: &str, peer_id: String, text: String) -> Result<()> {
+    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .send_clipboard_text(SendClipboardTextRequest { peer_id, text })
+        .await?
+        .into_inner();
+
+    println!("ok={} message={}", response.ok, response.message);
+    Ok(())
+}
+
+async fn transport_send_file(endpoint: &str, peer_id: String, path: String) -> Result<()> {
+    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .send_file(SendFileRequest {
+            peer_id,
+            file_path: path,
+        })
+        .await?
+        .into_inner();
+
+    println!("ok={} message={}", response.ok, response.message);
+    Ok(())
+}
+
+async fn transport_events(endpoint: &str, limit: usize) -> Result<()> {
+    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut events = client
+        .list_transport_events(Empty {})
+        .await?
+        .into_inner()
+        .events;
+
+    if limit > 0 && events.len() > limit {
+        events = events.split_off(events.len() - limit);
+    }
+
+    if events.is_empty() {
+        println!("no transport events");
+        return Ok(());
+    }
+
+    for event in events {
+        println!(
+            "{} direction={} kind={} peer_id={} size_bytes={} detail={}",
+            event.timestamp,
+            event.direction,
+            event.kind,
+            event.peer_id,
+            event.size_bytes,
+            event.detail
+        );
+    }
+
     Ok(())
 }
 

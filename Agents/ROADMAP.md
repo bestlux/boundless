@@ -22,8 +22,8 @@ Deliver MWB-style cross-machine control in Rust with stronger reliability, diagn
 - Core hotkeys and easy mouse behavior
 
 4. Phase 3: Clipboard and file parity
-- Text/image clipboard sync
-- File transfer with 100MB cap and conflict rename
+- Text/image clipboard sync (in progress: text payload wire path complete)
+- File transfer with 100MB cap and conflict rename (in progress: chunked wire path + inbox persistence complete)
 
 5. Phase 4: Hardening and alpha release
 - Failure-mode tests and diagnostics coverage

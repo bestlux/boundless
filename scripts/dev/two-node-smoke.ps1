@@ -29,6 +29,8 @@ $node1Config = Join-Path $node1Root "config.json"
 $node2Config = Join-Path $node2Root "config.json"
 $node1Security = Join-Path $node1Root "security"
 $node2Security = Join-Path $node2Root "security"
+$node1Inbox = Join-Path $node1Root "inbox"
+$node2Inbox = Join-Path $node2Root "inbox"
 
 $node1Endpoint = "http://127.0.0.1:55051"
 $node2Endpoint = "http://127.0.0.1:55052"
@@ -114,12 +116,51 @@ function Wait-ForConnectedPeer {
     throw "Timed out waiting for connected peer at $Endpoint"
 }
 
+function Get-FirstPeerId {
+    param(
+        [string]$Endpoint
+    )
+
+    $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs @("peer", "list")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to list peers on ${Endpoint}: $output"
+    }
+
+    $match = [regex]::Match($output, "peer_id=([^\s]+)")
+    if (-not $match.Success) {
+        throw "Could not parse peer_id from peer list on ${Endpoint}: $output"
+    }
+
+    return $match.Groups[1].Value
+}
+
+function Wait-ForTransportEvent {
+    param(
+        [string]$Endpoint,
+        [string]$Pattern,
+        [int]$Seconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs @("transport", "events", "--limit", "200")
+        if ($LASTEXITCODE -eq 0 -and $output -match $Pattern) {
+            return
+        }
+
+        Start-Sleep -Milliseconds 700
+    }
+
+    throw "Timed out waiting for transport event '$Pattern' at $Endpoint"
+}
+
 try {
     Write-Host "[smoke] starting node1"
     $node1 = Start-Process -FilePath $daemonExe -ArgumentList @("--bind", $node1Bind, "--network-port", "$node1Port") -PassThru -WindowStyle Hidden -RedirectStandardOutput $node1Out -RedirectStandardError $node1Err -Environment @{
         BOUNDLESS_CONFIG_PATH = $node1Config
         BOUNDLESS_SECURITY_ROOT = $node1Security
         BOUNDLESS_ADVERTISE_HOST = "127.0.0.1"
+        BOUNDLESS_INBOX_ROOT = $node1Inbox
     }
 
     Write-Host "[smoke] starting node2"
@@ -127,6 +168,7 @@ try {
         BOUNDLESS_CONFIG_PATH = $node2Config
         BOUNDLESS_SECURITY_ROOT = $node2Security
         BOUNDLESS_ADVERTISE_HOST = "127.0.0.1"
+        BOUNDLESS_INBOX_ROOT = $node2Inbox
     }
 
     Start-Sleep -Milliseconds 500
@@ -151,7 +193,31 @@ try {
     Wait-ForConnectedPeer -Endpoint $node1Endpoint -Seconds $TimeoutSeconds
     Wait-ForConnectedPeer -Endpoint $node2Endpoint -Seconds $TimeoutSeconds
 
-    Write-Host "[smoke] success: both nodes reported connected peers"
+    $node1PeerId = Get-FirstPeerId -Endpoint $node1Endpoint
+    $node2PeerId = Get-FirstPeerId -Endpoint $node2Endpoint
+
+    $clipboardText = "smoke-clipboard-" + (Get-Date -Format "HHmmss")
+    Write-Host "[smoke] sending clipboard payload from node1 to node2"
+    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("transport", "send-text", $node1PeerId, $clipboardText) | Out-Host
+
+    Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=clipboard_text peer_id=$node1PeerId" -Seconds $TimeoutSeconds
+    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_text peer_id=$node2PeerId" -Seconds $TimeoutSeconds
+
+    $sampleFile = Join-Path $runRoot "sample-transfer.txt"
+    Set-Content -Path $sampleFile -Value "smoke-file-payload" -NoNewline
+
+    Write-Host "[smoke] sending file payload from node1 to node2"
+    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("transport", "send-file", $node1PeerId, $sampleFile) | Out-Host
+
+    Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=file peer_id=$node1PeerId" -Seconds $TimeoutSeconds
+    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=file peer_id=$node2PeerId" -Seconds $TimeoutSeconds
+
+    $receivedPath = Join-Path $node2Inbox (Join-Path $node2PeerId "sample-transfer.txt")
+    if (-not (Test-Path $receivedPath)) {
+        throw "Expected incoming file was not materialized at $receivedPath"
+    }
+
+    Write-Host "[smoke] success: peer connectivity and payload transfer validated"
 }
 finally {
     foreach ($proc in @($node1, $node2)) {

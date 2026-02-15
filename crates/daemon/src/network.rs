@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     task::JoinHandle,
     time,
@@ -21,13 +21,25 @@ use tokio_rustls::{
 };
 use tracing::{error, info, warn};
 
-use core_protocol::{PROTOCOL_CURRENT, WireMessage, decode_line, encode_line};
+use core_protocol::{
+    PROTOCOL_CURRENT, WireMessage, decode_bytes_b64, decode_line, encode_bytes_b64, encode_line,
+};
+use core_transfer::validate_transfer_size;
 
-use crate::state::AppState;
+use crate::state::{AppState, OutboundPayload};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const SUPERVISOR_TICK: Duration = Duration::from_secs(3);
 const MAX_BACKOFF_SECONDS: u64 = 30;
+const FILE_CHUNK_BYTES: usize = 48 * 1024;
+
+#[derive(Debug)]
+struct InboundTransfer {
+    peer_id: String,
+    file_name: String,
+    total_bytes: u64,
+    bytes: Vec<u8>,
+}
 
 pub fn start(state: AppState) {
     tokio::spawn(listener_loop(state.clone()));
@@ -169,12 +181,10 @@ where
         capability_count: core_protocol::default_capabilities().len(),
     };
 
-    writer
-        .write_all(encode_line(&local_hello)?.as_bytes())
-        .await
-        .context("send hello")?;
+    send_message(&mut writer, &local_hello).await?;
 
     let mut remote_peer_id = peer_hint;
+    let mut inbound_transfers: HashMap<String, InboundTransfer> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -183,11 +193,14 @@ where
                     machine_id: snapshot.machine_id.clone(),
                     timestamp_unix_ms: now_millis(),
                 };
-                writer
-                    .write_all(encode_line(&heartbeat)?.as_bytes())
-                    .await
-                    .context("send heartbeat")?;
-                writer.flush().await.context("flush heartbeat")?;
+                send_message(&mut writer, &heartbeat).await?;
+                flush_outgoing_payloads(
+                    &state,
+                    &snapshot.machine_id,
+                    remote_peer_id.as_deref(),
+                    &mut writer,
+                )
+                .await?;
             }
             read = reader.read_line(&mut line) => {
                 let read = read.context("read transport line")?;
@@ -211,21 +224,152 @@ where
                                 machine_id: snapshot.machine_id.clone(),
                                 accepted: true,
                             };
-                            writer
-                                .write_all(encode_line(&ack)?.as_bytes())
-                                .await
-                                .context("send hello_ack")?;
-                            writer.flush().await.context("flush hello_ack")?;
+                            send_message(&mut writer, &ack).await?;
                         }
+
+                        flush_outgoing_payloads(
+                            &state,
+                            &snapshot.machine_id,
+                            remote_peer_id.as_deref(),
+                            &mut writer,
+                        )
+                        .await?;
                     }
                     WireMessage::HelloAck { accepted, .. } => {
                         if accepted && let Some(peer_id) = &remote_peer_id {
                             let _ = state.set_peer_connected(peer_id, true).await;
                         }
+
+                        flush_outgoing_payloads(
+                            &state,
+                            &snapshot.machine_id,
+                            remote_peer_id.as_deref(),
+                            &mut writer,
+                        )
+                        .await?;
                     }
                     WireMessage::Heartbeat { .. } => {
                         if let Some(peer_id) = &remote_peer_id {
                             let _ = state.touch_peer(peer_id).await;
+                        }
+                    }
+                    WireMessage::ClipboardText { machine_id, text } => {
+                        remote_peer_id.get_or_insert(machine_id);
+                        if let Some(peer_id) = &remote_peer_id {
+                            state.record_incoming_clipboard_text(peer_id, &text).await;
+                            info!(
+                                peer_id = %peer_id,
+                                size_bytes = text.len(),
+                                "received clipboard text payload"
+                            );
+                        }
+                    }
+                    WireMessage::FileStart {
+                        machine_id,
+                        transfer_id,
+                        file_name,
+                        total_bytes,
+                    } => {
+                        remote_peer_id.get_or_insert(machine_id);
+                        validate_transfer_size(total_bytes).context("validate file start size")?;
+
+                        if let Some(peer_id) = &remote_peer_id {
+                            inbound_transfers.insert(
+                                transfer_id.clone(),
+                                InboundTransfer {
+                                    peer_id: peer_id.clone(),
+                                    file_name: file_name.clone(),
+                                    total_bytes,
+                                    bytes: Vec::new(),
+                                },
+                            );
+                            info!(
+                                peer_id = %peer_id,
+                                transfer_id = %transfer_id,
+                                file_name = %file_name,
+                                total_bytes,
+                                "started inbound file transfer"
+                            );
+                        }
+                    }
+                    WireMessage::FileChunk {
+                        transfer_id,
+                        data_b64,
+                    } => {
+                        let Some(transfer) = inbound_transfers.get_mut(&transfer_id) else {
+                            warn!(transfer_id = %transfer_id, "received file chunk for unknown transfer");
+                            continue;
+                        };
+
+                        let chunk = match decode_bytes_b64(&data_b64) {
+                            Ok(chunk) => chunk,
+                            Err(error) => {
+                                warn!(transfer_id = %transfer_id, error = ?error, "failed to decode file chunk");
+                                inbound_transfers.remove(&transfer_id);
+                                continue;
+                            }
+                        };
+
+                        let next_size = transfer.bytes.len() + chunk.len();
+                        validate_transfer_size(next_size as u64).context("validate chunk size")?;
+
+                        if next_size as u64 > transfer.total_bytes {
+                            warn!(
+                                transfer_id = %transfer_id,
+                                announced_total = transfer.total_bytes,
+                                attempted_total = next_size as u64,
+                                "inbound file exceeded announced total bytes"
+                            );
+                            inbound_transfers.remove(&transfer_id);
+                            continue;
+                        }
+
+                        transfer.bytes.extend_from_slice(&chunk);
+                    }
+                    WireMessage::FileEnd { transfer_id } => {
+                        let Some(transfer) = inbound_transfers.remove(&transfer_id) else {
+                            warn!(transfer_id = %transfer_id, "received file end for unknown transfer");
+                            continue;
+                        };
+
+                        if transfer.bytes.len() as u64 != transfer.total_bytes {
+                            warn!(
+                                transfer_id = %transfer_id,
+                                expected = transfer.total_bytes,
+                                actual = transfer.bytes.len() as u64,
+                                "inbound file transfer ended with size mismatch"
+                            );
+                            continue;
+                        }
+
+                        let InboundTransfer {
+                            peer_id,
+                            file_name,
+                            total_bytes: _,
+                            bytes,
+                        } = transfer;
+
+                        match state
+                            .store_incoming_file(&peer_id, &file_name, bytes)
+                            .await
+                        {
+                            Ok(path) => {
+                                info!(
+                                    peer_id = %peer_id,
+                                    transfer_id = %transfer_id,
+                                    file_name = %file_name,
+                                    path = %path.display(),
+                                    "stored inbound file payload"
+                                );
+                            }
+                            Err(error) => {
+                                warn!(
+                                    peer_id = %peer_id,
+                                    transfer_id = %transfer_id,
+                                    error = ?error,
+                                    "failed to store inbound file payload"
+                                );
+                            }
                         }
                     }
                     WireMessage::Error { message } => {
@@ -238,6 +382,79 @@ where
 
     if let Some(peer_id) = &remote_peer_id {
         let _ = state.set_peer_connected(peer_id, false).await;
+    }
+
+    Ok(())
+}
+
+async fn send_message<W>(writer: &mut W, message: &WireMessage) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(encode_line(message)?.as_bytes())
+        .await
+        .context("write transport frame")?;
+    writer.flush().await.context("flush transport frame")?;
+    Ok(())
+}
+
+async fn flush_outgoing_payloads<W>(
+    state: &AppState,
+    local_machine_id: &str,
+    remote_peer_id: Option<&str>,
+    writer: &mut W,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(peer_id) = remote_peer_id else {
+        return Ok(());
+    };
+
+    for payload in state.drain_outgoing(peer_id).await {
+        match payload {
+            OutboundPayload::ClipboardText { text } => {
+                let message = WireMessage::ClipboardText {
+                    machine_id: local_machine_id.to_string(),
+                    text: text.clone(),
+                };
+                send_message(writer, &message).await?;
+                state.record_outgoing_clipboard_text(peer_id, &text).await;
+            }
+            OutboundPayload::File { file_name, bytes } => {
+                let total_bytes = bytes.len() as u64;
+                validate_transfer_size(total_bytes)?;
+
+                let transfer_id = uuid::Uuid::new_v4().to_string();
+                send_message(
+                    writer,
+                    &WireMessage::FileStart {
+                        machine_id: local_machine_id.to_string(),
+                        transfer_id: transfer_id.clone(),
+                        file_name: file_name.clone(),
+                        total_bytes,
+                    },
+                )
+                .await?;
+
+                for chunk in bytes.chunks(FILE_CHUNK_BYTES) {
+                    send_message(
+                        writer,
+                        &WireMessage::FileChunk {
+                            transfer_id: transfer_id.clone(),
+                            data_b64: encode_bytes_b64(chunk),
+                        },
+                    )
+                    .await?;
+                }
+
+                send_message(writer, &WireMessage::FileEnd { transfer_id }).await?;
+                state
+                    .record_outgoing_file(peer_id, &file_name, total_bytes)
+                    .await;
+            }
+        }
     }
 
     Ok(())

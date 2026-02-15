@@ -13,6 +13,8 @@
   - trust bundle export/import
   - TLS transport session establishment
   - heartbeat-driven connected state reporting
+  - queued clipboard text/file payload transfer and inbox materialization
+- Run `scripts/dev/validate.ps1` for fmt/test/clippy plus smoke in one command
 
 ## Test cases
 
@@ -42,9 +44,16 @@
 - Run `safe-reset --network`
 - Confirm peers were cleared while core config remains
 
+7. Transport payload checks
+- On Machine A: `transport send-text <peer_id> "sample text"`
+- On Machine A: `transport send-file <peer_id> <path>`
+- On both machines: `transport events --limit 100`
+- Confirm outgoing/incoming events are present and file appears in receiver inbox root
+
 ## Exit criteria for this stage
 
 - CLI commands are stable and deterministic
 - Persistence survives restart
 - Diagnostics bundle generated successfully
 - No daemon crashes during command workflows
+- Clipboard/file payload smoke path completes reliably

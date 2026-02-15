@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -137,6 +138,23 @@ pub enum WireMessage {
         machine_id: String,
         timestamp_unix_ms: i64,
     },
+    ClipboardText {
+        machine_id: String,
+        text: String,
+    },
+    FileStart {
+        machine_id: String,
+        transfer_id: String,
+        file_name: String,
+        total_bytes: u64,
+    },
+    FileChunk {
+        transfer_id: String,
+        data_b64: String,
+    },
+    FileEnd {
+        transfer_id: String,
+    },
     Error {
         message: String,
     },
@@ -146,6 +164,8 @@ pub enum WireMessage {
 pub enum WireCodecError {
     #[error("json serialization error: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("base64 decode error: {0}")]
+    Base64(#[from] base64::DecodeError),
 }
 
 pub fn encode_line(message: &WireMessage) -> Result<String, WireCodecError> {
@@ -156,6 +176,16 @@ pub fn encode_line(message: &WireMessage) -> Result<String, WireCodecError> {
 
 pub fn decode_line(line: &str) -> Result<WireMessage, WireCodecError> {
     Ok(serde_json::from_str(line.trim())?)
+}
+
+pub fn encode_bytes_b64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+pub fn decode_bytes_b64(data_b64: &str) -> Result<Vec<u8>, WireCodecError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(data_b64.as_bytes())
+        .map_err(WireCodecError::from)
 }
 
 #[cfg(test)]
@@ -240,6 +270,32 @@ mod tests {
         let original = WireMessage::Heartbeat {
             machine_id: "abc".to_string(),
             timestamp_unix_ms: 123,
+        };
+
+        let encoded = encode_line(&original).expect("encode");
+        let decoded = decode_line(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn base64_round_trip() {
+        let payload = vec![1u8, 2, 3, 4, 5, 255];
+        let encoded = encode_bytes_b64(&payload);
+        let decoded = decode_bytes_b64(&encoded).expect("decode");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn rejects_invalid_base64() {
+        let err = decode_bytes_b64("not-base64!").expect_err("must fail");
+        assert!(matches!(err, WireCodecError::Base64(_)));
+    }
+
+    #[test]
+    fn wire_message_file_chunk_round_trip() {
+        let original = WireMessage::FileChunk {
+            transfer_id: "xfer-1".to_string(),
+            data_b64: encode_bytes_b64(&[10u8, 20, 30]),
         };
 
         let encoded = encode_line(&original).expect("encode");

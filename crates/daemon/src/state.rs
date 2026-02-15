@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -10,10 +15,29 @@ use core_security::{
     ensure_device_identity, ensure_trust_store, fingerprint, generate_pairing_code,
     load_or_create_device_secret, load_trust_records, upsert_trust_record,
 };
+use core_transfer::{resolve_conflict_path, validate_transfer_size};
 
 use crate::config::{
     PeerConfig, RuntimeConfig, config_path, load_or_create_config_at, save_config_at,
 };
+
+const MAX_TRANSPORT_EVENTS: usize = 512;
+
+#[derive(Debug, Clone)]
+pub enum OutboundPayload {
+    ClipboardText { text: String },
+    File { file_name: String, bytes: Vec<u8> },
+}
+
+#[derive(Debug, Clone)]
+pub struct TransportEventRecord {
+    pub timestamp: DateTime<Utc>,
+    pub direction: String,
+    pub kind: String,
+    pub peer_id: String,
+    pub detail: String,
+    pub size_bytes: u64,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -23,6 +47,9 @@ pub struct AppState {
     security_paths: Arc<SecurityPaths>,
     identity: Arc<DeviceIdentity>,
     device_fingerprint: Arc<String>,
+    outgoing_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
+    transport_events: Arc<RwLock<VecDeque<TransportEventRecord>>>,
+    inbox_root: Arc<PathBuf>,
 }
 
 impl AppState {
@@ -56,12 +83,23 @@ impl AppState {
             },
         )?;
 
+        let inbox_root = if let Ok(path) = std::env::var("BOUNDLESS_INBOX_ROOT") {
+            PathBuf::from(path)
+        } else {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("Boundless")
+                .join("inbox")
+        };
+        std::fs::create_dir_all(&inbox_root)?;
+
         let fingerprint = fingerprint(&secret);
 
         info!(
             machine_id = %config.machine_id,
             config_path = %config_path.display(),
             security_root = %paths.root.display(),
+            inbox_root = %inbox_root.display(),
             "state loaded"
         );
 
@@ -72,6 +110,9 @@ impl AppState {
             security_paths: Arc::new(paths),
             identity: Arc::new(identity),
             device_fingerprint: Arc::new(fingerprint),
+            outgoing_payloads: Arc::new(RwLock::new(HashMap::new())),
+            transport_events: Arc::new(RwLock::new(VecDeque::new())),
+            inbox_root: Arc::new(inbox_root),
         })
     }
 
@@ -270,6 +311,130 @@ impl AppState {
         save_config_at(&self.config_path, &config)
     }
 
+    pub async fn queue_clipboard_text(&self, peer_id: &str, text: String) -> Result<()> {
+        if self.get_peer(peer_id).await.is_none() {
+            anyhow::bail!("unknown peer {peer_id}");
+        }
+
+        let mut queue_map = self.outgoing_payloads.write().await;
+        queue_map
+            .entry(peer_id.to_string())
+            .or_default()
+            .push_back(OutboundPayload::ClipboardText { text });
+        Ok(())
+    }
+
+    pub async fn queue_file_from_path(&self, peer_id: &str, file_path: &Path) -> Result<()> {
+        if self.get_peer(peer_id).await.is_none() {
+            anyhow::bail!("unknown peer {peer_id}");
+        }
+
+        let file_name = file_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .ok_or_else(|| anyhow::anyhow!("invalid file path"))?;
+
+        let metadata = tokio::fs::metadata(file_path)
+            .await
+            .map_err(anyhow::Error::from)?;
+        validate_transfer_size(metadata.len())?;
+        let bytes = tokio::fs::read(file_path)
+            .await
+            .map_err(anyhow::Error::from)?;
+
+        let mut queue_map = self.outgoing_payloads.write().await;
+        queue_map
+            .entry(peer_id.to_string())
+            .or_default()
+            .push_back(OutboundPayload::File { file_name, bytes });
+        Ok(())
+    }
+
+    pub async fn drain_outgoing(&self, peer_id: &str) -> Vec<OutboundPayload> {
+        let mut queue_map = self.outgoing_payloads.write().await;
+        queue_map
+            .remove(peer_id)
+            .map(|queue| queue.into_iter().collect::<Vec<_>>())
+            .unwrap_or_default()
+    }
+
+    pub async fn record_transport_event(&self, event: TransportEventRecord) {
+        let mut events = self.transport_events.write().await;
+        events.push_back(event);
+        while events.len() > MAX_TRANSPORT_EVENTS {
+            events.pop_front();
+        }
+    }
+
+    pub async fn transport_events(&self) -> Vec<TransportEventRecord> {
+        self.transport_events.read().await.iter().cloned().collect()
+    }
+
+    pub async fn record_incoming_clipboard_text(&self, peer_id: &str, text: &str) {
+        let preview = text.chars().take(80).collect::<String>();
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "incoming".to_string(),
+            kind: "clipboard_text".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: preview,
+            size_bytes: text.len() as u64,
+        })
+        .await;
+    }
+
+    pub async fn record_outgoing_clipboard_text(&self, peer_id: &str, text: &str) {
+        let preview = text.chars().take(80).collect::<String>();
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "outgoing".to_string(),
+            kind: "clipboard_text".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: preview,
+            size_bytes: text.len() as u64,
+        })
+        .await;
+    }
+
+    pub async fn store_incoming_file(
+        &self,
+        peer_id: &str,
+        file_name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<PathBuf> {
+        validate_transfer_size(bytes.len() as u64)?;
+
+        let peer_dir = self.inbox_root.join(peer_id);
+        tokio::fs::create_dir_all(&peer_dir).await?;
+
+        let final_path = resolve_conflict_path(&peer_dir, file_name);
+        tokio::fs::write(&final_path, bytes).await?;
+
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "incoming".to_string(),
+            kind: "file".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: final_path.display().to_string(),
+            size_bytes: tokio::fs::metadata(&final_path).await?.len(),
+        })
+        .await;
+
+        Ok(final_path)
+    }
+
+    pub async fn record_outgoing_file(&self, peer_id: &str, file_name: &str, size_bytes: u64) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "outgoing".to_string(),
+            kind: "file".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: file_name.to_string(),
+            size_bytes,
+        })
+        .await;
+    }
+
     pub async fn safe_reset(&self, network_only: bool, all: bool) -> Result<()> {
         let mut config = self.config.write().await;
 
@@ -282,6 +447,9 @@ impl AppState {
         } else if network_only {
             config.peers.clear();
         }
+
+        self.outgoing_payloads.write().await.clear();
+        self.transport_events.write().await.clear();
 
         save_config_at(&self.config_path, &config)
     }
@@ -306,13 +474,15 @@ impl AppState {
             .await
             .map(|items| items.len())
             .unwrap_or(0);
+        let event_count = self.transport_events.read().await.len();
 
         let report = format!(
-            "Boundless Diagnostics\nMachine: {}\nFingerprint: {}\nPeers: {}\nTrusted CAs: {}\nAPI: {}\nTransport Port: {}\nProtocol: {}\n",
+            "Boundless Diagnostics\nMachine: {}\nFingerprint: {}\nPeers: {}\nTrusted CAs: {}\nTransport Events: {}\nAPI: {}\nTransport Port: {}\nProtocol: {}\n",
             snapshot.machine_id,
             self.fingerprint(),
             snapshot.peers.len(),
             trust_count,
+            event_count,
             snapshot.api_bind,
             snapshot.network_port,
             snapshot.protocol_version
