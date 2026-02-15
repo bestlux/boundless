@@ -4,7 +4,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
@@ -168,6 +168,17 @@ async fn run_session<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let authenticated_peer_id = authenticated_peer_machine_id(&state, &stream).await?;
+    if let Some(expected_peer_id) = peer_hint.as_deref()
+        && expected_peer_id != authenticated_peer_id
+    {
+        bail!(
+            "peer identity mismatch: expected {} from topology, authenticated {} from TLS",
+            expected_peer_id,
+            authenticated_peer_id
+        );
+    }
+
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -183,7 +194,7 @@ where
 
     send_message(&mut writer, &local_hello).await?;
 
-    let mut remote_peer_id = peer_hint;
+    let remote_peer_id = Some(authenticated_peer_id.clone());
     let mut inbound_transfers: HashMap<String, InboundTransfer> = HashMap::new();
 
     loop {
@@ -213,7 +224,21 @@ where
 
                 match message {
                     WireMessage::Hello { machine_id, .. } => {
-                        remote_peer_id.get_or_insert(machine_id.clone());
+                        if machine_id != authenticated_peer_id {
+                            warn!(
+                                claimed_machine_id = %machine_id,
+                                authenticated_machine_id = %authenticated_peer_id,
+                                "hello machine_id mismatch from authenticated peer"
+                            );
+                            let _ = send_message(
+                                &mut writer,
+                                &WireMessage::Error {
+                                    message: "hello machine_id mismatch".to_string(),
+                                },
+                            )
+                            .await;
+                            break;
+                        }
 
                         if let Some(peer_id) = &remote_peer_id {
                             let _ = state.set_peer_connected(peer_id, true).await;
@@ -254,7 +279,15 @@ where
                         }
                     }
                     WireMessage::ClipboardText { machine_id, text } => {
-                        remote_peer_id.get_or_insert(machine_id);
+                        if machine_id != authenticated_peer_id {
+                            warn!(
+                                claimed_machine_id = %machine_id,
+                                authenticated_machine_id = %authenticated_peer_id,
+                                "dropping clipboard payload with mismatched machine_id"
+                            );
+                            continue;
+                        }
+
                         if let Some(peer_id) = &remote_peer_id {
                             state.record_incoming_clipboard_text(peer_id, &text).await;
                             info!(
@@ -270,7 +303,15 @@ where
                         file_name,
                         total_bytes,
                     } => {
-                        remote_peer_id.get_or_insert(machine_id);
+                        if machine_id != authenticated_peer_id {
+                            warn!(
+                                claimed_machine_id = %machine_id,
+                                authenticated_machine_id = %authenticated_peer_id,
+                                transfer_id = %transfer_id,
+                                "dropping file start with mismatched machine_id"
+                            );
+                            continue;
+                        }
                         validate_transfer_size(total_bytes).context("validate file start size")?;
 
                         if let Some(peer_id) = &remote_peer_id {
@@ -387,6 +428,57 @@ where
     Ok(())
 }
 
+async fn authenticated_peer_machine_id<S>(
+    state: &AppState,
+    stream: &tokio_rustls::TlsStream<S>,
+) -> Result<String> {
+    let (_, session) = stream.get_ref();
+    let peer_chain = session
+        .peer_certificates()
+        .context("missing peer certificate chain")?;
+
+    if peer_chain.len() < 2 {
+        bail!("peer TLS certificate chain must include issuer CA certificate");
+    }
+
+    let presented_ca = peer_chain
+        .last()
+        .context("peer certificate chain is unexpectedly empty")?;
+
+    let trusted = state.trusted_records().await?;
+    let Some(machine_id) = machine_id_from_presented_ca(&trusted, presented_ca)? else {
+        bail!("presented peer CA certificate does not map to a trusted machine record");
+    };
+
+    Ok(machine_id)
+}
+
+fn machine_id_from_presented_ca(
+    records: &[core_security::TrustRecord],
+    presented_ca: &CertificateDer<'_>,
+) -> Result<Option<String>> {
+    let mut matched_machine_id: Option<String> = None;
+
+    for record in records {
+        for cert in CertificateDer::pem_slice_iter(record.ca_cert_pem.as_bytes()) {
+            let cert = cert.context("parse trusted CA certificate")?;
+            if cert.as_ref() != presented_ca.as_ref() {
+                continue;
+            }
+
+            if let Some(existing) = &matched_machine_id {
+                if existing != &record.machine_id {
+                    bail!("presented CA certificate matched multiple machine records");
+                }
+            } else {
+                matched_machine_id = Some(record.machine_id.clone());
+            }
+        }
+    }
+
+    Ok(matched_machine_id)
+}
+
 async fn send_message<W>(writer: &mut W, message: &WireMessage) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -475,7 +567,7 @@ async fn build_tls_acceptor(state: &AppState) -> Result<TlsAcceptor> {
         .build()
         .context("build client verifier")?;
 
-    let cert_chain = parse_cert_chain(&identity.device_cert_pem)?;
+    let cert_chain = build_presented_cert_chain(&identity)?;
     let private_key = parse_private_key(&identity.device_key_pem)?;
 
     let server = ServerConfig::builder()
@@ -491,7 +583,7 @@ async fn build_tls_connector(state: &AppState) -> Result<TlsConnector> {
     let trusted = state.trusted_records().await?;
     let roots = build_root_store(&trusted)?;
 
-    let cert_chain = parse_cert_chain(&identity.device_cert_pem)?;
+    let cert_chain = build_presented_cert_chain(&identity)?;
     let private_key = parse_private_key(&identity.device_key_pem)?;
 
     let client = ClientConfig::builder()
@@ -520,6 +612,15 @@ fn parse_cert_chain(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
     CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .context("parse cert chain")
+}
+
+fn build_presented_cert_chain(
+    identity: &core_security::DeviceIdentity,
+) -> Result<Vec<CertificateDer<'static>>> {
+    let mut chain = parse_cert_chain(&identity.device_cert_pem)?;
+    let mut ca_chain = parse_cert_chain(&identity.ca_cert_pem)?;
+    chain.append(&mut ca_chain);
+    Ok(chain)
 }
 
 fn parse_private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
@@ -551,6 +652,8 @@ fn parse_server_name(address: &str) -> Result<ServerName<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use core_security::{SecurityPaths, TrustRecord, ensure_device_identity};
 
     #[test]
     fn extracts_server_name_from_ipv4_socket() {
@@ -568,5 +671,70 @@ mod tests {
     fn rejects_invalid_server_name() {
         let err = parse_server_name("!").expect_err("must fail");
         assert!(err.to_string().contains("parse server name"));
+    }
+
+    #[test]
+    fn maps_presented_ca_to_machine_id() {
+        let root =
+            std::env::temp_dir().join(format!("boundless-network-test-{}", uuid::Uuid::new_v4()));
+        let node1 = SecurityPaths::for_root(root.join("n1"));
+        let node2 = SecurityPaths::for_root(root.join("n2"));
+
+        let id1 = ensure_device_identity(&node1, "machine-1", "node1", Some("127.0.0.1"))
+            .expect("identity 1");
+        let id2 = ensure_device_identity(&node2, "machine-2", "node2", Some("127.0.0.1"))
+            .expect("identity 2");
+
+        let records = vec![
+            TrustRecord {
+                machine_id: "machine-1".to_string(),
+                ca_cert_pem: id1.ca_cert_pem,
+                added_at: Utc::now(),
+            },
+            TrustRecord {
+                machine_id: "machine-2".to_string(),
+                ca_cert_pem: id2.ca_cert_pem.clone(),
+                added_at: Utc::now(),
+            },
+        ];
+
+        let presented = CertificateDer::pem_slice_iter(id2.ca_cert_pem.as_bytes())
+            .next()
+            .expect("cert present")
+            .expect("parse cert");
+        let mapped =
+            machine_id_from_presented_ca(&records, &presented).expect("mapping must succeed");
+        assert_eq!(mapped.as_deref(), Some("machine-2"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn returns_none_for_unknown_presented_ca() {
+        let root =
+            std::env::temp_dir().join(format!("boundless-network-test-{}", uuid::Uuid::new_v4()));
+        let known = SecurityPaths::for_root(root.join("known"));
+        let unknown = SecurityPaths::for_root(root.join("unknown"));
+
+        let known_id = ensure_device_identity(&known, "known-id", "known", Some("127.0.0.1"))
+            .expect("known identity");
+        let unknown_id =
+            ensure_device_identity(&unknown, "unknown-id", "unknown", Some("127.0.0.1"))
+                .expect("unknown identity");
+
+        let records = vec![TrustRecord {
+            machine_id: "known-id".to_string(),
+            ca_cert_pem: known_id.ca_cert_pem,
+            added_at: Utc::now(),
+        }];
+
+        let presented = CertificateDer::pem_slice_iter(unknown_id.ca_cert_pem.as_bytes())
+            .next()
+            .expect("cert present")
+            .expect("parse cert");
+        let mapped = machine_id_from_presented_ca(&records, &presented).expect("mapping");
+        assert!(mapped.is_none());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
