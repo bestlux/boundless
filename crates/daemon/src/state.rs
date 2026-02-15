@@ -13,7 +13,8 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use core_clipboard::{
-    ClipboardPayload, ClipboardPolicy, ClipboardPolicyError, payload_hash_hex, validate_payload,
+    ClipboardPayload, ClipboardPolicy, ClipboardPolicyError, payload_hash_hex,
+    validate_bmp_payload, validate_payload,
 };
 use core_discovery::parse_manual_target;
 use core_input::{InputEvent, InputFrame, InputRouter, InputSink, RouteDecision};
@@ -437,6 +438,7 @@ impl AppState {
         if self.get_peer(peer_id).await.is_none() {
             anyhow::bail!("unknown peer {peer_id}");
         }
+        validate_bmp_payload(&image_bmp).context("invalid clipboard BMP payload")?;
 
         let mut queue_map = self.outgoing_payloads.write().await;
         queue_map
@@ -910,6 +912,10 @@ impl AppState {
         &self,
         payload: &ClipboardPayload,
     ) -> Result<Option<String>> {
+        if let ClipboardPayload::Image(image_bmp) = payload {
+            validate_bmp_payload(image_bmp).context("invalid clipboard BMP payload")?;
+        }
+
         let policy = ClipboardPolicy {
             enabled: self
                 .config
@@ -1030,6 +1036,14 @@ fn describe_route_decision(decision: &RouteDecision) -> String {
 mod tests {
     use super::*;
     use chrono::Duration;
+
+    fn minimal_bmp_payload(red: u8) -> Vec<u8> {
+        vec![
+            b'B', b'M', 58, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+            1, 0, 24, 0, 0, 0, 0, 0, 4, 0, 0, 0, 19, 11, 0, 0, 19, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, red, 0,
+        ]
+    }
 
     #[test]
     fn validate_bind_address_rejects_invalid_input() {
@@ -1603,7 +1617,7 @@ mod tests {
             .await
             .expect("connect peer-a");
 
-        let image = vec![b'B', b'M', 1, 2, 3, 4];
+        let image = minimal_bmp_payload(255);
         let queued = state
             .queue_local_clipboard_image_for_connected_peers(image.clone())
             .await
@@ -1647,7 +1661,7 @@ mod tests {
         );
 
         let changed = state
-            .queue_local_clipboard_image_for_connected_peers(vec![b'B', b'M', 9, 9, 9, 9])
+            .queue_local_clipboard_image_for_connected_peers(minimal_bmp_payload(64))
             .await
             .expect("queue changed image");
         assert!(changed, "different clipboard image should queue");

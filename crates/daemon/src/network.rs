@@ -24,8 +24,8 @@ use tracing::{error, info, warn};
 
 use core_input::{InputEvent, InputFrame, KeyState, MouseButton};
 use core_protocol::{
-    PROTOCOL_CURRENT, WireInputEvent, WireKeyState, WireMessage, WireMouseButton, decode_bytes_b64,
-    decode_line, encode_bytes_b64, encode_line,
+    PROTOCOL_CLIPBOARD_IMAGE_MIN, PROTOCOL_CURRENT, ProtocolVersion, WireInputEvent, WireKeyState,
+    WireMessage, WireMouseButton, decode_bytes_b64, decode_line, encode_bytes_b64, encode_line,
 };
 use core_transfer::validate_transfer_size;
 
@@ -247,6 +247,7 @@ where
     send_message(&mut writer, &local_hello).await?;
 
     let remote_peer_id = Some(authenticated_peer_id.clone());
+    let mut remote_protocol: Option<ProtocolVersion> = None;
     let mut inbound_transfers: HashMap<String, InboundTransfer> = HashMap::new();
 
     loop {
@@ -257,13 +258,16 @@ where
                     timestamp_unix_ms: now_millis(),
                 };
                 send_message(&mut writer, &heartbeat).await?;
-                flush_outgoing_payloads(
-                    &state,
-                    &snapshot.machine_id,
-                    remote_peer_id.as_deref(),
-                    &mut writer,
-                )
-                .await?;
+                if let Some(remote_protocol) = remote_protocol {
+                    flush_outgoing_payloads(
+                        &state,
+                        &snapshot.machine_id,
+                        remote_peer_id.as_deref(),
+                        remote_protocol,
+                        &mut writer,
+                    )
+                    .await?;
+                }
             }
             read = reader.read_line(&mut line) => {
                 let read = read.context("read transport line")?;
@@ -275,7 +279,11 @@ where
                 line.clear();
 
                 match message {
-                    WireMessage::Hello { machine_id, .. } => {
+                    WireMessage::Hello {
+                        machine_id,
+                        protocol,
+                        ..
+                    } => {
                         if machine_id != authenticated_peer_id {
                             warn!(
                                 claimed_machine_id = %machine_id,
@@ -291,6 +299,7 @@ where
                             .await;
                             break;
                         }
+                        remote_protocol = Some(protocol);
 
                         if let Some(peer_id) = &remote_peer_id {
                             let _ = state.set_peer_connected(peer_id, true).await;
@@ -304,26 +313,32 @@ where
                             send_message(&mut writer, &ack).await?;
                         }
 
-                        flush_outgoing_payloads(
-                            &state,
-                            &snapshot.machine_id,
-                            remote_peer_id.as_deref(),
-                            &mut writer,
-                        )
-                        .await?;
+                        if let Some(remote_protocol) = remote_protocol {
+                            flush_outgoing_payloads(
+                                &state,
+                                &snapshot.machine_id,
+                                remote_peer_id.as_deref(),
+                                remote_protocol,
+                                &mut writer,
+                            )
+                            .await?;
+                        }
                     }
                     WireMessage::HelloAck { accepted, .. } => {
                         if accepted && let Some(peer_id) = &remote_peer_id {
                             let _ = state.set_peer_connected(peer_id, true).await;
                         }
 
-                        flush_outgoing_payloads(
-                            &state,
-                            &snapshot.machine_id,
-                            remote_peer_id.as_deref(),
-                            &mut writer,
-                        )
-                        .await?;
+                        if let Some(remote_protocol) = remote_protocol {
+                            flush_outgoing_payloads(
+                                &state,
+                                &snapshot.machine_id,
+                                remote_peer_id.as_deref(),
+                                remote_protocol,
+                                &mut writer,
+                            )
+                            .await?;
+                        }
                     }
                     WireMessage::Heartbeat { .. } => {
                         if let Some(peer_id) = &remote_peer_id {
@@ -362,6 +377,16 @@ where
                         machine_id,
                         data_b64,
                     } => {
+                        if !remote_protocol.is_some_and(protocol_supports_clipboard_image) {
+                            warn!(
+                                peer_id = %authenticated_peer_id,
+                                remote_protocol = ?remote_protocol,
+                                required_protocol = %PROTOCOL_CLIPBOARD_IMAGE_MIN,
+                                "dropping clipboard image payload from peer without image-frame support"
+                            );
+                            continue;
+                        }
+
                         if machine_id != authenticated_peer_id {
                             warn!(
                                 claimed_machine_id = %machine_id,
@@ -643,6 +668,7 @@ async fn flush_outgoing_payloads<W>(
     state: &AppState,
     local_machine_id: &str,
     remote_peer_id: Option<&str>,
+    remote_protocol: ProtocolVersion,
     writer: &mut W,
 ) -> Result<()>
 where
@@ -654,8 +680,15 @@ where
 
     let mut pending = VecDeque::from(state.drain_outgoing(peer_id).await);
     while let Some(payload) = pending.pop_front() {
-        if let Err(error) =
-            send_outbound_payload(state, local_machine_id, peer_id, &payload, writer).await
+        if let Err(error) = send_outbound_payload(
+            state,
+            local_machine_id,
+            peer_id,
+            remote_protocol,
+            &payload,
+            writer,
+        )
+        .await
         {
             let mut unsent = Vec::with_capacity(pending.len() + 1);
             unsent.push(payload);
@@ -672,6 +705,7 @@ async fn send_outbound_payload<W>(
     state: &AppState,
     local_machine_id: &str,
     peer_id: &str,
+    remote_protocol: ProtocolVersion,
     payload: &OutboundPayload,
     writer: &mut W,
 ) -> Result<()>
@@ -688,6 +722,16 @@ where
             state.record_outgoing_clipboard_text(peer_id, text).await;
         }
         OutboundPayload::ClipboardImage { image_bmp } => {
+            if !protocol_supports_clipboard_image(remote_protocol) {
+                warn!(
+                    peer_id = %peer_id,
+                    remote_protocol = %remote_protocol,
+                    required_protocol = %PROTOCOL_CLIPBOARD_IMAGE_MIN,
+                    "dropping clipboard image payload for peer without image-frame support"
+                );
+                return Ok(());
+            }
+
             let message = WireMessage::ClipboardImage {
                 machine_id: local_machine_id.to_string(),
                 data_b64: encode_bytes_b64(image_bmp),
@@ -752,6 +796,10 @@ where
     }
 
     Ok(())
+}
+
+fn protocol_supports_clipboard_image(protocol: ProtocolVersion) -> bool {
+    protocol.as_tuple() >= PROTOCOL_CLIPBOARD_IMAGE_MIN.as_tuple()
 }
 
 fn input_event_to_wire(event: &InputEvent) -> WireInputEvent {
@@ -1110,6 +1158,28 @@ mod tests {
         (state, peer_id, root)
     }
 
+    fn minimal_bmp_payload() -> Vec<u8> {
+        vec![
+            b'B', b'M', 58, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+            1, 0, 24, 0, 0, 0, 0, 0, 4, 0, 0, 0, 19, 11, 0, 0, 19, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 255, 0,
+        ]
+    }
+
+    #[test]
+    fn clipboard_image_support_requires_protocol_1_1_or_newer() {
+        assert!(!protocol_supports_clipboard_image(ProtocolVersion {
+            major: 1,
+            minor: 0,
+            patch: 9,
+        }));
+        assert!(protocol_supports_clipboard_image(ProtocolVersion {
+            major: 1,
+            minor: 1,
+            patch: 0,
+        }));
+    }
+
     #[tokio::test]
     async fn flush_requeues_all_payloads_when_first_write_fails() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
@@ -1124,9 +1194,15 @@ mod tests {
             .expect("queue two");
 
         let mut writer = FailAfterCallsWriter::new(1);
-        let _err = flush_outgoing_payloads(&state, "local", Some(&peer_id), &mut writer)
-            .await
-            .expect_err("must fail");
+        let _err = flush_outgoing_payloads(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            &mut writer,
+        )
+        .await
+        .expect_err("must fail");
 
         let queued = state.drain_outgoing(&peer_id).await;
         assert_eq!(queued.len(), 2);
@@ -1161,9 +1237,15 @@ mod tests {
 
         // Each successful payload costs write+flush (2 calls). Fail on second payload write.
         let mut writer = FailAfterCallsWriter::new(3);
-        let _ = flush_outgoing_payloads(&state, "local", Some(&peer_id), &mut writer)
-            .await
-            .expect_err("must fail");
+        let _ = flush_outgoing_payloads(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            &mut writer,
+        )
+        .await
+        .expect_err("must fail");
 
         let queued = state.drain_outgoing(&peer_id).await;
         assert_eq!(queued.len(), 2);
@@ -1175,6 +1257,35 @@ mod tests {
             queued.get(1),
             Some(OutboundPayload::ClipboardText { text }) if text == "three"
         ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn flush_drops_clipboard_image_for_legacy_protocol_peer() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        state
+            .queue_clipboard_image(&peer_id, minimal_bmp_payload())
+            .await
+            .expect("queue image");
+
+        let mut writer = FailAfterCallsWriter::new(1);
+        flush_outgoing_payloads(
+            &state,
+            "local",
+            Some(&peer_id),
+            ProtocolVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+            },
+            &mut writer,
+        )
+        .await
+        .expect("legacy peer image should be dropped, not sent");
+
+        let queued = state.drain_outgoing(&peer_id).await;
+        assert!(queued.is_empty(), "dropped image must not be requeued");
 
         let _ = std::fs::remove_dir_all(root);
     }

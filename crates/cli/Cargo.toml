@@ -17,6 +17,7 @@ tokio.workspace = true
 tonic.workspace = true
 
 ipc-api = { path = "../ipc-api" }
+core-clipboard = { path = "../core-clipboard" }
 
 [target.'cfg(windows)'.dependencies]
 hyper-util.workspace = true
