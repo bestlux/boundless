@@ -54,6 +54,20 @@ function Invoke-Cli {
     & $cliExe @allArgs 2>&1
 }
 
+function Invoke-CliChecked {
+    param(
+        [string]$Endpoint,
+        [string[]]$CommandArgs
+    )
+
+    $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs $CommandArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "CLI command failed at ${Endpoint}: args='$($CommandArgs -join " ")' exit=$LASTEXITCODE output=$output"
+    }
+
+    return $output
+}
+
 function Wait-ForDaemon {
     param(
         [string]$Endpoint,
@@ -109,6 +123,30 @@ function Wait-ForConnectedPeer {
     }
 
     throw "Timed out waiting for connected peer at $Endpoint"
+}
+
+function Wait-ForPeerConnectionState {
+    param(
+        [string]$Endpoint,
+        [string]$PeerId,
+        [bool]$Connected,
+        [int]$Seconds
+    )
+
+    $expected = if ($Connected) { "true" } else { "false" }
+    $peerPattern = [regex]::Escape($PeerId)
+    $pattern = "peer_id=$peerPattern\s+name=.*\s+address=.*\s+connected=$expected"
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs @("peer", "list")
+        if ($LASTEXITCODE -eq 0 -and $output -match $pattern) {
+            return
+        }
+
+        Start-Sleep -Milliseconds 700
+    }
+
+    throw "Timed out waiting for peer connection state connected=$expected for peer_id=$PeerId at $Endpoint"
 }
 
 function Get-FirstPeerId {
@@ -258,6 +296,22 @@ function Start-DaemonProcess {
     return Start-Process -FilePath "cmd.exe" -ArgumentList @("/d", "/s", "/c", $commandLine) -PassThru -WindowStyle Hidden -RedirectStandardOutput $StdOutPath -RedirectStandardError $StdErrPath
 }
 
+function Stop-DaemonProcess {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [int]$WaitMs = 5000
+    )
+
+    if ($null -eq $Process -or $Process.HasExited) {
+        return
+    }
+
+    Stop-Process -Id $Process.Id -Force
+    if (-not $Process.WaitForExit($WaitMs)) {
+        throw "Timed out waiting for daemon process $($Process.Id) to stop"
+    }
+}
+
 function Remove-PathWithRetry {
     param(
         [string]$Path,
@@ -295,21 +349,24 @@ try {
         throw "Expected binaries were not built"
     }
 
-    Write-Host "[smoke] starting node1"
-    $node1 = Start-DaemonProcess -Bind $node1Bind -ApiTransport "tcp" -NetworkPort $node1Port -StdOutPath $node1Out -StdErrPath $node1Err -Environment @{
+    $node1Env = @{
         BOUNDLESS_CONFIG_PATH = $node1Config
         BOUNDLESS_SECURITY_ROOT = $node1Security
         BOUNDLESS_ADVERTISE_HOST = "127.0.0.1"
         BOUNDLESS_INBOX_ROOT = $node1Inbox
     }
-
-    Write-Host "[smoke] starting node2"
-    $node2 = Start-DaemonProcess -Bind $node2Bind -ApiTransport "tcp" -NetworkPort $node2Port -StdOutPath $node2Out -StdErrPath $node2Err -Environment @{
+    $node2Env = @{
         BOUNDLESS_CONFIG_PATH = $node2Config
         BOUNDLESS_SECURITY_ROOT = $node2Security
         BOUNDLESS_ADVERTISE_HOST = "127.0.0.1"
         BOUNDLESS_INBOX_ROOT = $node2Inbox
     }
+
+    Write-Host "[smoke] starting node1"
+    $node1 = Start-DaemonProcess -Bind $node1Bind -ApiTransport "tcp" -NetworkPort $node1Port -StdOutPath $node1Out -StdErrPath $node1Err -Environment $node1Env
+
+    Write-Host "[smoke] starting node2"
+    $node2 = Start-DaemonProcess -Bind $node2Bind -ApiTransport "tcp" -NetworkPort $node2Port -StdOutPath $node2Out -StdErrPath $node2Err -Environment $node2Env
 
     Start-Sleep -Milliseconds 500
     if ($node1.HasExited) {
@@ -323,50 +380,52 @@ try {
     Wait-ForDaemon -Endpoint $node2Endpoint -Seconds $TimeoutSeconds -Process $node2 -StdErrPath $node2Err
 
     Write-Host "[smoke] exporting trust bundles"
-    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("pair", "export-trust", "--output", $bundle1) | Out-Host
-    Invoke-Cli -Endpoint $node2Endpoint -CommandArgs @("pair", "export-trust", "--output", $bundle2) | Out-Host
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("pair", "export-trust", "--output", $bundle1) | Out-Host
+    Invoke-CliChecked -Endpoint $node2Endpoint -CommandArgs @("pair", "export-trust", "--output", $bundle2) | Out-Host
 
     Write-Host "[smoke] importing trust bundles"
-    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("pair", "import-trust", "--input", $bundle2, "--alias", "node2") | Out-Host
-    Invoke-Cli -Endpoint $node2Endpoint -CommandArgs @("pair", "import-trust", "--input", $bundle1, "--alias", "node1") | Out-Host
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("pair", "import-trust", "--input", $bundle2, "--alias", "node2") | Out-Host
+    Invoke-CliChecked -Endpoint $node2Endpoint -CommandArgs @("pair", "import-trust", "--input", $bundle1, "--alias", "node1") | Out-Host
 
     Wait-ForConnectedPeer -Endpoint $node1Endpoint -Seconds $TimeoutSeconds
     Wait-ForConnectedPeer -Endpoint $node2Endpoint -Seconds $TimeoutSeconds
 
     $node1PeerId = Get-FirstPeerId -Endpoint $node1Endpoint
     $node2PeerId = Get-FirstPeerId -Endpoint $node2Endpoint
+    Wait-ForPeerConnectionState -Endpoint $node1Endpoint -PeerId $node1PeerId -Connected $true -Seconds $TimeoutSeconds
+    Wait-ForPeerConnectionState -Endpoint $node2Endpoint -PeerId $node2PeerId -Connected $true -Seconds $TimeoutSeconds
 
     Write-Host "[smoke] validating input owner control plane"
-    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "claim", $node1PeerId) | Out-Host
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "claim", $node1PeerId) | Out-Host
     Wait-ForInputOwner -Endpoint $node1Endpoint -ExpectedOwner $node1PeerId -Seconds $TimeoutSeconds
-    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "release", $node1PeerId) | Out-Host
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "release", $node1PeerId) | Out-Host
     Wait-ForInputOwner -Endpoint $node1Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
 
     Write-Host "[smoke] validating input capture target control plane"
     Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
-    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "capture-start", $node1PeerId) | Out-Host
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "capture-start", $node1PeerId) | Out-Host
     Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget $node1PeerId -Seconds $TimeoutSeconds
-    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "capture-stop") | Out-Host
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "capture-stop") | Out-Host
     Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
 
     Write-Host "[smoke] sending synthetic input frame from node1 to node2"
-    Invoke-Cli -Endpoint $node2Endpoint -CommandArgs @("input", "claim", $node2PeerId) | Out-Host
+    Invoke-CliChecked -Endpoint $node2Endpoint -CommandArgs @("input", "claim", $node2PeerId) | Out-Host
     Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner $node2PeerId -Seconds $TimeoutSeconds
-    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "send-move", $node1PeerId, "3", "2") | Out-Host
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "send-move", $node1PeerId, "3", "2") | Out-Host
     Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId" -Seconds $TimeoutSeconds
     Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=input_frame peer_id=$node2PeerId" -Seconds $TimeoutSeconds
 
     $outgoingInputFrameCountBeforeKey = Get-TransportEventMatchCount -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId"
     $appliedInjectCountBeforeKey = Get-TransportEventMatchCount -Endpoint $node2Endpoint -Pattern "direction=local kind=input_inject_applied peer_id=$node2PeerId"
-    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "send-key", $node1PeerId, "30", "down") | Out-Host
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "send-key", $node1PeerId, "30", "down") | Out-Host
     Wait-ForTransportEventCount -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId" -ExpectedMinCount ($outgoingInputFrameCountBeforeKey + 1) -Seconds $TimeoutSeconds
     Wait-ForTransportEventCount -Endpoint $node2Endpoint -Pattern "direction=local kind=input_inject_applied peer_id=$node2PeerId" -ExpectedMinCount ($appliedInjectCountBeforeKey + 1) -Seconds $TimeoutSeconds
-    Invoke-Cli -Endpoint $node2Endpoint -CommandArgs @("input", "release", $node2PeerId) | Out-Host
+    Invoke-CliChecked -Endpoint $node2Endpoint -CommandArgs @("input", "release", $node2PeerId) | Out-Host
     Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
 
     $clipboardText = "smoke-clipboard-" + (Get-Date -Format "HHmmss")
     Write-Host "[smoke] sending clipboard payload from node1 to node2"
-    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("transport", "send-text", $node1PeerId, $clipboardText) | Out-Host
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-text", $node1PeerId, $clipboardText) | Out-Host
 
     Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=clipboard_text peer_id=$node1PeerId" -Seconds $TimeoutSeconds
     Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_text peer_id=$node2PeerId" -Seconds $TimeoutSeconds
@@ -382,7 +441,7 @@ try {
     [System.IO.File]::WriteAllBytes($sampleImage, $bmpBytes)
 
     Write-Host "[smoke] sending clipboard image payload from node1 to node2"
-    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("transport", "send-image", $node1PeerId, $sampleImage) | Out-Host
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-image", $node1PeerId, $sampleImage) | Out-Host
 
     Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=clipboard_image peer_id=$node1PeerId" -Seconds $TimeoutSeconds
     Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_image peer_id=$node2PeerId" -Seconds $TimeoutSeconds
@@ -391,7 +450,7 @@ try {
     Set-Content -Path $sampleFile -Value "smoke-file-payload" -NoNewline
 
     Write-Host "[smoke] sending file payload from node1 to node2"
-    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("transport", "send-file", $node1PeerId, $sampleFile) | Out-Host
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-file", $node1PeerId, $sampleFile) | Out-Host
 
     Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=file peer_id=$node1PeerId" -Seconds $TimeoutSeconds
     Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=file peer_id=$node2PeerId" -Seconds $TimeoutSeconds
@@ -401,7 +460,24 @@ try {
         throw "Expected incoming file was not materialized at $receivedPath"
     }
 
-    Write-Host "[smoke] success: peer connectivity and payload transfer validated"
+    Write-Host "[smoke] validating reconnect behavior and queued payload delivery"
+    Stop-DaemonProcess -Process $node2
+    Wait-ForPeerConnectionState -Endpoint $node1Endpoint -PeerId $node1PeerId -Connected $false -Seconds $TimeoutSeconds
+
+    $queuedClipboardText = "smoke-reconnect-queued-" + (Get-Date -Format "HHmmss")
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-text", $node1PeerId, $queuedClipboardText) | Out-Host
+
+    $node2 = Start-DaemonProcess -Bind $node2Bind -ApiTransport "tcp" -NetworkPort $node2Port -StdOutPath $node2Out -StdErrPath $node2Err -Environment $node2Env
+    Wait-ForDaemon -Endpoint $node2Endpoint -Seconds $TimeoutSeconds -Process $node2 -StdErrPath $node2Err
+    Wait-ForConnectedPeer -Endpoint $node1Endpoint -Seconds $TimeoutSeconds
+    Wait-ForConnectedPeer -Endpoint $node2Endpoint -Seconds $TimeoutSeconds
+    Wait-ForPeerConnectionState -Endpoint $node1Endpoint -PeerId $node1PeerId -Connected $true -Seconds $TimeoutSeconds
+    Wait-ForPeerConnectionState -Endpoint $node2Endpoint -PeerId $node2PeerId -Connected $true -Seconds $TimeoutSeconds
+    $escapedQueuedClipboardText = [regex]::Escape($queuedClipboardText)
+    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_text peer_id=$node2PeerId .*detail=$escapedQueuedClipboardText" -Seconds $TimeoutSeconds
+    Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
+
+    Write-Host "[smoke] success: connectivity, reconnect recovery, and payload transfer validated"
 }
 finally {
     if ($null -eq $originalCargoIncremental) {
@@ -413,7 +489,7 @@ finally {
 
     foreach ($proc in @($node1, $node2)) {
         if ($null -ne $proc -and -not $proc.HasExited) {
-            Stop-Process -Id $proc.Id -Force
+            Stop-DaemonProcess -Process $proc
         }
     }
 
