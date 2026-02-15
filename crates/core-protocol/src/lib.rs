@@ -7,7 +7,12 @@ use thiserror::Error;
 pub const PROTOCOL_NAME: &str = "boundless";
 pub const PROTOCOL_CURRENT: ProtocolVersion = ProtocolVersion {
     major: 1,
-    minor: 0,
+    minor: 1,
+    patch: 0,
+};
+pub const PROTOCOL_CLIPBOARD_IMAGE_MIN: ProtocolVersion = ProtocolVersion {
+    major: 1,
+    minor: 1,
     patch: 0,
 };
 

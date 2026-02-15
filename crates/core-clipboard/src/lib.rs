@@ -35,6 +35,28 @@ pub enum ClipboardPolicyError {
     ImageTooLarge { size: usize, limit: usize },
 }
 
+#[derive(Debug, Error)]
+pub enum BmpValidationError {
+    #[error("bmp payload is too small")]
+    TooSmall,
+    #[error("bmp payload must start with BM header")]
+    MissingSignature,
+    #[error("bmp payload declared file size is too small")]
+    DeclaredSizeTooSmall,
+    #[error("bmp payload is truncated relative to declared file size")]
+    TruncatedByDeclaredSize,
+    #[error("bmp payload has invalid pixel offset")]
+    InvalidPixelOffset,
+    #[error("bmp payload DIB header is too small")]
+    DibHeaderTooSmall,
+    #[error("bmp payload is truncated before full DIB header")]
+    TruncatedDibHeader,
+    #[error("bmp payload is truncated before declared pixel data")]
+    TruncatedPixelData,
+    #[error("bmp payload has no pixel data")]
+    MissingPixelData,
+}
+
 pub fn payload_hash_hex(payload: &ClipboardPayload) -> String {
     let mut hasher = Sha256::new();
     match payload {
@@ -83,6 +105,58 @@ pub fn validate_payload(
     Ok(())
 }
 
+pub fn validate_bmp_payload(bytes: &[u8]) -> Result<(), BmpValidationError> {
+    const BMP_FILE_HEADER_BYTES: usize = 14;
+    const BMP_INFO_HEADER_BYTES: usize = 40;
+    const BMP_MIN_BYTES: usize = BMP_FILE_HEADER_BYTES + BMP_INFO_HEADER_BYTES;
+
+    if bytes.len() < BMP_MIN_BYTES {
+        return Err(BmpValidationError::TooSmall);
+    }
+    if bytes[0] != b'B' || bytes[1] != b'M' {
+        return Err(BmpValidationError::MissingSignature);
+    }
+
+    let declared_file_size = read_u32_le(bytes, 2) as usize;
+    if declared_file_size < BMP_MIN_BYTES {
+        return Err(BmpValidationError::DeclaredSizeTooSmall);
+    }
+    if declared_file_size > bytes.len() {
+        return Err(BmpValidationError::TruncatedByDeclaredSize);
+    }
+
+    let pixel_offset = read_u32_le(bytes, 10) as usize;
+    if pixel_offset < BMP_FILE_HEADER_BYTES || pixel_offset >= bytes.len() {
+        return Err(BmpValidationError::InvalidPixelOffset);
+    }
+
+    let dib_header_size = read_u32_le(bytes, 14) as usize;
+    if dib_header_size < BMP_INFO_HEADER_BYTES {
+        return Err(BmpValidationError::DibHeaderTooSmall);
+    }
+    if BMP_FILE_HEADER_BYTES + dib_header_size > bytes.len() {
+        return Err(BmpValidationError::TruncatedDibHeader);
+    }
+
+    let declared_pixel_size = read_u32_le(bytes, 34) as usize;
+    let available_pixel_size = bytes.len().saturating_sub(pixel_offset);
+    if declared_pixel_size == 0 {
+        if available_pixel_size == 0 {
+            return Err(BmpValidationError::MissingPixelData);
+        }
+    } else if available_pixel_size < declared_pixel_size {
+        return Err(BmpValidationError::TruncatedPixelData);
+    }
+
+    Ok(())
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
+    let mut raw = [0u8; 4];
+    raw.copy_from_slice(&bytes[offset..offset + 4]);
+    u32::from_le_bytes(raw)
+}
+
 fn bytes_to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -94,6 +168,28 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_truncated_bmp() {
+        let payload = [
+            b'B', b'M', 58, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+            1, 0, 24, 0, 0, 0, 0, 0, 100, 0, 0, 0, 19, 11, 0, 0, 19, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 255, 0,
+        ];
+
+        let err = validate_bmp_payload(&payload).expect_err("must reject");
+        assert!(matches!(err, BmpValidationError::TruncatedPixelData));
+    }
+
+    #[test]
+    fn accepts_minimal_bmp() {
+        let payload = [
+            b'B', b'M', 58, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+            1, 0, 24, 0, 0, 0, 0, 0, 4, 0, 0, 0, 19, 11, 0, 0, 19, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 255, 0,
+        ];
+        validate_bmp_payload(&payload).expect("must accept");
+    }
 
     #[test]
     fn rejects_large_image() {

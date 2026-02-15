@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use core_clipboard::validate_bmp_payload as validate_bmp_bytes;
 use serde::{Deserialize, Serialize};
 use tonic::transport::{Channel, Endpoint};
 
@@ -727,14 +728,7 @@ fn is_pipe_busy_error(error: &io::Error) -> bool {
 }
 
 fn validate_bmp_payload(bytes: &[u8]) -> Result<()> {
-    const BMP_MIN_BYTES: usize = 14;
-    if bytes.len() < BMP_MIN_BYTES {
-        bail!("bmp payload is too small");
-    }
-    if bytes[0] != b'B' || bytes[1] != b'M' {
-        bail!("bmp payload must start with BM header");
-    }
-    Ok(())
+    validate_bmp_bytes(bytes).map_err(anyhow::Error::from)
 }
 
 #[cfg(test)]
@@ -766,16 +760,30 @@ mod tests {
         let err = validate_bmp_payload(&[0, 1, 2]).expect_err("must fail");
         assert!(err.to_string().contains("too small"));
 
-        let err = validate_bmp_payload(&[b'P', b'N', 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2])
-            .expect_err("must fail");
+        let mut invalid_signature = vec![0u8; 54];
+        invalid_signature[0] = b'P';
+        invalid_signature[1] = b'N';
+        let err = validate_bmp_payload(&invalid_signature).expect_err("must fail");
         assert!(err.to_string().contains("BM"));
     }
 
     #[test]
-    fn validate_bmp_payload_accepts_header() {
+    fn validate_bmp_payload_rejects_truncated_bitmap() {
         let payload = [
-            b'B', b'M', 0, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, // file header
-            40, 0, 0, 0, // minimal DIB header bytes start
+            b'B', b'M', 54, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+            1, 0, 24, 0, 0, 0, 0, 0, 100, 0, 0, 0, 19, 11, 0, 0, 19, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0,
+        ];
+        let err = validate_bmp_payload(&payload).expect_err("must fail");
+        assert!(err.to_string().contains("pixel"));
+    }
+
+    #[test]
+    fn validate_bmp_payload_accepts_minimal_bmp() {
+        let payload = [
+            b'B', b'M', 58, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+            1, 0, 24, 0, 0, 0, 0, 0, 4, 0, 0, 0, 19, 11, 0, 0, 19, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 255, 0,
         ];
         validate_bmp_payload(&payload).expect("must accept");
     }
