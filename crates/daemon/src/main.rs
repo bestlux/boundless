@@ -1,6 +1,7 @@
 mod clipboard;
 mod config;
 mod discovery;
+mod hotkeys;
 mod input;
 mod logging;
 mod network;
@@ -107,6 +108,7 @@ async fn main() -> Result<()> {
     clipboard::start(state.clone());
     discovery::start(state.clone());
     input::start(state.clone());
+    hotkeys::start(state.clone());
     network::start(state.clone(), transport_listener);
 
     let configured_api_transport = snapshot.api_transport;
