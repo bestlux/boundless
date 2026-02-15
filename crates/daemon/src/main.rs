@@ -1,4 +1,5 @@
 mod config;
+mod discovery;
 mod logging;
 mod network;
 mod services;
@@ -100,6 +101,7 @@ async fn main() -> Result<()> {
         diagnostics,
     } = ServiceBundle::new(state.clone());
 
+    discovery::start(state.clone());
     network::start(state.clone());
 
     let configured_api_transport = snapshot.api_transport;

@@ -199,6 +199,32 @@ function Start-DaemonProcess {
     return Start-Process -FilePath "cmd.exe" -ArgumentList @("/d", "/s", "/c", $commandLine) -PassThru -WindowStyle Hidden -RedirectStandardOutput $StdOutPath -RedirectStandardError $StdErrPath
 }
 
+function Remove-PathWithRetry {
+    param(
+        [string]$Path,
+        [int]$Attempts = 10,
+        [int]$DelayMs = 200
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            if (Test-Path $Path) {
+                Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
+            }
+            return $true
+        }
+        catch {
+            if ($attempt -eq $Attempts) {
+                Write-Warning "[smoke] failed to remove artifacts at ${Path}: $($_.Exception.Message)"
+                return $false
+            }
+            Start-Sleep -Milliseconds $DelayMs
+        }
+    }
+
+    return $false
+}
+
 try {
     $originalCargoIncremental = $env:CARGO_INCREMENTAL
     $env:CARGO_INCREMENTAL = "0"
@@ -304,7 +330,7 @@ finally {
     }
 
     if (-not $KeepArtifacts -and (Test-Path $runRoot)) {
-        Remove-Item -Path $runRoot -Recurse -Force
+        $null = Remove-PathWithRetry -Path $runRoot
     }
     elseif (Test-Path $runRoot) {
         Write-Host "[smoke] artifacts kept at: $runRoot"
