@@ -149,6 +149,41 @@ function Wait-ForTransportEvent {
     throw "Timed out waiting for transport event '$Pattern' at $Endpoint"
 }
 
+function Get-TransportEventMatchCount {
+    param(
+        [string]$Endpoint,
+        [string]$Pattern
+    )
+
+    $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs @("transport", "events", "--limit", "200")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to fetch transport events at ${Endpoint}: $output"
+    }
+
+    return ([regex]::Matches($output, $Pattern)).Count
+}
+
+function Wait-ForTransportEventCount {
+    param(
+        [string]$Endpoint,
+        [string]$Pattern,
+        [int]$ExpectedMinCount,
+        [int]$Seconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $count = Get-TransportEventMatchCount -Endpoint $Endpoint -Pattern $Pattern
+        if ($count -ge $ExpectedMinCount) {
+            return
+        }
+
+        Start-Sleep -Milliseconds 700
+    }
+
+    throw "Timed out waiting for transport event count >= $ExpectedMinCount for '$Pattern' at $Endpoint"
+}
+
 function Wait-ForInputOwner {
     param(
         [string]$Endpoint,
@@ -289,9 +324,12 @@ try {
     Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "send-move", $node1PeerId, "3", "2") | Out-Host
     Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId" -Seconds $TimeoutSeconds
     Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=input_frame peer_id=$node2PeerId" -Seconds $TimeoutSeconds
+
+    $outgoingInputFrameCountBeforeKey = Get-TransportEventMatchCount -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId"
+    $appliedInjectCountBeforeKey = Get-TransportEventMatchCount -Endpoint $node2Endpoint -Pattern "direction=local kind=input_inject_applied peer_id=$node2PeerId"
     Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "send-key", $node1PeerId, "30", "down") | Out-Host
-    Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId" -Seconds $TimeoutSeconds
-    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=local kind=input_inject_applied peer_id=$node2PeerId" -Seconds $TimeoutSeconds
+    Wait-ForTransportEventCount -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId" -ExpectedMinCount ($outgoingInputFrameCountBeforeKey + 1) -Seconds $TimeoutSeconds
+    Wait-ForTransportEventCount -Endpoint $node2Endpoint -Pattern "direction=local kind=input_inject_applied peer_id=$node2PeerId" -ExpectedMinCount ($appliedInjectCountBeforeKey + 1) -Seconds $TimeoutSeconds
     Invoke-Cli -Endpoint $node2Endpoint -CommandArgs @("input", "release", $node2PeerId) | Out-Host
     Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
 

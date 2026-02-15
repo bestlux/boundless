@@ -873,6 +873,24 @@ impl AppState {
         .await;
     }
 
+    pub async fn record_input_inject_skipped(
+        &self,
+        peer_id: &str,
+        sequence: u64,
+        event_count: usize,
+        reason: &str,
+    ) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: "input_inject_skipped".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("sequence={sequence} reason={reason}"),
+            size_bytes: event_count as u64,
+        })
+        .await;
+    }
+
     pub async fn route_incoming_input_frame(
         &self,
         peer_id: &str,
@@ -983,6 +1001,11 @@ impl AppState {
         }
 
         Ok(self.input_router.write().await.claim_owner(peer_id, force))
+    }
+
+    pub async fn input_injection_allowed_for_peer(&self, peer_id: &str) -> bool {
+        let router = self.input_router.read().await;
+        router.is_enabled() && router.owner() == Some(peer_id)
     }
 
     pub async fn release_input_owner(&self, peer_id: &str) -> bool {

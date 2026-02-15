@@ -125,6 +125,10 @@ impl InputRouter {
         self.owner_peer_id.as_deref()
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.input_enabled
+    }
+
     pub fn claim_owner(&mut self, peer_id: &str, force: bool) -> bool {
         if peer_id.trim().is_empty() {
             return false;
