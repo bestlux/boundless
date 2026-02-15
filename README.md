@@ -90,6 +90,9 @@ cargo run -p boundless-cli -- input release <peer_id>
 - Conventional Commits drive semver intent
 - `release-please` prepares version/tag releases
 - Tag pushes like `v1.2.3` trigger binary build + GitHub Release publishing
+- If `release-please` cannot open PRs with `GITHUB_TOKEN`, either:
+  - enable repository setting `Allow GitHub Actions to create and approve pull requests`, or
+  - add a `RELEASE_PLEASE_TOKEN` secret (PAT with `contents` + `pull_requests` write access)
 
 ## Notes
 
