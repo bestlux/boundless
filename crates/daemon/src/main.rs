@@ -42,6 +42,8 @@ async fn main() -> Result<()> {
     let state = AppState::load_or_create().context("load app state")?;
 
     if let Some(bind) = args.bind {
+        bind.parse::<std::net::SocketAddr>()
+            .with_context(|| format!("invalid --bind address {bind}"))?;
         state
             .update_bind(bind)
             .await

@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use tracing::info;
@@ -189,6 +189,8 @@ impl AppState {
     }
 
     pub async fn update_bind(&self, bind: String) -> Result<()> {
+        validate_bind_address(&bind)?;
+
         let mut config = self.config.write().await;
         config.api_bind = bind;
         save_config_at(&self.config_path, &config)
@@ -215,13 +217,15 @@ impl AppState {
         host: String,
         alias: Option<String>,
     ) -> Result<String> {
-        if code.trim().is_empty() {
-            anyhow::bail!("pairing code must not be empty");
+        let now = Utc::now();
+        {
+            let mut pairing_codes = self.pairing_codes.write().await;
+            validate_and_consume_pairing_code(&mut pairing_codes, &code, now)?;
+            pairing_codes.retain(|_, expires_at| *expires_at >= now);
         }
 
         let mut config = self.config.write().await;
         let peer_id = uuid::Uuid::new_v4().to_string();
-        let now = Utc::now();
 
         let peer = PeerConfig {
             peer_id: peer_id.clone(),
@@ -541,5 +545,118 @@ impl AppState {
 
         tokio::fs::write(&file_path, report).await?;
         Ok(file_path.display().to_string())
+    }
+}
+
+fn validate_bind_address(bind: &str) -> Result<()> {
+    bind.parse::<std::net::SocketAddr>()
+        .with_context(|| format!("invalid bind address {bind}"))?;
+    Ok(())
+}
+
+fn validate_and_consume_pairing_code(
+    pairing_codes: &mut HashMap<String, DateTime<Utc>>,
+    code: &str,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    if code.trim().is_empty() {
+        anyhow::bail!("pairing code must not be empty");
+    }
+
+    let Some(expires_at) = pairing_codes.remove(code) else {
+        anyhow::bail!("pairing code is invalid or was already used");
+    };
+
+    if expires_at < now {
+        anyhow::bail!("pairing code has expired");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    #[test]
+    fn validate_bind_address_rejects_invalid_input() {
+        let err = validate_bind_address("not-an-addr").expect_err("must fail");
+        assert!(err.to_string().contains("invalid bind address"));
+    }
+
+    #[test]
+    fn validate_bind_address_accepts_socket_addr() {
+        validate_bind_address("127.0.0.1:50051").expect("valid bind");
+    }
+
+    #[test]
+    fn pairing_code_validation_consumes_valid_code() {
+        let now = Utc::now();
+        let mut codes = HashMap::from([("ABC-123".to_string(), now + Duration::minutes(5))]);
+
+        validate_and_consume_pairing_code(&mut codes, "ABC-123", now).expect("must pass");
+        assert!(codes.is_empty(), "valid code should be consumed");
+    }
+
+    #[test]
+    fn pairing_code_validation_rejects_unknown_code() {
+        let now = Utc::now();
+        let mut codes = HashMap::new();
+
+        let err =
+            validate_and_consume_pairing_code(&mut codes, "MISSING", now).expect_err("must reject");
+        assert!(err.to_string().contains("invalid or was already used"));
+    }
+
+    #[test]
+    fn pairing_code_validation_rejects_and_consumes_expired_code() {
+        let now = Utc::now();
+        let mut codes = HashMap::from([("ABC-123".to_string(), now - Duration::minutes(1))]);
+
+        let err =
+            validate_and_consume_pairing_code(&mut codes, "ABC-123", now).expect_err("must reject");
+        assert!(err.to_string().contains("has expired"));
+        assert!(codes.is_empty(), "expired code should be consumed");
+    }
+
+    #[tokio::test]
+    async fn join_peer_requires_issued_code_and_consumes_it() {
+        let root =
+            std::env::temp_dir().join(format!("boundless-state-test-{}", uuid::Uuid::new_v4()));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let missing_err = state
+            .join_peer("missing".to_string(), "127.0.0.1:15100".to_string(), None)
+            .await
+            .expect_err("must reject unknown code");
+        assert!(
+            missing_err
+                .to_string()
+                .contains("invalid or was already used")
+        );
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(code.clone(), "127.0.0.1:15100".to_string(), None)
+            .await
+            .expect("issued code should join");
+        assert!(!peer_id.is_empty());
+
+        let reused_err = state
+            .join_peer(code, "127.0.0.1:15100".to_string(), None)
+            .await
+            .expect_err("reused code must fail");
+        assert!(
+            reused_err
+                .to_string()
+                .contains("invalid or was already used")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
