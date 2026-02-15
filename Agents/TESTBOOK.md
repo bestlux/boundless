@@ -25,6 +25,7 @@
 - Runtime input injection queue is active in daemon; on Windows, queued input events are applied via `SendInput`
 - Runtime input capture target control-plane is active in daemon; on Windows, low-level keyboard/mouse hooks (including wheel/hwheel) enqueue outbound input frames for the selected target peer (polling fallback retained)
 - Runtime input capture now supports layout-driven edge handoff (easy mouse + wrap mouse policy aware) when layout tokens resolve local + connected peer neighbors
+- Runtime hotkey loop is active on Windows and executes configured actions on combo press edge (`toggle_easy_mouse`, `reconnect`, `lock_machine`; `switch_all` reserved)
 - Run `scripts/dev/validate.ps1` for fmt/test/clippy plus smoke in one command
 
 ## Test cases
@@ -96,6 +97,12 @@
 - On Machine A: set capture target to one neighbor (`input capture-start <left-peer-id>`)
 - With `easy_mouse=on`, move cursor to the configured opposite edge and confirm capture target transitions to that edge neighbor (`input capture-target`)
 - Toggle `feature set easy_mouse off`, repeat edge movement, and confirm capture target no longer changes via edge movement
+
+12. Hotkey runtime behavior
+- On Machine A: set `hotkey toggle_easy_mouse Ctrl+Alt+Shift+E` and verify value persists after daemon restart
+- Press the configured combo once and verify `feature list` flips `easy_mouse` state exactly once per key press edge
+- On Machine A with connected peers: press configured reconnect combo (default `Ctrl+Alt+Shift+R`) and verify peers transition to reconnect cycle (`connected=false` then back to `connected=true`)
+- Validate lock-machine combo manually in a controlled session (it should invoke local workstation lock on Windows)
 
 ## Exit criteria for this stage
 

@@ -462,10 +462,49 @@ impl AppState {
         self.config.read().await.features.clone()
     }
 
+    pub async fn hotkey_map(&self) -> std::collections::BTreeMap<String, String> {
+        self.config.read().await.hotkeys.clone()
+    }
+
     pub async fn set_hotkey(&self, action: String, combo: String) -> Result<()> {
         let mut config = self.config.write().await;
         config.hotkeys.insert(action, combo);
         save_config_at(&self.config_path, &config)
+    }
+
+    pub async fn mark_all_peers_disconnected(&self) -> Result<usize> {
+        let mut config = self.config.write().await;
+        let mut disconnected_peer_ids = Vec::<String>::new();
+
+        for peer in &mut config.peers {
+            if !peer.connected {
+                continue;
+            }
+            peer.connected = false;
+            peer.last_seen = Utc::now();
+            disconnected_peer_ids.push(peer.peer_id.clone());
+        }
+
+        if !disconnected_peer_ids.is_empty() {
+            save_config_at(&self.config_path, &config)?;
+        }
+        drop(config);
+
+        if !disconnected_peer_ids.is_empty() {
+            let mut router = self.input_router.write().await;
+            for peer_id in &disconnected_peer_ids {
+                router.release_owner(peer_id);
+                router.clear_peer_state(peer_id);
+            }
+            drop(router);
+
+            for peer_id in &disconnected_peer_ids {
+                self.clear_pending_inject_input_frames_for_peer(peer_id)
+                    .await;
+            }
+        }
+
+        Ok(disconnected_peer_ids.len())
     }
 
     pub async fn queue_clipboard_text(&self, peer_id: &str, text: String) -> Result<()> {

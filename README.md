@@ -95,6 +95,14 @@ cargo run -p boundless-cli -- input claim <peer_id>
 cargo run -p boundless-cli -- input release <peer_id>
 ```
 
+Configure hotkeys (examples):
+
+```bash
+cargo run -p boundless-cli -- hotkey toggle_easy_mouse Ctrl+Alt+Shift+E
+cargo run -p boundless-cli -- hotkey reconnect Ctrl+Alt+Shift+R
+cargo run -p boundless-cli -- hotkey lock_machine Ctrl+Alt+Shift+L
+```
+
 Configure topology-driven edge handoff (tokens can be `self`/`local`/`me`, machine id, device name, or connected peer display names / peer id tokens):
 
 ```bash
@@ -112,4 +120,4 @@ cargo run -p boundless-cli -- layout set "left,self,right"
 
 ## Notes
 
-Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, real clipboard runtime sync for text and bitmap image payloads (watch/apply with echo suppression), queued file payload transfer primitives, and input routing groundwork (ownership control-plane + runtime capture target + synthetic input frame transport + runtime injection queue with pluggable backend). Windows runtime injection uses `SendInput`, and Windows capture now uses low-level keyboard/mouse hooks (with polling fallback) to drive outbound input frames, including wheel/hwheel events. Layout-driven edge handoff for capture target switching is now wired behind `easy_mouse`/`wrap_mouse` policy, with broader cross-platform capture still in progress. mDNS runtime discovery with manual address fallback is also in place.
+Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, real clipboard runtime sync for text and bitmap image payloads (watch/apply with echo suppression), queued file payload transfer primitives, and input routing groundwork (ownership control-plane + runtime capture target + synthetic input frame transport + runtime injection queue with pluggable backend). Windows runtime injection uses `SendInput`, and Windows capture now uses low-level keyboard/mouse hooks (with polling fallback) to drive outbound input frames, including wheel/hwheel events. Layout-driven edge handoff for capture target switching is now wired behind `easy_mouse`/`wrap_mouse` policy, and a Windows hotkey runtime executes configured `toggle_easy_mouse`, `reconnect`, and `lock_machine` actions on combo press edges. Broader cross-platform capture remains in progress. mDNS runtime discovery with manual address fallback is also in place.

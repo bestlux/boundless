@@ -37,8 +37,9 @@
 - [x] Upgraded Windows capture to low-level keyboard/mouse hooks with wheel + broader key coverage (polling fallback retained)
 - [x] Expanded two-node smoke harness with reconnect/disconnect assertions, queued-delivery checks, and stricter checked CLI helpers
 - [x] Implemented layout-driven edge switching semantics for capture target handoff (easy mouse + wrap mouse policy aware)
+- [x] Implemented core hotkey runtime actions (toggle easy mouse, reconnect, lock machine) with parser/edge-trigger engine and persistence-focused tests
 
 ## Next (priority order)
 
-- [ ] Implement core hotkey runtime actions (lock machine, reconnect, easy mouse toggle) with persistence assertions
 - [ ] Add explicit multi-machine edge-switch testbook flows on real displays
+- [ ] Implement `switch_all` hotkey semantics and integrate with capture ownership rules
