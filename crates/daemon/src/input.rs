@@ -215,6 +215,11 @@ async fn maybe_handoff_capture_target_from_edge(
     current_target: Option<&str>,
     edge_switch_state: &mut EdgeSwitchState,
 ) {
+    let Some(current_target) = current_target else {
+        edge_switch_state.last_direction = None;
+        return;
+    };
+
     let Some(sample) = backend.edge_switch_sample() else {
         edge_switch_state.last_direction = None;
         return;
@@ -244,7 +249,7 @@ async fn maybe_handoff_capture_target_from_edge(
     let Some(next_target) = state.capture_handoff_target_for_direction(direction).await else {
         return;
     };
-    if current_target == Some(next_target.as_str()) {
+    if current_target == next_target.as_str() {
         return;
     }
 
@@ -1689,6 +1694,60 @@ mod tests {
             state.input_capture_target().await.as_deref(),
             Some(left_peer.as_str()),
             "edge handoff must not run when easy_mouse is disabled"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn edge_switch_handoff_does_not_start_capture_when_inactive() {
+        let (state, left_peer, root) = state_with_peer_for_input_test().await;
+        let (code, _) = state.create_pairing_code(120).await;
+        let right_peer = state
+            .join_peer(
+                code,
+                "127.0.0.1:15101".to_string(),
+                Some("right".to_string()),
+            )
+            .await
+            .expect("join right peer");
+
+        state
+            .set_peer_connected(&left_peer, true)
+            .await
+            .expect("connect left");
+        state
+            .set_peer_connected(&right_peer, true)
+            .await
+            .expect("connect right");
+        state
+            .set_layout("left,self,right".to_string())
+            .await
+            .expect("set layout");
+        state.clear_input_capture_target().await;
+
+        let mut backend = ScriptedCaptureBackend::new(vec![Vec::new()], Vec::new())
+            .with_edge_samples(vec![Some(EdgeSwitchSample {
+                x: 1919,
+                y: 50,
+                width: 1920,
+                height: 1080,
+                modifier_held: false,
+            })]);
+        let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
+
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+
+        assert!(
+            state.input_capture_target().await.is_none(),
+            "edge handoff must not implicitly start capture when no target is active"
         );
 
         let _ = std::fs::remove_dir_all(root);
