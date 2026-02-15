@@ -11,9 +11,11 @@ use anyhow::Result;
 #[cfg(windows)]
 use anyhow::{Context, bail};
 use tokio::time;
-use tracing::warn;
+use tracing::{info, warn};
 
-use core_input::{InputEvent, MAX_EVENTS_PER_FRAME};
+use core_input::{
+    EdgeSwitchRequest, InputEvent, MAX_EVENTS_PER_FRAME, SwitchDirection, should_switch,
+};
 
 use crate::state::{AppState, PendingInjectInputFrame};
 
@@ -31,18 +33,33 @@ use windows_sys::Win32::{
             SendInput,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, HC_ACTION, HHOOK,
-            KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PostThreadMessageW, SetWindowsHookExW,
-            TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
-            WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
-            WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
+            CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics,
+            HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
+            SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+            SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+            WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+            WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+            WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
         },
     },
 };
 
 const INPUT_TICK: Duration = Duration::from_millis(5);
 const INPUT_CAPTURE_TICK: Duration = Duration::from_millis(8);
+
+#[derive(Debug, Clone, Copy)]
+struct EdgeSwitchSample {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    modifier_held: bool,
+}
+
+#[derive(Debug, Default)]
+struct EdgeSwitchState {
+    last_direction: Option<SwitchDirection>,
+}
 
 pub fn start(state: AppState) {
     tokio::spawn(async move {
@@ -58,6 +75,7 @@ async fn run(state: AppState) -> Result<()> {
     let mut inject_ticker = time::interval(INPUT_TICK);
     let mut capture_ticker = time::interval(INPUT_CAPTURE_TICK);
     let mut last_capture_target: Option<String> = None;
+    let mut edge_switch_state = EdgeSwitchState::default();
 
     loop {
         tokio::select! {
@@ -69,6 +87,7 @@ async fn run(state: AppState) -> Result<()> {
                     &state,
                     capture_backend.as_mut(),
                     &mut last_capture_target,
+                    &mut edge_switch_state,
                 )
                 .await;
             }
@@ -124,7 +143,17 @@ async fn capture_and_queue_outgoing_frames(
     state: &AppState,
     backend: &mut dyn InputCaptureBackend,
     last_capture_target: &mut Option<String>,
+    edge_switch_state: &mut EdgeSwitchState,
 ) {
+    let current_target = state.active_input_capture_target().await;
+    maybe_handoff_capture_target_from_edge(
+        state,
+        backend,
+        current_target.as_deref(),
+        edge_switch_state,
+    )
+    .await;
+
     let capture_target = state.active_input_capture_target().await;
     if &capture_target != last_capture_target {
         if let Some(previous_target) = last_capture_target.as_deref() {
@@ -180,6 +209,67 @@ async fn capture_and_queue_outgoing_frames(
     }
 }
 
+async fn maybe_handoff_capture_target_from_edge(
+    state: &AppState,
+    backend: &mut dyn InputCaptureBackend,
+    current_target: Option<&str>,
+    edge_switch_state: &mut EdgeSwitchState,
+) {
+    let Some(sample) = backend.edge_switch_sample() else {
+        edge_switch_state.last_direction = None;
+        return;
+    };
+
+    let (mode, wrap_mouse) = state.edge_switch_policy().await;
+    let direction = should_switch(EdgeSwitchRequest {
+        x: sample.x,
+        y: sample.y,
+        width: sample.width,
+        height: sample.height,
+        wrap_mouse,
+        mode,
+        modifier_held: sample.modifier_held,
+    });
+
+    let Some(direction) = direction else {
+        edge_switch_state.last_direction = None;
+        return;
+    };
+
+    if edge_switch_state.last_direction == Some(direction) {
+        return;
+    }
+    edge_switch_state.last_direction = Some(direction);
+
+    let Some(next_target) = state.capture_handoff_target_for_direction(direction).await else {
+        return;
+    };
+    if current_target == Some(next_target.as_str()) {
+        return;
+    }
+
+    match state.set_input_capture_target(Some(&next_target)).await {
+        Ok(Some(peer_id)) => {
+            info!(
+                direction = ?direction,
+                previous_target = ?current_target,
+                next_target = %peer_id,
+                "edge switch capture handoff applied"
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!(
+                direction = ?direction,
+                previous_target = ?current_target,
+                next_target = %next_target,
+                error = ?error,
+                "failed to apply edge switch capture handoff"
+            );
+        }
+    }
+}
+
 trait InputBackend: Send {
     fn apply(&mut self, event: &InputEvent) -> Result<()>;
 }
@@ -188,6 +278,7 @@ trait InputCaptureBackend: Send {
     fn drain_release_events(&mut self) -> Vec<InputEvent>;
     fn reset(&mut self);
     fn poll_events(&mut self) -> Result<Vec<InputEvent>>;
+    fn edge_switch_sample(&mut self) -> Option<EdgeSwitchSample>;
 }
 
 fn input_backend() -> Box<dyn InputBackend> {
@@ -246,6 +337,10 @@ impl InputCaptureBackend for NoopCaptureBackend {
 
     fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
         Ok(Vec::new())
+    }
+
+    fn edge_switch_sample(&mut self) -> Option<EdgeSwitchSample> {
+        None
     }
 }
 
@@ -362,6 +457,10 @@ impl InputCaptureBackend for WindowsPollingCaptureBackend {
         }
 
         Ok(events)
+    }
+
+    fn edge_switch_sample(&mut self) -> Option<EdgeSwitchSample> {
+        edge_switch_sample_from_system()
     }
 }
 
@@ -547,6 +646,10 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
 
         Ok(output)
     }
+
+    fn edge_switch_sample(&mut self) -> Option<EdgeSwitchSample> {
+        edge_switch_sample_from_system()
+    }
 }
 
 #[cfg(windows)]
@@ -559,6 +662,10 @@ const VK_MBUTTON_CODE: u16 = 0x04;
 const VK_XBUTTON1_CODE: u16 = 0x05;
 #[cfg(windows)]
 const VK_XBUTTON2_CODE: u16 = 0x06;
+#[cfg(windows)]
+const VK_SHIFT_CODE: u16 = 0x10;
+#[cfg(windows)]
+const VK_CONTROL_CODE: u16 = 0x11;
 #[cfg(windows)]
 const XBUTTON1_DATA: u16 = 0x0001;
 #[cfg(windows)]
@@ -858,6 +965,27 @@ fn cursor_position() -> Result<Option<(i32, i32)>> {
 }
 
 #[cfg(windows)]
+fn edge_switch_sample_from_system() -> Option<EdgeSwitchSample> {
+    let (cursor_x, cursor_y) = cursor_position().ok().flatten()?;
+
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    Some(EdgeSwitchSample {
+        x: cursor_x - left,
+        y: cursor_y - top,
+        width,
+        height,
+        modifier_held: is_virtual_key_down(VK_CONTROL_CODE) || is_virtual_key_down(VK_SHIFT_CODE),
+    })
+}
+
+#[cfg(windows)]
 fn is_virtual_key_down(vk: u16) -> bool {
     let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
     (state as u16 & 0x8000) != 0
@@ -1063,6 +1191,7 @@ mod tests {
     struct ScriptedCaptureBackend {
         batches: VecDeque<Vec<InputEvent>>,
         release_events: Vec<InputEvent>,
+        edge_samples: VecDeque<Option<EdgeSwitchSample>>,
         reset_count: usize,
         poll_count: usize,
     }
@@ -1072,9 +1201,15 @@ mod tests {
             Self {
                 batches: VecDeque::from(batches),
                 release_events,
+                edge_samples: VecDeque::new(),
                 reset_count: 0,
                 poll_count: 0,
             }
+        }
+
+        fn with_edge_samples(mut self, samples: Vec<Option<EdgeSwitchSample>>) -> Self {
+            self.edge_samples = VecDeque::from(samples);
+            self
         }
     }
 
@@ -1090,6 +1225,10 @@ mod tests {
         fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
             self.poll_count += 1;
             Ok(self.batches.pop_front().unwrap_or_default())
+        }
+
+        fn edge_switch_sample(&mut self) -> Option<EdgeSwitchSample> {
+            self.edge_samples.pop_front().flatten()
         }
     }
 
@@ -1177,8 +1316,15 @@ mod tests {
         let events = vec![InputEvent::MouseMove { dx: 1, dy: 1 }; MAX_EVENTS_PER_FRAME + 1];
         let mut backend = ScriptedCaptureBackend::new(vec![events], Vec::new());
         let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
 
-        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
         let queued = state.drain_outgoing(&peer_id).await;
         assert_eq!(queued.len(), 2);
         assert!(matches!(
@@ -1207,7 +1353,14 @@ mod tests {
 
         let mut backend = ScriptedCaptureBackend::new(vec![Vec::new(), Vec::new()], Vec::new());
         let mut last_target = None;
-        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+        let mut edge_switch_state = EdgeSwitchState::default();
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
         let reset_after_set = backend.reset_count;
         assert!(
             reset_after_set >= 1,
@@ -1215,7 +1368,13 @@ mod tests {
         );
 
         state.clear_input_capture_target().await;
-        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
         assert!(
             backend.reset_count > reset_after_set,
             "clearing target should reset capture backend"
@@ -1232,8 +1391,15 @@ mod tests {
             Vec::new(),
         );
         let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
 
-        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
 
         assert_eq!(
             backend.poll_count, 1,
@@ -1287,13 +1453,26 @@ mod tests {
             ],
         );
         let mut last_target = None;
-        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+        let mut edge_switch_state = EdgeSwitchState::default();
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
 
         state
             .set_input_capture_target(Some(&peer_two))
             .await
             .expect("switch target");
-        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
 
         let previous_outgoing = state.drain_outgoing(&peer_one).await;
         assert_eq!(previous_outgoing.len(), 1);
@@ -1329,10 +1508,23 @@ mod tests {
             }],
         );
         let mut last_target = None;
-        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+        let mut edge_switch_state = EdgeSwitchState::default();
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
 
         state.clear_input_capture_target().await;
-        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
 
         let outgoing = state.drain_outgoing(&peer_id).await;
         assert_eq!(outgoing.len(), 1);
@@ -1343,6 +1535,161 @@ mod tests {
                 [InputEvent::Key { scan_code: 42, state: KeyState::Up }]
             )
         ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn edge_switch_handoff_updates_capture_target_from_layout() {
+        let (state, left_peer, root) = state_with_peer_for_input_test().await;
+        let (code, _) = state.create_pairing_code(120).await;
+        let right_peer = state
+            .join_peer(
+                code,
+                "127.0.0.1:15101".to_string(),
+                Some("right".to_string()),
+            )
+            .await
+            .expect("join right peer");
+
+        state
+            .set_peer_connected(&left_peer, true)
+            .await
+            .expect("connect left");
+        state
+            .set_peer_connected(&right_peer, true)
+            .await
+            .expect("connect right");
+        state
+            .set_layout("peer,self,right".to_string())
+            .await
+            .expect("set layout");
+        state
+            .set_input_capture_target(Some(&left_peer))
+            .await
+            .expect("set initial target");
+
+        let mut backend = ScriptedCaptureBackend::new(
+            vec![Vec::new(), Vec::new()],
+            vec![InputEvent::Key {
+                scan_code: 30,
+                state: KeyState::Up,
+            }],
+        )
+        .with_edge_samples(vec![
+            None,
+            Some(EdgeSwitchSample {
+                x: 1919,
+                y: 50,
+                width: 1920,
+                height: 1080,
+                modifier_held: false,
+            }),
+        ]);
+        let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
+
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+
+        assert_eq!(
+            state.input_capture_target().await.as_deref(),
+            Some(right_peer.as_str()),
+            "right-edge switch should hand off capture target to right layout neighbor"
+        );
+        let left_outgoing = state.drain_outgoing(&left_peer).await;
+        assert_eq!(left_outgoing.len(), 1);
+        assert!(matches!(
+            left_outgoing.first(),
+            Some(crate::state::OutboundPayload::InputFrame { sequence: 1, events, .. }) if matches!(
+                events.as_slice(),
+                [InputEvent::Key { scan_code: 30, state: KeyState::Up }]
+            )
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn edge_switch_handoff_respects_easy_mouse_toggle() {
+        let (state, left_peer, root) = state_with_peer_for_input_test().await;
+        let (code, _) = state.create_pairing_code(120).await;
+        let right_peer = state
+            .join_peer(
+                code,
+                "127.0.0.1:15101".to_string(),
+                Some("right".to_string()),
+            )
+            .await
+            .expect("join right peer");
+
+        state
+            .set_peer_connected(&left_peer, true)
+            .await
+            .expect("connect left");
+        state
+            .set_peer_connected(&right_peer, true)
+            .await
+            .expect("connect right");
+        state
+            .set_layout("peer,self,right".to_string())
+            .await
+            .expect("set layout");
+        state
+            .set_input_capture_target(Some(&left_peer))
+            .await
+            .expect("set initial target");
+        state
+            .set_feature("easy_mouse".to_string(), false)
+            .await
+            .expect("disable easy mouse");
+
+        let mut backend = ScriptedCaptureBackend::new(vec![Vec::new(), Vec::new()], Vec::new())
+            .with_edge_samples(vec![
+                None,
+                Some(EdgeSwitchSample {
+                    x: 1919,
+                    y: 50,
+                    width: 1920,
+                    height: 1080,
+                    modifier_held: false,
+                }),
+            ]);
+        let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
+
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+
+        assert_eq!(
+            state.input_capture_target().await.as_deref(),
+            Some(left_peer.as_str()),
+            "edge handoff must not run when easy_mouse is disabled"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -18,7 +18,8 @@ use core_clipboard::{
 };
 use core_discovery::parse_manual_target;
 use core_input::{
-    InputEvent, InputFrame, InputRouter, InputSink, KeyState, MAX_EVENTS_PER_FRAME, RouteDecision,
+    EasyMouseMode, InputEvent, InputFrame, InputRouter, InputSink, KeyState, MAX_EVENTS_PER_FRAME,
+    RouteDecision, SwitchDirection,
 };
 use core_security::{
     DeviceIdentity, SecurityPaths, TrustBundle, TrustRecord, default_security_root,
@@ -418,6 +419,29 @@ impl AppState {
         let mut config = self.config.write().await;
         config.layout_matrix = matrix;
         save_config_at(&self.config_path, &config)
+    }
+
+    pub async fn edge_switch_policy(&self) -> (EasyMouseMode, bool) {
+        let config = self.config.read().await;
+        let share_input_enabled = config.features.get("share_input").copied().unwrap_or(true);
+        let easy_mouse_enabled = config.features.get("easy_mouse").copied().unwrap_or(true);
+        let wrap_mouse = config.features.get("wrap_mouse").copied().unwrap_or(true);
+
+        let mode = if share_input_enabled && easy_mouse_enabled {
+            EasyMouseMode::Enable
+        } else {
+            EasyMouseMode::Disable
+        };
+
+        (mode, wrap_mouse)
+    }
+
+    pub async fn capture_handoff_target_for_direction(
+        &self,
+        direction: SwitchDirection,
+    ) -> Option<String> {
+        let config = self.config.read().await;
+        resolve_capture_handoff_target(&config, direction)
     }
 
     pub async fn set_feature(&self, name: String, enabled: bool) -> Result<()> {
@@ -1278,6 +1302,154 @@ fn describe_route_decision(decision: &RouteDecision) -> String {
     }
 }
 
+fn resolve_capture_handoff_target(
+    config: &RuntimeConfig,
+    direction: SwitchDirection,
+) -> Option<String> {
+    let matrix = parse_layout_matrix(&config.layout_matrix);
+    let mut local_cell: Option<(usize, usize)> = None;
+
+    for (row_index, row) in matrix.iter().enumerate() {
+        for (column_index, token) in row.iter().enumerate() {
+            if !is_local_layout_token(token, config) {
+                continue;
+            }
+
+            if local_cell.is_some() {
+                return None;
+            }
+            local_cell = Some((row_index, column_index));
+        }
+    }
+
+    let (row, column) = local_cell?;
+
+    let token_at = |row_index: usize, column_index: usize| -> Option<String> {
+        matrix
+            .get(row_index)
+            .and_then(|row_tokens| row_tokens.get(column_index))
+            .cloned()
+    };
+
+    match direction {
+        SwitchDirection::Left => {
+            for next_column in (0..column).rev() {
+                let Some(token) = token_at(row, next_column) else {
+                    continue;
+                };
+                if is_local_layout_token(&token, config) {
+                    continue;
+                }
+                if let Some(peer_id) = resolve_peer_layout_token(&token, &config.peers) {
+                    return Some(peer_id);
+                }
+            }
+            None
+        }
+        SwitchDirection::Right => {
+            let row_width = matrix
+                .get(row)
+                .map(|row_tokens| row_tokens.len())
+                .unwrap_or(0);
+            for next_column in (column + 1)..row_width {
+                let Some(token) = token_at(row, next_column) else {
+                    continue;
+                };
+                if is_local_layout_token(&token, config) {
+                    continue;
+                }
+                if let Some(peer_id) = resolve_peer_layout_token(&token, &config.peers) {
+                    return Some(peer_id);
+                }
+            }
+            None
+        }
+        SwitchDirection::Up => {
+            for next_row in (0..row).rev() {
+                let Some(token) = token_at(next_row, column) else {
+                    continue;
+                };
+                if is_local_layout_token(&token, config) {
+                    continue;
+                }
+                if let Some(peer_id) = resolve_peer_layout_token(&token, &config.peers) {
+                    return Some(peer_id);
+                }
+            }
+            None
+        }
+        SwitchDirection::Down => {
+            for next_row in (row + 1)..matrix.len() {
+                let Some(token) = token_at(next_row, column) else {
+                    continue;
+                };
+                if is_local_layout_token(&token, config) {
+                    continue;
+                }
+                if let Some(peer_id) = resolve_peer_layout_token(&token, &config.peers) {
+                    return Some(peer_id);
+                }
+            }
+            None
+        }
+    }
+}
+
+fn parse_layout_matrix(spec: &str) -> Vec<Vec<String>> {
+    spec.split(';')
+        .map(|row| {
+            row.split(',')
+                .map(|token| token.trim().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+fn is_local_layout_token(token: &str, config: &RuntimeConfig) -> bool {
+    let token = token.trim();
+    if token.is_empty() {
+        return false;
+    }
+
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "self" | "local" | "this" | "me"
+    ) || token.eq_ignore_ascii_case(&config.machine_id)
+        || token.eq_ignore_ascii_case(&config.device_name)
+}
+
+fn resolve_peer_layout_token(token: &str, peers: &[PeerConfig]) -> Option<String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+
+    let token_lower = token.to_ascii_lowercase();
+    let mut matched_peer_ids = Vec::<String>::new();
+
+    for peer in peers.iter().filter(|peer| peer.connected) {
+        let peer_id_match = peer.peer_id.eq_ignore_ascii_case(token);
+        let display_name_match = peer.display_name.eq_ignore_ascii_case(token);
+        let peer_id_prefix_match = peer.peer_id.to_ascii_lowercase().starts_with(&token_lower);
+        if !(peer_id_match || display_name_match || peer_id_prefix_match) {
+            continue;
+        }
+
+        if !matched_peer_ids
+            .iter()
+            .any(|peer_id| peer_id == &peer.peer_id)
+        {
+            matched_peer_ids.push(peer.peer_id.clone());
+        }
+    }
+
+    if matched_peer_ids.len() == 1 {
+        matched_peer_ids.pop()
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1289,6 +1461,91 @@ mod tests {
             1, 0, 24, 0, 0, 0, 0, 0, 4, 0, 0, 0, 19, 11, 0, 0, 19, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, red, 0,
         ]
+    }
+
+    #[test]
+    fn resolve_capture_handoff_target_uses_layout_neighbors() {
+        let config = RuntimeConfig {
+            machine_id: "local-id".to_string(),
+            device_name: "local-device".to_string(),
+            layout_matrix: ",up,;left,self,right;,down,".to_string(),
+            peers: vec![
+                PeerConfig {
+                    peer_id: "peer-left".to_string(),
+                    display_name: "left".to_string(),
+                    address: "127.0.0.1:15100".to_string(),
+                    connected: true,
+                    last_seen: Utc::now(),
+                },
+                PeerConfig {
+                    peer_id: "peer-right".to_string(),
+                    display_name: "right".to_string(),
+                    address: "127.0.0.1:15101".to_string(),
+                    connected: true,
+                    last_seen: Utc::now(),
+                },
+                PeerConfig {
+                    peer_id: "peer-up".to_string(),
+                    display_name: "up".to_string(),
+                    address: "127.0.0.1:15102".to_string(),
+                    connected: true,
+                    last_seen: Utc::now(),
+                },
+                PeerConfig {
+                    peer_id: "peer-down".to_string(),
+                    display_name: "down".to_string(),
+                    address: "127.0.0.1:15103".to_string(),
+                    connected: true,
+                    last_seen: Utc::now(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_capture_handoff_target(&config, SwitchDirection::Left).as_deref(),
+            Some("peer-left")
+        );
+        assert_eq!(
+            resolve_capture_handoff_target(&config, SwitchDirection::Right).as_deref(),
+            Some("peer-right")
+        );
+        assert_eq!(
+            resolve_capture_handoff_target(&config, SwitchDirection::Up).as_deref(),
+            Some("peer-up")
+        );
+        assert_eq!(
+            resolve_capture_handoff_target(&config, SwitchDirection::Down).as_deref(),
+            Some("peer-down")
+        );
+    }
+
+    #[test]
+    fn resolve_capture_handoff_target_ignores_disconnected_and_requires_single_local_cell() {
+        let mut config = RuntimeConfig {
+            machine_id: "local-id".to_string(),
+            device_name: "local-device".to_string(),
+            layout_matrix: "local,right".to_string(),
+            peers: vec![PeerConfig {
+                peer_id: "peer-right".to_string(),
+                display_name: "right".to_string(),
+                address: "127.0.0.1:15101".to_string(),
+                connected: false,
+                last_seen: Utc::now(),
+            }],
+            ..Default::default()
+        };
+        assert!(
+            resolve_capture_handoff_target(&config, SwitchDirection::Right).is_none(),
+            "disconnected neighbors should not be selected"
+        );
+
+        config.peers[0].connected = true;
+        config.layout_matrix = "self,right;local,right".to_string();
+        assert!(
+            resolve_capture_handoff_target(&config, SwitchDirection::Right).is_none(),
+            "multiple local cells should invalidate edge handoff resolution"
+        );
     }
 
     #[test]

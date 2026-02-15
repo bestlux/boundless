@@ -24,6 +24,7 @@
 - Runtime clipboard image sync is active in daemon for BMP payloads; diagnostics `transport send-image <peer_id> <path.bmp>` is available as an explicit test hook
 - Runtime input injection queue is active in daemon; on Windows, queued input events are applied via `SendInput`
 - Runtime input capture target control-plane is active in daemon; on Windows, low-level keyboard/mouse hooks (including wheel/hwheel) enqueue outbound input frames for the selected target peer (polling fallback retained)
+- Runtime input capture now supports layout-driven edge handoff (easy mouse + wrap mouse policy aware) when layout tokens resolve local + connected peer neighbors
 - Run `scripts/dev/validate.ps1` for fmt/test/clippy plus smoke in one command
 
 ## Test cases
@@ -89,6 +90,12 @@
 - Verify both sides return to `connected=true`
 - On Machine B: verify incoming `kind=clipboard_text` event includes the queued text token after reconnect
 - On Machine B: verify `input owner` is `none` after reconnect
+
+11. Edge handoff behavior
+- On Machine A: set layout using local token plus peer display names, for example `layout set "left,self,right"` (or machine id/device name token for local cell)
+- On Machine A: set capture target to one neighbor (`input capture-start <left-peer-id>`)
+- With `easy_mouse=on`, move cursor to the configured opposite edge and confirm capture target transitions to that edge neighbor (`input capture-target`)
+- Toggle `feature set easy_mouse off`, repeat edge movement, and confirm capture target no longer changes via edge movement
 
 ## Exit criteria for this stage
 
