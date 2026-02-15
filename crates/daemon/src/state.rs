@@ -279,7 +279,9 @@ impl AppState {
         let removed = before != config.peers.len();
         if removed {
             save_config_at(&self.config_path, &config)?;
-            self.input_router.write().await.release_owner(peer_id);
+            let mut router = self.input_router.write().await;
+            router.release_owner(peer_id);
+            router.clear_peer_state(peer_id);
             self.input_sequence_by_peer.write().await.remove(peer_id);
         }
         Ok(removed)
@@ -300,7 +302,9 @@ impl AppState {
         }
 
         if !connected {
-            self.input_router.write().await.release_owner(peer_id);
+            let mut router = self.input_router.write().await;
+            router.release_owner(peer_id);
+            router.clear_peer_state(peer_id);
         }
 
         Ok(())
@@ -932,6 +936,76 @@ mod tests {
 
         let escaped_path = root.join("evil.txt");
         assert!(!escaped_path.exists(), "unsafe path must never be created");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn disconnect_clears_inbound_sequence_state_for_reconnect() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-reconnect-seq-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim")
+        );
+        let first = state
+            .route_incoming_input_frame(
+                &peer_id,
+                InputFrame {
+                    source_peer_id: peer_id.clone(),
+                    sequence: 1,
+                    timestamp_unix_ms: 1,
+                    events: vec![InputEvent::MouseMove { dx: 1, dy: 1 }],
+                },
+            )
+            .await
+            .expect("first route");
+        assert!(matches!(first, RouteDecision::Applied { .. }));
+
+        state
+            .set_peer_connected(&peer_id, false)
+            .await
+            .expect("disconnect");
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("re-claim")
+        );
+
+        let second = state
+            .route_incoming_input_frame(
+                &peer_id,
+                InputFrame {
+                    source_peer_id: peer_id.clone(),
+                    sequence: 1,
+                    timestamp_unix_ms: 2,
+                    events: vec![InputEvent::MouseMove { dx: 2, dy: 2 }],
+                },
+            )
+            .await
+            .expect("sequence should restart after disconnect");
+        assert!(matches!(second, RouteDecision::Applied { .. }));
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -153,6 +153,10 @@ impl InputRouter {
         false
     }
 
+    pub fn clear_peer_state(&mut self, peer_id: &str) {
+        self.last_sequence_by_peer.remove(peer_id);
+    }
+
     pub fn validate_frame(&self, frame: &InputFrame) -> Result<(), InputFrameError> {
         if frame.source_peer_id.trim().is_empty() {
             return Err(InputFrameError::EmptyPeer);
@@ -397,5 +401,23 @@ mod tests {
             .route_frame(&sample_frame("peer-a", 2), &mut sink)
             .expect_err("must fail");
         assert!(matches!(err, InputRouteError::SinkFailure { index: 1, .. }));
+    }
+
+    #[test]
+    fn clear_peer_state_allows_sequence_restart() {
+        let mut router = InputRouter::new(true);
+        assert!(router.claim_owner("peer-a", false));
+        let mut sink = MemorySink::default();
+
+        router
+            .route_frame(&sample_frame("peer-a", 10), &mut sink)
+            .expect("first frame");
+
+        router.clear_peer_state("peer-a");
+
+        let decision = router
+            .route_frame(&sample_frame("peer-a", 1), &mut sink)
+            .expect("sequence restart should pass after clear");
+        assert_eq!(decision, RouteDecision::Applied { event_count: 2 });
     }
 }
