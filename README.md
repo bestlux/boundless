@@ -81,6 +81,7 @@ Manage input ownership control-plane:
 
 ```bash
 cargo run -p boundless-cli -- input owner
+cargo run -p boundless-cli -- input send-move <peer_id> 3 2
 cargo run -p boundless-cli -- input claim <peer_id>
 cargo run -p boundless-cli -- input release <peer_id>
 ```
@@ -96,4 +97,4 @@ cargo run -p boundless-cli -- input release <peer_id>
 
 ## Notes
 
-Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, queued clipboard/file payload transfer primitives, and an input ownership control-plane. Windows input injection, OS clipboard integration, and mDNS runtime discovery are upcoming slices.
+Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, queued clipboard/file payload transfer primitives, and input routing groundwork (ownership control-plane + synthetic input frame transport routed through a no-op sink). Windows input injection, OS clipboard integration, and mDNS runtime discovery are upcoming slices.

@@ -251,6 +251,15 @@ try {
     Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "release", $node1PeerId) | Out-Host
     Wait-ForInputOwner -Endpoint $node1Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
 
+    Write-Host "[smoke] sending synthetic input frame from node1 to node2"
+    Invoke-Cli -Endpoint $node2Endpoint -CommandArgs @("input", "claim", $node2PeerId) | Out-Host
+    Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner $node2PeerId -Seconds $TimeoutSeconds
+    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "send-move", $node1PeerId, "3", "2") | Out-Host
+    Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId" -Seconds $TimeoutSeconds
+    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=input_frame peer_id=$node2PeerId" -Seconds $TimeoutSeconds
+    Invoke-Cli -Endpoint $node2Endpoint -CommandArgs @("input", "release", $node2PeerId) | Out-Host
+    Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
+
     $clipboardText = "smoke-clipboard-" + (Get-Date -Format "HHmmss")
     Write-Host "[smoke] sending clipboard payload from node1 to node2"
     Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("transport", "send-text", $node1PeerId, $clipboardText) | Out-Host
