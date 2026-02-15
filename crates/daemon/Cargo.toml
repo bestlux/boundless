@@ -32,3 +32,6 @@ core-protocol = { path = "../core-protocol" }
 core-security = { path = "../core-security" }
 core-transfer = { path = "../core-transfer" }
 ipc-api = { path = "../ipc-api" }
+
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4.1"

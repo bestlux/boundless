@@ -1,3 +1,4 @@
+mod clipboard;
 mod config;
 mod discovery;
 mod logging;
@@ -101,6 +102,7 @@ async fn main() -> Result<()> {
         diagnostics,
     } = ServiceBundle::new(state.clone());
 
+    clipboard::start(state.clone());
     discovery::start(state.clone());
     network::start(state.clone());
 
