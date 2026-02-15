@@ -154,6 +154,30 @@ function Wait-ForTransportEvent {
     throw "Timed out waiting for transport event '$Pattern' at $Endpoint"
 }
 
+function Wait-ForInputOwner {
+    param(
+        [string]$Endpoint,
+        [string]$ExpectedOwner,
+        [int]$Seconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs @("input", "owner")
+        if ($LASTEXITCODE -eq 0) {
+            if ($ExpectedOwner -eq "none" -and $output -match "owner=none") {
+                return
+            }
+            if ($ExpectedOwner -ne "none" -and $output -match "owner=$ExpectedOwner") {
+                return
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Timed out waiting for input owner '$ExpectedOwner' at $Endpoint"
+}
+
 try {
     Write-Host "[smoke] starting node1"
     $node1 = Start-Process -FilePath $daemonExe -ArgumentList @("--bind", $node1Bind, "--network-port", "$node1Port") -PassThru -WindowStyle Hidden -RedirectStandardOutput $node1Out -RedirectStandardError $node1Err -Environment @{
@@ -195,6 +219,12 @@ try {
 
     $node1PeerId = Get-FirstPeerId -Endpoint $node1Endpoint
     $node2PeerId = Get-FirstPeerId -Endpoint $node2Endpoint
+
+    Write-Host "[smoke] validating input owner control plane"
+    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "claim", $node1PeerId) | Out-Host
+    Wait-ForInputOwner -Endpoint $node1Endpoint -ExpectedOwner $node1PeerId -Seconds $TimeoutSeconds
+    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "release", $node1PeerId) | Out-Host
+    Wait-ForInputOwner -Endpoint $node1Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
 
     $clipboardText = "smoke-clipboard-" + (Get-Date -Format "HHmmss")
     Write-Host "[smoke] sending clipboard payload from node1 to node2"

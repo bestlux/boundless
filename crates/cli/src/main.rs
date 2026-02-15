@@ -5,8 +5,8 @@ use tonic::transport::Channel;
 
 use ipc_api::boundless::v1::{
     DiagnosticsDumpRequest, Empty, FeatureSetRequest, HotkeySetRequest, ImportTrustBundleRequest,
-    LayoutSetRequest, PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest, SafeResetRequest,
-    SendClipboardTextRequest, SendFileRequest, StatusRequest,
+    InputOwnerRequest, LayoutSetRequest, PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest,
+    SafeResetRequest, SendClipboardTextRequest, SendFileRequest, StatusRequest,
     daemon_service_client::DaemonServiceClient,
     diagnostics_service_client::DiagnosticsServiceClient,
     feature_service_client::FeatureServiceClient, pairing_service_client::PairingServiceClient,
@@ -53,6 +53,10 @@ enum Command {
     Transport {
         #[command(subcommand)]
         command: TransportCommand,
+    },
+    Input {
+        #[command(subcommand)]
+        command: InputCommand,
     },
     Hotkey {
         action: String,
@@ -134,6 +138,19 @@ enum TransportCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum InputCommand {
+    Owner,
+    Claim {
+        peer_id: String,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    Release {
+        peer_id: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ToggleValue {
     On,
@@ -200,6 +217,13 @@ async fn main() -> Result<()> {
                 transport_send_file(&cli.endpoint, peer_id, path).await
             }
             TransportCommand::Events { limit } => transport_events(&cli.endpoint, limit).await,
+        },
+        Command::Input { command } => match command {
+            InputCommand::Owner => input_owner(&cli.endpoint).await,
+            InputCommand::Claim { peer_id, force } => {
+                input_claim(&cli.endpoint, peer_id, force).await
+            }
+            InputCommand::Release { peer_id } => input_release(&cli.endpoint, peer_id).await,
         },
         Command::Hotkey { action, combo } => hotkey_set(&cli.endpoint, action, combo).await,
         Command::Diagnostics { command } => match command {
@@ -449,6 +473,65 @@ async fn transport_events(endpoint: &str, limit: usize) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+async fn input_owner(endpoint: &str) -> Result<()> {
+    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let response = client.get_input_owner(Empty {}).await?.into_inner();
+    let owner = if response.owner_peer_id.is_empty() {
+        "none".to_string()
+    } else {
+        response.owner_peer_id
+    };
+
+    println!(
+        "ok={} owner={} message={}",
+        response.ok, owner, response.message
+    );
+    Ok(())
+}
+
+async fn input_claim(endpoint: &str, peer_id: String, force: bool) -> Result<()> {
+    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .claim_input_owner(InputOwnerRequest { peer_id, force })
+        .await?
+        .into_inner();
+
+    let owner = if response.owner_peer_id.is_empty() {
+        "none".to_string()
+    } else {
+        response.owner_peer_id
+    };
+
+    println!(
+        "ok={} owner={} message={}",
+        response.ok, owner, response.message
+    );
+    Ok(())
+}
+
+async fn input_release(endpoint: &str, peer_id: String) -> Result<()> {
+    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .release_input_owner(InputOwnerRequest {
+            peer_id,
+            force: false,
+        })
+        .await?
+        .into_inner();
+
+    let owner = if response.owner_peer_id.is_empty() {
+        "none".to_string()
+    } else {
+        response.owner_peer_id
+    };
+
+    println!(
+        "ok={} owner={} message={}",
+        response.ok, owner, response.message
+    );
     Ok(())
 }
 
