@@ -283,6 +283,7 @@ async fn channel(endpoint: &str) -> Result<Channel> {
 
         #[cfg(not(windows))]
         {
+            let _ = pipe_path;
             bail!("named-pipe endpoint is only supported on Windows: {endpoint}");
         }
     }
