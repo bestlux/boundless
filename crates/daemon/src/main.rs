@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
             .context("update network port")?;
     }
 
+    let transport_listener = network::prepare_listener(&state).await;
     let snapshot = state.snapshot().await;
 
     let ServiceBundle {
@@ -106,7 +107,7 @@ async fn main() -> Result<()> {
     clipboard::start(state.clone());
     discovery::start(state.clone());
     input::start(state.clone());
-    network::start(state.clone());
+    network::start(state.clone(), transport_listener);
 
     let configured_api_transport = snapshot.api_transport;
     let effective_api_transport = configured_api_transport.effective();
