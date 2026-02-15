@@ -4,12 +4,12 @@ use tonic::{Request, Response, Status};
 
 use ipc_api::boundless::v1::{
     DiagnosticsDumpReply, DiagnosticsDumpRequest, Empty, FeatureListReply, FeatureSetRequest,
-    HotkeySetRequest, ImportTrustBundleRequest, InputOwnerReply, InputOwnerRequest, LayoutReply,
-    LayoutSetRequest, OperationReply, PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply,
-    PairJoinRequest, PeerInfo, PeerListReply, RemovePeerRequest, SafeResetRequest,
-    SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
-    SendInputMoveRequest, StatusReply, StatusRequest, TransportEvent, TransportEventsReply,
-    TrustBundleReply,
+    HotkeySetRequest, ImportTrustBundleRequest, InputCaptureTargetReply, InputCaptureTargetRequest,
+    InputOwnerReply, InputOwnerRequest, LayoutReply, LayoutSetRequest, OperationReply,
+    PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply, PairJoinRequest, PeerInfo,
+    PeerListReply, RemovePeerRequest, SafeResetRequest, SendClipboardImageRequest,
+    SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest, SendInputMoveRequest,
+    StatusReply, StatusRequest, TransportEvent, TransportEventsReply, TrustBundleReply,
     daemon_service_server::{DaemonService, DaemonServiceServer},
     diagnostics_service_server::{DiagnosticsService, DiagnosticsServiceServer},
     feature_service_server::{FeatureService, FeatureServiceServer},
@@ -480,6 +480,53 @@ impl DiagnosticsService for DiagnosticsApi {
             } else {
                 "peer did not hold input owner".to_string()
             },
+        }))
+    }
+
+    async fn get_input_capture_target(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<InputCaptureTargetReply>, Status> {
+        let peer_id = self.0.input_capture_target().await.unwrap_or_default();
+        Ok(Response::new(InputCaptureTargetReply {
+            ok: true,
+            peer_id,
+            message: "input capture target fetched".to_string(),
+        }))
+    }
+
+    async fn set_input_capture_target(
+        &self,
+        request: Request<InputCaptureTargetRequest>,
+    ) -> Result<Response<InputCaptureTargetReply>, Status> {
+        let request = request.into_inner();
+        let target = self
+            .0
+            .set_input_capture_target(Some(&request.peer_id))
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let peer_id = target.unwrap_or_default();
+
+        Ok(Response::new(InputCaptureTargetReply {
+            ok: true,
+            peer_id: peer_id.clone(),
+            message: if peer_id.is_empty() {
+                "input capture target cleared".to_string()
+            } else {
+                format!("input capture target set to {peer_id}")
+            },
+        }))
+    }
+
+    async fn clear_input_capture_target(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<InputCaptureTargetReply>, Status> {
+        self.0.clear_input_capture_target().await;
+        Ok(Response::new(InputCaptureTargetReply {
+            ok: true,
+            peer_id: String::new(),
+            message: "input capture target cleared".to_string(),
         }))
     }
 }

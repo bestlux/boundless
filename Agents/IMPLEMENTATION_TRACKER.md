@@ -33,8 +33,9 @@
 - [x] Added clipboard image sync path (wire transport + runtime apply/watch + diagnostics CLI enqueue helper)
 - [x] Added input injection runtime queue + backend abstraction and synthetic key diagnostics helper
 - [x] Implemented Windows `SendInput` runtime injection backend for mouse/key events
+- [x] Added runtime input capture target control-plane + Windows polling capture backend (cursor/buttons/keys)
 
 ## Next (priority order)
 
-- [ ] Implement real input capture/injection pipeline
+- [ ] Upgrade input capture from polling to low-level hook path with wheel + broader key coverage
 - [ ] Add richer multi-machine integration assertions beyond payload smoke

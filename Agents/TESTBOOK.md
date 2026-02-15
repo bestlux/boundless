@@ -21,6 +21,7 @@
 - Runtime clipboard text sync is active in daemon; diagnostics `transport send-text` remains available as an explicit test hook
 - Runtime clipboard image sync is active in daemon for BMP payloads; diagnostics `transport send-image <peer_id> <path.bmp>` is available as an explicit test hook
 - Runtime input injection queue is active in daemon; on Windows, queued input events are applied via `SendInput`
+- Runtime input capture target control-plane is active in daemon; on Windows, local cursor/button/key polling can enqueue outbound input frames for the selected target peer
 - Run `scripts/dev/validate.ps1` for fmt/test/clippy plus smoke in one command
 
 ## Test cases
@@ -66,6 +67,11 @@
 - On Machine A: `input owner` (expect none)
 
 9. Input frame transport path
+- On Machine A: `input capture-target` (expect none)
+- On Machine A: `input capture-start <peer_id-for-machine-b>`
+- On Machine A: `input capture-target` (expect peer_id-for-machine-b)
+- On Machine A: `input capture-stop`
+- On Machine A: `input capture-target` (expect none)
 - On Machine B: `input claim <peer_id-for-machine-a>`
 - On Machine A: `input send-move <peer_id-for-machine-b> 3 2`
 - On Machine A: `input send-key <peer_id-for-machine-b> 30 down`

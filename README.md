@@ -86,6 +86,9 @@ Manage input ownership control-plane:
 
 ```bash
 cargo run -p boundless-cli -- input owner
+cargo run -p boundless-cli -- input capture-target
+cargo run -p boundless-cli -- input capture-start <peer_id>
+cargo run -p boundless-cli -- input capture-stop
 cargo run -p boundless-cli -- input send-move <peer_id> 3 2
 cargo run -p boundless-cli -- input send-key <peer_id> 30 down
 cargo run -p boundless-cli -- input claim <peer_id>
@@ -103,4 +106,4 @@ cargo run -p boundless-cli -- input release <peer_id>
 
 ## Notes
 
-Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, real clipboard runtime sync for text and bitmap image payloads (watch/apply with echo suppression), queued file payload transfer primitives, and input routing groundwork (ownership control-plane + synthetic input frame transport + runtime injection queue with pluggable backend). Windows runtime injection now uses `SendInput` for mouse and keyboard events; capture and broader cross-platform injection support remain in progress. mDNS runtime discovery with manual address fallback is also in place.
+Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, real clipboard runtime sync for text and bitmap image payloads (watch/apply with echo suppression), queued file payload transfer primitives, and input routing groundwork (ownership control-plane + runtime capture target + synthetic input frame transport + runtime injection queue with pluggable backend). Windows runtime injection uses `SendInput`, and Windows capture now polls cursor/buttons/keys into outbound input frames; low-level hook capture and broader cross-platform support remain in progress. mDNS runtime discovery with manual address fallback is also in place.

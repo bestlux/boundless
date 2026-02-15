@@ -21,10 +21,10 @@ use tonic::{codegen::Service, transport::Uri};
 
 use ipc_api::boundless::v1::{
     DiagnosticsDumpRequest, Empty, FeatureSetRequest, HotkeySetRequest, ImportTrustBundleRequest,
-    InputOwnerRequest, LayoutSetRequest, PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest,
-    SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest,
-    SendInputKeyRequest, SendInputMoveRequest, StatusRequest,
-    daemon_service_client::DaemonServiceClient,
+    InputCaptureTargetRequest, InputOwnerRequest, LayoutSetRequest, PairCreateCodeRequest,
+    PairJoinRequest, RemovePeerRequest, SafeResetRequest, SendClipboardImageRequest,
+    SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest, SendInputMoveRequest,
+    StatusRequest, daemon_service_client::DaemonServiceClient,
     diagnostics_service_client::DiagnosticsServiceClient,
     feature_service_client::FeatureServiceClient, pairing_service_client::PairingServiceClient,
     topology_service_client::TopologyServiceClient,
@@ -162,6 +162,11 @@ enum TransportCommand {
 #[derive(Debug, Subcommand)]
 enum InputCommand {
     Owner,
+    CaptureTarget,
+    CaptureStart {
+        peer_id: String,
+    },
+    CaptureStop,
     SendMove {
         peer_id: String,
         dx: i32,
@@ -266,6 +271,11 @@ async fn main() -> Result<()> {
         },
         Command::Input { command } => match command {
             InputCommand::Owner => input_owner(&cli.endpoint).await,
+            InputCommand::CaptureTarget => input_capture_target(&cli.endpoint).await,
+            InputCommand::CaptureStart { peer_id } => {
+                input_capture_start(&cli.endpoint, peer_id).await
+            }
+            InputCommand::CaptureStop => input_capture_stop(&cli.endpoint).await,
             InputCommand::SendMove { peer_id, dx, dy } => {
                 input_send_move(&cli.endpoint, peer_id, dx, dy).await
             }
@@ -608,6 +618,63 @@ async fn input_owner(endpoint: &str) -> Result<()> {
     println!(
         "ok={} owner={} message={}",
         response.ok, owner, response.message
+    );
+    Ok(())
+}
+
+async fn input_capture_target(endpoint: &str) -> Result<()> {
+    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .get_input_capture_target(Empty {})
+        .await?
+        .into_inner();
+    let target = if response.peer_id.is_empty() {
+        "none".to_string()
+    } else {
+        response.peer_id
+    };
+
+    println!(
+        "ok={} target={} message={}",
+        response.ok, target, response.message
+    );
+    Ok(())
+}
+
+async fn input_capture_start(endpoint: &str, peer_id: String) -> Result<()> {
+    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .set_input_capture_target(InputCaptureTargetRequest { peer_id })
+        .await?
+        .into_inner();
+    let target = if response.peer_id.is_empty() {
+        "none".to_string()
+    } else {
+        response.peer_id
+    };
+
+    println!(
+        "ok={} target={} message={}",
+        response.ok, target, response.message
+    );
+    Ok(())
+}
+
+async fn input_capture_stop(endpoint: &str) -> Result<()> {
+    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .clear_input_capture_target(Empty {})
+        .await?
+        .into_inner();
+    let target = if response.peer_id.is_empty() {
+        "none".to_string()
+    } else {
+        response.peer_id
+    };
+
+    println!(
+        "ok={} target={} message={}",
+        response.ok, target, response.message
     );
     Ok(())
 }

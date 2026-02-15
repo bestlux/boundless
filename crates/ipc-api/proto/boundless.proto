@@ -152,6 +152,16 @@ message InputOwnerReply {
   string message = 3;
 }
 
+message InputCaptureTargetRequest {
+  string peer_id = 1;
+}
+
+message InputCaptureTargetReply {
+  bool ok = 1;
+  string peer_id = 2;
+  string message = 3;
+}
+
 service DaemonService {
   rpc GetStatus(StatusRequest) returns (StatusReply);
 }
@@ -188,4 +198,7 @@ service DiagnosticsService {
   rpc GetInputOwner(Empty) returns (InputOwnerReply);
   rpc ClaimInputOwner(InputOwnerRequest) returns (InputOwnerReply);
   rpc ReleaseInputOwner(InputOwnerRequest) returns (InputOwnerReply);
+  rpc GetInputCaptureTarget(Empty) returns (InputCaptureTargetReply);
+  rpc SetInputCaptureTarget(InputCaptureTargetRequest) returns (InputCaptureTargetReply);
+  rpc ClearInputCaptureTarget(Empty) returns (InputCaptureTargetReply);
 }

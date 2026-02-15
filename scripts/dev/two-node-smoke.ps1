@@ -208,6 +208,30 @@ function Wait-ForInputOwner {
     throw "Timed out waiting for input owner '$ExpectedOwner' at $Endpoint"
 }
 
+function Wait-ForInputCaptureTarget {
+    param(
+        [string]$Endpoint,
+        [string]$ExpectedTarget,
+        [int]$Seconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs @("input", "capture-target")
+        if ($LASTEXITCODE -eq 0) {
+            if ($ExpectedTarget -eq "none" -and $output -match "target=none") {
+                return
+            }
+            if ($ExpectedTarget -ne "none" -and $output -match "target=$ExpectedTarget") {
+                return
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Timed out waiting for input capture target '$ExpectedTarget' at $Endpoint"
+}
+
 function Start-DaemonProcess {
     param(
         [string]$Bind,
@@ -317,6 +341,13 @@ try {
     Wait-ForInputOwner -Endpoint $node1Endpoint -ExpectedOwner $node1PeerId -Seconds $TimeoutSeconds
     Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "release", $node1PeerId) | Out-Host
     Wait-ForInputOwner -Endpoint $node1Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
+
+    Write-Host "[smoke] validating input capture target control plane"
+    Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
+    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "capture-start", $node1PeerId) | Out-Host
+    Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget $node1PeerId -Seconds $TimeoutSeconds
+    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "capture-stop") | Out-Host
+    Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
 
     Write-Host "[smoke] sending synthetic input frame from node1 to node2"
     Invoke-Cli -Endpoint $node2Endpoint -CommandArgs @("input", "claim", $node2PeerId) | Out-Host

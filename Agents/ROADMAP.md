@@ -18,7 +18,7 @@ Deliver MWB-style cross-machine control in Rust with stronger reliability, diagn
 - mDNS discovery runtime with manual fallback integration (in progress)
 
 3. Phase 2: Input switching core
-- Keyboard/mouse capture + injection (in progress: input ownership control-plane + transport frame routing + runtime injection queue + Windows SendInput backend in place)
+- Keyboard/mouse capture + injection (in progress: input ownership control-plane + capture-target control API + Windows polling capture backend + transport frame routing + runtime injection queue + Windows SendInput backend in place)
 - Edge switching + layout matrix semantics
 - Core hotkeys and easy mouse behavior
 
