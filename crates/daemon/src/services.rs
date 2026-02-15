@@ -1,11 +1,13 @@
+use std::path::Path;
+
 use tonic::{Request, Response, Status};
 
 use ipc_api::boundless::v1::{
     DiagnosticsDumpReply, DiagnosticsDumpRequest, Empty, FeatureListReply, FeatureSetRequest,
     HotkeySetRequest, ImportTrustBundleRequest, LayoutReply, LayoutSetRequest, OperationReply,
     PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply, PairJoinRequest, PeerInfo,
-    PeerListReply, RemovePeerRequest, SafeResetRequest, StatusReply, StatusRequest,
-    TrustBundleReply,
+    PeerListReply, RemovePeerRequest, SafeResetRequest, SendClipboardTextRequest, SendFileRequest,
+    StatusReply, StatusRequest, TransportEvent, TransportEventsReply, TrustBundleReply,
     daemon_service_server::{DaemonService, DaemonServiceServer},
     diagnostics_service_server::{DiagnosticsService, DiagnosticsServiceServer},
     feature_service_server::{FeatureService, FeatureServiceServer},
@@ -303,5 +305,59 @@ impl DiagnosticsService for DiagnosticsApi {
             ok: true,
             message: "safe reset complete".to_string(),
         }))
+    }
+
+    async fn send_clipboard_text(
+        &self,
+        request: Request<SendClipboardTextRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        self.0
+            .queue_clipboard_text(&request.peer_id, request.text)
+            .await
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        Ok(Response::new(OperationReply {
+            ok: true,
+            message: "clipboard payload queued".to_string(),
+        }))
+    }
+
+    async fn send_file(
+        &self,
+        request: Request<SendFileRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        self.0
+            .queue_file_from_path(&request.peer_id, Path::new(&request.file_path))
+            .await
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        Ok(Response::new(OperationReply {
+            ok: true,
+            message: "file payload queued".to_string(),
+        }))
+    }
+
+    async fn list_transport_events(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<TransportEventsReply>, Status> {
+        let events = self
+            .0
+            .transport_events()
+            .await
+            .into_iter()
+            .map(|event| TransportEvent {
+                timestamp: event.timestamp.to_rfc3339(),
+                direction: event.direction,
+                kind: event.kind,
+                peer_id: event.peer_id,
+                detail: event.detail,
+                size_bytes: event.size_bytes,
+            })
+            .collect();
+
+        Ok(Response::new(TransportEventsReply { events }))
     }
 }

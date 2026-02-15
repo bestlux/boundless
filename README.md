@@ -30,6 +30,12 @@ cargo fmt
 cargo test
 ```
 
+Local full validation (PowerShell):
+
+```powershell
+./scripts/dev/validate.ps1
+```
+
 ## Run locally
 
 Start daemon:
@@ -63,6 +69,14 @@ Two-node smoke test (PowerShell):
 ./scripts/dev/two-node-smoke.ps1
 ```
 
+Queue transport payloads and inspect events:
+
+```bash
+cargo run -p boundless-cli -- transport send-text <peer_id> "hello"
+cargo run -p boundless-cli -- transport send-file <peer_id> ./path/to/file.txt
+cargo run -p boundless-cli -- transport events --limit 100
+```
+
 ## Release model
 
 - Conventional Commits drive semver intent
@@ -71,4 +85,4 @@ Two-node smoke test (PowerShell):
 
 ## Notes
 
-Alpha scope emphasizes reliability primitives and now includes a basic TLS transport/session layer with heartbeat/reconnect scaffolding. Windows input injection, clipboard/file streaming over transport, and mDNS runtime discovery are upcoming slices.
+Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, and queued clipboard/file payload transfer primitives. Windows input injection, OS clipboard integration, and mDNS runtime discovery are upcoming slices.
