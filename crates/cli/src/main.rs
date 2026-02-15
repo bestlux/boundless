@@ -8,8 +8,10 @@ use hyper_util::rt::TokioIo;
 #[cfg(windows)]
 use std::{
     future::Future,
+    io,
     pin::Pin,
     task::{Context as TaskContext, Poll},
+    time::Duration,
 };
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
@@ -668,10 +670,38 @@ impl Service<Uri> for NamedPipeConnector {
     fn call(&mut self, _req: Uri) -> Self::Future {
         let pipe_path = self.pipe_path.clone();
         Box::pin(async move {
-            let client = ClientOptions::new().open(pipe_path)?;
+            let client = open_named_pipe_with_retry(pipe_path).await?;
             Ok(TokioIo::new(client))
         })
     }
+}
+
+#[cfg(windows)]
+const ERROR_PIPE_BUSY_CODE: i32 = 231;
+#[cfg(windows)]
+const PIPE_BUSY_MAX_RETRIES: u32 = 20;
+#[cfg(windows)]
+const PIPE_BUSY_BACKOFF_MS: u64 = 25;
+
+#[cfg(windows)]
+async fn open_named_pipe_with_retry(pipe_path: String) -> io::Result<NamedPipeClient> {
+    let mut attempt = 0_u32;
+
+    loop {
+        match ClientOptions::new().open(pipe_path.as_str()) {
+            Ok(client) => return Ok(client),
+            Err(error) if is_pipe_busy_error(&error) && attempt < PIPE_BUSY_MAX_RETRIES => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(PIPE_BUSY_BACKOFF_MS)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_pipe_busy_error(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ERROR_PIPE_BUSY_CODE)
 }
 
 #[cfg(test)]
@@ -696,5 +726,14 @@ mod tests {
     fn parse_npipe_endpoint_ignores_http_endpoint() {
         let parsed = parse_npipe_endpoint("http://127.0.0.1:50051").expect("parse");
         assert!(parsed.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detects_pipe_busy_error_code() {
+        let busy = std::io::Error::from_raw_os_error(231);
+        let other = std::io::Error::from_raw_os_error(5);
+        assert!(is_pipe_busy_error(&busy));
+        assert!(!is_pipe_busy_error(&other));
     }
 }

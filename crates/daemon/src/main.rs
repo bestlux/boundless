@@ -102,17 +102,27 @@ async fn main() -> Result<()> {
 
     network::start(state.clone());
 
+    let configured_api_transport = snapshot.api_transport;
+    let effective_api_transport = configured_api_transport.effective();
+    if configured_api_transport != effective_api_transport {
+        warn!(
+            configured = configured_api_transport.as_str(),
+            effective = effective_api_transport.as_str(),
+            "configured API transport is not supported on this platform; using fallback"
+        );
+    }
+
     info!(
         machine_id = %snapshot.machine_id,
         api_bind = %snapshot.api_bind,
-        api_transport = snapshot.api_transport.as_str(),
+        api_transport = effective_api_transport.as_str(),
         api_pipe_name = %snapshot.api_pipe_name,
         network_port = snapshot.network_port,
         protocol = %snapshot.protocol_version,
         "boundless daemon starting"
     );
 
-    if matches!(snapshot.api_transport, ApiTransport::NamedPipe) {
+    if matches!(effective_api_transport, ApiTransport::NamedPipe) {
         #[cfg(windows)]
         {
             let incoming = named_pipe::incoming(&snapshot.api_pipe_name)
@@ -129,11 +139,6 @@ async fn main() -> Result<()> {
                 .context("gRPC named-pipe server failure")?;
 
             return Ok(());
-        }
-
-        #[cfg(not(windows))]
-        {
-            warn!("named_pipe API transport requested on non-Windows; falling back to TCP");
         }
     }
 

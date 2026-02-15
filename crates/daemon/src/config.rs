@@ -20,7 +20,7 @@ pub struct PeerConfig {
     pub last_seen: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiTransport {
     Tcp,
@@ -32,6 +32,21 @@ impl ApiTransport {
         match self {
             Self::Tcp => "tcp",
             Self::NamedPipe => "named_pipe",
+        }
+    }
+
+    pub fn effective(self) -> Self {
+        #[cfg(windows)]
+        {
+            self
+        }
+
+        #[cfg(not(windows))]
+        {
+            match self {
+                Self::Tcp => Self::Tcp,
+                Self::NamedPipe => Self::Tcp,
+            }
         }
     }
 }
@@ -159,4 +174,32 @@ fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "boundless-host".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiTransport;
+
+    #[test]
+    fn tcp_effective_transport_is_tcp() {
+        assert!(matches!(ApiTransport::Tcp.effective(), ApiTransport::Tcp));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn named_pipe_effective_transport_falls_back_to_tcp_on_non_windows() {
+        assert!(matches!(
+            ApiTransport::NamedPipe.effective(),
+            ApiTransport::Tcp
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_effective_transport_stays_named_pipe_on_windows() {
+        assert!(matches!(
+            ApiTransport::NamedPipe.effective(),
+            ApiTransport::NamedPipe
+        ));
+    }
 }
