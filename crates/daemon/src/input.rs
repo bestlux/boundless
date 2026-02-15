@@ -7,7 +7,9 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
+#[cfg(windows)]
+use anyhow::{Context, bail};
 use tokio::time;
 use tracing::warn;
 
@@ -1010,6 +1012,7 @@ fn is_extended_scan_code(scan_code: u16) -> bool {
     matches!(scan_code & 0xFF00, 0xE000 | 0xE100)
 }
 
+#[cfg(windows)]
 fn input_event_kind(event: &InputEvent) -> &'static str {
     match event {
         InputEvent::MouseMove { .. } => "mouse_move",
