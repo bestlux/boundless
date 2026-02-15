@@ -53,6 +53,7 @@ impl ApiTransport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
+    #[serde(default = "default_config_version")]
     pub config_version: String,
     pub machine_id: String,
     pub device_name: String,
@@ -98,7 +99,7 @@ impl Default for RuntimeConfig {
         .collect();
 
         Self {
-            config_version: "1".to_string(),
+            config_version: default_config_version(),
             machine_id: Uuid::new_v4().to_string(),
             device_name: hostname(),
             api_bind: "127.0.0.1:50051".to_string(),
@@ -114,6 +115,10 @@ impl Default for RuntimeConfig {
             updated_at: now,
         }
     }
+}
+
+fn default_config_version() -> String {
+    "1".to_string()
 }
 
 fn default_api_transport() -> ApiTransport {
@@ -178,7 +183,7 @@ fn hostname() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ApiTransport;
+    use super::{ApiTransport, RuntimeConfig};
 
     #[test]
     fn tcp_effective_transport_is_tcp() {
@@ -201,5 +206,38 @@ mod tests {
             ApiTransport::NamedPipe.effective(),
             ApiTransport::NamedPipe
         ));
+    }
+
+    #[test]
+    fn runtime_config_defaults_missing_config_version_on_deserialize() {
+        let json = r#"{
+  "machine_id": "m1",
+  "device_name": "node",
+  "api_bind": "127.0.0.1:50051",
+  "api_transport": "tcp",
+  "api_pipe_name": "boundlessd-api",
+  "protocol_version": "1.1.0",
+  "layout_matrix": "A,B;C,D",
+  "auto_start": true,
+  "network_port": 15100,
+  "features": {
+    "share_clipboard": true,
+    "transfer_file": true,
+    "share_input": true,
+    "easy_mouse": true,
+    "wrap_mouse": true
+  },
+  "hotkeys": {
+    "toggle_easy_mouse": "Ctrl+Alt+Shift+E",
+    "lock_machine": "Ctrl+Alt+Shift+L",
+    "switch_all": "Disabled",
+    "reconnect": "Ctrl+Alt+Shift+R"
+  },
+  "peers": [],
+  "updated_at": "2026-01-01T00:00:00Z"
+}"#;
+
+        let parsed: RuntimeConfig = serde_json::from_str(json).expect("parse legacy config");
+        assert_eq!(parsed.config_version, "1");
     }
 }
