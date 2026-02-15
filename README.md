@@ -101,4 +101,4 @@ cargo run -p boundless-cli -- input release <peer_id>
 
 ## Notes
 
-Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, queued clipboard/file payload transfer primitives, and input routing groundwork (ownership control-plane + synthetic input frame transport routed through a no-op sink). Windows input injection, OS clipboard integration, and mDNS runtime discovery are upcoming slices.
+Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, queued clipboard/file payload transfer primitives, input routing groundwork (ownership control-plane + synthetic input frame transport routed through a no-op sink), and mDNS runtime discovery with manual address fallback. Windows input injection and OS clipboard integration remain upcoming slices.

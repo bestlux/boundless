@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    net::SocketAddr,
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -11,6 +12,7 @@ use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio::sync::RwLock;
 use tracing::info;
 
+use core_discovery::parse_manual_target;
 use core_input::{InputEvent, InputFrame, InputRouter, InputSink, RouteDecision};
 use core_security::{
     DeviceIdentity, SecurityPaths, TrustBundle, TrustRecord, default_security_root,
@@ -61,6 +63,7 @@ pub struct AppState {
     device_fingerprint: Arc<String>,
     outgoing_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
     transport_events: Arc<RwLock<VecDeque<TransportEventRecord>>>,
+    discovered_endpoints: Arc<RwLock<HashMap<String, SocketAddr>>>,
     inbox_root: Arc<PathBuf>,
     input_router: Arc<RwLock<InputRouter>>,
     input_sequence_by_peer: Arc<RwLock<HashMap<String, u64>>>,
@@ -128,6 +131,7 @@ impl AppState {
             device_fingerprint: Arc::new(fingerprint),
             outgoing_payloads: Arc::new(RwLock::new(HashMap::new())),
             transport_events: Arc::new(RwLock::new(VecDeque::new())),
+            discovered_endpoints: Arc::new(RwLock::new(HashMap::new())),
             inbox_root: Arc::new(inbox_root),
             input_router: Arc::new(RwLock::new(InputRouter::new(input_enabled))),
             input_sequence_by_peer: Arc::new(RwLock::new(HashMap::new())),
@@ -179,13 +183,15 @@ impl AppState {
         )?;
 
         let mut config = self.config.write().await;
+        let normalized_address =
+            normalize_peer_address(&bundle.network_address, config.network_port)?;
 
         if let Some(peer) = config
             .peers
             .iter_mut()
             .find(|p| p.peer_id == bundle.machine_id)
         {
-            peer.address = bundle.network_address;
+            peer.address = normalized_address;
             peer.display_name = alias.unwrap_or(bundle.display_name);
             peer.connected = false;
             peer.last_seen = Utc::now();
@@ -193,7 +199,7 @@ impl AppState {
             config.peers.push(PeerConfig {
                 peer_id: bundle.machine_id,
                 display_name: alias.unwrap_or(bundle.display_name),
-                address: bundle.network_address,
+                address: normalized_address,
                 connected: false,
                 last_seen: Utc::now(),
             });
@@ -234,6 +240,29 @@ impl AppState {
         save_config_at(&self.config_path, &config)
     }
 
+    pub async fn set_discovered_endpoint(
+        &self,
+        machine_id: &str,
+        endpoint: SocketAddr,
+    ) -> Option<SocketAddr> {
+        self.discovered_endpoints
+            .write()
+            .await
+            .insert(machine_id.to_string(), endpoint)
+    }
+
+    pub async fn clear_discovered_endpoint(&self, machine_id: &str) -> Option<SocketAddr> {
+        self.discovered_endpoints.write().await.remove(machine_id)
+    }
+
+    pub async fn discovered_endpoint(&self, machine_id: &str) -> Option<SocketAddr> {
+        self.discovered_endpoints
+            .read()
+            .await
+            .get(machine_id)
+            .copied()
+    }
+
     pub async fn create_pairing_code(&self, ttl_secs: u64) -> (String, DateTime<Utc>) {
         let code = generate_pairing_code(Duration::from_secs(ttl_secs));
         self.pairing_codes
@@ -257,12 +286,13 @@ impl AppState {
         }
 
         let mut config = self.config.write().await;
+        let normalized_address = normalize_peer_address(&host, config.network_port)?;
         let peer_id = uuid::Uuid::new_v4().to_string();
 
         let peer = PeerConfig {
             peer_id: peer_id.clone(),
             display_name: alias.unwrap_or_else(|| format!("peer-{}", &peer_id[..8])),
-            address: host,
+            address: normalized_address,
             connected: false,
             last_seen: now,
         };
@@ -297,6 +327,7 @@ impl AppState {
             router.release_owner(peer_id);
             router.clear_peer_state(peer_id);
             self.input_sequence_by_peer.write().await.remove(peer_id);
+            self.discovered_endpoints.write().await.remove(peer_id);
         }
         Ok(removed)
     }
@@ -608,6 +639,7 @@ impl AppState {
 
         self.outgoing_payloads.write().await.clear();
         self.transport_events.write().await.clear();
+        self.discovered_endpoints.write().await.clear();
         *self.input_router.write().await =
             InputRouter::new(config.features.get("share_input").copied().unwrap_or(true));
         self.input_sequence_by_peer.write().await.clear();
@@ -663,6 +695,19 @@ fn validate_bind_address(bind: &str) -> Result<()> {
     bind.parse::<std::net::SocketAddr>()
         .with_context(|| format!("invalid bind address {bind}"))?;
     Ok(())
+}
+
+fn normalize_peer_address(address: &str, default_port: u16) -> Result<String> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("peer address must not be empty");
+    }
+
+    if let Some(parsed) = parse_manual_target(trimmed, default_port) {
+        return Ok(parsed.to_string());
+    }
+
+    Ok(trimmed.to_string())
 }
 
 fn validate_pipe_name(pipe_name: &str) -> Result<()> {
@@ -756,6 +801,24 @@ mod tests {
     #[test]
     fn validate_bind_address_accepts_socket_addr() {
         validate_bind_address("127.0.0.1:50051").expect("valid bind");
+    }
+
+    #[test]
+    fn normalize_peer_address_adds_default_port_for_ip() {
+        let normalized = normalize_peer_address("127.0.0.1", 15100).expect("normalize");
+        assert_eq!(normalized, "127.0.0.1:15100");
+    }
+
+    #[test]
+    fn normalize_peer_address_keeps_hostname_with_port() {
+        let normalized = normalize_peer_address("node-a.local:15100", 15100).expect("normalize");
+        assert_eq!(normalized, "node-a.local:15100");
+    }
+
+    #[test]
+    fn normalize_peer_address_rejects_empty_input() {
+        let err = normalize_peer_address("   ", 15100).expect_err("must fail");
+        assert!(err.to_string().contains("must not be empty"));
     }
 
     #[test]

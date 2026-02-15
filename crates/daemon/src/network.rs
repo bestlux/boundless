@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -88,7 +89,13 @@ async fn supervisor_loop(state: AppState) {
 
         let snapshot = state.snapshot().await;
         for peer in snapshot.peers {
-            if peer.peer_id == snapshot.machine_id || peer.address.trim().is_empty() {
+            if peer.peer_id == snapshot.machine_id {
+                continue;
+            }
+
+            let has_manual_address = !peer.address.trim().is_empty();
+            let has_discovered_endpoint = state.discovered_endpoint(&peer.peer_id).await.is_some();
+            if !has_manual_address && !has_discovered_endpoint {
                 continue;
             }
 
@@ -117,21 +124,64 @@ async fn peer_worker(state: AppState, peer_id: String) {
             return;
         };
 
-        match connect_and_run_outbound(state.clone(), &peer_id, &peer.address).await {
-            Ok(()) => {
-                backoff_secs = 1;
-            }
-            Err(error) => {
-                warn!(peer_id = %peer_id, address = %peer.address, error = ?error, "outbound connect failed");
-                if let Err(mark_error) = state.set_peer_connected(&peer_id, false).await {
-                    warn!(%mark_error, "failed to mark peer disconnected");
-                }
+        let discovered_endpoint = state.discovered_endpoint(&peer_id).await;
+        let target_candidates = outbound_target_candidates(&peer.address, discovered_endpoint);
+        if target_candidates.is_empty() {
+            time::sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECONDS);
+            continue;
+        }
 
-                time::sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECONDS);
+        let mut connected = false;
+        let mut last_error: Option<anyhow::Error> = None;
+        for target_address in &target_candidates {
+            match connect_and_run_outbound(state.clone(), &peer_id, target_address).await {
+                Ok(()) => {
+                    backoff_secs = 1;
+                    connected = true;
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                }
             }
         }
+
+        if !connected {
+            warn!(
+                peer_id = %peer_id,
+                configured_address = %peer.address,
+                target_candidates = ?target_candidates,
+                discovered_endpoint = ?discovered_endpoint,
+                error = ?last_error,
+                "outbound connect failed"
+            );
+            if let Err(mark_error) = state.set_peer_connected(&peer_id, false).await {
+                warn!(%mark_error, "failed to mark peer disconnected");
+            }
+
+            time::sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECONDS);
+        }
     }
+}
+
+fn outbound_target_candidates(
+    configured_address: &str,
+    discovered_endpoint: Option<SocketAddr>,
+) -> Vec<String> {
+    let mut targets = Vec::new();
+
+    if let Some(endpoint) = discovered_endpoint {
+        targets.push(endpoint.to_string());
+    }
+
+    let manual = configured_address.trim();
+    if !manual.is_empty() && !targets.iter().any(|target| target == manual) {
+        targets.push(manual.to_string());
+    }
+
+    targets
 }
 
 async fn connect_and_run_outbound(state: AppState, peer_id: &str, address: &str) -> Result<()> {
@@ -140,7 +190,7 @@ async fn connect_and_run_outbound(state: AppState, peer_id: &str, address: &str)
         .with_context(|| format!("tcp connect {address}"))?;
 
     let connector = build_tls_connector(&state).await?;
-    let server_name = parse_server_name(address)?;
+    let server_name = parse_server_name_for_peer(peer_id, address)?;
     let stream = connector
         .connect(server_name, socket)
         .await
@@ -800,6 +850,16 @@ fn parse_server_name(address: &str) -> Result<ServerName<'static>> {
     ServerName::try_from(host).context("parse server name")
 }
 
+fn parse_server_name_for_peer(peer_id: &str, address: &str) -> Result<ServerName<'static>> {
+    if !peer_id.trim().is_empty()
+        && let Ok(server_name) = ServerName::try_from(peer_id.to_string())
+    {
+        return Ok(server_name);
+    }
+
+    parse_server_name(address)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -881,6 +941,28 @@ mod tests {
     fn rejects_invalid_server_name() {
         let err = parse_server_name("!").expect_err("must fail");
         assert!(err.to_string().contains("parse server name"));
+    }
+
+    #[test]
+    fn parse_server_name_for_peer_prefers_peer_id_hint() {
+        let server_name =
+            parse_server_name_for_peer("peer-machine-id", "192.168.1.7:15100").expect("name");
+        assert_eq!(server_name.to_str(), "peer-machine-id");
+    }
+
+    #[test]
+    fn outbound_target_candidates_prefers_discovered_endpoint_first() {
+        let selected = outbound_target_candidates(
+            "manual-host:15100",
+            Some("10.0.0.7:15100".parse().expect("endpoint")),
+        );
+        assert_eq!(selected, vec!["10.0.0.7:15100", "manual-host:15100"]);
+    }
+
+    #[test]
+    fn outbound_target_candidates_falls_back_to_manual_address() {
+        let selected = outbound_target_candidates(" manual-host:15100 ", None);
+        assert_eq!(selected, vec!["manual-host:15100"]);
     }
 
     #[test]

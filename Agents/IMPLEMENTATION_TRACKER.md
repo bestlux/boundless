@@ -28,10 +28,10 @@
 - [x] Wired core-input frame routing into transport/runtime with no-op sink backend
 - [x] Added synthetic input frame enqueue API/CLI path for transport validation
 - [x] Added Windows named-pipe control-plane adapter with TCP fallback + CLI `npipe://` endpoint support
+- [x] Added mDNS discovery runtime with discovered-endpoint override + manual address fallback
 
 ## Next (priority order)
 
-- [ ] Implement mDNS discovery runtime with manual fallback integration
 - [ ] Implement real clipboard/text-image sync pipeline
 - [ ] Implement real input capture/injection pipeline
 - [ ] Add richer multi-machine integration assertions beyond payload smoke
