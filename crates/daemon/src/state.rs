@@ -172,6 +172,8 @@ impl AppState {
         alias: Option<String>,
     ) -> Result<()> {
         validate_ca_cert_pem(&bundle.ca_cert_pem)?;
+        let default_port = self.config.read().await.network_port;
+        let normalized_address = normalize_peer_address(&bundle.network_address, default_port)?;
 
         upsert_trust_record(
             &self.security_paths,
@@ -183,8 +185,6 @@ impl AppState {
         )?;
 
         let mut config = self.config.write().await;
-        let normalized_address =
-            normalize_peer_address(&bundle.network_address, config.network_port)?;
 
         if let Some(peer) = config
             .peers
@@ -1113,6 +1113,51 @@ mod tests {
             .await
             .expect("sequence should restart after disconnect");
         assert!(matches!(second, RouteDecision::Applied { .. }));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn import_trust_bundle_rejects_invalid_address_without_persisting_trust() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-import-bundle-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state = AppState::load_or_create_with_paths(config_path, security_root.clone())
+            .expect("load state");
+
+        let remote_paths = core_security::SecurityPaths::for_root(root.join("remote-security"));
+        let remote_identity = core_security::ensure_device_identity(
+            &remote_paths,
+            "remote-machine",
+            "remote",
+            Some("127.0.0.1"),
+        )
+        .expect("remote identity");
+
+        let err = state
+            .import_trust_bundle(
+                core_security::TrustBundle {
+                    machine_id: "remote-machine".to_string(),
+                    display_name: "remote".to_string(),
+                    network_address: "   ".to_string(),
+                    ca_cert_pem: remote_identity.ca_cert_pem,
+                },
+                None,
+            )
+            .await
+            .expect_err("invalid address must fail");
+        assert!(err.to_string().contains("peer address must not be empty"));
+
+        let trusted = state.trusted_records().await.expect("read trust");
+        assert!(
+            trusted
+                .iter()
+                .all(|record| record.machine_id != "remote-machine"),
+            "invalid bundle import must not persist trust records"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
