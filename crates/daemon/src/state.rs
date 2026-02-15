@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -151,6 +152,8 @@ impl AppState {
         bundle: TrustBundle,
         alias: Option<String>,
     ) -> Result<()> {
+        validate_ca_cert_pem(&bundle.ca_cert_pem)?;
+
         upsert_trust_record(
             &self.security_paths,
             TrustRecord {
@@ -293,7 +296,6 @@ impl AppState {
         let mut config = self.config.write().await;
         if let Some(peer) = config.peers.iter_mut().find(|p| p.peer_id == peer_id) {
             peer.last_seen = Utc::now();
-            save_config_at(&self.config_path, &config)?;
         }
         Ok(())
     }
@@ -574,6 +576,18 @@ fn validate_and_consume_pairing_code(
     Ok(())
 }
 
+fn validate_ca_cert_pem(ca_cert_pem: &str) -> Result<()> {
+    let certs = CertificateDer::pem_slice_iter(ca_cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .context("parse trust bundle CA certificate PEM")?;
+
+    if certs.is_empty() {
+        anyhow::bail!("trust bundle must include at least one CA certificate");
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +634,23 @@ mod tests {
         assert!(codes.is_empty(), "expired code should be consumed");
     }
 
+    #[test]
+    fn ca_pem_validation_rejects_invalid_pem() {
+        let err = validate_ca_cert_pem("not-pem").expect_err("must fail");
+        let message = err.to_string();
+        assert!(message.contains("certificate") || message.contains("PEM"));
+    }
+
+    #[test]
+    fn ca_pem_validation_accepts_generated_ca() {
+        let root = std::env::temp_dir().join(format!("boundless-ca-test-{}", uuid::Uuid::new_v4()));
+        let paths = core_security::SecurityPaths::for_root(root.join("security"));
+        let identity =
+            core_security::ensure_device_identity(&paths, "m1", "machine", None).expect("identity");
+        validate_ca_cert_pem(&identity.ca_cert_pem).expect("must accept");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn join_peer_requires_issued_code_and_consumes_it() {
         let root =
@@ -656,6 +687,31 @@ mod tests {
                 .to_string()
                 .contains("invalid or was already used")
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn touch_peer_does_not_persist_config_on_heartbeat() {
+        let root =
+            std::env::temp_dir().join(format!("boundless-touch-test-{}", uuid::Uuid::new_v4()));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+
+        let state = AppState::load_or_create_with_paths(config_path.clone(), security_root)
+            .expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(code, "127.0.0.1:15100".to_string(), None)
+            .await
+            .expect("join");
+
+        let before = std::fs::read_to_string(&config_path).expect("read before");
+        state.touch_peer(&peer_id).await.expect("touch");
+        let after = std::fs::read_to_string(&config_path).expect("read after");
+
+        assert_eq!(before, after, "touch should not write config file");
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -178,9 +178,34 @@ function Wait-ForInputOwner {
     throw "Timed out waiting for input owner '$ExpectedOwner' at $Endpoint"
 }
 
+function Start-DaemonProcess {
+    param(
+        [string]$Bind,
+        [int]$NetworkPort,
+        [string]$StdOutPath,
+        [string]$StdErrPath,
+        [hashtable]$Environment
+    )
+
+    $startProcessCommand = Get-Command Start-Process
+    if ($startProcessCommand.Parameters.ContainsKey("Environment")) {
+        return Start-Process -FilePath $daemonExe -ArgumentList @("--bind", $Bind, "--network-port", "$NetworkPort") -PassThru -WindowStyle Hidden -RedirectStandardOutput $StdOutPath -RedirectStandardError $StdErrPath -Environment $Environment
+    }
+
+    $setCommands = @()
+    foreach ($entry in $Environment.GetEnumerator()) {
+        $setCommands += "set `"$($entry.Key)=$($entry.Value)`""
+    }
+
+    $daemonCommand = "`"$daemonExe`" --bind $Bind --network-port $NetworkPort"
+    $commandLine = ($setCommands + $daemonCommand) -join " && "
+
+    return Start-Process -FilePath "cmd.exe" -ArgumentList @("/d", "/s", "/c", $commandLine) -PassThru -WindowStyle Hidden -RedirectStandardOutput $StdOutPath -RedirectStandardError $StdErrPath
+}
+
 try {
     Write-Host "[smoke] starting node1"
-    $node1 = Start-Process -FilePath $daemonExe -ArgumentList @("--bind", $node1Bind, "--network-port", "$node1Port") -PassThru -WindowStyle Hidden -RedirectStandardOutput $node1Out -RedirectStandardError $node1Err -Environment @{
+    $node1 = Start-DaemonProcess -Bind $node1Bind -NetworkPort $node1Port -StdOutPath $node1Out -StdErrPath $node1Err -Environment @{
         BOUNDLESS_CONFIG_PATH = $node1Config
         BOUNDLESS_SECURITY_ROOT = $node1Security
         BOUNDLESS_ADVERTISE_HOST = "127.0.0.1"
@@ -188,7 +213,7 @@ try {
     }
 
     Write-Host "[smoke] starting node2"
-    $node2 = Start-Process -FilePath $daemonExe -ArgumentList @("--bind", $node2Bind, "--network-port", "$node2Port") -PassThru -WindowStyle Hidden -RedirectStandardOutput $node2Out -RedirectStandardError $node2Err -Environment @{
+    $node2 = Start-DaemonProcess -Bind $node2Bind -NetworkPort $node2Port -StdOutPath $node2Out -StdErrPath $node2Err -Environment @{
         BOUNDLESS_CONFIG_PATH = $node2Config
         BOUNDLESS_SECURITY_ROOT = $node2Security
         BOUNDLESS_ADVERTISE_HOST = "127.0.0.1"
