@@ -1,10 +1,10 @@
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, SocketAddrV6},
 };
 
 use anyhow::{Context, Result};
-use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tracing::{debug, info, warn};
 
 use core_discovery::{DiscoveryAnnouncement, MDNS_SERVICE_TYPE, mdns_instance_name};
@@ -146,9 +146,7 @@ fn announcement_from_resolved(resolved: &ResolvedService) -> Option<DiscoveryAnn
         .unwrap_or(machine_id.as_str())
         .to_string();
 
-    let endpoint_ip =
-        preferred_endpoint_ip(resolved.get_addresses().iter().map(|ip| ip.to_ip_addr()))?;
-    let endpoint = SocketAddr::new(endpoint_ip, resolved.get_port());
+    let endpoint = preferred_endpoint_addr(resolved.get_addresses().iter(), resolved.get_port())?;
 
     Some(DiscoveryAnnouncement {
         machine_id,
@@ -157,22 +155,27 @@ fn announcement_from_resolved(resolved: &ResolvedService) -> Option<DiscoveryAnn
     })
 }
 
-fn preferred_endpoint_ip<I>(addresses: I) -> Option<IpAddr>
+fn preferred_endpoint_addr<'a, I>(addresses: I, port: u16) -> Option<SocketAddr>
 where
-    I: Iterator<Item = IpAddr>,
+    I: Iterator<Item = &'a ScopedIp>,
 {
-    let mut ipv4: Option<IpAddr> = None;
-    let mut ipv6: Option<IpAddr> = None;
+    let mut ipv4: Option<SocketAddr> = None;
+    let mut ipv6: Option<SocketAddr> = None;
 
     for address in addresses {
         if address.is_loopback() {
             continue;
         }
 
-        if address.is_ipv4() && ipv4.is_none() {
-            ipv4 = Some(address);
-        } else if address.is_ipv6() && ipv6.is_none() {
-            ipv6 = Some(address);
+        match address {
+            ScopedIp::V4(v4) if ipv4.is_none() => {
+                ipv4 = Some(SocketAddr::new(IpAddr::V4(*v4.addr()), port));
+            }
+            ScopedIp::V6(v6) if ipv6.is_none() => {
+                let socket = SocketAddrV6::new(*v6.addr(), port, 0, v6.scope_id().index);
+                ipv6 = Some(SocketAddr::V6(socket));
+            }
+            _ => {}
         }
     }
 
@@ -185,27 +188,44 @@ mod tests {
 
     #[test]
     fn preferred_endpoint_prefers_ipv4() {
-        let ip = preferred_endpoint_ip(
-            [
-                "fe80::1".parse().expect("ipv6"),
-                "10.0.0.9".parse().expect("ipv4"),
-            ]
-            .into_iter(),
+        let addresses: Vec<ScopedIp> = vec![
+            "fe80::1".parse::<IpAddr>().expect("ipv6").into(),
+            "10.0.0.9".parse::<IpAddr>().expect("ipv4").into(),
+        ];
+        let endpoint = preferred_endpoint_addr(addresses.iter(), 15100).expect("endpoint");
+        assert_eq!(
+            endpoint,
+            "10.0.0.9:15100".parse::<SocketAddr>().expect("parse")
         )
-        .expect("ip");
-        assert_eq!(ip, "10.0.0.9".parse::<IpAddr>().expect("parse"));
     }
 
     #[test]
     fn preferred_endpoint_ignores_loopback() {
-        let ip = preferred_endpoint_ip(
-            [
-                "127.0.0.1".parse().expect("loopback"),
-                "10.0.0.4".parse().expect("ipv4"),
-            ]
-            .into_iter(),
+        let addresses: Vec<ScopedIp> = vec![
+            "127.0.0.1".parse::<IpAddr>().expect("loopback").into(),
+            "10.0.0.4".parse::<IpAddr>().expect("ipv4").into(),
+        ];
+        let endpoint = preferred_endpoint_addr(addresses.iter(), 15100).expect("endpoint");
+        assert_eq!(
+            endpoint,
+            "10.0.0.4:15100".parse::<SocketAddr>().expect("parse")
         )
-        .expect("ip");
-        assert_eq!(ip, "10.0.0.4".parse::<IpAddr>().expect("parse"));
+    }
+
+    #[test]
+    fn preferred_endpoint_uses_ipv6_when_ipv4_missing() {
+        let addresses: Vec<ScopedIp> = vec!["fe80::1".parse::<IpAddr>().expect("ipv6").into()];
+        let endpoint = preferred_endpoint_addr(addresses.iter(), 15100).expect("endpoint");
+
+        match endpoint {
+            SocketAddr::V6(v6) => {
+                assert_eq!(
+                    v6.ip(),
+                    &"fe80::1".parse::<std::net::Ipv6Addr>().expect("ipv6")
+                );
+                assert_eq!(v6.port(), 15100);
+            }
+            SocketAddr::V4(_) => panic!("expected IPv6 endpoint"),
+        }
     }
 }
