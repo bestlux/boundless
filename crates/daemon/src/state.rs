@@ -434,6 +434,7 @@ impl AppState {
         &self,
         text: String,
     ) -> Result<bool> {
+        let connected_peer_ids = self.connected_peer_ids().await;
         let hash = match self.validated_clipboard_text_hash(&text).await? {
             Some(hash) => hash,
             None => return Ok(false),
@@ -441,20 +442,27 @@ impl AppState {
 
         {
             let mut sync = self.clipboard_sync.write().await;
-            if sync.suppress_echo_hash.as_deref() == Some(hash.as_str()) {
+            if let Some(suppress_hash) = sync.suppress_echo_hash.as_deref() {
+                if suppress_hash == hash.as_str() {
+                    sync.suppress_echo_hash = None;
+                    sync.last_observed_hash = Some(hash);
+                    return Ok(false);
+                }
+                // Clipboard moved on before the echo value was observed; drop stale token.
                 sync.suppress_echo_hash = None;
-                sync.last_observed_hash = Some(hash);
+            }
+
+            if connected_peer_ids.is_empty() {
+                // Do not cache disconnected observations. On next peer connect we should
+                // still broadcast current clipboard contents.
+                sync.last_observed_hash = None;
                 return Ok(false);
             }
+
             if sync.last_observed_hash.as_deref() == Some(hash.as_str()) {
                 return Ok(false);
             }
             sync.last_observed_hash = Some(hash);
-        }
-
-        let connected_peer_ids = self.connected_peer_ids().await;
-        if connected_peer_ids.is_empty() {
-            return Ok(false);
         }
 
         let mut queue_map = self.outgoing_payloads.write().await;
@@ -1357,6 +1365,115 @@ mod tests {
             !suppressed,
             "clipboard observer should suppress immediate echo after remote apply"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn clipboard_sync_does_not_cache_hash_when_no_peers_connected() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-clipboard-connect-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_a, _) = state.create_pairing_code(120).await;
+        let peer_a = state
+            .join_peer(
+                code_a,
+                "127.0.0.1:15100".to_string(),
+                Some("peer-a".to_string()),
+            )
+            .await
+            .expect("join peer-a");
+
+        let queued_disconnected = state
+            .queue_local_clipboard_text_for_connected_peers("hello".to_string())
+            .await
+            .expect("queue while disconnected");
+        assert!(
+            !queued_disconnected,
+            "must not queue without connected peers"
+        );
+        assert!(
+            state.drain_outgoing(&peer_a).await.is_empty(),
+            "no payloads should be queued while disconnected"
+        );
+
+        state
+            .set_peer_connected(&peer_a, true)
+            .await
+            .expect("connect peer-a");
+
+        let queued_connected = state
+            .queue_local_clipboard_text_for_connected_peers("hello".to_string())
+            .await
+            .expect("queue on connect");
+        assert!(
+            queued_connected,
+            "same clipboard value should queue once peers are connected"
+        );
+        let outgoing = state.drain_outgoing(&peer_a).await;
+        assert_eq!(outgoing.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn clipboard_sync_clears_stale_suppress_token_after_mismatch() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-clipboard-stale-suppress-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_a, _) = state.create_pairing_code(120).await;
+        let peer_a = state
+            .join_peer(
+                code_a,
+                "127.0.0.1:15100".to_string(),
+                Some("peer-a".to_string()),
+            )
+            .await
+            .expect("join peer-a");
+        state
+            .set_peer_connected(&peer_a, true)
+            .await
+            .expect("connect peer-a");
+
+        state
+            .enqueue_remote_clipboard_text(&peer_a, "remote".to_string())
+            .await
+            .expect("enqueue remote");
+        let remote = state
+            .dequeue_remote_clipboard_text()
+            .await
+            .expect("remote item");
+        state.mark_remote_clipboard_applied(&remote.hash).await;
+
+        let different = state
+            .queue_local_clipboard_text_for_connected_peers("different".to_string())
+            .await
+            .expect("queue different");
+        assert!(different, "different local clipboard value should queue");
+
+        let remote_again = state
+            .queue_local_clipboard_text_for_connected_peers("remote".to_string())
+            .await
+            .expect("queue remote again");
+        assert!(
+            remote_again,
+            "stale suppression token must not suppress later legitimate reuse"
+        );
+
+        let outgoing = state.drain_outgoing(&peer_a).await;
+        assert_eq!(outgoing.len(), 2);
 
         let _ = std::fs::remove_dir_all(&root);
     }
