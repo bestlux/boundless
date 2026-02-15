@@ -17,7 +17,9 @@ use core_clipboard::{
     validate_bmp_payload, validate_payload,
 };
 use core_discovery::parse_manual_target;
-use core_input::{InputEvent, InputFrame, InputRouter, InputSink, KeyState, RouteDecision};
+use core_input::{
+    InputEvent, InputFrame, InputRouter, InputSink, KeyState, MAX_EVENTS_PER_FRAME, RouteDecision,
+};
 use core_security::{
     DeviceIdentity, SecurityPaths, TrustBundle, TrustRecord, default_security_root,
     ensure_device_identity, ensure_trust_store, fingerprint, generate_pairing_code,
@@ -99,6 +101,7 @@ pub struct AppState {
     input_router: Arc<RwLock<InputRouter>>,
     input_sequence_by_peer: Arc<RwLock<HashMap<String, u64>>>,
     pending_inject_input_frames: Arc<RwLock<VecDeque<PendingInjectInputFrame>>>,
+    input_capture_target_peer_id: Arc<RwLock<Option<String>>>,
 }
 
 impl AppState {
@@ -169,6 +172,7 @@ impl AppState {
             input_router: Arc::new(RwLock::new(InputRouter::new(input_enabled))),
             input_sequence_by_peer: Arc::new(RwLock::new(HashMap::new())),
             pending_inject_input_frames: Arc::new(RwLock::new(VecDeque::new())),
+            input_capture_target_peer_id: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -364,6 +368,10 @@ impl AppState {
             self.discovered_endpoints.write().await.remove(peer_id);
             self.clear_pending_inject_input_frames_for_peer(peer_id)
                 .await;
+            let mut capture_target = self.input_capture_target_peer_id.write().await;
+            if capture_target.as_deref() == Some(peer_id) {
+                *capture_target = None;
+            }
         }
         Ok(removed)
     }
@@ -632,27 +640,8 @@ impl AppState {
     }
 
     pub async fn queue_input_move(&self, peer_id: &str, dx: i32, dy: i32) -> Result<()> {
-        if self.get_peer(peer_id).await.is_none() {
-            anyhow::bail!("unknown peer {peer_id}");
-        }
-
-        let sequence = {
-            let mut sequences = self.input_sequence_by_peer.write().await;
-            let entry = sequences.entry(peer_id.to_string()).or_insert(0);
-            *entry += 1;
-            *entry
-        };
-
-        let mut queue_map = self.outgoing_payloads.write().await;
-        queue_map
-            .entry(peer_id.to_string())
-            .or_default()
-            .push_back(OutboundPayload::InputFrame {
-                sequence,
-                timestamp_unix_ms: Utc::now().timestamp_millis(),
-                events: vec![InputEvent::MouseMove { dx, dy }],
-            });
-        Ok(())
+        self.queue_input_events(peer_id, vec![InputEvent::MouseMove { dx, dy }])
+            .await
     }
 
     pub async fn queue_input_key(
@@ -661,8 +650,29 @@ impl AppState {
         scan_code: u16,
         key_state: KeyState,
     ) -> Result<()> {
+        self.queue_input_events(
+            peer_id,
+            vec![InputEvent::Key {
+                scan_code,
+                state: key_state,
+            }],
+        )
+        .await
+    }
+
+    pub async fn queue_input_events(&self, peer_id: &str, events: Vec<InputEvent>) -> Result<()> {
         if self.get_peer(peer_id).await.is_none() {
             anyhow::bail!("unknown peer {peer_id}");
+        }
+        if events.is_empty() {
+            anyhow::bail!("input frame must include at least one event");
+        }
+        if events.len() > MAX_EVENTS_PER_FRAME {
+            anyhow::bail!(
+                "input frame event count exceeds limit: {} > {}",
+                events.len(),
+                MAX_EVENTS_PER_FRAME
+            );
         }
 
         let sequence = {
@@ -679,10 +689,7 @@ impl AppState {
             .push_back(OutboundPayload::InputFrame {
                 sequence,
                 timestamp_unix_ms: Utc::now().timestamp_millis(),
-                events: vec![InputEvent::Key {
-                    scan_code,
-                    state: key_state,
-                }],
+                events,
             });
         Ok(())
     }
@@ -1020,6 +1027,48 @@ impl AppState {
             .map(|owner| owner.to_string())
     }
 
+    pub async fn set_input_capture_target(&self, peer_id: Option<&str>) -> Result<Option<String>> {
+        let next = match peer_id.map(str::trim) {
+            Some("") | None => None,
+            Some(peer_id) => {
+                if self.get_peer(peer_id).await.is_none() {
+                    anyhow::bail!("unknown peer {peer_id}");
+                }
+                Some(peer_id.to_string())
+            }
+        };
+
+        let mut target = self.input_capture_target_peer_id.write().await;
+        *target = next.clone();
+        Ok(next)
+    }
+
+    pub async fn clear_input_capture_target(&self) {
+        *self.input_capture_target_peer_id.write().await = None;
+    }
+
+    pub async fn input_capture_target(&self) -> Option<String> {
+        self.input_capture_target_peer_id.read().await.clone()
+    }
+
+    pub async fn active_input_capture_target(&self) -> Option<String> {
+        let target = self.input_capture_target().await?;
+        let config = self.config.read().await;
+        let share_input_enabled = config.features.get("share_input").copied().unwrap_or(true);
+        if !share_input_enabled {
+            return None;
+        }
+        if config
+            .peers
+            .iter()
+            .any(|peer| peer.peer_id == target && peer.connected)
+        {
+            Some(target)
+        } else {
+            None
+        }
+    }
+
     pub async fn safe_reset(&self, network_only: bool, all: bool) -> Result<()> {
         let mut config = self.config.write().await;
 
@@ -1041,6 +1090,7 @@ impl AppState {
             InputRouter::new(config.features.get("share_input").copied().unwrap_or(true));
         self.input_sequence_by_peer.write().await.clear();
         self.pending_inject_input_frames.write().await.clear();
+        *self.input_capture_target_peer_id.write().await = None;
 
         save_config_at(&self.config_path, &config)
     }
@@ -1070,15 +1120,20 @@ impl AppState {
             .input_owner()
             .await
             .unwrap_or_else(|| "none".to_string());
+        let input_capture_target = self
+            .input_capture_target()
+            .await
+            .unwrap_or_else(|| "none".to_string());
 
         let report = format!(
-            "Boundless Diagnostics\nMachine: {}\nFingerprint: {}\nPeers: {}\nTrusted CAs: {}\nTransport Events: {}\nInput Owner: {}\nAPI: {}\nTransport Port: {}\nProtocol: {}\n",
+            "Boundless Diagnostics\nMachine: {}\nFingerprint: {}\nPeers: {}\nTrusted CAs: {}\nTransport Events: {}\nInput Owner: {}\nInput Capture Target: {}\nAPI: {}\nTransport Port: {}\nProtocol: {}\n",
             snapshot.machine_id,
             self.fingerprint(),
             snapshot.peers.len(),
             trust_count,
             event_count,
             input_owner,
+            input_capture_target,
             snapshot.api_bind,
             snapshot.network_port,
             snapshot.protocol_version
@@ -1468,6 +1523,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn input_capture_target_requires_known_peer() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-capture-target-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let err = state
+            .set_input_capture_target(Some("missing-peer"))
+            .await
+            .expect_err("unknown peer must fail");
+        assert!(err.to_string().contains("unknown peer"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn active_input_capture_target_requires_connected_peer_and_feature_enabled() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-capture-active-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        let set = state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set capture target");
+        assert_eq!(set.as_deref(), Some(peer_id.as_str()));
+        assert_eq!(
+            state.input_capture_target().await.as_deref(),
+            Some(peer_id.as_str())
+        );
+        assert!(
+            state.active_input_capture_target().await.is_none(),
+            "disconnected peer must not be capture-active"
+        );
+
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect peer");
+        assert_eq!(
+            state.active_input_capture_target().await.as_deref(),
+            Some(peer_id.as_str())
+        );
+
+        state
+            .set_feature("share_input".to_string(), false)
+            .await
+            .expect("disable input share");
+        assert!(
+            state.active_input_capture_target().await.is_none(),
+            "disabled share_input must block capture"
+        );
+
+        state
+            .set_feature("share_input".to_string(), true)
+            .await
+            .expect("enable input share");
+        assert_eq!(
+            state.active_input_capture_target().await.as_deref(),
+            Some(peer_id.as_str())
+        );
+
+        state.clear_input_capture_target().await;
+        assert!(state.input_capture_target().await.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn remove_peer_clears_input_capture_target() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-remove-capture-target-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set target");
+        assert_eq!(
+            state.input_capture_target().await.as_deref(),
+            Some(peer_id.as_str())
+        );
+
+        state.remove_peer(&peer_id).await.expect("remove");
+        assert!(
+            state.input_capture_target().await.is_none(),
+            "removed peer should clear capture target"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn store_incoming_file_rejects_unsafe_name() {
         let root = std::env::temp_dir().join(format!(
             "boundless-incoming-file-test-{}",
@@ -1730,6 +1912,78 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, MAX_PENDING_INJECT_INPUT_FRAMES);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn queue_input_events_validates_size_and_increments_sequence() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-queue-input-events-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        let empty_err = state
+            .queue_input_events(&peer_id, Vec::new())
+            .await
+            .expect_err("empty events must fail");
+        assert!(empty_err.to_string().contains("at least one event"));
+
+        let too_many = vec![InputEvent::MouseMove { dx: 1, dy: 1 }; MAX_EVENTS_PER_FRAME + 1];
+        let too_many_err = state
+            .queue_input_events(&peer_id, too_many)
+            .await
+            .expect_err("oversized frame must fail");
+        assert!(too_many_err.to_string().contains("exceeds limit"));
+
+        state
+            .queue_input_events(
+                &peer_id,
+                vec![
+                    InputEvent::MouseMove { dx: 2, dy: 3 },
+                    InputEvent::Key {
+                        scan_code: 30,
+                        state: KeyState::Down,
+                    },
+                ],
+            )
+            .await
+            .expect("queue frame 1");
+        state
+            .queue_input_events(
+                &peer_id,
+                vec![InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Up,
+                }],
+            )
+            .await
+            .expect("queue frame 2");
+
+        let queued = state.drain_outgoing(&peer_id).await;
+        assert_eq!(queued.len(), 2);
+        assert!(matches!(
+            queued.first(),
+            Some(OutboundPayload::InputFrame { sequence: 1, events, .. }) if events.len() == 2
+        ));
+        assert!(matches!(
+            queued.get(1),
+            Some(OutboundPayload::InputFrame { sequence: 2, events, .. }) if events.len() == 1
+        ));
 
         let _ = std::fs::remove_dir_all(&root);
     }

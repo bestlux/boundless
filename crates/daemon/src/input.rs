@@ -1,26 +1,34 @@
 use std::time::Duration;
 
+#[cfg(windows)]
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use tokio::time;
 use tracing::warn;
 
-use core_input::InputEvent;
+use core_input::{InputEvent, MAX_EVENTS_PER_FRAME};
 
 use crate::state::{AppState, PendingInjectInputFrame};
 
 #[cfg(windows)]
-use windows_sys::Win32::UI::{
-    Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-        KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-        MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-        MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-        SendInput,
+use windows_sys::Win32::{
+    Foundation::POINT,
+    UI::{
+        Input::KeyboardAndMouse::{
+            GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+            KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX,
+            MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+            MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+            MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW,
+            SendInput,
+        },
+        WindowsAndMessaging::{GetCursorPos, XBUTTON1, XBUTTON2},
     },
-    WindowsAndMessaging::{XBUTTON1, XBUTTON2},
 };
 
 const INPUT_TICK: Duration = Duration::from_millis(5);
+const INPUT_CAPTURE_TICK: Duration = Duration::from_millis(8);
 
 pub fn start(state: AppState) {
     tokio::spawn(async move {
@@ -31,12 +39,26 @@ pub fn start(state: AppState) {
 }
 
 async fn run(state: AppState) -> Result<()> {
-    let mut backend = input_backend();
-    let mut ticker = time::interval(INPUT_TICK);
+    let mut inject_backend = input_backend();
+    let mut capture_backend = input_capture_backend();
+    let mut inject_ticker = time::interval(INPUT_TICK);
+    let mut capture_ticker = time::interval(INPUT_CAPTURE_TICK);
+    let mut last_capture_target: Option<String> = None;
 
     loop {
-        ticker.tick().await;
-        drain_pending_inject_frames(&state, backend.as_mut()).await;
+        tokio::select! {
+            _ = inject_ticker.tick() => {
+                drain_pending_inject_frames(&state, inject_backend.as_mut()).await;
+            }
+            _ = capture_ticker.tick() => {
+                capture_and_queue_outgoing_frames(
+                    &state,
+                    capture_backend.as_mut(),
+                    &mut last_capture_target,
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -84,8 +106,51 @@ fn apply_frame(backend: &mut dyn InputBackend, frame: &PendingInjectInputFrame) 
     Ok(())
 }
 
+async fn capture_and_queue_outgoing_frames(
+    state: &AppState,
+    backend: &mut dyn InputCaptureBackend,
+    last_capture_target: &mut Option<String>,
+) {
+    let capture_target = state.active_input_capture_target().await;
+    if &capture_target != last_capture_target {
+        backend.reset();
+        *last_capture_target = capture_target.clone();
+    }
+
+    let Some(peer_id) = capture_target else {
+        return;
+    };
+
+    match backend.poll_events() {
+        Ok(events) => {
+            if events.is_empty() {
+                return;
+            }
+
+            for chunk in events.chunks(MAX_EVENTS_PER_FRAME) {
+                if let Err(error) = state.queue_input_events(&peer_id, chunk.to_vec()).await {
+                    warn!(
+                        peer_id = %peer_id,
+                        error = ?error,
+                        "failed to queue captured local input frame"
+                    );
+                    break;
+                }
+            }
+        }
+        Err(error) => {
+            warn!(error = ?error, "input capture poll failed");
+        }
+    }
+}
+
 trait InputBackend: Send {
     fn apply(&mut self, event: &InputEvent) -> Result<()>;
+}
+
+trait InputCaptureBackend: Send {
+    fn reset(&mut self);
+    fn poll_events(&mut self) -> Result<Vec<InputEvent>>;
 }
 
 fn input_backend() -> Box<dyn InputBackend> {
@@ -100,6 +165,18 @@ fn input_backend() -> Box<dyn InputBackend> {
     }
 }
 
+fn input_capture_backend() -> Box<dyn InputCaptureBackend> {
+    #[cfg(windows)]
+    {
+        Box::new(WindowsCaptureBackend::default())
+    }
+
+    #[cfg(not(windows))]
+    {
+        Box::new(NoopCaptureBackend)
+    }
+}
+
 #[cfg(not(windows))]
 struct NoopInputBackend;
 
@@ -107,6 +184,18 @@ struct NoopInputBackend;
 impl InputBackend for NoopInputBackend {
     fn apply(&mut self, _event: &InputEvent) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+struct NoopCaptureBackend;
+
+#[cfg(not(windows))]
+impl InputCaptureBackend for NoopCaptureBackend {
+    fn reset(&mut self) {}
+
+    fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
+        Ok(Vec::new())
     }
 }
 
@@ -121,6 +210,173 @@ impl InputBackend for WindowsInputBackend {
         send_input_records(&records)
             .with_context(|| format!("SendInput failed for {}", input_event_kind(event)))
     }
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct WindowsCaptureBackend {
+    last_cursor: Option<(i32, i32)>,
+    last_key_down: HashMap<u16, bool>,
+    last_button_down: HashMap<u16, bool>,
+}
+
+#[cfg(windows)]
+impl InputCaptureBackend for WindowsCaptureBackend {
+    fn reset(&mut self) {
+        self.last_cursor = None;
+        self.last_key_down.clear();
+        self.last_button_down.clear();
+    }
+
+    fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
+        let mut events = Vec::new();
+
+        if let Some((x, y)) = cursor_position()? {
+            if let Some((last_x, last_y)) = self.last_cursor {
+                let dx = x - last_x;
+                let dy = y - last_y;
+                if dx != 0 || dy != 0 {
+                    events.push(InputEvent::MouseMove { dx, dy });
+                }
+            }
+            self.last_cursor = Some((x, y));
+        }
+
+        for (vk, button) in mouse_button_virtual_keys() {
+            let down = is_virtual_key_down(vk);
+            if let Some(last) = self.last_button_down.insert(vk, down)
+                && last != down
+            {
+                events.push(InputEvent::MouseButton {
+                    button,
+                    state: if down {
+                        core_input::KeyState::Down
+                    } else {
+                        core_input::KeyState::Up
+                    },
+                });
+            }
+        }
+
+        for &vk in captured_key_virtual_keys() {
+            let down = is_virtual_key_down(vk);
+            if let Some(last) = self.last_key_down.insert(vk, down)
+                && last != down
+                && let Some(scan_code) = vk_to_scan_code(vk)
+            {
+                events.push(InputEvent::Key {
+                    scan_code,
+                    state: if down {
+                        core_input::KeyState::Down
+                    } else {
+                        core_input::KeyState::Up
+                    },
+                });
+            }
+        }
+
+        Ok(events)
+    }
+}
+
+#[cfg(windows)]
+const VK_LBUTTON_CODE: u16 = 0x01;
+#[cfg(windows)]
+const VK_RBUTTON_CODE: u16 = 0x02;
+#[cfg(windows)]
+const VK_MBUTTON_CODE: u16 = 0x04;
+#[cfg(windows)]
+const VK_XBUTTON1_CODE: u16 = 0x05;
+#[cfg(windows)]
+const VK_XBUTTON2_CODE: u16 = 0x06;
+
+#[cfg(windows)]
+const CAPTURE_KEY_VIRTUAL_KEYS: &[u16] = &[
+    0x08, // backspace
+    0x09, // tab
+    0x0D, // enter
+    0x14, // caps lock
+    0x1B, // escape
+    0x20, // space
+    0x21, // page up
+    0x22, // page down
+    0x23, // end
+    0x24, // home
+    0x25, // left
+    0x26, // up
+    0x27, // right
+    0x28, // down
+    0x2D, // insert
+    0x2E, // delete
+    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, // 0-9
+    0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50,
+    0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, // A-Z
+    0x5B, // left windows
+    0x5C, // right windows
+    0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, // numpad 0-9
+    0x6A, // numpad *
+    0x6B, // numpad +
+    0x6D, // numpad -
+    0x6E, // numpad .
+    0x6F, // numpad /
+    0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, // F1-F12
+    0x90, // num lock
+    0x91, // scroll lock
+    0xA0, // left shift
+    0xA1, // right shift
+    0xA2, // left control
+    0xA3, // right control
+    0xA4, // left alt
+    0xA5, // right alt
+    0xBA, // ;
+    0xBB, // =
+    0xBC, // ,
+    0xBD, // -
+    0xBE, // .
+    0xBF, // /
+    0xC0, // `
+    0xDB, // [
+    0xDC, // \
+    0xDD, // ]
+    0xDE, // '
+];
+
+#[cfg(windows)]
+fn mouse_button_virtual_keys() -> [(u16, core_input::MouseButton); 5] {
+    [
+        (VK_LBUTTON_CODE, core_input::MouseButton::Left),
+        (VK_RBUTTON_CODE, core_input::MouseButton::Right),
+        (VK_MBUTTON_CODE, core_input::MouseButton::Middle),
+        (VK_XBUTTON1_CODE, core_input::MouseButton::X1),
+        (VK_XBUTTON2_CODE, core_input::MouseButton::X2),
+    ]
+}
+
+#[cfg(windows)]
+fn captured_key_virtual_keys() -> &'static [u16] {
+    CAPTURE_KEY_VIRTUAL_KEYS
+}
+
+#[cfg(windows)]
+fn cursor_position() -> Result<Option<(i32, i32)>> {
+    let mut point = POINT { x: 0, y: 0 };
+    let ok = unsafe { GetCursorPos(&mut point as *mut POINT) };
+    if ok == 0 {
+        return Ok(None);
+    }
+    Ok(Some((point.x, point.y)))
+}
+
+#[cfg(windows)]
+fn is_virtual_key_down(vk: u16) -> bool {
+    let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
+    (state as u16 & 0x8000) != 0
+}
+
+#[cfg(windows)]
+fn vk_to_scan_code(vk: u16) -> Option<u16> {
+    let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) } as u16;
+    if scan == 0 { None } else { Some(scan) }
 }
 
 #[cfg(windows)]
@@ -208,6 +464,11 @@ fn mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> INPUT {
 #[cfg(windows)]
 fn keyboard_input(scan_code: u16, key_up: bool) -> INPUT {
     let mut flags = KEYEVENTF_SCANCODE;
+    let mut normalized_scan_code = scan_code;
+    if (scan_code & 0xFF00) == 0xE000 {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+        normalized_scan_code = scan_code & 0x00FF;
+    }
     if key_up {
         flags |= KEYEVENTF_KEYUP;
     }
@@ -217,7 +478,7 @@ fn keyboard_input(scan_code: u16, key_up: bool) -> INPUT {
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: 0,
-                wScan: scan_code,
+                wScan: normalized_scan_code,
                 dwFlags: flags,
                 time: 0,
                 dwExtraInfo: 0,
@@ -260,6 +521,9 @@ fn input_event_kind(event: &InputEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     #[cfg(not(windows))]
+    use std::collections::VecDeque;
+
+    #[cfg(not(windows))]
     use super::*;
     #[cfg(windows)]
     use super::*;
@@ -297,6 +561,33 @@ mod tests {
         fn apply(&mut self, _event: &InputEvent) -> Result<()> {
             self.applied += 1;
             Ok(())
+        }
+    }
+
+    #[cfg(not(windows))]
+    struct ScriptedCaptureBackend {
+        batches: VecDeque<Vec<InputEvent>>,
+        reset_count: usize,
+    }
+
+    #[cfg(not(windows))]
+    impl ScriptedCaptureBackend {
+        fn new(batches: Vec<Vec<InputEvent>>) -> Self {
+            Self {
+                batches: VecDeque::from(batches),
+                reset_count: 0,
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    impl InputCaptureBackend for ScriptedCaptureBackend {
+        fn reset(&mut self) {
+            self.reset_count += 1;
+        }
+
+        fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
+            Ok(self.batches.pop_front().unwrap_or_default())
         }
     }
 
@@ -371,6 +662,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn capture_queues_events_for_active_target_and_chunks_batches() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set target");
+
+        let events = vec![InputEvent::MouseMove { dx: 1, dy: 1 }; MAX_EVENTS_PER_FRAME + 1];
+        let mut backend = ScriptedCaptureBackend::new(vec![events]);
+        let mut last_target = None;
+
+        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+        let queued = state.drain_outgoing(&peer_id).await;
+        assert_eq!(queued.len(), 2);
+        assert!(matches!(
+            queued.first(),
+            Some(crate::state::OutboundPayload::InputFrame { sequence: 1, events, .. }) if events.len() == MAX_EVENTS_PER_FRAME
+        ));
+        assert!(matches!(
+            queued.get(1),
+            Some(crate::state::OutboundPayload::InputFrame { sequence: 2, events, .. }) if events.len() == 1
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn capture_resets_backend_when_target_becomes_inactive() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set target");
+
+        let mut backend = ScriptedCaptureBackend::new(vec![Vec::new(), Vec::new()]);
+        let mut last_target = None;
+        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+        let reset_after_set = backend.reset_count;
+        assert!(
+            reset_after_set >= 1,
+            "initial target activation should reset capture backend"
+        );
+
+        state.clear_input_capture_target().await;
+        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+        assert!(
+            backend.reset_count > reset_after_set,
+            "clearing target should reset capture backend"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(windows)]
     #[test]
     fn maps_key_event_to_scan_code_record() {
@@ -385,6 +740,24 @@ mod tests {
         assert_eq!(record.wScan, 30);
         assert_eq!(record.dwFlags & KEYEVENTF_SCANCODE, KEYEVENTF_SCANCODE);
         assert_eq!(record.dwFlags & KEYEVENTF_KEYUP, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn maps_extended_scan_code_with_extended_flag() {
+        let records = input_records_for_event(&InputEvent::Key {
+            scan_code: 0xE04D,
+            state: core_input::KeyState::Down,
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].r#type, INPUT_KEYBOARD);
+
+        let record = unsafe { records[0].Anonymous.ki };
+        assert_eq!(record.wScan, 0x4D);
+        assert_eq!(
+            record.dwFlags & KEYEVENTF_EXTENDEDKEY,
+            KEYEVENTF_EXTENDEDKEY
+        );
     }
 
     #[cfg(windows)]
