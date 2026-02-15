@@ -304,12 +304,29 @@ where
     send_message(&mut writer, &local_hello).await?;
 
     let remote_peer_id = Some(authenticated_peer_id.clone());
+    let mut observed_reconnect_generation = state
+        .peer_reconnect_generation(&authenticated_peer_id)
+        .await;
     let mut remote_protocol: Option<ProtocolVersion> = None;
     let mut inbound_transfers: HashMap<String, InboundTransfer> = HashMap::new();
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                if reconnect_requested_for_peer(
+                    &state,
+                    &authenticated_peer_id,
+                    &mut observed_reconnect_generation,
+                )
+                .await
+                {
+                    info!(
+                        peer_id = %authenticated_peer_id,
+                        "ending session due to explicit reconnect request"
+                    );
+                    break;
+                }
+
                 let heartbeat = WireMessage::Heartbeat {
                     machine_id: snapshot.machine_id.clone(),
                     timestamp_unix_ms: now_millis(),
@@ -327,6 +344,20 @@ where
                 }
             }
             read = reader.read_line(&mut line) => {
+                if reconnect_requested_for_peer(
+                    &state,
+                    &authenticated_peer_id,
+                    &mut observed_reconnect_generation,
+                )
+                .await
+                {
+                    info!(
+                        peer_id = %authenticated_peer_id,
+                        "ending session due to explicit reconnect request"
+                    );
+                    break;
+                }
+
                 let read = read.context("read transport line")?;
                 if read == 0 {
                     break;
@@ -656,6 +687,20 @@ where
     }
 
     Ok(())
+}
+
+async fn reconnect_requested_for_peer(
+    state: &AppState,
+    peer_id: &str,
+    observed_generation: &mut u64,
+) -> bool {
+    let current_generation = state.peer_reconnect_generation(peer_id).await;
+    if current_generation <= *observed_generation {
+        return false;
+    }
+
+    *observed_generation = current_generation;
+    true
 }
 
 async fn authenticated_peer_machine_id<S>(
@@ -1400,6 +1445,35 @@ mod tests {
 
         drop(listener);
         drop(blocker);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn reconnect_request_signal_is_edge_triggered_per_generation() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let mut observed = state.peer_reconnect_generation(&peer_id).await;
+
+        assert!(
+            !reconnect_requested_for_peer(&state, &peer_id, &mut observed).await,
+            "no reconnect request should be visible initially"
+        );
+
+        state.request_peer_reconnect(&peer_id).await;
+        assert!(
+            reconnect_requested_for_peer(&state, &peer_id, &mut observed).await,
+            "new reconnect generation should be observed once"
+        );
+        assert!(
+            !reconnect_requested_for_peer(&state, &peer_id, &mut observed).await,
+            "same generation must not retrigger"
+        );
+
+        state.request_peer_reconnect(&peer_id).await;
+        assert!(
+            reconnect_requested_for_peer(&state, &peer_id, &mut observed).await,
+            "next generation should retrigger"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 }
