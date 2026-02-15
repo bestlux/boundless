@@ -36,6 +36,9 @@ pub enum OutboundPayload {
     ClipboardText {
         text: String,
     },
+    ClipboardImage {
+        image_bmp: Vec<u8>,
+    },
     File {
         file_name: String,
         bytes: Vec<u8>,
@@ -58,9 +61,9 @@ pub struct TransportEventRecord {
 }
 
 #[derive(Debug, Clone)]
-pub struct PendingRemoteClipboardText {
+pub struct PendingRemoteClipboardPayload {
     pub peer_id: String,
-    pub text: String,
+    pub payload: ClipboardPayload,
     pub hash: String,
 }
 
@@ -68,7 +71,7 @@ pub struct PendingRemoteClipboardText {
 struct ClipboardSyncState {
     last_observed_hash: Option<String>,
     suppress_echo_hash: Option<String>,
-    pending_remote: VecDeque<PendingRemoteClipboardText>,
+    pending_remote: VecDeque<PendingRemoteClipboardPayload>,
 }
 
 #[derive(Clone)]
@@ -430,12 +433,41 @@ impl AppState {
         Ok(())
     }
 
+    pub async fn queue_clipboard_image(&self, peer_id: &str, image_bmp: Vec<u8>) -> Result<()> {
+        if self.get_peer(peer_id).await.is_none() {
+            anyhow::bail!("unknown peer {peer_id}");
+        }
+
+        let mut queue_map = self.outgoing_payloads.write().await;
+        queue_map
+            .entry(peer_id.to_string())
+            .or_default()
+            .push_back(OutboundPayload::ClipboardImage { image_bmp });
+        Ok(())
+    }
+
     pub async fn queue_local_clipboard_text_for_connected_peers(
         &self,
         text: String,
     ) -> Result<bool> {
+        self.queue_local_clipboard_payload_for_connected_peers(ClipboardPayload::Text(text))
+            .await
+    }
+
+    pub async fn queue_local_clipboard_image_for_connected_peers(
+        &self,
+        image_bmp: Vec<u8>,
+    ) -> Result<bool> {
+        self.queue_local_clipboard_payload_for_connected_peers(ClipboardPayload::Image(image_bmp))
+            .await
+    }
+
+    async fn queue_local_clipboard_payload_for_connected_peers(
+        &self,
+        payload: ClipboardPayload,
+    ) -> Result<bool> {
         let connected_peer_ids = self.connected_peer_ids().await;
-        let hash = match self.validated_clipboard_text_hash(&text).await? {
+        let hash = match self.validated_clipboard_payload_hash(&payload).await? {
             Some(hash) => hash,
             None => return Ok(false),
         };
@@ -467,19 +499,54 @@ impl AppState {
 
         let mut queue_map = self.outgoing_payloads.write().await;
         for peer_id in &connected_peer_ids {
+            let outbound = match &payload {
+                ClipboardPayload::Text(text) => {
+                    OutboundPayload::ClipboardText { text: text.clone() }
+                }
+                ClipboardPayload::Image(bytes) => OutboundPayload::ClipboardImage {
+                    image_bmp: bytes.clone(),
+                },
+            };
+
             queue_map
                 .entry(peer_id.clone())
                 .or_default()
-                .push_back(OutboundPayload::ClipboardText { text: text.clone() });
+                .push_back(outbound);
         }
 
         Ok(true)
     }
 
     pub async fn enqueue_remote_clipboard_text(&self, peer_id: &str, text: String) -> Result<()> {
-        self.record_incoming_clipboard_text(peer_id, &text).await;
+        self.enqueue_remote_clipboard_payload(peer_id, ClipboardPayload::Text(text))
+            .await
+    }
 
-        let hash = match self.validated_clipboard_text_hash(&text).await? {
+    pub async fn enqueue_remote_clipboard_image(
+        &self,
+        peer_id: &str,
+        image_bmp: Vec<u8>,
+    ) -> Result<()> {
+        self.enqueue_remote_clipboard_payload(peer_id, ClipboardPayload::Image(image_bmp))
+            .await
+    }
+
+    async fn enqueue_remote_clipboard_payload(
+        &self,
+        peer_id: &str,
+        payload: ClipboardPayload,
+    ) -> Result<()> {
+        match &payload {
+            ClipboardPayload::Text(text) => {
+                self.record_incoming_clipboard_text(peer_id, text).await;
+            }
+            ClipboardPayload::Image(image_bmp) => {
+                self.record_incoming_clipboard_image(peer_id, image_bmp.len())
+                    .await;
+            }
+        }
+
+        let hash = match self.validated_clipboard_payload_hash(&payload).await? {
             Some(hash) => hash,
             None => return Ok(()),
         };
@@ -491,19 +558,23 @@ impl AppState {
         if sync.pending_remote.len() >= MAX_PENDING_REMOTE_CLIPBOARD_ITEMS {
             sync.pending_remote.pop_front();
         }
-        sync.pending_remote.push_back(PendingRemoteClipboardText {
-            peer_id: peer_id.to_string(),
-            text,
-            hash,
-        });
+        sync.pending_remote
+            .push_back(PendingRemoteClipboardPayload {
+                peer_id: peer_id.to_string(),
+                payload,
+                hash,
+            });
         Ok(())
     }
 
-    pub async fn dequeue_remote_clipboard_text(&self) -> Option<PendingRemoteClipboardText> {
+    pub async fn dequeue_remote_clipboard_payload(&self) -> Option<PendingRemoteClipboardPayload> {
         self.clipboard_sync.write().await.pending_remote.pop_front()
     }
 
-    pub async fn requeue_remote_clipboard_text_front(&self, item: PendingRemoteClipboardText) {
+    pub async fn requeue_remote_clipboard_payload_front(
+        &self,
+        item: PendingRemoteClipboardPayload,
+    ) {
         let mut sync = self.clipboard_sync.write().await;
         if sync.pending_remote.len() >= MAX_PENDING_REMOTE_CLIPBOARD_ITEMS {
             sync.pending_remote.pop_back();
@@ -621,6 +692,30 @@ impl AppState {
             peer_id: peer_id.to_string(),
             detail: preview,
             size_bytes: text.len() as u64,
+        })
+        .await;
+    }
+
+    pub async fn record_incoming_clipboard_image(&self, peer_id: &str, size_bytes: usize) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "incoming".to_string(),
+            kind: "clipboard_image".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("bmp image {} bytes", size_bytes),
+            size_bytes: size_bytes as u64,
+        })
+        .await;
+    }
+
+    pub async fn record_outgoing_clipboard_image(&self, peer_id: &str, size_bytes: usize) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "outgoing".to_string(),
+            kind: "clipboard_image".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("bmp image {} bytes", size_bytes),
+            size_bytes: size_bytes as u64,
         })
         .await;
     }
@@ -811,7 +906,10 @@ impl AppState {
             .collect()
     }
 
-    async fn validated_clipboard_text_hash(&self, text: &str) -> Result<Option<String>> {
+    async fn validated_clipboard_payload_hash(
+        &self,
+        payload: &ClipboardPayload,
+    ) -> Result<Option<String>> {
         let policy = ClipboardPolicy {
             enabled: self
                 .config
@@ -823,10 +921,9 @@ impl AppState {
                 .unwrap_or(true),
             ..ClipboardPolicy::default()
         };
-        let payload = ClipboardPayload::Text(text.to_string());
 
-        match validate_payload(policy, &payload) {
-            Ok(()) => Ok(Some(payload_hash_hex(&payload))),
+        match validate_payload(policy, payload) {
+            Ok(()) => Ok(Some(payload_hash_hex(payload))),
             Err(ClipboardPolicyError::Disabled) => Ok(None),
             Err(error) => Err(anyhow::anyhow!(error)),
         }
@@ -1351,10 +1448,13 @@ mod tests {
             .await
             .expect("enqueue remote");
         let remote = state
-            .dequeue_remote_clipboard_text()
+            .dequeue_remote_clipboard_payload()
             .await
             .expect("remote item");
-        assert_eq!(remote.text, "remote");
+        assert!(matches!(
+            remote.payload,
+            ClipboardPayload::Text(ref text) if text == "remote"
+        ));
         state.mark_remote_clipboard_applied(&remote.hash).await;
 
         let suppressed = state
@@ -1452,7 +1552,7 @@ mod tests {
             .await
             .expect("enqueue remote");
         let remote = state
-            .dequeue_remote_clipboard_text()
+            .dequeue_remote_clipboard_payload()
             .await
             .expect("remote item");
         state.mark_remote_clipboard_applied(&remote.hash).await;
@@ -1474,6 +1574,83 @@ mod tests {
 
         let outgoing = state.drain_outgoing(&peer_a).await;
         assert_eq!(outgoing.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn clipboard_image_sync_dedupes_and_suppresses_remote_echo() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-clipboard-image-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_a, _) = state.create_pairing_code(120).await;
+        let peer_a = state
+            .join_peer(
+                code_a,
+                "127.0.0.1:15100".to_string(),
+                Some("peer-a".to_string()),
+            )
+            .await
+            .expect("join peer-a");
+        state
+            .set_peer_connected(&peer_a, true)
+            .await
+            .expect("connect peer-a");
+
+        let image = vec![b'B', b'M', 1, 2, 3, 4];
+        let queued = state
+            .queue_local_clipboard_image_for_connected_peers(image.clone())
+            .await
+            .expect("queue local image");
+        assert!(queued, "initial clipboard image should be queued");
+
+        let first = state.drain_outgoing(&peer_a).await;
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            first.first(),
+            Some(OutboundPayload::ClipboardImage { image_bmp }) if image_bmp == &image
+        ));
+
+        let deduped = state
+            .queue_local_clipboard_image_for_connected_peers(image.clone())
+            .await
+            .expect("dedupe image");
+        assert!(!deduped, "unchanged clipboard image should be ignored");
+
+        state
+            .enqueue_remote_clipboard_image(&peer_a, image.clone())
+            .await
+            .expect("enqueue remote image");
+        let remote = state
+            .dequeue_remote_clipboard_payload()
+            .await
+            .expect("remote image item");
+        assert!(matches!(
+            remote.payload,
+            ClipboardPayload::Image(ref image_bmp) if image_bmp == &image
+        ));
+        state.mark_remote_clipboard_applied(&remote.hash).await;
+
+        let suppressed = state
+            .queue_local_clipboard_image_for_connected_peers(image.clone())
+            .await
+            .expect("suppress remote image echo");
+        assert!(
+            !suppressed,
+            "clipboard observer should suppress immediate image echo after remote apply"
+        );
+
+        let changed = state
+            .queue_local_clipboard_image_for_connected_peers(vec![b'B', b'M', 9, 9, 9, 9])
+            .await
+            .expect("queue changed image");
+        assert!(changed, "different clipboard image should queue");
 
         let _ = std::fs::remove_dir_all(&root);
     }

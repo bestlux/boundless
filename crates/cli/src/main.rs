@@ -21,8 +21,8 @@ use tonic::{codegen::Service, transport::Uri};
 use ipc_api::boundless::v1::{
     DiagnosticsDumpRequest, Empty, FeatureSetRequest, HotkeySetRequest, ImportTrustBundleRequest,
     InputOwnerRequest, LayoutSetRequest, PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest,
-    SafeResetRequest, SendClipboardTextRequest, SendFileRequest, SendInputMoveRequest,
-    StatusRequest, daemon_service_client::DaemonServiceClient,
+    SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest,
+    SendInputMoveRequest, StatusRequest, daemon_service_client::DaemonServiceClient,
     diagnostics_service_client::DiagnosticsServiceClient,
     feature_service_client::FeatureServiceClient, pairing_service_client::PairingServiceClient,
     topology_service_client::TopologyServiceClient,
@@ -143,6 +143,10 @@ enum TransportCommand {
         peer_id: String,
         text: String,
     },
+    SendImage {
+        peer_id: String,
+        path: String,
+    },
     SendFile {
         peer_id: String,
         path: String,
@@ -232,6 +236,9 @@ async fn main() -> Result<()> {
         Command::Transport { command } => match command {
             TransportCommand::SendText { peer_id, text } => {
                 transport_send_text(&cli.endpoint, peer_id, text).await
+            }
+            TransportCommand::SendImage { peer_id, path } => {
+                transport_send_image(&cli.endpoint, peer_id, path).await
             }
             TransportCommand::SendFile { peer_id, path } => {
                 transport_send_file(&cli.endpoint, peer_id, path).await
@@ -504,6 +511,20 @@ async fn transport_send_text(endpoint: &str, peer_id: String, text: String) -> R
     Ok(())
 }
 
+async fn transport_send_image(endpoint: &str, peer_id: String, path: String) -> Result<()> {
+    let image_bmp = std::fs::read(&path).with_context(|| format!("read {path}"))?;
+    validate_bmp_payload(&image_bmp).with_context(|| format!("invalid BMP payload at {path}"))?;
+
+    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .send_clipboard_image(SendClipboardImageRequest { peer_id, image_bmp })
+        .await?
+        .into_inner();
+
+    println!("ok={} message={}", response.ok, response.message);
+    Ok(())
+}
+
 async fn transport_send_file(endpoint: &str, peer_id: String, path: String) -> Result<()> {
     let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
     let response = client
@@ -704,6 +725,17 @@ fn is_pipe_busy_error(error: &io::Error) -> bool {
     error.raw_os_error() == Some(ERROR_PIPE_BUSY_CODE)
 }
 
+fn validate_bmp_payload(bytes: &[u8]) -> Result<()> {
+    const BMP_MIN_BYTES: usize = 14;
+    if bytes.len() < BMP_MIN_BYTES {
+        bail!("bmp payload is too small");
+    }
+    if bytes[0] != b'B' || bytes[1] != b'M' {
+        bail!("bmp payload must start with BM header");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +758,25 @@ mod tests {
     fn parse_npipe_endpoint_ignores_http_endpoint() {
         let parsed = parse_npipe_endpoint("http://127.0.0.1:50051").expect("parse");
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn validate_bmp_payload_rejects_non_bmp() {
+        let err = validate_bmp_payload(&[0, 1, 2]).expect_err("must fail");
+        assert!(err.to_string().contains("too small"));
+
+        let err = validate_bmp_payload(&[b'P', b'N', 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2])
+            .expect_err("must fail");
+        assert!(err.to_string().contains("BM"));
+    }
+
+    #[test]
+    fn validate_bmp_payload_accepts_header() {
+        let payload = [
+            b'B', b'M', 0, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, // file header
+            40, 0, 0, 0, // minimal DIB header bytes start
+        ];
+        validate_bmp_payload(&payload).expect("must accept");
     }
 
     #[cfg(windows)]

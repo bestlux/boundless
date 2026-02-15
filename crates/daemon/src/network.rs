@@ -358,6 +358,47 @@ where
                             }
                         }
                     }
+                    WireMessage::ClipboardImage {
+                        machine_id,
+                        data_b64,
+                    } => {
+                        if machine_id != authenticated_peer_id {
+                            warn!(
+                                claimed_machine_id = %machine_id,
+                                authenticated_machine_id = %authenticated_peer_id,
+                                "dropping clipboard image payload with mismatched machine_id"
+                            );
+                            continue;
+                        }
+
+                        let image_bmp = match decode_bytes_b64(&data_b64) {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                warn!(error = ?error, "failed to decode clipboard image payload");
+                                continue;
+                            }
+                        };
+
+                        if let Some(peer_id) = &remote_peer_id {
+                            let size_bytes = image_bmp.len();
+                            if let Err(error) = state
+                                .enqueue_remote_clipboard_image(peer_id, image_bmp)
+                                .await
+                            {
+                                warn!(
+                                    peer_id = %peer_id,
+                                    error = ?error,
+                                    "failed to enqueue incoming clipboard image payload"
+                                );
+                            } else {
+                                info!(
+                                    peer_id = %peer_id,
+                                    size_bytes,
+                                    "received clipboard image payload"
+                                );
+                            }
+                        }
+                    }
                     WireMessage::FileStart {
                         machine_id,
                         transfer_id,
@@ -645,6 +686,16 @@ where
             };
             send_message(writer, &message).await?;
             state.record_outgoing_clipboard_text(peer_id, text).await;
+        }
+        OutboundPayload::ClipboardImage { image_bmp } => {
+            let message = WireMessage::ClipboardImage {
+                machine_id: local_machine_id.to_string(),
+                data_b64: encode_bytes_b64(image_bmp),
+            };
+            send_message(writer, &message).await?;
+            state
+                .record_outgoing_clipboard_image(peer_id, image_bmp.len())
+                .await;
         }
         OutboundPayload::File { file_name, bytes } => {
             let total_bytes = bytes.len() as u64;

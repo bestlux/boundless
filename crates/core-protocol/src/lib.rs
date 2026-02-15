@@ -142,6 +142,10 @@ pub enum WireMessage {
         machine_id: String,
         text: String,
     },
+    ClipboardImage {
+        machine_id: String,
+        data_b64: String,
+    },
     FileStart {
         machine_id: String,
         transfer_id: String,
@@ -340,6 +344,18 @@ mod tests {
         let original = WireMessage::FileChunk {
             transfer_id: "xfer-1".to_string(),
             data_b64: encode_bytes_b64(&[10u8, 20, 30]),
+        };
+
+        let encoded = encode_line(&original).expect("encode");
+        let decoded = decode_line(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn wire_message_clipboard_image_round_trip() {
+        let original = WireMessage::ClipboardImage {
+            machine_id: "machine-a".to_string(),
+            data_b64: encode_bytes_b64(&[1u8, 2, 3, 4]),
         };
 
         let encoded = encode_line(&original).expect("encode");

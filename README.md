@@ -77,6 +77,7 @@ Queue transport payloads and inspect events:
 
 ```bash
 cargo run -p boundless-cli -- transport send-text <peer_id> "hello"
+cargo run -p boundless-cli -- transport send-image <peer_id> ./path/to/image.bmp
 cargo run -p boundless-cli -- transport send-file <peer_id> ./path/to/file.txt
 cargo run -p boundless-cli -- transport events --limit 100
 ```
@@ -101,4 +102,4 @@ cargo run -p boundless-cli -- input release <peer_id>
 
 ## Notes
 
-Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, real clipboard text runtime sync (watch/apply with echo suppression), queued file payload transfer primitives, input routing groundwork (ownership control-plane + synthetic input frame transport routed through a no-op sink), and mDNS runtime discovery with manual address fallback. Windows input injection and clipboard image sync remain upcoming slices.
+Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, real clipboard runtime sync for text and bitmap image payloads (watch/apply with echo suppression), queued file payload transfer primitives, input routing groundwork (ownership control-plane + synthetic input frame transport routed through a no-op sink), and mDNS runtime discovery with manual address fallback. Windows input injection remains an upcoming slice.
