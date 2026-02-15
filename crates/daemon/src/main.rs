@@ -1,5 +1,6 @@
 mod config;
 mod logging;
+mod network;
 mod services;
 mod state;
 
@@ -15,6 +16,9 @@ use crate::{services::ServiceBundle, state::AppState};
 struct Args {
     #[arg(long)]
     bind: Option<String>,
+
+    #[arg(long)]
+    network_port: Option<u16>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -43,6 +47,12 @@ async fn main() -> Result<()> {
             .await
             .context("update bind address")?;
     }
+    if let Some(port) = args.network_port {
+        state
+            .update_network_port(port)
+            .await
+            .context("update network port")?;
+    }
 
     let snapshot = state.snapshot().await;
     let addr = snapshot
@@ -58,9 +68,12 @@ async fn main() -> Result<()> {
         diagnostics,
     } = ServiceBundle::new(state.clone());
 
+    network::start(state.clone());
+
     info!(
         machine_id = %snapshot.machine_id,
         api_bind = %snapshot.api_bind,
+        network_port = snapshot.network_port,
         protocol = %snapshot.protocol_version,
         "boundless daemon starting"
     );

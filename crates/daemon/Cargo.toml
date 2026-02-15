@@ -21,6 +21,8 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
 
 core-clipboard = { path = "../core-clipboard" }
 core-discovery = { path = "../core-discovery" }

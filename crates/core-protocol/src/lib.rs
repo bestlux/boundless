@@ -120,6 +120,44 @@ pub fn negotiate(
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireMessage {
+    Hello {
+        machine_id: String,
+        display_name: String,
+        protocol: ProtocolVersion,
+        capability_count: usize,
+    },
+    HelloAck {
+        machine_id: String,
+        accepted: bool,
+    },
+    Heartbeat {
+        machine_id: String,
+        timestamp_unix_ms: i64,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum WireCodecError {
+    #[error("json serialization error: {0}")]
+    Serialize(#[from] serde_json::Error),
+}
+
+pub fn encode_line(message: &WireMessage) -> Result<String, WireCodecError> {
+    let mut line = serde_json::to_string(message)?;
+    line.push('\n');
+    Ok(line)
+}
+
+pub fn decode_line(line: &str) -> Result<WireMessage, WireCodecError> {
+    Ok(serde_json::from_str(line.trim())?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +233,17 @@ mod tests {
         .expect_err("must reject");
 
         assert!(matches!(err, NegotiationError::MajorMismatch { .. }));
+    }
+
+    #[test]
+    fn wire_message_round_trip() {
+        let original = WireMessage::Heartbeat {
+            machine_id: "abc".to_string(),
+            timestamp_unix_ms: 123,
+        };
+
+        let encoded = encode_line(&original).expect("encode");
+        let decoded = decode_line(&encoded).expect("decode");
+        assert_eq!(decoded, original);
     }
 }

@@ -50,6 +50,19 @@ Generate pairing code:
 cargo run -p boundless-cli -- pair create-code --ttl 300
 ```
 
+Export/import trust bundles:
+
+```bash
+cargo run -p boundless-cli -- pair export-trust --output node-a.json
+cargo run -p boundless-cli -- pair import-trust --input node-b.json --alias node-b
+```
+
+Two-node smoke test (PowerShell):
+
+```powershell
+./scripts/dev/two-node-smoke.ps1
+```
+
 ## Release model
 
 - Conventional Commits drive semver intent
@@ -58,4 +71,4 @@ cargo run -p boundless-cli -- pair create-code --ttl 300
 
 ## Notes
 
-Alpha scope currently emphasizes architecture and reliability primitives. Windows input injection, TLS transport for inter-machine traffic, and mDNS runtime discovery are planned next implementation slices.
+Alpha scope emphasizes reliability primitives and now includes a basic TLS transport/session layer with heartbeat/reconnect scaffolding. Windows input injection, clipboard/file streaming over transport, and mDNS runtime discovery are upcoming slices.
