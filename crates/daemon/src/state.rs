@@ -264,6 +264,11 @@ impl AppState {
         let removed = before != config.peers.len();
         if removed {
             save_config_at(&self.config_path, &config)?;
+
+            let mut owner = self.input_owner_peer_id.write().await;
+            if owner.as_deref() == Some(peer_id) {
+                *owner = None;
+            }
         }
         Ok(removed)
     }
@@ -761,6 +766,67 @@ mod tests {
         let after = std::fs::read_to_string(&config_path).expect("read after");
 
         assert_eq!(before, after, "touch should not write config file");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn remove_peer_clears_input_owner_and_allows_new_claim() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-remove-owner-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_one, _) = state.create_pairing_code(120).await;
+        let peer_one = state
+            .join_peer(
+                code_one,
+                "127.0.0.1:15100".to_string(),
+                Some("peer-one".to_string()),
+            )
+            .await
+            .expect("join peer one");
+
+        let (code_two, _) = state.create_pairing_code(120).await;
+        let peer_two = state
+            .join_peer(
+                code_two,
+                "127.0.0.1:15101".to_string(),
+                Some("peer-two".to_string()),
+            )
+            .await
+            .expect("join peer two");
+
+        let claimed = state
+            .claim_input_owner(&peer_one, false)
+            .await
+            .expect("claim owner");
+        assert!(claimed);
+        assert_eq!(
+            state.input_owner().await.as_deref(),
+            Some(peer_one.as_str())
+        );
+
+        let removed = state.remove_peer(&peer_one).await.expect("remove peer");
+        assert!(removed);
+        assert!(
+            state.input_owner().await.is_none(),
+            "owner should be cleared"
+        );
+
+        let claimed_second = state
+            .claim_input_owner(&peer_two, false)
+            .await
+            .expect("claim second peer");
+        assert!(
+            claimed_second,
+            "new claim should not be blocked by stale owner"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
