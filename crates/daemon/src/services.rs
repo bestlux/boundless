@@ -7,8 +7,8 @@ use ipc_api::boundless::v1::{
     HotkeySetRequest, ImportTrustBundleRequest, InputOwnerReply, InputOwnerRequest, LayoutReply,
     LayoutSetRequest, OperationReply, PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply,
     PairJoinRequest, PeerInfo, PeerListReply, RemovePeerRequest, SafeResetRequest,
-    SendClipboardTextRequest, SendFileRequest, SendInputMoveRequest, StatusReply, StatusRequest,
-    TransportEvent, TransportEventsReply, TrustBundleReply,
+    SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputMoveRequest,
+    StatusReply, StatusRequest, TransportEvent, TransportEventsReply, TrustBundleReply,
     daemon_service_server::{DaemonService, DaemonServiceServer},
     diagnostics_service_server::{DiagnosticsService, DiagnosticsServiceServer},
     feature_service_server::{FeatureService, FeatureServiceServer},
@@ -332,6 +332,22 @@ impl DiagnosticsService for DiagnosticsApi {
         Ok(Response::new(OperationReply {
             ok: true,
             message: "clipboard payload queued".to_string(),
+        }))
+    }
+
+    async fn send_clipboard_image(
+        &self,
+        request: Request<SendClipboardImageRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        self.0
+            .queue_clipboard_image(&request.peer_id, request.image_bmp)
+            .await
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        Ok(Response::new(OperationReply {
+            ok: true,
+            message: "clipboard image payload queued".to_string(),
         }))
     }
 

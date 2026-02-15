@@ -299,6 +299,22 @@ try {
     Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=clipboard_text peer_id=$node1PeerId" -Seconds $TimeoutSeconds
     Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_text peer_id=$node2PeerId" -Seconds $TimeoutSeconds
 
+    $sampleImage = Join-Path $runRoot "sample-clipboard.bmp"
+    [byte[]]$bmpBytes = @(
+        0x42,0x4D,0x3A,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x36,0x00,0x00,0x00,
+        0x28,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,0x00,0x18,0x00,
+        0x00,0x00,0x00,0x00,0x04,0x00,0x00,0x00,0x13,0x0B,0x00,0x00,0x13,0x0B,0x00,0x00,
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0xFF,0x00
+    )
+    [System.IO.File]::WriteAllBytes($sampleImage, $bmpBytes)
+
+    Write-Host "[smoke] sending clipboard image payload from node1 to node2"
+    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("transport", "send-image", $node1PeerId, $sampleImage) | Out-Host
+
+    Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=clipboard_image peer_id=$node1PeerId" -Seconds $TimeoutSeconds
+    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_image peer_id=$node2PeerId" -Seconds $TimeoutSeconds
+
     $sampleFile = Join-Path $runRoot "sample-transfer.txt"
     Set-Content -Path $sampleFile -Value "smoke-file-payload" -NoNewline
 

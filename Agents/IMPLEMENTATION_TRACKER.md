@@ -30,9 +30,9 @@
 - [x] Added Windows named-pipe control-plane adapter with TCP fallback + CLI `npipe://` endpoint support
 - [x] Added mDNS discovery runtime with discovered-endpoint override + manual address fallback
 - [x] Added real clipboard text runtime sync path (OS clipboard watcher + inbound apply + echo suppression)
+- [x] Added clipboard image sync path (wire transport + runtime apply/watch + diagnostics CLI enqueue helper)
 
 ## Next (priority order)
 
-- [ ] Implement clipboard image sync path
 - [ ] Implement real input capture/injection pipeline
 - [ ] Add richer multi-machine integration assertions beyond payload smoke

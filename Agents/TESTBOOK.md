@@ -19,6 +19,7 @@
 - The smoke harness runs daemon API in TCP mode (`--api-transport tcp`) even though Windows default is named pipe, to keep two-node automation deterministic
 - mDNS discovery is enabled during daemon runtime; transport workers prefer discovered endpoints and fall back to configured/manual peer addresses
 - Runtime clipboard text sync is active in daemon; diagnostics `transport send-text` remains available as an explicit test hook
+- Runtime clipboard image sync is active in daemon for BMP payloads; diagnostics `transport send-image <peer_id> <path.bmp>` is available as an explicit test hook
 - Run `scripts/dev/validate.ps1` for fmt/test/clippy plus smoke in one command
 
 ## Test cases
@@ -51,9 +52,10 @@
 
 7. Transport payload checks
 - On Machine A: `transport send-text <peer_id> "sample text"`
+- On Machine A: `transport send-image <peer_id> <path-to-bmp>`
 - On Machine A: `transport send-file <peer_id> <path>`
 - On both machines: `transport events --limit 100`
-- Confirm outgoing/incoming events are present and file appears in receiver inbox root
+- Confirm outgoing/incoming events are present for text/image/file and file appears in receiver inbox root
 
 8. Input owner arbitration
 - On Machine A: `input owner` (expect none)

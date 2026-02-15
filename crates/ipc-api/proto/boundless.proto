@@ -106,6 +106,11 @@ message SendClipboardTextRequest {
   string text = 2;
 }
 
+message SendClipboardImageRequest {
+  string peer_id = 1;
+  bytes image_bmp = 2;
+}
+
 message SendFileRequest {
   string peer_id = 1;
   string file_path = 2;
@@ -169,6 +174,7 @@ service DiagnosticsService {
   rpc Dump(DiagnosticsDumpRequest) returns (DiagnosticsDumpReply);
   rpc SafeReset(SafeResetRequest) returns (OperationReply);
   rpc SendClipboardText(SendClipboardTextRequest) returns (OperationReply);
+  rpc SendClipboardImage(SendClipboardImageRequest) returns (OperationReply);
   rpc SendFile(SendFileRequest) returns (OperationReply);
   rpc SendInputMove(SendInputMoveRequest) returns (OperationReply);
   rpc ListTransportEvents(Empty) returns (TransportEventsReply);
