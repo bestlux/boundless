@@ -149,6 +149,9 @@ async fn capture_and_queue_outgoing_frames(
     }
 
     let Some(peer_id) = capture_target else {
+        if let Err(error) = backend.poll_events() {
+            warn!(error = ?error, "input capture drain while inactive failed");
+        }
         return;
     };
 
@@ -1058,6 +1061,7 @@ mod tests {
         batches: VecDeque<Vec<InputEvent>>,
         release_events: Vec<InputEvent>,
         reset_count: usize,
+        poll_count: usize,
     }
 
     impl ScriptedCaptureBackend {
@@ -1066,6 +1070,7 @@ mod tests {
                 batches: VecDeque::from(batches),
                 release_events,
                 reset_count: 0,
+                poll_count: 0,
             }
         }
     }
@@ -1080,6 +1085,7 @@ mod tests {
         }
 
         fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
+            self.poll_count += 1;
             Ok(self.batches.pop_front().unwrap_or_default())
         }
     }
@@ -1210,6 +1216,29 @@ mod tests {
         assert!(
             backend.reset_count > reset_after_set,
             "clearing target should reset capture backend"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn capture_drains_events_while_inactive() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        let mut backend = ScriptedCaptureBackend::new(
+            vec![vec![InputEvent::MouseMove { dx: 5, dy: -3 }]],
+            Vec::new(),
+        );
+        let mut last_target = None;
+
+        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+
+        assert_eq!(
+            backend.poll_count, 1,
+            "inactive capture loop should drain backend events"
+        );
+        assert!(
+            state.drain_outgoing(&peer_id).await.is_empty(),
+            "inactive drain must not enqueue frames"
         );
 
         let _ = std::fs::remove_dir_all(root);
