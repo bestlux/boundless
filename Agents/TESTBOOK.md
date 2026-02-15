@@ -20,6 +20,7 @@
 - mDNS discovery is enabled during daemon runtime; transport workers prefer discovered endpoints and fall back to configured/manual peer addresses
 - Runtime clipboard text sync is active in daemon; diagnostics `transport send-text` remains available as an explicit test hook
 - Runtime clipboard image sync is active in daemon for BMP payloads; diagnostics `transport send-image <peer_id> <path.bmp>` is available as an explicit test hook
+- Runtime input injection queue is active in daemon; on Windows, queued input events are applied via `SendInput`
 - Run `scripts/dev/validate.ps1` for fmt/test/clippy plus smoke in one command
 
 ## Test cases

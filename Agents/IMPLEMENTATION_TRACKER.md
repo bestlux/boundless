@@ -32,6 +32,7 @@
 - [x] Added real clipboard text runtime sync path (OS clipboard watcher + inbound apply + echo suppression)
 - [x] Added clipboard image sync path (wire transport + runtime apply/watch + diagnostics CLI enqueue helper)
 - [x] Added input injection runtime queue + backend abstraction and synthetic key diagnostics helper
+- [x] Implemented Windows `SendInput` runtime injection backend for mouse/key events
 
 ## Next (priority order)
 
