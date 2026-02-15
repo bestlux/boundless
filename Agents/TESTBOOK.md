@@ -6,6 +6,14 @@
 - Same build version of `boundlessd` and `boundlessctl`
 - Firewall allows selected daemon ports
 
+## Fast automation path
+
+- Run `scripts/dev/two-node-smoke.ps1` to validate:
+  - daemon startup on two isolated node configs
+  - trust bundle export/import
+  - TLS transport session establishment
+  - heartbeat-driven connected state reporting
+
 ## Test cases
 
 1. Daemon lifecycle

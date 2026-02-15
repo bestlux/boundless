@@ -14,14 +14,17 @@
 - [x] Implemented `boundlessctl` command surface for alpha operations
 - [x] Added structured logging and diagnostics dump/safe-reset handlers
 - [x] Added baseline tests and passing workspace test suite
+- [x] Implemented TLS identity bootstrap (local CA + device cert/key generation)
+- [x] Added trust bundle export/import workflow through CLI and local API
+- [x] Implemented initial inter-machine transport listener/session loop
+- [x] Added heartbeat and reconnect worker scaffolding for peer links
+- [x] Added two-node scripted smoke harness (`scripts/dev/two-node-smoke.ps1`)
 
 ## Next (priority order)
 
 - [ ] Replace loopback gRPC transport with Windows named pipe transport adapter
-- [ ] Implement true inter-machine transport and heartbeat/reconnect loop
-- [ ] Implement TLS cert issuance + validation for peer sessions
 - [ ] Implement mDNS discovery runtime with manual fallback integration
 - [ ] Implement real clipboard/text-image sync pipeline
 - [ ] Implement file transfer pipeline and chunking protocol
 - [ ] Implement real input capture/injection pipeline
-- [ ] Add multi-machine integration harness and scripted 2-machine test flow
+- [ ] Add richer multi-machine integration assertions beyond connectivity smoke

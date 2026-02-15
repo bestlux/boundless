@@ -33,6 +33,21 @@ message PairJoinReply {
   string message = 3;
 }
 
+message TrustBundleReply {
+  string machine_id = 1;
+  string display_name = 2;
+  string network_address = 3;
+  string ca_cert_pem = 4;
+}
+
+message ImportTrustBundleRequest {
+  string machine_id = 1;
+  string display_name = 2;
+  string network_address = 3;
+  string ca_cert_pem = 4;
+  string alias = 5;
+}
+
 message PeerInfo {
   string peer_id = 1;
   string display_name = 2;
@@ -91,6 +106,8 @@ service DaemonService {
 service PairingService {
   rpc CreateCode(PairCreateCodeRequest) returns (PairCreateCodeReply);
   rpc Join(PairJoinRequest) returns (PairJoinReply);
+  rpc ExportTrustBundle(Empty) returns (TrustBundleReply);
+  rpc ImportTrustBundle(ImportTrustBundleRequest) returns (OperationReply);
 }
 
 service TopologyService {

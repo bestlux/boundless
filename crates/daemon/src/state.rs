@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -6,39 +6,139 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use core_security::{
-    SecurityPaths, default_security_root, ensure_trust_store, fingerprint, generate_pairing_code,
-    load_or_create_device_secret,
+    DeviceIdentity, SecurityPaths, TrustBundle, TrustRecord, default_security_root,
+    ensure_device_identity, ensure_trust_store, fingerprint, generate_pairing_code,
+    load_or_create_device_secret, load_trust_records, upsert_trust_record,
 };
 
-use crate::config::{PeerConfig, RuntimeConfig, load_or_create_config, save_config};
+use crate::config::{
+    PeerConfig, RuntimeConfig, config_path, load_or_create_config_at, save_config_at,
+};
 
 #[derive(Clone)]
 pub struct AppState {
+    config_path: Arc<PathBuf>,
     config: Arc<RwLock<RuntimeConfig>>,
     pairing_codes: Arc<RwLock<HashMap<String, DateTime<Utc>>>>,
+    security_paths: Arc<SecurityPaths>,
+    identity: Arc<DeviceIdentity>,
     device_fingerprint: Arc<String>,
 }
 
 impl AppState {
     pub fn load_or_create() -> Result<Self> {
-        let config = load_or_create_config()?;
+        let config_path = config_path();
+        let security_root = default_security_root();
+        Self::load_or_create_with_paths(config_path, security_root)
+    }
 
-        let paths = SecurityPaths::for_root(default_security_root());
+    pub fn load_or_create_with_paths(config_path: PathBuf, security_root: PathBuf) -> Result<Self> {
+        let config = load_or_create_config_at(&config_path)?;
+
+        let paths = SecurityPaths::for_root(security_root);
         let secret = load_or_create_device_secret(&paths)?;
         ensure_trust_store(&paths)?;
+        let advertised_host = std::env::var("BOUNDLESS_ADVERTISE_HOST").ok();
+        let identity = ensure_device_identity(
+            &paths,
+            &config.machine_id,
+            &config.device_name,
+            advertised_host.as_deref(),
+        )?;
+
+        // Ensure self trust record exists. This enables symmetric mTLS setups and local test loops.
+        upsert_trust_record(
+            &paths,
+            TrustRecord {
+                machine_id: config.machine_id.clone(),
+                ca_cert_pem: identity.ca_cert_pem.clone(),
+                added_at: Utc::now(),
+            },
+        )?;
+
         let fingerprint = fingerprint(&secret);
 
-        info!(machine_id = %config.machine_id, "state loaded");
+        info!(
+            machine_id = %config.machine_id,
+            config_path = %config_path.display(),
+            security_root = %paths.root.display(),
+            "state loaded"
+        );
 
         Ok(Self {
+            config_path: Arc::new(config_path),
             config: Arc::new(RwLock::new(config)),
             pairing_codes: Arc::new(RwLock::new(HashMap::new())),
+            security_paths: Arc::new(paths),
+            identity: Arc::new(identity),
             device_fingerprint: Arc::new(fingerprint),
         })
     }
 
     pub fn fingerprint(&self) -> &str {
         self.device_fingerprint.as_ref().as_str()
+    }
+
+    pub fn identity(&self) -> &DeviceIdentity {
+        self.identity.as_ref()
+    }
+
+    pub async fn trusted_records(&self) -> Result<Vec<TrustRecord>> {
+        load_trust_records(&self.security_paths)
+    }
+
+    pub async fn export_trust_bundle(&self) -> Result<TrustBundle> {
+        let snapshot = self.snapshot().await;
+
+        let advertised_host = std::env::var("BOUNDLESS_ADVERTISE_HOST")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| snapshot.device_name.clone());
+
+        Ok(TrustBundle {
+            machine_id: snapshot.machine_id,
+            display_name: snapshot.device_name,
+            network_address: format!("{advertised_host}:{}", snapshot.network_port),
+            ca_cert_pem: self.identity.ca_cert_pem.clone(),
+        })
+    }
+
+    pub async fn import_trust_bundle(
+        &self,
+        bundle: TrustBundle,
+        alias: Option<String>,
+    ) -> Result<()> {
+        upsert_trust_record(
+            &self.security_paths,
+            TrustRecord {
+                machine_id: bundle.machine_id.clone(),
+                ca_cert_pem: bundle.ca_cert_pem.clone(),
+                added_at: Utc::now(),
+            },
+        )?;
+
+        let mut config = self.config.write().await;
+
+        if let Some(peer) = config
+            .peers
+            .iter_mut()
+            .find(|p| p.peer_id == bundle.machine_id)
+        {
+            peer.address = bundle.network_address;
+            peer.display_name = alias.unwrap_or(bundle.display_name);
+            peer.connected = false;
+            peer.last_seen = Utc::now();
+        } else {
+            config.peers.push(PeerConfig {
+                peer_id: bundle.machine_id,
+                display_name: alias.unwrap_or(bundle.display_name),
+                address: bundle.network_address,
+                connected: false,
+                last_seen: Utc::now(),
+            });
+        }
+
+        save_config_at(&self.config_path, &config)
     }
 
     pub async fn snapshot(&self) -> RuntimeConfig {
@@ -48,7 +148,13 @@ impl AppState {
     pub async fn update_bind(&self, bind: String) -> Result<()> {
         let mut config = self.config.write().await;
         config.api_bind = bind;
-        save_config(&config)
+        save_config_at(&self.config_path, &config)
+    }
+
+    pub async fn update_network_port(&self, port: u16) -> Result<()> {
+        let mut config = self.config.write().await;
+        config.network_port = port;
+        save_config_at(&self.config_path, &config)
     }
 
     pub async fn create_pairing_code(&self, ttl_secs: u64) -> (String, DateTime<Utc>) {
@@ -78,17 +184,27 @@ impl AppState {
             peer_id: peer_id.clone(),
             display_name: alias.unwrap_or_else(|| format!("peer-{}", &peer_id[..8])),
             address: host,
-            connected: true,
+            connected: false,
             last_seen: now,
         };
 
         config.peers.push(peer);
-        save_config(&config)?;
+        save_config_at(&self.config_path, &config)?;
         Ok(peer_id)
     }
 
     pub async fn list_peers(&self) -> Vec<PeerConfig> {
         self.config.read().await.peers.clone()
+    }
+
+    pub async fn get_peer(&self, peer_id: &str) -> Option<PeerConfig> {
+        self.config
+            .read()
+            .await
+            .peers
+            .iter()
+            .find(|p| p.peer_id == peer_id)
+            .cloned()
     }
 
     pub async fn remove_peer(&self, peer_id: &str) -> Result<bool> {
@@ -97,9 +213,35 @@ impl AppState {
         config.peers.retain(|p| p.peer_id != peer_id);
         let removed = before != config.peers.len();
         if removed {
-            save_config(&config)?;
+            save_config_at(&self.config_path, &config)?;
         }
         Ok(removed)
+    }
+
+    pub async fn set_peer_connected(&self, peer_id: &str, connected: bool) -> Result<()> {
+        let mut config = self.config.write().await;
+        let mut changed = false;
+
+        if let Some(peer) = config.peers.iter_mut().find(|p| p.peer_id == peer_id) {
+            peer.connected = connected;
+            peer.last_seen = Utc::now();
+            changed = true;
+        }
+
+        if changed {
+            save_config_at(&self.config_path, &config)?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn touch_peer(&self, peer_id: &str) -> Result<()> {
+        let mut config = self.config.write().await;
+        if let Some(peer) = config.peers.iter_mut().find(|p| p.peer_id == peer_id) {
+            peer.last_seen = Utc::now();
+            save_config_at(&self.config_path, &config)?;
+        }
+        Ok(())
     }
 
     pub async fn layout(&self) -> String {
@@ -109,13 +251,13 @@ impl AppState {
     pub async fn set_layout(&self, matrix: String) -> Result<()> {
         let mut config = self.config.write().await;
         config.layout_matrix = matrix;
-        save_config(&config)
+        save_config_at(&self.config_path, &config)
     }
 
     pub async fn set_feature(&self, name: String, enabled: bool) -> Result<()> {
         let mut config = self.config.write().await;
         config.features.insert(name, enabled);
-        save_config(&config)
+        save_config_at(&self.config_path, &config)
     }
 
     pub async fn feature_map(&self) -> std::collections::BTreeMap<String, bool> {
@@ -125,7 +267,7 @@ impl AppState {
     pub async fn set_hotkey(&self, action: String, combo: String) -> Result<()> {
         let mut config = self.config.write().await;
         config.hotkeys.insert(action, combo);
-        save_config(&config)
+        save_config_at(&self.config_path, &config)
     }
 
     pub async fn safe_reset(&self, network_only: bool, all: bool) -> Result<()> {
@@ -133,13 +275,15 @@ impl AppState {
 
         if all {
             let machine_id = config.machine_id.clone();
+            let device_name = config.device_name.clone();
             *config = RuntimeConfig::default();
             config.machine_id = machine_id;
+            config.device_name = device_name;
         } else if network_only {
             config.peers.clear();
         }
 
-        save_config(&config)
+        save_config_at(&self.config_path, &config)
     }
 
     pub async fn diagnostics_dump(&self, output_path: Option<String>) -> Result<String> {
@@ -157,12 +301,20 @@ impl AppState {
         let file_path = target.join(format!("dump-{}.txt", Utc::now().format("%Y%m%d-%H%M%S")));
 
         let snapshot = self.snapshot().await;
+        let trust_count = self
+            .trusted_records()
+            .await
+            .map(|items| items.len())
+            .unwrap_or(0);
+
         let report = format!(
-            "Boundless Diagnostics\nMachine: {}\nFingerprint: {}\nPeers: {}\nAPI: {}\nProtocol: {}\n",
+            "Boundless Diagnostics\nMachine: {}\nFingerprint: {}\nPeers: {}\nTrusted CAs: {}\nAPI: {}\nTransport Port: {}\nProtocol: {}\n",
             snapshot.machine_id,
             self.fingerprint(),
             snapshot.peers.len(),
+            trust_count,
             snapshot.api_bind,
+            snapshot.network_port,
             snapshot.protocol_version
         );
 

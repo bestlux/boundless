@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -75,39 +79,44 @@ impl Default for RuntimeConfig {
 }
 
 pub fn config_path() -> PathBuf {
+    if let Ok(path) = std::env::var("BOUNDLESS_CONFIG_PATH") {
+        return PathBuf::from(path);
+    }
+
     dirs::config_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Boundless")
         .join("config.json")
 }
 
-pub fn load_or_create_config() -> Result<RuntimeConfig> {
-    let path = config_path();
-
+pub fn load_or_create_config_at(path: &Path) -> Result<RuntimeConfig> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
 
     if !path.exists() {
         let config = RuntimeConfig::default();
-        save_config(&config)?;
+        save_config_at(path, &config)?;
         return Ok(config);
     }
 
-    let data = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let data = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut config: RuntimeConfig =
         serde_json::from_str(&data).with_context(|| format!("parse {}", path.display()))?;
     config.updated_at = Utc::now();
     Ok(config)
 }
 
-pub fn save_config(config: &RuntimeConfig) -> Result<()> {
-    let path = config_path();
+pub fn save_config_at(path: &Path, config: &RuntimeConfig) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+
     let mut cloned = config.clone();
     cloned.updated_at = Utc::now();
 
     let payload = serde_json::to_string_pretty(&cloned).context("serialize config")?;
-    fs::write(&path, payload).with_context(|| format!("write {}", path.display()))?;
+    fs::write(path, payload).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 

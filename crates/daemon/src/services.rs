@@ -2,9 +2,10 @@ use tonic::{Request, Response, Status};
 
 use ipc_api::boundless::v1::{
     DiagnosticsDumpReply, DiagnosticsDumpRequest, Empty, FeatureListReply, FeatureSetRequest,
-    HotkeySetRequest, LayoutReply, LayoutSetRequest, OperationReply, PairCreateCodeReply,
-    PairCreateCodeRequest, PairJoinReply, PairJoinRequest, PeerInfo, PeerListReply,
-    RemovePeerRequest, SafeResetRequest, StatusReply, StatusRequest,
+    HotkeySetRequest, ImportTrustBundleRequest, LayoutReply, LayoutSetRequest, OperationReply,
+    PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply, PairJoinRequest, PeerInfo,
+    PeerListReply, RemovePeerRequest, SafeResetRequest, StatusReply, StatusRequest,
+    TrustBundleReply,
     daemon_service_server::{DaemonService, DaemonServiceServer},
     diagnostics_service_server::{DiagnosticsService, DiagnosticsServiceServer},
     feature_service_server::{FeatureService, FeatureServiceServer},
@@ -98,6 +99,52 @@ impl PairingService for PairingApi {
             accepted: true,
             peer_id,
             message: "Pairing request accepted".to_string(),
+        }))
+    }
+
+    async fn export_trust_bundle(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<TrustBundleReply>, Status> {
+        let bundle = self
+            .0
+            .export_trust_bundle()
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+
+        Ok(Response::new(TrustBundleReply {
+            machine_id: bundle.machine_id,
+            display_name: bundle.display_name,
+            network_address: bundle.network_address,
+            ca_cert_pem: bundle.ca_cert_pem,
+        }))
+    }
+
+    async fn import_trust_bundle(
+        &self,
+        request: Request<ImportTrustBundleRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        self.0
+            .import_trust_bundle(
+                core_security::TrustBundle {
+                    machine_id: request.machine_id,
+                    display_name: request.display_name,
+                    network_address: request.network_address,
+                    ca_cert_pem: request.ca_cert_pem,
+                },
+                if request.alias.is_empty() {
+                    None
+                } else {
+                    Some(request.alias)
+                },
+            )
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+
+        Ok(Response::new(OperationReply {
+            ok: true,
+            message: "trust bundle imported".to_string(),
         }))
     }
 }
