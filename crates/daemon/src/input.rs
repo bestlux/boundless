@@ -1,7 +1,11 @@
 use std::time::Duration;
 
 #[cfg(windows)]
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock, mpsc},
+    thread::{self, JoinHandle},
+};
 
 use anyhow::{Context, Result, bail};
 use tokio::time;
@@ -13,7 +17,8 @@ use crate::state::{AppState, PendingInjectInputFrame};
 
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::POINT,
+    Foundation::{LPARAM, LRESULT, POINT, WPARAM},
+    System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
@@ -23,7 +28,14 @@ use windows_sys::Win32::{
             MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW,
             SendInput,
         },
-        WindowsAndMessaging::{GetCursorPos, XBUTTON1, XBUTTON2},
+        WindowsAndMessaging::{
+            CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, HC_ACTION, HHOOK,
+            KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PostThreadMessageW, SetWindowsHookExW,
+            TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
+            WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+            WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
+        },
     },
 };
 
@@ -188,7 +200,16 @@ fn input_backend() -> Box<dyn InputBackend> {
 fn input_capture_backend() -> Box<dyn InputCaptureBackend> {
     #[cfg(windows)]
     {
-        Box::new(WindowsCaptureBackend::default())
+        match WindowsHookCaptureBackend::new() {
+            Ok(backend) => Box::new(backend),
+            Err(error) => {
+                warn!(
+                    error = ?error,
+                    "failed to start low-level capture hooks; falling back to polling capture backend"
+                );
+                Box::new(WindowsPollingCaptureBackend::default())
+            }
+        }
     }
 
     #[cfg(not(windows))]
@@ -238,14 +259,14 @@ impl InputBackend for WindowsInputBackend {
 
 #[cfg(windows)]
 #[derive(Default)]
-struct WindowsCaptureBackend {
+struct WindowsPollingCaptureBackend {
     last_cursor: Option<(i32, i32)>,
     last_key_down: HashMap<u16, bool>,
     last_button_down: HashMap<u16, bool>,
 }
 
 #[cfg(windows)]
-impl InputCaptureBackend for WindowsCaptureBackend {
+impl InputCaptureBackend for WindowsPollingCaptureBackend {
     fn drain_release_events(&mut self) -> Vec<InputEvent> {
         let mut events = Vec::new();
 
@@ -340,6 +361,190 @@ impl InputCaptureBackend for WindowsCaptureBackend {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone)]
+enum HookCaptureEvent {
+    MousePosition { x: i32, y: i32 },
+    Input(InputEvent),
+}
+
+#[cfg(windows)]
+struct WindowsHookCaptureBackend {
+    event_rx: mpsc::Receiver<HookCaptureEvent>,
+    hook_thread_id: u32,
+    hook_thread: Option<JoinHandle<()>>,
+    last_cursor: Option<(i32, i32)>,
+    last_key_down: HashMap<u16, bool>,
+    last_button_down: HashMap<u16, bool>,
+}
+
+#[cfg(windows)]
+impl WindowsHookCaptureBackend {
+    fn new() -> Result<Self> {
+        let (event_tx, event_rx) = mpsc::channel::<HookCaptureEvent>();
+        let (startup_tx, startup_rx) = mpsc::channel::<Result<u32>>();
+
+        let hook_thread = thread::spawn(move || {
+            let thread_id = unsafe { GetCurrentThreadId() };
+            if let Err(error) = set_hook_event_sender(Some(event_tx)) {
+                let _ = startup_tx.send(Err(error));
+                return;
+            }
+
+            let _guard = HookSenderGuard;
+            let keyboard_hook = unsafe { install_keyboard_hook() };
+            let mouse_hook = unsafe { install_mouse_hook() };
+            match (keyboard_hook, mouse_hook) {
+                (Ok(keyboard_hook), Ok(mouse_hook)) => {
+                    let _ = startup_tx.send(Ok(thread_id));
+                    unsafe { run_hook_message_loop() };
+                    unsafe {
+                        let _ = UnhookWindowsHookEx(keyboard_hook);
+                        let _ = UnhookWindowsHookEx(mouse_hook);
+                    }
+                }
+                (keyboard, mouse) => {
+                    if let Ok(hook) = keyboard.as_ref() {
+                        unsafe {
+                            let _ = UnhookWindowsHookEx(*hook);
+                        }
+                    }
+                    if let Ok(hook) = mouse.as_ref() {
+                        unsafe {
+                            let _ = UnhookWindowsHookEx(*hook);
+                        }
+                    }
+                    let error = keyboard
+                        .err()
+                        .or_else(|| mouse.err())
+                        .unwrap_or_else(|| anyhow::anyhow!("failed to install capture hooks"));
+                    let _ = startup_tx.send(Err(error));
+                }
+            }
+        });
+
+        let hook_thread_id = startup_rx.recv().context("hook startup channel closed")??;
+
+        Ok(Self {
+            event_rx,
+            hook_thread_id,
+            hook_thread: Some(hook_thread),
+            last_cursor: None,
+            last_key_down: HashMap::new(),
+            last_button_down: HashMap::new(),
+        })
+    }
+
+    fn drain_pending_events(&mut self) -> Vec<HookCaptureEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.event_rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn update_pressed_state_and_filter(&mut self, event: InputEvent, output: &mut Vec<InputEvent>) {
+        match event {
+            InputEvent::MouseButton { button, state } => {
+                let vk = virtual_key_for_mouse_button(button);
+                let is_down = matches!(state, core_input::KeyState::Down);
+                let prior = self.last_button_down.insert(vk, is_down);
+                if prior != Some(is_down) {
+                    output.push(InputEvent::MouseButton { button, state });
+                }
+            }
+            InputEvent::Key { scan_code, state } => {
+                let is_down = matches!(state, core_input::KeyState::Down);
+                let prior = self.last_key_down.insert(scan_code, is_down);
+                if prior != Some(is_down) {
+                    output.push(InputEvent::Key { scan_code, state });
+                }
+            }
+            InputEvent::MouseMove { .. } | InputEvent::MouseWheel { .. } => output.push(event),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsHookCaptureBackend {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = PostThreadMessageW(self.hook_thread_id, WM_QUIT, 0, 0);
+        }
+        if let Some(thread) = self.hook_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl InputCaptureBackend for WindowsHookCaptureBackend {
+    fn drain_release_events(&mut self) -> Vec<InputEvent> {
+        let mut events = Vec::new();
+
+        let mut pressed_buttons = self
+            .last_button_down
+            .iter()
+            .filter_map(|(vk, down)| if *down { Some(*vk) } else { None })
+            .collect::<Vec<_>>();
+        pressed_buttons.sort_unstable();
+        for vk in pressed_buttons {
+            if let Some(button) = mouse_button_from_virtual_key(vk) {
+                events.push(InputEvent::MouseButton {
+                    button,
+                    state: core_input::KeyState::Up,
+                });
+            }
+        }
+
+        let mut pressed_keys = self
+            .last_key_down
+            .iter()
+            .filter_map(|(scan_code, down)| if *down { Some(*scan_code) } else { None })
+            .collect::<Vec<_>>();
+        pressed_keys.sort_unstable();
+        for scan_code in pressed_keys {
+            events.push(InputEvent::Key {
+                scan_code,
+                state: core_input::KeyState::Up,
+            });
+        }
+
+        events
+    }
+
+    fn reset(&mut self) {
+        self.last_cursor = None;
+        self.last_key_down.clear();
+        self.last_button_down.clear();
+        let _ = self.drain_pending_events();
+    }
+
+    fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
+        let mut output = Vec::new();
+
+        for event in self.drain_pending_events() {
+            match event {
+                HookCaptureEvent::MousePosition { x, y } => {
+                    if let Some((last_x, last_y)) = self.last_cursor {
+                        let dx = x - last_x;
+                        let dy = y - last_y;
+                        if dx != 0 || dy != 0 {
+                            output.push(InputEvent::MouseMove { dx, dy });
+                        }
+                    }
+                    self.last_cursor = Some((x, y));
+                }
+                HookCaptureEvent::Input(input_event) => {
+                    self.update_pressed_state_and_filter(input_event, &mut output);
+                }
+            }
+        }
+
+        Ok(output)
+    }
+}
+
+#[cfg(windows)]
 const VK_LBUTTON_CODE: u16 = 0x01;
 #[cfg(windows)]
 const VK_RBUTTON_CODE: u16 = 0x02;
@@ -349,6 +554,19 @@ const VK_MBUTTON_CODE: u16 = 0x04;
 const VK_XBUTTON1_CODE: u16 = 0x05;
 #[cfg(windows)]
 const VK_XBUTTON2_CODE: u16 = 0x06;
+#[cfg(windows)]
+const XBUTTON1_DATA: u16 = 0x0001;
+#[cfg(windows)]
+const XBUTTON2_DATA: u16 = 0x0002;
+#[cfg(windows)]
+const LLKHF_EXTENDED_MASK: u32 = 0x01;
+#[cfg(windows)]
+const LLKHF_INJECTED_MASK: u32 = 0x10;
+#[cfg(windows)]
+const LLMHF_INJECTED_MASK: u32 = 0x0000_0001;
+
+#[cfg(windows)]
+static HOOK_EVENT_SENDER: OnceLock<Mutex<Option<mpsc::Sender<HookCaptureEvent>>>> = OnceLock::new();
 
 #[cfg(windows)]
 const CAPTURE_KEY_VIRTUAL_KEYS: &[u16] = &[
@@ -425,8 +643,203 @@ fn mouse_button_from_virtual_key(vk: u16) -> Option<core_input::MouseButton> {
 }
 
 #[cfg(windows)]
+fn virtual_key_for_mouse_button(button: core_input::MouseButton) -> u16 {
+    match button {
+        core_input::MouseButton::Left => VK_LBUTTON_CODE,
+        core_input::MouseButton::Right => VK_RBUTTON_CODE,
+        core_input::MouseButton::Middle => VK_MBUTTON_CODE,
+        core_input::MouseButton::X1 => VK_XBUTTON1_CODE,
+        core_input::MouseButton::X2 => VK_XBUTTON2_CODE,
+    }
+}
+
+#[cfg(windows)]
 fn captured_key_virtual_keys() -> &'static [u16] {
     CAPTURE_KEY_VIRTUAL_KEYS
+}
+
+#[cfg(windows)]
+struct HookSenderGuard;
+
+#[cfg(windows)]
+impl Drop for HookSenderGuard {
+    fn drop(&mut self) {
+        let _ = set_hook_event_sender(None);
+    }
+}
+
+#[cfg(windows)]
+fn hook_sender_cell() -> &'static Mutex<Option<mpsc::Sender<HookCaptureEvent>>> {
+    HOOK_EVENT_SENDER.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(windows)]
+fn set_hook_event_sender(sender: Option<mpsc::Sender<HookCaptureEvent>>) -> Result<()> {
+    let mut guard = hook_sender_cell()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("hook sender mutex poisoned"))?;
+    *guard = sender;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn send_hook_event(event: HookCaptureEvent) {
+    let sender = hook_sender_cell()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned());
+    if let Some(sender) = sender {
+        let _ = sender.send(event);
+    }
+}
+
+#[cfg(windows)]
+unsafe fn install_keyboard_hook() -> Result<HHOOK> {
+    let module = unsafe { GetModuleHandleW(std::ptr::null()) };
+    let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), module, 0) };
+    if hook.is_null() {
+        return Err(std::io::Error::last_os_error()).context("SetWindowsHookExW keyboard");
+    }
+    Ok(hook)
+}
+
+#[cfg(windows)]
+unsafe fn install_mouse_hook() -> Result<HHOOK> {
+    let module = unsafe { GetModuleHandleW(std::ptr::null()) };
+    let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), module, 0) };
+    if hook.is_null() {
+        return Err(std::io::Error::last_os_error()).context("SetWindowsHookExW mouse");
+    }
+    Ok(hook)
+}
+
+#[cfg(windows)]
+unsafe fn run_hook_message_loop() {
+    let mut msg = MSG::default();
+    loop {
+        let result = unsafe { GetMessageW(&mut msg as *mut MSG, std::ptr::null_mut(), 0, 0) };
+        if result <= 0 {
+            break;
+        }
+        unsafe {
+            TranslateMessage(&msg as *const MSG);
+            DispatchMessageW(&msg as *const MSG);
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let keyboard = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+        if (keyboard.flags & LLKHF_INJECTED_MASK) == 0 {
+            let state = match wparam as u32 {
+                WM_KEYDOWN | WM_SYSKEYDOWN => Some(core_input::KeyState::Down),
+                WM_KEYUP | WM_SYSKEYUP => Some(core_input::KeyState::Up),
+                _ => None,
+            };
+
+            if let Some(state) = state {
+                let mut scan_code = keyboard.scanCode as u16;
+                if (keyboard.flags & LLKHF_EXTENDED_MASK) != 0 {
+                    scan_code |= 0xE000;
+                }
+                send_hook_event(HookCaptureEvent::Input(InputEvent::Key {
+                    scan_code,
+                    state,
+                }));
+            }
+        }
+    }
+
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let mouse = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+        if (mouse.flags & LLMHF_INJECTED_MASK) == 0 {
+            match wparam as u32 {
+                WM_MOUSEMOVE => {
+                    send_hook_event(HookCaptureEvent::MousePosition {
+                        x: mouse.pt.x,
+                        y: mouse.pt.y,
+                    });
+                }
+                WM_LBUTTONDOWN => {
+                    send_hook_event(HookCaptureEvent::Input(InputEvent::MouseButton {
+                        button: core_input::MouseButton::Left,
+                        state: core_input::KeyState::Down,
+                    }))
+                }
+                WM_LBUTTONUP => send_hook_event(HookCaptureEvent::Input(InputEvent::MouseButton {
+                    button: core_input::MouseButton::Left,
+                    state: core_input::KeyState::Up,
+                })),
+                WM_RBUTTONDOWN => {
+                    send_hook_event(HookCaptureEvent::Input(InputEvent::MouseButton {
+                        button: core_input::MouseButton::Right,
+                        state: core_input::KeyState::Down,
+                    }))
+                }
+                WM_RBUTTONUP => send_hook_event(HookCaptureEvent::Input(InputEvent::MouseButton {
+                    button: core_input::MouseButton::Right,
+                    state: core_input::KeyState::Up,
+                })),
+                WM_MBUTTONDOWN => {
+                    send_hook_event(HookCaptureEvent::Input(InputEvent::MouseButton {
+                        button: core_input::MouseButton::Middle,
+                        state: core_input::KeyState::Down,
+                    }))
+                }
+                WM_MBUTTONUP => send_hook_event(HookCaptureEvent::Input(InputEvent::MouseButton {
+                    button: core_input::MouseButton::Middle,
+                    state: core_input::KeyState::Up,
+                })),
+                WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                    let button = match high_word(mouse.mouseData) {
+                        XBUTTON1_DATA => Some(core_input::MouseButton::X1),
+                        XBUTTON2_DATA => Some(core_input::MouseButton::X2),
+                        _ => None,
+                    };
+                    if let Some(button) = button {
+                        send_hook_event(HookCaptureEvent::Input(InputEvent::MouseButton {
+                            button,
+                            state: if (wparam as u32) == WM_XBUTTONDOWN {
+                                core_input::KeyState::Down
+                            } else {
+                                core_input::KeyState::Up
+                            },
+                        }));
+                    }
+                }
+                WM_MOUSEWHEEL => send_hook_event(HookCaptureEvent::Input(InputEvent::MouseWheel {
+                    delta_x: 0,
+                    delta_y: signed_high_word(mouse.mouseData),
+                })),
+                WM_MOUSEHWHEEL => {
+                    send_hook_event(HookCaptureEvent::Input(InputEvent::MouseWheel {
+                        delta_x: signed_high_word(mouse.mouseData),
+                        delta_y: 0,
+                    }))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+#[cfg(windows)]
+fn high_word(value: u32) -> u16 {
+    ((value >> 16) & 0xFFFF) as u16
+}
+
+#[cfg(windows)]
+fn signed_high_word(value: u32) -> i32 {
+    i16::from_ne_bytes(high_word(value).to_ne_bytes()) as i32
 }
 
 #[cfg(windows)]
