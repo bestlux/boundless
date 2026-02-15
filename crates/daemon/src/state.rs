@@ -11,6 +11,7 @@ use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio::sync::RwLock;
 use tracing::info;
 
+use core_input::{InputEvent, InputFrame, InputRouter, InputSink, RouteDecision};
 use core_security::{
     DeviceIdentity, SecurityPaths, TrustBundle, TrustRecord, default_security_root,
     ensure_device_identity, ensure_trust_store, fingerprint, generate_pairing_code,
@@ -26,8 +27,18 @@ const MAX_TRANSPORT_EVENTS: usize = 512;
 
 #[derive(Debug, Clone)]
 pub enum OutboundPayload {
-    ClipboardText { text: String },
-    File { file_name: String, bytes: Vec<u8> },
+    ClipboardText {
+        text: String,
+    },
+    File {
+        file_name: String,
+        bytes: Vec<u8>,
+    },
+    InputFrame {
+        sequence: u64,
+        timestamp_unix_ms: i64,
+        events: Vec<InputEvent>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +62,8 @@ pub struct AppState {
     outgoing_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
     transport_events: Arc<RwLock<VecDeque<TransportEventRecord>>>,
     inbox_root: Arc<PathBuf>,
-    input_owner_peer_id: Arc<RwLock<Option<String>>>,
+    input_router: Arc<RwLock<InputRouter>>,
+    input_sequence_by_peer: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 impl AppState {
@@ -105,6 +117,8 @@ impl AppState {
             "state loaded"
         );
 
+        let input_enabled = config.features.get("share_input").copied().unwrap_or(true);
+
         Ok(Self {
             config_path: Arc::new(config_path),
             config: Arc::new(RwLock::new(config)),
@@ -115,7 +129,8 @@ impl AppState {
             outgoing_payloads: Arc::new(RwLock::new(HashMap::new())),
             transport_events: Arc::new(RwLock::new(VecDeque::new())),
             inbox_root: Arc::new(inbox_root),
-            input_owner_peer_id: Arc::new(RwLock::new(None)),
+            input_router: Arc::new(RwLock::new(InputRouter::new(input_enabled))),
+            input_sequence_by_peer: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -264,11 +279,8 @@ impl AppState {
         let removed = before != config.peers.len();
         if removed {
             save_config_at(&self.config_path, &config)?;
-
-            let mut owner = self.input_owner_peer_id.write().await;
-            if owner.as_deref() == Some(peer_id) {
-                *owner = None;
-            }
+            self.input_router.write().await.release_owner(peer_id);
+            self.input_sequence_by_peer.write().await.remove(peer_id);
         }
         Ok(removed)
     }
@@ -288,10 +300,7 @@ impl AppState {
         }
 
         if !connected {
-            let mut owner = self.input_owner_peer_id.write().await;
-            if owner.as_deref() == Some(peer_id) {
-                *owner = None;
-            }
+            self.input_router.write().await.release_owner(peer_id);
         }
 
         Ok(())
@@ -317,8 +326,14 @@ impl AppState {
 
     pub async fn set_feature(&self, name: String, enabled: bool) -> Result<()> {
         let mut config = self.config.write().await;
-        config.features.insert(name, enabled);
-        save_config_at(&self.config_path, &config)
+        config.features.insert(name.clone(), enabled);
+        save_config_at(&self.config_path, &config)?;
+
+        if name == "share_input" {
+            self.input_router.write().await.set_enabled(enabled);
+        }
+
+        Ok(())
     }
 
     pub async fn feature_map(&self) -> std::collections::BTreeMap<String, bool> {
@@ -367,6 +382,30 @@ impl AppState {
             .entry(peer_id.to_string())
             .or_default()
             .push_back(OutboundPayload::File { file_name, bytes });
+        Ok(())
+    }
+
+    pub async fn queue_input_move(&self, peer_id: &str, dx: i32, dy: i32) -> Result<()> {
+        if self.get_peer(peer_id).await.is_none() {
+            anyhow::bail!("unknown peer {peer_id}");
+        }
+
+        let sequence = {
+            let mut sequences = self.input_sequence_by_peer.write().await;
+            let entry = sequences.entry(peer_id.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+
+        let mut queue_map = self.outgoing_payloads.write().await;
+        queue_map
+            .entry(peer_id.to_string())
+            .or_default()
+            .push_back(OutboundPayload::InputFrame {
+                sequence,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::MouseMove { dx, dy }],
+            });
         Ok(())
     }
 
@@ -471,40 +510,69 @@ impl AppState {
         .await;
     }
 
+    pub async fn record_outgoing_input_frame(&self, peer_id: &str, event_count: usize) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "outgoing".to_string(),
+            kind: "input_frame".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: "queued_input_frame_sent".to_string(),
+            size_bytes: event_count as u64,
+        })
+        .await;
+    }
+
+    pub async fn route_incoming_input_frame(
+        &self,
+        peer_id: &str,
+        frame: InputFrame,
+    ) -> Result<RouteDecision> {
+        struct NoopInputSink;
+        impl InputSink for NoopInputSink {
+            fn apply(&mut self, _event: &InputEvent) -> std::result::Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let mut sink = NoopInputSink;
+        let decision = self
+            .input_router
+            .write()
+            .await
+            .route_frame(&frame, &mut sink)
+            .map_err(anyhow::Error::from)?;
+
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "incoming".to_string(),
+            kind: "input_frame".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: describe_route_decision(&decision),
+            size_bytes: frame.events.len() as u64,
+        })
+        .await;
+
+        Ok(decision)
+    }
+
     pub async fn claim_input_owner(&self, peer_id: &str, force: bool) -> Result<bool> {
         if self.get_peer(peer_id).await.is_none() {
             anyhow::bail!("unknown peer {peer_id}");
         }
 
-        let mut owner = self.input_owner_peer_id.write().await;
-        let acquired = match owner.as_deref() {
-            None => {
-                *owner = Some(peer_id.to_string());
-                true
-            }
-            Some(current) if current == peer_id => true,
-            Some(_) if force => {
-                *owner = Some(peer_id.to_string());
-                true
-            }
-            Some(_) => false,
-        };
-
-        Ok(acquired)
+        Ok(self.input_router.write().await.claim_owner(peer_id, force))
     }
 
     pub async fn release_input_owner(&self, peer_id: &str) -> bool {
-        let mut owner = self.input_owner_peer_id.write().await;
-        if owner.as_deref() == Some(peer_id) {
-            *owner = None;
-            return true;
-        }
-
-        false
+        self.input_router.write().await.release_owner(peer_id)
     }
 
     pub async fn input_owner(&self) -> Option<String> {
-        self.input_owner_peer_id.read().await.clone()
+        self.input_router
+            .read()
+            .await
+            .owner()
+            .map(|owner| owner.to_string())
     }
 
     pub async fn safe_reset(&self, network_only: bool, all: bool) -> Result<()> {
@@ -522,7 +590,9 @@ impl AppState {
 
         self.outgoing_payloads.write().await.clear();
         self.transport_events.write().await.clear();
-        *self.input_owner_peer_id.write().await = None;
+        *self.input_router.write().await =
+            InputRouter::new(config.features.get("share_input").copied().unwrap_or(true));
+        self.input_sequence_by_peer.write().await.clear();
 
         save_config_at(&self.config_path, &config)
     }
@@ -628,6 +698,17 @@ fn sanitize_incoming_file_name(file_name: &str) -> Result<String> {
     }
 
     Ok(sanitized)
+}
+
+fn describe_route_decision(decision: &RouteDecision) -> String {
+    match decision {
+        RouteDecision::Applied { event_count } => format!("applied events={event_count}"),
+        RouteDecision::IgnoredFeatureDisabled => "ignored feature_disabled".to_string(),
+        RouteDecision::IgnoredNoOwner => "ignored no_owner".to_string(),
+        RouteDecision::IgnoredWrongOwner { owner_peer_id } => {
+            format!("ignored wrong_owner={owner_peer_id}")
+        }
+    }
 }
 
 #[cfg(test)]

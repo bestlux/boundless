@@ -6,8 +6,8 @@ use tonic::transport::Channel;
 use ipc_api::boundless::v1::{
     DiagnosticsDumpRequest, Empty, FeatureSetRequest, HotkeySetRequest, ImportTrustBundleRequest,
     InputOwnerRequest, LayoutSetRequest, PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest,
-    SafeResetRequest, SendClipboardTextRequest, SendFileRequest, StatusRequest,
-    daemon_service_client::DaemonServiceClient,
+    SafeResetRequest, SendClipboardTextRequest, SendFileRequest, SendInputMoveRequest,
+    StatusRequest, daemon_service_client::DaemonServiceClient,
     diagnostics_service_client::DiagnosticsServiceClient,
     feature_service_client::FeatureServiceClient, pairing_service_client::PairingServiceClient,
     topology_service_client::TopologyServiceClient,
@@ -141,6 +141,11 @@ enum TransportCommand {
 #[derive(Debug, Subcommand)]
 enum InputCommand {
     Owner,
+    SendMove {
+        peer_id: String,
+        dx: i32,
+        dy: i32,
+    },
     Claim {
         peer_id: String,
         #[arg(long, default_value_t = false)]
@@ -220,6 +225,9 @@ async fn main() -> Result<()> {
         },
         Command::Input { command } => match command {
             InputCommand::Owner => input_owner(&cli.endpoint).await,
+            InputCommand::SendMove { peer_id, dx, dy } => {
+                input_send_move(&cli.endpoint, peer_id, dx, dy).await
+            }
             InputCommand::Claim { peer_id, force } => {
                 input_claim(&cli.endpoint, peer_id, force).await
             }
@@ -489,6 +497,17 @@ async fn input_owner(endpoint: &str) -> Result<()> {
         "ok={} owner={} message={}",
         response.ok, owner, response.message
     );
+    Ok(())
+}
+
+async fn input_send_move(endpoint: &str, peer_id: String, dx: i32, dy: i32) -> Result<()> {
+    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .send_input_move(SendInputMoveRequest { peer_id, dx, dy })
+        .await?
+        .into_inner();
+
+    println!("ok={} message={}", response.ok, response.message);
     Ok(())
 }
 

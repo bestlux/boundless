@@ -155,8 +155,52 @@ pub enum WireMessage {
     FileEnd {
         transfer_id: String,
     },
+    InputFrame {
+        machine_id: String,
+        sequence: u64,
+        timestamp_unix_ms: i64,
+        events: Vec<WireInputEvent>,
+    },
     Error {
         message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireKeyState {
+    Down,
+    Up,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireMouseButton {
+    Left,
+    Right,
+    Middle,
+    X1,
+    X2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireInputEvent {
+    MouseMove {
+        dx: i32,
+        dy: i32,
+    },
+    MouseButton {
+        button: WireMouseButton,
+        state: WireKeyState,
+    },
+    MouseWheel {
+        delta_x: i32,
+        delta_y: i32,
+    },
+    Key {
+        scan_code: u16,
+        state: WireKeyState,
     },
 }
 
@@ -296,6 +340,26 @@ mod tests {
         let original = WireMessage::FileChunk {
             transfer_id: "xfer-1".to_string(),
             data_b64: encode_bytes_b64(&[10u8, 20, 30]),
+        };
+
+        let encoded = encode_line(&original).expect("encode");
+        let decoded = decode_line(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn wire_message_input_frame_round_trip() {
+        let original = WireMessage::InputFrame {
+            machine_id: "machine-a".to_string(),
+            sequence: 42,
+            timestamp_unix_ms: 1000,
+            events: vec![
+                WireInputEvent::MouseMove { dx: 5, dy: -2 },
+                WireInputEvent::Key {
+                    scan_code: 30,
+                    state: WireKeyState::Down,
+                },
+            ],
         };
 
         let encoded = encode_line(&original).expect("encode");

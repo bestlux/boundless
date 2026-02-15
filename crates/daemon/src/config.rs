@@ -43,6 +43,7 @@ impl Default for RuntimeConfig {
         let features = [
             ("share_clipboard".to_string(), true),
             ("transfer_file".to_string(), true),
+            ("share_input".to_string(), true),
             ("easy_mouse".to_string(), true),
             ("wrap_mouse".to_string(), true),
         ]

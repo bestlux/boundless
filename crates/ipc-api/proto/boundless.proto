@@ -109,6 +109,12 @@ message SendFileRequest {
   string file_path = 2;
 }
 
+message SendInputMoveRequest {
+  string peer_id = 1;
+  int32 dx = 2;
+  int32 dy = 3;
+}
+
 message TransportEvent {
   string timestamp = 1;
   string direction = 2;
@@ -162,6 +168,7 @@ service DiagnosticsService {
   rpc SafeReset(SafeResetRequest) returns (OperationReply);
   rpc SendClipboardText(SendClipboardTextRequest) returns (OperationReply);
   rpc SendFile(SendFileRequest) returns (OperationReply);
+  rpc SendInputMove(SendInputMoveRequest) returns (OperationReply);
   rpc ListTransportEvents(Empty) returns (TransportEventsReply);
   rpc GetInputOwner(Empty) returns (InputOwnerReply);
   rpc ClaimInputOwner(InputOwnerRequest) returns (InputOwnerReply);

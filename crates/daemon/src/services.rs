@@ -7,8 +7,8 @@ use ipc_api::boundless::v1::{
     HotkeySetRequest, ImportTrustBundleRequest, InputOwnerReply, InputOwnerRequest, LayoutReply,
     LayoutSetRequest, OperationReply, PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply,
     PairJoinRequest, PeerInfo, PeerListReply, RemovePeerRequest, SafeResetRequest,
-    SendClipboardTextRequest, SendFileRequest, StatusReply, StatusRequest, TransportEvent,
-    TransportEventsReply, TrustBundleReply,
+    SendClipboardTextRequest, SendFileRequest, SendInputMoveRequest, StatusReply, StatusRequest,
+    TransportEvent, TransportEventsReply, TrustBundleReply,
     daemon_service_server::{DaemonService, DaemonServiceServer},
     diagnostics_service_server::{DiagnosticsService, DiagnosticsServiceServer},
     feature_service_server::{FeatureService, FeatureServiceServer},
@@ -337,6 +337,22 @@ impl DiagnosticsService for DiagnosticsApi {
         Ok(Response::new(OperationReply {
             ok: true,
             message: "file payload queued".to_string(),
+        }))
+    }
+
+    async fn send_input_move(
+        &self,
+        request: Request<SendInputMoveRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        self.0
+            .queue_input_move(&request.peer_id, request.dx, request.dy)
+            .await
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        Ok(Response::new(OperationReply {
+            ok: true,
+            message: "input move frame queued".to_string(),
         }))
     }
 

@@ -21,8 +21,10 @@ use tokio_rustls::{
 };
 use tracing::{error, info, warn};
 
+use core_input::{InputEvent, InputFrame, KeyState, MouseButton};
 use core_protocol::{
-    PROTOCOL_CURRENT, WireMessage, decode_bytes_b64, decode_line, encode_bytes_b64, encode_line,
+    PROTOCOL_CURRENT, WireInputEvent, WireKeyState, WireMessage, WireMouseButton, decode_bytes_b64,
+    decode_line, encode_bytes_b64, encode_line,
 };
 use core_transfer::validate_transfer_size;
 
@@ -413,6 +415,52 @@ where
                             }
                         }
                     }
+                    WireMessage::InputFrame {
+                        machine_id,
+                        sequence,
+                        timestamp_unix_ms,
+                        events,
+                    } => {
+                        if machine_id != authenticated_peer_id {
+                            warn!(
+                                claimed_machine_id = %machine_id,
+                                authenticated_machine_id = %authenticated_peer_id,
+                                "dropping input frame with mismatched machine_id"
+                            );
+                            continue;
+                        }
+
+                        if let Some(peer_id) = &remote_peer_id {
+                            let frame = InputFrame {
+                                source_peer_id: peer_id.clone(),
+                                sequence,
+                                timestamp_unix_ms,
+                                events: events
+                                    .into_iter()
+                                    .map(input_event_from_wire)
+                                    .collect(),
+                            };
+
+                            match state.route_incoming_input_frame(peer_id, frame).await {
+                                Ok(decision) => {
+                                    info!(
+                                        peer_id = %peer_id,
+                                        sequence,
+                                        decision = ?decision,
+                                        "processed inbound input frame"
+                                    );
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        peer_id = %peer_id,
+                                        sequence,
+                                        error = ?error,
+                                        "failed to process inbound input frame"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     WireMessage::Error { message } => {
                         warn!(%message, "remote error frame");
                     }
@@ -571,9 +619,88 @@ where
                 .record_outgoing_file(peer_id, file_name, total_bytes)
                 .await;
         }
+        OutboundPayload::InputFrame {
+            sequence,
+            timestamp_unix_ms,
+            events,
+        } => {
+            send_message(
+                writer,
+                &WireMessage::InputFrame {
+                    machine_id: local_machine_id.to_string(),
+                    sequence: *sequence,
+                    timestamp_unix_ms: *timestamp_unix_ms,
+                    events: events.iter().map(input_event_to_wire).collect(),
+                },
+            )
+            .await?;
+
+            state
+                .record_outgoing_input_frame(peer_id, events.len())
+                .await;
+        }
     }
 
     Ok(())
+}
+
+fn input_event_to_wire(event: &InputEvent) -> WireInputEvent {
+    match event {
+        InputEvent::MouseMove { dx, dy } => WireInputEvent::MouseMove { dx: *dx, dy: *dy },
+        InputEvent::MouseButton { button, state } => WireInputEvent::MouseButton {
+            button: match button {
+                MouseButton::Left => WireMouseButton::Left,
+                MouseButton::Right => WireMouseButton::Right,
+                MouseButton::Middle => WireMouseButton::Middle,
+                MouseButton::X1 => WireMouseButton::X1,
+                MouseButton::X2 => WireMouseButton::X2,
+            },
+            state: match state {
+                KeyState::Down => WireKeyState::Down,
+                KeyState::Up => WireKeyState::Up,
+            },
+        },
+        InputEvent::MouseWheel { delta_x, delta_y } => WireInputEvent::MouseWheel {
+            delta_x: *delta_x,
+            delta_y: *delta_y,
+        },
+        InputEvent::Key { scan_code, state } => WireInputEvent::Key {
+            scan_code: *scan_code,
+            state: match state {
+                KeyState::Down => WireKeyState::Down,
+                KeyState::Up => WireKeyState::Up,
+            },
+        },
+    }
+}
+
+fn input_event_from_wire(event: WireInputEvent) -> InputEvent {
+    match event {
+        WireInputEvent::MouseMove { dx, dy } => InputEvent::MouseMove { dx, dy },
+        WireInputEvent::MouseButton { button, state } => InputEvent::MouseButton {
+            button: match button {
+                WireMouseButton::Left => MouseButton::Left,
+                WireMouseButton::Right => MouseButton::Right,
+                WireMouseButton::Middle => MouseButton::Middle,
+                WireMouseButton::X1 => MouseButton::X1,
+                WireMouseButton::X2 => MouseButton::X2,
+            },
+            state: match state {
+                WireKeyState::Down => KeyState::Down,
+                WireKeyState::Up => KeyState::Up,
+            },
+        },
+        WireInputEvent::MouseWheel { delta_x, delta_y } => {
+            InputEvent::MouseWheel { delta_x, delta_y }
+        }
+        WireInputEvent::Key { scan_code, state } => InputEvent::Key {
+            scan_code,
+            state: match state {
+                WireKeyState::Down => KeyState::Down,
+                WireKeyState::Up => KeyState::Up,
+            },
+        },
+    }
 }
 
 fn now_millis() -> i64 {

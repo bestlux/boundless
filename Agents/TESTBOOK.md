@@ -14,6 +14,7 @@
   - TLS transport session establishment
   - heartbeat-driven connected state reporting
   - input ownership claim/release control-plane behavior
+  - synthetic input frame transport + router processing path
   - queued clipboard text/file payload transfer and inbox materialization
 - Run `scripts/dev/validate.ps1` for fmt/test/clippy plus smoke in one command
 
@@ -57,6 +58,12 @@
 - On Machine A: `input owner` (expect claimed peer)
 - On Machine A: `input release <peer_id>`
 - On Machine A: `input owner` (expect none)
+
+9. Input frame transport path
+- On Machine B: `input claim <peer_id-for-machine-a>`
+- On Machine A: `input send-move <peer_id-for-machine-b> 3 2`
+- On both machines: `transport events --limit 100`
+- Confirm outgoing/incoming `kind=input_frame` events are present and no daemon errors are reported
 
 ## Exit criteria for this stage
 

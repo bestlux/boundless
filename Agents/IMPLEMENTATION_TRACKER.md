@@ -25,6 +25,8 @@
 - [x] Added local validation helper script (`scripts/dev/validate.ps1`)
 - [x] Added input control-plane primitives (owner claim/release/query) for deterministic routing prep
 - [x] Expanded smoke harness to validate input owner claim/release flow
+- [x] Wired core-input frame routing into transport/runtime with no-op sink backend
+- [x] Added synthetic input frame enqueue API/CLI path for transport validation
 
 ## Next (priority order)
 
@@ -32,5 +34,4 @@
 - [ ] Implement mDNS discovery runtime with manual fallback integration
 - [ ] Implement real clipboard/text-image sync pipeline
 - [ ] Implement real input capture/injection pipeline
-- [ ] Wire core-input frame routing into transport/runtime with no-op sink backend
 - [ ] Add richer multi-machine integration assertions beyond payload smoke
