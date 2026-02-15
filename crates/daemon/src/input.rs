@@ -113,6 +113,25 @@ async fn capture_and_queue_outgoing_frames(
 ) {
     let capture_target = state.active_input_capture_target().await;
     if &capture_target != last_capture_target {
+        if let Some(previous_target) = last_capture_target.as_deref() {
+            let release_events = backend.drain_release_events();
+            if !release_events.is_empty() {
+                for chunk in release_events.chunks(MAX_EVENTS_PER_FRAME) {
+                    if let Err(error) = state
+                        .queue_input_events(previous_target, chunk.to_vec())
+                        .await
+                    {
+                        warn!(
+                            peer_id = %previous_target,
+                            error = ?error,
+                            "failed to queue synthetic release events for previous capture target"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
         backend.reset();
         *last_capture_target = capture_target.clone();
     }
@@ -149,6 +168,7 @@ trait InputBackend: Send {
 }
 
 trait InputCaptureBackend: Send {
+    fn drain_release_events(&mut self) -> Vec<InputEvent>;
     fn reset(&mut self);
     fn poll_events(&mut self) -> Result<Vec<InputEvent>>;
 }
@@ -192,6 +212,10 @@ struct NoopCaptureBackend;
 
 #[cfg(not(windows))]
 impl InputCaptureBackend for NoopCaptureBackend {
+    fn drain_release_events(&mut self) -> Vec<InputEvent> {
+        Vec::new()
+    }
+
     fn reset(&mut self) {}
 
     fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
@@ -222,6 +246,42 @@ struct WindowsCaptureBackend {
 
 #[cfg(windows)]
 impl InputCaptureBackend for WindowsCaptureBackend {
+    fn drain_release_events(&mut self) -> Vec<InputEvent> {
+        let mut events = Vec::new();
+
+        let mut pressed_buttons = self
+            .last_button_down
+            .iter()
+            .filter_map(|(vk, down)| if *down { Some(*vk) } else { None })
+            .collect::<Vec<_>>();
+        pressed_buttons.sort_unstable();
+        for vk in pressed_buttons {
+            if let Some(button) = mouse_button_from_virtual_key(vk) {
+                events.push(InputEvent::MouseButton {
+                    button,
+                    state: core_input::KeyState::Up,
+                });
+            }
+        }
+
+        let mut pressed_keys = self
+            .last_key_down
+            .iter()
+            .filter_map(|(vk, down)| if *down { Some(*vk) } else { None })
+            .collect::<Vec<_>>();
+        pressed_keys.sort_unstable();
+        for vk in pressed_keys {
+            if let Some(scan_code) = vk_to_scan_code(vk) {
+                events.push(InputEvent::Key {
+                    scan_code,
+                    state: core_input::KeyState::Up,
+                });
+            }
+        }
+
+        events
+    }
+
     fn reset(&mut self) {
         self.last_cursor = None;
         self.last_key_down.clear();
@@ -350,6 +410,18 @@ fn mouse_button_virtual_keys() -> [(u16, core_input::MouseButton); 5] {
         (VK_XBUTTON1_CODE, core_input::MouseButton::X1),
         (VK_XBUTTON2_CODE, core_input::MouseButton::X2),
     ]
+}
+
+#[cfg(windows)]
+fn mouse_button_from_virtual_key(vk: u16) -> Option<core_input::MouseButton> {
+    match vk {
+        VK_LBUTTON_CODE => Some(core_input::MouseButton::Left),
+        VK_RBUTTON_CODE => Some(core_input::MouseButton::Right),
+        VK_MBUTTON_CODE => Some(core_input::MouseButton::Middle),
+        VK_XBUTTON1_CODE => Some(core_input::MouseButton::X1),
+        VK_XBUTTON2_CODE => Some(core_input::MouseButton::X2),
+        _ => None,
+    }
 }
 
 #[cfg(windows)]
@@ -533,16 +605,10 @@ fn input_event_kind(event: &InputEvent) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(windows))]
     use std::collections::VecDeque;
 
-    #[cfg(not(windows))]
     use super::*;
-    #[cfg(windows)]
-    use super::*;
-    #[cfg(not(windows))]
     use crate::state::AppState;
-    #[cfg(not(windows))]
     use core_input::{InputFrame, KeyState};
 
     #[cfg(not(windows))]
@@ -564,12 +630,10 @@ mod tests {
         apply_frame(&mut backend, &frame).expect("noop backend should accept events");
     }
 
-    #[cfg(not(windows))]
     struct CountingBackend {
         applied: usize,
     }
 
-    #[cfg(not(windows))]
     impl InputBackend for CountingBackend {
         fn apply(&mut self, _event: &InputEvent) -> Result<()> {
             self.applied += 1;
@@ -577,24 +641,27 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     struct ScriptedCaptureBackend {
         batches: VecDeque<Vec<InputEvent>>,
+        release_events: Vec<InputEvent>,
         reset_count: usize,
     }
 
-    #[cfg(not(windows))]
     impl ScriptedCaptureBackend {
-        fn new(batches: Vec<Vec<InputEvent>>) -> Self {
+        fn new(batches: Vec<Vec<InputEvent>>, release_events: Vec<InputEvent>) -> Self {
             Self {
                 batches: VecDeque::from(batches),
+                release_events,
                 reset_count: 0,
             }
         }
     }
 
-    #[cfg(not(windows))]
     impl InputCaptureBackend for ScriptedCaptureBackend {
+        fn drain_release_events(&mut self) -> Vec<InputEvent> {
+            std::mem::take(&mut self.release_events)
+        }
+
         fn reset(&mut self) {
             self.reset_count += 1;
         }
@@ -604,7 +671,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     async fn state_with_peer_for_input_test() -> (AppState, String, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "boundless-input-runtime-test-{}",
@@ -627,7 +693,6 @@ mod tests {
         (state, peer_id, root)
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn drain_skips_frame_if_owner_changes_before_inject() {
         let (state, peer_id, root) = state_with_peer_for_input_test().await;
@@ -675,7 +740,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn capture_queues_events_for_active_target_and_chunks_batches() {
         let (state, peer_id, root) = state_with_peer_for_input_test().await;
@@ -689,7 +753,7 @@ mod tests {
             .expect("set target");
 
         let events = vec![InputEvent::MouseMove { dx: 1, dy: 1 }; MAX_EVENTS_PER_FRAME + 1];
-        let mut backend = ScriptedCaptureBackend::new(vec![events]);
+        let mut backend = ScriptedCaptureBackend::new(vec![events], Vec::new());
         let mut last_target = None;
 
         capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
@@ -707,7 +771,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn capture_resets_backend_when_target_becomes_inactive() {
         let (state, peer_id, root) = state_with_peer_for_input_test().await;
@@ -720,7 +783,7 @@ mod tests {
             .await
             .expect("set target");
 
-        let mut backend = ScriptedCaptureBackend::new(vec![Vec::new(), Vec::new()]);
+        let mut backend = ScriptedCaptureBackend::new(vec![Vec::new(), Vec::new()], Vec::new());
         let mut last_target = None;
         capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
         let reset_after_set = backend.reset_count;
@@ -735,6 +798,106 @@ mod tests {
             backend.reset_count > reset_after_set,
             "clearing target should reset capture backend"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn capture_target_switch_flushes_release_events_to_previous_target() {
+        let (state, peer_one, root) = state_with_peer_for_input_test().await;
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_two = state
+            .join_peer(
+                code,
+                "127.0.0.1:15101".to_string(),
+                Some("peer-two".to_string()),
+            )
+            .await
+            .expect("join second peer");
+        state
+            .set_peer_connected(&peer_one, true)
+            .await
+            .expect("connect one");
+        state
+            .set_peer_connected(&peer_two, true)
+            .await
+            .expect("connect two");
+
+        state
+            .set_input_capture_target(Some(&peer_one))
+            .await
+            .expect("set target one");
+
+        let mut backend = ScriptedCaptureBackend::new(
+            vec![Vec::new(), Vec::new()],
+            vec![
+                InputEvent::MouseButton {
+                    button: core_input::MouseButton::Left,
+                    state: KeyState::Up,
+                },
+                InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Up,
+                },
+            ],
+        );
+        let mut last_target = None;
+        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+
+        state
+            .set_input_capture_target(Some(&peer_two))
+            .await
+            .expect("switch target");
+        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+
+        let previous_outgoing = state.drain_outgoing(&peer_one).await;
+        assert_eq!(previous_outgoing.len(), 1);
+        assert!(matches!(
+            previous_outgoing.first(),
+            Some(crate::state::OutboundPayload::InputFrame { sequence: 1, events, .. }) if events.len() == 2
+        ));
+        assert!(
+            state.drain_outgoing(&peer_two).await.is_empty(),
+            "release events should flush to previous target only"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn capture_target_clear_flushes_release_events_to_previous_target() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set target");
+
+        let mut backend = ScriptedCaptureBackend::new(
+            vec![Vec::new(), Vec::new()],
+            vec![InputEvent::Key {
+                scan_code: 42,
+                state: KeyState::Up,
+            }],
+        );
+        let mut last_target = None;
+        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+
+        state.clear_input_capture_target().await;
+        capture_and_queue_outgoing_frames(&state, &mut backend, &mut last_target).await;
+
+        let outgoing = state.drain_outgoing(&peer_id).await;
+        assert_eq!(outgoing.len(), 1);
+        assert!(matches!(
+            outgoing.first(),
+            Some(crate::state::OutboundPayload::InputFrame { sequence: 1, events, .. }) if matches!(
+                events.as_slice(),
+                [InputEvent::Key { scan_code: 42, state: KeyState::Up }]
+            )
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }
