@@ -17,7 +17,7 @@ use core_clipboard::{
     validate_bmp_payload, validate_payload,
 };
 use core_discovery::parse_manual_target;
-use core_input::{InputEvent, InputFrame, InputRouter, InputSink, RouteDecision};
+use core_input::{InputEvent, InputFrame, InputRouter, InputSink, KeyState, RouteDecision};
 use core_security::{
     DeviceIdentity, SecurityPaths, TrustBundle, TrustRecord, default_security_root,
     ensure_device_identity, ensure_trust_store, fingerprint, generate_pairing_code,
@@ -31,6 +31,7 @@ use crate::config::{
 
 const MAX_TRANSPORT_EVENTS: usize = 512;
 const MAX_PENDING_REMOTE_CLIPBOARD_ITEMS: usize = 64;
+const MAX_PENDING_INJECT_INPUT_FRAMES: usize = 128;
 
 #[derive(Debug, Clone)]
 pub enum OutboundPayload {
@@ -68,6 +69,13 @@ pub struct PendingRemoteClipboardPayload {
     pub hash: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingInjectInputFrame {
+    pub peer_id: String,
+    pub sequence: u64,
+    pub events: Vec<InputEvent>,
+}
+
 #[derive(Debug, Default)]
 struct ClipboardSyncState {
     last_observed_hash: Option<String>,
@@ -90,6 +98,7 @@ pub struct AppState {
     inbox_root: Arc<PathBuf>,
     input_router: Arc<RwLock<InputRouter>>,
     input_sequence_by_peer: Arc<RwLock<HashMap<String, u64>>>,
+    pending_inject_input_frames: Arc<RwLock<VecDeque<PendingInjectInputFrame>>>,
 }
 
 impl AppState {
@@ -159,6 +168,7 @@ impl AppState {
             inbox_root: Arc::new(inbox_root),
             input_router: Arc::new(RwLock::new(InputRouter::new(input_enabled))),
             input_sequence_by_peer: Arc::new(RwLock::new(HashMap::new())),
+            pending_inject_input_frames: Arc::new(RwLock::new(VecDeque::new())),
         })
     }
 
@@ -352,6 +362,8 @@ impl AppState {
             router.clear_peer_state(peer_id);
             self.input_sequence_by_peer.write().await.remove(peer_id);
             self.discovered_endpoints.write().await.remove(peer_id);
+            self.clear_pending_inject_input_frames_for_peer(peer_id)
+                .await;
         }
         Ok(removed)
     }
@@ -374,6 +386,9 @@ impl AppState {
             let mut router = self.input_router.write().await;
             router.release_owner(peer_id);
             router.clear_peer_state(peer_id);
+            drop(router);
+            self.clear_pending_inject_input_frames_for_peer(peer_id)
+                .await;
         }
 
         Ok(())
@@ -640,6 +655,38 @@ impl AppState {
         Ok(())
     }
 
+    pub async fn queue_input_key(
+        &self,
+        peer_id: &str,
+        scan_code: u16,
+        key_state: KeyState,
+    ) -> Result<()> {
+        if self.get_peer(peer_id).await.is_none() {
+            anyhow::bail!("unknown peer {peer_id}");
+        }
+
+        let sequence = {
+            let mut sequences = self.input_sequence_by_peer.write().await;
+            let entry = sequences.entry(peer_id.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+
+        let mut queue_map = self.outgoing_payloads.write().await;
+        queue_map
+            .entry(peer_id.to_string())
+            .or_default()
+            .push_back(OutboundPayload::InputFrame {
+                sequence,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::Key {
+                    scan_code,
+                    state: key_state,
+                }],
+            });
+        Ok(())
+    }
+
     pub async fn drain_outgoing(&self, peer_id: &str) -> Vec<OutboundPayload> {
         let mut queue_map = self.outgoing_payloads.write().await;
         queue_map
@@ -777,25 +824,98 @@ impl AppState {
         .await;
     }
 
+    async fn enqueue_pending_inject_input_frame(
+        &self,
+        frame: PendingInjectInputFrame,
+    ) -> (usize, Option<PendingInjectInputFrame>) {
+        let mut queue = self.pending_inject_input_frames.write().await;
+        let dropped = if queue.len() >= MAX_PENDING_INJECT_INPUT_FRAMES {
+            queue.pop_front()
+        } else {
+            None
+        };
+        queue.push_back(frame);
+        (queue.len(), dropped)
+    }
+
+    async fn clear_pending_inject_input_frames_for_peer(&self, peer_id: &str) {
+        let mut queue = self.pending_inject_input_frames.write().await;
+        queue.retain(|frame| frame.peer_id != peer_id);
+    }
+
+    async fn record_input_inject_queued(
+        &self,
+        peer_id: &str,
+        sequence: u64,
+        event_count: usize,
+        depth: usize,
+    ) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: "input_inject_queued".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("sequence={sequence} queue_depth={depth}"),
+            size_bytes: event_count as u64,
+        })
+        .await;
+    }
+
+    async fn record_input_inject_dropped(&self, peer_id: &str, sequence: u64, event_count: usize) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: "input_inject_dropped".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("sequence={sequence} dropped_oldest"),
+            size_bytes: event_count as u64,
+        })
+        .await;
+    }
+
     pub async fn route_incoming_input_frame(
         &self,
         peer_id: &str,
         frame: InputFrame,
     ) -> Result<RouteDecision> {
-        struct NoopInputSink;
-        impl InputSink for NoopInputSink {
-            fn apply(&mut self, _event: &InputEvent) -> std::result::Result<(), String> {
+        struct RecordingInputSink {
+            events: Vec<InputEvent>,
+        }
+        impl InputSink for RecordingInputSink {
+            fn apply(&mut self, event: &InputEvent) -> std::result::Result<(), String> {
+                self.events.push(event.clone());
                 Ok(())
             }
         }
 
-        let mut sink = NoopInputSink;
+        let mut sink = RecordingInputSink {
+            events: Vec::with_capacity(frame.events.len()),
+        };
         let decision = self
             .input_router
             .write()
             .await
             .route_frame(&frame, &mut sink)
             .map_err(anyhow::Error::from)?;
+
+        if matches!(decision, RouteDecision::Applied { .. }) {
+            let pending = PendingInjectInputFrame {
+                peer_id: peer_id.to_string(),
+                sequence: frame.sequence,
+                events: sink.events,
+            };
+            let (depth, dropped) = self.enqueue_pending_inject_input_frame(pending).await;
+            if let Some(dropped) = dropped {
+                self.record_input_inject_dropped(
+                    &dropped.peer_id,
+                    dropped.sequence,
+                    dropped.events.len(),
+                )
+                .await;
+            }
+            self.record_input_inject_queued(peer_id, frame.sequence, frame.events.len(), depth)
+                .await;
+        }
 
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
@@ -808,6 +928,53 @@ impl AppState {
         .await;
 
         Ok(decision)
+    }
+
+    pub async fn dequeue_pending_inject_input_frame(&self) -> Option<PendingInjectInputFrame> {
+        self.pending_inject_input_frames.write().await.pop_front()
+    }
+
+    pub async fn requeue_pending_inject_input_frame_front(&self, frame: PendingInjectInputFrame) {
+        let mut queue = self.pending_inject_input_frames.write().await;
+        if queue.len() >= MAX_PENDING_INJECT_INPUT_FRAMES {
+            queue.pop_back();
+        }
+        queue.push_front(frame);
+    }
+
+    pub async fn record_input_inject_applied(
+        &self,
+        peer_id: &str,
+        sequence: u64,
+        event_count: usize,
+    ) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: "input_inject_applied".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("sequence={sequence}"),
+            size_bytes: event_count as u64,
+        })
+        .await;
+    }
+
+    pub async fn record_input_inject_failed(
+        &self,
+        peer_id: &str,
+        sequence: u64,
+        event_count: usize,
+        message: &str,
+    ) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: "input_inject_failed".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("sequence={sequence} {message}"),
+            size_bytes: event_count as u64,
+        })
+        .await;
     }
 
     pub async fn claim_input_owner(&self, peer_id: &str, force: bool) -> Result<bool> {
@@ -850,6 +1017,7 @@ impl AppState {
         *self.input_router.write().await =
             InputRouter::new(config.features.get("share_input").copied().unwrap_or(true));
         self.input_sequence_by_peer.write().await.clear();
+        self.pending_inject_input_frames.write().await.clear();
 
         save_config_at(&self.config_path, &config)
     }
@@ -1366,6 +1534,179 @@ mod tests {
             .await
             .expect("sequence should restart after disconnect");
         assert!(matches!(second, RouteDecision::Applied { .. }));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn route_incoming_input_frame_queues_for_injection_when_applied() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-input-queue-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim owner")
+        );
+
+        let decision = state
+            .route_incoming_input_frame(
+                &peer_id,
+                InputFrame {
+                    source_peer_id: peer_id.clone(),
+                    sequence: 1,
+                    timestamp_unix_ms: 1,
+                    events: vec![
+                        InputEvent::MouseMove { dx: 2, dy: -1 },
+                        InputEvent::Key {
+                            scan_code: 30,
+                            state: KeyState::Down,
+                        },
+                    ],
+                },
+            )
+            .await
+            .expect("route");
+        assert!(matches!(
+            decision,
+            RouteDecision::Applied { event_count: 2 }
+        ));
+
+        let queued = state
+            .dequeue_pending_inject_input_frame()
+            .await
+            .expect("queued frame");
+        assert_eq!(queued.peer_id, peer_id);
+        assert_eq!(queued.sequence, 1);
+        assert_eq!(queued.events.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn disconnect_clears_pending_injection_frames_for_peer() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-input-clear-queue-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim owner")
+        );
+
+        state
+            .route_incoming_input_frame(
+                &peer_id,
+                InputFrame {
+                    source_peer_id: peer_id.clone(),
+                    sequence: 1,
+                    timestamp_unix_ms: 1,
+                    events: vec![InputEvent::MouseMove { dx: 1, dy: 1 }],
+                },
+            )
+            .await
+            .expect("route");
+
+        state
+            .set_peer_connected(&peer_id, false)
+            .await
+            .expect("disconnect");
+        assert!(
+            state.dequeue_pending_inject_input_frame().await.is_none(),
+            "disconnect should clear queued injection frames for that peer"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn pending_input_injection_queue_drops_oldest_when_full() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-input-overflow-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim owner")
+        );
+
+        for sequence in 1..=(MAX_PENDING_INJECT_INPUT_FRAMES as u64 + 1) {
+            state
+                .route_incoming_input_frame(
+                    &peer_id,
+                    InputFrame {
+                        source_peer_id: peer_id.clone(),
+                        sequence,
+                        timestamp_unix_ms: sequence as i64,
+                        events: vec![InputEvent::MouseMove { dx: 1, dy: 1 }],
+                    },
+                )
+                .await
+                .expect("route");
+        }
+
+        let first = state
+            .dequeue_pending_inject_input_frame()
+            .await
+            .expect("first queued");
+        assert_eq!(first.sequence, 2, "oldest frame should have been dropped");
+
+        let mut count = 1usize;
+        while state.dequeue_pending_inject_input_frame().await.is_some() {
+            count += 1;
+        }
+        assert_eq!(count, MAX_PENDING_INJECT_INPUT_FRAMES);
 
         let _ = std::fs::remove_dir_all(&root);
     }

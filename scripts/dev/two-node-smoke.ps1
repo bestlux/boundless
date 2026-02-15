@@ -289,6 +289,9 @@ try {
     Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "send-move", $node1PeerId, "3", "2") | Out-Host
     Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId" -Seconds $TimeoutSeconds
     Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=input_frame peer_id=$node2PeerId" -Seconds $TimeoutSeconds
+    Invoke-Cli -Endpoint $node1Endpoint -CommandArgs @("input", "send-key", $node1PeerId, "30", "down") | Out-Host
+    Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId" -Seconds $TimeoutSeconds
+    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=local kind=input_inject_applied peer_id=$node2PeerId" -Seconds $TimeoutSeconds
     Invoke-Cli -Endpoint $node2Endpoint -CommandArgs @("input", "release", $node2PeerId) | Out-Host
     Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
 

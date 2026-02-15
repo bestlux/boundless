@@ -87,6 +87,7 @@ Manage input ownership control-plane:
 ```bash
 cargo run -p boundless-cli -- input owner
 cargo run -p boundless-cli -- input send-move <peer_id> 3 2
+cargo run -p boundless-cli -- input send-key <peer_id> 30 down
 cargo run -p boundless-cli -- input claim <peer_id>
 cargo run -p boundless-cli -- input release <peer_id>
 ```
@@ -102,4 +103,4 @@ cargo run -p boundless-cli -- input release <peer_id>
 
 ## Notes
 
-Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, real clipboard runtime sync for text and bitmap image payloads (watch/apply with echo suppression), queued file payload transfer primitives, input routing groundwork (ownership control-plane + synthetic input frame transport routed through a no-op sink), and mDNS runtime discovery with manual address fallback. Windows input injection remains an upcoming slice.
+Alpha scope emphasizes reliability primitives and now includes TLS transport with heartbeat/reconnect, trust-bundle pairing, real clipboard runtime sync for text and bitmap image payloads (watch/apply with echo suppression), queued file payload transfer primitives, and input routing groundwork (ownership control-plane + synthetic input frame transport + runtime injection queue with pluggable backend). Current input backend behavior remains no-op while capture/injection platform implementations are built out. mDNS runtime discovery with manual address fallback is also in place.

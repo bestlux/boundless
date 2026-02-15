@@ -23,7 +23,8 @@ use ipc_api::boundless::v1::{
     DiagnosticsDumpRequest, Empty, FeatureSetRequest, HotkeySetRequest, ImportTrustBundleRequest,
     InputOwnerRequest, LayoutSetRequest, PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest,
     SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest,
-    SendInputMoveRequest, StatusRequest, daemon_service_client::DaemonServiceClient,
+    SendInputKeyRequest, SendInputMoveRequest, StatusRequest,
+    daemon_service_client::DaemonServiceClient,
     diagnostics_service_client::DiagnosticsServiceClient,
     feature_service_client::FeatureServiceClient, pairing_service_client::PairingServiceClient,
     topology_service_client::TopologyServiceClient,
@@ -166,6 +167,11 @@ enum InputCommand {
         dx: i32,
         dy: i32,
     },
+    SendKey {
+        peer_id: String,
+        scan_code: u16,
+        state: InputKeyState,
+    },
     Claim {
         peer_id: String,
         #[arg(long, default_value_t = false)]
@@ -185,6 +191,18 @@ enum ToggleValue {
 impl ToggleValue {
     fn as_bool(self) -> bool {
         matches!(self, Self::On)
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum InputKeyState {
+    Down,
+    Up,
+}
+
+impl InputKeyState {
+    fn is_down(self) -> bool {
+        matches!(self, Self::Down)
     }
 }
 
@@ -251,6 +269,11 @@ async fn main() -> Result<()> {
             InputCommand::SendMove { peer_id, dx, dy } => {
                 input_send_move(&cli.endpoint, peer_id, dx, dy).await
             }
+            InputCommand::SendKey {
+                peer_id,
+                scan_code,
+                state,
+            } => input_send_key(&cli.endpoint, peer_id, scan_code, state).await,
             InputCommand::Claim { peer_id, force } => {
                 input_claim(&cli.endpoint, peer_id, force).await
             }
@@ -593,6 +616,26 @@ async fn input_send_move(endpoint: &str, peer_id: String, dx: i32, dy: i32) -> R
     let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
     let response = client
         .send_input_move(SendInputMoveRequest { peer_id, dx, dy })
+        .await?
+        .into_inner();
+
+    println!("ok={} message={}", response.ok, response.message);
+    Ok(())
+}
+
+async fn input_send_key(
+    endpoint: &str,
+    peer_id: String,
+    scan_code: u16,
+    state: InputKeyState,
+) -> Result<()> {
+    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .send_input_key(SendInputKeyRequest {
+            peer_id,
+            scan_code: scan_code as u32,
+            key_down: state.is_down(),
+        })
         .await?
         .into_inner();
 
