@@ -35,6 +35,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const SUPERVISOR_TICK: Duration = Duration::from_secs(3);
 const MAX_BACKOFF_SECONDS: u64 = 30;
 const FILE_CHUNK_BYTES: usize = 48 * 1024;
+const FALLBACK_BIND_HOST: &str = "0.0.0.0";
 
 #[derive(Debug)]
 struct InboundTransfer {
@@ -44,23 +45,20 @@ struct InboundTransfer {
     bytes: Vec<u8>,
 }
 
-pub fn start(state: AppState) {
-    tokio::spawn(listener_loop(state.clone()));
+pub fn start(state: AppState, listener: Option<TcpListener>) {
+    if let Some(listener) = listener {
+        tokio::spawn(listener_loop(state.clone(), listener));
+    } else {
+        warn!("transport listener not started");
+    }
     tokio::spawn(supervisor_loop(state));
 }
 
-async fn listener_loop(state: AppState) {
-    let snapshot = state.snapshot().await;
-    let bind = format!("0.0.0.0:{}", snapshot.network_port);
-
-    let listener = match TcpListener::bind(&bind).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            error!(%error, bind = %bind, "transport listener failed to bind");
-            return;
-        }
-    };
-
+async fn listener_loop(state: AppState, listener: TcpListener) {
+    let bind = listener
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     info!(bind = %bind, "transport listener started");
 
     loop {
@@ -77,6 +75,65 @@ async fn listener_loop(state: AppState) {
                 warn!(%error, "transport accept failed");
                 time::sleep(Duration::from_millis(250)).await;
             }
+        }
+    }
+}
+
+pub async fn prepare_listener(state: &AppState) -> Option<TcpListener> {
+    let configured_port = state.snapshot().await.network_port;
+    let configured_bind = format!("{FALLBACK_BIND_HOST}:{configured_port}");
+
+    match TcpListener::bind(&configured_bind).await {
+        Ok(listener) => Some(listener),
+        Err(primary_error) => {
+            warn!(
+                configured_bind = %configured_bind,
+                error = %primary_error,
+                "configured transport bind failed; trying automatic fallback port"
+            );
+
+            let fallback_bind = format!("{FALLBACK_BIND_HOST}:0");
+            let listener = match TcpListener::bind(&fallback_bind).await {
+                Ok(listener) => listener,
+                Err(fallback_error) => {
+                    error!(
+                        configured_bind = %configured_bind,
+                        fallback_bind = %fallback_bind,
+                        primary_error = %primary_error,
+                        fallback_error = %fallback_error,
+                        "transport listener failed to bind on configured and fallback ports"
+                    );
+                    return None;
+                }
+            };
+
+            let effective_port = match listener.local_addr() {
+                Ok(addr) => addr.port(),
+                Err(error) => {
+                    error!(
+                        error = %error,
+                        "transport listener fallback bind succeeded but local_addr failed"
+                    );
+                    return Some(listener);
+                }
+            };
+
+            if let Err(error) = state.update_network_port(effective_port).await {
+                error!(
+                    configured_port,
+                    effective_port,
+                    error = ?error,
+                    "failed to persist effective fallback network port"
+                );
+            } else {
+                warn!(
+                    configured_port,
+                    effective_port,
+                    "transport listener port updated to fallback value and persisted"
+                );
+            }
+
+            Some(listener)
         }
     }
 }
@@ -1158,6 +1215,17 @@ mod tests {
         (state, peer_id, root)
     }
 
+    async fn state_for_listener_test() -> (AppState, std::path::PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("boundless-listener-test-{}", uuid::Uuid::new_v4()));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+        (state, root)
+    }
+
     fn minimal_bmp_payload() -> Vec<u8> {
         vec![
             b'B', b'M', 58, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
@@ -1287,6 +1355,51 @@ mod tests {
         let queued = state.drain_outgoing(&peer_id).await;
         assert!(queued.is_empty(), "dropped image must not be requeued");
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn prepare_listener_uses_configured_port_when_available() {
+        let (state, root) = state_for_listener_test().await;
+        let probe = TcpListener::bind("0.0.0.0:0").await.expect("probe bind");
+        let preferred_port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+
+        state
+            .update_network_port(preferred_port)
+            .await
+            .expect("set preferred port");
+
+        let listener = prepare_listener(&state).await.expect("listener");
+        let effective_port = listener.local_addr().expect("addr").port();
+        assert_eq!(effective_port, preferred_port);
+        assert_eq!(state.snapshot().await.network_port, preferred_port);
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn prepare_listener_falls_back_and_persists_effective_port() {
+        let (state, root) = state_for_listener_test().await;
+        let blocker = TcpListener::bind("0.0.0.0:0").await.expect("block bind");
+        let blocked_port = blocker.local_addr().expect("block addr").port();
+
+        state
+            .update_network_port(blocked_port)
+            .await
+            .expect("set blocked port");
+
+        let listener = prepare_listener(&state).await.expect("fallback listener");
+        let effective_port = listener.local_addr().expect("addr").port();
+        assert_ne!(
+            effective_port, blocked_port,
+            "fallback must avoid blocked configured port"
+        );
+        assert_eq!(state.snapshot().await.network_port, effective_port);
+
+        drop(listener);
+        drop(blocker);
         let _ = std::fs::remove_dir_all(root);
     }
 }
