@@ -103,6 +103,7 @@ pub struct AppState {
     input_sequence_by_peer: Arc<RwLock<HashMap<String, u64>>>,
     pending_inject_input_frames: Arc<RwLock<VecDeque<PendingInjectInputFrame>>>,
     input_capture_target_peer_id: Arc<RwLock<Option<String>>>,
+    reconnect_generation_by_peer: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 impl AppState {
@@ -174,6 +175,7 @@ impl AppState {
             input_sequence_by_peer: Arc::new(RwLock::new(HashMap::new())),
             pending_inject_input_frames: Arc::new(RwLock::new(VecDeque::new())),
             input_capture_target_peer_id: Arc::new(RwLock::new(None)),
+            reconnect_generation_by_peer: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -369,6 +371,10 @@ impl AppState {
             self.discovered_endpoints.write().await.remove(peer_id);
             self.clear_pending_inject_input_frames_for_peer(peer_id)
                 .await;
+            self.reconnect_generation_by_peer
+                .write()
+                .await
+                .remove(peer_id);
             let mut capture_target = self.input_capture_target_peer_id.write().await;
             if capture_target.as_deref() == Some(peer_id) {
                 *capture_target = None;
@@ -470,6 +476,22 @@ impl AppState {
         let mut config = self.config.write().await;
         config.hotkeys.insert(action, combo);
         save_config_at(&self.config_path, &config)
+    }
+
+    pub async fn request_peer_reconnect(&self, peer_id: &str) -> u64 {
+        let mut generations = self.reconnect_generation_by_peer.write().await;
+        let entry = generations.entry(peer_id.to_string()).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    pub async fn peer_reconnect_generation(&self, peer_id: &str) -> u64 {
+        *self
+            .reconnect_generation_by_peer
+            .read()
+            .await
+            .get(peer_id)
+            .unwrap_or(&0)
     }
 
     pub async fn mark_all_peers_disconnected(&self) -> Result<usize> {
@@ -1154,6 +1176,7 @@ impl AppState {
         self.input_sequence_by_peer.write().await.clear();
         self.pending_inject_input_frames.write().await.clear();
         *self.input_capture_target_peer_id.write().await = None;
+        self.reconnect_generation_by_peer.write().await.clear();
 
         save_config_at(&self.config_path, &config)
     }

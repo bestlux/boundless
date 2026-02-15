@@ -108,8 +108,13 @@ impl HotkeyEngine {
             }
         }
 
+        let bound_actions = bindings
+            .iter()
+            .map(|binding| binding.action)
+            .collect::<HashSet<_>>();
         self.bindings = bindings;
-        self.active_actions.clear();
+        self.active_actions
+            .retain(|action| bound_actions.contains(action));
     }
 
     fn poll<F>(&mut self, key_down: F) -> Vec<HotkeyAction>
@@ -195,6 +200,11 @@ async fn apply_hotkey_action(state: &AppState, action: HotkeyAction) -> Result<(
             info!("hotkey lock_machine executed");
         }
         HotkeyAction::Reconnect => {
+            let peers = state.list_peers().await;
+            for peer in &peers {
+                state.request_peer_reconnect(&peer.peer_id).await;
+            }
+
             let peer_count = state
                 .mark_all_peers_disconnected()
                 .await
@@ -383,6 +393,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hotkey_engine_reload_keeps_active_edges_pressed() {
+        let mut map = BTreeMap::<String, String>::new();
+        map.insert("toggle_easy_mouse".to_string(), "Ctrl+Alt+E".to_string());
+
+        let mut engine = HotkeyEngine::default();
+        engine.update_bindings(&map);
+
+        let mut down = HashSet::<u16>::new();
+        down.insert(VK_CONTROL);
+        down.insert(VK_ALT);
+        down.insert(u16::from(b'E'));
+
+        assert_eq!(
+            engine.poll(|key| down.contains(&key)),
+            vec![HotkeyAction::ToggleEasyMouse]
+        );
+
+        engine.update_bindings(&map);
+        assert!(
+            engine.poll(|key| down.contains(&key)).is_empty(),
+            "binding reload must not fire action again while key is still held"
+        );
+    }
+
     #[tokio::test]
     async fn hotkey_toggle_easy_mouse_updates_persisted_feature() {
         let (root, config_path, security_root) = temp_state_paths("hotkey-toggle-test");
@@ -467,6 +502,14 @@ mod tests {
         assert!(
             state.input_owner().await.is_none(),
             "reconnect action should release input ownership"
+        );
+        assert!(
+            state.peer_reconnect_generation(&peer_one).await > 0,
+            "reconnect action should request active session teardown for peer one"
+        );
+        assert!(
+            state.peer_reconnect_generation(&peer_two).await > 0,
+            "reconnect action should request active session teardown for peer two"
         );
 
         let _ = std::fs::remove_dir_all(root);
