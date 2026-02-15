@@ -6,6 +6,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$originalCargoIncremental = $env:CARGO_INCREMENTAL
+$env:CARGO_INCREMENTAL = "0"
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 Set-Location $repoRoot
 
@@ -284,6 +287,13 @@ try {
     Write-Host "[smoke] success: peer connectivity and payload transfer validated"
 }
 finally {
+    if ($null -eq $originalCargoIncremental) {
+        Remove-Item Env:CARGO_INCREMENTAL -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:CARGO_INCREMENTAL = $originalCargoIncremental
+    }
+
     foreach ($proc in @($node1, $node2)) {
         if ($null -ne $proc -and -not $proc.HasExited) {
             Stop-Process -Id $proc.Id -Force
