@@ -204,12 +204,17 @@ async fn apply_hotkey_action(state: &AppState, action: HotkeyAction) -> Result<(
             for peer in &peers {
                 state.request_peer_reconnect(&peer.peer_id).await;
             }
+            let peer_ids = peers
+                .iter()
+                .map(|peer| peer.peer_id.clone())
+                .collect::<Vec<_>>();
+            let aborted_sessions = state.abort_transport_sessions_for_peers(&peer_ids).await;
 
             let peer_count = state
                 .mark_all_peers_disconnected()
                 .await
                 .context("mark peers disconnected")?;
-            info!(peer_count, "hotkey reconnect requested");
+            info!(peer_count, aborted_sessions, "hotkey reconnect requested");
         }
         HotkeyAction::SwitchAll => {
             info!("hotkey switch_all is not implemented yet");
@@ -490,6 +495,19 @@ mod tests {
                 .expect("claim owner")
         );
 
+        let session_one = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        state
+            .register_transport_session_for_peer(&peer_one, session_one.abort_handle())
+            .await;
+        let session_two = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        state
+            .register_transport_session_for_peer(&peer_two, session_two.abort_handle())
+            .await;
+
         apply_hotkey_action(&state, HotkeyAction::Reconnect)
             .await
             .expect("reconnect");
@@ -511,6 +529,15 @@ mod tests {
             state.peer_reconnect_generation(&peer_two).await > 0,
             "reconnect action should request active session teardown for peer two"
         );
+
+        let join_one = session_one
+            .await
+            .expect_err("session one should be aborted");
+        assert!(join_one.is_cancelled());
+        let join_two = session_two
+            .await
+            .expect_err("session two should be aborted");
+        assert!(join_two.is_cancelled());
 
         let _ = std::fs::remove_dir_all(root);
     }
