@@ -13,8 +13,10 @@
   - trust bundle export/import
   - TLS transport session establishment
   - heartbeat-driven connected state reporting
+  - explicit per-peer connected/disconnected state assertions during restart
   - input ownership claim/release control-plane behavior
   - synthetic input frame transport + router processing path
+  - reconnect behavior (drop + recover) with queued payload delivery after reconnect
   - queued clipboard text/file payload transfer and inbox materialization
 - The smoke harness runs daemon API in TCP mode (`--api-transport tcp`) even though Windows default is named pipe, to keep two-node automation deterministic
 - mDNS discovery is enabled during daemon runtime; transport workers prefer discovered endpoints and fall back to configured/manual peer addresses
@@ -78,10 +80,21 @@
 - On both machines: `transport events --limit 100`
 - Confirm outgoing/incoming `kind=input_frame` events are present, local runtime emits `kind=input_inject_*` events, and no daemon errors are reported
 
+10. Reconnect and queued-delivery behavior
+- On Machine A/B: establish connected state and capture peer IDs
+- Stop daemon on Machine B
+- On Machine A: verify `peer list` shows the known peer as `connected=false`
+- On Machine A: enqueue `transport send-text <peer_id> "<queued-text>"`
+- Restart daemon on Machine B
+- Verify both sides return to `connected=true`
+- On Machine B: verify incoming `kind=clipboard_text` event includes the queued text token after reconnect
+- On Machine B: verify `input owner` is `none` after reconnect
+
 ## Exit criteria for this stage
 
 - CLI commands are stable and deterministic
 - Persistence survives restart
 - Diagnostics bundle generated successfully
 - No daemon crashes during command workflows
+- Reconnect cycle preserves transport health and drains queued payloads
 - Clipboard/file payload smoke path completes reliably

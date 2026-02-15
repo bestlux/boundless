@@ -35,7 +35,9 @@
 - [x] Implemented Windows `SendInput` runtime injection backend for mouse/key events
 - [x] Added runtime input capture target control-plane + Windows polling capture backend (cursor/buttons/keys)
 - [x] Upgraded Windows capture to low-level keyboard/mouse hooks with wheel + broader key coverage (polling fallback retained)
+- [x] Expanded two-node smoke harness with reconnect/disconnect assertions, queued-delivery checks, and stricter checked CLI helpers
 
 ## Next (priority order)
 
-- [ ] Add richer multi-machine integration assertions beyond payload smoke
+- [ ] Implement layout-driven edge switching semantics for capture target handoff
+- [ ] Implement core hotkey runtime actions (lock machine, reconnect, easy mouse toggle) with persistence assertions
