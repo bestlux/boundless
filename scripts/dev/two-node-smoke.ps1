@@ -6,21 +6,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$originalCargoIncremental = $env:CARGO_INCREMENTAL
-$env:CARGO_INCREMENTAL = "0"
+$originalCargoIncremental = $null
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 Set-Location $repoRoot
 
 $daemonExe = Join-Path $repoRoot "target/debug/boundlessd.exe"
 $cliExe = Join-Path $repoRoot "target/debug/boundlessctl.exe"
-
-Write-Host "[smoke] building debug binaries"
-cargo build -p boundless-daemon -p boundless-cli | Out-Host
-
-if (-not (Test-Path $daemonExe) -or -not (Test-Path $cliExe)) {
-    throw "Expected binaries were not built"
-}
 
 $runRoot = Join-Path $env:TEMP ("boundless-smoke-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
 $node1Root = Join-Path $runRoot "node1"
@@ -207,6 +199,16 @@ function Start-DaemonProcess {
 }
 
 try {
+    $originalCargoIncremental = $env:CARGO_INCREMENTAL
+    $env:CARGO_INCREMENTAL = "0"
+
+    Write-Host "[smoke] building debug binaries"
+    cargo build -p boundless-daemon -p boundless-cli | Out-Host
+
+    if (-not (Test-Path $daemonExe) -or -not (Test-Path $cliExe)) {
+        throw "Expected binaries were not built"
+    }
+
     Write-Host "[smoke] starting node1"
     $node1 = Start-DaemonProcess -Bind $node1Bind -NetworkPort $node1Port -StdOutPath $node1Out -StdErrPath $node1Err -Environment @{
         BOUNDLESS_CONFIG_PATH = $node1Config
