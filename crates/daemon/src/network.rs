@@ -341,12 +341,21 @@ where
                         }
 
                         if let Some(peer_id) = &remote_peer_id {
-                            state.record_incoming_clipboard_text(peer_id, &text).await;
-                            info!(
-                                peer_id = %peer_id,
-                                size_bytes = text.len(),
-                                "received clipboard text payload"
-                            );
+                            if let Err(error) =
+                                state.enqueue_remote_clipboard_text(peer_id, text.clone()).await
+                            {
+                                warn!(
+                                    peer_id = %peer_id,
+                                    error = ?error,
+                                    "failed to enqueue incoming clipboard text payload"
+                                );
+                            } else {
+                                info!(
+                                    peer_id = %peer_id,
+                                    size_bytes = text.len(),
+                                    "received clipboard text payload"
+                                );
+                            }
                         }
                     }
                     WireMessage::FileStart {

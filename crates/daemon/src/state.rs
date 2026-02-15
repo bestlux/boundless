@@ -12,6 +12,9 @@ use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio::sync::RwLock;
 use tracing::info;
 
+use core_clipboard::{
+    ClipboardPayload, ClipboardPolicy, ClipboardPolicyError, payload_hash_hex, validate_payload,
+};
 use core_discovery::parse_manual_target;
 use core_input::{InputEvent, InputFrame, InputRouter, InputSink, RouteDecision};
 use core_security::{
@@ -26,6 +29,7 @@ use crate::config::{
 };
 
 const MAX_TRANSPORT_EVENTS: usize = 512;
+const MAX_PENDING_REMOTE_CLIPBOARD_ITEMS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub enum OutboundPayload {
@@ -53,6 +57,20 @@ pub struct TransportEventRecord {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingRemoteClipboardText {
+    pub peer_id: String,
+    pub text: String,
+    pub hash: String,
+}
+
+#[derive(Debug, Default)]
+struct ClipboardSyncState {
+    last_observed_hash: Option<String>,
+    suppress_echo_hash: Option<String>,
+    pending_remote: VecDeque<PendingRemoteClipboardText>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     config_path: Arc<PathBuf>,
@@ -63,6 +81,7 @@ pub struct AppState {
     device_fingerprint: Arc<String>,
     outgoing_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
     transport_events: Arc<RwLock<VecDeque<TransportEventRecord>>>,
+    clipboard_sync: Arc<RwLock<ClipboardSyncState>>,
     discovered_endpoints: Arc<RwLock<HashMap<String, SocketAddr>>>,
     inbox_root: Arc<PathBuf>,
     input_router: Arc<RwLock<InputRouter>>,
@@ -131,6 +150,7 @@ impl AppState {
             device_fingerprint: Arc::new(fingerprint),
             outgoing_payloads: Arc::new(RwLock::new(HashMap::new())),
             transport_events: Arc::new(RwLock::new(VecDeque::new())),
+            clipboard_sync: Arc::new(RwLock::new(ClipboardSyncState::default())),
             discovered_endpoints: Arc::new(RwLock::new(HashMap::new())),
             inbox_root: Arc::new(inbox_root),
             input_router: Arc::new(RwLock::new(InputRouter::new(input_enabled))),
@@ -380,6 +400,8 @@ impl AppState {
 
         if name == "share_input" {
             self.input_router.write().await.set_enabled(enabled);
+        } else if name == "share_clipboard" && !enabled {
+            *self.clipboard_sync.write().await = ClipboardSyncState::default();
         }
 
         Ok(())
@@ -406,6 +428,85 @@ impl AppState {
             .or_default()
             .push_back(OutboundPayload::ClipboardText { text });
         Ok(())
+    }
+
+    pub async fn queue_local_clipboard_text_for_connected_peers(
+        &self,
+        text: String,
+    ) -> Result<bool> {
+        let hash = match self.validated_clipboard_text_hash(&text).await? {
+            Some(hash) => hash,
+            None => return Ok(false),
+        };
+
+        {
+            let mut sync = self.clipboard_sync.write().await;
+            if sync.suppress_echo_hash.as_deref() == Some(hash.as_str()) {
+                sync.suppress_echo_hash = None;
+                sync.last_observed_hash = Some(hash);
+                return Ok(false);
+            }
+            if sync.last_observed_hash.as_deref() == Some(hash.as_str()) {
+                return Ok(false);
+            }
+            sync.last_observed_hash = Some(hash);
+        }
+
+        let connected_peer_ids = self.connected_peer_ids().await;
+        if connected_peer_ids.is_empty() {
+            return Ok(false);
+        }
+
+        let mut queue_map = self.outgoing_payloads.write().await;
+        for peer_id in &connected_peer_ids {
+            queue_map
+                .entry(peer_id.clone())
+                .or_default()
+                .push_back(OutboundPayload::ClipboardText { text: text.clone() });
+        }
+
+        Ok(true)
+    }
+
+    pub async fn enqueue_remote_clipboard_text(&self, peer_id: &str, text: String) -> Result<()> {
+        self.record_incoming_clipboard_text(peer_id, &text).await;
+
+        let hash = match self.validated_clipboard_text_hash(&text).await? {
+            Some(hash) => hash,
+            None => return Ok(()),
+        };
+
+        let mut sync = self.clipboard_sync.write().await;
+        if sync.pending_remote.back().map(|item| item.hash.as_str()) == Some(hash.as_str()) {
+            return Ok(());
+        }
+        if sync.pending_remote.len() >= MAX_PENDING_REMOTE_CLIPBOARD_ITEMS {
+            sync.pending_remote.pop_front();
+        }
+        sync.pending_remote.push_back(PendingRemoteClipboardText {
+            peer_id: peer_id.to_string(),
+            text,
+            hash,
+        });
+        Ok(())
+    }
+
+    pub async fn dequeue_remote_clipboard_text(&self) -> Option<PendingRemoteClipboardText> {
+        self.clipboard_sync.write().await.pending_remote.pop_front()
+    }
+
+    pub async fn requeue_remote_clipboard_text_front(&self, item: PendingRemoteClipboardText) {
+        let mut sync = self.clipboard_sync.write().await;
+        if sync.pending_remote.len() >= MAX_PENDING_REMOTE_CLIPBOARD_ITEMS {
+            sync.pending_remote.pop_back();
+        }
+        sync.pending_remote.push_front(item);
+    }
+
+    pub async fn mark_remote_clipboard_applied(&self, hash: &str) {
+        let mut sync = self.clipboard_sync.write().await;
+        sync.suppress_echo_hash = Some(hash.to_string());
+        sync.last_observed_hash = Some(hash.to_string());
     }
 
     pub async fn queue_file_from_path(&self, peer_id: &str, file_path: &Path) -> Result<()> {
@@ -639,6 +740,7 @@ impl AppState {
 
         self.outgoing_payloads.write().await.clear();
         self.transport_events.write().await.clear();
+        *self.clipboard_sync.write().await = ClipboardSyncState::default();
         self.discovered_endpoints.write().await.clear();
         *self.input_router.write().await =
             InputRouter::new(config.features.get("share_input").copied().unwrap_or(true));
@@ -688,6 +790,38 @@ impl AppState {
 
         tokio::fs::write(&file_path, report).await?;
         Ok(file_path.display().to_string())
+    }
+
+    async fn connected_peer_ids(&self) -> Vec<String> {
+        self.config
+            .read()
+            .await
+            .peers
+            .iter()
+            .filter(|peer| peer.connected)
+            .map(|peer| peer.peer_id.clone())
+            .collect()
+    }
+
+    async fn validated_clipboard_text_hash(&self, text: &str) -> Result<Option<String>> {
+        let policy = ClipboardPolicy {
+            enabled: self
+                .config
+                .read()
+                .await
+                .features
+                .get("share_clipboard")
+                .copied()
+                .unwrap_or(true),
+            ..ClipboardPolicy::default()
+        };
+        let payload = ClipboardPayload::Text(text.to_string());
+
+        match validate_payload(policy, &payload) {
+            Ok(()) => Ok(Some(payload_hash_hex(&payload))),
+            Err(ClipboardPolicyError::Disabled) => Ok(None),
+            Err(error) => Err(anyhow::anyhow!(error)),
+        }
     }
 }
 
@@ -1157,6 +1291,71 @@ mod tests {
                 .iter()
                 .all(|record| record.machine_id != "remote-machine"),
             "invalid bundle import must not persist trust records"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn clipboard_sync_dedupes_and_suppresses_remote_echo() {
+        let root =
+            std::env::temp_dir().join(format!("boundless-clipboard-test-{}", uuid::Uuid::new_v4()));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_a, _) = state.create_pairing_code(120).await;
+        let peer_a = state
+            .join_peer(
+                code_a,
+                "127.0.0.1:15100".to_string(),
+                Some("peer-a".to_string()),
+            )
+            .await
+            .expect("join peer-a");
+        state
+            .set_peer_connected(&peer_a, true)
+            .await
+            .expect("connect peer-a");
+
+        let queued = state
+            .queue_local_clipboard_text_for_connected_peers("hello".to_string())
+            .await
+            .expect("queue local hello");
+        assert!(queued, "initial clipboard text should be queued");
+
+        let first = state.drain_outgoing(&peer_a).await;
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            first.first(),
+            Some(OutboundPayload::ClipboardText { text }) if text == "hello"
+        ));
+
+        let deduped = state
+            .queue_local_clipboard_text_for_connected_peers("hello".to_string())
+            .await
+            .expect("dedupe");
+        assert!(!deduped, "unchanged clipboard text should be ignored");
+
+        state
+            .enqueue_remote_clipboard_text(&peer_a, "remote".to_string())
+            .await
+            .expect("enqueue remote");
+        let remote = state
+            .dequeue_remote_clipboard_text()
+            .await
+            .expect("remote item");
+        assert_eq!(remote.text, "remote");
+        state.mark_remote_clipboard_applied(&remote.hash).await;
+
+        let suppressed = state
+            .queue_local_clipboard_text_for_connected_peers("remote".to_string())
+            .await
+            .expect("suppress remote echo");
+        assert!(
+            !suppressed,
+            "clipboard observer should suppress immediate echo after remote apply"
         );
 
         let _ = std::fs::remove_dir_all(&root);
