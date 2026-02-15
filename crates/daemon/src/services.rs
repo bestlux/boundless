@@ -7,8 +7,9 @@ use ipc_api::boundless::v1::{
     HotkeySetRequest, ImportTrustBundleRequest, InputOwnerReply, InputOwnerRequest, LayoutReply,
     LayoutSetRequest, OperationReply, PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply,
     PairJoinRequest, PeerInfo, PeerListReply, RemovePeerRequest, SafeResetRequest,
-    SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputMoveRequest,
-    StatusReply, StatusRequest, TransportEvent, TransportEventsReply, TrustBundleReply,
+    SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
+    SendInputMoveRequest, StatusReply, StatusRequest, TransportEvent, TransportEventsReply,
+    TrustBundleReply,
     daemon_service_server::{DaemonService, DaemonServiceServer},
     diagnostics_service_server::{DiagnosticsService, DiagnosticsServiceServer},
     feature_service_server::{FeatureService, FeatureServiceServer},
@@ -380,6 +381,30 @@ impl DiagnosticsService for DiagnosticsApi {
         Ok(Response::new(OperationReply {
             ok: true,
             message: "input move frame queued".to_string(),
+        }))
+    }
+
+    async fn send_input_key(
+        &self,
+        request: Request<SendInputKeyRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        let scan_code = u16::try_from(request.scan_code)
+            .map_err(|_| Status::invalid_argument("scan_code must be in 0..=65535"))?;
+        let key_state = if request.key_down {
+            core_input::KeyState::Down
+        } else {
+            core_input::KeyState::Up
+        };
+
+        self.0
+            .queue_input_key(&request.peer_id, scan_code, key_state)
+            .await
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        Ok(Response::new(OperationReply {
+            ok: true,
+            message: "input key frame queued".to_string(),
         }))
     }
 

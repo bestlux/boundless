@@ -122,6 +122,12 @@ message SendInputMoveRequest {
   int32 dy = 3;
 }
 
+message SendInputKeyRequest {
+  string peer_id = 1;
+  uint32 scan_code = 2;
+  bool key_down = 3;
+}
+
 message TransportEvent {
   string timestamp = 1;
   string direction = 2;
@@ -177,6 +183,7 @@ service DiagnosticsService {
   rpc SendClipboardImage(SendClipboardImageRequest) returns (OperationReply);
   rpc SendFile(SendFileRequest) returns (OperationReply);
   rpc SendInputMove(SendInputMoveRequest) returns (OperationReply);
+  rpc SendInputKey(SendInputKeyRequest) returns (OperationReply);
   rpc ListTransportEvents(Empty) returns (TransportEventsReply);
   rpc GetInputOwner(Empty) returns (InputOwnerReply);
   rpc ClaimInputOwner(InputOwnerRequest) returns (InputOwnerReply);

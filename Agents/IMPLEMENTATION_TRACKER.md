@@ -31,6 +31,7 @@
 - [x] Added mDNS discovery runtime with discovered-endpoint override + manual address fallback
 - [x] Added real clipboard text runtime sync path (OS clipboard watcher + inbound apply + echo suppression)
 - [x] Added clipboard image sync path (wire transport + runtime apply/watch + diagnostics CLI enqueue helper)
+- [x] Added input injection runtime queue + backend abstraction and synthetic key diagnostics helper
 
 ## Next (priority order)
 
