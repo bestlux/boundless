@@ -1,0 +1,112 @@
+syntax = "proto3";
+
+package boundless.v1;
+
+message Empty {}
+
+message StatusRequest {}
+message StatusReply {
+  string daemon_version = 1;
+  bool running = 2;
+  string machine_id = 3;
+  uint32 peer_count = 4;
+  string protocol_version = 5;
+  string api_bind = 6;
+}
+
+message PairCreateCodeRequest {
+  uint32 ttl_seconds = 1;
+}
+message PairCreateCodeReply {
+  string code = 1;
+  string expires_at = 2;
+}
+
+message PairJoinRequest {
+  string code = 1;
+  string host = 2;
+  string alias = 3;
+}
+message PairJoinReply {
+  bool accepted = 1;
+  string peer_id = 2;
+  string message = 3;
+}
+
+message PeerInfo {
+  string peer_id = 1;
+  string display_name = 2;
+  string address = 3;
+  bool connected = 4;
+}
+message PeerListReply {
+  repeated PeerInfo peers = 1;
+}
+
+message RemovePeerRequest {
+  string peer_id = 1;
+}
+
+message OperationReply {
+  bool ok = 1;
+  string message = 2;
+}
+
+message LayoutSetRequest {
+  string matrix_spec = 1;
+}
+message LayoutReply {
+  string matrix_spec = 1;
+}
+
+message FeatureSetRequest {
+  string name = 1;
+  bool enabled = 2;
+}
+message FeatureListReply {
+  map<string, bool> features = 1;
+}
+
+message HotkeySetRequest {
+  string action = 1;
+  string combo = 2;
+}
+
+message DiagnosticsDumpRequest {
+  string output_path = 1;
+}
+message DiagnosticsDumpReply {
+  string bundle_path = 1;
+}
+
+message SafeResetRequest {
+  bool network_only = 1;
+  bool all = 2;
+}
+
+service DaemonService {
+  rpc GetStatus(StatusRequest) returns (StatusReply);
+}
+
+service PairingService {
+  rpc CreateCode(PairCreateCodeRequest) returns (PairCreateCodeReply);
+  rpc Join(PairJoinRequest) returns (PairJoinReply);
+}
+
+service TopologyService {
+  rpc ListPeers(Empty) returns (PeerListReply);
+  rpc RemovePeer(RemovePeerRequest) returns (OperationReply);
+  rpc LayoutShow(Empty) returns (LayoutReply);
+  rpc LayoutSet(LayoutSetRequest) returns (OperationReply);
+}
+
+service FeatureService {
+  rpc SetFeature(FeatureSetRequest) returns (OperationReply);
+  rpc ListFeatures(Empty) returns (FeatureListReply);
+  rpc SetHotkey(HotkeySetRequest) returns (OperationReply);
+}
+
+service DiagnosticsService {
+  rpc Dump(DiagnosticsDumpRequest) returns (DiagnosticsDumpReply);
+  rpc SafeReset(SafeResetRequest) returns (OperationReply);
+}
