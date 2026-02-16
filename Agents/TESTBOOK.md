@@ -34,6 +34,7 @@
 - Run `scripts/dev/validate.ps1` for fmt/test/clippy plus smoke in one command
 - Run `scripts/dev/validate.ps1 -IncludeThreeNodeSmoke` to include both two-node and three-node smoke flows
 - For real multi-display validation pass, execute `Agents/MULTI_DISPLAY_VALIDATION_RUNBOOK.md` and record results in `Agents/MULTI_DISPLAY_VALIDATION_RESULTS_TEMPLATE.md`
+- Use `scripts/dev/multi-display-capture.ps1` to collect synchronized before/after/failure snapshots for both machines during Slice 2
 
 ## Test cases
 

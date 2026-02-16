@@ -71,6 +71,20 @@ boundlessctl input capture-target
 boundlessctl transport events --limit 200
 ```
 
+Preferred capture helper (run from either machine with reachable endpoints):
+
+```powershell
+scripts/dev/multi-display-capture.ps1 `
+  -Scenario "edge_enabled_topology_a" `
+  -Phase before `
+  -EndpointA "http://<machine-a-api-host>:50051" `
+  -EndpointB "http://<machine-b-api-host>:50051" `
+  -LabelA machine-a `
+  -LabelB machine-b
+```
+
+Repeat with `-Phase after` (or `-Phase failure`) for each scenario.
+
 For deterministic action checks:
 
 ```powershell
