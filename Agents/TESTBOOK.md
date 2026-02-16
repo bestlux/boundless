@@ -25,7 +25,7 @@
 - Runtime input injection queue is active in daemon; on Windows, queued input events are applied via `SendInput`
 - Runtime input capture target control-plane is active in daemon; on Windows, low-level keyboard/mouse hooks (including wheel/hwheel) enqueue outbound input frames for the selected target peer (polling fallback retained)
 - Runtime input capture now supports layout-driven edge handoff (easy mouse + wrap mouse policy aware) when layout tokens resolve local + connected peer neighbors
-- Runtime hotkey loop is active on Windows and executes configured actions on combo press edge (`toggle_easy_mouse`, `reconnect`, `lock_machine`; `switch_all` reserved)
+- Runtime hotkey loop is active on Windows and executes configured actions on combo press edge (`toggle_easy_mouse`, `reconnect`, `lock_machine`, `switch_all`)
 - Run `scripts/dev/validate.ps1` for fmt/test/clippy plus smoke in one command
 
 ## Test cases
@@ -103,6 +103,12 @@
 - Press the configured combo once and verify `feature list` flips `easy_mouse` state exactly once per key press edge
 - On Machine A with connected peers: press configured reconnect combo (default `Ctrl+Alt+Shift+R`) and verify peers transition to reconnect cycle (`connected=false` then back to `connected=true`)
 - Validate lock-machine combo manually in a controlled session (it should invoke local workstation lock on Windows)
+
+13. `switch_all` capture rotation behavior
+- On Machine A: configure layout with local + at least two connected peers, for example `layout set "left,self,right"`
+- On Machine A: set `hotkey switch_all Ctrl+Alt+Shift+S` (or preferred combo)
+- Press combo repeatedly and verify `input capture-target` rotates in deterministic order (layout neighbors first, then remaining connected peers sorted by display name)
+- Disconnect one peer and press combo again; confirm disconnected peer is skipped and rotation continues across connected peers only
 
 ## Exit criteria for this stage
 

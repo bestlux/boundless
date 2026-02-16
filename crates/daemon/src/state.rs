@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -456,6 +456,38 @@ impl AppState {
     ) -> Option<String> {
         let config = self.config.read().await;
         resolve_capture_handoff_target(&config, direction)
+    }
+
+    pub async fn apply_switch_all_capture_target(&self) -> Option<String> {
+        let next = self.next_switch_all_capture_target().await;
+        match next.as_deref() {
+            Some(peer_id) => {
+                let _ = self.set_input_capture_target(Some(peer_id)).await;
+            }
+            None => {
+                self.clear_input_capture_target().await;
+            }
+        }
+        next
+    }
+
+    pub async fn next_switch_all_capture_target(&self) -> Option<String> {
+        let order = {
+            let config = self.config.read().await;
+            resolve_switch_all_target_order(&config)
+        };
+        let current_target = self.input_capture_target_peer_id.read().await.clone();
+        if order.is_empty() {
+            return None;
+        }
+
+        if let Some(current) = current_target
+            && let Some(index) = order.iter().position(|peer_id| peer_id == &current)
+        {
+            return Some(order[(index + 1) % order.len()].clone());
+        }
+
+        Some(order[0].clone())
     }
 
     pub async fn set_feature(&self, name: String, enabled: bool) -> Result<()> {
@@ -1570,6 +1602,41 @@ fn resolve_capture_handoff_target(
     }
 }
 
+fn resolve_switch_all_target_order(config: &RuntimeConfig) -> Vec<String> {
+    let mut ordered = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for row in parse_layout_matrix(&config.layout_matrix) {
+        for token in row {
+            if is_local_layout_token(&token, config) {
+                continue;
+            }
+            let Some(peer_id) = resolve_peer_layout_token(&token, &config.peers) else {
+                continue;
+            };
+            if seen.insert(peer_id.clone()) {
+                ordered.push(peer_id);
+            }
+        }
+    }
+
+    let mut remainder = config
+        .peers
+        .iter()
+        .filter(|peer| peer.connected)
+        .map(|peer| (peer.display_name.to_ascii_lowercase(), peer.peer_id.clone()))
+        .collect::<Vec<_>>();
+    remainder
+        .sort_by(|(name_a, id_a), (name_b, id_b)| name_a.cmp(name_b).then_with(|| id_a.cmp(id_b)));
+    for (_, peer_id) in remainder {
+        if seen.insert(peer_id.clone()) {
+            ordered.push(peer_id);
+        }
+    }
+
+    ordered
+}
+
 fn parse_layout_matrix(spec: &str) -> Vec<Vec<String>> {
     spec.split(';')
         .map(|row| {
@@ -1720,6 +1787,49 @@ mod tests {
         assert!(
             resolve_capture_handoff_target(&config, SwitchDirection::Right).is_none(),
             "multiple local cells should invalidate edge handoff resolution"
+        );
+    }
+
+    #[test]
+    fn resolve_switch_all_target_order_prefers_layout_then_connected_remainder() {
+        let config = RuntimeConfig {
+            machine_id: "local-id".to_string(),
+            device_name: "local-device".to_string(),
+            layout_matrix: "right,self,left".to_string(),
+            peers: vec![
+                PeerConfig {
+                    peer_id: "peer-left".to_string(),
+                    display_name: "left".to_string(),
+                    address: "127.0.0.1:15100".to_string(),
+                    connected: true,
+                    last_seen: Utc::now(),
+                },
+                PeerConfig {
+                    peer_id: "peer-right".to_string(),
+                    display_name: "right".to_string(),
+                    address: "127.0.0.1:15101".to_string(),
+                    connected: true,
+                    last_seen: Utc::now(),
+                },
+                PeerConfig {
+                    peer_id: "peer-zeta".to_string(),
+                    display_name: "zeta".to_string(),
+                    address: "127.0.0.1:15102".to_string(),
+                    connected: true,
+                    last_seen: Utc::now(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let order = resolve_switch_all_target_order(&config);
+        assert_eq!(
+            order,
+            vec![
+                "peer-right".to_string(),
+                "peer-left".to_string(),
+                "peer-zeta".to_string()
+            ]
         );
     }
 
@@ -2076,6 +2186,81 @@ mod tests {
         assert!(
             state.input_capture_target().await.is_none(),
             "removed peer should clear capture target"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn switch_all_capture_target_cycles_connected_layout_peers() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-switch-all-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_one, _) = state.create_pairing_code(120).await;
+        let left_peer = state
+            .join_peer(
+                code_one,
+                "127.0.0.1:15100".to_string(),
+                Some("left".to_string()),
+            )
+            .await
+            .expect("join left");
+
+        let (code_two, _) = state.create_pairing_code(120).await;
+        let right_peer = state
+            .join_peer(
+                code_two,
+                "127.0.0.1:15101".to_string(),
+                Some("right".to_string()),
+            )
+            .await
+            .expect("join right");
+
+        state
+            .set_layout("right,self,left".to_string())
+            .await
+            .expect("set layout");
+        state
+            .set_peer_connected(&left_peer, true)
+            .await
+            .expect("connect left");
+        state
+            .set_peer_connected(&right_peer, true)
+            .await
+            .expect("connect right");
+
+        assert_eq!(
+            state.apply_switch_all_capture_target().await.as_deref(),
+            Some(right_peer.as_str())
+        );
+        assert_eq!(
+            state.input_capture_target().await.as_deref(),
+            Some(right_peer.as_str())
+        );
+
+        assert_eq!(
+            state.apply_switch_all_capture_target().await.as_deref(),
+            Some(left_peer.as_str())
+        );
+        assert_eq!(
+            state.input_capture_target().await.as_deref(),
+            Some(left_peer.as_str())
+        );
+
+        state
+            .set_peer_connected(&left_peer, false)
+            .await
+            .expect("disconnect left");
+        assert_eq!(
+            state.apply_switch_all_capture_target().await.as_deref(),
+            Some(right_peer.as_str()),
+            "disconnected peers must be skipped from switch-all rotation"
         );
 
         let _ = std::fs::remove_dir_all(&root);
