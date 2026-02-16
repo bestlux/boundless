@@ -77,6 +77,9 @@ pub struct PendingRemoteClipboardPayload {
 pub struct PendingInjectInputFrame {
     pub peer_id: String,
     pub sequence: u64,
+    pub capture_timestamp_unix_ms: i64,
+    pub received_timestamp_unix_ms: i64,
+    pub queued_timestamp_unix_ms: i64,
     pub events: Vec<InputEvent>,
 }
 
@@ -1219,13 +1222,23 @@ impl AppState {
         .await;
     }
 
-    pub async fn record_outgoing_input_frame(&self, peer_id: &str, event_count: usize) {
+    pub async fn record_outgoing_input_frame(
+        &self,
+        peer_id: &str,
+        sequence: u64,
+        event_count: usize,
+        capture_timestamp_unix_ms: i64,
+    ) {
+        let now_ms = Utc::now().timestamp_millis();
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
             direction: "outgoing".to_string(),
             kind: "input_frame".to_string(),
             peer_id: peer_id.to_string(),
-            detail: "queued_input_frame_sent".to_string(),
+            detail: format!(
+                "sequence={sequence} capture_to_send_ms={} captured_at_unix_ms={capture_timestamp_unix_ms}",
+                elapsed_ms(capture_timestamp_unix_ms, now_ms)
+            ),
             size_bytes: event_count as u64,
         })
         .await;
@@ -1256,25 +1269,42 @@ impl AppState {
         sequence: u64,
         event_count: usize,
         depth: usize,
+        capture_timestamp_unix_ms: i64,
+        received_timestamp_unix_ms: i64,
+        queued_timestamp_unix_ms: i64,
     ) {
+        let capture_to_queue_ms = elapsed_ms(capture_timestamp_unix_ms, queued_timestamp_unix_ms);
+        let receive_to_queue_ms = elapsed_ms(received_timestamp_unix_ms, queued_timestamp_unix_ms);
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
             direction: "local".to_string(),
             kind: "input_inject_queued".to_string(),
             peer_id: peer_id.to_string(),
-            detail: format!("sequence={sequence} queue_depth={depth}"),
+            detail: format!(
+                "sequence={sequence} queue_depth={depth} capture_to_queue_ms={capture_to_queue_ms} receive_to_queue_ms={receive_to_queue_ms}"
+            ),
             size_bytes: event_count as u64,
         })
         .await;
     }
 
-    async fn record_input_inject_dropped(&self, peer_id: &str, sequence: u64, event_count: usize) {
+    async fn record_input_inject_dropped(
+        &self,
+        peer_id: &str,
+        sequence: u64,
+        event_count: usize,
+        capture_timestamp_unix_ms: i64,
+    ) {
+        let now_ms = Utc::now().timestamp_millis();
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
             direction: "local".to_string(),
             kind: "input_inject_dropped".to_string(),
             peer_id: peer_id.to_string(),
-            detail: format!("sequence={sequence} dropped_oldest"),
+            detail: format!(
+                "sequence={sequence} dropped_oldest capture_age_ms={}",
+                elapsed_ms(capture_timestamp_unix_ms, now_ms)
+            ),
             size_bytes: event_count as u64,
         })
         .await;
@@ -1285,14 +1315,23 @@ impl AppState {
         peer_id: &str,
         sequence: u64,
         event_count: usize,
+        capture_timestamp_unix_ms: i64,
+        received_timestamp_unix_ms: i64,
+        queued_timestamp_unix_ms: i64,
         reason: &str,
     ) {
+        let now_ms = Utc::now().timestamp_millis();
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
             direction: "local".to_string(),
             kind: "input_inject_skipped".to_string(),
             peer_id: peer_id.to_string(),
-            detail: format!("sequence={sequence} reason={reason}"),
+            detail: format!(
+                "sequence={sequence} reason={reason} queue_wait_ms={} capture_to_skip_ms={} receive_to_skip_ms={}",
+                elapsed_ms(queued_timestamp_unix_ms, now_ms),
+                elapsed_ms(capture_timestamp_unix_ms, now_ms),
+                elapsed_ms(received_timestamp_unix_ms, now_ms)
+            ),
             size_bytes: event_count as u64,
         })
         .await;
@@ -1316,6 +1355,7 @@ impl AppState {
         let mut sink = RecordingInputSink {
             events: Vec::with_capacity(frame.events.len()),
         };
+        let received_timestamp_unix_ms = Utc::now().timestamp_millis();
         let decision = self
             .input_router
             .write()
@@ -1324,9 +1364,13 @@ impl AppState {
             .map_err(anyhow::Error::from)?;
 
         if matches!(decision, RouteDecision::Applied { .. }) {
+            let queued_timestamp_unix_ms = Utc::now().timestamp_millis();
             let pending = PendingInjectInputFrame {
                 peer_id: peer_id.to_string(),
                 sequence: frame.sequence,
+                capture_timestamp_unix_ms: frame.timestamp_unix_ms,
+                received_timestamp_unix_ms,
+                queued_timestamp_unix_ms,
                 events: sink.events,
             };
             let (depth, dropped) = self.enqueue_pending_inject_input_frame(pending).await;
@@ -1335,11 +1379,20 @@ impl AppState {
                     &dropped.peer_id,
                     dropped.sequence,
                     dropped.events.len(),
+                    dropped.capture_timestamp_unix_ms,
                 )
                 .await;
             }
-            self.record_input_inject_queued(peer_id, frame.sequence, frame.events.len(), depth)
-                .await;
+            self.record_input_inject_queued(
+                peer_id,
+                frame.sequence,
+                frame.events.len(),
+                depth,
+                frame.timestamp_unix_ms,
+                received_timestamp_unix_ms,
+                queued_timestamp_unix_ms,
+            )
+            .await;
         }
 
         self.record_transport_event(TransportEventRecord {
@@ -1347,7 +1400,12 @@ impl AppState {
             direction: "incoming".to_string(),
             kind: "input_frame".to_string(),
             peer_id: peer_id.to_string(),
-            detail: describe_route_decision(&decision),
+            detail: describe_input_frame_decision(
+                &decision,
+                frame.sequence,
+                frame.timestamp_unix_ms,
+                received_timestamp_unix_ms,
+            ),
             size_bytes: frame.events.len() as u64,
         })
         .await;
@@ -1372,13 +1430,22 @@ impl AppState {
         peer_id: &str,
         sequence: u64,
         event_count: usize,
+        capture_timestamp_unix_ms: i64,
+        received_timestamp_unix_ms: i64,
+        queued_timestamp_unix_ms: i64,
     ) {
+        let now_ms = Utc::now().timestamp_millis();
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
             direction: "local".to_string(),
             kind: "input_inject_applied".to_string(),
             peer_id: peer_id.to_string(),
-            detail: format!("sequence={sequence}"),
+            detail: format!(
+                "sequence={sequence} queue_wait_ms={} capture_to_apply_ms={} receive_to_apply_ms={}",
+                elapsed_ms(queued_timestamp_unix_ms, now_ms),
+                elapsed_ms(capture_timestamp_unix_ms, now_ms),
+                elapsed_ms(received_timestamp_unix_ms, now_ms)
+            ),
             size_bytes: event_count as u64,
         })
         .await;
@@ -1389,14 +1456,23 @@ impl AppState {
         peer_id: &str,
         sequence: u64,
         event_count: usize,
+        capture_timestamp_unix_ms: i64,
+        received_timestamp_unix_ms: i64,
+        queued_timestamp_unix_ms: i64,
         message: &str,
     ) {
+        let now_ms = Utc::now().timestamp_millis();
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
             direction: "local".to_string(),
             kind: "input_inject_failed".to_string(),
             peer_id: peer_id.to_string(),
-            detail: format!("sequence={sequence} {message}"),
+            detail: format!(
+                "sequence={sequence} queue_wait_ms={} capture_to_fail_ms={} receive_to_fail_ms={} {message}",
+                elapsed_ms(queued_timestamp_unix_ms, now_ms),
+                elapsed_ms(capture_timestamp_unix_ms, now_ms),
+                elapsed_ms(received_timestamp_unix_ms, now_ms)
+            ),
             size_bytes: event_count as u64,
         })
         .await;
@@ -1697,6 +1773,23 @@ fn describe_route_decision(decision: &RouteDecision) -> String {
             format!("ignored wrong_owner={owner_peer_id}")
         }
     }
+}
+
+fn describe_input_frame_decision(
+    decision: &RouteDecision,
+    sequence: u64,
+    capture_timestamp_unix_ms: i64,
+    received_timestamp_unix_ms: i64,
+) -> String {
+    let capture_to_receive_ms = elapsed_ms(capture_timestamp_unix_ms, received_timestamp_unix_ms);
+    format!(
+        "sequence={sequence} capture_to_receive_ms={capture_to_receive_ms} {}",
+        describe_route_decision(decision)
+    )
+}
+
+fn elapsed_ms(start_unix_ms: i64, end_unix_ms: i64) -> i64 {
+    (end_unix_ms - start_unix_ms).max(0)
 }
 
 fn resolve_capture_handoff_target(
@@ -2644,6 +2737,66 @@ mod tests {
         assert_eq!(queued.peer_id, peer_id);
         assert_eq!(queued.sequence, 1);
         assert_eq!(queued.events.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn route_incoming_input_frame_records_latency_detail_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-input-latency-detail-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim owner")
+        );
+
+        state
+            .route_incoming_input_frame(
+                &peer_id,
+                InputFrame {
+                    source_peer_id: peer_id.clone(),
+                    sequence: 42,
+                    timestamp_unix_ms: 1,
+                    events: vec![InputEvent::MouseMove { dx: 1, dy: 1 }],
+                },
+            )
+            .await
+            .expect("route");
+
+        let events = state.transport_events().await;
+        let incoming = events
+            .iter()
+            .find(|event| event.kind == "input_frame" && event.direction == "incoming")
+            .expect("incoming input frame event");
+        assert!(incoming.detail.contains("sequence=42"));
+        assert!(incoming.detail.contains("capture_to_receive_ms="));
+
+        let queued = events
+            .iter()
+            .find(|event| event.kind == "input_inject_queued" && event.direction == "local")
+            .expect("queued input inject event");
+        assert!(queued.detail.contains("sequence=42"));
+        assert!(queued.detail.contains("capture_to_queue_ms="));
+        assert!(queued.detail.contains("receive_to_queue_ms="));
 
         let _ = std::fs::remove_dir_all(&root);
     }

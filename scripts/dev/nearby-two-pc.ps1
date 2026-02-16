@@ -4,7 +4,7 @@ param(
     [string]$Role,
 
     [Parameter(Mandatory = $true)]
-    [ValidateSet("start-daemon", "stop-daemon", "status", "create-code", "pending", "approve", "join", "peers", "show-session", "clipboard-test", "input-test", "edge-test")]
+    [ValidateSet("start-daemon", "stop-daemon", "status", "create-code", "pending", "approve", "join", "peers", "show-session", "clipboard-test", "input-test", "edge-test", "latency-report")]
     [string]$Action,
 
     [string]$RootPath,
@@ -340,6 +340,43 @@ function Wait-ForCaptureTarget {
     throw "Timed out waiting for capture target '$ExpectedTarget' at endpoint=$Endpoint (current='$finalTarget')"
 }
 
+function Get-MetricFromDetail {
+    param(
+        [string]$Detail,
+        [string]$MetricName
+    )
+
+    $match = [regex]::Match($Detail, "(?:^|\s)$([regex]::Escape($MetricName))=(-?\d+)")
+    if (-not $match.Success) {
+        return $null
+    }
+
+    return [int]$match.Groups[1].Value
+}
+
+function Show-LatencyMetricSummary {
+    param(
+        [string]$Label,
+        [System.Collections.IEnumerable]$Values
+    )
+
+    $items = @($Values)
+    if (-not $items -or $items.Count -eq 0) {
+        Write-Host "${Label}: no samples"
+        return
+    }
+
+    $sorted = @($items | Sort-Object)
+    $count = $sorted.Count
+    $min = $sorted[0]
+    $max = $sorted[$count - 1]
+    $avg = [math]::Round((($sorted | Measure-Object -Average).Average), 2)
+    $p50 = $sorted[[int][math]::Floor(($count - 1) * 0.50)]
+    $p95 = $sorted[[int][math]::Floor(($count - 1) * 0.95)]
+
+    Write-Host "${Label}: n=$count min=$min p50=$p50 p95=$p95 max=$max avg=$avg"
+}
+
 switch ($Action) {
     "start-daemon" {
         if ($Build -or -not (Test-Path $daemonExe) -or -not (Test-Path $cliExe)) {
@@ -646,6 +683,54 @@ switch ($Action) {
         Wait-ForCaptureTarget -Endpoint $session.endpoint -ExpectedTarget $leftPeer -Seconds $WaitSeconds
         Write-Host "Left-edge handoff observed."
         Write-Host "Edge handoff test passed."
+        break
+    }
+    "latency-report" {
+        $session = Load-Session
+        $raw = Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("transport", "events", "--limit", "400")
+        $text = ($raw | Out-String)
+        $lines = $text -split "\r?\n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+        $captureToSend = New-Object System.Collections.Generic.List[int]
+        $captureToReceive = New-Object System.Collections.Generic.List[int]
+        $captureToApply = New-Object System.Collections.Generic.List[int]
+        $receiveToApply = New-Object System.Collections.Generic.List[int]
+        $queueWait = New-Object System.Collections.Generic.List[int]
+
+        foreach ($line in $lines) {
+            $eventMatch = [regex]::Match($line, "direction=(\S+)\s+kind=(\S+)\s+peer_id=(\S+)\s+size_bytes=\S+\s+detail=(.*)$")
+            if (-not $eventMatch.Success) {
+                continue
+            }
+
+            $direction = $eventMatch.Groups[1].Value
+            $kind = $eventMatch.Groups[2].Value
+            $detail = $eventMatch.Groups[4].Value
+
+            if ($direction -eq "outgoing" -and $kind -eq "input_frame") {
+                $value = Get-MetricFromDetail -Detail $detail -MetricName "capture_to_send_ms"
+                if ($null -ne $value) { [void]$captureToSend.Add($value) }
+            }
+            if ($direction -eq "incoming" -and $kind -eq "input_frame") {
+                $value = Get-MetricFromDetail -Detail $detail -MetricName "capture_to_receive_ms"
+                if ($null -ne $value) { [void]$captureToReceive.Add($value) }
+            }
+            if ($direction -eq "local" -and $kind -eq "input_inject_applied") {
+                $v1 = Get-MetricFromDetail -Detail $detail -MetricName "capture_to_apply_ms"
+                $v2 = Get-MetricFromDetail -Detail $detail -MetricName "receive_to_apply_ms"
+                $v3 = Get-MetricFromDetail -Detail $detail -MetricName "queue_wait_ms"
+                if ($null -ne $v1) { [void]$captureToApply.Add($v1) }
+                if ($null -ne $v2) { [void]$receiveToApply.Add($v2) }
+                if ($null -ne $v3) { [void]$queueWait.Add($v3) }
+            }
+        }
+
+        Write-Host "Latency summary for endpoint=$($session.endpoint)"
+        Show-LatencyMetricSummary -Label "capture_to_send_ms" -Values $captureToSend
+        Show-LatencyMetricSummary -Label "capture_to_receive_ms" -Values $captureToReceive
+        Show-LatencyMetricSummary -Label "capture_to_apply_ms (end-to-end)" -Values $captureToApply
+        Show-LatencyMetricSummary -Label "receive_to_apply_ms (remote host only)" -Values $receiveToApply
+        Show-LatencyMetricSummary -Label "queue_wait_ms (remote host only)" -Values $queueWait
         break
     }
 }
