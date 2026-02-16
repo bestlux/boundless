@@ -3,6 +3,8 @@
 ## Vision
 Deliver MWB-style cross-machine control in Rust with stronger reliability, diagnostics, and secure defaults.
 
+Execution order for v1 slices is tracked in `Agents/V1_RELEASE_SLICES.md`.
+
 ## Milestones
 
 1. Phase 0: Foundation (in progress)

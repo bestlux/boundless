@@ -43,5 +43,5 @@
 
 ## Next (priority order)
 
-- [ ] Add explicit multi-machine edge-switch testbook flows on real displays
-- [ ] Validate `switch_all` behavior with real multi-display two-machine sessions and tune UX defaults
+- See `Agents/V1_RELEASE_SLICES.md` for the ordered v1 execution list.
+- [ ] Slice 1: 3-node automation harness
