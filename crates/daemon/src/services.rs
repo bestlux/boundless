@@ -4,10 +4,10 @@ use tonic::{Request, Response, Status};
 
 use ipc_api::boundless::v1::{
     DiagnosticsDumpReply, DiagnosticsDumpRequest, Empty, FeatureListReply, FeatureSetRequest,
-    HotkeySetRequest, ImportTrustBundleRequest, InputCaptureTargetReply, InputCaptureTargetRequest,
-    InputOwnerReply, InputOwnerRequest, LayoutReply, LayoutSetRequest, OperationReply,
-    PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply, PairJoinRequest, PeerInfo,
-    PeerListReply, RemovePeerRequest, SafeResetRequest, SendClipboardImageRequest,
+    HotkeySetRequest, HotkeyTriggerRequest, ImportTrustBundleRequest, InputCaptureTargetReply,
+    InputCaptureTargetRequest, InputOwnerReply, InputOwnerRequest, LayoutReply, LayoutSetRequest,
+    OperationReply, PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply, PairJoinRequest,
+    PeerInfo, PeerListReply, RemovePeerRequest, SafeResetRequest, SendClipboardImageRequest,
     SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest, SendInputMoveRequest,
     StatusReply, StatusRequest, TransportEvent, TransportEventsReply, TrustBundleReply,
     daemon_service_server::{DaemonService, DaemonServiceServer},
@@ -317,6 +317,21 @@ impl DiagnosticsService for DiagnosticsApi {
         Ok(Response::new(OperationReply {
             ok: true,
             message: "safe reset complete".to_string(),
+        }))
+    }
+
+    async fn trigger_hotkey_action(
+        &self,
+        request: Request<HotkeyTriggerRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        let action_name = crate::hotkeys::trigger_action_for_diagnostics(&self.0, &request.action)
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+
+        Ok(Response::new(OperationReply {
+            ok: true,
+            message: format!("hotkey action {action_name} triggered"),
         }))
     }
 

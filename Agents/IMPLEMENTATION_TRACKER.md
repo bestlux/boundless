@@ -39,6 +39,7 @@
 - [x] Implemented layout-driven edge switching semantics for capture target handoff (easy mouse + wrap mouse policy aware)
 - [x] Implemented core hotkey runtime actions (toggle easy mouse, reconnect, lock machine) with parser/edge-trigger engine and persistence-focused tests
 - [x] Implemented `switch_all` hotkey semantics to rotate capture target across connected peers in deterministic layout-first order
+- [x] Added diagnostics hotkey-action trigger API/CLI helper and smoke coverage for deterministic runtime action validation
 
 ## Next (priority order)
 

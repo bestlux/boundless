@@ -20,11 +20,11 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tonic::{codegen::Service, transport::Uri};
 
 use ipc_api::boundless::v1::{
-    DiagnosticsDumpRequest, Empty, FeatureSetRequest, HotkeySetRequest, ImportTrustBundleRequest,
-    InputCaptureTargetRequest, InputOwnerRequest, LayoutSetRequest, PairCreateCodeRequest,
-    PairJoinRequest, RemovePeerRequest, SafeResetRequest, SendClipboardImageRequest,
-    SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest, SendInputMoveRequest,
-    StatusRequest, daemon_service_client::DaemonServiceClient,
+    DiagnosticsDumpRequest, Empty, FeatureSetRequest, HotkeySetRequest, HotkeyTriggerRequest,
+    ImportTrustBundleRequest, InputCaptureTargetRequest, InputOwnerRequest, LayoutSetRequest,
+    PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest, SafeResetRequest,
+    SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
+    SendInputMoveRequest, StatusRequest, daemon_service_client::DaemonServiceClient,
     diagnostics_service_client::DiagnosticsServiceClient,
     feature_service_client::FeatureServiceClient, pairing_service_client::PairingServiceClient,
     topology_service_client::TopologyServiceClient,
@@ -217,6 +217,9 @@ enum DiagnosticsCommand {
         #[arg(long)]
         output: Option<String>,
     },
+    RunAction {
+        action: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +295,9 @@ async fn main() -> Result<()> {
         Command::Hotkey { action, combo } => hotkey_set(&cli.endpoint, action, combo).await,
         Command::Diagnostics { command } => match command {
             DiagnosticsCommand::Dump { output } => diagnostics_dump(&cli.endpoint, output).await,
+            DiagnosticsCommand::RunAction { action } => {
+                diagnostics_run_action(&cli.endpoint, action).await
+            }
         },
         Command::SafeReset { network, all } => safe_reset(&cli.endpoint, network, all).await,
     }
@@ -763,6 +769,17 @@ async fn diagnostics_dump(endpoint: &str, output: Option<String>) -> Result<()> 
         .into_inner();
 
     println!("bundle_path={}", response.bundle_path);
+    Ok(())
+}
+
+async fn diagnostics_run_action(endpoint: &str, action: String) -> Result<()> {
+    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .trigger_hotkey_action(HotkeyTriggerRequest { action })
+        .await?
+        .into_inner();
+
+    println!("ok={} message={}", response.ok, response.message);
     Ok(())
 }
 

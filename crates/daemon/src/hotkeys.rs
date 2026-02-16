@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::time;
 use tracing::{info, warn};
 
@@ -39,6 +39,15 @@ impl HotkeyAction {
             "switch_all" => Some(Self::SwitchAll),
             "reconnect" => Some(Self::Reconnect),
             _ => None,
+        }
+    }
+
+    fn config_name(self) -> &'static str {
+        match self {
+            Self::ToggleEasyMouse => "toggle_easy_mouse",
+            Self::LockMachine => "lock_machine",
+            Self::SwitchAll => "switch_all",
+            Self::Reconnect => "reconnect",
         }
     }
 }
@@ -153,6 +162,21 @@ pub fn start(state: AppState) {
             let _ = state;
         }
     });
+}
+
+pub async fn trigger_action_for_diagnostics(state: &AppState, action: &str) -> Result<String> {
+    let raw_action = action.trim();
+    let Some(action) = HotkeyAction::from_config_name(action) else {
+        bail!(
+            "unknown hotkey action '{raw_action}' (expected toggle_easy_mouse, switch_all, reconnect)"
+        );
+    };
+    if matches!(action, HotkeyAction::LockMachine) {
+        bail!("lock_machine cannot be triggered via diagnostics action");
+    }
+
+    apply_hotkey_action(state, action).await?;
+    Ok(action.config_name().to_string())
 }
 
 #[cfg(windows)]
@@ -595,6 +619,33 @@ mod tests {
         assert_eq!(
             state.input_capture_target().await.as_deref(),
             Some(left_peer.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_trigger_rejects_unknown_or_lock_machine_actions() {
+        let (root, config_path, security_root) =
+            temp_state_paths("hotkey-diagnostics-trigger-test");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let unknown = trigger_action_for_diagnostics(&state, "not_a_real_action")
+            .await
+            .expect_err("unknown action should fail");
+        assert!(
+            unknown
+                .to_string()
+                .contains("unknown hotkey action 'not_a_real_action'")
+        );
+
+        let lock = trigger_action_for_diagnostics(&state, "lock_machine")
+            .await
+            .expect_err("lock_machine diagnostics trigger should fail");
+        assert!(
+            lock.to_string()
+                .contains("lock_machine cannot be triggered via diagnostics action")
         );
 
         let _ = std::fs::remove_dir_all(root);

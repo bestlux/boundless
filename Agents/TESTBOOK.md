@@ -26,6 +26,7 @@
 - Runtime input capture target control-plane is active in daemon; on Windows, low-level keyboard/mouse hooks (including wheel/hwheel) enqueue outbound input frames for the selected target peer (polling fallback retained)
 - Runtime input capture now supports layout-driven edge handoff (easy mouse + wrap mouse policy aware) when layout tokens resolve local + connected peer neighbors
 - Runtime hotkey loop is active on Windows and executes configured actions on combo press edge (`toggle_easy_mouse`, `reconnect`, `lock_machine`, `switch_all`)
+- Diagnostics action trigger helper is available for deterministic validation without physical key presses: `diagnostics run-action <toggle_easy_mouse|switch_all|reconnect>`
 - Run `scripts/dev/validate.ps1` for fmt/test/clippy plus smoke in one command
 
 ## Test cases
@@ -109,6 +110,11 @@
 - On Machine A: set `hotkey switch_all Ctrl+Alt+Shift+S` (or preferred combo)
 - Press combo repeatedly and verify `input capture-target` rotates in deterministic order (layout neighbors first, then remaining connected peers sorted by display name)
 - Disconnect one peer and press combo again; confirm disconnected peer is skipped and rotation continues across connected peers only
+
+14. Diagnostics action trigger behavior
+- On Machine A: run `diagnostics run-action toggle_easy_mouse` and verify `feature list` flips `easy_mouse`
+- Run `diagnostics run-action toggle_easy_mouse` again and verify state returns to its prior value
+- Run `diagnostics run-action switch_all` and verify `input capture-target` advances to the next connected peer target
 
 ## Exit criteria for this stage
 
