@@ -1,5 +1,6 @@
 param(
-    [switch]$SkipSmoke
+    [switch]$SkipSmoke,
+    [switch]$IncludeThreeNodeSmoke
 )
 
 Set-StrictMode -Version Latest
@@ -24,6 +25,11 @@ try {
     if (-not $SkipSmoke) {
         Write-Host "[validate] scripts/dev/two-node-smoke.ps1"
         & (Join-Path $repoRoot "scripts/dev/two-node-smoke.ps1") -TimeoutSeconds 60 | Out-Host
+
+        if ($IncludeThreeNodeSmoke) {
+            Write-Host "[validate] scripts/dev/three-node-smoke.ps1"
+            & (Join-Path $repoRoot "scripts/dev/three-node-smoke.ps1") -TimeoutSeconds 90 | Out-Host
+        }
     }
 
     Write-Host "[validate] complete"
