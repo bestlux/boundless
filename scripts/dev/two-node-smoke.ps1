@@ -270,6 +270,28 @@ function Wait-ForInputCaptureTarget {
     throw "Timed out waiting for input capture target '$ExpectedTarget' at $Endpoint"
 }
 
+function Wait-ForFeatureValue {
+    param(
+        [string]$Endpoint,
+        [string]$FeatureName,
+        [bool]$ExpectedValue,
+        [int]$Seconds
+    )
+
+    $expected = if ($ExpectedValue) { "true" } else { "false" }
+    $pattern = [regex]::Escape("${FeatureName}=${expected}")
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs @("feature", "list")
+        if ($LASTEXITCODE -eq 0 -and $output -match $pattern) {
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Timed out waiting for feature ${FeatureName}=${expected} at $Endpoint"
+}
+
 function Start-DaemonProcess {
     param(
         [string]$Bind,
@@ -394,6 +416,29 @@ try {
     $node2PeerId = Get-FirstPeerId -Endpoint $node2Endpoint
     Wait-ForPeerConnectionState -Endpoint $node1Endpoint -PeerId $node1PeerId -Connected $true -Seconds $TimeoutSeconds
     Wait-ForPeerConnectionState -Endpoint $node2Endpoint -PeerId $node2PeerId -Connected $true -Seconds $TimeoutSeconds
+
+    Write-Host "[smoke] validating diagnostics action trigger helpers"
+    $featureList = Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("feature", "list")
+    $easyMouseMatch = [regex]::Match($featureList, "easy_mouse=(true|false)")
+    if (-not $easyMouseMatch.Success) {
+        throw "Could not parse easy_mouse value from feature list: $featureList"
+    }
+    $easyMouseBefore = $easyMouseMatch.Groups[1].Value
+    $easyMouseAfter = if ($easyMouseBefore -eq "true") { $false } else { $true }
+    $easyMouseBeforeBool = ($easyMouseBefore -eq "true")
+
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("diagnostics", "run-action", "toggle_easy_mouse") | Out-Host
+    Wait-ForFeatureValue -Endpoint $node1Endpoint -FeatureName "easy_mouse" -ExpectedValue $easyMouseAfter -Seconds $TimeoutSeconds
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("diagnostics", "run-action", "toggle_easy_mouse") | Out-Host
+    Wait-ForFeatureValue -Endpoint $node1Endpoint -FeatureName "easy_mouse" -ExpectedValue $easyMouseBeforeBool -Seconds $TimeoutSeconds
+
+    Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("diagnostics", "run-action", "switch_all") | Out-Host
+    Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget $node1PeerId -Seconds $TimeoutSeconds
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("diagnostics", "run-action", "switch_all") | Out-Host
+    Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget $node1PeerId -Seconds $TimeoutSeconds
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "capture-stop") | Out-Host
+    Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
 
     Write-Host "[smoke] validating input owner control plane"
     Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "claim", $node1PeerId) | Out-Host

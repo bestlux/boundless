@@ -89,6 +89,10 @@ message HotkeySetRequest {
   string combo = 2;
 }
 
+message HotkeyTriggerRequest {
+  string action = 1;
+}
+
 message DiagnosticsDumpRequest {
   string output_path = 1;
 }
@@ -189,6 +193,7 @@ service FeatureService {
 service DiagnosticsService {
   rpc Dump(DiagnosticsDumpRequest) returns (DiagnosticsDumpReply);
   rpc SafeReset(SafeResetRequest) returns (OperationReply);
+  rpc TriggerHotkeyAction(HotkeyTriggerRequest) returns (OperationReply);
   rpc SendClipboardText(SendClipboardTextRequest) returns (OperationReply);
   rpc SendClipboardImage(SendClipboardImageRequest) returns (OperationReply);
   rpc SendFile(SendFileRequest) returns (OperationReply);
