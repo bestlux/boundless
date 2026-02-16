@@ -197,9 +197,11 @@ fn pairing_listener_port(network_port: u16) -> u16 {
         return port;
     }
 
-    network_port
-        .checked_add(PAIRING_PORT_OFFSET)
-        .unwrap_or(network_port)
+    if let Some(port) = network_port.checked_add(PAIRING_PORT_OFFSET) {
+        return port;
+    }
+
+    network_port.saturating_sub(PAIRING_PORT_OFFSET).max(1)
 }
 
 fn extract_port_from_address(address: &str, default_port: u16) -> u16 {
@@ -237,6 +239,12 @@ mod tests {
         assert_eq!(extract_port_from_address("[fe80::1%4]:30100", 15100), 30100);
         assert_eq!(extract_port_from_address("example", 15100), 15100);
         assert_eq!(extract_port_from_address("", 15100), 15100);
+    }
+
+    #[test]
+    fn pairing_listener_port_avoids_transport_port_on_overflow() {
+        assert_eq!(pairing_listener_port(65436), 65336);
+        assert_eq!(pairing_listener_port(65535), 65435);
     }
 
     #[tokio::test]

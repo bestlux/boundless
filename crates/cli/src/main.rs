@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use core_clipboard::validate_bmp_payload as validate_bmp_bytes;
-use core_discovery::parse_manual_target;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::{
@@ -1119,10 +1118,37 @@ async fn send_nearby_pairing_request(
 }
 
 fn normalize_bundle_address_for_host(bundle: &mut StoredTrustBundle, host: &str) -> Result<()> {
-    let parsed = parse_manual_target(bundle.network_address.trim(), 15100)
-        .ok_or_else(|| anyhow::anyhow!("invalid responder network address"))?;
-    bundle.network_address = format_host_port(host, parsed.port());
+    let port = extract_port_from_network_address(bundle.network_address.trim())?;
+    bundle.network_address = format_host_port(host, port);
     Ok(())
+}
+
+fn extract_port_from_network_address(address: &str) -> Result<u16> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        bail!("invalid responder network address: empty");
+    }
+
+    if let Ok(socket) = trimmed.parse::<std::net::SocketAddr>() {
+        return Ok(socket.port());
+    }
+
+    if let Some((host_part, port_part)) = trimmed.rsplit_once(':') {
+        if host_part.trim().is_empty() {
+            bail!("invalid responder network address: missing host");
+        }
+
+        let port = port_part
+            .trim()
+            .parse::<u16>()
+            .context("invalid responder network address port")?;
+        if port == 0 {
+            bail!("invalid responder network address port: 0");
+        }
+        return Ok(port);
+    }
+
+    bail!("invalid responder network address: missing port");
 }
 
 fn format_host_port(host: &str, port: u16) -> String {
@@ -1198,6 +1224,18 @@ mod tests {
         assert_eq!(format_host_port("10.0.0.7", 15200), "10.0.0.7:15200");
         assert_eq!(format_host_port("fe80::1", 15200), "[fe80::1]:15200");
         assert_eq!(format_host_port("[fe80::1]", 15200), "[fe80::1]:15200");
+    }
+
+    #[test]
+    fn extract_port_from_network_address_accepts_hostname_with_port() {
+        assert_eq!(
+            extract_port_from_network_address("DESKTOP-ABC:15100").expect("port"),
+            15100
+        );
+        assert_eq!(
+            extract_port_from_network_address("[fe80::1%4]:17100").expect("port"),
+            17100
+        );
     }
 
     #[cfg(windows)]
