@@ -9,6 +9,7 @@ This file is the ordered execution plan for shipping `v1.0.0`.
 
 2. [ ] Real multi-display validation pass
 - Run testbook flows on real two-machine, multi-monitor setups and close layout/edge/DPI behavior gaps.
+- Use `Agents/MULTI_DISPLAY_VALIDATION_RUNBOOK.md` and `Agents/MULTI_DISPLAY_VALIDATION_RESULTS_TEMPLATE.md`.
 
 3. [ ] Input reliability hardening
 - Stress reconnect + high event-rate paths and tighten queue/backpressure behavior to prevent stuck input or lag spikes.

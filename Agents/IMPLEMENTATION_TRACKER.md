@@ -41,6 +41,7 @@
 - [x] Implemented `switch_all` hotkey semantics to rotate capture target across connected peers in deterministic layout-first order
 - [x] Added diagnostics hotkey-action trigger API/CLI helper and smoke coverage for deterministic runtime action validation
 - [x] Added deterministic 3-node smoke harness to validate `switch_all` rotation ordering and disconnect/reconnect skip behavior
+- [x] Added multi-display validation runbook and result template for Slice 2 execution tracking
 
 ## Next (priority order)
 
