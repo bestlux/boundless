@@ -366,6 +366,10 @@ try {
 
     Write-Host "[smoke] building debug binaries"
     cargo build -p boundless-daemon -p boundless-cli | Out-Host
+    $buildExitCode = $LASTEXITCODE
+    if ($buildExitCode -ne 0) {
+        throw "cargo build failed with exit code $buildExitCode"
+    }
 
     if (-not (Test-Path $daemonExe) -or -not (Test-Path $cliExe)) {
         throw "Expected binaries were not built"
