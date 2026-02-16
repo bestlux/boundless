@@ -217,7 +217,8 @@ async fn apply_hotkey_action(state: &AppState, action: HotkeyAction) -> Result<(
             info!(peer_count, aborted_sessions, "hotkey reconnect requested");
         }
         HotkeyAction::SwitchAll => {
-            info!("hotkey switch_all is not implemented yet");
+            let next_target = state.apply_switch_all_capture_target().await;
+            info!(next_target = ?next_target, "hotkey switch_all applied");
         }
     }
 
@@ -538,6 +539,63 @@ mod tests {
             .await
             .expect_err("session two should be aborted");
         assert!(join_two.is_cancelled());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn hotkey_switch_all_cycles_capture_target() {
+        let (root, config_path, security_root) = temp_state_paths("hotkey-switch-all-test");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_one, _) = state.create_pairing_code(120).await;
+        let left_peer = state
+            .join_peer(
+                code_one,
+                "127.0.0.1:15100".to_string(),
+                Some("left".to_string()),
+            )
+            .await
+            .expect("join left peer");
+        let (code_two, _) = state.create_pairing_code(120).await;
+        let right_peer = state
+            .join_peer(
+                code_two,
+                "127.0.0.1:15101".to_string(),
+                Some("right".to_string()),
+            )
+            .await
+            .expect("join right peer");
+
+        state
+            .set_layout("right,self,left".to_string())
+            .await
+            .expect("set layout");
+        state
+            .set_peer_connected(&left_peer, true)
+            .await
+            .expect("connect left");
+        state
+            .set_peer_connected(&right_peer, true)
+            .await
+            .expect("connect right");
+
+        apply_hotkey_action(&state, HotkeyAction::SwitchAll)
+            .await
+            .expect("switch all first");
+        assert_eq!(
+            state.input_capture_target().await.as_deref(),
+            Some(right_peer.as_str())
+        );
+
+        apply_hotkey_action(&state, HotkeyAction::SwitchAll)
+            .await
+            .expect("switch all second");
+        assert_eq!(
+            state.input_capture_target().await.as_deref(),
+            Some(left_peer.as_str())
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
