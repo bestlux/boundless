@@ -18,6 +18,7 @@ tonic.workspace = true
 
 ipc-api = { path = "../ipc-api" }
 core-clipboard = { path = "../core-clipboard" }
+core-discovery = { path = "../core-discovery" }
 
 [target.'cfg(windows)'.dependencies]
 hyper-util.workspace = true

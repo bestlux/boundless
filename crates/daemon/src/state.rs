@@ -35,6 +35,7 @@ use crate::config::{
 const MAX_TRANSPORT_EVENTS: usize = 512;
 const MAX_PENDING_REMOTE_CLIPBOARD_ITEMS: usize = 64;
 const MAX_PENDING_INJECT_INPUT_FRAMES: usize = 128;
+const NEARBY_PAIRING_DECISION_RETENTION_MINUTES: i64 = 10;
 
 #[derive(Debug, Clone)]
 pub enum OutboundPayload {
@@ -79,6 +80,41 @@ pub struct PendingInjectInputFrame {
     pub events: Vec<InputEvent>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingNearbyPairingRequest {
+    pub request_id: String,
+    pub requester_machine_id: String,
+    pub requester_display_name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub enum NearbyPairingStatus {
+    Pending,
+    Approved { responder_bundle: TrustBundle },
+    Rejected { message: String },
+    Missing,
+}
+
+#[derive(Debug, Clone)]
+struct PendingNearbyPairingRequestRecord {
+    summary: PendingNearbyPairingRequest,
+    requester_bundle: TrustBundle,
+    requester_alias: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum NearbyPairingDecision {
+    Approved { responder_bundle: TrustBundle },
+    Rejected { message: String },
+}
+
+#[derive(Debug, Clone)]
+struct NearbyPairingDecisionRecord {
+    decision: NearbyPairingDecision,
+    decided_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Default)]
 struct ClipboardSyncState {
     last_observed_hash: Option<String>,
@@ -104,6 +140,9 @@ pub struct AppState {
     pending_inject_input_frames: Arc<RwLock<VecDeque<PendingInjectInputFrame>>>,
     input_capture_target_peer_id: Arc<RwLock<Option<String>>>,
     reconnect_generation_by_peer: Arc<RwLock<HashMap<String, u64>>>,
+    pending_nearby_pairing_requests:
+        Arc<RwLock<HashMap<String, PendingNearbyPairingRequestRecord>>>,
+    nearby_pairing_decisions: Arc<RwLock<HashMap<String, NearbyPairingDecisionRecord>>>,
     pending_transport_session_abort_handles: Arc<RwLock<HashMap<u64, AbortHandle>>>,
     transport_session_abort_handles_by_peer:
         Arc<RwLock<HashMap<String, HashMap<u64, AbortHandle>>>>,
@@ -180,6 +219,8 @@ impl AppState {
             pending_inject_input_frames: Arc::new(RwLock::new(VecDeque::new())),
             input_capture_target_peer_id: Arc::new(RwLock::new(None)),
             reconnect_generation_by_peer: Arc::new(RwLock::new(HashMap::new())),
+            pending_nearby_pairing_requests: Arc::new(RwLock::new(HashMap::new())),
+            nearby_pairing_decisions: Arc::new(RwLock::new(HashMap::new())),
             pending_transport_session_abort_handles: Arc::new(RwLock::new(HashMap::new())),
             transport_session_abort_handles_by_peer: Arc::new(RwLock::new(HashMap::new())),
             next_transport_session_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -320,6 +361,147 @@ impl AppState {
         (code.value, code.expires_at)
     }
 
+    pub async fn consume_pairing_code(&self, code: &str) -> Result<()> {
+        let now = Utc::now();
+        let mut pairing_codes = self.pairing_codes.write().await;
+        validate_and_consume_pairing_code(&mut pairing_codes, code, now)?;
+        pairing_codes.retain(|_, expires_at| *expires_at >= now);
+        Ok(())
+    }
+
+    pub async fn queue_nearby_pairing_request(
+        &self,
+        requester_bundle: TrustBundle,
+        requester_alias: Option<String>,
+    ) -> PendingNearbyPairingRequest {
+        let summary = PendingNearbyPairingRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            requester_machine_id: requester_bundle.machine_id.clone(),
+            requester_display_name: requester_bundle.display_name.clone(),
+            created_at: Utc::now(),
+        };
+        let request_id = summary.request_id.clone();
+
+        self.pending_nearby_pairing_requests.write().await.insert(
+            request_id,
+            PendingNearbyPairingRequestRecord {
+                summary: summary.clone(),
+                requester_bundle,
+                requester_alias: requester_alias.and_then(normalize_optional_alias),
+            },
+        );
+        summary
+    }
+
+    pub async fn list_pending_nearby_pairing_requests(&self) -> Vec<PendingNearbyPairingRequest> {
+        let mut requests = self
+            .pending_nearby_pairing_requests
+            .read()
+            .await
+            .values()
+            .map(|record| record.summary.clone())
+            .collect::<Vec<_>>();
+        requests.sort_by_key(|request| request.created_at);
+        requests
+    }
+
+    pub async fn nearby_pairing_status(&self, request_id: &str) -> NearbyPairingStatus {
+        if self
+            .pending_nearby_pairing_requests
+            .read()
+            .await
+            .contains_key(request_id)
+        {
+            return NearbyPairingStatus::Pending;
+        }
+
+        let now = Utc::now();
+        let mut decisions = self.nearby_pairing_decisions.write().await;
+        decisions.retain(|_, record| {
+            record.decided_at
+                + chrono::TimeDelta::minutes(NEARBY_PAIRING_DECISION_RETENTION_MINUTES)
+                >= now
+        });
+        if let Some(record) = decisions.get(request_id) {
+            return match &record.decision {
+                NearbyPairingDecision::Approved { responder_bundle } => {
+                    NearbyPairingStatus::Approved {
+                        responder_bundle: responder_bundle.clone(),
+                    }
+                }
+                NearbyPairingDecision::Rejected { message } => NearbyPairingStatus::Rejected {
+                    message: message.clone(),
+                },
+            };
+        }
+
+        NearbyPairingStatus::Missing
+    }
+
+    pub async fn approve_nearby_pairing_request(
+        &self,
+        request_id: &str,
+        alias_override: Option<String>,
+    ) -> Result<TrustBundle> {
+        let pending = {
+            self.pending_nearby_pairing_requests
+                .write()
+                .await
+                .remove(request_id)
+        }
+        .ok_or_else(|| anyhow::anyhow!("nearby pairing request not found"))?;
+        let peer_id = pending.summary.requester_machine_id.clone();
+        let effective_alias = alias_override
+            .and_then(normalize_optional_alias)
+            .or(pending.requester_alias.clone());
+
+        if let Err(error) = self
+            .import_trust_bundle(pending.requester_bundle.clone(), effective_alias)
+            .await
+        {
+            self.pending_nearby_pairing_requests
+                .write()
+                .await
+                .insert(request_id.to_string(), pending);
+            return Err(error);
+        }
+
+        let responder_bundle = self.export_trust_bundle().await?;
+        self.nearby_pairing_decisions.write().await.insert(
+            request_id.to_string(),
+            NearbyPairingDecisionRecord {
+                decision: NearbyPairingDecision::Approved {
+                    responder_bundle: responder_bundle.clone(),
+                },
+                decided_at: Utc::now(),
+            },
+        );
+        self.request_peer_reconnect(&peer_id).await;
+        Ok(responder_bundle)
+    }
+
+    pub async fn reject_nearby_pairing_request(&self, request_id: &str) -> bool {
+        let removed = self
+            .pending_nearby_pairing_requests
+            .write()
+            .await
+            .remove(request_id);
+        if removed.is_none() {
+            return false;
+        }
+
+        self.nearby_pairing_decisions.write().await.insert(
+            request_id.to_string(),
+            NearbyPairingDecisionRecord {
+                decision: NearbyPairingDecision::Rejected {
+                    message: "nearby pairing request rejected".to_string(),
+                },
+                decided_at: Utc::now(),
+            },
+        );
+        true
+    }
+
     pub async fn join_peer(
         &self,
         code: String,
@@ -327,11 +509,7 @@ impl AppState {
         alias: Option<String>,
     ) -> Result<String> {
         let now = Utc::now();
-        {
-            let mut pairing_codes = self.pairing_codes.write().await;
-            validate_and_consume_pairing_code(&mut pairing_codes, &code, now)?;
-            pairing_codes.retain(|_, expires_at| *expires_at >= now);
-        }
+        self.consume_pairing_code(&code).await?;
 
         let mut config = self.config.write().await;
         let normalized_address = normalize_peer_address(&host, config.network_port)?;
@@ -1314,6 +1492,9 @@ impl AppState {
         self.pending_inject_input_frames.write().await.clear();
         *self.input_capture_target_peer_id.write().await = None;
         self.reconnect_generation_by_peer.write().await.clear();
+        self.pairing_codes.write().await.clear();
+        self.pending_nearby_pairing_requests.write().await.clear();
+        self.nearby_pairing_decisions.write().await.clear();
         self.pending_transport_session_abort_handles
             .write()
             .await
@@ -1443,6 +1624,15 @@ fn validate_pipe_name(pipe_name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn normalize_optional_alias(alias: String) -> Option<String> {
+    let trimmed = alias.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn validate_and_consume_pairing_code(

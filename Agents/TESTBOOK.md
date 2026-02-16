@@ -43,9 +43,10 @@
 - Verify `boundlessctl daemon status` returns running and machine IDs
 
 2. Pairing flow
-- On Machine A: create code (`pair create-code`)
-- On Machine B: join using code and host (`pair join`)
-- Verify peer appears in `peer list`
+- On Machine B (target): create code (`pair create-code --ttl 120`)
+- On Machine A (requester): send nearby request (`pair nearby-join <code> --host <machine-b-host> --port <machine-b-network-port+100>`)
+- On Machine B: list pending requests (`pair pending`) and approve (`pair approve <request_id>`)
+- Verify peers appear in `peer list` and converge to `connected=true`
 
 3. Topology edits
 - Set matrix with `layout set`
