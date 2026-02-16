@@ -4,7 +4,7 @@ param(
     [string]$Role,
 
     [Parameter(Mandatory = $true)]
-    [ValidateSet("start-daemon", "stop-daemon", "status", "create-code", "pending", "approve", "join", "peers", "show-session")]
+    [ValidateSet("start-daemon", "stop-daemon", "status", "create-code", "pending", "approve", "join", "peers", "show-session", "clipboard-test", "input-test")]
     [string]$Action,
 
     [string]$RootPath,
@@ -14,7 +14,9 @@ param(
     [string]$ResponderHost,
     [int]$ResponderPairingPort,
     [int]$TimeoutSeconds = 120,
+    [int]$WaitSeconds = 45,
     [string]$RequestId,
+    [string]$Message,
     [switch]$Build,
     [switch]$Clean
 )
@@ -27,6 +29,7 @@ Set-Location $repoRoot
 
 $daemonExe = Join-Path $repoRoot "target/debug/boundlessd.exe"
 $cliExe = Join-Path $repoRoot "target/debug/boundlessctl.exe"
+$scriptPath = Join-Path $repoRoot "scripts/dev/nearby-two-pc.ps1"
 
 if (-not $RootPath) {
     $RootPath = Join-Path $env:TEMP "boundless-nearby-two-pc-$Role"
@@ -183,6 +186,90 @@ function Stop-ManagedDaemon {
     Write-Host "Stopped daemon pid=$($proc.Id)"
 }
 
+function Get-FirstPeerId {
+    param([string]$Endpoint)
+
+    $output = Invoke-CliChecked -Endpoint $Endpoint -CommandArgs @("peer", "list")
+    if ($output -match "no peers configured") {
+        throw "No peers configured at endpoint=$Endpoint"
+    }
+
+    $match = [regex]::Match($output, "peer_id=([^\s]+)")
+    if (-not $match.Success) {
+        throw "Unable to parse peer_id from peer list output: $output"
+    }
+
+    return $match.Groups[1].Value
+}
+
+function Get-TransportEventMatchCount {
+    param(
+        [string]$Endpoint,
+        [string]$Pattern
+    )
+
+    $output = Invoke-CliChecked -Endpoint $Endpoint -CommandArgs @("transport", "events", "--limit", "200")
+    return ([regex]::Matches($output, $Pattern)).Count
+}
+
+function Wait-ForTransportEventCount {
+    param(
+        [string]$Endpoint,
+        [string]$Pattern,
+        [int]$ExpectedMinCount,
+        [int]$Seconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $count = Get-TransportEventMatchCount -Endpoint $Endpoint -Pattern $Pattern
+        if ($count -ge $ExpectedMinCount) {
+            return
+        }
+        Start-Sleep -Milliseconds 700
+    }
+
+    throw "Timed out waiting for transport event count >= $ExpectedMinCount for pattern '$Pattern' at endpoint=$Endpoint"
+}
+
+function Wait-ForTransportEventPattern {
+    param(
+        [string]$Endpoint,
+        [string]$Pattern,
+        [int]$Seconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $output = Invoke-CliChecked -Endpoint $Endpoint -CommandArgs @("transport", "events", "--limit", "200")
+        if ($output -match $Pattern) {
+            return
+        }
+        Start-Sleep -Milliseconds 700
+    }
+
+    throw "Timed out waiting for transport event pattern '$Pattern' at endpoint=$Endpoint"
+}
+
+function Wait-ForInputOwner {
+    param(
+        [string]$Endpoint,
+        [string]$ExpectedOwner,
+        [int]$Seconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs @("input", "owner")
+        if ($LASTEXITCODE -eq 0 -and $output -match "owner=$ExpectedOwner") {
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Timed out waiting for input owner '$ExpectedOwner' at endpoint=$Endpoint"
+}
+
 switch ($Action) {
     "start-daemon" {
         if ($Build -or -not (Test-Path $daemonExe) -or -not (Test-Path $cliExe)) {
@@ -237,7 +324,7 @@ switch ($Action) {
         Write-Host "Stderr log: $stderrPath"
 
         if ($Role -eq "responder") {
-            Write-Host "Next: .\\scripts\\dev\\nearby-two-pc.ps1 -Role responder -Action create-code"
+            Write-Host "Next: & `"$scriptPath`" -Role responder -Action create-code"
         } else {
             Write-Host "Next: run join once you have a code from responder."
         }
@@ -340,6 +427,90 @@ switch ($Action) {
         $session = Load-Session
         $output = Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("peer", "list")
         $output | Out-Host
+        break
+    }
+    "clipboard-test" {
+        $session = Load-Session
+        $peerId = Get-FirstPeerId -Endpoint $session.endpoint
+
+        if ($Role -eq "requester") {
+            $text = if ($Message) {
+                $Message
+            } else {
+                "nearby-clipboard-$((Get-Date).ToString('yyyyMMdd-HHmmss'))"
+            }
+
+            $pattern = "direction=outgoing kind=clipboard_text peer_id=$([regex]::Escape($peerId))"
+            $before = Get-TransportEventMatchCount -Endpoint $session.endpoint -Pattern $pattern
+
+            Write-Host "Sending clipboard text to peer_id=$peerId"
+            Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("transport", "send-text", $peerId, $text) | Out-Host
+            Wait-ForTransportEventCount -Endpoint $session.endpoint -Pattern $pattern -ExpectedMinCount ($before + 1) -Seconds $WaitSeconds
+            Write-Host "Clipboard send event observed. message=$text"
+            Write-Host "On responder, run:"
+            Write-Host "& `"$scriptPath`" -Role responder -Action clipboard-test -Message `"$text`""
+            break
+        }
+
+        $incomingPattern = "direction=incoming kind=clipboard_text peer_id=$([regex]::Escape($peerId))"
+        if ($Message) {
+            $escapedMessage = [regex]::Escape($Message)
+            $incomingPattern = "$incomingPattern .*detail=$escapedMessage"
+            Write-Host "Waiting for clipboard text with message='$Message' from peer_id=$peerId"
+            Wait-ForTransportEventPattern -Endpoint $session.endpoint -Pattern $incomingPattern -Seconds $WaitSeconds
+        } else {
+            $before = Get-TransportEventMatchCount -Endpoint $session.endpoint -Pattern $incomingPattern
+            Write-Host "Waiting for next incoming clipboard text from peer_id=$peerId"
+            Wait-ForTransportEventCount -Endpoint $session.endpoint -Pattern $incomingPattern -ExpectedMinCount ($before + 1) -Seconds $WaitSeconds
+        }
+
+        Write-Host "Clipboard receive event observed."
+        break
+    }
+    "input-test" {
+        $session = Load-Session
+        $peerId = Get-FirstPeerId -Endpoint $session.endpoint
+
+        if ($Role -eq "responder") {
+            $incomingPattern = "direction=incoming kind=input_frame peer_id=$([regex]::Escape($peerId))"
+            $appliedPattern = "direction=local kind=input_inject_applied peer_id=$([regex]::Escape($peerId))"
+
+            $incomingBefore = Get-TransportEventMatchCount -Endpoint $session.endpoint -Pattern $incomingPattern
+            $appliedBefore = Get-TransportEventMatchCount -Endpoint $session.endpoint -Pattern $appliedPattern
+
+            Write-Host "Claiming input owner for peer_id=$peerId"
+            Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("input", "claim", $peerId) | Out-Host
+            Wait-ForInputOwner -Endpoint $session.endpoint -ExpectedOwner $peerId -Seconds 10
+
+            try {
+                Write-Host "Waiting up to $WaitSeconds seconds for input frames from requester"
+                Wait-ForTransportEventCount -Endpoint $session.endpoint -Pattern $incomingPattern -ExpectedMinCount ($incomingBefore + 1) -Seconds $WaitSeconds
+                Wait-ForTransportEventCount -Endpoint $session.endpoint -Pattern $appliedPattern -ExpectedMinCount ($appliedBefore + 1) -Seconds $WaitSeconds
+                Write-Host "Input receive/apply events observed."
+            } finally {
+                Write-Host "Releasing input owner for peer_id=$peerId"
+                $releaseOutput = Invoke-Cli -Endpoint $session.endpoint -CommandArgs @("input", "release", $peerId)
+                if ($LASTEXITCODE -eq 0) {
+                    $releaseOutput | Out-Host
+                } else {
+                    Write-Warning "Failed to release input owner cleanly: $releaseOutput"
+                }
+            }
+            break
+        }
+
+        $outgoingPattern = "direction=outgoing kind=input_frame peer_id=$([regex]::Escape($peerId))"
+        $before = Get-TransportEventMatchCount -Endpoint $session.endpoint -Pattern $outgoingPattern
+
+        Write-Host "Sending input frames to peer_id=$peerId"
+        Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("input", "send-move", $peerId, "30", "0") | Out-Host
+        Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("input", "send-key", $peerId, "30", "down") | Out-Host
+        Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("input", "send-key", $peerId, "30", "up") | Out-Host
+
+        Wait-ForTransportEventCount -Endpoint $session.endpoint -Pattern $outgoingPattern -ExpectedMinCount ($before + 1) -Seconds $WaitSeconds
+        Write-Host "Outgoing input event observed."
+        Write-Host "On responder, run:"
+        Write-Host "& `"$scriptPath`" -Role responder -Action input-test"
         break
     }
 }
