@@ -103,6 +103,9 @@ async fn drain_pending_inject_frames(state: &AppState, backend: &mut dyn InputBa
                     &frame.peer_id,
                     frame.sequence,
                     frame.events.len(),
+                    frame.capture_timestamp_unix_ms,
+                    frame.received_timestamp_unix_ms,
+                    frame.queued_timestamp_unix_ms,
                     "owner_or_feature_changed",
                 )
                 .await;
@@ -112,7 +115,14 @@ async fn drain_pending_inject_frames(state: &AppState, backend: &mut dyn InputBa
         match apply_frame(backend, &frame) {
             Ok(()) => {
                 state
-                    .record_input_inject_applied(&frame.peer_id, frame.sequence, frame.events.len())
+                    .record_input_inject_applied(
+                        &frame.peer_id,
+                        frame.sequence,
+                        frame.events.len(),
+                        frame.capture_timestamp_unix_ms,
+                        frame.received_timestamp_unix_ms,
+                        frame.queued_timestamp_unix_ms,
+                    )
                     .await;
             }
             Err(error) => {
@@ -122,6 +132,9 @@ async fn drain_pending_inject_frames(state: &AppState, backend: &mut dyn InputBa
                         &frame.peer_id,
                         frame.sequence,
                         frame.events.len(),
+                        frame.capture_timestamp_unix_ms,
+                        frame.received_timestamp_unix_ms,
+                        frame.queued_timestamp_unix_ms,
                         &message,
                     )
                     .await;
@@ -1170,6 +1183,9 @@ mod tests {
         let frame = PendingInjectInputFrame {
             peer_id: "peer-a".to_string(),
             sequence: 1,
+            capture_timestamp_unix_ms: 1,
+            received_timestamp_unix_ms: 2,
+            queued_timestamp_unix_ms: 3,
             events: vec![
                 InputEvent::MouseMove { dx: 1, dy: -1 },
                 InputEvent::Key {
