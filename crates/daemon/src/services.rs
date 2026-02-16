@@ -6,6 +6,7 @@ use ipc_api::boundless::v1::{
     DiagnosticsDumpReply, DiagnosticsDumpRequest, Empty, FeatureListReply, FeatureSetRequest,
     HotkeySetRequest, HotkeyTriggerRequest, ImportTrustBundleRequest, InputCaptureTargetReply,
     InputCaptureTargetRequest, InputOwnerReply, InputOwnerRequest, LayoutReply, LayoutSetRequest,
+    NearbyPairingDecisionRequest, NearbyPairingRequestInfo, NearbyPairingRequestsReply,
     OperationReply, PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply, PairJoinRequest,
     PeerInfo, PeerListReply, RemovePeerRequest, SafeResetRequest, SendClipboardImageRequest,
     SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest, SendInputMoveRequest,
@@ -114,6 +115,69 @@ impl PairingService for PairingApi {
             accepted: true,
             peer_id,
             message: "Pairing request accepted".to_string(),
+        }))
+    }
+
+    async fn list_nearby_pairing_requests(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<NearbyPairingRequestsReply>, Status> {
+        let requests = self
+            .0
+            .list_pending_nearby_pairing_requests()
+            .await
+            .into_iter()
+            .map(|request| NearbyPairingRequestInfo {
+                request_id: request.request_id,
+                requester_machine_id: request.requester_machine_id,
+                requester_display_name: request.requester_display_name,
+                created_at: request.created_at.to_rfc3339(),
+            })
+            .collect();
+
+        Ok(Response::new(NearbyPairingRequestsReply { requests }))
+    }
+
+    async fn approve_nearby_pairing_request(
+        &self,
+        request: Request<NearbyPairingDecisionRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        self.0
+            .approve_nearby_pairing_request(
+                &request.request_id,
+                if request.alias.is_empty() {
+                    None
+                } else {
+                    Some(request.alias)
+                },
+            )
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+
+        Ok(Response::new(OperationReply {
+            ok: true,
+            message: "nearby pairing request approved".to_string(),
+        }))
+    }
+
+    async fn reject_nearby_pairing_request(
+        &self,
+        request: Request<NearbyPairingDecisionRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        let rejected = self
+            .0
+            .reject_nearby_pairing_request(&request.request_id)
+            .await;
+
+        Ok(Response::new(OperationReply {
+            ok: rejected,
+            message: if rejected {
+                "nearby pairing request rejected".to_string()
+            } else {
+                "nearby pairing request not found".to_string()
+            },
         }))
     }
 

@@ -52,13 +52,19 @@ cargo run -p boundless-cli -- daemon status
 
 On Windows, the daemon now defaults to a local named pipe control endpoint (`npipe://./pipe/boundlessd-api`) and the CLI default endpoint matches that. Use `--endpoint http://127.0.0.1:50051` to target loopback TCP explicitly.
 
-Generate pairing code:
+Nearby pairing (approval-based, no trust-bundle file copy):
 
 ```bash
-cargo run -p boundless-cli -- pair create-code --ttl 300
+cargo run -p boundless-cli -- pair create-code --ttl 120
+cargo run -p boundless-cli -- pair nearby-join 123456 --host <target-host-or-ip> --port 15200
+cargo run -p boundless-cli -- pair pending
+cargo run -p boundless-cli -- pair approve <request_id>
 ```
 
-Export/import trust bundles:
+`nearby-join` waits for remote approval and then imports trust automatically on success.  
+The daemon nearby pairing listener defaults to `network_port + 100` (for example `15200` when transport network port is `15100`).
+
+Export/import trust bundles (fallback or offline workflow):
 
 ```bash
 cargo run -p boundless-cli -- pair export-trust --output node-a.json

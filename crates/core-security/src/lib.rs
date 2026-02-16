@@ -7,7 +7,7 @@ use std::{
 use anyhow::Context;
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use rand::{Rng, distr::Alphanumeric};
+use rand::Rng;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
@@ -88,22 +88,10 @@ pub fn default_security_root() -> PathBuf {
 }
 
 pub fn generate_pairing_code(ttl: Duration) -> PairingCode {
-    let rng = rand::rng();
-    let raw: String = rng
-        .sample_iter(&Alphanumeric)
-        .map(char::from)
-        .take(16)
-        .collect::<String>()
-        .to_uppercase();
-
-    let groups = [0, 4, 8, 12]
-        .iter()
-        .map(|offset| &raw[*offset..offset + 4])
-        .collect::<Vec<_>>()
-        .join("-");
+    let value = format!("{:06}", rand::rng().random_range(0..1_000_000));
 
     PairingCode {
-        value: groups,
+        value,
         expires_at: Utc::now() + chrono::TimeDelta::from_std(ttl).unwrap_or_default(),
     }
 }
@@ -294,8 +282,8 @@ mod tests {
     #[test]
     fn pairing_code_has_expected_shape() {
         let code = generate_pairing_code(Duration::from_secs(300));
-        assert_eq!(code.value.len(), 19);
-        assert!(code.value.contains('-'));
+        assert_eq!(code.value.len(), 6);
+        assert!(code.value.chars().all(|ch| ch.is_ascii_digit()));
     }
 
     #[test]

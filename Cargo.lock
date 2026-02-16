@@ -231,6 +231,7 @@ dependencies = [
  "anyhow",
  "clap",
  "core-clipboard",
+ "core-discovery",
  "hyper-util",
  "ipc-api",
  "serde",

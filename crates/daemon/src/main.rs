@@ -5,6 +5,7 @@ mod hotkeys;
 mod input;
 mod logging;
 mod network;
+mod pairing_wire;
 mod services;
 mod state;
 
@@ -109,6 +110,7 @@ async fn main() -> Result<()> {
     discovery::start(state.clone());
     input::start(state.clone());
     hotkeys::start(state.clone());
+    pairing_wire::start(state.clone());
     network::start(state.clone(), transport_listener);
 
     let configured_api_transport = snapshot.api_transport;

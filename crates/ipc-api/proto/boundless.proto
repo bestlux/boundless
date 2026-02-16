@@ -35,6 +35,22 @@ message PairJoinReply {
   string message = 3;
 }
 
+message NearbyPairingRequestInfo {
+  string request_id = 1;
+  string requester_machine_id = 2;
+  string requester_display_name = 3;
+  string created_at = 4;
+}
+
+message NearbyPairingRequestsReply {
+  repeated NearbyPairingRequestInfo requests = 1;
+}
+
+message NearbyPairingDecisionRequest {
+  string request_id = 1;
+  string alias = 2;
+}
+
 message TrustBundleReply {
   string machine_id = 1;
   string display_name = 2;
@@ -173,6 +189,9 @@ service DaemonService {
 service PairingService {
   rpc CreateCode(PairCreateCodeRequest) returns (PairCreateCodeReply);
   rpc Join(PairJoinRequest) returns (PairJoinReply);
+  rpc ListNearbyPairingRequests(Empty) returns (NearbyPairingRequestsReply);
+  rpc ApproveNearbyPairingRequest(NearbyPairingDecisionRequest) returns (OperationReply);
+  rpc RejectNearbyPairingRequest(NearbyPairingDecisionRequest) returns (OperationReply);
   rpc ExportTrustBundle(Empty) returns (TrustBundleReply);
   rpc ImportTrustBundle(ImportTrustBundleRequest) returns (OperationReply);
 }

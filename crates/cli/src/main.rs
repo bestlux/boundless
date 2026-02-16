@@ -1,7 +1,13 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use core_clipboard::validate_bmp_payload as validate_bmp_bytes;
+use core_discovery::parse_manual_target;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
+};
 use tonic::transport::{Channel, Endpoint};
 
 #[cfg(windows)]
@@ -12,7 +18,6 @@ use std::{
     io,
     pin::Pin,
     task::{Context as TaskContext, Poll},
-    time::Duration,
 };
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
@@ -22,9 +27,10 @@ use tonic::{codegen::Service, transport::Uri};
 use ipc_api::boundless::v1::{
     DiagnosticsDumpRequest, Empty, FeatureSetRequest, HotkeySetRequest, HotkeyTriggerRequest,
     ImportTrustBundleRequest, InputCaptureTargetRequest, InputOwnerRequest, LayoutSetRequest,
-    PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest, SafeResetRequest,
-    SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
-    SendInputMoveRequest, StatusRequest, daemon_service_client::DaemonServiceClient,
+    NearbyPairingDecisionRequest, PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest,
+    SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest,
+    SendInputKeyRequest, SendInputMoveRequest, StatusRequest,
+    daemon_service_client::DaemonServiceClient,
     diagnostics_service_client::DiagnosticsServiceClient,
     feature_service_client::FeatureServiceClient, pairing_service_client::PairingServiceClient,
     topology_service_client::TopologyServiceClient,
@@ -108,6 +114,26 @@ enum PairCommand {
         host: String,
         #[arg(long)]
         alias: Option<String>,
+    },
+    NearbyJoin {
+        code: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long, default_value_t = 15200)]
+        port: u16,
+        #[arg(long, default_value_t = 120)]
+        timeout_seconds: u64,
+        #[arg(long)]
+        alias: Option<String>,
+    },
+    Pending,
+    Approve {
+        request_id: String,
+        #[arg(long)]
+        alias: Option<String>,
+    },
+    Reject {
+        request_id: String,
     },
     ExportTrust {
         #[arg(long)]
@@ -230,6 +256,40 @@ struct StoredTrustBundle {
     ca_cert_pem: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum NearbyJoinWireRequest {
+    NearbyJoin {
+        code: String,
+        requester_bundle: StoredTrustBundle,
+        requester_alias: Option<String>,
+    },
+    CheckNearbyJoin {
+        request_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum NearbyJoinWireResponse {
+    Pending {
+        request_id: String,
+        message: String,
+    },
+    Approved {
+        request_id: String,
+        message: String,
+        responder_bundle: StoredTrustBundle,
+    },
+    Rejected {
+        request_id: String,
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -243,6 +303,18 @@ async fn main() -> Result<()> {
             PairCommand::Join { code, host, alias } => {
                 pair_join(&cli.endpoint, code, host, alias).await
             }
+            PairCommand::NearbyJoin {
+                code,
+                host,
+                port,
+                timeout_seconds,
+                alias,
+            } => pair_nearby_join(&cli.endpoint, code, host, port, timeout_seconds, alias).await,
+            PairCommand::Pending => pair_pending(&cli.endpoint).await,
+            PairCommand::Approve { request_id, alias } => {
+                pair_approve(&cli.endpoint, request_id, alias).await
+            }
+            PairCommand::Reject { request_id } => pair_reject(&cli.endpoint, request_id).await,
             PairCommand::ExportTrust { output } => pair_export_trust(&cli.endpoint, output).await,
             PairCommand::ImportTrust { input, alias } => {
                 pair_import_trust(&cli.endpoint, input, alias).await
@@ -407,6 +479,160 @@ async fn pair_join(
         "accepted={} peer_id={} message={}",
         response.accepted, response.peer_id, response.message
     );
+    Ok(())
+}
+
+async fn pair_nearby_join(
+    endpoint: &str,
+    code: String,
+    host: String,
+    port: u16,
+    timeout_seconds: u64,
+    alias: Option<String>,
+) -> Result<()> {
+    let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
+    let local_bundle = pairing_client
+        .export_trust_bundle(Empty {})
+        .await?
+        .into_inner();
+    let requester_bundle = StoredTrustBundle {
+        machine_id: local_bundle.machine_id,
+        display_name: local_bundle.display_name,
+        network_address: local_bundle.network_address,
+        ca_cert_pem: local_bundle.ca_cert_pem,
+    };
+
+    let target = format_host_port(&host, port);
+    let initial_response = send_nearby_pairing_request(
+        &target,
+        NearbyJoinWireRequest::NearbyJoin {
+            code,
+            requester_bundle,
+            requester_alias: None,
+        },
+    )
+    .await?;
+
+    let mut responder_bundle = match initial_response {
+        NearbyJoinWireResponse::Approved {
+            responder_bundle, ..
+        } => responder_bundle,
+        NearbyJoinWireResponse::Pending {
+            request_id,
+            message,
+        } => {
+            println!("pending=true request_id={} message={}", request_id, message);
+            let deadline = std::time::Instant::now() + Duration::from_secs(timeout_seconds.max(5));
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    bail!("timed out waiting for nearby pairing approval request_id={request_id}");
+                }
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let status_response = send_nearby_pairing_request(
+                    &target,
+                    NearbyJoinWireRequest::CheckNearbyJoin {
+                        request_id: request_id.clone(),
+                    },
+                )
+                .await?;
+                match status_response {
+                    NearbyJoinWireResponse::Pending { .. } => continue,
+                    NearbyJoinWireResponse::Approved {
+                        responder_bundle, ..
+                    } => break responder_bundle,
+                    NearbyJoinWireResponse::Rejected { message, .. } => {
+                        bail!("nearby pairing rejected: {message}");
+                    }
+                    NearbyJoinWireResponse::Error { message } => {
+                        bail!("nearby pairing failed: {message}");
+                    }
+                }
+            }
+        }
+        NearbyJoinWireResponse::Rejected { message, .. } => {
+            bail!("nearby pairing rejected: {message}");
+        }
+        NearbyJoinWireResponse::Error { message } => {
+            bail!("nearby pairing failed: {message}");
+        }
+    };
+    normalize_bundle_address_for_host(&mut responder_bundle, &host)?;
+
+    pairing_client
+        .import_trust_bundle(ImportTrustBundleRequest {
+            machine_id: responder_bundle.machine_id.clone(),
+            display_name: responder_bundle.display_name,
+            network_address: responder_bundle.network_address,
+            ca_cert_pem: responder_bundle.ca_cert_pem,
+            alias: alias.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+
+    let mut diagnostics_client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let _ = diagnostics_client
+        .trigger_hotkey_action(HotkeyTriggerRequest {
+            action: "reconnect".to_string(),
+        })
+        .await;
+
+    println!(
+        "accepted=true peer_machine_id={} message=nearby pairing complete",
+        responder_bundle.machine_id
+    );
+    Ok(())
+}
+
+async fn pair_pending(endpoint: &str) -> Result<()> {
+    let mut client = PairingServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .list_nearby_pairing_requests(Empty {})
+        .await?
+        .into_inner();
+
+    if response.requests.is_empty() {
+        println!("no pending nearby pairing requests");
+        return Ok(());
+    }
+
+    for request in response.requests {
+        println!(
+            "request_id={} requester_machine_id={} requester_display_name={} created_at={}",
+            request.request_id,
+            request.requester_machine_id,
+            request.requester_display_name,
+            request.created_at
+        );
+    }
+    Ok(())
+}
+
+async fn pair_approve(endpoint: &str, request_id: String, alias: Option<String>) -> Result<()> {
+    let mut client = PairingServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .approve_nearby_pairing_request(NearbyPairingDecisionRequest {
+            request_id,
+            alias: alias.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+
+    println!("ok={} message={}", response.ok, response.message);
+    Ok(())
+}
+
+async fn pair_reject(endpoint: &str, request_id: String) -> Result<()> {
+    let mut client = PairingServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .reject_nearby_pairing_request(NearbyPairingDecisionRequest {
+            request_id,
+            alias: String::new(),
+        })
+        .await?
+        .into_inner();
+
+    println!("ok={} message={}", response.ok, response.message);
     Ok(())
 }
 
@@ -858,6 +1084,58 @@ fn validate_bmp_payload(bytes: &[u8]) -> Result<()> {
     validate_bmp_bytes(bytes).map_err(anyhow::Error::from)
 }
 
+async fn send_nearby_pairing_request(
+    target: &str,
+    request: NearbyJoinWireRequest,
+) -> Result<NearbyJoinWireResponse> {
+    let mut socket = TcpStream::connect(target)
+        .await
+        .with_context(|| format!("connect nearby pairing endpoint {target}"))?;
+    let payload = serde_json::to_string(&request).context("serialize nearby pairing request")?;
+    socket
+        .write_all(payload.as_bytes())
+        .await
+        .context("send nearby pairing request")?;
+    socket
+        .write_all(b"\n")
+        .await
+        .context("terminate nearby pairing request")?;
+    socket
+        .flush()
+        .await
+        .context("flush nearby pairing request")?;
+
+    let mut reader = BufReader::new(socket);
+    let mut response_line = String::new();
+    let read = reader
+        .read_line(&mut response_line)
+        .await
+        .context("read nearby pairing response")?;
+    if read == 0 {
+        bail!("nearby pairing endpoint closed without a response");
+    }
+
+    serde_json::from_str(&response_line).context("parse nearby pairing response")
+}
+
+fn normalize_bundle_address_for_host(bundle: &mut StoredTrustBundle, host: &str) -> Result<()> {
+    let parsed = parse_manual_target(bundle.network_address.trim(), 15100)
+        .ok_or_else(|| anyhow::anyhow!("invalid responder network address"))?;
+    bundle.network_address = format_host_port(host, parsed.port());
+    Ok(())
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    let trimmed = host.trim();
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        format!("{trimmed}:{port}")
+    } else if trimmed.contains(':') {
+        format!("[{trimmed}]:{port}")
+    } else {
+        format!("{trimmed}:{port}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,6 +1191,13 @@ mod tests {
             0, 0, 0, 255, 0,
         ];
         validate_bmp_payload(&payload).expect("must accept");
+    }
+
+    #[test]
+    fn format_host_port_handles_ipv4_and_ipv6() {
+        assert_eq!(format_host_port("10.0.0.7", 15200), "10.0.0.7:15200");
+        assert_eq!(format_host_port("fe80::1", 15200), "[fe80::1]:15200");
+        assert_eq!(format_host_port("[fe80::1]", 15200), "[fe80::1]:15200");
     }
 
     #[cfg(windows)]
