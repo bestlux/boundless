@@ -33,6 +33,7 @@ use core_transfer::validate_transfer_size;
 use crate::state::{AppState, OutboundPayload};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+const OUTGOING_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
 const SUPERVISOR_TICK: Duration = Duration::from_secs(3);
 const MAX_BACKOFF_SECONDS: u64 = 30;
 const FILE_CHUNK_BYTES: usize = 48 * 1024;
@@ -347,7 +348,8 @@ where
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    let mut interval = time::interval(HEARTBEAT_INTERVAL);
+    let mut heartbeat_interval = time::interval(HEARTBEAT_INTERVAL);
+    let mut outgoing_flush_interval = time::interval(OUTGOING_FLUSH_INTERVAL);
 
     let snapshot = state.snapshot().await;
     let local_hello = WireMessage::Hello {
@@ -368,7 +370,7 @@ where
 
     loop {
         tokio::select! {
-            _ = interval.tick() => {
+            _ = heartbeat_interval.tick() => {
                 if reconnect_requested_for_peer(
                     &state,
                     &authenticated_peer_id,
@@ -388,6 +390,32 @@ where
                     timestamp_unix_ms: now_millis(),
                 };
                 send_message(&mut writer, &heartbeat).await?;
+                if let Some(remote_protocol) = remote_protocol {
+                    flush_outgoing_payloads(
+                        &state,
+                        &snapshot.machine_id,
+                        remote_peer_id.as_deref(),
+                        remote_protocol,
+                        &mut writer,
+                    )
+                    .await?;
+                }
+            }
+            _ = outgoing_flush_interval.tick(), if remote_protocol.is_some() => {
+                if reconnect_requested_for_peer(
+                    &state,
+                    &authenticated_peer_id,
+                    &mut observed_reconnect_generation,
+                )
+                .await
+                {
+                    info!(
+                        peer_id = %authenticated_peer_id,
+                        "ending session due to explicit reconnect request"
+                    );
+                    break;
+                }
+
                 if let Some(remote_protocol) = remote_protocol {
                     flush_outgoing_payloads(
                         &state,

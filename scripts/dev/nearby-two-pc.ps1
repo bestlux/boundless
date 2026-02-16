@@ -15,6 +15,8 @@ param(
     [int]$ResponderPairingPort,
     [int]$TimeoutSeconds = 120,
     [int]$WaitSeconds = 45,
+    [ValidateSet("left", "right")]
+    [string]$PeerSide = "left",
     [string]$RequestId,
     [string]$Message,
     [switch]$Build,
@@ -599,8 +601,14 @@ switch ($Action) {
 
         if ($connectedPeers.Count -eq 1) {
             $peerId = $connectedPeers[0]
-            $layout = "self,$peerId"
-            Write-Host "Single-peer mode: configuring layout '$layout'"
+            $layout = if ($PeerSide -eq "left") {
+                "$peerId,self"
+            } else {
+                "self,$peerId"
+            }
+            $edgeHint = if ($PeerSide -eq "left") { "LEFT" } else { "RIGHT" }
+
+            Write-Host "Single-peer mode: configuring layout '$layout' (peer side: $PeerSide)"
             Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("layout", "set", $layout) | Out-Host
 
             Write-Host "Starting capture on peer_id=$peerId"
@@ -610,7 +618,7 @@ switch ($Action) {
             $outgoingPattern = "direction=outgoing kind=input_frame peer_id=$([regex]::Escape($peerId))"
             $before = Get-TransportEventMatchCount -Endpoint $session.endpoint -Pattern $outgoingPattern
 
-            Write-Host "Move the local mouse aggressively into the RIGHT screen edge for up to $WaitSeconds seconds."
+            Write-Host "Move the local mouse aggressively into the $edgeHint screen edge for up to $WaitSeconds seconds."
             Write-Host "This validates edge sampling + capture loop in 2-node mode (target handoff change requires 2+ connected peers)."
 
             Wait-ForTransportEventCount -Endpoint $session.endpoint -Pattern $outgoingPattern -ExpectedMinCount ($before + 1) -Seconds $WaitSeconds
