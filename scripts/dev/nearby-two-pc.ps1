@@ -4,7 +4,7 @@ param(
     [string]$Role,
 
     [Parameter(Mandatory = $true)]
-    [ValidateSet("start-daemon", "stop-daemon", "status", "create-code", "pending", "approve", "join", "peers", "show-session", "clipboard-test", "input-test")]
+    [ValidateSet("start-daemon", "stop-daemon", "status", "create-code", "pending", "approve", "join", "peers", "show-session", "clipboard-test", "input-test", "edge-test")]
     [string]$Action,
 
     [string]$RootPath,
@@ -270,6 +270,74 @@ function Wait-ForInputOwner {
     throw "Timed out waiting for input owner '$ExpectedOwner' at endpoint=$Endpoint"
 }
 
+function Get-PeerRecords {
+    param([string]$Endpoint)
+
+    $output = Invoke-CliChecked -Endpoint $Endpoint -CommandArgs @("peer", "list")
+    $text = ($output | Out-String)
+    if ($text -match "no peers configured") {
+        return @()
+    }
+
+    $records = @()
+    $lines = $text -split "\r?\n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    foreach ($line in $lines) {
+        if ($line -match "^peer_id=(\S+)\s+name=(.+?)\s+address=(\S+)\s+connected=(true|false)$") {
+            $records += [pscustomobject]@{
+                peer_id = $matches[1]
+                name = $matches[2]
+                address = $matches[3]
+                connected = ($matches[4] -eq "true")
+            }
+        }
+    }
+
+    return $records
+}
+
+function Get-ConnectedPeerIds {
+    param([string]$Endpoint)
+
+    return @(
+        (Get-PeerRecords -Endpoint $Endpoint) |
+            Where-Object { $_.connected } |
+            ForEach-Object { $_.peer_id }
+    )
+}
+
+function Get-CaptureTarget {
+    param([string]$Endpoint)
+
+    $output = Invoke-CliChecked -Endpoint $Endpoint -CommandArgs @("input", "capture-target")
+    $text = ($output | Out-String)
+    $match = [regex]::Match($text, "target=([^\s]+)")
+    if (-not $match.Success) {
+        throw "Unable to parse capture target from output: $text"
+    }
+
+    return $match.Groups[1].Value
+}
+
+function Wait-ForCaptureTarget {
+    param(
+        [string]$Endpoint,
+        [string]$ExpectedTarget,
+        [int]$Seconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $target = Get-CaptureTarget -Endpoint $Endpoint
+        if ($target -eq $ExpectedTarget) {
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    $finalTarget = Get-CaptureTarget -Endpoint $Endpoint
+    throw "Timed out waiting for capture target '$ExpectedTarget' at endpoint=$Endpoint (current='$finalTarget')"
+}
+
 switch ($Action) {
     "start-daemon" {
         if ($Build -or -not (Test-Path $daemonExe) -or -not (Test-Path $cliExe)) {
@@ -511,6 +579,65 @@ switch ($Action) {
         Write-Host "Outgoing input event observed."
         Write-Host "On responder, run:"
         Write-Host "& `"$scriptPath`" -Role responder -Action input-test"
+        break
+    }
+    "edge-test" {
+        if ($Role -ne "requester") {
+            throw "-Action edge-test is only valid for requester role."
+        }
+
+        $session = Load-Session
+        $connectedPeers = @(Get-ConnectedPeerIds -Endpoint $session.endpoint)
+        if ($connectedPeers.Count -eq 0) {
+            throw "No connected peers available for edge test. Verify pairing and connectivity first."
+        }
+
+        Write-Host "Enabling edge-switch related features on requester"
+        Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("feature", "set", "share_input", "on") | Out-Host
+        Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("feature", "set", "easy_mouse", "on") | Out-Host
+        Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("feature", "set", "wrap_mouse", "on") | Out-Host
+
+        if ($connectedPeers.Count -eq 1) {
+            $peerId = $connectedPeers[0]
+            $layout = "self,$peerId"
+            Write-Host "Single-peer mode: configuring layout '$layout'"
+            Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("layout", "set", $layout) | Out-Host
+
+            Write-Host "Starting capture on peer_id=$peerId"
+            Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("input", "capture-start", $peerId) | Out-Host
+            Wait-ForCaptureTarget -Endpoint $session.endpoint -ExpectedTarget $peerId -Seconds 10
+
+            $outgoingPattern = "direction=outgoing kind=input_frame peer_id=$([regex]::Escape($peerId))"
+            $before = Get-TransportEventMatchCount -Endpoint $session.endpoint -Pattern $outgoingPattern
+
+            Write-Host "Move the local mouse aggressively into the RIGHT screen edge for up to $WaitSeconds seconds."
+            Write-Host "This validates edge sampling + capture loop in 2-node mode (target handoff change requires 2+ connected peers)."
+
+            Wait-ForTransportEventCount -Endpoint $session.endpoint -Pattern $outgoingPattern -ExpectedMinCount ($before + 1) -Seconds $WaitSeconds
+            Write-Host "Edge capture smoke passed (outgoing input frames observed)."
+            break
+        }
+
+        $leftPeer = $connectedPeers[0]
+        $rightPeer = $connectedPeers[1]
+        $layout = "$leftPeer,self,$rightPeer"
+        Write-Host "Multi-peer mode: configuring layout '$layout'"
+        Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("layout", "set", $layout) | Out-Host
+
+        Write-Host "Phase 1/2: start capture at left peer and hand off to right peer"
+        Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("input", "capture-start", $leftPeer) | Out-Host
+        Wait-ForCaptureTarget -Endpoint $session.endpoint -ExpectedTarget $leftPeer -Seconds 10
+        Write-Host "Move cursor to RIGHT screen edge now. Waiting up to $WaitSeconds seconds for target switch..."
+        Wait-ForCaptureTarget -Endpoint $session.endpoint -ExpectedTarget $rightPeer -Seconds $WaitSeconds
+        Write-Host "Right-edge handoff observed."
+
+        Write-Host "Phase 2/2: start capture at right peer and hand off to left peer"
+        Invoke-CliChecked -Endpoint $session.endpoint -CommandArgs @("input", "capture-start", $rightPeer) | Out-Host
+        Wait-ForCaptureTarget -Endpoint $session.endpoint -ExpectedTarget $rightPeer -Seconds 10
+        Write-Host "Move cursor to LEFT screen edge now. Waiting up to $WaitSeconds seconds for target switch..."
+        Wait-ForCaptureTarget -Endpoint $session.endpoint -ExpectedTarget $leftPeer -Seconds $WaitSeconds
+        Write-Host "Left-edge handoff observed."
+        Write-Host "Edge handoff test passed."
         break
     }
 }
