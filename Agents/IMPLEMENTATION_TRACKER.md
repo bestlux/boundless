@@ -40,8 +40,9 @@
 - [x] Implemented core hotkey runtime actions (toggle easy mouse, reconnect, lock machine) with parser/edge-trigger engine and persistence-focused tests
 - [x] Implemented `switch_all` hotkey semantics to rotate capture target across connected peers in deterministic layout-first order
 - [x] Added diagnostics hotkey-action trigger API/CLI helper and smoke coverage for deterministic runtime action validation
+- [x] Added deterministic 3-node smoke harness to validate `switch_all` rotation ordering and disconnect/reconnect skip behavior
 
 ## Next (priority order)
 
 - See `Agents/V1_RELEASE_SLICES.md` for the ordered v1 execution list.
-- [ ] Slice 1: 3-node automation harness
+- [ ] Slice 2: real multi-display validation pass

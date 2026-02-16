@@ -4,7 +4,7 @@ This file is the ordered execution plan for shipping `v1.0.0`.
 
 ## Ordered Slices
 
-1. [ ] 3-node automation harness
+1. [x] 3-node automation harness
 - Add deterministic local 3-node smoke flow to validate real `switch_all` rotation order and multi-peer handoff behavior.
 
 2. [ ] Real multi-display validation pass
@@ -42,4 +42,4 @@ This file is the ordered execution plan for shipping `v1.0.0`.
 
 ## Active Slice
 
-- Current: `1) 3-node automation harness`
+- Current: `2) Real multi-display validation pass`

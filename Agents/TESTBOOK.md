@@ -18,6 +18,10 @@
   - synthetic input frame transport + router processing path
   - reconnect behavior (drop + recover) with queued payload delivery after reconnect
   - queued clipboard text/file payload transfer and inbox materialization
+- Run `scripts/dev/three-node-smoke.ps1` to validate:
+  - three-node trust/bootstrap and connected-state convergence
+  - deterministic `switch_all` capture-target rotation ordering on node1
+  - disconnected-peer skip and post-restart rotation recovery behavior
 - The smoke harness runs daemon API in TCP mode (`--api-transport tcp`) even though Windows default is named pipe, to keep two-node automation deterministic
 - mDNS discovery is enabled during daemon runtime; transport workers prefer discovered endpoints and fall back to configured/manual peer addresses
 - Runtime clipboard text sync is active in daemon; diagnostics `transport send-text` remains available as an explicit test hook
@@ -28,6 +32,7 @@
 - Runtime hotkey loop is active on Windows and executes configured actions on combo press edge (`toggle_easy_mouse`, `reconnect`, `lock_machine`, `switch_all`)
 - Diagnostics action trigger helper is available for deterministic validation without physical key presses: `diagnostics run-action <toggle_easy_mouse|switch_all|reconnect>`
 - Run `scripts/dev/validate.ps1` for fmt/test/clippy plus smoke in one command
+- Run `scripts/dev/validate.ps1 -IncludeThreeNodeSmoke` to include both two-node and three-node smoke flows
 
 ## Test cases
 
