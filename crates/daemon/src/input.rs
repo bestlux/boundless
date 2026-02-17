@@ -212,7 +212,17 @@ async fn capture_and_queue_outgoing_frames(
         }
     }
 
-    let Some(peer_id) = capture_target.clone() else {
+    maybe_handoff_capture_target_from_motion(
+        state,
+        &events,
+        capture_target.as_deref(),
+        edge_switch_state,
+    )
+    .await;
+    capture_target = state.active_input_capture_target().await;
+    sync_local_input_lock(state, backend, capture_target.is_some()).await;
+
+    let Some(peer_id) = capture_target else {
         return;
     };
 
@@ -228,8 +238,6 @@ async fn capture_and_queue_outgoing_frames(
             }
         }
     }
-
-    maybe_handoff_capture_target_from_motion(state, &events, &peer_id, edge_switch_state).await;
 }
 
 async fn sync_local_input_lock(
@@ -338,7 +346,7 @@ fn edge_switch_direction_from_motion(
 async fn maybe_handoff_capture_target_from_motion(
     state: &AppState,
     events: &[InputEvent],
-    current_target: &str,
+    current_target: Option<&str>,
     edge_switch_state: &mut EdgeSwitchState,
 ) {
     let (mode, wrap_mouse) = state.edge_switch_policy().await;
@@ -361,7 +369,7 @@ async fn maybe_handoff_capture_target_from_motion(
     edge_switch_state.last_direction = Some(direction);
 
     let Some(next_target) = state
-        .capture_handoff_target_for_direction(Some(current_target), direction)
+        .capture_handoff_target_for_direction(current_target, direction)
         .await
     else {
         return;
@@ -369,21 +377,22 @@ async fn maybe_handoff_capture_target_from_motion(
 
     match next_target {
         CaptureHandoffTarget::Peer(next_peer_id) => {
-            if current_target == next_peer_id {
+            if current_target == Some(next_peer_id.as_str()) {
                 return;
             }
             match state.set_input_capture_target(Some(&next_peer_id)).await {
                 Ok(Some(peer_id)) => {
+                    let previous_target = current_target.unwrap_or("local");
                     info!(
                         direction = ?direction,
-                        previous_target = %current_target,
+                        previous_target = %previous_target,
                         next_target = %peer_id,
                         "edge switch capture handoff applied"
                     );
                     record_local_input_runtime_event(
                         state,
                         "input_handoff",
-                        &format!("direction={direction:?} from={current_target} to={peer_id}"),
+                        &format!("direction={direction:?} from={previous_target} to={peer_id}"),
                         &peer_id,
                     )
                     .await;
@@ -392,9 +401,10 @@ async fn maybe_handoff_capture_target_from_motion(
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    let previous_target = current_target.unwrap_or("local");
                     warn!(
                         direction = ?direction,
-                        previous_target = %current_target,
+                        previous_target = %previous_target,
                         next_target = %next_peer_id,
                         error = ?error,
                         "failed to apply edge switch capture handoff"
@@ -403,16 +413,20 @@ async fn maybe_handoff_capture_target_from_motion(
             }
         }
         CaptureHandoffTarget::Local => {
+            if current_target.is_none() {
+                return;
+            }
+            let previous_target = current_target.unwrap_or("local");
             state.clear_input_capture_target().await;
             info!(
                 direction = ?direction,
-                previous_target = %current_target,
+                previous_target = %previous_target,
                 "edge switch capture handoff returned to local"
             );
             record_local_input_runtime_event(
                 state,
                 "input_handoff",
-                &format!("direction={direction:?} from={current_target} to=local"),
+                &format!("direction={direction:?} from={previous_target} to=local"),
                 "none",
             )
             .await;
@@ -1926,12 +1940,21 @@ mod tests {
             "right-edge switch should hand off capture target to right layout neighbor"
         );
         let left_outgoing = state.drain_outgoing(&left_peer).await;
-        assert_eq!(left_outgoing.len(), 2);
+        assert_eq!(left_outgoing.len(), 1);
         assert!(matches!(
-            left_outgoing.get(1),
-            Some(crate::state::OutboundPayload::InputFrame { sequence: 2, events, .. }) if matches!(
+            left_outgoing.first(),
+            Some(crate::state::OutboundPayload::InputFrame { sequence: 1, events, .. }) if matches!(
                 events.as_slice(),
                 [InputEvent::Key { scan_code: 30, state: KeyState::Up }]
+            )
+        ));
+        let right_outgoing = state.drain_outgoing(&right_peer).await;
+        assert_eq!(right_outgoing.len(), 1);
+        assert!(matches!(
+            right_outgoing.first(),
+            Some(crate::state::OutboundPayload::InputFrame { sequence: 1, events, .. }) if matches!(
+                events.as_slice(),
+                [InputEvent::MouseMove { dx, dy }] if *dx == EDGE_PRESSURE_THRESHOLD && *dy == 0
             )
         ));
 
@@ -2010,7 +2033,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edge_switch_handoff_does_not_start_capture_when_inactive() {
+    async fn edge_switch_handoff_starts_capture_when_inactive() {
         let (state, left_peer, root) = state_with_peer_for_input_test().await;
         let (code, _) = state.create_pairing_code(120).await;
         let right_peer = state
@@ -2054,9 +2077,10 @@ mod tests {
         )
         .await;
 
-        assert!(
-            state.input_capture_target().await.is_none(),
-            "edge handoff must not implicitly start capture when no target is active"
+        assert_eq!(
+            state.input_capture_target().await.as_deref(),
+            Some(right_peer.as_str()),
+            "edge handoff should auto-start capture from local when pushing into configured edge"
         );
 
         let _ = std::fs::remove_dir_all(root);
