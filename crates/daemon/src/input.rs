@@ -995,7 +995,7 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
                     if let Some((last_x, last_y)) = self.last_cursor {
                         let dx = x - last_x;
                         let dy = y - last_y;
-                        if !self.raw_input_enabled {
+                        if !self.raw_input_enabled || !self.lock_active {
                             Self::accumulate_pending_move(&mut pending_move, dx, dy);
                         }
                     }
@@ -2701,5 +2701,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(raw_mouse_relative_delta(&absolute), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hook_backend_uses_mouse_position_when_unlocked_with_raw_mode() {
+        let (tx, rx) = mpsc::channel();
+        let mut backend = WindowsHookCaptureBackend {
+            event_rx: rx,
+            hook_thread_id: 0,
+            hook_thread: None,
+            raw_input_thread_id: None,
+            raw_input_thread: None,
+            raw_input_enabled: true,
+            lock_active: false,
+            control_actions: VecDeque::new(),
+            last_cursor: None,
+            last_key_down: HashMap::new(),
+            last_button_down: HashMap::new(),
+        };
+
+        tx.send(HookCaptureEvent::MousePosition { x: 100, y: 100 })
+            .expect("send first position");
+        tx.send(HookCaptureEvent::MousePosition { x: 130, y: 90 })
+            .expect("send second position");
+
+        let events = backend.poll_events().expect("poll");
+        assert!(matches!(
+            events.as_slice(),
+            [InputEvent::MouseMove { dx, dy }] if *dx == 30 && *dy == -10
+        ));
     }
 }
