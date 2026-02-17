@@ -46,6 +46,7 @@
 - [x] Added approval-based nearby pairing flow (`pair nearby-join` + `pair pending|approve|reject`) with auto trust import on approval
 - [x] Added interactive CLI console flow (`boundlessctl console`) with daemon auto-start, mDNS discovery visibility, feature toggles, control target actions, and nearby pairing shortcuts
 - [x] Added discovery-indexed console pairing request flow (`pair request <index|machine_id> [code]`) with display-name surfaced mDNS peers and automatic pairing-port derivation
+- [x] Implemented strict local input lock while controlling peers (Windows hook suppression), double-`Ctrl` escape unlock, topology-driven edge handoff from active target (including return-to-local), and surfaced lock/capture state in daemon status
 
 ## Next (priority order)
 

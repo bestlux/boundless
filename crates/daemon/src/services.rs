@@ -52,6 +52,12 @@ impl DaemonService for DaemonApi {
         _request: Request<StatusRequest>,
     ) -> Result<Response<StatusReply>, Status> {
         let snapshot = self.0.snapshot().await;
+        let (input_locked, input_lock_supported) = self.0.input_lock_runtime().await;
+        let capture_target_peer_id = self
+            .0
+            .active_input_capture_target()
+            .await
+            .unwrap_or_default();
         let effective_api_transport = snapshot.api_transport.effective();
         let api_pipe_name = if matches!(
             effective_api_transport,
@@ -71,6 +77,9 @@ impl DaemonService for DaemonApi {
             api_bind: snapshot.api_bind,
             api_transport: effective_api_transport.as_str().to_string(),
             api_pipe_name,
+            input_locked,
+            input_lock_supported,
+            capture_target_peer_id,
         }))
     }
 }

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
 #[cfg(windows)]
 use std::{
@@ -13,11 +13,11 @@ use anyhow::{Context, bail};
 use tokio::time;
 use tracing::{info, warn};
 
-use core_input::{
-    EdgeSwitchRequest, InputEvent, MAX_EVENTS_PER_FRAME, SwitchDirection, should_switch,
-};
+use chrono::Utc;
 
-use crate::state::{AppState, PendingInjectInputFrame};
+use core_input::{EasyMouseMode, InputEvent, MAX_EVENTS_PER_FRAME, SwitchDirection};
+
+use crate::state::{AppState, CaptureHandoffTarget, PendingInjectInputFrame, TransportEventRecord};
 
 #[cfg(windows)]
 use windows_sys::Win32::{
@@ -33,32 +33,32 @@ use windows_sys::Win32::{
             SendInput,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics,
-            HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-            SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-            SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
-            WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-            WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-            WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
+            CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, HC_ACTION, HHOOK,
+            KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PostThreadMessageW, SetWindowsHookExW,
+            TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
+            WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+            WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
         },
     },
 };
 
 const INPUT_TICK: Duration = Duration::from_millis(5);
 const INPUT_CAPTURE_TICK: Duration = Duration::from_millis(8);
+const EDGE_PRESSURE_THRESHOLD: i32 = 300;
+#[cfg(windows)]
+const ESCAPE_DOUBLE_CTRL_WINDOW_MS: u64 = 400;
 
-#[derive(Debug, Clone, Copy)]
-struct EdgeSwitchSample {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    modifier_held: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureControlAction {
+    EscapeUnlock,
 }
 
 #[derive(Debug, Default)]
 struct EdgeSwitchState {
     last_direction: Option<SwitchDirection>,
+    x_pressure: i32,
+    y_pressure: i32,
 }
 
 pub fn start(state: AppState) {
@@ -72,6 +72,9 @@ pub fn start(state: AppState) {
 async fn run(state: AppState) -> Result<()> {
     let mut inject_backend = input_backend();
     let mut capture_backend = input_capture_backend();
+    state
+        .set_input_lock_runtime(false, capture_backend.lock_supported())
+        .await;
     let mut inject_ticker = time::interval(INPUT_TICK);
     let mut capture_ticker = time::interval(INPUT_CAPTURE_TICK);
     let mut last_capture_target: Option<String> = None;
@@ -152,16 +155,9 @@ async fn capture_and_queue_outgoing_frames(
     last_capture_target: &mut Option<String>,
     edge_switch_state: &mut EdgeSwitchState,
 ) {
-    let current_target = state.active_input_capture_target().await;
-    maybe_handoff_capture_target_from_edge(
-        state,
-        backend,
-        current_target.as_deref(),
-        edge_switch_state,
-    )
-    .await;
+    let mut capture_target = state.active_input_capture_target().await;
+    sync_local_input_lock(state, backend, capture_target.is_some()).await;
 
-    let capture_target = state.active_input_capture_target().await;
     if &capture_target != last_capture_target {
         if let Some(previous_target) = last_capture_target.as_deref() {
             let release_events = backend.drain_release_events();
@@ -186,63 +182,174 @@ async fn capture_and_queue_outgoing_frames(
         *last_capture_target = capture_target.clone();
     }
 
-    let Some(peer_id) = capture_target else {
-        if let Err(error) = backend.poll_events() {
-            warn!(error = ?error, "input capture drain while inactive failed");
+    let events = match backend.poll_events() {
+        Ok(events) => events,
+        Err(error) => {
+            warn!(error = ?error, "input capture poll failed");
+            Vec::new()
         }
+    };
+
+    for action in backend.drain_control_actions() {
+        if !matches!(action, CaptureControlAction::EscapeUnlock) {
+            continue;
+        }
+
+        if capture_target.is_some() {
+            state.clear_input_capture_target().await;
+            record_local_input_runtime_event(
+                state,
+                "input_escape_triggered",
+                "double_ctrl",
+                "none",
+            )
+            .await;
+            edge_switch_state.last_direction = None;
+            edge_switch_state.x_pressure = 0;
+            edge_switch_state.y_pressure = 0;
+            capture_target = None;
+            sync_local_input_lock(state, backend, false).await;
+        }
+    }
+
+    let Some(peer_id) = capture_target.clone() else {
         return;
     };
 
-    match backend.poll_events() {
-        Ok(events) => {
-            if events.is_empty() {
-                return;
+    if !events.is_empty() {
+        for chunk in events.chunks(MAX_EVENTS_PER_FRAME) {
+            if let Err(error) = state.queue_input_events(&peer_id, chunk.to_vec()).await {
+                warn!(
+                    peer_id = %peer_id,
+                    error = ?error,
+                    "failed to queue captured local input frame"
+                );
+                break;
             }
+        }
+    }
 
-            for chunk in events.chunks(MAX_EVENTS_PER_FRAME) {
-                if let Err(error) = state.queue_input_events(&peer_id, chunk.to_vec()).await {
-                    warn!(
-                        peer_id = %peer_id,
-                        error = ?error,
-                        "failed to queue captured local input frame"
-                    );
-                    break;
-                }
-            }
-        }
+    maybe_handoff_capture_target_from_motion(state, &events, &peer_id, edge_switch_state).await;
+}
+
+async fn sync_local_input_lock(
+    state: &AppState,
+    backend: &mut dyn InputCaptureBackend,
+    should_lock: bool,
+) {
+    let supported = backend.lock_supported();
+    let active = match backend.set_lock_active(should_lock) {
+        Ok(active) => active,
         Err(error) => {
-            warn!(error = ?error, "input capture poll failed");
+            warn!(error = ?error, should_lock, "failed to update local input lock state");
+            false
         }
+    };
+
+    let (last_active, last_supported) = state.input_lock_runtime().await;
+    if last_active != active {
+        let kind = if active {
+            "input_lock_engaged"
+        } else {
+            "input_lock_released"
+        };
+        let detail = if should_lock && !active {
+            "requested=true applied=false".to_string()
+        } else {
+            format!("requested={should_lock} applied={active}")
+        };
+        record_local_input_runtime_event(state, kind, &detail, "none").await;
+    }
+    if last_active != active || last_supported != supported {
+        state.set_input_lock_runtime(active, supported).await;
     }
 }
 
-async fn maybe_handoff_capture_target_from_edge(
+async fn record_local_input_runtime_event(
     state: &AppState,
-    backend: &mut dyn InputCaptureBackend,
-    current_target: Option<&str>,
+    kind: &str,
+    detail: &str,
+    peer_id: &str,
+) {
+    state
+        .record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: kind.to_string(),
+            peer_id: peer_id.to_string(),
+            detail: detail.to_string(),
+            size_bytes: 0,
+        })
+        .await;
+}
+
+fn edge_switch_direction_from_motion(
+    events: &[InputEvent],
+    state: &mut EdgeSwitchState,
+    wrap_mouse: bool,
+) -> Option<SwitchDirection> {
+    for event in events {
+        let InputEvent::MouseMove { dx, dy } = event else {
+            continue;
+        };
+
+        if *dx != 0 {
+            if state.x_pressure.signum() != dx.signum() {
+                state.x_pressure = 0;
+            }
+            state.x_pressure = state
+                .x_pressure
+                .saturating_add(*dx)
+                .clamp(-EDGE_PRESSURE_THRESHOLD * 2, EDGE_PRESSURE_THRESHOLD * 2);
+        }
+
+        if *dy != 0 {
+            if state.y_pressure.signum() != dy.signum() {
+                state.y_pressure = 0;
+            }
+            state.y_pressure = state
+                .y_pressure
+                .saturating_add(*dy)
+                .clamp(-EDGE_PRESSURE_THRESHOLD * 2, EDGE_PRESSURE_THRESHOLD * 2);
+        }
+    }
+
+    let x_abs = state.x_pressure.abs();
+    let y_abs = state.y_pressure.abs();
+
+    if x_abs >= EDGE_PRESSURE_THRESHOLD && x_abs >= y_abs {
+        return Some(if state.x_pressure < 0 {
+            SwitchDirection::Left
+        } else {
+            SwitchDirection::Right
+        });
+    }
+    if wrap_mouse && y_abs >= EDGE_PRESSURE_THRESHOLD && y_abs >= x_abs {
+        return Some(if state.y_pressure < 0 {
+            SwitchDirection::Up
+        } else {
+            SwitchDirection::Down
+        });
+    }
+
+    None
+}
+
+async fn maybe_handoff_capture_target_from_motion(
+    state: &AppState,
+    events: &[InputEvent],
+    current_target: &str,
     edge_switch_state: &mut EdgeSwitchState,
 ) {
-    let Some(current_target) = current_target else {
-        edge_switch_state.last_direction = None;
-        return;
-    };
-
-    let Some(sample) = backend.edge_switch_sample() else {
-        edge_switch_state.last_direction = None;
-        return;
-    };
-
     let (mode, wrap_mouse) = state.edge_switch_policy().await;
-    let direction = should_switch(EdgeSwitchRequest {
-        x: sample.x,
-        y: sample.y,
-        width: sample.width,
-        height: sample.height,
-        wrap_mouse,
-        mode,
-        modifier_held: sample.modifier_held,
-    });
+    if !matches!(mode, EasyMouseMode::Enable) {
+        edge_switch_state.last_direction = None;
+        edge_switch_state.x_pressure = 0;
+        edge_switch_state.y_pressure = 0;
+        return;
+    }
 
+    let direction = edge_switch_direction_from_motion(events, edge_switch_state, wrap_mouse);
     let Some(direction) = direction else {
         edge_switch_state.last_direction = None;
         return;
@@ -253,31 +360,64 @@ async fn maybe_handoff_capture_target_from_edge(
     }
     edge_switch_state.last_direction = Some(direction);
 
-    let Some(next_target) = state.capture_handoff_target_for_direction(direction).await else {
+    let Some(next_target) = state
+        .capture_handoff_target_for_direction(Some(current_target), direction)
+        .await
+    else {
         return;
     };
-    if current_target == next_target.as_str() {
-        return;
-    }
 
-    match state.set_input_capture_target(Some(&next_target)).await {
-        Ok(Some(peer_id)) => {
+    match next_target {
+        CaptureHandoffTarget::Peer(next_peer_id) => {
+            if current_target == next_peer_id {
+                return;
+            }
+            match state.set_input_capture_target(Some(&next_peer_id)).await {
+                Ok(Some(peer_id)) => {
+                    info!(
+                        direction = ?direction,
+                        previous_target = %current_target,
+                        next_target = %peer_id,
+                        "edge switch capture handoff applied"
+                    );
+                    record_local_input_runtime_event(
+                        state,
+                        "input_handoff",
+                        &format!("direction={direction:?} from={current_target} to={peer_id}"),
+                        &peer_id,
+                    )
+                    .await;
+                    edge_switch_state.x_pressure = 0;
+                    edge_switch_state.y_pressure = 0;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        direction = ?direction,
+                        previous_target = %current_target,
+                        next_target = %next_peer_id,
+                        error = ?error,
+                        "failed to apply edge switch capture handoff"
+                    );
+                }
+            }
+        }
+        CaptureHandoffTarget::Local => {
+            state.clear_input_capture_target().await;
             info!(
                 direction = ?direction,
-                previous_target = ?current_target,
-                next_target = %peer_id,
-                "edge switch capture handoff applied"
+                previous_target = %current_target,
+                "edge switch capture handoff returned to local"
             );
-        }
-        Ok(None) => {}
-        Err(error) => {
-            warn!(
-                direction = ?direction,
-                previous_target = ?current_target,
-                next_target = %next_target,
-                error = ?error,
-                "failed to apply edge switch capture handoff"
-            );
+            record_local_input_runtime_event(
+                state,
+                "input_handoff",
+                &format!("direction={direction:?} from={current_target} to=local"),
+                "none",
+            )
+            .await;
+            edge_switch_state.x_pressure = 0;
+            edge_switch_state.y_pressure = 0;
         }
     }
 }
@@ -290,7 +430,9 @@ trait InputCaptureBackend: Send {
     fn drain_release_events(&mut self) -> Vec<InputEvent>;
     fn reset(&mut self);
     fn poll_events(&mut self) -> Result<Vec<InputEvent>>;
-    fn edge_switch_sample(&mut self) -> Option<EdgeSwitchSample>;
+    fn drain_control_actions(&mut self) -> Vec<CaptureControlAction>;
+    fn set_lock_active(&mut self, active: bool) -> Result<bool>;
+    fn lock_supported(&self) -> bool;
 }
 
 fn input_backend() -> Box<dyn InputBackend> {
@@ -351,8 +493,16 @@ impl InputCaptureBackend for NoopCaptureBackend {
         Ok(Vec::new())
     }
 
-    fn edge_switch_sample(&mut self) -> Option<EdgeSwitchSample> {
-        None
+    fn drain_control_actions(&mut self) -> Vec<CaptureControlAction> {
+        Vec::new()
+    }
+
+    fn set_lock_active(&mut self, _active: bool) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn lock_supported(&self) -> bool {
+        false
     }
 }
 
@@ -471,8 +621,16 @@ impl InputCaptureBackend for WindowsPollingCaptureBackend {
         Ok(events)
     }
 
-    fn edge_switch_sample(&mut self) -> Option<EdgeSwitchSample> {
-        edge_switch_sample_from_system()
+    fn drain_control_actions(&mut self) -> Vec<CaptureControlAction> {
+        Vec::new()
+    }
+
+    fn set_lock_active(&mut self, _active: bool) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn lock_supported(&self) -> bool {
+        false
     }
 }
 
@@ -481,6 +639,7 @@ impl InputCaptureBackend for WindowsPollingCaptureBackend {
 enum HookCaptureEvent {
     MousePosition { x: i32, y: i32 },
     Input(InputEvent),
+    Control(CaptureControlAction),
 }
 
 #[cfg(windows)]
@@ -488,6 +647,8 @@ struct WindowsHookCaptureBackend {
     event_rx: mpsc::Receiver<HookCaptureEvent>,
     hook_thread_id: u32,
     hook_thread: Option<JoinHandle<()>>,
+    lock_active: bool,
+    control_actions: VecDeque<CaptureControlAction>,
     last_cursor: Option<(i32, i32)>,
     last_key_down: HashMap<u16, bool>,
     last_button_down: HashMap<u16, bool>,
@@ -544,6 +705,8 @@ impl WindowsHookCaptureBackend {
             event_rx,
             hook_thread_id,
             hook_thread: Some(hook_thread),
+            lock_active: false,
+            control_actions: VecDeque::new(),
             last_cursor: None,
             last_key_down: HashMap::new(),
             last_button_down: HashMap::new(),
@@ -583,6 +746,10 @@ impl WindowsHookCaptureBackend {
 #[cfg(windows)]
 impl Drop for WindowsHookCaptureBackend {
     fn drop(&mut self) {
+        if self.lock_active {
+            let _ = set_hook_lock_active(false);
+            self.lock_active = false;
+        }
         unsafe {
             let _ = PostThreadMessageW(self.hook_thread_id, WM_QUIT, 0, 0);
         }
@@ -632,6 +799,7 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
         self.last_cursor = None;
         self.last_key_down.clear();
         self.last_button_down.clear();
+        self.control_actions.clear();
         let _ = self.drain_pending_events();
     }
 
@@ -653,14 +821,29 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
                 HookCaptureEvent::Input(input_event) => {
                     self.update_pressed_state_and_filter(input_event, &mut output);
                 }
+                HookCaptureEvent::Control(action) => {
+                    self.control_actions.push_back(action);
+                }
             }
         }
 
         Ok(output)
     }
 
-    fn edge_switch_sample(&mut self) -> Option<EdgeSwitchSample> {
-        edge_switch_sample_from_system()
+    fn drain_control_actions(&mut self) -> Vec<CaptureControlAction> {
+        self.control_actions.drain(..).collect()
+    }
+
+    fn set_lock_active(&mut self, active: bool) -> Result<bool> {
+        if self.lock_active != active {
+            set_hook_lock_active(active)?;
+            self.lock_active = active;
+        }
+        Ok(self.lock_active)
+    }
+
+    fn lock_supported(&self) -> bool {
+        true
     }
 }
 
@@ -675,9 +858,11 @@ const VK_XBUTTON1_CODE: u16 = 0x05;
 #[cfg(windows)]
 const VK_XBUTTON2_CODE: u16 = 0x06;
 #[cfg(windows)]
-const VK_SHIFT_CODE: u16 = 0x10;
-#[cfg(windows)]
 const VK_CONTROL_CODE: u16 = 0x11;
+#[cfg(windows)]
+const VK_LCONTROL_CODE: u16 = 0xA2;
+#[cfg(windows)]
+const VK_RCONTROL_CODE: u16 = 0xA3;
 #[cfg(windows)]
 const XBUTTON1_DATA: u16 = 0x0001;
 #[cfg(windows)]
@@ -691,6 +876,17 @@ const LLMHF_INJECTED_MASK: u32 = 0x0000_0001;
 
 #[cfg(windows)]
 static HOOK_EVENT_SENDER: OnceLock<Mutex<Option<mpsc::Sender<HookCaptureEvent>>>> = OnceLock::new();
+#[cfg(windows)]
+static HOOK_RUNTIME_STATE: OnceLock<Mutex<HookRuntimeState>> = OnceLock::new();
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct HookRuntimeState {
+    lock_active: bool,
+    left_ctrl_down: bool,
+    right_ctrl_down: bool,
+    last_ctrl_tap_unix_ms: Option<u64>,
+}
 
 #[cfg(windows)]
 const CAPTURE_KEY_VIRTUAL_KEYS: &[u16] = &[
@@ -818,6 +1014,89 @@ fn send_hook_event(event: HookCaptureEvent) {
 }
 
 #[cfg(windows)]
+fn hook_runtime_state_cell() -> &'static Mutex<HookRuntimeState> {
+    HOOK_RUNTIME_STATE.get_or_init(|| Mutex::new(HookRuntimeState::default()))
+}
+
+#[cfg(windows)]
+fn set_hook_lock_active(active: bool) -> Result<()> {
+    let mut state = hook_runtime_state_cell()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("hook runtime state mutex poisoned"))?;
+    state.lock_active = active;
+    if !active {
+        state.left_ctrl_down = false;
+        state.right_ctrl_down = false;
+        state.last_ctrl_tap_unix_ms = None;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_hook_lock_active() -> bool {
+    hook_runtime_state_cell()
+        .lock()
+        .map(|state| state.lock_active)
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn update_escape_state_for_key(vk_code: u16, key_state: core_input::KeyState) -> bool {
+    if vk_code != VK_CONTROL_CODE && vk_code != VK_LCONTROL_CODE && vk_code != VK_RCONTROL_CODE {
+        return false;
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let mut state = match hook_runtime_state_cell().lock() {
+        Ok(state) => state,
+        Err(_) => return false,
+    };
+    if !state.lock_active {
+        return false;
+    }
+
+    let is_down = matches!(key_state, core_input::KeyState::Down);
+    let was_down = match vk_code {
+        VK_LCONTROL_CODE => state.left_ctrl_down,
+        VK_RCONTROL_CODE => state.right_ctrl_down,
+        _ => state.left_ctrl_down || state.right_ctrl_down,
+    };
+
+    if is_down {
+        match vk_code {
+            VK_LCONTROL_CODE => state.left_ctrl_down = true,
+            VK_RCONTROL_CODE => state.right_ctrl_down = true,
+            _ => {
+                state.left_ctrl_down = true;
+                state.right_ctrl_down = true;
+            }
+        }
+
+        if !was_down {
+            let triggered = state.last_ctrl_tap_unix_ms.is_some_and(|previous| {
+                now_ms.saturating_sub(previous) <= ESCAPE_DOUBLE_CTRL_WINDOW_MS
+            });
+            state.last_ctrl_tap_unix_ms = Some(now_ms);
+            return triggered;
+        }
+    } else {
+        match vk_code {
+            VK_LCONTROL_CODE => state.left_ctrl_down = false,
+            VK_RCONTROL_CODE => state.right_ctrl_down = false,
+            _ => {
+                state.left_ctrl_down = false;
+                state.right_ctrl_down = false;
+            }
+        }
+    }
+
+    false
+}
+
+#[cfg(windows)]
 unsafe fn install_keyboard_hook() -> Result<HHOOK> {
     let module = unsafe { GetModuleHandleW(std::ptr::null()) };
     let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), module, 0) };
@@ -854,9 +1133,11 @@ unsafe fn run_hook_message_loop() {
 
 #[cfg(windows)]
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let mut lock_active = false;
     if code == HC_ACTION as i32 {
         let keyboard = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
         if (keyboard.flags & LLKHF_INJECTED_MASK) == 0 {
+            lock_active = is_hook_lock_active();
             let state = match wparam as u32 {
                 WM_KEYDOWN | WM_SYSKEYDOWN => Some(core_input::KeyState::Down),
                 WM_KEYUP | WM_SYSKEYUP => Some(core_input::KeyState::Up),
@@ -872,8 +1153,18 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     scan_code,
                     state,
                 }));
+
+                if lock_active && update_escape_state_for_key(keyboard.vkCode as u16, state) {
+                    send_hook_event(HookCaptureEvent::Control(
+                        CaptureControlAction::EscapeUnlock,
+                    ));
+                }
             }
         }
+    }
+
+    if lock_active {
+        return 1;
     }
 
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
@@ -881,9 +1172,11 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
 
 #[cfg(windows)]
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let mut lock_active = false;
     if code == HC_ACTION as i32 {
         let mouse = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
         if (mouse.flags & LLMHF_INJECTED_MASK) == 0 {
+            lock_active = is_hook_lock_active();
             match wparam as u32 {
                 WM_MOUSEMOVE => {
                     send_hook_event(HookCaptureEvent::MousePosition {
@@ -953,6 +1246,10 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         }
     }
 
+    if lock_active {
+        return 1;
+    }
+
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
 
@@ -974,27 +1271,6 @@ fn cursor_position() -> Result<Option<(i32, i32)>> {
         return Ok(None);
     }
     Ok(Some((point.x, point.y)))
-}
-
-#[cfg(windows)]
-fn edge_switch_sample_from_system() -> Option<EdgeSwitchSample> {
-    let (cursor_x, cursor_y) = cursor_position().ok().flatten()?;
-
-    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-    if width <= 0 || height <= 0 {
-        return None;
-    }
-
-    Some(EdgeSwitchSample {
-        x: cursor_x - left,
-        y: cursor_y - top,
-        width,
-        height,
-        modifier_held: is_virtual_key_down(VK_CONTROL_CODE) || is_virtual_key_down(VK_SHIFT_CODE),
-    })
 }
 
 #[cfg(windows)]
@@ -1206,7 +1482,10 @@ mod tests {
     struct ScriptedCaptureBackend {
         batches: VecDeque<Vec<InputEvent>>,
         release_events: Vec<InputEvent>,
-        edge_samples: VecDeque<Option<EdgeSwitchSample>>,
+        control_actions: VecDeque<CaptureControlAction>,
+        lock_supported: bool,
+        lock_active: bool,
+        lock_updates: Vec<bool>,
         reset_count: usize,
         poll_count: usize,
     }
@@ -1216,14 +1495,17 @@ mod tests {
             Self {
                 batches: VecDeque::from(batches),
                 release_events,
-                edge_samples: VecDeque::new(),
+                control_actions: VecDeque::new(),
+                lock_supported: true,
+                lock_active: false,
+                lock_updates: Vec::new(),
                 reset_count: 0,
                 poll_count: 0,
             }
         }
 
-        fn with_edge_samples(mut self, samples: Vec<Option<EdgeSwitchSample>>) -> Self {
-            self.edge_samples = VecDeque::from(samples);
+        fn with_control_actions(mut self, actions: Vec<CaptureControlAction>) -> Self {
+            self.control_actions = VecDeque::from(actions);
             self
         }
     }
@@ -1242,8 +1524,23 @@ mod tests {
             Ok(self.batches.pop_front().unwrap_or_default())
         }
 
-        fn edge_switch_sample(&mut self) -> Option<EdgeSwitchSample> {
-            self.edge_samples.pop_front().flatten()
+        fn drain_control_actions(&mut self) -> Vec<CaptureControlAction> {
+            self.control_actions.drain(..).collect()
+        }
+
+        fn set_lock_active(&mut self, active: bool) -> Result<bool> {
+            self.lock_updates.push(active);
+            if self.lock_supported {
+                self.lock_active = active;
+                Ok(active)
+            } else {
+                self.lock_active = false;
+                Ok(false)
+            }
+        }
+
+        fn lock_supported(&self) -> bool {
+            self.lock_supported
         }
     }
 
@@ -1576,7 +1873,7 @@ mod tests {
             .await
             .expect("connect right");
         state
-            .set_layout("peer,self,right".to_string())
+            .set_layout("peer,right,self".to_string())
             .await
             .expect("set layout");
         state
@@ -1585,25 +1882,29 @@ mod tests {
             .expect("set initial target");
 
         let mut backend = ScriptedCaptureBackend::new(
-            vec![Vec::new(), Vec::new()],
+            vec![
+                Vec::new(),
+                vec![InputEvent::MouseMove {
+                    dx: EDGE_PRESSURE_THRESHOLD,
+                    dy: 0,
+                }],
+                Vec::new(),
+            ],
             vec![InputEvent::Key {
                 scan_code: 30,
                 state: KeyState::Up,
             }],
-        )
-        .with_edge_samples(vec![
-            None,
-            Some(EdgeSwitchSample {
-                x: 1919,
-                y: 50,
-                width: 1920,
-                height: 1080,
-                modifier_held: false,
-            }),
-        ]);
+        );
         let mut last_target = None;
         let mut edge_switch_state = EdgeSwitchState::default();
 
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
         capture_and_queue_outgoing_frames(
             &state,
             &mut backend,
@@ -1625,10 +1926,10 @@ mod tests {
             "right-edge switch should hand off capture target to right layout neighbor"
         );
         let left_outgoing = state.drain_outgoing(&left_peer).await;
-        assert_eq!(left_outgoing.len(), 1);
+        assert_eq!(left_outgoing.len(), 2);
         assert!(matches!(
-            left_outgoing.first(),
-            Some(crate::state::OutboundPayload::InputFrame { sequence: 1, events, .. }) if matches!(
+            left_outgoing.get(1),
+            Some(crate::state::OutboundPayload::InputFrame { sequence: 2, events, .. }) if matches!(
                 events.as_slice(),
                 [InputEvent::Key { scan_code: 30, state: KeyState::Up }]
             )
@@ -1671,17 +1972,16 @@ mod tests {
             .await
             .expect("disable easy mouse");
 
-        let mut backend = ScriptedCaptureBackend::new(vec![Vec::new(), Vec::new()], Vec::new())
-            .with_edge_samples(vec![
-                None,
-                Some(EdgeSwitchSample {
-                    x: 1919,
-                    y: 50,
-                    width: 1920,
-                    height: 1080,
-                    modifier_held: false,
-                }),
-            ]);
+        let mut backend = ScriptedCaptureBackend::new(
+            vec![
+                Vec::new(),
+                vec![InputEvent::MouseMove {
+                    dx: EDGE_PRESSURE_THRESHOLD,
+                    dy: 0,
+                }],
+            ],
+            Vec::new(),
+        );
         let mut last_target = None;
         let mut edge_switch_state = EdgeSwitchState::default();
 
@@ -1736,14 +2036,13 @@ mod tests {
             .expect("set layout");
         state.clear_input_capture_target().await;
 
-        let mut backend = ScriptedCaptureBackend::new(vec![Vec::new()], Vec::new())
-            .with_edge_samples(vec![Some(EdgeSwitchSample {
-                x: 1919,
-                y: 50,
-                width: 1920,
-                height: 1080,
-                modifier_held: false,
-            })]);
+        let mut backend = ScriptedCaptureBackend::new(
+            vec![vec![InputEvent::MouseMove {
+                dx: EDGE_PRESSURE_THRESHOLD,
+                dy: 0,
+            }]],
+            Vec::new(),
+        );
         let mut last_target = None;
         let mut edge_switch_state = EdgeSwitchState::default();
 
@@ -1759,6 +2058,41 @@ mod tests {
             state.input_capture_target().await.is_none(),
             "edge handoff must not implicitly start capture when no target is active"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn capture_escape_action_clears_target_and_unlocks() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set target");
+
+        let mut backend = ScriptedCaptureBackend::new(vec![Vec::new()], Vec::new())
+            .with_control_actions(vec![CaptureControlAction::EscapeUnlock]);
+        let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
+
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+
+        assert!(
+            state.input_capture_target().await.is_none(),
+            "escape control action should clear capture target"
+        );
+        let (locked, _) = state.input_lock_runtime().await;
+        assert!(!locked, "escape control action should release lock");
 
         let _ = std::fs::remove_dir_all(root);
     }

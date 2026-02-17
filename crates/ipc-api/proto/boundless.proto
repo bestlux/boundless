@@ -14,6 +14,9 @@ message StatusReply {
   string api_bind = 6;
   string api_transport = 7;
   string api_pipe_name = 8;
+  bool input_locked = 9;
+  bool input_lock_supported = 10;
+  string capture_target_peer_id = 11;
 }
 
 message PairCreateCodeRequest {
