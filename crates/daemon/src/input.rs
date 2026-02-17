@@ -33,8 +33,8 @@ use windows_sys::Win32::{
             SendInput,
         },
         Input::{
-            GetRawInputData, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK,
-            RIM_TYPEMOUSE, RegisterRawInputDevices,
+            GetRawInputData, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
+            RAWMOUSE, RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
         },
         WindowsAndMessaging::{
             CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetCursorPos,
@@ -862,6 +862,29 @@ impl WindowsHookCaptureBackend {
         }
     }
 
+    fn accumulate_pending_move(pending_move: &mut Option<(i32, i32)>, dx: i32, dy: i32) {
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        match pending_move {
+            Some((pending_dx, pending_dy)) => {
+                *pending_dx = pending_dx.saturating_add(dx);
+                *pending_dy = pending_dy.saturating_add(dy);
+            }
+            None => *pending_move = Some((dx, dy)),
+        }
+    }
+
+    fn flush_pending_move(output: &mut Vec<InputEvent>, pending_move: &mut Option<(i32, i32)>) {
+        let Some((dx, dy)) = pending_move.take() else {
+            return;
+        };
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        output.push(InputEvent::MouseMove { dx, dy });
+    }
+
     fn update_raw_input_runtime_state(&mut self) {
         if !self.raw_input_enabled {
             return;
@@ -959,31 +982,27 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
         self.update_raw_input_runtime_state();
 
         let mut output = Vec::new();
-        let mut fallback_mouse_moves = Vec::new();
-        let mut raw_dx = 0i32;
-        let mut raw_dy = 0i32;
-        let mut saw_raw_delta = false;
+        let mut pending_move: Option<(i32, i32)> = None;
 
         for event in self.drain_pending_events() {
             match event {
                 HookCaptureEvent::MouseDelta { dx, dy } => {
                     if self.raw_input_enabled {
-                        raw_dx = raw_dx.saturating_add(dx);
-                        raw_dy = raw_dy.saturating_add(dy);
-                        saw_raw_delta = true;
+                        Self::accumulate_pending_move(&mut pending_move, dx, dy);
                     }
                 }
                 HookCaptureEvent::MousePosition { x, y } => {
                     if let Some((last_x, last_y)) = self.last_cursor {
                         let dx = x - last_x;
                         let dy = y - last_y;
-                        if dx != 0 || dy != 0 {
-                            fallback_mouse_moves.push(InputEvent::MouseMove { dx, dy });
+                        if !self.raw_input_enabled {
+                            Self::accumulate_pending_move(&mut pending_move, dx, dy);
                         }
                     }
                     self.last_cursor = Some((x, y));
                 }
                 HookCaptureEvent::Input(input_event) => {
+                    Self::flush_pending_move(&mut output, &mut pending_move);
                     self.update_pressed_state_and_filter(input_event, &mut output);
                 }
                 HookCaptureEvent::Control(action) => {
@@ -992,16 +1011,7 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
             }
         }
 
-        if self.raw_input_enabled && saw_raw_delta {
-            if raw_dx != 0 || raw_dy != 0 {
-                output.push(InputEvent::MouseMove {
-                    dx: raw_dx,
-                    dy: raw_dy,
-                });
-            }
-        } else if !fallback_mouse_moves.is_empty() {
-            output.extend(fallback_mouse_moves);
-        }
+        Self::flush_pending_move(&mut output, &mut pending_move);
 
         Ok(output)
     }
@@ -1447,14 +1457,22 @@ fn process_raw_input_message(lparam: LPARAM) -> Result<()> {
     }
 
     let mouse = unsafe { raw.data.mouse };
-    if mouse.lLastX != 0 || mouse.lLastY != 0 {
-        send_hook_event(HookCaptureEvent::MouseDelta {
-            dx: mouse.lLastX,
-            dy: mouse.lLastY,
-        });
+    if let Some((dx, dy)) = raw_mouse_relative_delta(&mouse) {
+        send_hook_event(HookCaptureEvent::MouseDelta { dx, dy });
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn raw_mouse_relative_delta(mouse: &RAWMOUSE) -> Option<(i32, i32)> {
+    if (mouse.usFlags & MOUSE_MOVE_ABSOLUTE) != 0 {
+        return None;
+    }
+    if mouse.lLastX == 0 && mouse.lLastY == 0 {
+        return None;
+    }
+    Some((mouse.lLastX, mouse.lLastY))
 }
 
 #[cfg(windows)]
@@ -2624,5 +2642,64 @@ mod tests {
 
         assert_eq!(call_count, 2, "must not replay successfully sent prefix");
         assert!(err.to_string().contains("index 1"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hook_backend_flushes_mouse_move_before_button_event() {
+        let (tx, rx) = mpsc::channel();
+        let mut backend = WindowsHookCaptureBackend {
+            event_rx: rx,
+            hook_thread_id: 0,
+            hook_thread: None,
+            raw_input_thread_id: None,
+            raw_input_thread: None,
+            raw_input_enabled: true,
+            lock_active: false,
+            control_actions: VecDeque::new(),
+            last_cursor: None,
+            last_key_down: HashMap::new(),
+            last_button_down: HashMap::new(),
+        };
+
+        tx.send(HookCaptureEvent::MouseDelta { dx: 9, dy: -4 })
+            .expect("send mouse delta");
+        tx.send(HookCaptureEvent::Input(InputEvent::MouseButton {
+            button: core_input::MouseButton::Left,
+            state: KeyState::Down,
+        }))
+        .expect("send mouse button");
+
+        let events = backend.poll_events().expect("poll");
+        assert!(matches!(
+            events.as_slice(),
+            [
+                InputEvent::MouseMove { dx, dy },
+                InputEvent::MouseButton {
+                    button: core_input::MouseButton::Left,
+                    state: KeyState::Down
+                }
+            ] if *dx == 9 && *dy == -4
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_mouse_relative_delta_ignores_absolute_packets() {
+        let relative = RAWMOUSE {
+            usFlags: 0,
+            lLastX: 12,
+            lLastY: -7,
+            ..Default::default()
+        };
+        assert_eq!(raw_mouse_relative_delta(&relative), Some((12, -7)));
+
+        let absolute = RAWMOUSE {
+            usFlags: MOUSE_MOVE_ABSOLUTE,
+            lLastX: 1200,
+            lLastY: 800,
+            ..Default::default()
+        };
+        assert_eq!(raw_mouse_relative_delta(&absolute), None);
     }
 }
