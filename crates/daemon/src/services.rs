@@ -519,9 +519,10 @@ impl DiagnosticsService for DiagnosticsApi {
             .discovered_endpoints()
             .await
             .into_iter()
-            .map(|(machine_id, endpoint)| DiscoveredPeerInfo {
+            .map(|(machine_id, record)| DiscoveredPeerInfo {
                 machine_id,
-                endpoint: endpoint.to_string(),
+                display_name: record.display_name,
+                endpoint: record.endpoint.to_string(),
             })
             .collect();
 

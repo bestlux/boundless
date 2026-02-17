@@ -163,7 +163,8 @@ message TransportEventsReply {
 
 message DiscoveredPeerInfo {
   string machine_id = 1;
-  string endpoint = 2;
+  string display_name = 2;
+  string endpoint = 3;
 }
 
 message DiscoveryPeersReply {
