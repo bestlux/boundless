@@ -44,6 +44,7 @@ async fn run(state: AppState) -> Result<()> {
         service_type = MDNS_SERVICE_TYPE,
         "mDNS discovery started"
     );
+    state.set_mdns_active(true).await;
 
     let mut fullname_to_machine_id: HashMap<String, String> = HashMap::new();
 
@@ -106,6 +107,7 @@ async fn run(state: AppState) -> Result<()> {
     }
 
     let _ = mdns.shutdown();
+    state.set_mdns_active(false).await;
     Ok(())
 }
 

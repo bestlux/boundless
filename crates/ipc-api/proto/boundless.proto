@@ -161,6 +161,16 @@ message TransportEventsReply {
   repeated TransportEvent events = 1;
 }
 
+message DiscoveredPeerInfo {
+  string machine_id = 1;
+  string endpoint = 2;
+}
+
+message DiscoveryPeersReply {
+  bool mdns_active = 1;
+  repeated DiscoveredPeerInfo peers = 2;
+}
+
 message InputOwnerRequest {
   string peer_id = 1;
   bool force = 2;
@@ -219,6 +229,7 @@ service DiagnosticsService {
   rpc SendInputMove(SendInputMoveRequest) returns (OperationReply);
   rpc SendInputKey(SendInputKeyRequest) returns (OperationReply);
   rpc ListTransportEvents(Empty) returns (TransportEventsReply);
+  rpc ListDiscoveryPeers(Empty) returns (DiscoveryPeersReply);
   rpc GetInputOwner(Empty) returns (InputOwnerReply);
   rpc ClaimInputOwner(InputOwnerRequest) returns (InputOwnerReply);
   rpc ReleaseInputOwner(InputOwnerRequest) returns (InputOwnerReply);
