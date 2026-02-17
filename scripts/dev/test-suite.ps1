@@ -19,24 +19,27 @@ Set-Location $repoRoot
 function Invoke-CheckedCommand {
     param(
         [string]$Label,
-        [scriptblock]$Action
+        [scriptblock]$Action,
+        [switch]$CheckLastExitCode
     )
 
     Write-Host "[test-suite] $Label"
+    $global:LASTEXITCODE = 0
     & $Action
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Label failed with exit code $LASTEXITCODE"
+    $exitCode = $global:LASTEXITCODE
+    if ($CheckLastExitCode -and $exitCode -ne 0) {
+        throw "$Label failed with exit code $exitCode"
     }
 }
 
 function Run-WorkspaceQualityChecks {
-    Invoke-CheckedCommand -Label "cargo fmt --all -- --check" -Action {
+    Invoke-CheckedCommand -Label "cargo fmt --all -- --check" -CheckLastExitCode -Action {
         cargo fmt --all -- --check | Out-Host
     }
-    Invoke-CheckedCommand -Label "cargo test --workspace" -Action {
+    Invoke-CheckedCommand -Label "cargo test --workspace" -CheckLastExitCode -Action {
         cargo test --workspace | Out-Host
     }
-    Invoke-CheckedCommand -Label "cargo clippy --workspace --all-targets -- -D warnings" -Action {
+    Invoke-CheckedCommand -Label "cargo clippy --workspace --all-targets -- -D warnings" -CheckLastExitCode -Action {
         cargo clippy --workspace --all-targets -- -D warnings | Out-Host
     }
 }
