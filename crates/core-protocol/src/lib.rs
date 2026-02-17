@@ -7,12 +7,17 @@ use thiserror::Error;
 pub const PROTOCOL_NAME: &str = "boundless";
 pub const PROTOCOL_CURRENT: ProtocolVersion = ProtocolVersion {
     major: 1,
-    minor: 1,
+    minor: 2,
     patch: 0,
 };
 pub const PROTOCOL_CLIPBOARD_IMAGE_MIN: ProtocolVersion = ProtocolVersion {
     major: 1,
     minor: 1,
+    patch: 0,
+};
+pub const PROTOCOL_INPUT_ANCHOR_MIN: ProtocolVersion = ProtocolVersion {
+    major: 1,
+    minor: 2,
     patch: 0,
 };
 
@@ -198,6 +203,10 @@ pub enum WireInputEvent {
     MouseMove {
         dx: i32,
         dy: i32,
+    },
+    MouseMoveAbsolute {
+        x_norm: u16,
+        y_norm: u16,
     },
     MouseButton {
         button: WireMouseButton,
