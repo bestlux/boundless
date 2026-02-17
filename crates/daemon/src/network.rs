@@ -989,12 +989,7 @@ where
             .await?;
 
             state
-                .record_outgoing_input_frame(
-                    peer_id,
-                    *sequence,
-                    events.len(),
-                    *timestamp_unix_ms,
-                )
+                .record_outgoing_input_frame(peer_id, *sequence, events.len(), *timestamp_unix_ms)
                 .await;
         }
     }

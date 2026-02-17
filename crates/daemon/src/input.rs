@@ -390,10 +390,15 @@ fn edge_switch_direction_from_motion(
     }
     state.suppress_until_unix_ms = None;
 
+    let mut batch_dx: i32 = 0;
+    let mut batch_dy: i32 = 0;
     for event in events {
         let InputEvent::MouseMove { dx, dy } = event else {
             continue;
         };
+
+        batch_dx = batch_dx.saturating_add(*dx);
+        batch_dy = batch_dy.saturating_add(*dy);
 
         if *dx != 0 {
             if state.x_pressure.signum() != dx.signum() {
@@ -414,6 +419,14 @@ fn edge_switch_direction_from_motion(
                 .saturating_add(*dy)
                 .clamp(-EDGE_PRESSURE_THRESHOLD * 2, EDGE_PRESSURE_THRESHOLD * 2);
         }
+    }
+
+    if current_target.is_none() {
+        let direction = batch_direction(batch_dx, batch_dy, wrap_mouse)?;
+        if !is_local_handoff_edge(direction, cursor_position, screen_bounds) {
+            return None;
+        }
+        return Some(direction);
     }
 
     let x_abs = state.x_pressure.abs();
@@ -443,6 +456,32 @@ fn edge_switch_direction_from_motion(
     }
 
     Some(direction)
+}
+
+fn batch_direction(dx: i32, dy: i32, wrap_mouse: bool) -> Option<SwitchDirection> {
+    let x_abs = dx.abs();
+    let y_abs = dy.abs();
+    if x_abs == 0 && y_abs == 0 {
+        return None;
+    }
+
+    if x_abs >= y_abs {
+        return Some(if dx < 0 {
+            SwitchDirection::Left
+        } else {
+            SwitchDirection::Right
+        });
+    }
+
+    if wrap_mouse {
+        return Some(if dy < 0 {
+            SwitchDirection::Up
+        } else {
+            SwitchDirection::Down
+        });
+    }
+
+    None
 }
 
 fn unix_now_ms() -> u64 {
@@ -594,10 +633,16 @@ fn handoff_anchor_event(
     screen_bounds: Option<VirtualScreenBounds>,
 ) -> InputEvent {
     let center = u16::MAX / 2;
-    let x_axis = normalize_cursor_axis(cursor_position.map(|(x, _)| x), screen_bounds.map(|b| (b.left, b.right)))
-        .unwrap_or(center);
-    let y_axis = normalize_cursor_axis(cursor_position.map(|(_, y)| y), screen_bounds.map(|b| (b.top, b.bottom)))
-        .unwrap_or(center);
+    let x_axis = normalize_cursor_axis(
+        cursor_position.map(|(x, _)| x),
+        screen_bounds.map(|b| (b.left, b.right)),
+    )
+    .unwrap_or(center);
+    let y_axis = normalize_cursor_axis(
+        cursor_position.map(|(_, y)| y),
+        screen_bounds.map(|b| (b.top, b.bottom)),
+    )
+    .unwrap_or(center);
 
     let (x_norm, y_norm) = match direction {
         SwitchDirection::Left => (u16::MAX, y_axis),
@@ -2670,6 +2715,32 @@ mod tests {
             direction,
             Some(SwitchDirection::Right),
             "local capture start should trigger when pressure points into a configured edge"
+        );
+    }
+
+    #[test]
+    fn local_edge_handoff_accepts_small_push_at_boundary() {
+        let mut edge_switch_state = EdgeSwitchState::default();
+        let events = vec![InputEvent::MouseMove { dx: 5, dy: 0 }];
+        let bounds = VirtualScreenBounds {
+            left: 0,
+            top: 0,
+            right: 1919,
+            bottom: 1079,
+        };
+
+        let direction = edge_switch_direction_from_motion(
+            &events,
+            &mut edge_switch_state,
+            false,
+            None,
+            Some((1919, 540)),
+            Some(bounds),
+        );
+        assert_eq!(
+            direction,
+            Some(SwitchDirection::Right),
+            "local capture start should work with a small push once cursor is at the edge"
         );
     }
 
