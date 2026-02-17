@@ -46,6 +46,7 @@ use windows_sys::Win32::{
 const INPUT_TICK: Duration = Duration::from_millis(5);
 const INPUT_CAPTURE_TICK: Duration = Duration::from_millis(8);
 const EDGE_PRESSURE_THRESHOLD: i32 = 300;
+const ESCAPE_EDGE_RECAPTURE_SUPPRESS_MS: u64 = 600;
 #[cfg(windows)]
 const ESCAPE_DOUBLE_CTRL_WINDOW_MS: u64 = 400;
 
@@ -59,6 +60,7 @@ struct EdgeSwitchState {
     last_direction: Option<SwitchDirection>,
     x_pressure: i32,
     y_pressure: i32,
+    suppress_until_unix_ms: Option<u64>,
 }
 
 pub fn start(state: AppState) {
@@ -190,6 +192,7 @@ async fn capture_and_queue_outgoing_frames(
         }
     };
 
+    let mut escape_triggered = false;
     for action in backend.drain_control_actions() {
         if !matches!(action, CaptureControlAction::EscapeUnlock) {
             continue;
@@ -207,32 +210,57 @@ async fn capture_and_queue_outgoing_frames(
             edge_switch_state.last_direction = None;
             edge_switch_state.x_pressure = 0;
             edge_switch_state.y_pressure = 0;
+            edge_switch_state.suppress_until_unix_ms =
+                Some(unix_now_ms().saturating_add(ESCAPE_EDGE_RECAPTURE_SUPPRESS_MS));
             capture_target = None;
             sync_local_input_lock(state, backend, false).await;
+            escape_triggered = true;
         }
     }
 
-    maybe_handoff_capture_target_from_motion(
-        state,
-        &events,
-        capture_target.as_deref(),
-        edge_switch_state,
-    )
-    .await;
-    capture_target = state.active_input_capture_target().await;
-    sync_local_input_lock(state, backend, capture_target.is_some()).await;
+    let pre_handoff_target = capture_target;
+    if let Some(peer_id) = pre_handoff_target.as_deref()
+        && !events.is_empty()
+    {
+        for chunk in events.chunks(MAX_EVENTS_PER_FRAME) {
+            if let Err(error) = state.queue_input_events(peer_id, chunk.to_vec()).await {
+                warn!(
+                    peer_id = %peer_id,
+                    error = ?error,
+                    "failed to queue captured local input frame"
+                );
+                break;
+            }
+        }
+    }
 
-    let Some(peer_id) = capture_target else {
+    if !escape_triggered {
+        maybe_handoff_capture_target_from_motion(
+            state,
+            &events,
+            pre_handoff_target.as_deref(),
+            edge_switch_state,
+        )
+        .await;
+    }
+
+    let post_handoff_target = state.active_input_capture_target().await;
+    sync_local_input_lock(state, backend, post_handoff_target.is_some()).await;
+
+    let (Some(peer_id), None) = (
+        post_handoff_target.as_deref(),
+        pre_handoff_target.as_deref(),
+    ) else {
         return;
     };
 
     if !events.is_empty() {
         for chunk in events.chunks(MAX_EVENTS_PER_FRAME) {
-            if let Err(error) = state.queue_input_events(&peer_id, chunk.to_vec()).await {
+            if let Err(error) = state.queue_input_events(peer_id, chunk.to_vec()).await {
                 warn!(
                     peer_id = %peer_id,
                     error = ?error,
-                    "failed to queue captured local input frame"
+                    "failed to queue captured local input frame after local edge-start handoff"
                 );
                 break;
             }
@@ -296,6 +324,18 @@ fn edge_switch_direction_from_motion(
     state: &mut EdgeSwitchState,
     wrap_mouse: bool,
 ) -> Option<SwitchDirection> {
+    let now_ms = unix_now_ms();
+    if state
+        .suppress_until_unix_ms
+        .is_some_and(|until| now_ms < until)
+    {
+        state.last_direction = None;
+        state.x_pressure = 0;
+        state.y_pressure = 0;
+        return None;
+    }
+    state.suppress_until_unix_ms = None;
+
     for event in events {
         let InputEvent::MouseMove { dx, dy } = event else {
             continue;
@@ -341,6 +381,13 @@ fn edge_switch_direction_from_motion(
     }
 
     None
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 async fn maybe_handoff_capture_target_from_motion(
@@ -1261,6 +1308,9 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     }
 
     if lock_active {
+        if (wparam as u32) == WM_MOUSEMOVE {
+            return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+        }
         return 1;
     }
 
@@ -1940,23 +1990,26 @@ mod tests {
             "right-edge switch should hand off capture target to right layout neighbor"
         );
         let left_outgoing = state.drain_outgoing(&left_peer).await;
-        assert_eq!(left_outgoing.len(), 1);
+        assert_eq!(left_outgoing.len(), 2);
         assert!(matches!(
             left_outgoing.first(),
-            Some(crate::state::OutboundPayload::InputFrame { sequence: 1, events, .. }) if matches!(
-                events.as_slice(),
-                [InputEvent::Key { scan_code: 30, state: KeyState::Up }]
-            )
-        ));
-        let right_outgoing = state.drain_outgoing(&right_peer).await;
-        assert_eq!(right_outgoing.len(), 1);
-        assert!(matches!(
-            right_outgoing.first(),
             Some(crate::state::OutboundPayload::InputFrame { sequence: 1, events, .. }) if matches!(
                 events.as_slice(),
                 [InputEvent::MouseMove { dx, dy }] if *dx == EDGE_PRESSURE_THRESHOLD && *dy == 0
             )
         ));
+        assert!(matches!(
+            left_outgoing.get(1),
+            Some(crate::state::OutboundPayload::InputFrame { sequence: 2, events, .. }) if matches!(
+                events.as_slice(),
+                [InputEvent::Key { scan_code: 30, state: KeyState::Up }]
+            )
+        ));
+        let right_outgoing = state.drain_outgoing(&right_peer).await;
+        assert!(
+            right_outgoing.is_empty(),
+            "trigger frame should remain on previous target; new target gets subsequent frames"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2117,6 +2170,51 @@ mod tests {
         );
         let (locked, _) = state.input_lock_runtime().await;
         assert!(!locked, "escape control action should release lock");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn escape_unlock_suppresses_immediate_edge_recapture() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        state
+            .set_layout("self,peer".to_string())
+            .await
+            .expect("set layout");
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set target");
+
+        let mut backend = ScriptedCaptureBackend::new(
+            vec![vec![InputEvent::MouseMove {
+                dx: EDGE_PRESSURE_THRESHOLD,
+                dy: 0,
+            }]],
+            Vec::new(),
+        )
+        .with_control_actions(vec![CaptureControlAction::EscapeUnlock]);
+        let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
+
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+
+        assert!(
+            state.input_capture_target().await.is_none(),
+            "escape should not be immediately undone by same-tick edge movement"
+        );
+        let (locked, _) = state.input_lock_runtime().await;
+        assert!(!locked, "escape should leave lock disengaged");
 
         let _ = std::fs::remove_dir_all(root);
     }
