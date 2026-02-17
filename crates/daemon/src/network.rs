@@ -25,8 +25,9 @@ use tracing::{error, info, warn};
 
 use core_input::{InputEvent, InputFrame, KeyState, MouseButton};
 use core_protocol::{
-    PROTOCOL_CLIPBOARD_IMAGE_MIN, PROTOCOL_CURRENT, ProtocolVersion, WireInputEvent, WireKeyState,
-    WireMessage, WireMouseButton, decode_bytes_b64, decode_line, encode_bytes_b64, encode_line,
+    PROTOCOL_CLIPBOARD_IMAGE_MIN, PROTOCOL_CURRENT, PROTOCOL_INPUT_ANCHOR_MIN, ProtocolVersion,
+    WireInputEvent, WireKeyState, WireMessage, WireMouseButton, decode_bytes_b64, decode_line,
+    encode_bytes_b64, encode_line,
 };
 use core_transfer::validate_transfer_size;
 
@@ -964,19 +965,36 @@ where
             timestamp_unix_ms,
             events,
         } => {
+            let wire_events = input_events_to_wire_for_protocol(events, remote_protocol);
+            if wire_events.is_empty() {
+                warn!(
+                    peer_id = %peer_id,
+                    sequence = *sequence,
+                    remote_protocol = %remote_protocol,
+                    required_protocol = %PROTOCOL_INPUT_ANCHOR_MIN,
+                    "dropping input frame with unsupported events for negotiated protocol"
+                );
+                return Ok(());
+            }
+
             send_message(
                 writer,
                 &WireMessage::InputFrame {
                     machine_id: local_machine_id.to_string(),
                     sequence: *sequence,
                     timestamp_unix_ms: *timestamp_unix_ms,
-                    events: events.iter().map(input_event_to_wire).collect(),
+                    events: wire_events,
                 },
             )
             .await?;
 
             state
-                .record_outgoing_input_frame(peer_id, *sequence, events.len(), *timestamp_unix_ms)
+                .record_outgoing_input_frame(
+                    peer_id,
+                    *sequence,
+                    events.len(),
+                    *timestamp_unix_ms,
+                )
                 .await;
         }
     }
@@ -988,9 +1006,34 @@ fn protocol_supports_clipboard_image(protocol: ProtocolVersion) -> bool {
     protocol.as_tuple() >= PROTOCOL_CLIPBOARD_IMAGE_MIN.as_tuple()
 }
 
+fn protocol_supports_input_anchor(protocol: ProtocolVersion) -> bool {
+    protocol.as_tuple() >= PROTOCOL_INPUT_ANCHOR_MIN.as_tuple()
+}
+
+fn input_events_to_wire_for_protocol(
+    events: &[InputEvent],
+    remote_protocol: ProtocolVersion,
+) -> Vec<WireInputEvent> {
+    events
+        .iter()
+        .filter_map(|event| {
+            if matches!(event, InputEvent::MouseMoveAbsolute { .. })
+                && !protocol_supports_input_anchor(remote_protocol)
+            {
+                return None;
+            }
+            Some(input_event_to_wire(event))
+        })
+        .collect()
+}
+
 fn input_event_to_wire(event: &InputEvent) -> WireInputEvent {
     match event {
         InputEvent::MouseMove { dx, dy } => WireInputEvent::MouseMove { dx: *dx, dy: *dy },
+        InputEvent::MouseMoveAbsolute { x_norm, y_norm } => WireInputEvent::MouseMoveAbsolute {
+            x_norm: *x_norm,
+            y_norm: *y_norm,
+        },
         InputEvent::MouseButton { button, state } => WireInputEvent::MouseButton {
             button: match button {
                 MouseButton::Left => WireMouseButton::Left,
@@ -1021,6 +1064,9 @@ fn input_event_to_wire(event: &InputEvent) -> WireInputEvent {
 fn input_event_from_wire(event: WireInputEvent) -> InputEvent {
     match event {
         WireInputEvent::MouseMove { dx, dy } => InputEvent::MouseMove { dx, dy },
+        WireInputEvent::MouseMoveAbsolute { x_norm, y_norm } => {
+            InputEvent::MouseMoveAbsolute { x_norm, y_norm }
+        }
         WireInputEvent::MouseButton { button, state } => InputEvent::MouseButton {
             button: match button {
                 WireMouseButton::Left => MouseButton::Left,
@@ -1375,6 +1421,67 @@ mod tests {
             minor: 1,
             patch: 0,
         }));
+    }
+
+    #[test]
+    fn input_anchor_support_requires_protocol_1_2_or_newer() {
+        assert!(!protocol_supports_input_anchor(ProtocolVersion {
+            major: 1,
+            minor: 1,
+            patch: 9,
+        }));
+        assert!(protocol_supports_input_anchor(ProtocolVersion {
+            major: 1,
+            minor: 2,
+            patch: 0,
+        }));
+    }
+
+    #[test]
+    fn input_wire_filter_drops_absolute_move_for_legacy_peer() {
+        let events = vec![
+            InputEvent::MouseMoveAbsolute {
+                x_norm: 10,
+                y_norm: 20,
+            },
+            InputEvent::MouseMove { dx: 3, dy: -4 },
+        ];
+        let wire = input_events_to_wire_for_protocol(
+            &events,
+            ProtocolVersion {
+                major: 1,
+                minor: 1,
+                patch: 0,
+            },
+        );
+
+        assert_eq!(wire.len(), 1);
+        assert!(matches!(
+            wire.first(),
+            Some(WireInputEvent::MouseMove { dx, dy }) if *dx == 3 && *dy == -4
+        ));
+    }
+
+    #[test]
+    fn input_wire_filter_keeps_absolute_move_for_supported_peer() {
+        let events = vec![InputEvent::MouseMoveAbsolute {
+            x_norm: 100,
+            y_norm: 200,
+        }];
+        let wire = input_events_to_wire_for_protocol(
+            &events,
+            ProtocolVersion {
+                major: 1,
+                minor: 2,
+                patch: 0,
+            },
+        );
+
+        assert!(matches!(
+            wire.first(),
+            Some(WireInputEvent::MouseMoveAbsolute { x_norm, y_norm })
+                if *x_norm == 100 && *y_norm == 200
+        ));
     }
 
     #[tokio::test]

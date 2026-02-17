@@ -41,6 +41,10 @@ pub enum InputEvent {
         dx: i32,
         dy: i32,
     },
+    MouseMoveAbsolute {
+        x_norm: u16,
+        y_norm: u16,
+    },
     MouseButton {
         button: MouseButton,
         state: KeyState,

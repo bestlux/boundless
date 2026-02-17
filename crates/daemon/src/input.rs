@@ -27,10 +27,10 @@ use windows_sys::Win32::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
             KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX,
-            MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-            MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-            MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW,
-            SendInput,
+            MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+            MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+            MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+            MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput,
         },
         Input::{
             GetRawInputData, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
@@ -501,6 +501,16 @@ async fn maybe_handoff_capture_target_from_motion(
             match state.set_input_capture_target(Some(&next_peer_id)).await {
                 Ok(Some(peer_id)) => {
                     let previous_target = current_target.unwrap_or("local");
+                    let anchor_event =
+                        handoff_anchor_event(direction, cursor_position, screen_bounds);
+                    if let Err(error) = state.queue_input_events(&peer_id, vec![anchor_event]).await
+                    {
+                        warn!(
+                            peer_id = %peer_id,
+                            error = ?error,
+                            "failed to queue handoff cursor anchor event"
+                        );
+                    }
                     info!(
                         direction = ?direction,
                         previous_target = %previous_target,
@@ -576,6 +586,40 @@ fn is_local_handoff_edge(
         SwitchDirection::Up => y <= bounds.top.saturating_add(EDGE_POSITION_TOLERANCE_PX),
         SwitchDirection::Down => y >= bounds.bottom.saturating_sub(EDGE_POSITION_TOLERANCE_PX),
     }
+}
+
+fn handoff_anchor_event(
+    direction: SwitchDirection,
+    cursor_position: Option<(i32, i32)>,
+    screen_bounds: Option<VirtualScreenBounds>,
+) -> InputEvent {
+    let center = u16::MAX / 2;
+    let x_axis = normalize_cursor_axis(cursor_position.map(|(x, _)| x), screen_bounds.map(|b| (b.left, b.right)))
+        .unwrap_or(center);
+    let y_axis = normalize_cursor_axis(cursor_position.map(|(_, y)| y), screen_bounds.map(|b| (b.top, b.bottom)))
+        .unwrap_or(center);
+
+    let (x_norm, y_norm) = match direction {
+        SwitchDirection::Left => (u16::MAX, y_axis),
+        SwitchDirection::Right => (0, y_axis),
+        SwitchDirection::Up => (x_axis, u16::MAX),
+        SwitchDirection::Down => (x_axis, 0),
+    };
+
+    InputEvent::MouseMoveAbsolute { x_norm, y_norm }
+}
+
+fn normalize_cursor_axis(value: Option<i32>, bounds: Option<(i32, i32)>) -> Option<u16> {
+    let value = value?;
+    let (start, end) = bounds?;
+    let span = end.saturating_sub(start);
+    if span <= 0 {
+        return None;
+    }
+
+    let clamped = value.clamp(start, end).saturating_sub(start) as u64;
+    let norm = (clamped.saturating_mul(u16::MAX as u64) / span as u64) as u16;
+    Some(norm)
 }
 
 #[cfg(all(windows, not(test)))]
@@ -951,7 +995,9 @@ impl WindowsHookCaptureBackend {
                     output.push(InputEvent::Key { scan_code, state });
                 }
             }
-            InputEvent::MouseMove { .. } | InputEvent::MouseWheel { .. } => output.push(event),
+            InputEvent::MouseMove { .. }
+            | InputEvent::MouseMoveAbsolute { .. }
+            | InputEvent::MouseWheel { .. } => output.push(event),
         }
     }
 
@@ -1771,6 +1817,14 @@ fn input_records_for_event(event: &InputEvent) -> Vec<INPUT> {
                 vec![mouse_input(*dx, *dy, 0, MOUSEEVENTF_MOVE)]
             }
         }
+        InputEvent::MouseMoveAbsolute { x_norm, y_norm } => {
+            vec![mouse_input(
+                i32::from(*x_norm),
+                i32::from(*y_norm),
+                0,
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            )]
+        }
         InputEvent::MouseButton { button, state } => {
             let (flags, mouse_data) = match (button, state) {
                 (core_input::MouseButton::Left, core_input::KeyState::Down) => {
@@ -1908,6 +1962,7 @@ fn is_extended_scan_code(scan_code: u16) -> bool {
 fn input_event_kind(event: &InputEvent) -> &'static str {
     match event {
         InputEvent::MouseMove { .. } => "mouse_move",
+        InputEvent::MouseMoveAbsolute { .. } => "mouse_move_absolute",
         InputEvent::MouseButton { .. } => "mouse_button",
         InputEvent::MouseWheel { .. } => "mouse_wheel",
         InputEvent::Key { .. } => "key",
@@ -2422,9 +2477,15 @@ mod tests {
             )
         ));
         let right_outgoing = state.drain_outgoing(&right_peer).await;
-        assert!(
-            right_outgoing.is_empty(),
-            "trigger frame should remain on previous target; new target gets subsequent frames"
+        assert!(matches!(
+            right_outgoing.first(),
+            Some(crate::state::OutboundPayload::InputFrame { sequence: 1, events, .. })
+                if matches!(events.as_slice(), [InputEvent::MouseMoveAbsolute { .. }])
+        ));
+        assert_eq!(
+            right_outgoing.len(),
+            1,
+            "new target should receive only anchor event in this scenario"
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -2612,6 +2673,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn handoff_anchor_places_cursor_on_destination_edge() {
+        let bounds = VirtualScreenBounds {
+            left: 0,
+            top: 0,
+            right: 1919,
+            bottom: 1079,
+        };
+        let anchor = handoff_anchor_event(SwitchDirection::Right, Some((1919, 540)), Some(bounds));
+        assert!(matches!(
+            anchor,
+            InputEvent::MouseMoveAbsolute { x_norm, y_norm } if x_norm == 0 && y_norm > 32000
+        ));
+    }
+
     #[tokio::test]
     async fn capture_escape_action_clears_target_and_unlocks() {
         let (state, peer_id, root) = state_with_peer_for_input_test().await;
@@ -2758,6 +2834,25 @@ mod tests {
         let horizontal = unsafe { records[1].Anonymous.mi };
         assert_eq!(vertical.dwFlags, MOUSEEVENTF_WHEEL);
         assert_eq!(horizontal.dwFlags, MOUSEEVENTF_HWHEEL);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn maps_absolute_move_event_to_absolute_mouse_record() {
+        let records = input_records_for_event(&InputEvent::MouseMoveAbsolute {
+            x_norm: 1234,
+            y_norm: 5678,
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].r#type, INPUT_MOUSE);
+
+        let record = unsafe { records[0].Anonymous.mi };
+        assert_eq!(record.dx, 1234);
+        assert_eq!(record.dy, 5678);
+        assert_eq!(
+            record.dwFlags,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+        );
     }
 
     #[cfg(windows)]
