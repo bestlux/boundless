@@ -23,6 +23,7 @@
 - [x] Added transport diagnostics API/CLI for payload enqueue and event inspection
 - [x] Extended two-node smoke harness to validate clipboard/file payload transfer
 - [x] Added local validation helper script (`scripts/dev/validate.ps1`)
+- [x] Added unified test-suite entrypoint with profiles (`scripts/dev/test-suite.ps1`) and kept `validate.ps1` as compatibility wrapper
 - [x] Added input control-plane primitives (owner claim/release/query) for deterministic routing prep
 - [x] Expanded smoke harness to validate input owner claim/release flow
 - [x] Wired core-input frame routing into transport/runtime with no-op sink backend

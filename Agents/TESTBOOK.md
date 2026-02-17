@@ -32,8 +32,10 @@
 - Runtime input capture now supports layout-driven edge handoff (easy mouse + wrap mouse policy aware) when layout tokens resolve local + connected peer neighbors
 - Runtime hotkey loop is active on Windows and executes configured actions on combo press edge (`toggle_easy_mouse`, `reconnect`, `lock_machine`, `switch_all`)
 - Diagnostics action trigger helper is available for deterministic validation without physical key presses: `diagnostics run-action <toggle_easy_mouse|switch_all|reconnect>`
-- Run `scripts/dev/validate.ps1` for fmt/test/clippy plus smoke in one command
-- Run `scripts/dev/validate.ps1 -IncludeThreeNodeSmoke` to include both two-node and three-node smoke flows
+- Run `scripts/dev/test-suite.ps1 -Profile quick` for fmt/test/clippy only
+- Run `scripts/dev/test-suite.ps1 -Profile smoke` for quick checks + two-node smoke
+- Run `scripts/dev/test-suite.ps1 -Profile full` for quick checks + two-node + three-node smoke
+- `scripts/dev/validate.ps1` remains as a compatibility wrapper that forwards to `test-suite.ps1`
 - For real multi-display validation pass, execute `Agents/MULTI_DISPLAY_VALIDATION_RUNBOOK.md` and record results in `Agents/MULTI_DISPLAY_VALIDATION_RESULTS_TEMPLATE.md`
 - Use `scripts/dev/multi-display-capture.ps1` to collect synchronized before/after/failure snapshots for both machines during Slice 2
 - Use `scripts/dev/edge-handoff-trace.ps1` during manual edge tests to capture a timestamped stream of capture-target transitions + input runtime transport events for faster triage
