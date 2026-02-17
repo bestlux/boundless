@@ -680,8 +680,17 @@ fn print_console_snapshot(endpoint: &str, snapshot: &ConsoleSnapshot) {
     println!();
     println!("=== Boundless Status ===");
     println!(
-        "daemon=running endpoint={} machine_id={} protocol={}",
-        endpoint, snapshot.status.machine_id, snapshot.status.protocol_version
+        "daemon=running endpoint={} machine_id={} protocol={} input_locked={} input_lock_supported={} active_capture_target={}",
+        endpoint,
+        snapshot.status.machine_id,
+        snapshot.status.protocol_version,
+        snapshot.status.input_locked,
+        snapshot.status.input_lock_supported,
+        if snapshot.status.capture_target_peer_id.is_empty() {
+            "none"
+        } else {
+            snapshot.status.capture_target_peer_id.as_str()
+        }
     );
     println!(
         "api_transport={} api_bind={} api_pipe_name={}",
@@ -1012,14 +1021,21 @@ async fn daemon_status(endpoint: &str) -> Result<()> {
     let mut client = DaemonServiceClient::new(channel(endpoint).await?);
     let status = client.get_status(StatusRequest {}).await?.into_inner();
     println!(
-        "running={} machine_id={} peers={} protocol={} api_transport={} api_bind={} api_pipe_name={}",
+        "running={} machine_id={} peers={} protocol={} api_transport={} api_bind={} api_pipe_name={} input_locked={} input_lock_supported={} active_capture_target={}",
         status.running,
         status.machine_id,
         status.peer_count,
         status.protocol_version,
         status.api_transport,
         status.api_bind,
-        status.api_pipe_name
+        status.api_pipe_name,
+        status.input_locked,
+        status.input_lock_supported,
+        if status.capture_target_peer_id.is_empty() {
+            "none"
+        } else {
+            status.capture_target_peer_id.as_str()
+        }
     );
     Ok(())
 }

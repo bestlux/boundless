@@ -122,6 +122,12 @@ pub enum NearbyPairingStatus {
     Missing,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureHandoffTarget {
+    Local,
+    Peer(String),
+}
+
 #[derive(Debug, Clone)]
 struct PendingNearbyPairingRequestRecord {
     summary: PendingNearbyPairingRequest,
@@ -166,6 +172,8 @@ pub struct AppState {
     input_sequence_by_peer: Arc<RwLock<HashMap<String, u64>>>,
     pending_inject_input_frames: Arc<RwLock<VecDeque<PendingInjectInputFrame>>>,
     input_capture_target_peer_id: Arc<RwLock<Option<String>>>,
+    input_lock_active: Arc<RwLock<bool>>,
+    input_lock_supported: Arc<RwLock<bool>>,
     reconnect_generation_by_peer: Arc<RwLock<HashMap<String, u64>>>,
     pending_nearby_pairing_requests:
         Arc<RwLock<HashMap<String, PendingNearbyPairingRequestRecord>>>,
@@ -246,6 +254,8 @@ impl AppState {
             input_sequence_by_peer: Arc::new(RwLock::new(HashMap::new())),
             pending_inject_input_frames: Arc::new(RwLock::new(VecDeque::new())),
             input_capture_target_peer_id: Arc::new(RwLock::new(None)),
+            input_lock_active: Arc::new(RwLock::new(false)),
+            input_lock_supported: Arc::new(RwLock::new(cfg!(windows))),
             reconnect_generation_by_peer: Arc::new(RwLock::new(HashMap::new())),
             pending_nearby_pairing_requests: Arc::new(RwLock::new(HashMap::new())),
             nearby_pairing_decisions: Arc::new(RwLock::new(HashMap::new())),
@@ -643,6 +653,10 @@ impl AppState {
             router.release_owner(peer_id);
             router.clear_peer_state(peer_id);
             drop(router);
+            let mut capture_target = self.input_capture_target_peer_id.write().await;
+            if capture_target.as_deref() == Some(peer_id) {
+                *capture_target = None;
+            }
             self.clear_pending_inject_input_frames_for_peer(peer_id)
                 .await;
         }
@@ -685,10 +699,11 @@ impl AppState {
 
     pub async fn capture_handoff_target_for_direction(
         &self,
+        current_target: Option<&str>,
         direction: SwitchDirection,
-    ) -> Option<String> {
+    ) -> Option<CaptureHandoffTarget> {
         let config = self.config.read().await;
-        resolve_capture_handoff_target(&config, direction)
+        resolve_capture_handoff_target(&config, current_target, direction)
     }
 
     pub async fn apply_switch_all_capture_target(&self) -> Option<String> {
@@ -1613,6 +1628,17 @@ impl AppState {
         }
     }
 
+    pub async fn set_input_lock_runtime(&self, active: bool, supported: bool) {
+        *self.input_lock_active.write().await = active;
+        *self.input_lock_supported.write().await = supported;
+    }
+
+    pub async fn input_lock_runtime(&self) -> (bool, bool) {
+        let active = *self.input_lock_active.read().await;
+        let supported = *self.input_lock_supported.read().await;
+        (active, supported)
+    }
+
     pub async fn safe_reset(&self, network_only: bool, all: bool) -> Result<()> {
         let mut config = self.config.write().await;
 
@@ -1635,6 +1661,7 @@ impl AppState {
         self.input_sequence_by_peer.write().await.clear();
         self.pending_inject_input_frames.write().await.clear();
         *self.input_capture_target_peer_id.write().await = None;
+        *self.input_lock_active.write().await = false;
         self.reconnect_generation_by_peer.write().await.clear();
         self.pairing_codes.write().await.clear();
         self.pending_nearby_pairing_requests.write().await.clear();
@@ -1863,25 +1890,31 @@ fn elapsed_ms(start_unix_ms: i64, end_unix_ms: i64) -> i64 {
 
 fn resolve_capture_handoff_target(
     config: &RuntimeConfig,
+    current_target: Option<&str>,
     direction: SwitchDirection,
-) -> Option<String> {
+) -> Option<CaptureHandoffTarget> {
     let matrix = parse_layout_matrix(&config.layout_matrix);
-    let mut local_cell: Option<(usize, usize)> = None;
+    let mut source_cell: Option<(usize, usize)> = None;
 
     for (row_index, row) in matrix.iter().enumerate() {
         for (column_index, token) in row.iter().enumerate() {
-            if !is_local_layout_token(token, config) {
+            let is_source = if let Some(peer_id) = current_target {
+                layout_token_matches_peer(token, peer_id, &config.peers)
+            } else {
+                is_local_layout_token(token, config)
+            };
+            if !is_source {
                 continue;
             }
 
-            if local_cell.is_some() {
+            if source_cell.is_some() {
                 return None;
             }
-            local_cell = Some((row_index, column_index));
+            source_cell = Some((row_index, column_index));
         }
     }
 
-    let (row, column) = local_cell?;
+    let (row, column) = source_cell?;
 
     let token_at = |row_index: usize, column_index: usize| -> Option<String> {
         matrix
@@ -1890,17 +1923,24 @@ fn resolve_capture_handoff_target(
             .cloned()
     };
 
+    let token_to_target = |token: String| -> Option<CaptureHandoffTarget> {
+        if token.trim().is_empty() {
+            return None;
+        }
+        if is_local_layout_token(&token, config) {
+            return Some(CaptureHandoffTarget::Local);
+        }
+        resolve_peer_layout_token(&token, &config.peers).map(CaptureHandoffTarget::Peer)
+    };
+
     match direction {
         SwitchDirection::Left => {
             for next_column in (0..column).rev() {
                 let Some(token) = token_at(row, next_column) else {
                     continue;
                 };
-                if is_local_layout_token(&token, config) {
-                    continue;
-                }
-                if let Some(peer_id) = resolve_peer_layout_token(&token, &config.peers) {
-                    return Some(peer_id);
+                if let Some(target) = token_to_target(token) {
+                    return Some(target);
                 }
             }
             None
@@ -1914,11 +1954,8 @@ fn resolve_capture_handoff_target(
                 let Some(token) = token_at(row, next_column) else {
                     continue;
                 };
-                if is_local_layout_token(&token, config) {
-                    continue;
-                }
-                if let Some(peer_id) = resolve_peer_layout_token(&token, &config.peers) {
-                    return Some(peer_id);
+                if let Some(target) = token_to_target(token) {
+                    return Some(target);
                 }
             }
             None
@@ -1928,11 +1965,8 @@ fn resolve_capture_handoff_target(
                 let Some(token) = token_at(next_row, column) else {
                     continue;
                 };
-                if is_local_layout_token(&token, config) {
-                    continue;
-                }
-                if let Some(peer_id) = resolve_peer_layout_token(&token, &config.peers) {
-                    return Some(peer_id);
+                if let Some(target) = token_to_target(token) {
+                    return Some(target);
                 }
             }
             None
@@ -1942,11 +1976,8 @@ fn resolve_capture_handoff_target(
                 let Some(token) = token_at(next_row, column) else {
                     continue;
                 };
-                if is_local_layout_token(&token, config) {
-                    continue;
-                }
-                if let Some(peer_id) = resolve_peer_layout_token(&token, &config.peers) {
-                    return Some(peer_id);
+                if let Some(target) = token_to_target(token) {
+                    return Some(target);
                 }
             }
             None
@@ -2044,6 +2075,10 @@ fn resolve_peer_layout_token(token: &str, peers: &[PeerConfig]) -> Option<String
     }
 }
 
+fn layout_token_matches_peer(token: &str, peer_id: &str, peers: &[PeerConfig]) -> bool {
+    resolve_peer_layout_token(token, peers).as_deref() == Some(peer_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2097,20 +2132,20 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_capture_handoff_target(&config, SwitchDirection::Left).as_deref(),
-            Some("peer-left")
+            resolve_capture_handoff_target(&config, None, SwitchDirection::Left),
+            Some(CaptureHandoffTarget::Peer("peer-left".to_string()))
         );
         assert_eq!(
-            resolve_capture_handoff_target(&config, SwitchDirection::Right).as_deref(),
-            Some("peer-right")
+            resolve_capture_handoff_target(&config, None, SwitchDirection::Right),
+            Some(CaptureHandoffTarget::Peer("peer-right".to_string()))
         );
         assert_eq!(
-            resolve_capture_handoff_target(&config, SwitchDirection::Up).as_deref(),
-            Some("peer-up")
+            resolve_capture_handoff_target(&config, None, SwitchDirection::Up),
+            Some(CaptureHandoffTarget::Peer("peer-up".to_string()))
         );
         assert_eq!(
-            resolve_capture_handoff_target(&config, SwitchDirection::Down).as_deref(),
-            Some("peer-down")
+            resolve_capture_handoff_target(&config, None, SwitchDirection::Down),
+            Some(CaptureHandoffTarget::Peer("peer-down".to_string()))
         );
     }
 
@@ -2130,15 +2165,54 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            resolve_capture_handoff_target(&config, SwitchDirection::Right).is_none(),
+            resolve_capture_handoff_target(&config, None, SwitchDirection::Right).is_none(),
             "disconnected neighbors should not be selected"
         );
 
         config.peers[0].connected = true;
         config.layout_matrix = "self,right;local,right".to_string();
         assert!(
-            resolve_capture_handoff_target(&config, SwitchDirection::Right).is_none(),
+            resolve_capture_handoff_target(&config, None, SwitchDirection::Right).is_none(),
             "multiple local cells should invalidate edge handoff resolution"
+        );
+    }
+
+    #[test]
+    fn resolve_capture_handoff_target_supports_peer_chain_and_return_to_local() {
+        let config = RuntimeConfig {
+            machine_id: "local-id".to_string(),
+            device_name: "local-device".to_string(),
+            layout_matrix: "left,self,right".to_string(),
+            peers: vec![
+                PeerConfig {
+                    peer_id: "peer-left".to_string(),
+                    display_name: "left".to_string(),
+                    address: "127.0.0.1:15100".to_string(),
+                    connected: true,
+                    last_seen: Utc::now(),
+                },
+                PeerConfig {
+                    peer_id: "peer-right".to_string(),
+                    display_name: "right".to_string(),
+                    address: "127.0.0.1:15101".to_string(),
+                    connected: true,
+                    last_seen: Utc::now(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_capture_handoff_target(&config, Some("peer-left"), SwitchDirection::Right),
+            Some(CaptureHandoffTarget::Local)
+        );
+        assert_eq!(
+            resolve_capture_handoff_target(&config, Some("peer-right"), SwitchDirection::Left),
+            Some(CaptureHandoffTarget::Local)
+        );
+        assert_eq!(
+            resolve_capture_handoff_target(&config, Some("peer-left"), SwitchDirection::Left),
+            None
         );
     }
 
@@ -2538,6 +2612,52 @@ mod tests {
         assert!(
             state.input_capture_target().await.is_none(),
             "removed peer should clear capture target"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn disconnect_peer_clears_input_capture_target() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-disconnect-capture-target-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect peer");
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set target");
+        assert_eq!(
+            state.input_capture_target().await.as_deref(),
+            Some(peer_id.as_str())
+        );
+
+        state
+            .set_peer_connected(&peer_id, false)
+            .await
+            .expect("disconnect peer");
+        assert!(
+            state.input_capture_target().await.is_none(),
+            "disconnected peer should clear capture target"
         );
 
         let _ = std::fs::remove_dir_all(&root);
