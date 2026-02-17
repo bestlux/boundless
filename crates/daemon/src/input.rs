@@ -1308,9 +1308,6 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     }
 
     if lock_active {
-        if (wparam as u32) == WM_MOUSEMOVE {
-            return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
-        }
         return 1;
     }
 
