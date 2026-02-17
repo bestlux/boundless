@@ -44,6 +44,7 @@
 - [x] Added multi-display validation runbook and result template for Slice 2 execution tracking
 - [x] Added multi-display capture helper script for synchronized scenario artifacts across two endpoints
 - [x] Added approval-based nearby pairing flow (`pair nearby-join` + `pair pending|approve|reject`) with auto trust import on approval
+- [x] Added interactive CLI console flow (`boundlessctl console`) with daemon auto-start, mDNS discovery visibility, feature toggles, control target actions, and nearby pairing shortcuts
 
 ## Next (priority order)
 

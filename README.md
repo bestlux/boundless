@@ -50,6 +50,14 @@ Query status:
 cargo run -p boundless-cli -- daemon status
 ```
 
+Interactive all-in-one terminal flow (auto-start daemon by default):
+
+```bash
+cargo run -p boundless-cli -- console
+```
+
+The `console` command shows daemon health, mDNS discovery status, discovered endpoints, trusted/connected peers, feature toggles, input owner/capture target, and pending pairing requests. It also provides quick commands for toggles and nearby pairing actions.
+
 On Windows, the daemon now defaults to a local named pipe control endpoint (`npipe://./pipe/boundlessd-api`) and the CLI default endpoint matches that. Use `--endpoint http://127.0.0.1:50051` to target loopback TCP explicitly.
 
 Nearby pairing (approval-based, no trust-bundle file copy):

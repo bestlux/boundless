@@ -3,14 +3,15 @@ use std::path::Path;
 use tonic::{Request, Response, Status};
 
 use ipc_api::boundless::v1::{
-    DiagnosticsDumpReply, DiagnosticsDumpRequest, Empty, FeatureListReply, FeatureSetRequest,
-    HotkeySetRequest, HotkeyTriggerRequest, ImportTrustBundleRequest, InputCaptureTargetReply,
-    InputCaptureTargetRequest, InputOwnerReply, InputOwnerRequest, LayoutReply, LayoutSetRequest,
-    NearbyPairingDecisionRequest, NearbyPairingRequestInfo, NearbyPairingRequestsReply,
-    OperationReply, PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply, PairJoinRequest,
-    PeerInfo, PeerListReply, RemovePeerRequest, SafeResetRequest, SendClipboardImageRequest,
-    SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest, SendInputMoveRequest,
-    StatusReply, StatusRequest, TransportEvent, TransportEventsReply, TrustBundleReply,
+    DiagnosticsDumpReply, DiagnosticsDumpRequest, DiscoveredPeerInfo, DiscoveryPeersReply, Empty,
+    FeatureListReply, FeatureSetRequest, HotkeySetRequest, HotkeyTriggerRequest,
+    ImportTrustBundleRequest, InputCaptureTargetReply, InputCaptureTargetRequest, InputOwnerReply,
+    InputOwnerRequest, LayoutReply, LayoutSetRequest, NearbyPairingDecisionRequest,
+    NearbyPairingRequestInfo, NearbyPairingRequestsReply, OperationReply, PairCreateCodeReply,
+    PairCreateCodeRequest, PairJoinReply, PairJoinRequest, PeerInfo, PeerListReply,
+    RemovePeerRequest, SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest,
+    SendFileRequest, SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest,
+    TransportEvent, TransportEventsReply, TrustBundleReply,
     daemon_service_server::{DaemonService, DaemonServiceServer},
     diagnostics_service_server::{DiagnosticsService, DiagnosticsServiceServer},
     feature_service_server::{FeatureService, FeatureServiceServer},
@@ -507,6 +508,27 @@ impl DiagnosticsService for DiagnosticsApi {
             .collect();
 
         Ok(Response::new(TransportEventsReply { events }))
+    }
+
+    async fn list_discovery_peers(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<DiscoveryPeersReply>, Status> {
+        let peers = self
+            .0
+            .discovered_endpoints()
+            .await
+            .into_iter()
+            .map(|(machine_id, endpoint)| DiscoveredPeerInfo {
+                machine_id,
+                endpoint: endpoint.to_string(),
+            })
+            .collect();
+
+        Ok(Response::new(DiscoveryPeersReply {
+            mdns_active: self.0.mdns_active().await,
+            peers,
+        }))
     }
 
     async fn get_input_owner(

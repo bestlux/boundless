@@ -154,6 +154,7 @@ pub struct AppState {
     transport_events: Arc<RwLock<VecDeque<TransportEventRecord>>>,
     clipboard_sync: Arc<RwLock<ClipboardSyncState>>,
     discovered_endpoints: Arc<RwLock<HashMap<String, SocketAddr>>>,
+    mdns_active: Arc<RwLock<bool>>,
     inbox_root: Arc<PathBuf>,
     input_router: Arc<RwLock<InputRouter>>,
     input_sequence_by_peer: Arc<RwLock<HashMap<String, u64>>>,
@@ -233,6 +234,7 @@ impl AppState {
             transport_events: Arc::new(RwLock::new(VecDeque::new())),
             clipboard_sync: Arc::new(RwLock::new(ClipboardSyncState::default())),
             discovered_endpoints: Arc::new(RwLock::new(HashMap::new())),
+            mdns_active: Arc::new(RwLock::new(false)),
             inbox_root: Arc::new(inbox_root),
             input_router: Arc::new(RwLock::new(InputRouter::new(input_enabled))),
             input_sequence_by_peer: Arc::new(RwLock::new(HashMap::new())),
@@ -364,12 +366,32 @@ impl AppState {
         self.discovered_endpoints.write().await.remove(machine_id)
     }
 
+    pub async fn discovered_endpoints(&self) -> Vec<(String, SocketAddr)> {
+        let mut entries = self
+            .discovered_endpoints
+            .read()
+            .await
+            .iter()
+            .map(|(machine_id, endpoint)| (machine_id.clone(), *endpoint))
+            .collect::<Vec<_>>();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
     pub async fn discovered_endpoint(&self, machine_id: &str) -> Option<SocketAddr> {
         self.discovered_endpoints
             .read()
             .await
             .get(machine_id)
             .copied()
+    }
+
+    pub async fn set_mdns_active(&self, active: bool) {
+        *self.mdns_active.write().await = active;
+    }
+
+    pub async fn mdns_active(&self) -> bool {
+        *self.mdns_active.read().await
     }
 
     pub async fn create_pairing_code(&self, ttl_secs: u64) -> (String, DateTime<Utc>) {
