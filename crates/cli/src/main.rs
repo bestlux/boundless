@@ -4,6 +4,7 @@ use core_clipboard::validate_bmp_payload as validate_bmp_bytes;
 use serde::{Deserialize, Serialize};
 use std::{
     io::{self, Write},
+    net::SocketAddr,
     process::{Command as ProcessCommand, Stdio},
     time::Duration,
 };
@@ -427,6 +428,7 @@ struct ConsolePeer {
 #[derive(Debug)]
 struct ConsoleDiscoveredPeer {
     machine_id: String,
+    display_name: String,
     endpoint: String,
 }
 
@@ -624,6 +626,7 @@ async fn fetch_console_snapshot(endpoint: &str) -> Result<ConsoleSnapshot> {
         .into_iter()
         .map(|peer| ConsoleDiscoveredPeer {
             machine_id: peer.machine_id,
+            display_name: peer.display_name,
             endpoint: peer.endpoint,
         })
         .collect::<Vec<_>>();
@@ -695,10 +698,13 @@ fn print_console_snapshot(endpoint: &str, snapshot: &ConsoleSnapshot) {
         mdns,
         snapshot.discovered_peers.len()
     );
-    for peer in &snapshot.discovered_peers {
+    for (index, peer) in snapshot.discovered_peers.iter().enumerate() {
         println!(
-            "  discovered machine_id={} endpoint={}",
-            peer.machine_id, peer.endpoint
+            "  [{}] discovered name={} endpoint={} machine_id={}",
+            index + 1,
+            peer.display_name,
+            peer.endpoint,
+            short_machine_id(&peer.machine_id),
         );
     }
 
@@ -751,6 +757,7 @@ fn print_console_help() {
     println!("  pair pending");
     println!("  pair approve <request_id> [alias]");
     println!("  pair reject <request_id>");
+    println!("  pair request <index|machine_id> [code] [alias]");
     println!("  pair nearby <host> <code> [port] [alias]");
 }
 
@@ -811,14 +818,18 @@ async fn handle_console_command(
             }
         }
         "reconnect" => diagnostics_run_action(endpoint, "reconnect".to_string()).await,
-        "pair" => handle_console_pair_command(endpoint, &parts[1..]).await,
+        "pair" => handle_console_pair_command(endpoint, snapshot, &parts[1..]).await,
         _ => bail!("unknown command `{}`; run `help`", parts[0]),
     }
 }
 
-async fn handle_console_pair_command(endpoint: &str, args: &[&str]) -> Result<()> {
+async fn handle_console_pair_command(
+    endpoint: &str,
+    snapshot: &ConsoleSnapshot,
+    args: &[&str],
+) -> Result<()> {
     if args.is_empty() {
-        bail!("usage: pair <code|pending|approve|reject|nearby> ...");
+        bail!("usage: pair <code|pending|approve|reject|request|nearby> ...");
     }
 
     match args[0] {
@@ -838,13 +849,54 @@ async fn handle_console_pair_command(endpoint: &str, args: &[&str]) -> Result<()
                 bail!("usage: pair approve <request_id> [alias]");
             }
             let alias = args.get(2).map(|value| (*value).to_string());
-            pair_approve(endpoint, args[1].to_string(), alias).await
+            let request_id = if args[1].eq_ignore_ascii_case("latest") {
+                snapshot
+                    .pending_requests
+                    .last()
+                    .map(|request| request.request_id.clone())
+                    .ok_or_else(|| anyhow::anyhow!("no pending pairing requests"))?
+            } else {
+                args[1].to_string()
+            };
+            pair_approve(endpoint, request_id, alias).await
         }
         "reject" => {
             if args.len() != 2 {
                 bail!("usage: pair reject <request_id>");
             }
             pair_reject(endpoint, args[1].to_string()).await
+        }
+        "request" => {
+            if args.len() < 2 {
+                bail!("usage: pair request <index|machine_id> [code] [alias]");
+            }
+
+            let discovered = resolve_discovered_peer(snapshot, args[1])?;
+            let socket = discovered
+                .endpoint
+                .parse::<SocketAddr>()
+                .with_context(|| format!("invalid discovered endpoint {}", discovered.endpoint))?;
+            let host = socket.ip().to_string();
+            let pairing_port = nearby_pairing_port(socket.port());
+
+            let code = if let Some(code) = args.get(2) {
+                code.to_string()
+            } else {
+                prompt_pairing_code()?
+            };
+            if code.trim().is_empty() {
+                bail!("pairing code must not be empty");
+            }
+
+            let alias = args.get(3).map(|value| (*value).to_string());
+            println!(
+                "pair_request target={} endpoint={} pairing_port={} machine_id={}",
+                discovered.display_name,
+                discovered.endpoint,
+                pairing_port,
+                short_machine_id(&discovered.machine_id),
+            );
+            pair_nearby_join(endpoint, code, host, pairing_port, 120, alias).await
         }
         "nearby" => {
             if args.len() < 3 {
@@ -874,6 +926,57 @@ async fn handle_console_pair_command(endpoint: &str, args: &[&str]) -> Result<()
         }
         _ => bail!("unknown pair command `{}`", args[0]),
     }
+}
+
+fn resolve_discovered_peer<'a>(
+    snapshot: &'a ConsoleSnapshot,
+    selector: &str,
+) -> Result<&'a ConsoleDiscoveredPeer> {
+    if let Ok(index) = selector.parse::<usize>() {
+        if index == 0 {
+            bail!("pair request index must start at 1");
+        }
+        return snapshot
+            .discovered_peers
+            .get(index - 1)
+            .ok_or_else(|| anyhow::anyhow!("no discovered peer at index {index}"));
+    }
+
+    let matches = snapshot
+        .discovered_peers
+        .iter()
+        .filter(|peer| peer.machine_id == selector || peer.machine_id.starts_with(selector))
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        bail!("no discovered peer matching machine_id `{selector}`");
+    }
+    if matches.len() > 1 {
+        bail!("multiple discovered peers match `{selector}`; use full machine_id or index");
+    }
+    Ok(matches[0])
+}
+
+fn prompt_pairing_code() -> Result<String> {
+    print!("pairing code: ");
+    io::stdout().flush().context("flush stdout")?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .context("read pairing code")?;
+    Ok(line.trim().to_string())
+}
+
+fn nearby_pairing_port(transport_port: u16) -> u16 {
+    if transport_port <= u16::MAX - 100 {
+        return transport_port + 100;
+    }
+
+    let fallback = transport_port.saturating_sub(100);
+    if fallback == 0 { 1 } else { fallback }
+}
+
+fn short_machine_id(machine_id: &str) -> &str {
+    machine_id.get(..8).unwrap_or(machine_id)
 }
 
 fn parse_npipe_endpoint(endpoint: &str) -> Result<Option<String>> {
@@ -1706,6 +1809,42 @@ mod tests {
             extract_port_from_network_address("[fe80::1%4]:17100").expect("port"),
             17100
         );
+    }
+
+    #[test]
+    fn nearby_pairing_port_uses_offset_and_overflow_fallback() {
+        assert_eq!(nearby_pairing_port(15100), 15200);
+        assert_eq!(nearby_pairing_port(65436), 65336);
+    }
+
+    #[test]
+    fn resolve_discovered_peer_supports_index_and_prefix_selector() {
+        let snapshot = ConsoleSnapshot {
+            status: StatusReply::default(),
+            peers: Vec::new(),
+            features: Vec::new(),
+            discovered_peers: vec![
+                ConsoleDiscoveredPeer {
+                    machine_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+                    display_name: "MACHINE-A".to_string(),
+                    endpoint: "10.0.0.10:15100".to_string(),
+                },
+                ConsoleDiscoveredPeer {
+                    machine_id: "11111111-2222-3333-4444-555555555555".to_string(),
+                    display_name: "MACHINE-B".to_string(),
+                    endpoint: "10.0.0.11:15100".to_string(),
+                },
+            ],
+            pending_requests: Vec::new(),
+            input_owner: None,
+            capture_target: None,
+            mdns_active: true,
+        };
+
+        let by_index = resolve_discovered_peer(&snapshot, "2").expect("index");
+        assert_eq!(by_index.display_name, "MACHINE-B");
+        let by_prefix = resolve_discovered_peer(&snapshot, "aaaaaaaa").expect("prefix");
+        assert_eq!(by_prefix.display_name, "MACHINE-A");
     }
 
     #[cfg(windows)]

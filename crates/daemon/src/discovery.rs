@@ -73,10 +73,14 @@ async fn run(state: AppState) -> Result<()> {
                 );
 
                 let previous = state
-                    .set_discovered_endpoint(&announcement.machine_id, announcement.endpoint)
+                    .set_discovered_endpoint(
+                        &announcement.machine_id,
+                        &announcement.display_name,
+                        announcement.endpoint,
+                    )
                     .await;
 
-                if previous != Some(announcement.endpoint) {
+                if previous.as_ref().map(|item| item.endpoint) != Some(announcement.endpoint) {
                     info!(
                         machine_id = %announcement.machine_id,
                         display_name = %announcement.display_name,

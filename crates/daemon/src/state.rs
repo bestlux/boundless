@@ -73,6 +73,12 @@ pub struct PendingRemoteClipboardPayload {
     pub hash: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct DiscoveredPeerEndpoint {
+    pub display_name: String,
+    pub endpoint: SocketAddr,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct InputFrameTiming {
     pub capture_timestamp_unix_ms: i64,
@@ -153,7 +159,7 @@ pub struct AppState {
     outgoing_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
     transport_events: Arc<RwLock<VecDeque<TransportEventRecord>>>,
     clipboard_sync: Arc<RwLock<ClipboardSyncState>>,
-    discovered_endpoints: Arc<RwLock<HashMap<String, SocketAddr>>>,
+    discovered_endpoints: Arc<RwLock<HashMap<String, DiscoveredPeerEndpoint>>>,
     mdns_active: Arc<RwLock<bool>>,
     inbox_root: Arc<PathBuf>,
     input_router: Arc<RwLock<InputRouter>>,
@@ -354,25 +360,32 @@ impl AppState {
     pub async fn set_discovered_endpoint(
         &self,
         machine_id: &str,
+        display_name: &str,
         endpoint: SocketAddr,
-    ) -> Option<SocketAddr> {
-        self.discovered_endpoints
-            .write()
-            .await
-            .insert(machine_id.to_string(), endpoint)
+    ) -> Option<DiscoveredPeerEndpoint> {
+        self.discovered_endpoints.write().await.insert(
+            machine_id.to_string(),
+            DiscoveredPeerEndpoint {
+                display_name: display_name.to_string(),
+                endpoint,
+            },
+        )
     }
 
-    pub async fn clear_discovered_endpoint(&self, machine_id: &str) -> Option<SocketAddr> {
+    pub async fn clear_discovered_endpoint(
+        &self,
+        machine_id: &str,
+    ) -> Option<DiscoveredPeerEndpoint> {
         self.discovered_endpoints.write().await.remove(machine_id)
     }
 
-    pub async fn discovered_endpoints(&self) -> Vec<(String, SocketAddr)> {
+    pub async fn discovered_endpoints(&self) -> Vec<(String, DiscoveredPeerEndpoint)> {
         let mut entries = self
             .discovered_endpoints
             .read()
             .await
             .iter()
-            .map(|(machine_id, endpoint)| (machine_id.clone(), *endpoint))
+            .map(|(machine_id, record)| (machine_id.clone(), record.clone()))
             .collect::<Vec<_>>();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         entries
@@ -383,7 +396,7 @@ impl AppState {
             .read()
             .await
             .get(machine_id)
-            .copied()
+            .map(|record| record.endpoint)
     }
 
     pub async fn set_mdns_active(&self, active: bool) {

@@ -58,6 +58,8 @@ cargo run -p boundless-cli -- console
 
 The `console` command shows daemon health, mDNS discovery status, discovered endpoints, trusted/connected peers, feature toggles, input owner/capture target, and pending pairing requests. It also provides quick commands for toggles and nearby pairing actions.
 
+Inside console, use `pair request <index|machine_id> [code] [alias]` to send a strict nearby pairing request to a discovered peer without manually typing host/port (pairing port is derived automatically from discovered transport endpoint).
+
 On Windows, the daemon now defaults to a local named pipe control endpoint (`npipe://./pipe/boundlessd-api`) and the CLI default endpoint matches that. Use `--endpoint http://127.0.0.1:50051` to target loopback TCP explicitly.
 
 Nearby pairing (approval-based, no trust-bundle file copy):
