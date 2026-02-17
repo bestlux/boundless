@@ -85,6 +85,17 @@ scripts/dev/multi-display-capture.ps1 `
 
 Repeat with `-Phase after` (or `-Phase failure`) for each scenario.
 
+For timeline-style edge debugging while reproducing movement live:
+
+```powershell
+scripts/dev/edge-handoff-trace.ps1 `
+  -EndpointA "http://<machine-a-api-host>:50051" `
+  -EndpointB "http://<machine-b-api-host>:50051" `
+  -LabelA machine-a `
+  -LabelB machine-b `
+  -DurationSeconds 45
+```
+
 For deterministic action checks:
 
 ```powershell
