@@ -48,9 +48,16 @@ use windows_sys::Win32::{
     },
 };
 
+#[cfg(all(windows, not(test)))]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
+
 const INPUT_TICK: Duration = Duration::from_millis(5);
 const INPUT_CAPTURE_TICK: Duration = Duration::from_millis(8);
 const EDGE_PRESSURE_THRESHOLD: i32 = 300;
+const EDGE_POSITION_TOLERANCE_PX: i32 = 2;
+const EDGE_SWITCH_POST_HANDOFF_SUPPRESS_MS: u64 = 220;
 const ESCAPE_EDGE_RECAPTURE_SUPPRESS_MS: u64 = 600;
 #[cfg(windows)]
 const ESCAPE_DOUBLE_CTRL_WINDOW_MS: u64 = 400;
@@ -74,6 +81,14 @@ struct EdgeSwitchState {
     x_pressure: i32,
     y_pressure: i32,
     suppress_until_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VirtualScreenBounds {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
 }
 
 pub fn start(state: AppState) {
@@ -223,6 +238,8 @@ async fn capture_and_queue_outgoing_frames(
             Vec::new()
         }
     };
+    let cursor_position = backend.cursor_position();
+    let screen_bounds = local_virtual_screen_bounds();
 
     let mut escape_triggered = false;
     for action in backend.drain_control_actions() {
@@ -272,6 +289,8 @@ async fn capture_and_queue_outgoing_frames(
             &events,
             pre_handoff_target.as_deref(),
             edge_switch_state,
+            cursor_position,
+            screen_bounds,
         )
         .await;
     }
@@ -355,6 +374,9 @@ fn edge_switch_direction_from_motion(
     events: &[InputEvent],
     state: &mut EdgeSwitchState,
     wrap_mouse: bool,
+    current_target: Option<&str>,
+    cursor_position: Option<(i32, i32)>,
+    screen_bounds: Option<VirtualScreenBounds>,
 ) -> Option<SwitchDirection> {
     let now_ms = unix_now_ms();
     if state
@@ -397,22 +419,30 @@ fn edge_switch_direction_from_motion(
     let x_abs = state.x_pressure.abs();
     let y_abs = state.y_pressure.abs();
 
-    if x_abs >= EDGE_PRESSURE_THRESHOLD && x_abs >= y_abs {
-        return Some(if state.x_pressure < 0 {
+    let direction = if x_abs >= EDGE_PRESSURE_THRESHOLD && x_abs >= y_abs {
+        Some(if state.x_pressure < 0 {
             SwitchDirection::Left
         } else {
             SwitchDirection::Right
-        });
-    }
-    if wrap_mouse && y_abs >= EDGE_PRESSURE_THRESHOLD && y_abs >= x_abs {
-        return Some(if state.y_pressure < 0 {
+        })
+    } else if wrap_mouse && y_abs >= EDGE_PRESSURE_THRESHOLD && y_abs >= x_abs {
+        Some(if state.y_pressure < 0 {
             SwitchDirection::Up
         } else {
             SwitchDirection::Down
-        });
+        })
+    } else {
+        None
+    };
+
+    let direction = direction?;
+
+    if current_target.is_none() && !is_local_handoff_edge(direction, cursor_position, screen_bounds)
+    {
+        return None;
     }
 
-    None
+    Some(direction)
 }
 
 fn unix_now_ms() -> u64 {
@@ -427,6 +457,8 @@ async fn maybe_handoff_capture_target_from_motion(
     events: &[InputEvent],
     current_target: Option<&str>,
     edge_switch_state: &mut EdgeSwitchState,
+    cursor_position: Option<(i32, i32)>,
+    screen_bounds: Option<VirtualScreenBounds>,
 ) {
     let (mode, wrap_mouse) = state.edge_switch_policy().await;
     if !matches!(mode, EasyMouseMode::Enable) {
@@ -436,7 +468,14 @@ async fn maybe_handoff_capture_target_from_motion(
         return;
     }
 
-    let direction = edge_switch_direction_from_motion(events, edge_switch_state, wrap_mouse);
+    let direction = edge_switch_direction_from_motion(
+        events,
+        edge_switch_state,
+        wrap_mouse,
+        current_target,
+        cursor_position,
+        screen_bounds,
+    );
     let Some(direction) = direction else {
         edge_switch_state.last_direction = None;
         return;
@@ -477,6 +516,8 @@ async fn maybe_handoff_capture_target_from_motion(
                     .await;
                     edge_switch_state.x_pressure = 0;
                     edge_switch_state.y_pressure = 0;
+                    edge_switch_state.suppress_until_unix_ms =
+                        Some(unix_now_ms().saturating_add(EDGE_SWITCH_POST_HANDOFF_SUPPRESS_MS));
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -511,8 +552,53 @@ async fn maybe_handoff_capture_target_from_motion(
             .await;
             edge_switch_state.x_pressure = 0;
             edge_switch_state.y_pressure = 0;
+            edge_switch_state.suppress_until_unix_ms =
+                Some(unix_now_ms().saturating_add(EDGE_SWITCH_POST_HANDOFF_SUPPRESS_MS));
         }
     }
+}
+
+fn is_local_handoff_edge(
+    direction: SwitchDirection,
+    cursor_position: Option<(i32, i32)>,
+    screen_bounds: Option<VirtualScreenBounds>,
+) -> bool {
+    let Some(bounds) = screen_bounds else {
+        return true;
+    };
+    let Some((x, y)) = cursor_position else {
+        return false;
+    };
+
+    match direction {
+        SwitchDirection::Left => x <= bounds.left.saturating_add(EDGE_POSITION_TOLERANCE_PX),
+        SwitchDirection::Right => x >= bounds.right.saturating_sub(EDGE_POSITION_TOLERANCE_PX),
+        SwitchDirection::Up => y <= bounds.top.saturating_add(EDGE_POSITION_TOLERANCE_PX),
+        SwitchDirection::Down => y >= bounds.bottom.saturating_sub(EDGE_POSITION_TOLERANCE_PX),
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+fn local_virtual_screen_bounds() -> Option<VirtualScreenBounds> {
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    Some(VirtualScreenBounds {
+        left,
+        top,
+        right: left.saturating_add(width.saturating_sub(1)),
+        bottom: top.saturating_add(height.saturating_sub(1)),
+    })
+}
+
+#[cfg(any(not(windows), test))]
+fn local_virtual_screen_bounds() -> Option<VirtualScreenBounds> {
+    None
 }
 
 trait InputBackend: Send {
@@ -527,6 +613,9 @@ trait InputCaptureBackend: Send {
     fn set_lock_active(&mut self, active: bool) -> Result<bool>;
     fn lock_supported(&self) -> bool;
     fn backend_mode(&self) -> &'static str;
+    fn cursor_position(&self) -> Option<(i32, i32)> {
+        None
+    }
 }
 
 fn input_backend() -> Box<dyn InputBackend> {
@@ -733,6 +822,10 @@ impl InputCaptureBackend for WindowsPollingCaptureBackend {
 
     fn backend_mode(&self) -> &'static str {
         "polling"
+    }
+
+    fn cursor_position(&self) -> Option<(i32, i32)> {
+        self.last_cursor
     }
 }
 
@@ -1038,6 +1131,10 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
         } else {
             "hook"
         }
+    }
+
+    fn cursor_position(&self) -> Option<(i32, i32)> {
+        self.last_cursor
     }
 }
 
@@ -2456,6 +2553,63 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_edge_handoff_requires_cursor_at_boundary() {
+        let mut edge_switch_state = EdgeSwitchState::default();
+        let events = vec![InputEvent::MouseMove {
+            dx: EDGE_PRESSURE_THRESHOLD,
+            dy: 0,
+        }];
+        let bounds = VirtualScreenBounds {
+            left: 0,
+            top: 0,
+            right: 1919,
+            bottom: 1079,
+        };
+
+        let direction = edge_switch_direction_from_motion(
+            &events,
+            &mut edge_switch_state,
+            false,
+            None,
+            Some((960, 540)),
+            Some(bounds),
+        );
+        assert_eq!(
+            direction, None,
+            "local capture start must ignore pressure when cursor is not at an edge"
+        );
+    }
+
+    #[test]
+    fn local_edge_handoff_accepts_cursor_at_boundary() {
+        let mut edge_switch_state = EdgeSwitchState::default();
+        let events = vec![InputEvent::MouseMove {
+            dx: EDGE_PRESSURE_THRESHOLD,
+            dy: 0,
+        }];
+        let bounds = VirtualScreenBounds {
+            left: 0,
+            top: 0,
+            right: 1919,
+            bottom: 1079,
+        };
+
+        let direction = edge_switch_direction_from_motion(
+            &events,
+            &mut edge_switch_state,
+            false,
+            None,
+            Some((1919, 540)),
+            Some(bounds),
+        );
+        assert_eq!(
+            direction,
+            Some(SwitchDirection::Right),
+            "local capture start should trigger when pressure points into a configured edge"
+        );
     }
 
     #[tokio::test]
