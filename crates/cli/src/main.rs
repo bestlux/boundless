@@ -811,6 +811,9 @@ async fn handle_console_command(
                 println!("control=off");
                 Ok(())
             } else {
+                if snapshot.feature_enabled("share_input") == Some(false) {
+                    feature_set(endpoint, "share_input".to_string(), ToggleValue::On).await?;
+                }
                 input_capture_start(endpoint, target.to_string()).await?;
                 input_claim(endpoint, target.to_string(), false).await?;
                 println!("control=on peer_id={target}");

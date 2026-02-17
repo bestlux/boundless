@@ -1410,12 +1410,26 @@ impl AppState {
             events: Vec::with_capacity(frame.events.len()),
         };
         let received_timestamp_unix_ms = Utc::now().timestamp_millis();
-        let decision = self
-            .input_router
-            .write()
-            .await
-            .route_frame(&frame, &mut sink)
-            .map_err(anyhow::Error::from)?;
+        let (decision, auto_claimed_owner) = {
+            let mut router = self.input_router.write().await;
+            let mut decision = router
+                .route_frame(&frame, &mut sink)
+                .map_err(anyhow::Error::from)?;
+            let mut auto_claimed_owner = false;
+
+            if matches!(
+                decision,
+                RouteDecision::IgnoredNoOwner | RouteDecision::IgnoredWrongOwner { .. }
+            ) && router.claim_owner(peer_id, true)
+            {
+                auto_claimed_owner = true;
+                decision = router
+                    .route_frame(&frame, &mut sink)
+                    .map_err(anyhow::Error::from)?;
+            }
+
+            (decision, auto_claimed_owner)
+        };
 
         if matches!(decision, RouteDecision::Applied { .. }) {
             let queued_timestamp_unix_ms = Utc::now().timestamp_millis();
@@ -1462,6 +1476,7 @@ impl AppState {
                 frame.sequence,
                 frame.timestamp_unix_ms,
                 received_timestamp_unix_ms,
+                auto_claimed_owner,
             ),
             size_bytes: frame.events.len() as u64,
         })
@@ -1833,10 +1848,11 @@ fn describe_input_frame_decision(
     sequence: u64,
     capture_timestamp_unix_ms: i64,
     received_timestamp_unix_ms: i64,
+    auto_claimed_owner: bool,
 ) -> String {
     let capture_to_receive_ms = elapsed_ms(capture_timestamp_unix_ms, received_timestamp_unix_ms);
     format!(
-        "sequence={sequence} capture_to_receive_ms={capture_to_receive_ms} {}",
+        "sequence={sequence} capture_to_receive_ms={capture_to_receive_ms} auto_claimed_owner={auto_claimed_owner} {}",
         describe_route_decision(decision)
     )
 }
@@ -2790,6 +2806,121 @@ mod tests {
         assert_eq!(queued.peer_id, peer_id);
         assert_eq!(queued.sequence, 1);
         assert_eq!(queued.events.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn route_incoming_input_frame_auto_claims_owner_when_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-input-auto-claim-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        let decision = state
+            .route_incoming_input_frame(
+                &peer_id,
+                InputFrame {
+                    source_peer_id: peer_id.clone(),
+                    sequence: 1,
+                    timestamp_unix_ms: 1,
+                    events: vec![InputEvent::MouseMove { dx: 1, dy: 1 }],
+                },
+            )
+            .await
+            .expect("route");
+        assert!(matches!(decision, RouteDecision::Applied { .. }));
+        assert_eq!(state.input_owner().await.as_deref(), Some(peer_id.as_str()));
+
+        let incoming = state
+            .transport_events()
+            .await
+            .into_iter()
+            .find(|event| event.kind == "input_frame" && event.direction == "incoming")
+            .expect("incoming event");
+        assert!(incoming.detail.contains("auto_claimed_owner=true"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn route_incoming_input_frame_auto_steals_owner_when_mismatched() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-input-auto-steal-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_a, _) = state.create_pairing_code(120).await;
+        let peer_a = state
+            .join_peer(
+                code_a,
+                "127.0.0.1:15100".to_string(),
+                Some("peer-a".to_string()),
+            )
+            .await
+            .expect("join peer-a");
+        let (code_b, _) = state.create_pairing_code(120).await;
+        let peer_b = state
+            .join_peer(
+                code_b,
+                "127.0.0.1:15101".to_string(),
+                Some("peer-b".to_string()),
+            )
+            .await
+            .expect("join peer-b");
+
+        assert!(
+            state
+                .claim_input_owner(&peer_a, false)
+                .await
+                .expect("claim")
+        );
+        assert_eq!(state.input_owner().await.as_deref(), Some(peer_a.as_str()));
+
+        let decision = state
+            .route_incoming_input_frame(
+                &peer_b,
+                InputFrame {
+                    source_peer_id: peer_b.clone(),
+                    sequence: 1,
+                    timestamp_unix_ms: 2,
+                    events: vec![InputEvent::MouseMove { dx: 2, dy: 2 }],
+                },
+            )
+            .await
+            .expect("route");
+        assert!(matches!(decision, RouteDecision::Applied { .. }));
+        assert_eq!(state.input_owner().await.as_deref(), Some(peer_b.as_str()));
+
+        let incoming = state
+            .transport_events()
+            .await
+            .into_iter()
+            .find(|event| {
+                event.kind == "input_frame"
+                    && event.direction == "incoming"
+                    && event.peer_id == peer_b
+            })
+            .expect("incoming event");
+        assert!(incoming.detail.contains("auto_claimed_owner=true"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
