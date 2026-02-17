@@ -103,9 +103,7 @@ async fn drain_pending_inject_frames(state: &AppState, backend: &mut dyn InputBa
                     &frame.peer_id,
                     frame.sequence,
                     frame.events.len(),
-                    frame.capture_timestamp_unix_ms,
-                    frame.received_timestamp_unix_ms,
-                    frame.queued_timestamp_unix_ms,
+                    frame.timing(),
                     "owner_or_feature_changed",
                 )
                 .await;
@@ -119,9 +117,7 @@ async fn drain_pending_inject_frames(state: &AppState, backend: &mut dyn InputBa
                         &frame.peer_id,
                         frame.sequence,
                         frame.events.len(),
-                        frame.capture_timestamp_unix_ms,
-                        frame.received_timestamp_unix_ms,
-                        frame.queued_timestamp_unix_ms,
+                        frame.timing(),
                     )
                     .await;
             }
@@ -132,9 +128,7 @@ async fn drain_pending_inject_frames(state: &AppState, backend: &mut dyn InputBa
                         &frame.peer_id,
                         frame.sequence,
                         frame.events.len(),
-                        frame.capture_timestamp_unix_ms,
-                        frame.received_timestamp_unix_ms,
-                        frame.queued_timestamp_unix_ms,
+                        frame.timing(),
                         &message,
                     )
                     .await;

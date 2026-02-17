@@ -73,6 +73,13 @@ pub struct PendingRemoteClipboardPayload {
     pub hash: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct InputFrameTiming {
+    pub capture_timestamp_unix_ms: i64,
+    pub received_timestamp_unix_ms: i64,
+    pub queued_timestamp_unix_ms: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingInjectInputFrame {
     pub peer_id: String,
@@ -81,6 +88,16 @@ pub struct PendingInjectInputFrame {
     pub received_timestamp_unix_ms: i64,
     pub queued_timestamp_unix_ms: i64,
     pub events: Vec<InputEvent>,
+}
+
+impl PendingInjectInputFrame {
+    pub fn timing(&self) -> InputFrameTiming {
+        InputFrameTiming {
+            capture_timestamp_unix_ms: self.capture_timestamp_unix_ms,
+            received_timestamp_unix_ms: self.received_timestamp_unix_ms,
+            queued_timestamp_unix_ms: self.queued_timestamp_unix_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1269,12 +1286,16 @@ impl AppState {
         sequence: u64,
         event_count: usize,
         depth: usize,
-        capture_timestamp_unix_ms: i64,
-        received_timestamp_unix_ms: i64,
-        queued_timestamp_unix_ms: i64,
+        timing: InputFrameTiming,
     ) {
-        let capture_to_queue_ms = elapsed_ms(capture_timestamp_unix_ms, queued_timestamp_unix_ms);
-        let receive_to_queue_ms = elapsed_ms(received_timestamp_unix_ms, queued_timestamp_unix_ms);
+        let capture_to_queue_ms = elapsed_ms(
+            timing.capture_timestamp_unix_ms,
+            timing.queued_timestamp_unix_ms,
+        );
+        let receive_to_queue_ms = elapsed_ms(
+            timing.received_timestamp_unix_ms,
+            timing.queued_timestamp_unix_ms,
+        );
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
             direction: "local".to_string(),
@@ -1315,9 +1336,7 @@ impl AppState {
         peer_id: &str,
         sequence: u64,
         event_count: usize,
-        capture_timestamp_unix_ms: i64,
-        received_timestamp_unix_ms: i64,
-        queued_timestamp_unix_ms: i64,
+        timing: InputFrameTiming,
         reason: &str,
     ) {
         let now_ms = Utc::now().timestamp_millis();
@@ -1328,9 +1347,9 @@ impl AppState {
             peer_id: peer_id.to_string(),
             detail: format!(
                 "sequence={sequence} reason={reason} queue_wait_ms={} capture_to_skip_ms={} receive_to_skip_ms={}",
-                elapsed_ms(queued_timestamp_unix_ms, now_ms),
-                elapsed_ms(capture_timestamp_unix_ms, now_ms),
-                elapsed_ms(received_timestamp_unix_ms, now_ms)
+                elapsed_ms(timing.queued_timestamp_unix_ms, now_ms),
+                elapsed_ms(timing.capture_timestamp_unix_ms, now_ms),
+                elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
         })
@@ -1365,12 +1384,17 @@ impl AppState {
 
         if matches!(decision, RouteDecision::Applied { .. }) {
             let queued_timestamp_unix_ms = Utc::now().timestamp_millis();
-            let pending = PendingInjectInputFrame {
-                peer_id: peer_id.to_string(),
-                sequence: frame.sequence,
+            let timing = InputFrameTiming {
                 capture_timestamp_unix_ms: frame.timestamp_unix_ms,
                 received_timestamp_unix_ms,
                 queued_timestamp_unix_ms,
+            };
+            let pending = PendingInjectInputFrame {
+                peer_id: peer_id.to_string(),
+                sequence: frame.sequence,
+                capture_timestamp_unix_ms: timing.capture_timestamp_unix_ms,
+                received_timestamp_unix_ms: timing.received_timestamp_unix_ms,
+                queued_timestamp_unix_ms: timing.queued_timestamp_unix_ms,
                 events: sink.events,
             };
             let (depth, dropped) = self.enqueue_pending_inject_input_frame(pending).await;
@@ -1388,9 +1412,7 @@ impl AppState {
                 frame.sequence,
                 frame.events.len(),
                 depth,
-                frame.timestamp_unix_ms,
-                received_timestamp_unix_ms,
-                queued_timestamp_unix_ms,
+                timing,
             )
             .await;
         }
@@ -1430,9 +1452,7 @@ impl AppState {
         peer_id: &str,
         sequence: u64,
         event_count: usize,
-        capture_timestamp_unix_ms: i64,
-        received_timestamp_unix_ms: i64,
-        queued_timestamp_unix_ms: i64,
+        timing: InputFrameTiming,
     ) {
         let now_ms = Utc::now().timestamp_millis();
         self.record_transport_event(TransportEventRecord {
@@ -1442,9 +1462,9 @@ impl AppState {
             peer_id: peer_id.to_string(),
             detail: format!(
                 "sequence={sequence} queue_wait_ms={} capture_to_apply_ms={} receive_to_apply_ms={}",
-                elapsed_ms(queued_timestamp_unix_ms, now_ms),
-                elapsed_ms(capture_timestamp_unix_ms, now_ms),
-                elapsed_ms(received_timestamp_unix_ms, now_ms)
+                elapsed_ms(timing.queued_timestamp_unix_ms, now_ms),
+                elapsed_ms(timing.capture_timestamp_unix_ms, now_ms),
+                elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
         })
@@ -1456,9 +1476,7 @@ impl AppState {
         peer_id: &str,
         sequence: u64,
         event_count: usize,
-        capture_timestamp_unix_ms: i64,
-        received_timestamp_unix_ms: i64,
-        queued_timestamp_unix_ms: i64,
+        timing: InputFrameTiming,
         message: &str,
     ) {
         let now_ms = Utc::now().timestamp_millis();
@@ -1469,9 +1487,9 @@ impl AppState {
             peer_id: peer_id.to_string(),
             detail: format!(
                 "sequence={sequence} queue_wait_ms={} capture_to_fail_ms={} receive_to_fail_ms={} {message}",
-                elapsed_ms(queued_timestamp_unix_ms, now_ms),
-                elapsed_ms(capture_timestamp_unix_ms, now_ms),
-                elapsed_ms(received_timestamp_unix_ms, now_ms)
+                elapsed_ms(timing.queued_timestamp_unix_ms, now_ms),
+                elapsed_ms(timing.capture_timestamp_unix_ms, now_ms),
+                elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
         })
