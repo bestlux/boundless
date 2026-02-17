@@ -21,7 +21,7 @@ use crate::state::{AppState, CaptureHandoffTarget, PendingInjectInputFrame, Tran
 
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{LPARAM, LRESULT, POINT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
         Input::KeyboardAndMouse::{
@@ -32,13 +32,18 @@ use windows_sys::Win32::{
             MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW,
             SendInput,
         },
+        Input::{
+            GetRawInputData, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK,
+            RIM_TYPEMOUSE, RegisterRawInputDevices,
+        },
         WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, HC_ACTION, HHOOK,
-            KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PostThreadMessageW, SetWindowsHookExW,
-            TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
-            WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
-            WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
+            CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetCursorPos,
+            GetMessageW, HC_ACTION, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
+            PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+            WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+            WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+            WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+            WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
         },
     },
 };
@@ -49,6 +54,14 @@ const EDGE_PRESSURE_THRESHOLD: i32 = 300;
 const ESCAPE_EDGE_RECAPTURE_SUPPRESS_MS: u64 = 600;
 #[cfg(windows)]
 const ESCAPE_DOUBLE_CTRL_WINDOW_MS: u64 = 400;
+#[cfg(windows)]
+const RAW_INPUT_USAGE_PAGE_GENERIC: u16 = 0x01;
+#[cfg(windows)]
+const RAW_INPUT_USAGE_MOUSE: u16 = 0x02;
+#[cfg(windows)]
+const STATIC_WINDOW_CLASS_NAME: [u16; 7] = [83, 84, 65, 84, 73, 67, 0];
+#[cfg(windows)]
+const EMPTY_WINDOW_NAME: [u16; 1] = [0];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureControlAction {
@@ -77,6 +90,14 @@ async fn run(state: AppState) -> Result<()> {
     state
         .set_input_lock_runtime(false, capture_backend.lock_supported())
         .await;
+    let mut capture_backend_mode = capture_backend.backend_mode();
+    record_local_input_runtime_event(
+        &state,
+        "input_capture_backend_mode",
+        capture_backend_mode,
+        "none",
+    )
+    .await;
     let mut inject_ticker = time::interval(INPUT_TICK);
     let mut capture_ticker = time::interval(INPUT_CAPTURE_TICK);
     let mut last_capture_target: Option<String> = None;
@@ -95,6 +116,17 @@ async fn run(state: AppState) -> Result<()> {
                     &mut edge_switch_state,
                 )
                 .await;
+                let next_mode = capture_backend.backend_mode();
+                if next_mode != capture_backend_mode {
+                    capture_backend_mode = next_mode;
+                    record_local_input_runtime_event(
+                        &state,
+                        "input_capture_backend_mode",
+                        capture_backend_mode,
+                        "none",
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -494,6 +526,7 @@ trait InputCaptureBackend: Send {
     fn drain_control_actions(&mut self) -> Vec<CaptureControlAction>;
     fn set_lock_active(&mut self, active: bool) -> Result<bool>;
     fn lock_supported(&self) -> bool;
+    fn backend_mode(&self) -> &'static str;
 }
 
 fn input_backend() -> Box<dyn InputBackend> {
@@ -564,6 +597,10 @@ impl InputCaptureBackend for NoopCaptureBackend {
 
     fn lock_supported(&self) -> bool {
         false
+    }
+
+    fn backend_mode(&self) -> &'static str {
+        "noop"
     }
 }
 
@@ -693,11 +730,16 @@ impl InputCaptureBackend for WindowsPollingCaptureBackend {
     fn lock_supported(&self) -> bool {
         false
     }
+
+    fn backend_mode(&self) -> &'static str {
+        "polling"
+    }
 }
 
 #[cfg(windows)]
 #[derive(Debug, Clone)]
 enum HookCaptureEvent {
+    MouseDelta { dx: i32, dy: i32 },
     MousePosition { x: i32, y: i32 },
     Input(InputEvent),
     Control(CaptureControlAction),
@@ -708,6 +750,9 @@ struct WindowsHookCaptureBackend {
     event_rx: mpsc::Receiver<HookCaptureEvent>,
     hook_thread_id: u32,
     hook_thread: Option<JoinHandle<()>>,
+    raw_input_thread_id: Option<u32>,
+    raw_input_thread: Option<JoinHandle<()>>,
+    raw_input_enabled: bool,
     lock_active: bool,
     control_actions: VecDeque<CaptureControlAction>,
     last_cursor: Option<(i32, i32)>,
@@ -761,11 +806,25 @@ impl WindowsHookCaptureBackend {
         });
 
         let hook_thread_id = startup_rx.recv().context("hook startup channel closed")??;
+        let (raw_input_thread_id, raw_input_thread, raw_input_enabled) =
+            match spawn_raw_input_thread() {
+                Ok((thread_id, thread)) => (Some(thread_id), Some(thread), true),
+                Err(error) => {
+                    warn!(
+                        error = ?error,
+                        "raw input mouse capture unavailable; falling back to mouse hook position deltas"
+                    );
+                    (None, None, false)
+                }
+            };
 
         Ok(Self {
             event_rx,
             hook_thread_id,
             hook_thread: Some(hook_thread),
+            raw_input_thread_id,
+            raw_input_thread,
+            raw_input_enabled,
             lock_active: false,
             control_actions: VecDeque::new(),
             last_cursor: None,
@@ -802,6 +861,28 @@ impl WindowsHookCaptureBackend {
             InputEvent::MouseMove { .. } | InputEvent::MouseWheel { .. } => output.push(event),
         }
     }
+
+    fn update_raw_input_runtime_state(&mut self) {
+        if !self.raw_input_enabled {
+            return;
+        }
+
+        let finished = self
+            .raw_input_thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished());
+        if !finished {
+            return;
+        }
+
+        if let Some(thread) = self.raw_input_thread.take() {
+            let _ = thread.join();
+        }
+        self.raw_input_thread_id = None;
+        self.raw_input_enabled = false;
+        self.last_cursor = None;
+        warn!("raw input capture thread exited; using mouse hook position delta fallback");
+    }
 }
 
 #[cfg(windows)]
@@ -811,6 +892,16 @@ impl Drop for WindowsHookCaptureBackend {
             let _ = set_hook_lock_active(false);
             self.lock_active = false;
         }
+        if let Some(thread_id) = self.raw_input_thread_id {
+            unsafe {
+                let _ = PostThreadMessageW(thread_id, WM_QUIT, 0, 0);
+            }
+        }
+        if let Some(thread) = self.raw_input_thread.take() {
+            let _ = thread.join();
+        }
+        self.raw_input_thread_id = None;
+        self.raw_input_enabled = false;
         unsafe {
             let _ = PostThreadMessageW(self.hook_thread_id, WM_QUIT, 0, 0);
         }
@@ -865,16 +956,29 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
     }
 
     fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
+        self.update_raw_input_runtime_state();
+
         let mut output = Vec::new();
+        let mut fallback_mouse_moves = Vec::new();
+        let mut raw_dx = 0i32;
+        let mut raw_dy = 0i32;
+        let mut saw_raw_delta = false;
 
         for event in self.drain_pending_events() {
             match event {
+                HookCaptureEvent::MouseDelta { dx, dy } => {
+                    if self.raw_input_enabled {
+                        raw_dx = raw_dx.saturating_add(dx);
+                        raw_dy = raw_dy.saturating_add(dy);
+                        saw_raw_delta = true;
+                    }
+                }
                 HookCaptureEvent::MousePosition { x, y } => {
                     if let Some((last_x, last_y)) = self.last_cursor {
                         let dx = x - last_x;
                         let dy = y - last_y;
                         if dx != 0 || dy != 0 {
-                            output.push(InputEvent::MouseMove { dx, dy });
+                            fallback_mouse_moves.push(InputEvent::MouseMove { dx, dy });
                         }
                     }
                     self.last_cursor = Some((x, y));
@@ -886,6 +990,17 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
                     self.control_actions.push_back(action);
                 }
             }
+        }
+
+        if self.raw_input_enabled && saw_raw_delta {
+            if raw_dx != 0 || raw_dy != 0 {
+                output.push(InputEvent::MouseMove {
+                    dx: raw_dx,
+                    dy: raw_dy,
+                });
+            }
+        } else if !fallback_mouse_moves.is_empty() {
+            output.extend(fallback_mouse_moves);
         }
 
         Ok(output)
@@ -905,6 +1020,14 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
 
     fn lock_supported(&self) -> bool {
         true
+    }
+
+    fn backend_mode(&self) -> &'static str {
+        if self.raw_input_enabled {
+            "hook_raw"
+        } else {
+            "hook"
+        }
     }
 }
 
@@ -1155,6 +1278,183 @@ fn update_escape_state_for_key(vk_code: u16, key_state: core_input::KeyState) ->
     }
 
     false
+}
+
+#[cfg(windows)]
+fn spawn_raw_input_thread() -> Result<(u32, JoinHandle<()>)> {
+    let (startup_tx, startup_rx) = mpsc::channel::<Result<u32>>();
+    let thread = thread::spawn(move || {
+        let thread_id = unsafe { GetCurrentThreadId() };
+        let hwnd = match create_raw_input_window() {
+            Ok(hwnd) => hwnd,
+            Err(error) => {
+                let _ = startup_tx.send(Err(error));
+                return;
+            }
+        };
+
+        if let Err(error) = register_raw_input_mouse_device(hwnd) {
+            let _ = startup_tx.send(Err(error));
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            return;
+        }
+
+        let _ = startup_tx.send(Ok(thread_id));
+        unsafe {
+            run_raw_input_message_loop();
+            let _ = DestroyWindow(hwnd);
+        }
+    });
+
+    let thread_id = match startup_rx.recv() {
+        Ok(Ok(thread_id)) => thread_id,
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = thread.join();
+            return Err(anyhow::anyhow!("raw input startup channel closed"));
+        }
+    };
+
+    Ok((thread_id, thread))
+}
+
+#[cfg(windows)]
+fn create_raw_input_window() -> Result<HWND> {
+    let module = unsafe { GetModuleHandleW(std::ptr::null()) };
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            STATIC_WINDOW_CLASS_NAME.as_ptr(),
+            EMPTY_WINDOW_NAME.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            std::ptr::null_mut(),
+            module,
+            std::ptr::null(),
+        )
+    };
+    if hwnd.is_null() {
+        return Err(std::io::Error::last_os_error()).context("CreateWindowExW raw input window");
+    }
+    Ok(hwnd)
+}
+
+#[cfg(windows)]
+fn register_raw_input_mouse_device(hwnd: HWND) -> Result<()> {
+    let devices = [RAWINPUTDEVICE {
+        usUsagePage: RAW_INPUT_USAGE_PAGE_GENERIC,
+        usUsage: RAW_INPUT_USAGE_MOUSE,
+        dwFlags: RIDEV_INPUTSINK,
+        hwndTarget: hwnd,
+    }];
+    let ok = unsafe {
+        RegisterRawInputDevices(
+            devices.as_ptr(),
+            devices.len() as u32,
+            std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error()).context("RegisterRawInputDevices mouse");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+unsafe fn run_raw_input_message_loop() {
+    let mut warned_once = false;
+    let mut msg = MSG::default();
+    loop {
+        let result = unsafe { GetMessageW(&mut msg as *mut MSG, std::ptr::null_mut(), 0, 0) };
+        if result <= 0 {
+            break;
+        }
+
+        if msg.message == WM_INPUT {
+            match process_raw_input_message(msg.lParam) {
+                Ok(()) => warned_once = false,
+                Err(error) => {
+                    if !warned_once {
+                        warn!(error = ?error, "raw input message processing failed");
+                        warned_once = true;
+                    }
+                }
+            }
+            continue;
+        }
+
+        unsafe {
+            TranslateMessage(&msg as *const MSG);
+            DispatchMessageW(&msg as *const MSG);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn process_raw_input_message(lparam: LPARAM) -> Result<()> {
+    if !is_hook_lock_active() {
+        return Ok(());
+    }
+
+    let hrawinput = lparam as *mut core::ffi::c_void;
+    let header_size = std::mem::size_of::<RAWINPUTHEADER>() as u32;
+    let mut raw_size = 0u32;
+    let query_size = unsafe {
+        GetRawInputData(
+            hrawinput,
+            RID_INPUT,
+            std::ptr::null_mut(),
+            &mut raw_size as *mut u32,
+            header_size,
+        )
+    };
+    if query_size == u32::MAX {
+        return Err(std::io::Error::last_os_error()).context("GetRawInputData query size");
+    }
+    if raw_size < header_size {
+        return Ok(());
+    }
+
+    let mut buffer = vec![0u8; raw_size as usize];
+    let read_size = unsafe {
+        GetRawInputData(
+            hrawinput,
+            RID_INPUT,
+            buffer.as_mut_ptr().cast(),
+            &mut raw_size as *mut u32,
+            header_size,
+        )
+    };
+    if read_size == u32::MAX {
+        return Err(std::io::Error::last_os_error()).context("GetRawInputData read payload");
+    }
+    if read_size < header_size {
+        return Ok(());
+    }
+
+    let raw = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<RAWINPUT>()) };
+    if raw.header.dwType != RIM_TYPEMOUSE {
+        return Ok(());
+    }
+
+    let mouse = unsafe { raw.data.mouse };
+    if mouse.lLastX != 0 || mouse.lLastY != 0 {
+        send_hook_event(HookCaptureEvent::MouseDelta {
+            dx: mouse.lLastX,
+            dy: mouse.lLastY,
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1602,6 +1902,10 @@ mod tests {
 
         fn lock_supported(&self) -> bool {
             self.lock_supported
+        }
+
+        fn backend_mode(&self) -> &'static str {
+            "scripted"
         }
     }
 

@@ -28,6 +28,7 @@
 - Runtime clipboard image sync is active in daemon for BMP payloads; diagnostics `transport send-image <peer_id> <path.bmp>` is available as an explicit test hook
 - Runtime input injection queue is active in daemon; on Windows, queued input events are applied via `SendInput`
 - Runtime input capture target control-plane is active in daemon; on Windows, low-level keyboard/mouse hooks (including wheel/hwheel) enqueue outbound input frames for the selected target peer (polling fallback retained)
+- Runtime input capture backend emits local transport telemetry `kind=input_capture_backend_mode` (`detail=hook_raw|hook|polling|noop`) so smoke and troubleshooting can confirm effective capture mode/fallback
 - Runtime input capture now supports layout-driven edge handoff (easy mouse + wrap mouse policy aware) when layout tokens resolve local + connected peer neighbors
 - Runtime hotkey loop is active on Windows and executes configured actions on combo press edge (`toggle_easy_mouse`, `reconnect`, `lock_machine`, `switch_all`)
 - Diagnostics action trigger helper is available for deterministic validation without physical key presses: `diagnostics run-action <toggle_easy_mouse|switch_all|reconnect>`
