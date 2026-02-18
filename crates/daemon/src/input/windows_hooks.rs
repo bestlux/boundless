@@ -1,5 +1,11 @@
 use super::*;
 
+const XBUTTON1_DATA: u16 = 0x0001;
+const XBUTTON2_DATA: u16 = 0x0002;
+const LLKHF_EXTENDED_MASK: u32 = 0x01;
+const LLKHF_INJECTED_MASK: u32 = 0x10;
+const LLMHF_INJECTED_MASK: u32 = 0x0000_0001;
+
 pub(super) unsafe fn install_keyboard_hook() -> Result<HHOOK> {
     let module = unsafe { GetModuleHandleW(std::ptr::null()) };
     let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), module, 0) };
