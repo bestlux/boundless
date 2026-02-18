@@ -45,5 +45,3 @@ impl FeatureService for FeatureApi {
         }))
     }
 }
-
-

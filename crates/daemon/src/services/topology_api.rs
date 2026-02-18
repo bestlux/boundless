@@ -67,5 +67,3 @@ impl TopologyService for TopologyApi {
         }))
     }
 }
-
-

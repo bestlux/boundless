@@ -85,19 +85,17 @@ mod windows_inject;
 #[cfg(windows)]
 mod windows_raw_input;
 
+#[cfg(test)]
+use edge_switch::{edge_switch_direction_from_motion, handoff_anchor_event};
 use edge_switch::{
     filter_edge_start_replay_events, local_virtual_screen_bounds,
     maybe_handoff_capture_target_from_motion, unix_now_ms,
 };
-#[cfg(test)]
-use edge_switch::{edge_switch_direction_from_motion, handoff_anchor_event};
-use runtime::{
-    record_local_input_runtime_event, run,
-};
-#[cfg(test)]
-use runtime::{capture_and_queue_outgoing_frames, drain_pending_inject_frames};
 #[cfg(all(test, not(windows)))]
 use runtime::apply_frame;
+#[cfg(test)]
+use runtime::{capture_and_queue_outgoing_frames, drain_pending_inject_frames};
+use runtime::{record_local_input_runtime_event, run};
 #[cfg(windows)]
 use windows_hook_runtime::{
     HookSenderGuard, captured_key_virtual_keys, is_hook_lock_active, mouse_button_from_virtual_key,
@@ -106,19 +104,19 @@ use windows_hook_runtime::{
 };
 #[cfg(windows)]
 use windows_hooks::{install_keyboard_hook, install_mouse_hook, run_hook_message_loop};
-#[cfg(windows)]
-use windows_inject::{
-    cursor_position, high_word, input_event_kind, input_records_for_event, is_virtual_key_down, send_input_records,
-    signed_high_word, vk_to_scan_code,
-};
 #[cfg(test)]
 #[cfg(windows)]
 use windows_inject::send_input_records_with_sender;
 #[cfg(windows)]
-use windows_raw_input::spawn_raw_input_thread;
+use windows_inject::{
+    cursor_position, high_word, input_event_kind, input_records_for_event, is_virtual_key_down,
+    send_input_records, signed_high_word, vk_to_scan_code,
+};
 #[cfg(test)]
 #[cfg(windows)]
 use windows_raw_input::raw_mouse_relative_delta;
+#[cfg(windows)]
+use windows_raw_input::spawn_raw_input_thread;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureControlAction {

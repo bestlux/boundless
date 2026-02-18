@@ -182,7 +182,11 @@ pub(super) async fn pair_pending(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn pair_approve(endpoint: &str, request_id: String, alias: Option<String>) -> Result<()> {
+pub(super) async fn pair_approve(
+    endpoint: &str,
+    request_id: String,
+    alias: Option<String>,
+) -> Result<()> {
     let mut client = PairingServiceClient::new(channel(endpoint).await?);
     let response = client
         .approve_nearby_pairing_request(NearbyPairingDecisionRequest {
@@ -233,7 +237,11 @@ pub(super) async fn pair_export_trust(endpoint: &str, output: Option<String>) ->
     Ok(())
 }
 
-pub(super) async fn pair_import_trust(endpoint: &str, input: String, alias: Option<String>) -> Result<()> {
+pub(super) async fn pair_import_trust(
+    endpoint: &str,
+    input: String,
+    alias: Option<String>,
+) -> Result<()> {
     let raw = std::fs::read_to_string(&input).with_context(|| format!("read {input}"))?;
     let bundle: StoredTrustBundle = serde_json::from_str(&raw).context("parse trust bundle")?;
 
@@ -341,7 +349,11 @@ pub(super) async fn hotkey_set(endpoint: &str, action: String, combo: String) ->
     Ok(())
 }
 
-pub(super) async fn transport_send_text(endpoint: &str, peer_id: String, text: String) -> Result<()> {
+pub(super) async fn transport_send_text(
+    endpoint: &str,
+    peer_id: String,
+    text: String,
+) -> Result<()> {
     let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
     let response = client
         .send_clipboard_text(SendClipboardTextRequest { peer_id, text })
@@ -352,7 +364,11 @@ pub(super) async fn transport_send_text(endpoint: &str, peer_id: String, text: S
     Ok(())
 }
 
-pub(super) async fn transport_send_image(endpoint: &str, peer_id: String, path: String) -> Result<()> {
+pub(super) async fn transport_send_image(
+    endpoint: &str,
+    peer_id: String,
+    path: String,
+) -> Result<()> {
     let image_bmp = std::fs::read(&path).with_context(|| format!("read {path}"))?;
     validate_bmp_payload(&image_bmp).with_context(|| format!("invalid BMP payload at {path}"))?;
 
@@ -366,7 +382,11 @@ pub(super) async fn transport_send_image(endpoint: &str, peer_id: String, path: 
     Ok(())
 }
 
-pub(super) async fn transport_send_file(endpoint: &str, peer_id: String, path: String) -> Result<()> {
+pub(super) async fn transport_send_file(
+    endpoint: &str,
+    peer_id: String,
+    path: String,
+) -> Result<()> {
     let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
     let response = client
         .send_file(SendFileRequest {
@@ -485,7 +505,12 @@ pub(super) async fn input_capture_stop(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn input_send_move(endpoint: &str, peer_id: String, dx: i32, dy: i32) -> Result<()> {
+pub(super) async fn input_send_move(
+    endpoint: &str,
+    peer_id: String,
+    dx: i32,
+    dy: i32,
+) -> Result<()> {
     let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
     let response = client
         .send_input_move(SendInputMoveRequest { peer_id, dx, dy })
@@ -593,5 +618,3 @@ pub(super) async fn safe_reset(endpoint: &str, network_only: bool, all: bool) ->
     println!("ok={} message={}", response.ok, response.message);
     Ok(())
 }
-
-

@@ -158,5 +158,3 @@ pub(super) fn outbound_target_candidates(
 
     targets
 }
-
-

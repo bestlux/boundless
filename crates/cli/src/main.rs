@@ -1021,7 +1021,6 @@ fn pipe_path_from_name(name: &str) -> Result<String> {
     Ok(format!(r"\\.\pipe\{trimmed}"))
 }
 
-
 #[cfg(windows)]
 #[derive(Clone)]
 struct NamedPipeConnector {

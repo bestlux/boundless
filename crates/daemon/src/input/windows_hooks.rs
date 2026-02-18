@@ -161,5 +161,3 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
-
-

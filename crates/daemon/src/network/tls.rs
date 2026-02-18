@@ -116,7 +116,10 @@ pub(super) fn parse_server_name(address: &str) -> Result<ServerName<'static>> {
     ServerName::try_from(host).context("parse server name")
 }
 
-pub(super) fn parse_server_name_for_peer(peer_id: &str, address: &str) -> Result<ServerName<'static>> {
+pub(super) fn parse_server_name_for_peer(
+    peer_id: &str,
+    address: &str,
+) -> Result<ServerName<'static>> {
     if !peer_id.trim().is_empty()
         && let Ok(server_name) = ServerName::try_from(peer_id.to_string())
     {

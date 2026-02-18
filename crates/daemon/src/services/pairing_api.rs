@@ -153,5 +153,3 @@ impl PairingService for PairingApi {
         }))
     }
 }
-
-
