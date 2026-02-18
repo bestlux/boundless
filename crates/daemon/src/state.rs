@@ -756,7 +756,7 @@ impl AppState {
         self.config.read().await.features.clone()
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(windows)]
     pub async fn hotkey_map(&self) -> std::collections::BTreeMap<String, String> {
         self.config.read().await.hotkeys.clone()
     }

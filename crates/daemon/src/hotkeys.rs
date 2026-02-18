@@ -13,9 +13,9 @@ use tracing::warn;
 
 use crate::state::AppState;
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const HOTKEY_TICK: Duration = Duration::from_millis(50);
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const HOTKEY_RELOAD_EVERY_TICKS: usize = 20;
 
 #[cfg(any(windows, test))]
