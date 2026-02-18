@@ -7,7 +7,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 #[cfg(windows)]
 use tokio::time;
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(any(windows, test))]
+use tracing::warn;
 
 use crate::state::AppState;
 
