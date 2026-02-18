@@ -33,6 +33,18 @@ use core_transfer::validate_transfer_size;
 
 use crate::state::{AppState, OutboundPayload};
 
+mod codec;
+mod tls;
+
+use codec::{
+    input_event_from_wire, input_events_to_wire_for_protocol, now_millis,
+    protocol_supports_clipboard_image, protocol_supports_input_anchor,
+};
+use tls::{
+    build_tls_acceptor, build_tls_connector, machine_id_from_presented_ca, parse_server_name,
+    parse_server_name_for_peer,
+};
+
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const OUTGOING_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
 const SUPERVISOR_TICK: Duration = Duration::from_secs(3);
@@ -813,32 +825,6 @@ async fn authenticated_peer_machine_id<S>(
     Ok(machine_id)
 }
 
-fn machine_id_from_presented_ca(
-    records: &[core_security::TrustRecord],
-    presented_ca: &CertificateDer<'_>,
-) -> Result<Option<String>> {
-    let mut matched_machine_id: Option<String> = None;
-
-    for record in records {
-        for cert in CertificateDer::pem_slice_iter(record.ca_cert_pem.as_bytes()) {
-            let cert = cert.context("parse trusted CA certificate")?;
-            if cert.as_ref() != presented_ca.as_ref() {
-                continue;
-            }
-
-            if let Some(existing) = &matched_machine_id {
-                if existing != &record.machine_id {
-                    bail!("presented CA certificate matched multiple machine records");
-                }
-            } else {
-                matched_machine_id = Some(record.machine_id.clone());
-            }
-        }
-    }
-
-    Ok(matched_machine_id)
-}
-
 async fn send_message<W>(writer: &mut W, message: &WireMessage) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -995,204 +981,6 @@ where
     }
 
     Ok(())
-}
-
-fn protocol_supports_clipboard_image(protocol: ProtocolVersion) -> bool {
-    protocol.as_tuple() >= PROTOCOL_CLIPBOARD_IMAGE_MIN.as_tuple()
-}
-
-fn protocol_supports_input_anchor(protocol: ProtocolVersion) -> bool {
-    protocol.as_tuple() >= PROTOCOL_INPUT_ANCHOR_MIN.as_tuple()
-}
-
-fn input_events_to_wire_for_protocol(
-    events: &[InputEvent],
-    remote_protocol: ProtocolVersion,
-) -> Vec<WireInputEvent> {
-    events
-        .iter()
-        .filter_map(|event| {
-            if matches!(event, InputEvent::MouseMoveAbsolute { .. })
-                && !protocol_supports_input_anchor(remote_protocol)
-            {
-                return None;
-            }
-            Some(input_event_to_wire(event))
-        })
-        .collect()
-}
-
-fn input_event_to_wire(event: &InputEvent) -> WireInputEvent {
-    match event {
-        InputEvent::MouseMove { dx, dy } => WireInputEvent::MouseMove { dx: *dx, dy: *dy },
-        InputEvent::MouseMoveAbsolute { x_norm, y_norm } => WireInputEvent::MouseMoveAbsolute {
-            x_norm: *x_norm,
-            y_norm: *y_norm,
-        },
-        InputEvent::MouseButton { button, state } => WireInputEvent::MouseButton {
-            button: match button {
-                MouseButton::Left => WireMouseButton::Left,
-                MouseButton::Right => WireMouseButton::Right,
-                MouseButton::Middle => WireMouseButton::Middle,
-                MouseButton::X1 => WireMouseButton::X1,
-                MouseButton::X2 => WireMouseButton::X2,
-            },
-            state: match state {
-                KeyState::Down => WireKeyState::Down,
-                KeyState::Up => WireKeyState::Up,
-            },
-        },
-        InputEvent::MouseWheel { delta_x, delta_y } => WireInputEvent::MouseWheel {
-            delta_x: *delta_x,
-            delta_y: *delta_y,
-        },
-        InputEvent::Key { scan_code, state } => WireInputEvent::Key {
-            scan_code: *scan_code,
-            state: match state {
-                KeyState::Down => WireKeyState::Down,
-                KeyState::Up => WireKeyState::Up,
-            },
-        },
-    }
-}
-
-fn input_event_from_wire(event: WireInputEvent) -> InputEvent {
-    match event {
-        WireInputEvent::MouseMove { dx, dy } => InputEvent::MouseMove { dx, dy },
-        WireInputEvent::MouseMoveAbsolute { x_norm, y_norm } => {
-            InputEvent::MouseMoveAbsolute { x_norm, y_norm }
-        }
-        WireInputEvent::MouseButton { button, state } => InputEvent::MouseButton {
-            button: match button {
-                WireMouseButton::Left => MouseButton::Left,
-                WireMouseButton::Right => MouseButton::Right,
-                WireMouseButton::Middle => MouseButton::Middle,
-                WireMouseButton::X1 => MouseButton::X1,
-                WireMouseButton::X2 => MouseButton::X2,
-            },
-            state: match state {
-                WireKeyState::Down => KeyState::Down,
-                WireKeyState::Up => KeyState::Up,
-            },
-        },
-        WireInputEvent::MouseWheel { delta_x, delta_y } => {
-            InputEvent::MouseWheel { delta_x, delta_y }
-        }
-        WireInputEvent::Key { scan_code, state } => InputEvent::Key {
-            scan_code,
-            state: match state {
-                WireKeyState::Down => KeyState::Down,
-                WireKeyState::Up => KeyState::Up,
-            },
-        },
-    }
-}
-
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-async fn build_tls_acceptor(state: &AppState) -> Result<TlsAcceptor> {
-    let identity = state.identity().clone();
-    let trusted = state.trusted_records().await?;
-    let roots = build_root_store(&trusted)?;
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-        .build()
-        .context("build client verifier")?;
-
-    let cert_chain = build_presented_cert_chain(&identity)?;
-    let private_key = parse_private_key(&identity.device_key_pem)?;
-
-    let server = ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(cert_chain, private_key)
-        .context("build server tls config")?;
-
-    Ok(TlsAcceptor::from(Arc::new(server)))
-}
-
-async fn build_tls_connector(state: &AppState) -> Result<TlsConnector> {
-    let identity = state.identity().clone();
-    let trusted = state.trusted_records().await?;
-    let roots = build_root_store(&trusted)?;
-
-    let cert_chain = build_presented_cert_chain(&identity)?;
-    let private_key = parse_private_key(&identity.device_key_pem)?;
-
-    let client = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_client_auth_cert(cert_chain, private_key)
-        .context("build client tls config")?;
-
-    Ok(TlsConnector::from(Arc::new(client)))
-}
-
-fn build_root_store(records: &[core_security::TrustRecord]) -> Result<RootCertStore> {
-    let mut roots = RootCertStore::empty();
-
-    for record in records {
-        for cert in CertificateDer::pem_slice_iter(record.ca_cert_pem.as_bytes()) {
-            roots
-                .add(cert.context("parse trusted CA certificate")?)
-                .context("add trusted CA certificate")?;
-        }
-    }
-
-    Ok(roots)
-}
-
-fn parse_cert_chain(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
-    CertificateDer::pem_slice_iter(pem.as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .context("parse cert chain")
-}
-
-fn build_presented_cert_chain(
-    identity: &core_security::DeviceIdentity,
-) -> Result<Vec<CertificateDer<'static>>> {
-    let mut chain = parse_cert_chain(&identity.device_cert_pem)?;
-    let mut ca_chain = parse_cert_chain(&identity.ca_cert_pem)?;
-    chain.append(&mut ca_chain);
-    Ok(chain)
-}
-
-fn parse_private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
-    PrivateKeyDer::from_pem_slice(pem.as_bytes()).context("parse private key")
-}
-
-fn parse_server_name(address: &str) -> Result<ServerName<'static>> {
-    if let Ok(socket) = address.parse::<std::net::SocketAddr>() {
-        return ServerName::try_from(socket.ip().to_string())
-            .context("parse server name from socket address");
-    }
-
-    let host = if address.starts_with('[') {
-        address
-            .split(']')
-            .next()
-            .map(|s| s.trim_start_matches('[').to_string())
-            .unwrap_or_else(|| address.to_string())
-    } else {
-        address
-            .rsplit_once(':')
-            .map(|(host, _)| host.to_string())
-            .unwrap_or_else(|| address.to_string())
-    };
-
-    ServerName::try_from(host).context("parse server name")
-}
-
-fn parse_server_name_for_peer(peer_id: &str, address: &str) -> Result<ServerName<'static>> {
-    if !peer_id.trim().is_empty()
-        && let Ok(server_name) = ServerName::try_from(peer_id.to_string())
-    {
-        return Ok(server_name);
-    }
-
-    parse_server_name(address)
 }
 
 #[cfg(test)]
