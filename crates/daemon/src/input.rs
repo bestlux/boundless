@@ -71,6 +71,7 @@ const STATIC_WINDOW_CLASS_NAME: [u16; 7] = [83, 84, 65, 84, 73, 67, 0];
 #[cfg(windows)]
 const EMPTY_WINDOW_NAME: [u16; 1] = [0];
 
+mod backends;
 mod edge_switch;
 #[cfg(windows)]
 mod windows_hook_backend;
@@ -464,56 +465,11 @@ fn input_capture_backend() -> Box<dyn InputCaptureBackend> {
 struct NoopInputBackend;
 
 #[cfg(not(windows))]
-impl InputBackend for NoopInputBackend {
-    fn apply(&mut self, _event: &InputEvent) -> Result<()> {
-        Ok(())
-    }
-}
-
-#[cfg(not(windows))]
 struct NoopCaptureBackend;
-
-#[cfg(not(windows))]
-impl InputCaptureBackend for NoopCaptureBackend {
-    fn drain_release_events(&mut self) -> Vec<InputEvent> {
-        Vec::new()
-    }
-
-    fn reset(&mut self) {}
-
-    fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
-        Ok(Vec::new())
-    }
-
-    fn drain_control_actions(&mut self) -> Vec<CaptureControlAction> {
-        Vec::new()
-    }
-
-    fn set_lock_active(&mut self, _active: bool) -> Result<bool> {
-        Ok(false)
-    }
-
-    fn lock_supported(&self) -> bool {
-        false
-    }
-
-    fn backend_mode(&self) -> &'static str {
-        "noop"
-    }
-}
 
 #[cfg(windows)]
 #[derive(Default)]
 struct WindowsInputBackend;
-
-#[cfg(windows)]
-impl InputBackend for WindowsInputBackend {
-    fn apply(&mut self, event: &InputEvent) -> Result<()> {
-        let records = input_records_for_event(event);
-        send_input_records(&records)
-            .with_context(|| format!("SendInput failed for {}", input_event_kind(event)))
-    }
-}
 
 #[cfg(windows)]
 #[derive(Default)]
@@ -521,121 +477,6 @@ struct WindowsPollingCaptureBackend {
     last_cursor: Option<(i32, i32)>,
     last_key_down: HashMap<u16, bool>,
     last_button_down: HashMap<u16, bool>,
-}
-
-#[cfg(windows)]
-impl InputCaptureBackend for WindowsPollingCaptureBackend {
-    fn drain_release_events(&mut self) -> Vec<InputEvent> {
-        let mut events = Vec::new();
-
-        let mut pressed_buttons = self
-            .last_button_down
-            .iter()
-            .filter_map(|(vk, down)| if *down { Some(*vk) } else { None })
-            .collect::<Vec<_>>();
-        pressed_buttons.sort_unstable();
-        for vk in pressed_buttons {
-            if let Some(button) = mouse_button_from_virtual_key(vk) {
-                events.push(InputEvent::MouseButton {
-                    button,
-                    state: core_input::KeyState::Up,
-                });
-            }
-        }
-
-        let mut pressed_keys = self
-            .last_key_down
-            .iter()
-            .filter_map(|(vk, down)| if *down { Some(*vk) } else { None })
-            .collect::<Vec<_>>();
-        pressed_keys.sort_unstable();
-        for vk in pressed_keys {
-            if let Some(scan_code) = vk_to_scan_code(vk) {
-                events.push(InputEvent::Key {
-                    scan_code,
-                    state: core_input::KeyState::Up,
-                });
-            }
-        }
-
-        events
-    }
-
-    fn reset(&mut self) {
-        self.last_cursor = None;
-        self.last_key_down.clear();
-        self.last_button_down.clear();
-    }
-
-    fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
-        let mut events = Vec::new();
-
-        if let Some((x, y)) = cursor_position()? {
-            if let Some((last_x, last_y)) = self.last_cursor {
-                let dx = x - last_x;
-                let dy = y - last_y;
-                if dx != 0 || dy != 0 {
-                    events.push(InputEvent::MouseMove { dx, dy });
-                }
-            }
-            self.last_cursor = Some((x, y));
-        }
-
-        for (vk, button) in mouse_button_virtual_keys() {
-            let down = is_virtual_key_down(vk);
-            if let Some(last) = self.last_button_down.insert(vk, down)
-                && last != down
-            {
-                events.push(InputEvent::MouseButton {
-                    button,
-                    state: if down {
-                        core_input::KeyState::Down
-                    } else {
-                        core_input::KeyState::Up
-                    },
-                });
-            }
-        }
-
-        for &vk in captured_key_virtual_keys() {
-            let down = is_virtual_key_down(vk);
-            if let Some(last) = self.last_key_down.insert(vk, down)
-                && last != down
-                && let Some(scan_code) = vk_to_scan_code(vk)
-            {
-                events.push(InputEvent::Key {
-                    scan_code,
-                    state: if down {
-                        core_input::KeyState::Down
-                    } else {
-                        core_input::KeyState::Up
-                    },
-                });
-            }
-        }
-
-        Ok(events)
-    }
-
-    fn drain_control_actions(&mut self) -> Vec<CaptureControlAction> {
-        Vec::new()
-    }
-
-    fn set_lock_active(&mut self, _active: bool) -> Result<bool> {
-        Ok(false)
-    }
-
-    fn lock_supported(&self) -> bool {
-        false
-    }
-
-    fn backend_mode(&self) -> &'static str {
-        "polling"
-    }
-
-    fn cursor_position(&self) -> Option<(i32, i32)> {
-        self.last_cursor
-    }
 }
 
 #[cfg(windows)]
