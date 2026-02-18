@@ -1,21 +1,30 @@
+#[cfg(any(windows, test))]
 use std::{
     collections::{BTreeMap, HashSet},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+#[cfg(windows)]
 use tokio::time;
 use tracing::{info, warn};
 
 use crate::state::AppState;
 
+#[cfg(any(windows, test))]
 const HOTKEY_TICK: Duration = Duration::from_millis(50);
+#[cfg(any(windows, test))]
 const HOTKEY_RELOAD_EVERY_TICKS: usize = 20;
 
+#[cfg(any(windows, test))]
 const VK_SHIFT: u16 = 0x10;
+#[cfg(any(windows, test))]
 const VK_CONTROL: u16 = 0x11;
+#[cfg(any(windows, test))]
 const VK_ALT: u16 = 0x12;
+#[cfg(any(windows, test))]
 const VK_LWIN: u16 = 0x5B;
+#[cfg(any(windows, test))]
 const VK_RWIN: u16 = 0x5C;
 
 #[cfg(windows)]
@@ -52,6 +61,7 @@ impl HotkeyAction {
     }
 }
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KeyCombo {
     key: u16,
@@ -61,6 +71,7 @@ struct KeyCombo {
     require_win: bool,
 }
 
+#[cfg(any(windows, test))]
 impl KeyCombo {
     fn is_active<F>(self, key_down: F) -> bool
     where
@@ -83,18 +94,21 @@ impl KeyCombo {
     }
 }
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HotkeyBinding {
     action: HotkeyAction,
     combo: KeyCombo,
 }
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Default)]
 struct HotkeyEngine {
     bindings: Vec<HotkeyBinding>,
     active_actions: HashSet<HotkeyAction>,
 }
 
+#[cfg(any(windows, test))]
 impl HotkeyEngine {
     fn update_bindings(&mut self, hotkeys: &BTreeMap<String, String>) {
         let mut bindings = Vec::<HotkeyBinding>::new();
@@ -269,6 +283,7 @@ fn is_virtual_key_down(vk: u16) -> bool {
     (state as u16 & 0x8000) != 0
 }
 
+#[cfg(any(windows, test))]
 fn parse_key_combo(spec: &str) -> Result<Option<KeyCombo>> {
     let trimmed = spec.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("disabled") {
@@ -322,6 +337,7 @@ fn parse_key_combo(spec: &str) -> Result<Option<KeyCombo>> {
     }))
 }
 
+#[cfg(any(windows, test))]
 fn parse_primary_key_token(token: &str) -> Result<u16> {
     let upper = token.trim().to_ascii_uppercase();
 

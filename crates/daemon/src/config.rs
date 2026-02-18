@@ -267,8 +267,10 @@ mod tests {
         let path = root.join("config.json");
         std::fs::create_dir_all(&root).expect("create temp root");
 
-        let mut seed = RuntimeConfig::default();
-        seed.layout_matrix = LEGACY_LAYOUT_MATRIX_PLACEHOLDER.to_string();
+        let seed = RuntimeConfig {
+            layout_matrix: LEGACY_LAYOUT_MATRIX_PLACEHOLDER.to_string(),
+            ..RuntimeConfig::default()
+        };
         save_config_at(&path, &seed).expect("seed legacy config");
 
         let loaded = load_or_create_config_at(&path).expect("load config");
