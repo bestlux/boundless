@@ -622,9 +622,6 @@ impl AppState {
         config.hotkeys.insert(action, combo);
         save_config_at(&self.config_path, &config)
     }
-
-
-
 }
 
 fn validate_bind_address(bind: &str) -> Result<()> {

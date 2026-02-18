@@ -92,7 +92,10 @@ pub(super) async fn drain_pending_inject_frames(state: &AppState, backend: &mut 
     }
 }
 
-pub(super) fn apply_frame(backend: &mut dyn InputBackend, frame: &PendingInjectInputFrame) -> Result<()> {
+pub(super) fn apply_frame(
+    backend: &mut dyn InputBackend,
+    frame: &PendingInjectInputFrame,
+) -> Result<()> {
     for event in &frame.events {
         backend.apply(event)?;
     }

@@ -183,4 +183,3 @@ pub(super) fn raw_mouse_relative_delta(mouse: &RAWMOUSE) -> Option<(i32, i32)> {
     }
     Some((mouse.lLastX, mouse.lLastY))
 }
-

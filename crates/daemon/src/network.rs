@@ -37,19 +37,21 @@ mod codec;
 mod runtime;
 mod tls;
 
-use codec::{
-    input_event_from_wire, input_events_to_wire_for_protocol, now_millis, protocol_supports_clipboard_image,
-};
 #[cfg(test)]
 use codec::protocol_supports_input_anchor;
-use runtime::{listener_loop, supervisor_loop};
-#[cfg(test)]
-use runtime::outbound_target_candidates;
-use tls::{
-    build_tls_acceptor, build_tls_connector, machine_id_from_presented_ca, parse_server_name_for_peer,
+use codec::{
+    input_event_from_wire, input_events_to_wire_for_protocol, now_millis,
+    protocol_supports_clipboard_image,
 };
 #[cfg(test)]
+use runtime::outbound_target_candidates;
+use runtime::{listener_loop, supervisor_loop};
+#[cfg(test)]
 use tls::parse_server_name;
+use tls::{
+    build_tls_acceptor, build_tls_connector, machine_id_from_presented_ca,
+    parse_server_name_for_peer,
+};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const OUTGOING_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
@@ -74,7 +76,6 @@ pub fn start(state: AppState, listener: Option<TcpListener>) {
     }
     tokio::spawn(supervisor_loop(state));
 }
-
 
 pub async fn prepare_listener(state: &AppState) -> Option<TcpListener> {
     let configured_port = state.snapshot().await.network_port;
@@ -134,7 +135,6 @@ pub async fn prepare_listener(state: &AppState) -> Option<TcpListener> {
         }
     }
 }
-
 
 async fn connect_and_run_outbound(state: AppState, peer_id: &str, address: &str) -> Result<()> {
     let socket = TcpStream::connect(address)

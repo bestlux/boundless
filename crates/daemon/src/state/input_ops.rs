@@ -328,6 +328,4 @@ impl AppState {
         let supported = *self.input_lock_supported.read().await;
         (active, supported)
     }
-
 }
-

@@ -192,5 +192,3 @@ pub(super) fn input_event_kind(event: &InputEvent) -> &'static str {
         InputEvent::Key { .. } => "key",
     }
 }
-
-
