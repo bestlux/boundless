@@ -38,14 +38,18 @@ mod runtime;
 mod tls;
 
 use codec::{
-    input_event_from_wire, input_events_to_wire_for_protocol, now_millis,
-    protocol_supports_clipboard_image, protocol_supports_input_anchor,
+    input_event_from_wire, input_events_to_wire_for_protocol, now_millis, protocol_supports_clipboard_image,
 };
-use runtime::{listener_loop, outbound_target_candidates, supervisor_loop};
+#[cfg(test)]
+use codec::protocol_supports_input_anchor;
+use runtime::{listener_loop, supervisor_loop};
+#[cfg(test)]
+use runtime::outbound_target_candidates;
 use tls::{
-    build_tls_acceptor, build_tls_connector, machine_id_from_presented_ca, parse_server_name,
-    parse_server_name_for_peer,
+    build_tls_acceptor, build_tls_connector, machine_id_from_presented_ca, parse_server_name_for_peer,
 };
+#[cfg(test)]
+use tls::parse_server_name;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const OUTGOING_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
