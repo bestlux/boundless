@@ -56,6 +56,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const INPUT_TICK: Duration = Duration::from_millis(5);
 const INPUT_CAPTURE_TICK: Duration = Duration::from_millis(8);
 const EDGE_PRESSURE_THRESHOLD: i32 = 300;
+const EDGE_REMOTE_PRESSURE_THRESHOLD_MAX: i32 = 2400;
+const EDGE_REMOTE_PRESSURE_THRESHOLD_NUMERATOR: i32 = 4;
+const EDGE_REMOTE_PRESSURE_THRESHOLD_DENOMINATOR: i32 = 5;
 const EDGE_POSITION_TOLERANCE_PX: i32 = 2;
 const EDGE_SWITCH_POST_HANDOFF_SUPPRESS_MS: u64 = 220;
 const ESCAPE_EDGE_RECAPTURE_SUPPRESS_MS: u64 = 600;
@@ -305,8 +308,14 @@ async fn capture_and_queue_outgoing_frames(
         return;
     };
 
-    if !events.is_empty() {
-        for chunk in events.chunks(MAX_EVENTS_PER_FRAME) {
+    let replay_events = if edge_switch_state.suppress_until_unix_ms.is_some() {
+        filter_edge_start_replay_events(&events)
+    } else {
+        events
+    };
+
+    if !replay_events.is_empty() {
+        for chunk in replay_events.chunks(MAX_EVENTS_PER_FRAME) {
             if let Err(error) = state.queue_input_events(peer_id, chunk.to_vec()).await {
                 warn!(
                     peer_id = %peer_id,
@@ -317,6 +326,14 @@ async fn capture_and_queue_outgoing_frames(
             }
         }
     }
+}
+
+fn filter_edge_start_replay_events(events: &[InputEvent]) -> Vec<InputEvent> {
+    events
+        .iter()
+        .filter(|event| !matches!(event, InputEvent::MouseMove { .. }))
+        .cloned()
+        .collect()
 }
 
 async fn sync_local_input_lock(
@@ -378,6 +395,9 @@ fn edge_switch_direction_from_motion(
     cursor_position: Option<(i32, i32)>,
     screen_bounds: Option<VirtualScreenBounds>,
 ) -> Option<SwitchDirection> {
+    let pressure_threshold = edge_switch_pressure_threshold(current_target, screen_bounds);
+    let pressure_limit = pressure_threshold.saturating_mul(2);
+
     let now_ms = unix_now_ms();
     if state
         .suppress_until_unix_ms
@@ -407,7 +427,7 @@ fn edge_switch_direction_from_motion(
             state.x_pressure = state
                 .x_pressure
                 .saturating_add(*dx)
-                .clamp(-EDGE_PRESSURE_THRESHOLD * 2, EDGE_PRESSURE_THRESHOLD * 2);
+                .clamp(-pressure_limit, pressure_limit);
         }
 
         if *dy != 0 {
@@ -417,7 +437,7 @@ fn edge_switch_direction_from_motion(
             state.y_pressure = state
                 .y_pressure
                 .saturating_add(*dy)
-                .clamp(-EDGE_PRESSURE_THRESHOLD * 2, EDGE_PRESSURE_THRESHOLD * 2);
+                .clamp(-pressure_limit, pressure_limit);
         }
     }
 
@@ -432,13 +452,13 @@ fn edge_switch_direction_from_motion(
     let x_abs = state.x_pressure.abs();
     let y_abs = state.y_pressure.abs();
 
-    let direction = if x_abs >= EDGE_PRESSURE_THRESHOLD && x_abs >= y_abs {
+    let direction = if x_abs >= pressure_threshold && x_abs >= y_abs {
         Some(if state.x_pressure < 0 {
             SwitchDirection::Left
         } else {
             SwitchDirection::Right
         })
-    } else if wrap_mouse && y_abs >= EDGE_PRESSURE_THRESHOLD && y_abs >= x_abs {
+    } else if wrap_mouse && y_abs >= pressure_threshold && y_abs >= x_abs {
         Some(if state.y_pressure < 0 {
             SwitchDirection::Up
         } else {
@@ -456,6 +476,28 @@ fn edge_switch_direction_from_motion(
     }
 
     Some(direction)
+}
+
+fn edge_switch_pressure_threshold(
+    current_target: Option<&str>,
+    screen_bounds: Option<VirtualScreenBounds>,
+) -> i32 {
+    if current_target.is_none() {
+        return EDGE_PRESSURE_THRESHOLD;
+    }
+
+    let Some(bounds) = screen_bounds else {
+        return EDGE_PRESSURE_THRESHOLD;
+    };
+
+    let width = bounds
+        .right
+        .saturating_sub(bounds.left)
+        .saturating_add(1)
+        .max(0);
+    let scaled = width.saturating_mul(EDGE_REMOTE_PRESSURE_THRESHOLD_NUMERATOR)
+        / EDGE_REMOTE_PRESSURE_THRESHOLD_DENOMINATOR;
+    scaled.clamp(EDGE_PRESSURE_THRESHOLD, EDGE_REMOTE_PRESSURE_THRESHOLD_MAX)
 }
 
 fn batch_direction(dx: i32, dy: i32, wrap_mouse: bool) -> Option<SwitchDirection> {
@@ -2659,6 +2701,103 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn edge_switch_handoff_from_local_anchors_without_replaying_trigger_motion() {
+        let (state, _left_peer, root) = state_with_peer_for_input_test().await;
+        let (code, _) = state.create_pairing_code(120).await;
+        let right_peer = state
+            .join_peer(
+                code,
+                "127.0.0.1:15101".to_string(),
+                Some("right".to_string()),
+            )
+            .await
+            .expect("join right peer");
+
+        state
+            .set_peer_connected(&right_peer, true)
+            .await
+            .expect("connect right");
+        state
+            .set_layout("self,right".to_string())
+            .await
+            .expect("set layout");
+        state.clear_input_capture_target().await;
+
+        let mut backend = ScriptedCaptureBackend::new(
+            vec![vec![InputEvent::MouseMove {
+                dx: EDGE_PRESSURE_THRESHOLD,
+                dy: 0,
+            }]],
+            Vec::new(),
+        );
+        let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
+
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+
+        let outgoing = state.drain_outgoing(&right_peer).await;
+        assert_eq!(
+            outgoing.len(),
+            1,
+            "local edge-start handoff should only emit an anchor on first frame"
+        );
+        assert!(matches!(
+            outgoing.first(),
+            Some(crate::state::OutboundPayload::InputFrame { events, .. })
+                if matches!(events.as_slice(), [InputEvent::MouseMoveAbsolute { .. }])
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_edge_handoff_uses_screen_scaled_pressure_threshold() {
+        let mut edge_switch_state = EdgeSwitchState::default();
+        let bounds = VirtualScreenBounds {
+            left: 0,
+            top: 0,
+            right: 1919,
+            bottom: 1079,
+        };
+
+        let direction = edge_switch_direction_from_motion(
+            &[InputEvent::MouseMove {
+                dx: EDGE_PRESSURE_THRESHOLD,
+                dy: 0,
+            }],
+            &mut edge_switch_state,
+            false,
+            Some("peer-a"),
+            None,
+            Some(bounds),
+        );
+        assert_eq!(
+            direction, None,
+            "active remote capture should require stronger pressure than local edge start"
+        );
+
+        let direction = edge_switch_direction_from_motion(
+            &[InputEvent::MouseMove { dx: 2000, dy: 0 }],
+            &mut edge_switch_state,
+            false,
+            Some("peer-a"),
+            None,
+            Some(bounds),
+        );
+        assert_eq!(
+            direction,
+            Some(SwitchDirection::Right),
+            "strong sustained pressure should still allow handoff when actively controlling a peer"
+        );
     }
 
     #[test]
