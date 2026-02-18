@@ -1078,7 +1078,7 @@ impl WindowsHookCaptureBackend {
             InputEvent::Key { scan_code, state } => {
                 let is_down = matches!(state, core_input::KeyState::Down);
                 let prior = self.last_key_down.insert(scan_code, is_down);
-                if prior != Some(is_down) {
+                if is_down || prior != Some(is_down) {
                     output.push(InputEvent::Key { scan_code, state });
                 }
             }
@@ -3189,6 +3189,65 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [InputEvent::MouseMove { dx, dy }] if *dx == 30 && *dy == -10
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hook_backend_preserves_repeated_key_down_events() {
+        let (tx, rx) = mpsc::channel();
+        let mut backend = WindowsHookCaptureBackend {
+            event_rx: rx,
+            hook_thread_id: 0,
+            hook_thread: None,
+            raw_input_thread_id: None,
+            raw_input_thread: None,
+            raw_input_enabled: false,
+            lock_active: false,
+            control_actions: VecDeque::new(),
+            last_cursor: None,
+            last_key_down: HashMap::new(),
+            last_button_down: HashMap::new(),
+        };
+
+        tx.send(HookCaptureEvent::Input(InputEvent::Key {
+            scan_code: 30,
+            state: KeyState::Down,
+        }))
+        .expect("send key down 1");
+        tx.send(HookCaptureEvent::Input(InputEvent::Key {
+            scan_code: 30,
+            state: KeyState::Down,
+        }))
+        .expect("send key down 2");
+        tx.send(HookCaptureEvent::Input(InputEvent::Key {
+            scan_code: 30,
+            state: KeyState::Up,
+        }))
+        .expect("send key up");
+        tx.send(HookCaptureEvent::Input(InputEvent::Key {
+            scan_code: 30,
+            state: KeyState::Up,
+        }))
+        .expect("send duplicate key up");
+
+        let events = backend.poll_events().expect("poll");
+        assert!(matches!(
+            events.as_slice(),
+            [
+                InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Down
+                },
+                InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Down
+                },
+                InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Up
+                }
+            ]
         ));
     }
 }
