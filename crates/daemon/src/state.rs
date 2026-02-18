@@ -756,6 +756,7 @@ impl AppState {
         self.config.read().await.features.clone()
     }
 
+    #[cfg(any(windows, test))]
     pub async fn hotkey_map(&self) -> std::collections::BTreeMap<String, String> {
         self.config.read().await.hotkeys.clone()
     }
@@ -2044,9 +2045,7 @@ fn resolve_single_peer_handoff_target(
         .iter()
         .filter(|peer| peer.connected)
         .map(|peer| peer.peer_id.as_str());
-    let Some(peer_id) = connected.next() else {
-        return None;
-    };
+    let peer_id = connected.next()?;
     if connected.next().is_some() {
         return None;
     }

@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, time::Duration};
+use std::time::Duration;
+
+#[cfg(any(windows, test))]
+use std::collections::VecDeque;
 
 #[cfg(windows)]
 use std::{
@@ -75,6 +78,7 @@ const EMPTY_WINDOW_NAME: [u16; 1] = [0];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureControlAction {
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     EscapeUnlock,
 }
 
