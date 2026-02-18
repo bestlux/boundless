@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 #[cfg(windows)]
 use std::{
     collections::HashMap,
-    sync::{Mutex, OnceLock, mpsc},
+    sync::mpsc,
     thread::{self, JoinHandle},
 };
 
@@ -232,98 +232,6 @@ struct WindowsHookCaptureBackend {
     last_key_down: HashMap<u16, bool>,
     last_button_down: HashMap<u16, bool>,
 }
-
-#[cfg(windows)]
-const VK_LBUTTON_CODE: u16 = 0x01;
-#[cfg(windows)]
-const VK_RBUTTON_CODE: u16 = 0x02;
-#[cfg(windows)]
-const VK_MBUTTON_CODE: u16 = 0x04;
-#[cfg(windows)]
-const VK_XBUTTON1_CODE: u16 = 0x05;
-#[cfg(windows)]
-const VK_XBUTTON2_CODE: u16 = 0x06;
-#[cfg(windows)]
-const VK_CONTROL_CODE: u16 = 0x11;
-#[cfg(windows)]
-const VK_LCONTROL_CODE: u16 = 0xA2;
-#[cfg(windows)]
-const VK_RCONTROL_CODE: u16 = 0xA3;
-#[cfg(windows)]
-const XBUTTON1_DATA: u16 = 0x0001;
-#[cfg(windows)]
-const XBUTTON2_DATA: u16 = 0x0002;
-#[cfg(windows)]
-const LLKHF_EXTENDED_MASK: u32 = 0x01;
-#[cfg(windows)]
-const LLKHF_INJECTED_MASK: u32 = 0x10;
-#[cfg(windows)]
-const LLMHF_INJECTED_MASK: u32 = 0x0000_0001;
-
-#[cfg(windows)]
-static HOOK_EVENT_SENDER: OnceLock<Mutex<Option<mpsc::Sender<HookCaptureEvent>>>> = OnceLock::new();
-#[cfg(windows)]
-static HOOK_RUNTIME_STATE: OnceLock<Mutex<HookRuntimeState>> = OnceLock::new();
-
-#[cfg(windows)]
-#[derive(Debug, Default)]
-struct HookRuntimeState {
-    lock_active: bool,
-    left_ctrl_down: bool,
-    right_ctrl_down: bool,
-    last_ctrl_tap_unix_ms: Option<u64>,
-}
-
-#[cfg(windows)]
-const CAPTURE_KEY_VIRTUAL_KEYS: &[u16] = &[
-    0x08, // backspace
-    0x09, // tab
-    0x0D, // enter
-    0x14, // caps lock
-    0x1B, // escape
-    0x20, // space
-    0x21, // page up
-    0x22, // page down
-    0x23, // end
-    0x24, // home
-    0x25, // left
-    0x26, // up
-    0x27, // right
-    0x28, // down
-    0x2D, // insert
-    0x2E, // delete
-    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, // 0-9
-    0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50,
-    0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, // A-Z
-    0x5B, // left windows
-    0x5C, // right windows
-    0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, // numpad 0-9
-    0x6A, // numpad *
-    0x6B, // numpad +
-    0x6D, // numpad -
-    0x6E, // numpad .
-    0x6F, // numpad /
-    0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, // F1-F12
-    0x90, // num lock
-    0x91, // scroll lock
-    0xA0, // left shift
-    0xA1, // right shift
-    0xA2, // left control
-    0xA3, // right control
-    0xA4, // left alt
-    0xA5, // right alt
-    0xBA, // ;
-    0xBB, // =
-    0xBC, // ,
-    0xBD, // -
-    0xBE, // .
-    0xBF, // /
-    0xC0, // `
-    0xDB, // [
-    0xDC, // \
-    0xDD, // ]
-    0xDE, // '
-];
 
 #[cfg(test)]
 mod tests {
