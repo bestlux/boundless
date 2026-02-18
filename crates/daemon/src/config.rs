@@ -11,6 +11,9 @@ use uuid::Uuid;
 
 use core_protocol::PROTOCOL_CURRENT;
 
+const DEFAULT_LAYOUT_MATRIX: &str = "self";
+const LEGACY_LAYOUT_MATRIX_PLACEHOLDER: &str = "A,B;C,D";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerConfig {
     pub peer_id: String,
@@ -106,7 +109,7 @@ impl Default for RuntimeConfig {
             api_transport: default_api_transport(),
             api_pipe_name: default_api_pipe_name(),
             protocol_version: PROTOCOL_CURRENT.to_string(),
-            layout_matrix: "A,B;C,D".to_string(),
+            layout_matrix: DEFAULT_LAYOUT_MATRIX.to_string(),
             auto_start: true,
             network_port: 15100,
             features,
@@ -158,7 +161,18 @@ pub fn load_or_create_config_at(path: &Path) -> Result<RuntimeConfig> {
     let data = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut config: RuntimeConfig =
         serde_json::from_str(&data).with_context(|| format!("parse {}", path.display()))?;
+
+    let mut changed = false;
+    let layout = config.layout_matrix.trim();
+    if layout.is_empty() || layout.eq_ignore_ascii_case(LEGACY_LAYOUT_MATRIX_PLACEHOLDER) {
+        config.layout_matrix = DEFAULT_LAYOUT_MATRIX.to_string();
+        changed = true;
+    }
+
     config.updated_at = Utc::now();
+    if changed {
+        save_config_at(path, &config)?;
+    }
     Ok(config)
 }
 
@@ -183,7 +197,10 @@ fn hostname() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiTransport, RuntimeConfig};
+    use super::{
+        ApiTransport, DEFAULT_LAYOUT_MATRIX, LEGACY_LAYOUT_MATRIX_PLACEHOLDER, RuntimeConfig,
+        load_or_create_config_at, save_config_at,
+    };
 
     #[test]
     fn tcp_effective_transport_is_tcp() {
@@ -239,5 +256,28 @@ mod tests {
 
         let parsed: RuntimeConfig = serde_json::from_str(json).expect("parse legacy config");
         assert_eq!(parsed.config_version, "1");
+    }
+
+    #[test]
+    fn load_or_create_config_migrates_placeholder_layout_matrix() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-config-layout-migration-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("config.json");
+        std::fs::create_dir_all(&root).expect("create temp root");
+
+        let mut seed = RuntimeConfig::default();
+        seed.layout_matrix = LEGACY_LAYOUT_MATRIX_PLACEHOLDER.to_string();
+        save_config_at(&path, &seed).expect("seed legacy config");
+
+        let loaded = load_or_create_config_at(&path).expect("load config");
+        assert_eq!(loaded.layout_matrix, DEFAULT_LAYOUT_MATRIX);
+
+        let persisted = std::fs::read_to_string(&path).expect("read persisted config");
+        let parsed: RuntimeConfig = serde_json::from_str(&persisted).expect("parse persisted json");
+        assert_eq!(parsed.layout_matrix, DEFAULT_LAYOUT_MATRIX);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

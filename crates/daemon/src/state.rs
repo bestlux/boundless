@@ -703,7 +703,7 @@ impl AppState {
         direction: SwitchDirection,
     ) -> Option<CaptureHandoffTarget> {
         let config = self.config.read().await;
-        resolve_capture_handoff_target(&config, current_target, direction)
+        resolve_capture_handoff_target_with_fallback(&config, current_target, direction)
     }
 
     pub async fn apply_switch_all_capture_target(&self) -> Option<String> {
@@ -1888,6 +1888,23 @@ fn elapsed_ms(start_unix_ms: i64, end_unix_ms: i64) -> i64 {
     (end_unix_ms - start_unix_ms).max(0)
 }
 
+fn resolve_capture_handoff_target_with_fallback(
+    config: &RuntimeConfig,
+    current_target: Option<&str>,
+    direction: SwitchDirection,
+) -> Option<CaptureHandoffTarget> {
+    let resolved = resolve_capture_handoff_target(config, current_target, direction);
+    if resolved.is_some() {
+        return resolved;
+    }
+
+    if layout_is_actionable_for_handoff(config, current_target) {
+        return None;
+    }
+
+    resolve_single_peer_handoff_target(config, current_target, direction)
+}
+
 fn resolve_capture_handoff_target(
     config: &RuntimeConfig,
     current_target: Option<&str>,
@@ -1982,6 +1999,62 @@ fn resolve_capture_handoff_target(
             }
             None
         }
+    }
+}
+
+fn layout_is_actionable_for_handoff(config: &RuntimeConfig, current_target: Option<&str>) -> bool {
+    let matrix = parse_layout_matrix(&config.layout_matrix);
+    let mut source_count = 0usize;
+    let mut has_destination = false;
+
+    for row in matrix {
+        for token in row {
+            if let Some(peer_id) = current_target {
+                if layout_token_matches_peer(&token, peer_id, &config.peers) {
+                    source_count += 1;
+                }
+                if is_local_layout_token(&token, config) {
+                    has_destination = true;
+                }
+            } else {
+                if is_local_layout_token(&token, config) {
+                    source_count += 1;
+                }
+                if resolve_peer_layout_token(&token, &config.peers).is_some() {
+                    has_destination = true;
+                }
+            }
+        }
+    }
+
+    source_count == 1 && has_destination
+}
+
+fn resolve_single_peer_handoff_target(
+    config: &RuntimeConfig,
+    current_target: Option<&str>,
+    direction: SwitchDirection,
+) -> Option<CaptureHandoffTarget> {
+    if !matches!(direction, SwitchDirection::Left | SwitchDirection::Right) {
+        return None;
+    }
+
+    let mut connected = config
+        .peers
+        .iter()
+        .filter(|peer| peer.connected)
+        .map(|peer| peer.peer_id.as_str());
+    let Some(peer_id) = connected.next() else {
+        return None;
+    };
+    if connected.next().is_some() {
+        return None;
+    }
+
+    match current_target {
+        None => Some(CaptureHandoffTarget::Peer(peer_id.to_string())),
+        Some(current_peer_id) if current_peer_id == peer_id => Some(CaptureHandoffTarget::Local),
+        Some(_) => None,
     }
 }
 
@@ -2213,6 +2286,63 @@ mod tests {
         assert_eq!(
             resolve_capture_handoff_target(&config, Some("peer-left"), SwitchDirection::Left),
             None
+        );
+    }
+
+    #[test]
+    fn resolve_capture_handoff_target_with_fallback_switches_single_peer_when_layout_is_unusable() {
+        let config = RuntimeConfig {
+            machine_id: "local-id".to_string(),
+            device_name: "local-device".to_string(),
+            layout_matrix: "A,B;C,D".to_string(),
+            peers: vec![PeerConfig {
+                peer_id: "peer-right".to_string(),
+                display_name: "right".to_string(),
+                address: "127.0.0.1:15101".to_string(),
+                connected: true,
+                last_seen: Utc::now(),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_capture_handoff_target_with_fallback(&config, None, SwitchDirection::Right),
+            Some(CaptureHandoffTarget::Peer("peer-right".to_string()))
+        );
+        assert_eq!(
+            resolve_capture_handoff_target_with_fallback(
+                &config,
+                Some("peer-right"),
+                SwitchDirection::Left
+            ),
+            Some(CaptureHandoffTarget::Local)
+        );
+    }
+
+    #[test]
+    fn resolve_capture_handoff_target_with_fallback_respects_actionable_layout_edges() {
+        let config = RuntimeConfig {
+            machine_id: "local-id".to_string(),
+            device_name: "local-device".to_string(),
+            layout_matrix: "self,right".to_string(),
+            peers: vec![PeerConfig {
+                peer_id: "peer-right".to_string(),
+                display_name: "right".to_string(),
+                address: "127.0.0.1:15101".to_string(),
+                connected: true,
+                last_seen: Utc::now(),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_capture_handoff_target_with_fallback(
+                &config,
+                Some("peer-right"),
+                SwitchDirection::Right
+            ),
+            None,
+            "with actionable layout, pushing deeper into the same edge should stay unresolved"
         );
     }
 
