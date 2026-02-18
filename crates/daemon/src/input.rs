@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 use std::collections::VecDeque;
 
 #[cfg(windows)]
