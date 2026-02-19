@@ -1,11 +1,16 @@
+use chrono::Utc;
+
+use crate::state::TransportEventRecord;
+
 use super::*;
 
-#[derive(Debug)]
 struct InboundTransfer {
     peer_id: String,
     file_name: String,
     total_bytes: u64,
-    bytes: Vec<u8>,
+    bytes_received: u64,
+    temp_path: std::path::PathBuf,
+    temp_file: tokio::fs::File,
 }
 
 pub(super) async fn connect_and_run_outbound(
@@ -83,9 +88,10 @@ where
         );
     }
 
-    let (reader, mut writer) = tokio::io::split(stream);
+    let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    let mut writer = BufWriter::new(writer);
+    let mut line = Vec::<u8>::with_capacity(4096);
     let mut heartbeat_interval = time::interval(HEARTBEAT_INTERVAL);
     let mut outgoing_flush_interval = time::interval(OUTGOING_FLUSH_INTERVAL);
 
@@ -98,6 +104,7 @@ where
     };
 
     send_message(&mut writer, &local_hello).await?;
+    writer.flush().await.context("flush local hello")?;
 
     let remote_peer_id = Some(authenticated_peer_id.clone());
     let mut observed_reconnect_generation = state
@@ -138,6 +145,7 @@ where
                     )
                     .await?;
                 }
+                writer.flush().await.context("flush heartbeat batch")?;
             }
             _ = outgoing_flush_interval.tick(), if remote_protocol.is_some() => {
                 if reconnect_requested_for_peer(
@@ -165,7 +173,7 @@ where
                     .await?;
                 }
             }
-            read = reader.read_line(&mut line) => {
+            read = read_wire_line(&mut reader, &mut line) => {
                 if reconnect_requested_for_peer(
                     &state,
                     &authenticated_peer_id,
@@ -180,13 +188,68 @@ where
                     break;
                 }
 
-                let read = read.context("read transport line")?;
+                let Some(read) = (match read {
+                    Ok(read) => read,
+                    Err(error) => {
+                        record_transport_frame_rejected(
+                            &state,
+                            &authenticated_peer_id,
+                            format!("reason=line_too_large error={error:#}"),
+                            line.len() as u64,
+                        )
+                        .await;
+                        warn!(
+                            peer_id = %authenticated_peer_id,
+                            error = ?error,
+                            "transport frame exceeded max line length"
+                        );
+                        break;
+                    }
+                }) else {
+                    break;
+                };
+
                 if read == 0 {
                     break;
                 }
 
-                let message = decode_line(&line).context("decode wire message")?;
-                line.clear();
+                let line_text = match std::str::from_utf8(&line) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        record_transport_frame_rejected(
+                            &state,
+                            &authenticated_peer_id,
+                            format!("reason=invalid_utf8 error={error}"),
+                            line.len() as u64,
+                        )
+                        .await;
+                        warn!(
+                            peer_id = %authenticated_peer_id,
+                            error = ?error,
+                            "dropping invalid utf8 transport frame"
+                        );
+                        continue;
+                    }
+                };
+
+                let message = match decode_line(line_text) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        record_transport_frame_rejected(
+                            &state,
+                            &authenticated_peer_id,
+                            format!("reason=decode_failed error={error}"),
+                            line.len() as u64,
+                        )
+                        .await;
+                        warn!(
+                            peer_id = %authenticated_peer_id,
+                            error = ?error,
+                            "dropping undecodable wire message"
+                        );
+                        continue;
+                    }
+                };
 
                 match message {
                     WireMessage::Hello {
@@ -207,6 +270,7 @@ where
                                 },
                             )
                             .await;
+                            let _ = writer.flush().await;
                             break;
                         }
                         remote_protocol = Some(protocol);
@@ -233,6 +297,7 @@ where
                             )
                             .await?;
                         }
+                        writer.flush().await.context("flush hello/ack batch")?;
                     }
                     WireMessage::HelloAck { accepted, .. } => {
                         if accepted && let Some(peer_id) = &remote_peer_id {
@@ -249,6 +314,7 @@ where
                             )
                             .await?;
                         }
+                        writer.flush().await.context("flush hello-ack batch")?;
                     }
                     WireMessage::Heartbeat { .. } => {
                         if let Some(peer_id) = &remote_peer_id {
@@ -262,6 +328,21 @@ where
                                 authenticated_machine_id = %authenticated_peer_id,
                                 "dropping clipboard payload with mismatched machine_id"
                             );
+                            continue;
+                        }
+
+                        if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+                            record_transport_frame_rejected(
+                                &state,
+                                &authenticated_peer_id,
+                                format!(
+                                    "reason=clipboard_text_too_large size={} limit={}",
+                                    text.len(),
+                                    MAX_CLIPBOARD_TEXT_BYTES
+                                ),
+                                text.len() as u64,
+                            )
+                            .await;
                             continue;
                         }
 
@@ -349,7 +430,67 @@ where
                             );
                             continue;
                         }
-                        validate_transfer_size(total_bytes).context("validate file start size")?;
+
+                        if inbound_transfers.len() >= MAX_INBOUND_TRANSFERS_PER_PEER {
+                            record_transport_transfer_rejected(
+                                &state,
+                                &authenticated_peer_id,
+                                format!(
+                                    "reason=too_many_transfers active={} limit={}",
+                                    inbound_transfers.len(),
+                                    MAX_INBOUND_TRANSFERS_PER_PEER
+                                ),
+                                0,
+                            )
+                            .await;
+                            continue;
+                        }
+
+                        if inbound_transfers.contains_key(&transfer_id) {
+                            record_transport_transfer_rejected(
+                                &state,
+                                &authenticated_peer_id,
+                                format!("reason=duplicate_transfer_id transfer_id={transfer_id}"),
+                                0,
+                            )
+                            .await;
+                            continue;
+                        }
+
+                        if let Err(error) = validate_transfer_size(total_bytes) {
+                            record_transport_transfer_rejected(
+                                &state,
+                                &authenticated_peer_id,
+                                format!(
+                                    "reason=invalid_total_size transfer_id={transfer_id} error={error}"
+                                ),
+                                total_bytes,
+                            )
+                            .await;
+                            continue;
+                        }
+
+                        let temp_path = std::env::temp_dir().join(format!(
+                            "boundless-inbound-{}-{}-{}.part",
+                            authenticated_peer_id,
+                            now_millis(),
+                            transfer_id
+                        ));
+                        let temp_file = match tokio::fs::File::create(&temp_path).await {
+                            Ok(file) => file,
+                            Err(error) => {
+                                record_transport_transfer_rejected(
+                                    &state,
+                                    &authenticated_peer_id,
+                                    format!(
+                                        "reason=temp_create_failed transfer_id={transfer_id} error={error}"
+                                    ),
+                                    total_bytes,
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
 
                         if let Some(peer_id) = &remote_peer_id {
                             inbound_transfers.insert(
@@ -358,7 +499,9 @@ where
                                     peer_id: peer_id.clone(),
                                     file_name: file_name.clone(),
                                     total_bytes,
-                                    bytes: Vec::new(),
+                                    bytes_received: 0,
+                                    temp_path,
+                                    temp_file,
                                 },
                             );
                             info!(
@@ -374,7 +517,7 @@ where
                         transfer_id,
                         data_b64,
                     } => {
-                        let Some(transfer) = inbound_transfers.get_mut(&transfer_id) else {
+                        let Some(mut transfer) = inbound_transfers.remove(&transfer_id) else {
                             warn!(transfer_id = %transfer_id, "received file chunk for unknown transfer");
                             continue;
                         };
@@ -383,70 +526,133 @@ where
                             Ok(chunk) => chunk,
                             Err(error) => {
                                 warn!(transfer_id = %transfer_id, error = ?error, "failed to decode file chunk");
-                                inbound_transfers.remove(&transfer_id);
+                                discard_inbound_transfer(transfer).await;
                                 continue;
                             }
                         };
 
-                        let next_size = transfer.bytes.len() + chunk.len();
-                        validate_transfer_size(next_size as u64).context("validate chunk size")?;
-
-                        if next_size as u64 > transfer.total_bytes {
-                            warn!(
-                                transfer_id = %transfer_id,
-                                announced_total = transfer.total_bytes,
-                                attempted_total = next_size as u64,
-                                "inbound file exceeded announced total bytes"
-                            );
-                            inbound_transfers.remove(&transfer_id);
+                        let next_size = transfer.bytes_received.saturating_add(chunk.len() as u64);
+                        if let Err(error) = validate_transfer_size(next_size) {
+                            record_transport_transfer_rejected(
+                                &state,
+                                &transfer.peer_id,
+                                format!(
+                                    "reason=chunk_size_invalid transfer_id={transfer_id} error={error}"
+                                ),
+                                next_size,
+                            )
+                            .await;
+                            discard_inbound_transfer(transfer).await;
                             continue;
                         }
 
-                        transfer.bytes.extend_from_slice(&chunk);
+                        if next_size > transfer.total_bytes {
+                            warn!(
+                                transfer_id = %transfer_id,
+                                announced_total = transfer.total_bytes,
+                                attempted_total = next_size,
+                                "inbound file exceeded announced total bytes"
+                            );
+                            record_transport_transfer_rejected(
+                                &state,
+                                &transfer.peer_id,
+                                format!(
+                                    "reason=chunk_exceeds_total transfer_id={transfer_id} announced_total={} attempted_total={next_size}",
+                                    transfer.total_bytes
+                                ),
+                                next_size,
+                            )
+                            .await;
+                            discard_inbound_transfer(transfer).await;
+                            continue;
+                        }
+
+                        if let Err(error) = transfer.temp_file.write_all(&chunk).await {
+                            record_transport_transfer_rejected(
+                                &state,
+                                &transfer.peer_id,
+                                format!(
+                                    "reason=temp_write_failed transfer_id={transfer_id} error={error}"
+                                ),
+                                next_size,
+                            )
+                            .await;
+                            discard_inbound_transfer(transfer).await;
+                            continue;
+                        }
+
+                        transfer.bytes_received = next_size;
+                        inbound_transfers.insert(transfer_id, transfer);
                     }
                     WireMessage::FileEnd { transfer_id } => {
-                        let Some(transfer) = inbound_transfers.remove(&transfer_id) else {
+                        let Some(mut transfer) = inbound_transfers.remove(&transfer_id) else {
                             warn!(transfer_id = %transfer_id, "received file end for unknown transfer");
                             continue;
                         };
 
-                        if transfer.bytes.len() as u64 != transfer.total_bytes {
+                        if transfer.bytes_received != transfer.total_bytes {
                             warn!(
                                 transfer_id = %transfer_id,
                                 expected = transfer.total_bytes,
-                                actual = transfer.bytes.len() as u64,
+                                actual = transfer.bytes_received,
                                 "inbound file transfer ended with size mismatch"
                             );
+                            record_transport_transfer_rejected(
+                                &state,
+                                &transfer.peer_id,
+                                format!(
+                                    "reason=size_mismatch transfer_id={transfer_id} expected={} actual={}",
+                                    transfer.total_bytes,
+                                    transfer.bytes_received
+                                ),
+                                transfer.bytes_received,
+                            )
+                            .await;
+                            discard_inbound_transfer(transfer).await;
                             continue;
                         }
 
-                        let InboundTransfer {
-                            peer_id,
-                            file_name,
-                            total_bytes: _,
-                            bytes,
-                        } = transfer;
+                        if let Err(error) = transfer.temp_file.flush().await {
+                            record_transport_transfer_rejected(
+                                &state,
+                                &transfer.peer_id,
+                                format!(
+                                    "reason=temp_flush_failed transfer_id={transfer_id} error={error}"
+                                ),
+                                transfer.bytes_received,
+                            )
+                            .await;
+                            discard_inbound_transfer(transfer).await;
+                            continue;
+                        }
+                        drop(transfer.temp_file);
 
                         match state
-                            .store_incoming_file(&peer_id, &file_name, bytes)
+                            .store_incoming_file_from_temp(
+                                &transfer.peer_id,
+                                &transfer.file_name,
+                                &transfer.temp_path,
+                                transfer.bytes_received,
+                            )
                             .await
                         {
                             Ok(path) => {
                                 info!(
-                                    peer_id = %peer_id,
+                                    peer_id = %transfer.peer_id,
                                     transfer_id = %transfer_id,
-                                    file_name = %file_name,
+                                    file_name = %transfer.file_name,
                                     path = %path.display(),
                                     "stored inbound file payload"
                                 );
                             }
                             Err(error) => {
                                 warn!(
-                                    peer_id = %peer_id,
+                                    peer_id = %transfer.peer_id,
                                     transfer_id = %transfer_id,
                                     error = ?error,
                                     "failed to store inbound file payload"
                                 );
+                                let _ = tokio::fs::remove_file(&transfer.temp_path).await;
                             }
                         }
                     }
@@ -504,11 +710,25 @@ where
         }
     }
 
+    for transfer in inbound_transfers.into_values() {
+        discard_inbound_transfer(transfer).await;
+    }
+
     if let Some(peer_id) = &remote_peer_id {
         let _ = state.set_peer_connected(peer_id, false).await;
     }
 
     Ok(())
+}
+
+async fn discard_inbound_transfer(transfer: InboundTransfer) {
+    let InboundTransfer {
+        temp_path,
+        temp_file,
+        ..
+    } = transfer;
+    drop(temp_file);
+    let _ = tokio::fs::remove_file(temp_path).await;
 }
 
 pub(super) async fn reconnect_requested_for_peer(
@@ -558,7 +778,6 @@ where
         .write_all(encode_line(message)?.as_bytes())
         .await
         .context("write transport frame")?;
-    writer.flush().await.context("flush transport frame")?;
     Ok(())
 }
 
@@ -577,8 +796,10 @@ where
     };
 
     let mut pending = VecDeque::from(state.drain_outgoing(peer_id).await);
+    let mut sent_for_flush = Vec::<OutboundPayload>::new();
+    let mut sent_any = false;
     while let Some(payload) = pending.pop_front() {
-        if let Err(error) = send_outbound_payload(
+        match send_outbound_payload(
             state,
             local_machine_id,
             peer_id,
@@ -588,10 +809,27 @@ where
         )
         .await
         {
-            let mut unsent = Vec::with_capacity(pending.len() + 1);
-            unsent.push(payload);
-            unsent.extend(pending.into_iter());
-            state.requeue_outgoing_front(peer_id, unsent).await;
+            Ok(sent_payload) => {
+                sent_any = sent_any || sent_payload;
+                if sent_payload {
+                    sent_for_flush.push(payload);
+                }
+            }
+            Err(error) => {
+                let mut unsent = Vec::with_capacity(pending.len() + 1);
+                unsent.push(payload);
+                unsent.extend(pending.into_iter());
+                state.requeue_outgoing_front(peer_id, unsent).await;
+                return Err(error);
+            }
+        }
+    }
+
+    if sent_any {
+        if let Err(error) = writer.flush().await.context("flush outbound payload batch") {
+            if !sent_for_flush.is_empty() {
+                state.requeue_outgoing_front(peer_id, sent_for_flush).await;
+            }
             return Err(error);
         }
     }
@@ -606,7 +844,7 @@ async fn send_outbound_payload<W>(
     remote_protocol: ProtocolVersion,
     payload: &OutboundPayload,
     writer: &mut W,
-) -> Result<()>
+) -> Result<bool>
 where
     W: AsyncWrite + Unpin,
 {
@@ -616,8 +854,22 @@ where
                 machine_id: local_machine_id.to_string(),
                 text: text.clone(),
             };
-            send_message(writer, &message).await?;
+            let line = encode_line(&message)?;
+            if line.len() > MAX_WIRE_LINE_BYTES {
+                warn!(
+                    peer_id = %peer_id,
+                    size_bytes = line.len(),
+                    limit_bytes = MAX_WIRE_LINE_BYTES,
+                    "dropping clipboard text payload that exceeds wire line cap"
+                );
+                return Ok(false);
+            }
+            writer
+                .write_all(line.as_bytes())
+                .await
+                .context("write transport frame")?;
             state.record_outgoing_clipboard_text(peer_id, text).await;
+            Ok(true)
         }
         OutboundPayload::ClipboardImage { image_bmp } => {
             if !protocol_supports_clipboard_image(remote_protocol) {
@@ -627,17 +879,32 @@ where
                     required_protocol = %PROTOCOL_CLIPBOARD_IMAGE_MIN,
                     "dropping clipboard image payload for peer without image-frame support"
                 );
-                return Ok(());
+                return Ok(false);
             }
 
             let message = WireMessage::ClipboardImage {
                 machine_id: local_machine_id.to_string(),
                 data_b64: encode_bytes_b64(image_bmp),
             };
-            send_message(writer, &message).await?;
+            let line = encode_line(&message)?;
+            if line.len() > MAX_WIRE_LINE_BYTES {
+                warn!(
+                    peer_id = %peer_id,
+                    payload_bytes = image_bmp.len(),
+                    line_bytes = line.len(),
+                    limit_bytes = MAX_WIRE_LINE_BYTES,
+                    "dropping clipboard image payload that exceeds wire line cap"
+                );
+                return Ok(false);
+            }
+            writer
+                .write_all(line.as_bytes())
+                .await
+                .context("write transport frame")?;
             state
                 .record_outgoing_clipboard_image(peer_id, image_bmp.len())
                 .await;
+            Ok(true)
         }
         OutboundPayload::File { file_name, bytes } => {
             let total_bytes = bytes.len() as u64;
@@ -670,6 +937,7 @@ where
             state
                 .record_outgoing_file(peer_id, file_name, total_bytes)
                 .await;
+            Ok(true)
         }
         OutboundPayload::InputFrame {
             sequence,
@@ -685,7 +953,7 @@ where
                     required_protocol = %PROTOCOL_INPUT_ANCHOR_MIN,
                     "dropping input frame with unsupported events for negotiated protocol"
                 );
-                return Ok(());
+                return Ok(false);
             }
 
             send_message(
@@ -702,8 +970,81 @@ where
             state
                 .record_outgoing_input_frame(peer_id, *sequence, events.len(), *timestamp_unix_ms)
                 .await;
+            Ok(true)
         }
     }
+}
 
-    Ok(())
+async fn read_wire_line<R>(reader: &mut R, line: &mut Vec<u8>) -> Result<Option<usize>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    line.clear();
+    loop {
+        let available = reader.fill_buf().await.context("fill transport buffer")?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(line.len()));
+        }
+
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(available.len());
+        let next_len = line.len().saturating_add(take);
+        let ended_with_newline = available.get(take - 1) == Some(&b'\n');
+        if next_len > MAX_WIRE_LINE_BYTES {
+            reader.consume(take);
+            bail!(
+                "wire frame exceeds max line length: {} > {}",
+                next_len,
+                MAX_WIRE_LINE_BYTES
+            );
+        }
+
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if ended_with_newline {
+            return Ok(Some(line.len()));
+        }
+    }
+}
+
+async fn record_transport_frame_rejected(
+    state: &AppState,
+    peer_id: &str,
+    detail: String,
+    size_bytes: u64,
+) {
+    state
+        .record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "incoming".to_string(),
+            kind: "transport_frame_rejected".to_string(),
+            peer_id: peer_id.to_string(),
+            detail,
+            size_bytes,
+        })
+        .await;
+}
+
+async fn record_transport_transfer_rejected(
+    state: &AppState,
+    peer_id: &str,
+    detail: String,
+    size_bytes: u64,
+) {
+    state
+        .record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "incoming".to_string(),
+            kind: "transport_transfer_rejected".to_string(),
+            peer_id: peer_id.to_string(),
+            detail,
+            size_bytes,
+        })
+        .await;
 }
