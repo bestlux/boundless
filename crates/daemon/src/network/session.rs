@@ -94,6 +94,7 @@ where
     let mut line = Vec::<u8>::with_capacity(4096);
     let mut heartbeat_interval = time::interval(HEARTBEAT_INTERVAL);
     let mut outgoing_flush_interval = time::interval(OUTGOING_FLUSH_INTERVAL);
+    let mut outgoing_flush_signal = state.subscribe_outgoing_flush_signal();
     heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     outgoing_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
@@ -150,6 +151,37 @@ where
                 writer.flush().await.context("flush heartbeat batch")?;
             }
             _ = outgoing_flush_interval.tick(), if remote_protocol.is_some() => {
+                if reconnect_requested_for_peer(
+                    &state,
+                    &authenticated_peer_id,
+                    &mut observed_reconnect_generation,
+                )
+                .await
+                {
+                    info!(
+                        peer_id = %authenticated_peer_id,
+                        "ending session due to explicit reconnect request"
+                    );
+                    break;
+                }
+
+                if let Some(remote_protocol) = remote_protocol {
+                    flush_outgoing_payloads(
+                        &state,
+                        &snapshot.machine_id,
+                        remote_peer_id.as_deref(),
+                        remote_protocol,
+                        &mut writer,
+                    )
+                    .await?;
+                }
+            }
+            changed = outgoing_flush_signal.changed(), if remote_protocol.is_some() => {
+                if changed.is_err() {
+                    // State dropped; session will naturally unwind shortly.
+                    break;
+                }
+
                 if reconnect_requested_for_peer(
                     &state,
                     &authenticated_peer_id,

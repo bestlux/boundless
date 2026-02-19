@@ -9,7 +9,10 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
-use tokio::{sync::RwLock, task::AbortHandle};
+use tokio::{
+    sync::{RwLock, watch},
+    task::AbortHandle,
+};
 use tracing::info;
 
 use core_clipboard::{
@@ -202,6 +205,8 @@ pub struct AppState {
     input_lock_active: Arc<RwLock<bool>>,
     input_lock_supported: Arc<RwLock<bool>>,
     reconnect_generation_by_peer: Arc<RwLock<HashMap<String, u64>>>,
+    outgoing_flush_signal: watch::Sender<u64>,
+    outgoing_flush_generation: Arc<std::sync::atomic::AtomicU64>,
     pending_nearby_pairing_requests:
         Arc<RwLock<HashMap<String, PendingNearbyPairingRequestRecord>>>,
     nearby_pairing_decisions: Arc<RwLock<HashMap<String, NearbyPairingDecisionRecord>>>,
@@ -263,6 +268,7 @@ impl AppState {
         );
 
         let input_enabled = config.features.get("share_input").copied().unwrap_or(true);
+        let (outgoing_flush_signal, _outgoing_flush_rx) = watch::channel(0u64);
 
         Ok(Self {
             config_path: Arc::new(config_path),
@@ -285,6 +291,8 @@ impl AppState {
             input_lock_active: Arc::new(RwLock::new(false)),
             input_lock_supported: Arc::new(RwLock::new(cfg!(windows))),
             reconnect_generation_by_peer: Arc::new(RwLock::new(HashMap::new())),
+            outgoing_flush_signal,
+            outgoing_flush_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_nearby_pairing_requests: Arc::new(RwLock::new(HashMap::new())),
             nearby_pairing_decisions: Arc::new(RwLock::new(HashMap::new())),
             pending_transport_session_abort_handles: Arc::new(RwLock::new(HashMap::new())),
@@ -365,6 +373,18 @@ impl AppState {
 
     pub async fn snapshot(&self) -> RuntimeConfig {
         self.config.read().await.clone()
+    }
+
+    pub fn subscribe_outgoing_flush_signal(&self) -> watch::Receiver<u64> {
+        self.outgoing_flush_signal.subscribe()
+    }
+
+    pub(crate) fn notify_outgoing_flush_signal(&self) {
+        let next = self
+            .outgoing_flush_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        let _ = self.outgoing_flush_signal.send(next);
     }
 }
 
@@ -1630,6 +1650,45 @@ mod tests {
             queued.get(1),
             Some(OutboundPayload::InputFrame { sequence: 2, events, .. }) if events.len() == 1
         ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn queue_input_events_notifies_outgoing_flush_signal() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-outgoing-flush-signal-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        let mut flush_signal = state.subscribe_outgoing_flush_signal();
+        state
+            .queue_input_events(&peer_id, vec![InputEvent::MouseMove { dx: 1, dy: 1 }])
+            .await
+            .expect("queue frame");
+
+        tokio::time::timeout(std::time::Duration::from_millis(200), flush_signal.changed())
+            .await
+            .expect("flush signal should be observed")
+            .expect("flush signal channel should remain open");
+        assert!(
+            *flush_signal.borrow_and_update() > 0,
+            "flush signal generation should advance after enqueue"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

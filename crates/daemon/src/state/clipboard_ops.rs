@@ -6,11 +6,14 @@ impl AppState {
             anyhow::bail!("unknown peer {peer_id}");
         }
 
-        let mut queue_map = self.outgoing_payloads.write().await;
-        queue_map
-            .entry(peer_id.to_string())
-            .or_default()
-            .push_back(OutboundPayload::ClipboardText { text });
+        {
+            let mut queue_map = self.outgoing_payloads.write().await;
+            queue_map
+                .entry(peer_id.to_string())
+                .or_default()
+                .push_back(OutboundPayload::ClipboardText { text });
+        }
+        self.notify_outgoing_flush_signal();
         Ok(())
     }
 
@@ -20,11 +23,14 @@ impl AppState {
         }
         validate_bmp_payload(&image_bmp).context("invalid clipboard BMP payload")?;
 
-        let mut queue_map = self.outgoing_payloads.write().await;
-        queue_map
-            .entry(peer_id.to_string())
-            .or_default()
-            .push_back(OutboundPayload::ClipboardImage { image_bmp });
+        {
+            let mut queue_map = self.outgoing_payloads.write().await;
+            queue_map
+                .entry(peer_id.to_string())
+                .or_default()
+                .push_back(OutboundPayload::ClipboardImage { image_bmp });
+        }
+        self.notify_outgoing_flush_signal();
         Ok(())
     }
 
@@ -79,22 +85,25 @@ impl AppState {
             sync.last_observed_hash = Some(hash);
         }
 
-        let mut queue_map = self.outgoing_payloads.write().await;
-        for peer_id in &connected_peer_ids {
-            let outbound = match &payload {
-                ClipboardPayload::Text(text) => {
-                    OutboundPayload::ClipboardText { text: text.clone() }
-                }
-                ClipboardPayload::Image(bytes) => OutboundPayload::ClipboardImage {
-                    image_bmp: bytes.clone(),
-                },
-            };
+        {
+            let mut queue_map = self.outgoing_payloads.write().await;
+            for peer_id in &connected_peer_ids {
+                let outbound = match &payload {
+                    ClipboardPayload::Text(text) => {
+                        OutboundPayload::ClipboardText { text: text.clone() }
+                    }
+                    ClipboardPayload::Image(bytes) => OutboundPayload::ClipboardImage {
+                        image_bmp: bytes.clone(),
+                    },
+                };
 
-            queue_map
-                .entry(peer_id.clone())
-                .or_default()
-                .push_back(outbound);
+                queue_map
+                    .entry(peer_id.clone())
+                    .or_default()
+                    .push_back(outbound);
+            }
         }
+        self.notify_outgoing_flush_signal();
 
         Ok(true)
     }
@@ -188,11 +197,14 @@ impl AppState {
             .await
             .map_err(anyhow::Error::from)?;
 
-        let mut queue_map = self.outgoing_payloads.write().await;
-        queue_map
-            .entry(peer_id.to_string())
-            .or_default()
-            .push_back(OutboundPayload::File { file_name, bytes });
+        {
+            let mut queue_map = self.outgoing_payloads.write().await;
+            queue_map
+                .entry(peer_id.to_string())
+                .or_default()
+                .push_back(OutboundPayload::File { file_name, bytes });
+        }
+        self.notify_outgoing_flush_signal();
         Ok(())
     }
 
@@ -239,15 +251,18 @@ impl AppState {
             *entry
         };
 
-        let mut queue_map = self.outgoing_payloads.write().await;
-        queue_map
-            .entry(peer_id.to_string())
-            .or_default()
-            .push_back(OutboundPayload::InputFrame {
-                sequence,
-                timestamp_unix_ms: Utc::now().timestamp_millis(),
-                events,
-            });
+        {
+            let mut queue_map = self.outgoing_payloads.write().await;
+            queue_map
+                .entry(peer_id.to_string())
+                .or_default()
+                .push_back(OutboundPayload::InputFrame {
+                    sequence,
+                    timestamp_unix_ms: Utc::now().timestamp_millis(),
+                    events,
+                });
+        }
+        self.notify_outgoing_flush_signal();
         Ok(())
     }
 
@@ -264,11 +279,14 @@ impl AppState {
             return;
         }
 
-        let mut queue_map = self.outgoing_payloads.write().await;
-        let queue = queue_map.entry(peer_id.to_string()).or_default();
-        for payload in payloads.into_iter().rev() {
-            queue.push_front(payload);
+        {
+            let mut queue_map = self.outgoing_payloads.write().await;
+            let queue = queue_map.entry(peer_id.to_string()).or_default();
+            for payload in payloads.into_iter().rev() {
+                queue.push_front(payload);
+            }
         }
+        self.notify_outgoing_flush_signal();
     }
 
     pub async fn record_transport_event(&self, event: TransportEventRecord) {
