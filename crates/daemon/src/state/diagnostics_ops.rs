@@ -14,7 +14,8 @@ impl AppState {
             config.peers.clear();
         }
 
-        self.outgoing_payloads.write().await.clear();
+        self.outgoing_input_payloads.write().await.clear();
+        self.outgoing_bulk_payloads.write().await.clear();
         self.transport_events.write().await.clear();
         *self.clipboard_sync.write().await = ClipboardSyncState::default();
         self.discovered_endpoints.write().await.clear();

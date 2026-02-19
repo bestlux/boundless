@@ -1,19 +1,35 @@
 use super::*;
 
 impl AppState {
+    async fn queue_outgoing_bulk_payload(&self, peer_id: &str, payload: OutboundPayload) {
+        {
+            let mut queue_map = self.outgoing_bulk_payloads.write().await;
+            queue_map
+                .entry(peer_id.to_string())
+                .or_default()
+                .push_back(payload);
+        }
+        self.notify_outgoing_flush_signal();
+    }
+
+    async fn queue_outgoing_input_payload(&self, peer_id: &str, payload: OutboundPayload) {
+        {
+            let mut queue_map = self.outgoing_input_payloads.write().await;
+            queue_map
+                .entry(peer_id.to_string())
+                .or_default()
+                .push_back(payload);
+        }
+        self.notify_outgoing_flush_signal();
+    }
+
     pub async fn queue_clipboard_text(&self, peer_id: &str, text: String) -> Result<()> {
         if self.get_peer(peer_id).await.is_none() {
             anyhow::bail!("unknown peer {peer_id}");
         }
 
-        {
-            let mut queue_map = self.outgoing_payloads.write().await;
-            queue_map
-                .entry(peer_id.to_string())
-                .or_default()
-                .push_back(OutboundPayload::ClipboardText { text });
-        }
-        self.notify_outgoing_flush_signal();
+        self.queue_outgoing_bulk_payload(peer_id, OutboundPayload::ClipboardText { text })
+            .await;
         Ok(())
     }
 
@@ -23,14 +39,8 @@ impl AppState {
         }
         validate_bmp_payload(&image_bmp).context("invalid clipboard BMP payload")?;
 
-        {
-            let mut queue_map = self.outgoing_payloads.write().await;
-            queue_map
-                .entry(peer_id.to_string())
-                .or_default()
-                .push_back(OutboundPayload::ClipboardImage { image_bmp });
-        }
-        self.notify_outgoing_flush_signal();
+        self.queue_outgoing_bulk_payload(peer_id, OutboundPayload::ClipboardImage { image_bmp })
+            .await;
         Ok(())
     }
 
@@ -86,7 +96,7 @@ impl AppState {
         }
 
         {
-            let mut queue_map = self.outgoing_payloads.write().await;
+            let mut queue_map = self.outgoing_bulk_payloads.write().await;
             for peer_id in &connected_peer_ids {
                 let outbound = match &payload {
                     ClipboardPayload::Text(text) => {
@@ -197,14 +207,8 @@ impl AppState {
             .await
             .map_err(anyhow::Error::from)?;
 
-        {
-            let mut queue_map = self.outgoing_payloads.write().await;
-            queue_map
-                .entry(peer_id.to_string())
-                .or_default()
-                .push_back(OutboundPayload::File { file_name, bytes });
-        }
-        self.notify_outgoing_flush_signal();
+        self.queue_outgoing_bulk_payload(peer_id, OutboundPayload::File { file_name, bytes })
+            .await;
         Ok(())
     }
 
@@ -251,27 +255,33 @@ impl AppState {
             *entry
         };
 
-        {
-            let mut queue_map = self.outgoing_payloads.write().await;
-            queue_map
-                .entry(peer_id.to_string())
-                .or_default()
-                .push_back(OutboundPayload::InputFrame {
-                    sequence,
-                    timestamp_unix_ms: Utc::now().timestamp_millis(),
-                    events,
-                });
-        }
-        self.notify_outgoing_flush_signal();
+        self.queue_outgoing_input_payload(
+            peer_id,
+            OutboundPayload::InputFrame {
+                sequence,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events,
+            },
+        )
+        .await;
         Ok(())
     }
 
     pub async fn drain_outgoing(&self, peer_id: &str) -> Vec<OutboundPayload> {
-        let mut queue_map = self.outgoing_payloads.write().await;
-        queue_map
-            .remove(peer_id)
-            .map(|queue| queue.into_iter().collect::<Vec<_>>())
-            .unwrap_or_default()
+        let mut drained = OutgoingPeerQueues::default();
+        {
+            let mut queue_map = self.outgoing_input_payloads.write().await;
+            drained.input = queue_map.remove(peer_id).unwrap_or_default();
+        }
+        {
+            let mut queue_map = self.outgoing_bulk_payloads.write().await;
+            drained.bulk = queue_map.remove(peer_id).unwrap_or_default();
+        }
+
+        let mut payloads = Vec::with_capacity(drained.input.len() + drained.bulk.len());
+        payloads.extend(drained.input);
+        payloads.extend(drained.bulk);
+        payloads
     }
 
     pub async fn requeue_outgoing_front(&self, peer_id: &str, payloads: Vec<OutboundPayload>) {
@@ -279,13 +289,31 @@ impl AppState {
             return;
         }
 
-        {
-            let mut queue_map = self.outgoing_payloads.write().await;
+        let mut split = OutgoingPeerQueues::default();
+        for payload in payloads {
+            if matches!(payload, OutboundPayload::InputFrame { .. }) {
+                split.input.push_back(payload);
+            } else {
+                split.bulk.push_back(payload);
+            }
+        }
+
+        if !split.input.is_empty() {
+            let mut queue_map = self.outgoing_input_payloads.write().await;
             let queue = queue_map.entry(peer_id.to_string()).or_default();
-            for payload in payloads.into_iter().rev() {
+            for payload in split.input.into_iter().rev() {
                 queue.push_front(payload);
             }
         }
+
+        if !split.bulk.is_empty() {
+            let mut queue_map = self.outgoing_bulk_payloads.write().await;
+            let queue = queue_map.entry(peer_id.to_string()).or_default();
+            for payload in split.bulk.into_iter().rev() {
+                queue.push_front(payload);
+            }
+        }
+
         self.notify_outgoing_flush_signal();
     }
 

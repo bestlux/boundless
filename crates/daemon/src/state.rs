@@ -83,6 +83,12 @@ pub enum OutboundPayload {
     },
 }
 
+#[derive(Debug, Default)]
+struct OutgoingPeerQueues {
+    input: VecDeque<OutboundPayload>,
+    bulk: VecDeque<OutboundPayload>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TransportEventRecord {
     pub timestamp: DateTime<Utc>,
@@ -191,7 +197,8 @@ pub struct AppState {
     security_paths: Arc<SecurityPaths>,
     identity: Arc<DeviceIdentity>,
     device_fingerprint: Arc<String>,
-    outgoing_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
+    outgoing_input_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
+    outgoing_bulk_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
     transport_events: Arc<RwLock<VecDeque<TransportEventRecord>>>,
     clipboard_sync: Arc<RwLock<ClipboardSyncState>>,
     discovered_endpoints: Arc<RwLock<HashMap<String, DiscoveredPeerEndpoint>>>,
@@ -277,7 +284,8 @@ impl AppState {
             security_paths: Arc::new(paths),
             identity: Arc::new(identity),
             device_fingerprint: Arc::new(fingerprint),
-            outgoing_payloads: Arc::new(RwLock::new(HashMap::new())),
+            outgoing_input_payloads: Arc::new(RwLock::new(HashMap::new())),
+            outgoing_bulk_payloads: Arc::new(RwLock::new(HashMap::new())),
             transport_events: Arc::new(RwLock::new(VecDeque::new())),
             clipboard_sync: Arc::new(RwLock::new(ClipboardSyncState::default())),
             discovered_endpoints: Arc::new(RwLock::new(HashMap::new())),
@@ -1688,6 +1696,50 @@ mod tests {
         assert!(
             *flush_signal.borrow_and_update() > 0,
             "flush signal generation should advance after enqueue"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn drain_outgoing_prioritizes_input_frames_over_bulk_payloads() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-outgoing-priority-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        state
+            .queue_clipboard_text(&peer_id, "bulk".to_string())
+            .await
+            .expect("queue bulk");
+        state
+            .queue_input_events(&peer_id, vec![InputEvent::MouseMove { dx: 1, dy: 2 }])
+            .await
+            .expect("queue input");
+
+        let drained = state.drain_outgoing(&peer_id).await;
+        assert_eq!(drained.len(), 2);
+        assert!(
+            matches!(drained.first(), Some(OutboundPayload::InputFrame { .. })),
+            "input frame should drain before bulk payloads"
+        );
+        assert!(
+            matches!(drained.get(1), Some(OutboundPayload::ClipboardText { .. })),
+            "bulk payload should follow drained input frame"
         );
 
         let _ = std::fs::remove_dir_all(&root);
