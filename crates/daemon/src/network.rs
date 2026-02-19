@@ -58,7 +58,7 @@ use tls::{
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
-const OUTGOING_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
+const OUTGOING_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
 const SUPERVISOR_TICK: Duration = Duration::from_secs(3);
 const MAX_BACKOFF_SECONDS: u64 = 30;
 const FILE_CHUNK_BYTES: usize = 48 * 1024;
@@ -415,6 +415,17 @@ mod tests {
             minor: 2,
             patch: 0,
         }));
+    }
+
+    #[test]
+    fn perf_probe_outgoing_flush_tick_rate() {
+        let flush_ms = OUTGOING_FLUSH_INTERVAL.as_millis() as f64;
+        let theoretical_max_hz = if flush_ms > 0.0 { 1000.0 / flush_ms } else { 0.0 };
+        eprintln!(
+            "PERF_PROBE outgoing_flush interval_ms={} theoretical_max_hz={:.2}",
+            flush_ms, theoretical_max_hz
+        );
+        assert!(flush_ms > 0.0, "flush interval must be positive");
     }
 
     #[test]

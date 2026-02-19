@@ -53,6 +53,7 @@ use windows_sys::Win32::{
 
 const INPUT_TICK: Duration = Duration::from_millis(5);
 const INPUT_CAPTURE_TICK: Duration = Duration::from_millis(8);
+const INPUT_INJECT_MAX_FRAMES_PER_TICK: usize = 24;
 const INPUT_INJECT_RETRY_BASE_BACKOFF_MS: u64 = 12;
 const INPUT_INJECT_RETRY_MAX_BACKOFF_MS: u64 = 160;
 const INPUT_INJECT_MAX_RETRIES: u8 = 5;
@@ -392,6 +393,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn perf_probe_inject_tick_backlog_throughput() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim owner"),
+            "owner claim should succeed"
+        );
+
+        let frame_count = 240u64;
+        for sequence in 1..=frame_count {
+            state
+                .route_incoming_input_frame(
+                    &peer_id,
+                    InputFrame {
+                        source_peer_id: peer_id.clone(),
+                        sequence,
+                        timestamp_unix_ms: Utc::now().timestamp_millis(),
+                        events: vec![InputEvent::MouseMove { dx: 1, dy: 0 }],
+                    },
+                )
+                .await
+                .expect("route frame");
+        }
+
+        let mut backend = CountingBackend { applied: 0 };
+        let started = Instant::now();
+        drain_pending_inject_frames(&state, &mut backend).await;
+        let elapsed = started.elapsed();
+        let remaining = state.pending_inject_input_frame_count().await;
+
+        eprintln!(
+            "PERF_PROBE inject_tick frame_count={} processed={} remaining={} elapsed_us={}",
+            frame_count,
+            backend.applied,
+            remaining,
+            elapsed.as_micros()
+        );
+
+        assert!(backend.applied > 0, "probe must process at least one frame");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn drain_skips_frame_if_owner_changes_before_inject() {
         let (state, peer_id, root) = state_with_peer_for_input_test().await;
         assert!(
@@ -434,6 +485,59 @@ mod tests {
                 .any(|event| event.kind == "input_inject_skipped" && event.peer_id == peer_id),
             "runtime should emit skipped event telemetry"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn drain_caps_work_per_tick_and_leaves_remainder_queued() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim owner"),
+            "owner claim should succeed"
+        );
+
+        let frame_count = INPUT_INJECT_MAX_FRAMES_PER_TICK + 8;
+        for sequence in 1..=frame_count as u64 {
+            state
+                .route_incoming_input_frame(
+                    &peer_id,
+                    InputFrame {
+                        source_peer_id: peer_id.clone(),
+                        sequence,
+                        timestamp_unix_ms: Utc::now().timestamp_millis(),
+                        events: vec![InputEvent::MouseMove { dx: 1, dy: 0 }],
+                    },
+                )
+                .await
+                .expect("route");
+        }
+
+        let mut backend = CountingBackend { applied: 0 };
+        drain_pending_inject_frames(&state, &mut backend).await;
+        assert_eq!(
+            backend.applied, INPUT_INJECT_MAX_FRAMES_PER_TICK,
+            "first tick should be bounded by inject frame budget"
+        );
+        assert_eq!(
+            state.pending_inject_input_frame_count().await,
+            8,
+            "remaining frames should stay queued for next tick"
+        );
+
+        drain_pending_inject_frames(&state, &mut backend).await;
+        assert_eq!(
+            backend.applied, frame_count,
+            "second tick should drain the remaining frames"
+        );
+        assert_eq!(state.pending_inject_input_frame_count().await, 0);
 
         let _ = std::fs::remove_dir_all(root);
     }

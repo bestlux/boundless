@@ -94,6 +94,8 @@ where
     let mut line = Vec::<u8>::with_capacity(4096);
     let mut heartbeat_interval = time::interval(HEARTBEAT_INTERVAL);
     let mut outgoing_flush_interval = time::interval(OUTGOING_FLUSH_INTERVAL);
+    heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    outgoing_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     let snapshot = state.snapshot().await;
     let local_hello = WireMessage::Hello {

@@ -52,7 +52,8 @@ pub(super) async fn run(state: AppState) -> Result<()> {
 
 pub(super) async fn drain_pending_inject_frames(state: &AppState, backend: &mut dyn InputBackend) {
     let cycle_len = state.pending_inject_input_frame_count().await;
-    for _ in 0..cycle_len {
+    let frames_this_tick = cycle_len.min(INPUT_INJECT_MAX_FRAMES_PER_TICK);
+    for _ in 0..frames_this_tick {
         let Some(mut frame) = state.dequeue_pending_inject_input_frame().await else {
             break;
         };
