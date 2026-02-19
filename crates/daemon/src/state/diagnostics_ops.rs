@@ -17,6 +17,9 @@ impl AppState {
         self.outgoing_input_payloads.write().await.clear();
         self.outgoing_bulk_payloads.write().await.clear();
         self.transport_events.write().await.clear();
+        if let Ok(mut pending) = self.pending_transport_events.lock() {
+            pending.clear();
+        }
         *self.clipboard_sync.write().await = ClipboardSyncState::default();
         self.discovered_endpoints.write().await.clear();
         *self.input_router.write().await =
@@ -62,6 +65,7 @@ impl AppState {
             .await
             .map(|items| items.len())
             .unwrap_or(0);
+        self.flush_pending_transport_events(usize::MAX).await;
         let event_count = self.transport_events.read().await.len();
         let input_owner = self
             .input_owner()

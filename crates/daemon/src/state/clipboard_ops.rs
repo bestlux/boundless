@@ -318,15 +318,57 @@ impl AppState {
     }
 
     pub async fn record_transport_event(&self, event: TransportEventRecord) {
-        let mut events = self.transport_events.write().await;
-        events.push_back(event);
-        while events.len() > MAX_TRANSPORT_EVENTS {
-            events.pop_front();
+        let pending_len = {
+            match self.pending_transport_events.lock() {
+                Ok(mut pending) => {
+                    pending.push_back(event);
+                    pending.len()
+                }
+                Err(_) => return,
+            }
+        };
+
+        if pending_len >= TRANSPORT_EVENT_FLUSH_TRIGGER {
+            self.flush_pending_transport_events(TRANSPORT_EVENT_FLUSH_BATCH)
+                .await;
         }
     }
 
     pub async fn transport_events(&self) -> Vec<TransportEventRecord> {
+        self.flush_pending_transport_events(usize::MAX).await;
         self.transport_events.read().await.iter().cloned().collect()
+    }
+
+    pub(crate) async fn flush_pending_transport_events(&self, max_batch: usize) {
+        if max_batch == 0 {
+            return;
+        }
+
+        let _flush_guard = self.transport_event_flush_lock.lock().await;
+
+        let drained = {
+            match self.pending_transport_events.lock() {
+                Ok(mut pending) => {
+                    if pending.is_empty() {
+                        Vec::new()
+                    } else {
+                        let count = pending.len().min(max_batch);
+                        pending.drain(..count).collect::<Vec<_>>()
+                    }
+                }
+                Err(_) => Vec::new(),
+            }
+        };
+
+        if drained.is_empty() {
+            return;
+        }
+
+        let mut events = self.transport_events.write().await;
+        events.extend(drained);
+        while events.len() > MAX_TRANSPORT_EVENTS {
+            events.pop_front();
+        }
     }
 
     pub async fn record_incoming_clipboard_text(&self, peer_id: &str, text: &str) {

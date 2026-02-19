@@ -36,6 +36,8 @@ use crate::config::{
 };
 
 const MAX_TRANSPORT_EVENTS: usize = 512;
+const TRANSPORT_EVENT_FLUSH_TRIGGER: usize = 32;
+const TRANSPORT_EVENT_FLUSH_BATCH: usize = 128;
 const MAX_PENDING_REMOTE_CLIPBOARD_ITEMS: usize = 64;
 const MAX_PENDING_INJECT_INPUT_FRAMES: usize = 128;
 const INPUT_OWNER_AUTO_STEAL_COOLDOWN_MS: u64 = 1_000;
@@ -200,6 +202,8 @@ pub struct AppState {
     outgoing_input_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
     outgoing_bulk_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
     transport_events: Arc<RwLock<VecDeque<TransportEventRecord>>>,
+    pending_transport_events: Arc<std::sync::Mutex<VecDeque<TransportEventRecord>>>,
+    transport_event_flush_lock: Arc<tokio::sync::Mutex<()>>,
     clipboard_sync: Arc<RwLock<ClipboardSyncState>>,
     discovered_endpoints: Arc<RwLock<HashMap<String, DiscoveredPeerEndpoint>>>,
     mdns_active: Arc<RwLock<bool>>,
@@ -287,6 +291,8 @@ impl AppState {
             outgoing_input_payloads: Arc::new(RwLock::new(HashMap::new())),
             outgoing_bulk_payloads: Arc::new(RwLock::new(HashMap::new())),
             transport_events: Arc::new(RwLock::new(VecDeque::new())),
+            pending_transport_events: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            transport_event_flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             clipboard_sync: Arc::new(RwLock::new(ClipboardSyncState::default())),
             discovered_endpoints: Arc::new(RwLock::new(HashMap::new())),
             mdns_active: Arc::new(RwLock::new(false)),
