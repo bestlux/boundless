@@ -213,14 +213,17 @@ impl AppState {
         let metadata = tokio::fs::metadata(file_path)
             .await
             .map_err(anyhow::Error::from)?;
-        validate_transfer_size(metadata.len())?;
-        let bytes = tokio::fs::read(file_path)
+        if !metadata.is_file() {
+            anyhow::bail!("file path must reference a regular file");
+        }
+        tokio::fs::File::open(file_path)
             .await
             .map_err(anyhow::Error::from)?;
-        let total_bytes = bytes.len() as u64;
+        let total_bytes = metadata.len();
         validate_transfer_size(total_bytes)?;
 
         let transfer_id = uuid::Uuid::new_v4().to_string();
+        let source_path = file_path.to_path_buf();
         {
             let mut queue_map = self.outgoing_bulk_payloads.write().await;
             let queue = queue_map.entry(peer_id.to_string()).or_default();
@@ -229,11 +232,17 @@ impl AppState {
                 file_name: file_name.clone(),
                 total_bytes,
             });
-            for chunk in bytes.chunks(FILE_TRANSFER_CHUNK_BYTES) {
+            let mut offset_bytes = 0u64;
+            while offset_bytes < total_bytes {
+                let remaining = (total_bytes - offset_bytes) as usize;
+                let length_bytes = remaining.min(FILE_TRANSFER_CHUNK_BYTES);
                 queue.push_back(OutboundPayload::FileChunk {
                     transfer_id: transfer_id.clone(),
-                    data: chunk.to_vec(),
+                    source_path: source_path.clone(),
+                    offset_bytes,
+                    length_bytes,
                 });
+                offset_bytes = offset_bytes.saturating_add(length_bytes as u64);
             }
             queue.push_back(OutboundPayload::FileEnd {
                 transfer_id,

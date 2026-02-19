@@ -1117,12 +1117,41 @@ where
             .await?;
             Ok(true)
         }
-        OutboundPayload::FileChunk { transfer_id, data } => {
+        OutboundPayload::FileChunk {
+            transfer_id,
+            source_path,
+            offset_bytes,
+            length_bytes,
+        } => {
+            let mut source_file = tokio::fs::File::open(source_path).await.with_context(|| {
+                format!("open outbound file chunk source {}", source_path.display())
+            })?;
+            source_file
+                .seek(std::io::SeekFrom::Start(*offset_bytes))
+                .await
+                .with_context(|| {
+                    format!(
+                        "seek outbound file chunk source {} to offset {}",
+                        source_path.display(),
+                        offset_bytes
+                    )
+                })?;
+
+            let mut data = vec![0u8; *length_bytes];
+            source_file.read_exact(&mut data).await.with_context(|| {
+                format!(
+                    "read outbound file chunk source {} offset {} length {}",
+                    source_path.display(),
+                    offset_bytes,
+                    length_bytes
+                )
+            })?;
+
             send_message(
                 writer,
                 &WireMessage::FileChunk {
                     transfer_id: transfer_id.clone(),
-                    data: data.clone(),
+                    data,
                 },
                 frame_buffer,
             )

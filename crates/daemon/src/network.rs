@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::JoinHandle,

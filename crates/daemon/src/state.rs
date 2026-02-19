@@ -84,7 +84,9 @@ pub enum OutboundPayload {
     },
     FileChunk {
         transfer_id: String,
-        data: Vec<u8>,
+        source_path: PathBuf,
+        offset_bytes: u64,
+        length_bytes: usize,
     },
     FileEnd {
         transfer_id: String,
@@ -1903,24 +1905,28 @@ mod tests {
             other => panic!("expected file start payload, got {other:?}"),
         };
 
-        let expected_chunk_sizes = [
-            FILE_TRANSFER_CHUNK_BYTES,
-            FILE_TRANSFER_CHUNK_BYTES,
-            17usize,
+        let expected_chunks = [
+            (0u64, FILE_TRANSFER_CHUNK_BYTES),
+            (FILE_TRANSFER_CHUNK_BYTES as u64, FILE_TRANSFER_CHUNK_BYTES),
+            ((FILE_TRANSFER_CHUNK_BYTES * 2) as u64, 17usize),
         ];
-        for (payload_item, expected_size) in queued
+        for (payload_item, (expected_offset, expected_size)) in queued
             .iter()
             .skip(1)
             .take(3)
-            .zip(expected_chunk_sizes.into_iter())
+            .zip(expected_chunks.into_iter())
         {
             match payload_item {
                 OutboundPayload::FileChunk {
                     transfer_id: chunk_transfer_id,
-                    data,
+                    source_path,
+                    offset_bytes,
+                    length_bytes,
                 } => {
                     assert_eq!(chunk_transfer_id, &transfer_id);
-                    assert_eq!(data.len(), expected_size);
+                    assert_eq!(source_path, &file_path);
+                    assert_eq!(*offset_bytes, expected_offset);
+                    assert_eq!(*length_bytes, expected_size);
                 }
                 other => panic!("expected file chunk payload, got {other:?}"),
             }
@@ -1938,6 +1944,43 @@ mod tests {
             }
             other => panic!("expected file end payload, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn queue_file_from_path_rejects_non_regular_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-file-outgoing-invalid-path-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        let err = state
+            .queue_file_from_path(&peer_id, &root)
+            .await
+            .expect_err("directory path must fail");
+        assert!(
+            err.to_string().contains("regular file"),
+            "error should indicate non-regular input"
+        );
+        assert!(
+            state.drain_outgoing_bulk(&peer_id, usize::MAX).await.is_empty(),
+            "invalid source path must not enqueue bulk payloads"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
