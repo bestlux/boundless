@@ -86,7 +86,10 @@ impl AppState {
     pub async fn set_layout(&self, matrix: String) -> Result<()> {
         let mut config = self.config.write().await;
         config.layout_matrix = matrix;
-        save_config_at(&self.config_path, &config)
+        save_config_at(&self.config_path, &config)?;
+        drop(config);
+        self.invalidate_cached_layout_matrix().await;
+        Ok(())
     }
 
     pub async fn edge_switch_policy(&self) -> (EasyMouseMode, bool) {
@@ -110,7 +113,13 @@ impl AppState {
         direction: SwitchDirection,
     ) -> Option<CaptureHandoffTarget> {
         let config = self.config.read().await;
-        resolve_capture_handoff_target_with_fallback(&config, current_target, direction)
+        let matrix = self.cached_layout_matrix_for_spec(&config.layout_matrix).await;
+        resolve_capture_handoff_target_with_fallback_from_matrix(
+            &config,
+            current_target,
+            direction,
+            matrix.as_ref(),
+        )
     }
 
     pub async fn apply_switch_all_capture_target(&self) -> Option<String> {
@@ -129,7 +138,8 @@ impl AppState {
     pub async fn next_switch_all_capture_target(&self) -> Option<String> {
         let order = {
             let config = self.config.read().await;
-            resolve_switch_all_target_order(&config)
+            let matrix = self.cached_layout_matrix_for_spec(&config.layout_matrix).await;
+            resolve_switch_all_target_order_from_matrix(&config, matrix.as_ref())
         };
         let current_target = self.input_capture_target_peer_id.read().await.clone();
         if order.is_empty() {

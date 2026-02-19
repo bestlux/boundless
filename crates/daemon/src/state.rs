@@ -57,7 +57,9 @@ mod validation;
 #[cfg(test)]
 use layout_resolver::resolve_capture_handoff_target;
 use layout_resolver::{
-    resolve_capture_handoff_target_with_fallback, resolve_switch_all_target_order,
+    parse_layout_matrix, resolve_capture_handoff_target_with_fallback,
+    resolve_capture_handoff_target_with_fallback_from_matrix, resolve_switch_all_target_order,
+    resolve_switch_all_target_order_from_matrix,
 };
 use routing_helpers::{describe_input_frame_decision, elapsed_ms};
 use validation::{
@@ -191,6 +193,12 @@ struct ClipboardSyncState {
     pending_remote: VecDeque<PendingRemoteClipboardPayload>,
 }
 
+#[derive(Debug, Clone)]
+struct ParsedLayoutMatrixCache {
+    spec: String,
+    matrix: Arc<Vec<Vec<String>>>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     config_path: Arc<PathBuf>,
@@ -208,6 +216,7 @@ pub struct AppState {
     discovered_endpoints: Arc<RwLock<HashMap<String, DiscoveredPeerEndpoint>>>,
     mdns_active: Arc<RwLock<bool>>,
     inbox_root: Arc<PathBuf>,
+    parsed_layout_matrix_cache: Arc<RwLock<Option<ParsedLayoutMatrixCache>>>,
     input_router: Arc<RwLock<InputRouter>>,
     input_sequence_by_peer: Arc<RwLock<HashMap<String, u64>>>,
     pending_inject_input_frames: Arc<RwLock<VecDeque<PendingInjectInputFrame>>>,
@@ -297,6 +306,7 @@ impl AppState {
             discovered_endpoints: Arc::new(RwLock::new(HashMap::new())),
             mdns_active: Arc::new(RwLock::new(false)),
             inbox_root: Arc::new(inbox_root),
+            parsed_layout_matrix_cache: Arc::new(RwLock::new(None)),
             input_router: Arc::new(RwLock::new(InputRouter::new(input_enabled))),
             input_sequence_by_peer: Arc::new(RwLock::new(HashMap::new())),
             pending_inject_input_frames: Arc::new(RwLock::new(VecDeque::new())),
@@ -387,6 +397,31 @@ impl AppState {
 
     pub async fn snapshot(&self) -> RuntimeConfig {
         self.config.read().await.clone()
+    }
+
+    pub(crate) async fn cached_layout_matrix_for_spec(&self, spec: &str) -> Arc<Vec<Vec<String>>> {
+        if let Some(cached) = self.parsed_layout_matrix_cache.read().await.as_ref()
+            && cached.spec == spec
+        {
+            return cached.matrix.clone();
+        }
+
+        let parsed = Arc::new(parse_layout_matrix(spec));
+        let mut cache = self.parsed_layout_matrix_cache.write().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.spec == spec
+        {
+            return cached.matrix.clone();
+        }
+        *cache = Some(ParsedLayoutMatrixCache {
+            spec: spec.to_string(),
+            matrix: parsed.clone(),
+        });
+        parsed
+    }
+
+    pub(crate) async fn invalidate_cached_layout_matrix(&self) {
+        *self.parsed_layout_matrix_cache.write().await = None;
     }
 
     pub fn subscribe_outgoing_flush_signal(&self) -> watch::Receiver<u64> {

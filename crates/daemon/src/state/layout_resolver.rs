@@ -5,12 +5,22 @@ pub(super) fn resolve_capture_handoff_target_with_fallback(
     current_target: Option<&str>,
     direction: SwitchDirection,
 ) -> Option<CaptureHandoffTarget> {
-    let resolved = resolve_capture_handoff_target(config, current_target, direction);
+    let matrix = parse_layout_matrix(&config.layout_matrix);
+    resolve_capture_handoff_target_with_fallback_from_matrix(config, current_target, direction, &matrix)
+}
+
+pub(super) fn resolve_capture_handoff_target_with_fallback_from_matrix(
+    config: &RuntimeConfig,
+    current_target: Option<&str>,
+    direction: SwitchDirection,
+    matrix: &[Vec<String>],
+) -> Option<CaptureHandoffTarget> {
+    let resolved = resolve_capture_handoff_target_from_matrix(config, current_target, direction, matrix);
     if resolved.is_some() {
         return resolved;
     }
 
-    if layout_is_actionable_for_handoff(config, current_target) {
+    if layout_is_actionable_for_handoff_from_matrix(config, current_target, matrix) {
         return None;
     }
 
@@ -23,6 +33,15 @@ pub(super) fn resolve_capture_handoff_target(
     direction: SwitchDirection,
 ) -> Option<CaptureHandoffTarget> {
     let matrix = parse_layout_matrix(&config.layout_matrix);
+    resolve_capture_handoff_target_from_matrix(config, current_target, direction, &matrix)
+}
+
+pub(super) fn resolve_capture_handoff_target_from_matrix(
+    config: &RuntimeConfig,
+    current_target: Option<&str>,
+    direction: SwitchDirection,
+    matrix: &[Vec<String>],
+) -> Option<CaptureHandoffTarget> {
     let mut source_cell: Option<(usize, usize)> = None;
 
     for (row_index, row) in matrix.iter().enumerate() {
@@ -114,25 +133,28 @@ pub(super) fn resolve_capture_handoff_target(
     }
 }
 
-fn layout_is_actionable_for_handoff(config: &RuntimeConfig, current_target: Option<&str>) -> bool {
-    let matrix = parse_layout_matrix(&config.layout_matrix);
+fn layout_is_actionable_for_handoff_from_matrix(
+    config: &RuntimeConfig,
+    current_target: Option<&str>,
+    matrix: &[Vec<String>],
+) -> bool {
     let mut source_count = 0usize;
     let mut has_destination = false;
 
     for row in matrix {
         for token in row {
             if let Some(peer_id) = current_target {
-                if layout_token_matches_peer(&token, peer_id, &config.peers) {
+                if layout_token_matches_peer(token, peer_id, &config.peers) {
                     source_count += 1;
                 }
-                if is_local_layout_token(&token, config) {
+                if is_local_layout_token(token, config) {
                     has_destination = true;
                 }
             } else {
-                if is_local_layout_token(&token, config) {
+                if is_local_layout_token(token, config) {
                     source_count += 1;
                 }
-                if resolve_peer_layout_token(&token, &config.peers).is_some() {
+                if resolve_peer_layout_token(token, &config.peers).is_some() {
                     has_destination = true;
                 }
             }
@@ -169,10 +191,18 @@ fn resolve_single_peer_handoff_target(
 }
 
 pub(super) fn resolve_switch_all_target_order(config: &RuntimeConfig) -> Vec<String> {
+    let matrix = parse_layout_matrix(&config.layout_matrix);
+    resolve_switch_all_target_order_from_matrix(config, &matrix)
+}
+
+pub(super) fn resolve_switch_all_target_order_from_matrix(
+    config: &RuntimeConfig,
+    matrix: &[Vec<String>],
+) -> Vec<String> {
     let mut ordered = Vec::<String>::new();
     let mut seen = HashSet::<String>::new();
 
-    for row in parse_layout_matrix(&config.layout_matrix) {
+    for row in matrix {
         for token in row {
             if is_local_layout_token(&token, config) {
                 continue;
@@ -203,7 +233,7 @@ pub(super) fn resolve_switch_all_target_order(config: &RuntimeConfig) -> Vec<Str
     ordered
 }
 
-fn parse_layout_matrix(spec: &str) -> Vec<Vec<String>> {
+pub(super) fn parse_layout_matrix(spec: &str) -> Vec<Vec<String>> {
     spec.split(';')
         .map(|row| {
             row.split(',')

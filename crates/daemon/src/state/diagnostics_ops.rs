@@ -44,6 +44,7 @@ impl AppState {
             .write()
             .await
             .clear();
+        self.invalidate_cached_layout_matrix().await;
 
         save_config_at(&self.config_path, &config)
     }
