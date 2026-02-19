@@ -42,6 +42,7 @@ const MAX_PENDING_REMOTE_CLIPBOARD_ITEMS: usize = 64;
 const MAX_PENDING_INJECT_INPUT_FRAMES: usize = 128;
 const INPUT_OWNER_AUTO_STEAL_COOLDOWN_MS: u64 = 1_000;
 const NEARBY_PAIRING_DECISION_RETENTION_MINUTES: i64 = 10;
+pub(crate) const FILE_TRANSFER_CHUNK_BYTES: usize = 48 * 1024;
 
 mod clipboard_ops;
 mod config_ops;
@@ -76,9 +77,19 @@ pub enum OutboundPayload {
     ClipboardImage {
         image_bmp: Vec<u8>,
     },
-    File {
+    FileStart {
+        transfer_id: String,
         file_name: String,
-        bytes: Vec<u8>,
+        total_bytes: u64,
+    },
+    FileChunk {
+        transfer_id: String,
+        data: Vec<u8>,
+    },
+    FileEnd {
+        transfer_id: String,
+        file_name: String,
+        total_bytes: u64,
     },
     InputFrame {
         sequence: u64,
@@ -1785,6 +1796,148 @@ mod tests {
             matches!(drained.get(1), Some(OutboundPayload::ClipboardText { .. })),
             "bulk payload should follow drained input frame"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn drain_outgoing_bulk_respects_max_payloads() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-outgoing-bulk-limit-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        state
+            .queue_clipboard_text(&peer_id, "one".to_string())
+            .await
+            .expect("queue one");
+        state
+            .queue_clipboard_text(&peer_id, "two".to_string())
+            .await
+            .expect("queue two");
+        state
+            .queue_clipboard_text(&peer_id, "three".to_string())
+            .await
+            .expect("queue three");
+
+        let first_batch = state.drain_outgoing_bulk(&peer_id, 2).await;
+        assert_eq!(first_batch.len(), 2);
+        assert!(matches!(
+            first_batch.first(),
+            Some(OutboundPayload::ClipboardText { text }) if text == "one"
+        ));
+        assert!(matches!(
+            first_batch.get(1),
+            Some(OutboundPayload::ClipboardText { text }) if text == "two"
+        ));
+
+        let second_batch = state.drain_outgoing_bulk(&peer_id, usize::MAX).await;
+        assert_eq!(second_batch.len(), 1);
+        assert!(matches!(
+            second_batch.first(),
+            Some(OutboundPayload::ClipboardText { text }) if text == "three"
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn queue_file_from_path_enqueues_chunked_bulk_transfer() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-file-outgoing-chunk-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        let file_path = root.join("payload.bin");
+        let payload = vec![7u8; FILE_TRANSFER_CHUNK_BYTES * 2 + 17];
+        tokio::fs::write(&file_path, &payload)
+            .await
+            .expect("write payload");
+
+        state
+            .queue_file_from_path(&peer_id, &file_path)
+            .await
+            .expect("queue file");
+
+        let queued = state.drain_outgoing_bulk(&peer_id, usize::MAX).await;
+        assert_eq!(queued.len(), 5, "start + 3 chunks + end expected");
+
+        let transfer_id = match queued.first() {
+            Some(OutboundPayload::FileStart {
+                transfer_id,
+                file_name,
+                total_bytes,
+            }) => {
+                assert_eq!(file_name, "payload.bin");
+                assert_eq!(*total_bytes, payload.len() as u64);
+                transfer_id.clone()
+            }
+            other => panic!("expected file start payload, got {other:?}"),
+        };
+
+        let expected_chunk_sizes = [
+            FILE_TRANSFER_CHUNK_BYTES,
+            FILE_TRANSFER_CHUNK_BYTES,
+            17usize,
+        ];
+        for (payload_item, expected_size) in queued
+            .iter()
+            .skip(1)
+            .take(3)
+            .zip(expected_chunk_sizes.into_iter())
+        {
+            match payload_item {
+                OutboundPayload::FileChunk {
+                    transfer_id: chunk_transfer_id,
+                    data,
+                } => {
+                    assert_eq!(chunk_transfer_id, &transfer_id);
+                    assert_eq!(data.len(), expected_size);
+                }
+                other => panic!("expected file chunk payload, got {other:?}"),
+            }
+        }
+
+        match queued.get(4) {
+            Some(OutboundPayload::FileEnd {
+                transfer_id: end_transfer_id,
+                file_name,
+                total_bytes,
+            }) => {
+                assert_eq!(end_transfer_id, &transfer_id);
+                assert_eq!(file_name, "payload.bin");
+                assert_eq!(*total_bytes, payload.len() as u64);
+            }
+            other => panic!("expected file end payload, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

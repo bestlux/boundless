@@ -1,5 +1,16 @@
 use super::*;
 
+fn drain_queue_up_to(
+    queue: &mut VecDeque<OutboundPayload>,
+    max_payloads: usize,
+) -> Vec<OutboundPayload> {
+    if max_payloads == 0 || queue.is_empty() {
+        return Vec::new();
+    }
+    let drain_count = queue.len().min(max_payloads);
+    queue.drain(..drain_count).collect()
+}
+
 impl AppState {
     async fn queue_outgoing_bulk_payload(&self, peer_id: &str, payload: OutboundPayload) {
         {
@@ -206,9 +217,31 @@ impl AppState {
         let bytes = tokio::fs::read(file_path)
             .await
             .map_err(anyhow::Error::from)?;
+        let total_bytes = bytes.len() as u64;
+        validate_transfer_size(total_bytes)?;
 
-        self.queue_outgoing_bulk_payload(peer_id, OutboundPayload::File { file_name, bytes })
-            .await;
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut queue_map = self.outgoing_bulk_payloads.write().await;
+            let queue = queue_map.entry(peer_id.to_string()).or_default();
+            queue.push_back(OutboundPayload::FileStart {
+                transfer_id: transfer_id.clone(),
+                file_name: file_name.clone(),
+                total_bytes,
+            });
+            for chunk in bytes.chunks(FILE_TRANSFER_CHUNK_BYTES) {
+                queue.push_back(OutboundPayload::FileChunk {
+                    transfer_id: transfer_id.clone(),
+                    data: chunk.to_vec(),
+                });
+            }
+            queue.push_back(OutboundPayload::FileEnd {
+                transfer_id,
+                file_name,
+                total_bytes,
+            });
+        }
+        self.notify_outgoing_flush_signal();
         Ok(())
     }
 
@@ -267,20 +300,54 @@ impl AppState {
         Ok(())
     }
 
-    pub async fn drain_outgoing(&self, peer_id: &str) -> Vec<OutboundPayload> {
-        let mut drained = OutgoingPeerQueues::default();
-        {
-            let mut queue_map = self.outgoing_input_payloads.write().await;
-            drained.input = queue_map.remove(peer_id).unwrap_or_default();
-        }
-        {
-            let mut queue_map = self.outgoing_bulk_payloads.write().await;
-            drained.bulk = queue_map.remove(peer_id).unwrap_or_default();
+    pub async fn drain_outgoing_input(
+        &self,
+        peer_id: &str,
+        max_payloads: usize,
+    ) -> Vec<OutboundPayload> {
+        let mut queue_map = self.outgoing_input_payloads.write().await;
+        let mut drained = {
+            let Some(queue) = queue_map.get_mut(peer_id) else {
+                return Vec::new();
+            };
+            drain_queue_up_to(queue, max_payloads)
+        };
+
+        if queue_map.get(peer_id).is_some_and(VecDeque::is_empty) {
+            queue_map.remove(peer_id);
         }
 
-        let mut payloads = Vec::with_capacity(drained.input.len() + drained.bulk.len());
-        payloads.extend(drained.input);
-        payloads.extend(drained.bulk);
+        drained.shrink_to_fit();
+        drained
+    }
+
+    pub async fn drain_outgoing_bulk(
+        &self,
+        peer_id: &str,
+        max_payloads: usize,
+    ) -> Vec<OutboundPayload> {
+        let mut queue_map = self.outgoing_bulk_payloads.write().await;
+        let mut drained = {
+            let Some(queue) = queue_map.get_mut(peer_id) else {
+                return Vec::new();
+            };
+            drain_queue_up_to(queue, max_payloads)
+        };
+
+        if queue_map.get(peer_id).is_some_and(VecDeque::is_empty) {
+            queue_map.remove(peer_id);
+        }
+
+        drained.shrink_to_fit();
+        drained
+    }
+
+    pub async fn drain_outgoing(&self, peer_id: &str) -> Vec<OutboundPayload> {
+        let input = self.drain_outgoing_input(peer_id, usize::MAX).await;
+        let bulk = self.drain_outgoing_bulk(peer_id, usize::MAX).await;
+        let mut payloads = Vec::with_capacity(input.len() + bulk.len());
+        payloads.extend(input);
+        payloads.extend(bulk);
         payloads
     }
 

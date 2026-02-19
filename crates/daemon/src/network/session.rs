@@ -94,10 +94,12 @@ where
     let mut frame_payload = Vec::<u8>::with_capacity(4096);
     let mut write_frame_buffer = Vec::<u8>::with_capacity(4096);
     let mut heartbeat_interval = time::interval(HEARTBEAT_INTERVAL);
-    let mut outgoing_flush_interval = time::interval(OUTGOING_FLUSH_INTERVAL);
+    let mut outgoing_input_flush_interval = time::interval(OUTGOING_INPUT_FLUSH_INTERVAL);
+    let mut outgoing_bulk_flush_interval = time::interval(OUTGOING_BULK_FLUSH_INTERVAL);
     let mut outgoing_flush_signal = state.subscribe_outgoing_flush_signal();
     heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    outgoing_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    outgoing_input_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    outgoing_bulk_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     let snapshot = state.snapshot().await;
     let local_hello = WireMessage::Hello {
@@ -140,7 +142,7 @@ where
                 };
                 send_message(&mut writer, &heartbeat, &mut write_frame_buffer).await?;
                 if let Some(remote_protocol) = remote_protocol {
-                    flush_outgoing_payloads_with_buffer(
+                    flush_outgoing_input_payloads_with_buffer(
                         &state,
                         &snapshot.machine_id,
                         remote_peer_id.as_deref(),
@@ -149,10 +151,20 @@ where
                         &mut write_frame_buffer,
                     )
                     .await?;
+                    flush_outgoing_bulk_payloads_with_buffer(
+                        &state,
+                        &snapshot.machine_id,
+                        remote_peer_id.as_deref(),
+                        remote_protocol,
+                        OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
+                        &mut writer,
+                        &mut write_frame_buffer,
+                    )
+                    .await?;
                 }
                 writer.flush().await.context("flush heartbeat batch")?;
             }
-            _ = outgoing_flush_interval.tick(), if remote_protocol.is_some() => {
+            _ = outgoing_input_flush_interval.tick(), if remote_protocol.is_some() => {
                 if reconnect_requested_for_peer(
                     &state,
                     &authenticated_peer_id,
@@ -168,11 +180,39 @@ where
                 }
 
                 if let Some(remote_protocol) = remote_protocol {
-                    flush_outgoing_payloads_with_buffer(
+                    flush_outgoing_input_payloads_with_buffer(
                         &state,
                         &snapshot.machine_id,
                         remote_peer_id.as_deref(),
                         remote_protocol,
+                        &mut writer,
+                        &mut write_frame_buffer,
+                    )
+                    .await?;
+                }
+            }
+            _ = outgoing_bulk_flush_interval.tick(), if remote_protocol.is_some() => {
+                if reconnect_requested_for_peer(
+                    &state,
+                    &authenticated_peer_id,
+                    &mut observed_reconnect_generation,
+                )
+                .await
+                {
+                    info!(
+                        peer_id = %authenticated_peer_id,
+                        "ending session due to explicit reconnect request"
+                    );
+                    break;
+                }
+
+                if let Some(remote_protocol) = remote_protocol {
+                    flush_outgoing_bulk_payloads_with_buffer(
+                        &state,
+                        &snapshot.machine_id,
+                        remote_peer_id.as_deref(),
+                        remote_protocol,
+                        OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
                         &mut writer,
                         &mut write_frame_buffer,
                     )
@@ -200,7 +240,7 @@ where
                 }
 
                 if let Some(remote_protocol) = remote_protocol {
-                    flush_outgoing_payloads_with_buffer(
+                    flush_outgoing_input_payloads_with_buffer(
                         &state,
                         &snapshot.machine_id,
                         remote_peer_id.as_deref(),
@@ -304,11 +344,21 @@ where
                         }
 
                         if let Some(remote_protocol) = remote_protocol {
-                            flush_outgoing_payloads_with_buffer(
+                            flush_outgoing_input_payloads_with_buffer(
                                 &state,
                                 &snapshot.machine_id,
                                 remote_peer_id.as_deref(),
                                 remote_protocol,
+                                &mut writer,
+                                &mut write_frame_buffer,
+                            )
+                            .await?;
+                            flush_outgoing_bulk_payloads_with_buffer(
+                                &state,
+                                &snapshot.machine_id,
+                                remote_peer_id.as_deref(),
+                                remote_protocol,
+                                OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
                                 &mut writer,
                                 &mut write_frame_buffer,
                             )
@@ -322,11 +372,21 @@ where
                         }
 
                         if let Some(remote_protocol) = remote_protocol {
-                            flush_outgoing_payloads_with_buffer(
+                            flush_outgoing_input_payloads_with_buffer(
                                 &state,
                                 &snapshot.machine_id,
                                 remote_peer_id.as_deref(),
                                 remote_protocol,
+                                &mut writer,
+                                &mut write_frame_buffer,
+                            )
+                            .await?;
+                            flush_outgoing_bulk_payloads_with_buffer(
+                                &state,
+                                &snapshot.machine_id,
+                                remote_peer_id.as_deref(),
+                                remote_protocol,
+                                OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
                                 &mut writer,
                                 &mut write_frame_buffer,
                             )
@@ -802,7 +862,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut frame_buffer = Vec::with_capacity(4096);
-    flush_outgoing_payloads_with_buffer(
+    flush_outgoing_input_payloads_with_buffer(
         state,
         local_machine_id,
         remote_peer_id,
@@ -810,10 +870,20 @@ where
         writer,
         &mut frame_buffer,
     )
+    .await?;
+    flush_outgoing_bulk_payloads_with_buffer(
+        state,
+        local_machine_id,
+        remote_peer_id,
+        remote_protocol,
+        usize::MAX,
+        writer,
+        &mut frame_buffer,
+    )
     .await
 }
 
-async fn flush_outgoing_payloads_with_buffer<W>(
+async fn flush_outgoing_input_payloads_with_buffer<W>(
     state: &AppState,
     local_machine_id: &str,
     remote_peer_id: Option<&str>,
@@ -827,8 +897,67 @@ where
     let Some(peer_id) = remote_peer_id else {
         return Ok(());
     };
+    let pending = state.drain_outgoing_input(peer_id, usize::MAX).await;
+    flush_pending_payloads_with_buffer(
+        state,
+        local_machine_id,
+        peer_id,
+        remote_protocol,
+        pending,
+        writer,
+        frame_buffer,
+    )
+    .await
+}
 
-    let mut pending = VecDeque::from(state.drain_outgoing(peer_id).await);
+async fn flush_outgoing_bulk_payloads_with_buffer<W>(
+    state: &AppState,
+    local_machine_id: &str,
+    remote_peer_id: Option<&str>,
+    remote_protocol: ProtocolVersion,
+    max_payloads: usize,
+    writer: &mut W,
+    frame_buffer: &mut Vec<u8>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if max_payloads == 0 {
+        return Ok(());
+    }
+    let Some(peer_id) = remote_peer_id else {
+        return Ok(());
+    };
+    let pending = state.drain_outgoing_bulk(peer_id, max_payloads).await;
+    flush_pending_payloads_with_buffer(
+        state,
+        local_machine_id,
+        peer_id,
+        remote_protocol,
+        pending,
+        writer,
+        frame_buffer,
+    )
+    .await
+}
+
+async fn flush_pending_payloads_with_buffer<W>(
+    state: &AppState,
+    local_machine_id: &str,
+    peer_id: &str,
+    remote_protocol: ProtocolVersion,
+    pending_payloads: Vec<OutboundPayload>,
+    writer: &mut W,
+    frame_buffer: &mut Vec<u8>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if pending_payloads.is_empty() {
+        return Ok(());
+    }
+
+    let mut pending = VecDeque::from(pending_payloads);
     let mut sent_for_flush = Vec::<OutboundPayload>::new();
     let mut sent_any = false;
     while let Some(payload) = pending.pop_front() {
@@ -969,38 +1098,53 @@ where
                 .await;
             Ok(true)
         }
-        OutboundPayload::File { file_name, bytes } => {
-            let total_bytes = bytes.len() as u64;
-            validate_transfer_size(total_bytes)?;
-
-            let transfer_id = uuid::Uuid::new_v4().to_string();
+        OutboundPayload::FileStart {
+            transfer_id,
+            file_name,
+            total_bytes,
+        } => {
+            validate_transfer_size(*total_bytes)?;
             send_message(
                 writer,
                 &WireMessage::FileStart {
                     machine_id: local_machine_id.to_string(),
                     transfer_id: transfer_id.clone(),
                     file_name: file_name.clone(),
-                    total_bytes,
+                    total_bytes: *total_bytes,
+                },
+                frame_buffer,
+            )
+            .await?;
+            Ok(true)
+        }
+        OutboundPayload::FileChunk { transfer_id, data } => {
+            send_message(
+                writer,
+                &WireMessage::FileChunk {
+                    transfer_id: transfer_id.clone(),
+                    data: data.clone(),
+                },
+                frame_buffer,
+            )
+            .await?;
+            Ok(true)
+        }
+        OutboundPayload::FileEnd {
+            transfer_id,
+            file_name,
+            total_bytes,
+        } => {
+            send_message(
+                writer,
+                &WireMessage::FileEnd {
+                    transfer_id: transfer_id.clone(),
                 },
                 frame_buffer,
             )
             .await?;
 
-            for chunk in bytes.chunks(FILE_CHUNK_BYTES) {
-                send_message(
-                    writer,
-                    &WireMessage::FileChunk {
-                        transfer_id: transfer_id.clone(),
-                        data: chunk.to_vec(),
-                    },
-                    frame_buffer,
-                )
-                .await?;
-            }
-
-            send_message(writer, &WireMessage::FileEnd { transfer_id }, frame_buffer).await?;
             state
-                .record_outgoing_file(peer_id, file_name, total_bytes)
+                .record_outgoing_file(peer_id, file_name, *total_bytes)
                 .await;
             Ok(true)
         }
