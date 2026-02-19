@@ -6,7 +6,12 @@ pub(super) fn resolve_capture_handoff_target_with_fallback(
     direction: SwitchDirection,
 ) -> Option<CaptureHandoffTarget> {
     let matrix = parse_layout_matrix(&config.layout_matrix);
-    resolve_capture_handoff_target_with_fallback_from_matrix(config, current_target, direction, &matrix)
+    resolve_capture_handoff_target_with_fallback_from_matrix(
+        config,
+        current_target,
+        direction,
+        &matrix,
+    )
 }
 
 pub(super) fn resolve_capture_handoff_target_with_fallback_from_matrix(
@@ -15,7 +20,8 @@ pub(super) fn resolve_capture_handoff_target_with_fallback_from_matrix(
     direction: SwitchDirection,
     matrix: &[Vec<String>],
 ) -> Option<CaptureHandoffTarget> {
-    let resolved = resolve_capture_handoff_target_from_matrix(config, current_target, direction, matrix);
+    let resolved =
+        resolve_capture_handoff_target_from_matrix(config, current_target, direction, matrix);
     if resolved.is_some() {
         return resolved;
     }

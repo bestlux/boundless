@@ -59,7 +59,6 @@ pub(super) async fn drain_pending_inject_frames(state: &AppState, backend: &mut 
     }
     let mut deferred_frames = Vec::new();
     for mut frame in frames {
-
         if frame
             .next_retry_at
             .is_some_and(|next| std::time::Instant::now() < next)

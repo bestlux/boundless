@@ -1730,10 +1730,13 @@ mod tests {
             .await
             .expect("queue frame");
 
-        tokio::time::timeout(std::time::Duration::from_millis(200), flush_signal.changed())
-            .await
-            .expect("flush signal should be observed")
-            .expect("flush signal channel should remain open");
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            flush_signal.changed(),
+        )
+        .await
+        .expect("flush signal should be observed")
+        .expect("flush signal channel should remain open");
         assert!(
             *flush_signal.borrow_and_update() > 0,
             "flush signal generation should advance after enqueue"

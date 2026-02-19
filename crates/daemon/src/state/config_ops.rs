@@ -113,7 +113,9 @@ impl AppState {
         direction: SwitchDirection,
     ) -> Option<CaptureHandoffTarget> {
         let config = self.config.read().await;
-        let matrix = self.cached_layout_matrix_for_spec(&config.layout_matrix).await;
+        let matrix = self
+            .cached_layout_matrix_for_spec(&config.layout_matrix)
+            .await;
         resolve_capture_handoff_target_with_fallback_from_matrix(
             &config,
             current_target,
@@ -138,7 +140,9 @@ impl AppState {
     pub async fn next_switch_all_capture_target(&self) -> Option<String> {
         let order = {
             let config = self.config.read().await;
-            let matrix = self.cached_layout_matrix_for_spec(&config.layout_matrix).await;
+            let matrix = self
+                .cached_layout_matrix_for_spec(&config.layout_matrix)
+                .await;
             resolve_switch_all_target_order_from_matrix(&config, matrix.as_ref())
         };
         let current_target = self.input_capture_target_peer_id.read().await.clone();
