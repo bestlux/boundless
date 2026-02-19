@@ -26,9 +26,9 @@ use tracing::{error, info, warn};
 use core_input::{InputEvent, InputFrame, KeyState, MouseButton};
 use core_protocol::{
     MAX_WIRE_PAYLOAD_BYTES, PROTOCOL_CLIPBOARD_IMAGE_MIN, PROTOCOL_CURRENT,
-    PROTOCOL_INPUT_ANCHOR_MIN, ProtocolVersion, WIRE_FRAME_LENGTH_PREFIX_BYTES, WireCodecError,
-    WireInputEvent, WireKeyState, WireMessage, WireMouseButton, decode_frame_payload,
-    encode_frame_to_vec,
+    PROTOCOL_FILE_CHUNK_CREDIT_MIN, PROTOCOL_INPUT_ANCHOR_MIN, ProtocolVersion,
+    WIRE_FRAME_LENGTH_PREFIX_BYTES, WireCodecError, WireInputEvent, WireKeyState, WireMessage,
+    WireMouseButton, decode_frame_payload, encode_frame_to_vec,
 };
 use core_transfer::validate_transfer_size;
 
@@ -43,7 +43,7 @@ mod tls;
 use codec::protocol_supports_input_anchor;
 use codec::{
     input_event_from_wire, input_events_to_wire_for_protocol, now_millis,
-    protocol_supports_clipboard_image,
+    protocol_supports_clipboard_image, protocol_supports_file_chunk_credit,
 };
 #[cfg(test)]
 use runtime::outbound_target_candidates;
@@ -245,6 +245,56 @@ mod tests {
         ) -> Poll<Result<(), io::Error>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[derive(Default)]
+    struct CaptureWriter {
+        bytes: Vec<u8>,
+    }
+
+    impl AsyncWrite for CaptureWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            self.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn decode_written_frames(bytes: &[u8]) -> Vec<WireMessage> {
+        let mut cursor = bytes;
+        let mut frames = Vec::new();
+        while !cursor.is_empty() {
+            assert!(
+                cursor.len() >= WIRE_FRAME_LENGTH_PREFIX_BYTES,
+                "frame must include length prefix"
+            );
+            let payload_len =
+                u32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]) as usize;
+            assert!(
+                cursor.len() >= WIRE_FRAME_LENGTH_PREFIX_BYTES + payload_len,
+                "buffer must contain full frame payload"
+            );
+            let payload = &cursor
+                [WIRE_FRAME_LENGTH_PREFIX_BYTES..WIRE_FRAME_LENGTH_PREFIX_BYTES + payload_len];
+            let frame = decode_frame_payload(payload).expect("decode frame payload");
+            frames.push(frame);
+            cursor = &cursor[WIRE_FRAME_LENGTH_PREFIX_BYTES + payload_len..];
+        }
+        frames
     }
 
     #[test]
@@ -671,6 +721,126 @@ mod tests {
         assert!(
             queued.is_empty(),
             "oversized dropped image must not remain queued"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn flush_applies_file_chunk_backpressure_contract() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let file_path = root.join("flow.bin");
+        let payload = vec![9u8; crate::state::FILE_TRANSFER_CHUNK_BYTES + 7];
+        tokio::fs::write(&file_path, &payload)
+            .await
+            .expect("write payload");
+
+        state
+            .queue_file_from_path(&peer_id, &file_path)
+            .await
+            .expect("queue file");
+
+        let mut writer = CaptureWriter::default();
+        flush_outgoing_payloads(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            &mut writer,
+        )
+        .await
+        .expect("flush file transfer");
+
+        let frames = decode_written_frames(&writer.bytes);
+        assert_eq!(
+            frames.len(),
+            1,
+            "without chunk credit only file-start should be sent"
+        );
+        let transfer_id = match frames.first() {
+            Some(WireMessage::FileStart { transfer_id, .. }) => transfer_id.clone(),
+            other => panic!("expected first wire frame to be file start, got {other:?}"),
+        };
+
+        let queued = state.drain_outgoing_bulk(&peer_id, usize::MAX).await;
+        assert_eq!(
+            queued.len(),
+            3,
+            "two file chunks and file-end should remain queued after backpressure defer"
+        );
+        assert!(matches!(
+            queued.first(),
+            Some(OutboundPayload::FileChunk {
+                transfer_id: chunk_transfer_id,
+                ..
+            }) if chunk_transfer_id == &transfer_id
+        ));
+        assert!(matches!(
+            queued.get(1),
+            Some(OutboundPayload::FileChunk {
+                transfer_id: chunk_transfer_id,
+                ..
+            }) if chunk_transfer_id == &transfer_id
+        ));
+        assert!(matches!(
+            queued.get(2),
+            Some(OutboundPayload::FileEnd {
+                transfer_id: end_transfer_id,
+                ..
+            }) if end_transfer_id == &transfer_id
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn flush_file_transfer_falls_back_for_legacy_peer_without_chunk_credit() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let file_path = root.join("legacy-flow.bin");
+        let payload = vec![5u8; crate::state::FILE_TRANSFER_CHUNK_BYTES + 7];
+        tokio::fs::write(&file_path, &payload)
+            .await
+            .expect("write payload");
+
+        state
+            .queue_file_from_path(&peer_id, &file_path)
+            .await
+            .expect("queue file");
+
+        let mut writer = CaptureWriter::default();
+        flush_outgoing_payloads(
+            &state,
+            "local",
+            Some(&peer_id),
+            ProtocolVersion {
+                major: 2,
+                minor: 0,
+                patch: 0,
+            },
+            &mut writer,
+        )
+        .await
+        .expect("flush file transfer for legacy peer");
+
+        let frames = decode_written_frames(&writer.bytes);
+        assert_eq!(
+            frames.len(),
+            4,
+            "legacy peers should receive full file transfer without chunk credits"
+        );
+        assert!(matches!(
+            frames.first(),
+            Some(WireMessage::FileStart { .. })
+        ));
+        assert!(matches!(frames.get(1), Some(WireMessage::FileChunk { .. })));
+        assert!(matches!(frames.get(2), Some(WireMessage::FileChunk { .. })));
+        assert!(matches!(frames.get(3), Some(WireMessage::FileEnd { .. })));
+        assert!(
+            state
+                .drain_outgoing_bulk(&peer_id, usize::MAX)
+                .await
+                .is_empty(),
+            "legacy transfer should not stall in outbound queue"
         );
 
         let _ = std::fs::remove_dir_all(root);

@@ -8,6 +8,10 @@ pub(super) fn protocol_supports_input_anchor(protocol: ProtocolVersion) -> bool 
     protocol.as_tuple() >= PROTOCOL_INPUT_ANCHOR_MIN.as_tuple()
 }
 
+pub(super) fn protocol_supports_file_chunk_credit(protocol: ProtocolVersion) -> bool {
+    protocol.as_tuple() >= PROTOCOL_FILE_CHUNK_CREDIT_MIN.as_tuple()
+}
+
 pub(super) fn input_events_to_wire_for_protocol(
     events: &[InputEvent],
     remote_protocol: ProtocolVersion,

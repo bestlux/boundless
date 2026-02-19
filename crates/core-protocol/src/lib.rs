@@ -5,7 +5,7 @@ use thiserror::Error;
 
 pub const PROTOCOL_NAME: &str = "boundless";
 pub const PROTOCOL_CURRENT: ProtocolVersion = ProtocolVersion {
-    major: 2,
+    major: 3,
     minor: 0,
     patch: 0,
 };
@@ -17,6 +17,11 @@ pub const PROTOCOL_CLIPBOARD_IMAGE_MIN: ProtocolVersion = ProtocolVersion {
 pub const PROTOCOL_INPUT_ANCHOR_MIN: ProtocolVersion = ProtocolVersion {
     major: 1,
     minor: 2,
+    patch: 0,
+};
+pub const PROTOCOL_FILE_CHUNK_CREDIT_MIN: ProtocolVersion = ProtocolVersion {
+    major: 3,
+    minor: 0,
     patch: 0,
 };
 pub const MAX_WIRE_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -177,6 +182,10 @@ pub enum WireMessage {
     },
     Error {
         message: String,
+    },
+    FileChunkCredit {
+        transfer_id: String,
+        chunk_credits: u32,
     },
 }
 
@@ -413,6 +422,18 @@ mod tests {
         let original = WireMessage::FileChunk {
             transfer_id: "xfer-1".to_string(),
             data: vec![10u8, 20, 30],
+        };
+
+        let encoded = encode_frame(&original).expect("encode");
+        let decoded = decode_frame(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn wire_message_file_chunk_credit_round_trip() {
+        let original = WireMessage::FileChunkCredit {
+            transfer_id: "xfer-1".to_string(),
+            chunk_credits: 8,
         };
 
         let encoded = encode_frame(&original).expect("encode");
