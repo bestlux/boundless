@@ -134,11 +134,15 @@ impl AppState {
 
         if !disconnected_peer_ids.is_empty() {
             let mut router = self.input_router.write().await;
+            let mut released_owner = false;
             for peer_id in &disconnected_peer_ids {
-                router.release_owner(peer_id);
+                released_owner = router.release_owner(peer_id) || released_owner;
                 router.clear_peer_state(peer_id);
             }
             drop(router);
+            if released_owner {
+                self.note_input_owner_transition().await;
+            }
 
             for peer_id in &disconnected_peer_ids {
                 self.clear_pending_inject_input_frames_for_peer(peer_id)

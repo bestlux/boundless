@@ -43,6 +43,14 @@ impl InputBackend for WindowsInputBackend {
         send_input_records(&records)
             .with_context(|| format!("SendInput failed for {}", input_event_kind(event)))
     }
+
+    fn apply_frame(&mut self, events: &[InputEvent]) -> Result<()> {
+        let mut records = Vec::new();
+        for event in events {
+            records.extend(input_records_for_event(event));
+        }
+        send_input_records(&records).context("SendInput failed for frame batch")
+    }
 }
 
 #[cfg(windows)]

@@ -1,4 +1,9 @@
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc::{self, TrySendError},
+};
+use std::time::{Duration, Instant};
 
 use super::*;
 
@@ -11,15 +16,17 @@ const VK_CONTROL_CODE: u16 = 0x11;
 const VK_LCONTROL_CODE: u16 = 0xA2;
 const VK_RCONTROL_CODE: u16 = 0xA3;
 
-static HOOK_EVENT_SENDER: OnceLock<Mutex<Option<mpsc::Sender<HookCaptureEvent>>>> = OnceLock::new();
+static HOOK_EVENT_SENDER: OnceLock<Mutex<Option<mpsc::SyncSender<HookCaptureEvent>>>> =
+    OnceLock::new();
 static HOOK_RUNTIME_STATE: OnceLock<Mutex<HookRuntimeState>> = OnceLock::new();
+static HOOK_LOCK_ACTIVE: AtomicBool = AtomicBool::new(false);
+static HOOK_DROPPED_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Default)]
 struct HookRuntimeState {
-    lock_active: bool,
     left_ctrl_down: bool,
     right_ctrl_down: bool,
-    last_ctrl_tap_unix_ms: Option<u64>,
+    last_ctrl_tap_at: Option<Instant>,
 }
 
 const CAPTURE_KEY_VIRTUAL_KEYS: &[u16] = &[
@@ -115,11 +122,13 @@ impl Drop for HookSenderGuard {
     }
 }
 
-fn hook_sender_cell() -> &'static Mutex<Option<mpsc::Sender<HookCaptureEvent>>> {
+fn hook_sender_cell() -> &'static Mutex<Option<mpsc::SyncSender<HookCaptureEvent>>> {
     HOOK_EVENT_SENDER.get_or_init(|| Mutex::new(None))
 }
 
-pub(super) fn set_hook_event_sender(sender: Option<mpsc::Sender<HookCaptureEvent>>) -> Result<()> {
+pub(super) fn set_hook_event_sender(
+    sender: Option<mpsc::SyncSender<HookCaptureEvent>>,
+) -> Result<()> {
     let mut guard = hook_sender_cell()
         .lock()
         .map_err(|_| anyhow::anyhow!("hook sender mutex poisoned"))?;
@@ -133,8 +142,17 @@ pub(super) fn send_hook_event(event: HookCaptureEvent) {
         .ok()
         .and_then(|guard| guard.as_ref().cloned());
     if let Some(sender) = sender {
-        let _ = sender.send(event);
+        match sender.try_send(event) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                HOOK_DROPPED_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
+}
+
+pub(super) fn take_hook_dropped_event_count() -> u64 {
+    HOOK_DROPPED_EVENT_COUNT.swap(0, Ordering::Relaxed)
 }
 
 fn hook_runtime_state_cell() -> &'static Mutex<HookRuntimeState> {
@@ -142,23 +160,20 @@ fn hook_runtime_state_cell() -> &'static Mutex<HookRuntimeState> {
 }
 
 pub(super) fn set_hook_lock_active(active: bool) -> Result<()> {
+    HOOK_LOCK_ACTIVE.store(active, Ordering::Relaxed);
     let mut state = hook_runtime_state_cell()
         .lock()
         .map_err(|_| anyhow::anyhow!("hook runtime state mutex poisoned"))?;
-    state.lock_active = active;
     if !active {
         state.left_ctrl_down = false;
         state.right_ctrl_down = false;
-        state.last_ctrl_tap_unix_ms = None;
+        state.last_ctrl_tap_at = None;
     }
     Ok(())
 }
 
 pub(super) fn is_hook_lock_active() -> bool {
-    hook_runtime_state_cell()
-        .lock()
-        .map(|state| state.lock_active)
-        .unwrap_or(false)
+    HOOK_LOCK_ACTIVE.load(Ordering::Relaxed)
 }
 
 pub(super) fn update_escape_state_for_key(vk_code: u16, key_state: core_input::KeyState) -> bool {
@@ -166,15 +181,12 @@ pub(super) fn update_escape_state_for_key(vk_code: u16, key_state: core_input::K
         return false;
     }
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0);
+    let now = Instant::now();
     let mut state = match hook_runtime_state_cell().lock() {
         Ok(state) => state,
         Err(_) => return false,
     };
-    if !state.lock_active {
+    if !HOOK_LOCK_ACTIVE.load(Ordering::Relaxed) {
         return false;
     }
 
@@ -196,10 +208,10 @@ pub(super) fn update_escape_state_for_key(vk_code: u16, key_state: core_input::K
         }
 
         if !was_down {
-            let triggered = state.last_ctrl_tap_unix_ms.is_some_and(|previous| {
-                now_ms.saturating_sub(previous) <= ESCAPE_DOUBLE_CTRL_WINDOW_MS
+            let triggered = state.last_ctrl_tap_at.is_some_and(|previous| {
+                now.duration_since(previous) <= Duration::from_millis(ESCAPE_DOUBLE_CTRL_WINDOW_MS)
             });
-            state.last_ctrl_tap_unix_ms = Some(now_ms);
+            state.last_ctrl_tap_at = Some(now);
             return triggered;
         }
     } else {
