@@ -92,6 +92,7 @@ where
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
     let mut line = Vec::<u8>::with_capacity(4096);
+    let mut write_line_buffer = Vec::<u8>::with_capacity(4096);
     let mut heartbeat_interval = time::interval(HEARTBEAT_INTERVAL);
     let mut outgoing_flush_interval = time::interval(OUTGOING_FLUSH_INTERVAL);
     let mut outgoing_flush_signal = state.subscribe_outgoing_flush_signal();
@@ -106,7 +107,7 @@ where
         capability_count: core_protocol::default_capabilities().len(),
     };
 
-    send_message(&mut writer, &local_hello).await?;
+    send_message(&mut writer, &local_hello, &mut write_line_buffer).await?;
     writer.flush().await.context("flush local hello")?;
 
     let remote_peer_id = Some(authenticated_peer_id.clone());
@@ -137,14 +138,15 @@ where
                     machine_id: snapshot.machine_id.clone(),
                     timestamp_unix_ms: now_millis(),
                 };
-                send_message(&mut writer, &heartbeat).await?;
+                send_message(&mut writer, &heartbeat, &mut write_line_buffer).await?;
                 if let Some(remote_protocol) = remote_protocol {
-                    flush_outgoing_payloads(
+                    flush_outgoing_payloads_with_buffer(
                         &state,
                         &snapshot.machine_id,
                         remote_peer_id.as_deref(),
                         remote_protocol,
                         &mut writer,
+                        &mut write_line_buffer,
                     )
                     .await?;
                 }
@@ -166,12 +168,13 @@ where
                 }
 
                 if let Some(remote_protocol) = remote_protocol {
-                    flush_outgoing_payloads(
+                    flush_outgoing_payloads_with_buffer(
                         &state,
                         &snapshot.machine_id,
                         remote_peer_id.as_deref(),
                         remote_protocol,
                         &mut writer,
+                        &mut write_line_buffer,
                     )
                     .await?;
                 }
@@ -197,12 +200,13 @@ where
                 }
 
                 if let Some(remote_protocol) = remote_protocol {
-                    flush_outgoing_payloads(
+                    flush_outgoing_payloads_with_buffer(
                         &state,
                         &snapshot.machine_id,
                         remote_peer_id.as_deref(),
                         remote_protocol,
                         &mut writer,
+                        &mut write_line_buffer,
                     )
                     .await?;
                 }
@@ -247,26 +251,7 @@ where
                     break;
                 }
 
-                let line_text = match std::str::from_utf8(&line) {
-                    Ok(text) => text,
-                    Err(error) => {
-                        record_transport_frame_rejected(
-                            &state,
-                            &authenticated_peer_id,
-                            format!("reason=invalid_utf8 error={error}"),
-                            line.len() as u64,
-                        )
-                        .await;
-                        warn!(
-                            peer_id = %authenticated_peer_id,
-                            error = ?error,
-                            "dropping invalid utf8 transport frame"
-                        );
-                        continue;
-                    }
-                };
-
-                let message = match decode_line(line_text) {
+                let message = match decode_line_bytes(&line) {
                     Ok(message) => message,
                     Err(error) => {
                         record_transport_frame_rejected(
@@ -302,6 +287,7 @@ where
                                 &WireMessage::Error {
                                     message: "hello machine_id mismatch".to_string(),
                                 },
+                                &mut write_line_buffer,
                             )
                             .await;
                             let _ = writer.flush().await;
@@ -318,16 +304,17 @@ where
                                 machine_id: snapshot.machine_id.clone(),
                                 accepted: true,
                             };
-                            send_message(&mut writer, &ack).await?;
+                            send_message(&mut writer, &ack, &mut write_line_buffer).await?;
                         }
 
                         if let Some(remote_protocol) = remote_protocol {
-                            flush_outgoing_payloads(
+                            flush_outgoing_payloads_with_buffer(
                                 &state,
                                 &snapshot.machine_id,
                                 remote_peer_id.as_deref(),
                                 remote_protocol,
                                 &mut writer,
+                                &mut write_line_buffer,
                             )
                             .await?;
                         }
@@ -339,12 +326,13 @@ where
                         }
 
                         if let Some(remote_protocol) = remote_protocol {
-                            flush_outgoing_payloads(
+                            flush_outgoing_payloads_with_buffer(
                                 &state,
                                 &snapshot.machine_id,
                                 remote_peer_id.as_deref(),
                                 remote_protocol,
                                 &mut writer,
+                                &mut write_line_buffer,
                             )
                             .await?;
                         }
@@ -804,12 +792,17 @@ async fn authenticated_peer_machine_id<S>(
     Ok(machine_id)
 }
 
-async fn send_message<W>(writer: &mut W, message: &WireMessage) -> Result<()>
+async fn send_message<W>(
+    writer: &mut W,
+    message: &WireMessage,
+    line_buffer: &mut Vec<u8>,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    encode_line_to_vec(message, line_buffer)?;
     writer
-        .write_all(encode_line(message)?.as_bytes())
+        .write_all(line_buffer.as_slice())
         .await
         .context("write transport frame")?;
     Ok(())
@@ -821,6 +814,29 @@ pub(super) async fn flush_outgoing_payloads<W>(
     remote_peer_id: Option<&str>,
     remote_protocol: ProtocolVersion,
     writer: &mut W,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut line_buffer = Vec::with_capacity(4096);
+    flush_outgoing_payloads_with_buffer(
+        state,
+        local_machine_id,
+        remote_peer_id,
+        remote_protocol,
+        writer,
+        &mut line_buffer,
+    )
+    .await
+}
+
+async fn flush_outgoing_payloads_with_buffer<W>(
+    state: &AppState,
+    local_machine_id: &str,
+    remote_peer_id: Option<&str>,
+    remote_protocol: ProtocolVersion,
+    writer: &mut W,
+    line_buffer: &mut Vec<u8>,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -840,6 +856,7 @@ where
             remote_protocol,
             &payload,
             writer,
+            line_buffer,
         )
         .await
         {
@@ -878,6 +895,7 @@ async fn send_outbound_payload<W>(
     remote_protocol: ProtocolVersion,
     payload: &OutboundPayload,
     writer: &mut W,
+    line_buffer: &mut Vec<u8>,
 ) -> Result<bool>
 where
     W: AsyncWrite + Unpin,
@@ -888,18 +906,18 @@ where
                 machine_id: local_machine_id.to_string(),
                 text: text.clone(),
             };
-            let line = encode_line(&message)?;
-            if line.len() > MAX_WIRE_LINE_BYTES {
+            encode_line_to_vec(&message, line_buffer)?;
+            if line_buffer.len() > MAX_WIRE_LINE_BYTES {
                 warn!(
                     peer_id = %peer_id,
-                    size_bytes = line.len(),
+                    size_bytes = line_buffer.len(),
                     limit_bytes = MAX_WIRE_LINE_BYTES,
                     "dropping clipboard text payload that exceeds wire line cap"
                 );
                 return Ok(false);
             }
             writer
-                .write_all(line.as_bytes())
+                .write_all(line_buffer.as_slice())
                 .await
                 .context("write transport frame")?;
             state.record_outgoing_clipboard_text(peer_id, text).await;
@@ -920,19 +938,19 @@ where
                 machine_id: local_machine_id.to_string(),
                 data_b64: encode_bytes_b64(image_bmp),
             };
-            let line = encode_line(&message)?;
-            if line.len() > MAX_WIRE_LINE_BYTES {
+            encode_line_to_vec(&message, line_buffer)?;
+            if line_buffer.len() > MAX_WIRE_LINE_BYTES {
                 warn!(
                     peer_id = %peer_id,
                     payload_bytes = image_bmp.len(),
-                    line_bytes = line.len(),
+                    line_bytes = line_buffer.len(),
                     limit_bytes = MAX_WIRE_LINE_BYTES,
                     "dropping clipboard image payload that exceeds wire line cap"
                 );
                 return Ok(false);
             }
             writer
-                .write_all(line.as_bytes())
+                .write_all(line_buffer.as_slice())
                 .await
                 .context("write transport frame")?;
             state
@@ -953,6 +971,7 @@ where
                     file_name: file_name.clone(),
                     total_bytes,
                 },
+                line_buffer,
             )
             .await?;
 
@@ -963,11 +982,12 @@ where
                         transfer_id: transfer_id.clone(),
                         data_b64: encode_bytes_b64(chunk),
                     },
+                    line_buffer,
                 )
                 .await?;
             }
 
-            send_message(writer, &WireMessage::FileEnd { transfer_id }).await?;
+            send_message(writer, &WireMessage::FileEnd { transfer_id }, line_buffer).await?;
             state
                 .record_outgoing_file(peer_id, file_name, total_bytes)
                 .await;
@@ -998,6 +1018,7 @@ where
                     timestamp_unix_ms: *timestamp_unix_ms,
                     events: wire_events,
                 },
+                line_buffer,
             )
             .await?;
 

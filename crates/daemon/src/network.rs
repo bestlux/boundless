@@ -26,8 +26,8 @@ use tracing::{error, info, warn};
 use core_input::{InputEvent, InputFrame, KeyState, MouseButton};
 use core_protocol::{
     PROTOCOL_CLIPBOARD_IMAGE_MIN, PROTOCOL_CURRENT, PROTOCOL_INPUT_ANCHOR_MIN, ProtocolVersion,
-    WireInputEvent, WireKeyState, WireMessage, WireMouseButton, decode_bytes_b64, decode_line,
-    encode_bytes_b64, encode_line,
+    WireInputEvent, WireKeyState, WireMessage, WireMouseButton, decode_bytes_b64,
+    decode_line_bytes, encode_bytes_b64, encode_line_to_vec,
 };
 use core_transfer::validate_transfer_size;
 

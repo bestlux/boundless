@@ -236,8 +236,22 @@ pub fn encode_line(message: &WireMessage) -> Result<String, WireCodecError> {
     Ok(line)
 }
 
+pub fn encode_line_to_vec(
+    message: &WireMessage,
+    line_buffer: &mut Vec<u8>,
+) -> Result<(), WireCodecError> {
+    line_buffer.clear();
+    serde_json::to_writer(&mut *line_buffer, message)?;
+    line_buffer.push(b'\n');
+    Ok(())
+}
+
 pub fn decode_line(line: &str) -> Result<WireMessage, WireCodecError> {
     Ok(serde_json::from_str(line.trim())?)
+}
+
+pub fn decode_line_bytes(line: &[u8]) -> Result<WireMessage, WireCodecError> {
+    Ok(serde_json::from_slice(line)?)
 }
 
 pub fn encode_bytes_b64(bytes: &[u8]) -> String {
@@ -336,6 +350,19 @@ mod tests {
 
         let encoded = encode_line(&original).expect("encode");
         let decoded = decode_line(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn wire_message_round_trip_with_reused_buffer() {
+        let original = WireMessage::Heartbeat {
+            machine_id: "abc".to_string(),
+            timestamp_unix_ms: 123,
+        };
+
+        let mut buffer = Vec::with_capacity(64);
+        encode_line_to_vec(&original, &mut buffer).expect("encode");
+        let decoded = decode_line_bytes(&buffer).expect("decode");
         assert_eq!(decoded, original);
     }
 
