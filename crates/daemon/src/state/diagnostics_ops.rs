@@ -16,12 +16,8 @@ impl AppState {
 
         self.outgoing_input_payloads.write().await.clear();
         self.outgoing_bulk_payloads.write().await.clear();
-        {
-            let _flush_guard = self.transport_event_flush_lock.lock().await;
-            self.transport_events.write().await.clear();
-            if let Ok(mut pending) = self.pending_transport_events.lock() {
-                pending.clear();
-            }
+        if let Ok(mut events) = self.transport_events.lock() {
+            events.clear();
         }
         *self.clipboard_sync.write().await = ClipboardSyncState::default();
         self.discovered_endpoints.write().await.clear();
@@ -69,8 +65,11 @@ impl AppState {
             .await
             .map(|items| items.len())
             .unwrap_or(0);
-        self.flush_pending_transport_events(usize::MAX).await;
-        let event_count = self.transport_events.read().await.len();
+        let event_count = self
+            .transport_events
+            .lock()
+            .map(|events| events.len())
+            .unwrap_or(0);
         let input_owner = self
             .input_owner()
             .await

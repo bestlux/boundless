@@ -45,8 +45,7 @@ impl AppState {
                 "sequence={sequence} queue_depth={depth} capture_to_queue_ms={capture_to_queue_ms} receive_to_queue_ms={receive_to_queue_ms}"
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 
     async fn record_input_inject_dropped(
@@ -67,8 +66,7 @@ impl AppState {
                 elapsed_ms(capture_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn record_input_inject_skipped(
@@ -92,8 +90,7 @@ impl AppState {
                 elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn route_incoming_input_frame(
@@ -212,8 +209,7 @@ impl AppState {
                 auto_claimed_owner,
             ),
             size_bytes: frame.events.len() as u64,
-        })
-        .await;
+        });
 
         Ok(decision)
     }
@@ -279,8 +275,7 @@ impl AppState {
                 elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn record_input_inject_failed(
@@ -304,8 +299,7 @@ impl AppState {
                 elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn record_input_inject_retry_scheduled(
@@ -330,8 +324,7 @@ impl AppState {
                 elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn record_input_inject_dropped_permanent(
@@ -356,8 +349,7 @@ impl AppState {
                 elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn claim_input_owner(&self, peer_id: &str, force: bool) -> Result<bool> {
@@ -505,7 +497,6 @@ impl AppState {
             peer_id: peer_id.to_string(),
             detail: format!("sequence={sequence} reason={reason}"),
             size_bytes: 0,
-        })
-        .await;
+        });
     }
 }

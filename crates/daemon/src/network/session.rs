@@ -1446,16 +1446,14 @@ async fn record_transport_frame_rejected(
     detail: String,
     size_bytes: u64,
 ) {
-    state
-        .record_transport_event(TransportEventRecord {
-            timestamp: Utc::now(),
-            direction: "incoming".to_string(),
-            kind: "transport_frame_rejected".to_string(),
-            peer_id: peer_id.to_string(),
-            detail,
-            size_bytes,
-        })
-        .await;
+    state.record_transport_event(TransportEventRecord {
+        timestamp: Utc::now(),
+        direction: "incoming".to_string(),
+        kind: "transport_frame_rejected".to_string(),
+        peer_id: peer_id.to_string(),
+        detail,
+        size_bytes,
+    });
 }
 
 async fn record_transport_transfer_rejected(
@@ -1464,14 +1462,12 @@ async fn record_transport_transfer_rejected(
     detail: String,
     size_bytes: u64,
 ) {
-    state
-        .record_transport_event(TransportEventRecord {
-            timestamp: Utc::now(),
-            direction: "incoming".to_string(),
-            kind: "transport_transfer_rejected".to_string(),
-            peer_id: peer_id.to_string(),
-            detail,
-            size_bytes,
-        })
-        .await;
+    state.record_transport_event(TransportEventRecord {
+        timestamp: Utc::now(),
+        direction: "incoming".to_string(),
+        kind: "transport_transfer_rejected".to_string(),
+        peer_id: peer_id.to_string(),
+        detail,
+        size_bytes,
+    });
 }

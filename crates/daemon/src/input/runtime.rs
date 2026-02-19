@@ -339,14 +339,12 @@ pub(super) async fn record_local_input_runtime_event(
     detail: &str,
     peer_id: &str,
 ) {
-    state
-        .record_transport_event(TransportEventRecord {
-            timestamp: Utc::now(),
-            direction: "local".to_string(),
-            kind: kind.to_string(),
-            peer_id: peer_id.to_string(),
-            detail: detail.to_string(),
-            size_bytes: 0,
-        })
-        .await;
+    state.record_transport_event(TransportEventRecord {
+        timestamp: Utc::now(),
+        direction: "local".to_string(),
+        kind: kind.to_string(),
+        peer_id: peer_id.to_string(),
+        detail: detail.to_string(),
+        size_bytes: 0,
+    });
 }

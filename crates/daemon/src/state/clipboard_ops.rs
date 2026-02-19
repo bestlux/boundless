@@ -394,58 +394,22 @@ impl AppState {
         self.notify_outgoing_flush_signal();
     }
 
-    pub async fn record_transport_event(&self, event: TransportEventRecord) {
-        let pending_len = {
-            match self.pending_transport_events.lock() {
-                Ok(mut pending) => {
-                    pending.push_back(event);
-                    pending.len()
-                }
-                Err(_) => return,
-            }
+    pub fn record_transport_event(&self, event: TransportEventRecord) {
+        let Ok(mut events) = self.transport_events.lock() else {
+            return;
         };
 
-        if pending_len >= TRANSPORT_EVENT_FLUSH_TRIGGER {
-            self.flush_pending_transport_events(TRANSPORT_EVENT_FLUSH_BATCH)
-                .await;
+        events.push_back(event);
+        while events.len() > MAX_TRANSPORT_EVENTS {
+            events.pop_front();
         }
     }
 
     pub async fn transport_events(&self) -> Vec<TransportEventRecord> {
-        self.flush_pending_transport_events(usize::MAX).await;
-        self.transport_events.read().await.iter().cloned().collect()
-    }
-
-    pub(crate) async fn flush_pending_transport_events(&self, max_batch: usize) {
-        if max_batch == 0 {
-            return;
-        }
-
-        let _flush_guard = self.transport_event_flush_lock.lock().await;
-
-        let drained = {
-            match self.pending_transport_events.lock() {
-                Ok(mut pending) => {
-                    if pending.is_empty() {
-                        Vec::new()
-                    } else {
-                        let count = pending.len().min(max_batch);
-                        pending.drain(..count).collect::<Vec<_>>()
-                    }
-                }
-                Err(_) => Vec::new(),
-            }
+        let Ok(events) = self.transport_events.lock() else {
+            return Vec::new();
         };
-
-        if drained.is_empty() {
-            return;
-        }
-
-        let mut events = self.transport_events.write().await;
-        events.extend(drained);
-        while events.len() > MAX_TRANSPORT_EVENTS {
-            events.pop_front();
-        }
+        events.iter().cloned().collect()
     }
 
     pub async fn record_incoming_clipboard_text(&self, peer_id: &str, text: &str) {
@@ -457,8 +421,7 @@ impl AppState {
             peer_id: peer_id.to_string(),
             detail: preview,
             size_bytes: text.len() as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn record_outgoing_clipboard_text(&self, peer_id: &str, text: &str) {
@@ -470,8 +433,7 @@ impl AppState {
             peer_id: peer_id.to_string(),
             detail: preview,
             size_bytes: text.len() as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn record_incoming_clipboard_image(&self, peer_id: &str, size_bytes: usize) {
@@ -482,8 +444,7 @@ impl AppState {
             peer_id: peer_id.to_string(),
             detail: format!("bmp image {} bytes", size_bytes),
             size_bytes: size_bytes as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn record_outgoing_clipboard_image(&self, peer_id: &str, size_bytes: usize) {
@@ -494,8 +455,7 @@ impl AppState {
             peer_id: peer_id.to_string(),
             detail: format!("bmp image {} bytes", size_bytes),
             size_bytes: size_bytes as u64,
-        })
-        .await;
+        });
     }
 
     #[cfg(test)]
@@ -524,8 +484,7 @@ impl AppState {
             peer_id: peer_id.to_string(),
             detail: final_path.display().to_string(),
             size_bytes: tokio::fs::metadata(&final_path).await?.len(),
-        })
-        .await;
+        });
 
         Ok(final_path)
     }
@@ -563,8 +522,7 @@ impl AppState {
             peer_id: peer_id.to_string(),
             detail: final_path.display().to_string(),
             size_bytes,
-        })
-        .await;
+        });
 
         Ok(final_path)
     }
@@ -577,8 +535,7 @@ impl AppState {
             peer_id: peer_id.to_string(),
             detail: file_name.to_string(),
             size_bytes,
-        })
-        .await;
+        });
     }
 
     pub async fn record_outgoing_input_frame(
@@ -599,7 +556,6 @@ impl AppState {
                 elapsed_ms(capture_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 }
