@@ -851,6 +851,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) async fn flush_outgoing_payloads<W>(
     state: &AppState,
     local_machine_id: &str,

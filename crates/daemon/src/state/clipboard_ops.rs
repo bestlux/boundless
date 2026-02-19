@@ -351,6 +351,7 @@ impl AppState {
         drained
     }
 
+    #[cfg(test)]
     pub async fn drain_outgoing(&self, peer_id: &str) -> Vec<OutboundPayload> {
         let input = self.drain_outgoing_input(peer_id, usize::MAX).await;
         let bulk = self.drain_outgoing_bulk(peer_id, usize::MAX).await;
@@ -497,6 +498,7 @@ impl AppState {
         .await;
     }
 
+    #[cfg(test)]
     pub async fn store_incoming_file(
         &self,
         peer_id: &str,

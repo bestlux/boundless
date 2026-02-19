@@ -218,11 +218,13 @@ impl AppState {
         Ok(decision)
     }
 
+    #[cfg(test)]
     pub async fn dequeue_pending_inject_input_frame(&self) -> Option<PendingInjectInputFrame> {
         let mut frames = self.dequeue_pending_inject_input_frames_up_to(1).await;
         frames.pop()
     }
 
+    #[cfg(test)]
     pub async fn pending_inject_input_frame_count(&self) -> usize {
         self.pending_inject_input_frames.read().await.len()
     }

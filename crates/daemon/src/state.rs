@@ -58,9 +58,12 @@ mod validation;
 #[cfg(test)]
 use layout_resolver::resolve_capture_handoff_target;
 use layout_resolver::{
-    parse_layout_matrix, resolve_capture_handoff_target_with_fallback,
-    resolve_capture_handoff_target_with_fallback_from_matrix, resolve_switch_all_target_order,
+    parse_layout_matrix, resolve_capture_handoff_target_with_fallback_from_matrix,
     resolve_switch_all_target_order_from_matrix,
+};
+#[cfg(test)]
+use layout_resolver::{
+    resolve_capture_handoff_target_with_fallback, resolve_switch_all_target_order,
 };
 use routing_helpers::{describe_input_frame_decision, elapsed_ms};
 use validation::{
@@ -1978,7 +1981,10 @@ mod tests {
             "error should indicate non-regular input"
         );
         assert!(
-            state.drain_outgoing_bulk(&peer_id, usize::MAX).await.is_empty(),
+            state
+                .drain_outgoing_bulk(&peer_id, usize::MAX)
+                .await
+                .is_empty(),
             "invalid source path must not enqueue bulk payloads"
         );
 

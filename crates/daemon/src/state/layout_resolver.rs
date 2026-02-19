@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(test)]
 pub(super) fn resolve_capture_handoff_target_with_fallback(
     config: &RuntimeConfig,
     current_target: Option<&str>,
@@ -33,6 +34,7 @@ pub(super) fn resolve_capture_handoff_target_with_fallback_from_matrix(
     resolve_single_peer_handoff_target(config, current_target, direction)
 }
 
+#[cfg(test)]
 pub(super) fn resolve_capture_handoff_target(
     config: &RuntimeConfig,
     current_target: Option<&str>,
@@ -196,6 +198,7 @@ fn resolve_single_peer_handoff_target(
     }
 }
 
+#[cfg(test)]
 pub(super) fn resolve_switch_all_target_order(config: &RuntimeConfig) -> Vec<String> {
     let matrix = parse_layout_matrix(&config.layout_matrix);
     resolve_switch_all_target_order_from_matrix(config, &matrix)
