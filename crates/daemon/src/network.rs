@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::JoinHandle,
@@ -25,9 +25,10 @@ use tracing::{error, info, warn};
 
 use core_input::{InputEvent, InputFrame, KeyState, MouseButton};
 use core_protocol::{
-    PROTOCOL_CLIPBOARD_IMAGE_MIN, PROTOCOL_CURRENT, PROTOCOL_INPUT_ANCHOR_MIN, ProtocolVersion,
-    WireInputEvent, WireKeyState, WireMessage, WireMouseButton, decode_bytes_b64,
-    decode_line_bytes, encode_bytes_b64, encode_line_to_vec,
+    MAX_WIRE_PAYLOAD_BYTES, PROTOCOL_CLIPBOARD_IMAGE_MIN, PROTOCOL_CURRENT,
+    PROTOCOL_INPUT_ANCHOR_MIN, ProtocolVersion, WIRE_FRAME_LENGTH_PREFIX_BYTES, WireInputEvent,
+    WireCodecError, WireKeyState, WireMessage, WireMouseButton, decode_frame_payload,
+    encode_frame_to_vec,
 };
 use core_transfer::validate_transfer_size;
 
@@ -62,7 +63,7 @@ const OUTGOING_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
 const SUPERVISOR_TICK: Duration = Duration::from_secs(3);
 const MAX_BACKOFF_SECONDS: u64 = 30;
 const FILE_CHUNK_BYTES: usize = 48 * 1024;
-const MAX_WIRE_LINE_BYTES: usize = 256 * 1024;
+const MAX_WIRE_FRAME_BYTES: usize = MAX_WIRE_PAYLOAD_BYTES;
 const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
 const MAX_INBOUND_TRANSFERS_PER_PEER: usize = 4;
 const FALLBACK_BIND_HOST: &str = "0.0.0.0";
@@ -420,7 +421,11 @@ mod tests {
     #[test]
     fn perf_probe_outgoing_flush_tick_rate() {
         let flush_ms = OUTGOING_FLUSH_INTERVAL.as_millis() as f64;
-        let theoretical_max_hz = if flush_ms > 0.0 { 1000.0 / flush_ms } else { 0.0 };
+        let theoretical_max_hz = if flush_ms > 0.0 {
+            1000.0 / flush_ms
+        } else {
+            0.0
+        };
         eprintln!(
             "PERF_PROBE outgoing_flush interval_ms={} theoretical_max_hz={:.2}",
             flush_ms, theoretical_max_hz
@@ -626,13 +631,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_drops_clipboard_image_that_exceeds_wire_line_cap() {
+    async fn flush_drops_clipboard_image_that_exceeds_wire_frame_cap() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         state
             .requeue_outgoing_front(
                 &peer_id,
                 vec![OutboundPayload::ClipboardImage {
-                    image_bmp: vec![0u8; 220 * 1024],
+                    image_bmp: vec![0u8; 300 * 1024],
                 }],
             )
             .await;

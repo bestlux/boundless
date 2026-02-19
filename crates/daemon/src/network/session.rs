@@ -91,8 +91,8 @@ where
     let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
-    let mut line = Vec::<u8>::with_capacity(4096);
-    let mut write_line_buffer = Vec::<u8>::with_capacity(4096);
+    let mut frame_payload = Vec::<u8>::with_capacity(4096);
+    let mut write_frame_buffer = Vec::<u8>::with_capacity(4096);
     let mut heartbeat_interval = time::interval(HEARTBEAT_INTERVAL);
     let mut outgoing_flush_interval = time::interval(OUTGOING_FLUSH_INTERVAL);
     let mut outgoing_flush_signal = state.subscribe_outgoing_flush_signal();
@@ -107,7 +107,7 @@ where
         capability_count: core_protocol::default_capabilities().len(),
     };
 
-    send_message(&mut writer, &local_hello, &mut write_line_buffer).await?;
+    send_message(&mut writer, &local_hello, &mut write_frame_buffer).await?;
     writer.flush().await.context("flush local hello")?;
 
     let remote_peer_id = Some(authenticated_peer_id.clone());
@@ -138,7 +138,7 @@ where
                     machine_id: snapshot.machine_id.clone(),
                     timestamp_unix_ms: now_millis(),
                 };
-                send_message(&mut writer, &heartbeat, &mut write_line_buffer).await?;
+                send_message(&mut writer, &heartbeat, &mut write_frame_buffer).await?;
                 if let Some(remote_protocol) = remote_protocol {
                     flush_outgoing_payloads_with_buffer(
                         &state,
@@ -146,7 +146,7 @@ where
                         remote_peer_id.as_deref(),
                         remote_protocol,
                         &mut writer,
-                        &mut write_line_buffer,
+                        &mut write_frame_buffer,
                     )
                     .await?;
                 }
@@ -174,7 +174,7 @@ where
                         remote_peer_id.as_deref(),
                         remote_protocol,
                         &mut writer,
-                        &mut write_line_buffer,
+                        &mut write_frame_buffer,
                     )
                     .await?;
                 }
@@ -206,12 +206,12 @@ where
                         remote_peer_id.as_deref(),
                         remote_protocol,
                         &mut writer,
-                        &mut write_line_buffer,
+                        &mut write_frame_buffer,
                     )
                     .await?;
                 }
             }
-            read = read_wire_line(&mut reader, &mut line) => {
+            read = read_wire_frame_payload(&mut reader, &mut frame_payload) => {
                 if reconnect_requested_for_peer(
                     &state,
                     &authenticated_peer_id,
@@ -232,14 +232,14 @@ where
                         record_transport_frame_rejected(
                             &state,
                             &authenticated_peer_id,
-                            format!("reason=line_too_large error={error:#}"),
-                            line.len() as u64,
+                            format!("reason=invalid_frame error={error:#}"),
+                            frame_payload.len() as u64,
                         )
                         .await;
                         warn!(
                             peer_id = %authenticated_peer_id,
                             error = ?error,
-                            "transport frame exceeded max line length"
+                            "transport frame rejected"
                         );
                         break;
                     }
@@ -247,18 +247,14 @@ where
                     break;
                 };
 
-                if read == 0 {
-                    break;
-                }
-
-                let message = match decode_line_bytes(&line) {
+                let message = match decode_frame_payload(&frame_payload) {
                     Ok(message) => message,
                     Err(error) => {
                         record_transport_frame_rejected(
                             &state,
                             &authenticated_peer_id,
                             format!("reason=decode_failed error={error}"),
-                            line.len() as u64,
+                            read as u64,
                         )
                         .await;
                         warn!(
@@ -287,7 +283,7 @@ where
                                 &WireMessage::Error {
                                     message: "hello machine_id mismatch".to_string(),
                                 },
-                                &mut write_line_buffer,
+                                &mut write_frame_buffer,
                             )
                             .await;
                             let _ = writer.flush().await;
@@ -304,7 +300,7 @@ where
                                 machine_id: snapshot.machine_id.clone(),
                                 accepted: true,
                             };
-                            send_message(&mut writer, &ack, &mut write_line_buffer).await?;
+                            send_message(&mut writer, &ack, &mut write_frame_buffer).await?;
                         }
 
                         if let Some(remote_protocol) = remote_protocol {
@@ -314,7 +310,7 @@ where
                                 remote_peer_id.as_deref(),
                                 remote_protocol,
                                 &mut writer,
-                                &mut write_line_buffer,
+                                &mut write_frame_buffer,
                             )
                             .await?;
                         }
@@ -332,7 +328,7 @@ where
                                 remote_peer_id.as_deref(),
                                 remote_protocol,
                                 &mut writer,
-                                &mut write_line_buffer,
+                                &mut write_frame_buffer,
                             )
                             .await?;
                         }
@@ -388,7 +384,7 @@ where
                     }
                     WireMessage::ClipboardImage {
                         machine_id,
-                        data_b64,
+                        data,
                     } => {
                         if !remote_protocol.is_some_and(protocol_supports_clipboard_image) {
                             warn!(
@@ -409,13 +405,7 @@ where
                             continue;
                         }
 
-                        let image_bmp = match decode_bytes_b64(&data_b64) {
-                            Ok(bytes) => bytes,
-                            Err(error) => {
-                                warn!(error = ?error, "failed to decode clipboard image payload");
-                                continue;
-                            }
-                        };
+                        let image_bmp = data;
 
                         if let Some(peer_id) = &remote_peer_id {
                             let size_bytes = image_bmp.len();
@@ -537,21 +527,14 @@ where
                     }
                     WireMessage::FileChunk {
                         transfer_id,
-                        data_b64,
+                        data,
                     } => {
                         let Some(mut transfer) = inbound_transfers.remove(&transfer_id) else {
                             warn!(transfer_id = %transfer_id, "received file chunk for unknown transfer");
                             continue;
                         };
 
-                        let chunk = match decode_bytes_b64(&data_b64) {
-                            Ok(chunk) => chunk,
-                            Err(error) => {
-                                warn!(transfer_id = %transfer_id, error = ?error, "failed to decode file chunk");
-                                discard_inbound_transfer(transfer).await;
-                                continue;
-                            }
-                        };
+                        let chunk = data;
 
                         let next_size = transfer.bytes_received.saturating_add(chunk.len() as u64);
                         if let Err(error) = validate_transfer_size(next_size) {
@@ -795,14 +778,14 @@ async fn authenticated_peer_machine_id<S>(
 async fn send_message<W>(
     writer: &mut W,
     message: &WireMessage,
-    line_buffer: &mut Vec<u8>,
+    frame_buffer: &mut Vec<u8>,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    encode_line_to_vec(message, line_buffer)?;
+    encode_frame_to_vec(message, frame_buffer)?;
     writer
-        .write_all(line_buffer.as_slice())
+        .write_all(frame_buffer.as_slice())
         .await
         .context("write transport frame")?;
     Ok(())
@@ -818,14 +801,14 @@ pub(super) async fn flush_outgoing_payloads<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let mut line_buffer = Vec::with_capacity(4096);
+    let mut frame_buffer = Vec::with_capacity(4096);
     flush_outgoing_payloads_with_buffer(
         state,
         local_machine_id,
         remote_peer_id,
         remote_protocol,
         writer,
-        &mut line_buffer,
+        &mut frame_buffer,
     )
     .await
 }
@@ -836,7 +819,7 @@ async fn flush_outgoing_payloads_with_buffer<W>(
     remote_peer_id: Option<&str>,
     remote_protocol: ProtocolVersion,
     writer: &mut W,
-    line_buffer: &mut Vec<u8>,
+    frame_buffer: &mut Vec<u8>,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -856,7 +839,7 @@ where
             remote_protocol,
             &payload,
             writer,
-            line_buffer,
+            frame_buffer,
         )
         .await
         {
@@ -895,7 +878,7 @@ async fn send_outbound_payload<W>(
     remote_protocol: ProtocolVersion,
     payload: &OutboundPayload,
     writer: &mut W,
-    line_buffer: &mut Vec<u8>,
+    frame_buffer: &mut Vec<u8>,
 ) -> Result<bool>
 where
     W: AsyncWrite + Unpin,
@@ -906,18 +889,32 @@ where
                 machine_id: local_machine_id.to_string(),
                 text: text.clone(),
             };
-            encode_line_to_vec(&message, line_buffer)?;
-            if line_buffer.len() > MAX_WIRE_LINE_BYTES {
+            if let Err(error) = encode_frame_to_vec(&message, frame_buffer) {
+                if matches!(error, WireCodecError::FrameTooLargeToEncode { .. }) {
+                    warn!(
+                        peer_id = %peer_id,
+                        payload_bytes = text.len(),
+                        limit_bytes = MAX_WIRE_FRAME_BYTES,
+                        "dropping clipboard text payload that exceeds wire frame cap"
+                    );
+                    return Ok(false);
+                }
+                return Err(anyhow::Error::from(error));
+            }
+            let payload_bytes = frame_buffer
+                .len()
+                .saturating_sub(WIRE_FRAME_LENGTH_PREFIX_BYTES);
+            if payload_bytes > MAX_WIRE_FRAME_BYTES {
                 warn!(
                     peer_id = %peer_id,
-                    size_bytes = line_buffer.len(),
-                    limit_bytes = MAX_WIRE_LINE_BYTES,
-                    "dropping clipboard text payload that exceeds wire line cap"
+                    size_bytes = payload_bytes,
+                    limit_bytes = MAX_WIRE_FRAME_BYTES,
+                    "dropping clipboard text payload that exceeds wire frame cap"
                 );
                 return Ok(false);
             }
             writer
-                .write_all(line_buffer.as_slice())
+                .write_all(frame_buffer.as_slice())
                 .await
                 .context("write transport frame")?;
             state.record_outgoing_clipboard_text(peer_id, text).await;
@@ -936,21 +933,35 @@ where
 
             let message = WireMessage::ClipboardImage {
                 machine_id: local_machine_id.to_string(),
-                data_b64: encode_bytes_b64(image_bmp),
+                data: image_bmp.clone(),
             };
-            encode_line_to_vec(&message, line_buffer)?;
-            if line_buffer.len() > MAX_WIRE_LINE_BYTES {
+            if let Err(error) = encode_frame_to_vec(&message, frame_buffer) {
+                if matches!(error, WireCodecError::FrameTooLargeToEncode { .. }) {
+                    warn!(
+                        peer_id = %peer_id,
+                        payload_bytes = image_bmp.len(),
+                        limit_bytes = MAX_WIRE_FRAME_BYTES,
+                        "dropping clipboard image payload that exceeds wire frame cap"
+                    );
+                    return Ok(false);
+                }
+                return Err(anyhow::Error::from(error));
+            }
+            let payload_bytes = frame_buffer
+                .len()
+                .saturating_sub(WIRE_FRAME_LENGTH_PREFIX_BYTES);
+            if payload_bytes > MAX_WIRE_FRAME_BYTES {
                 warn!(
                     peer_id = %peer_id,
                     payload_bytes = image_bmp.len(),
-                    line_bytes = line_buffer.len(),
-                    limit_bytes = MAX_WIRE_LINE_BYTES,
-                    "dropping clipboard image payload that exceeds wire line cap"
+                    frame_bytes = payload_bytes,
+                    limit_bytes = MAX_WIRE_FRAME_BYTES,
+                    "dropping clipboard image payload that exceeds wire frame cap"
                 );
                 return Ok(false);
             }
             writer
-                .write_all(line_buffer.as_slice())
+                .write_all(frame_buffer.as_slice())
                 .await
                 .context("write transport frame")?;
             state
@@ -971,7 +982,7 @@ where
                     file_name: file_name.clone(),
                     total_bytes,
                 },
-                line_buffer,
+                frame_buffer,
             )
             .await?;
 
@@ -980,14 +991,14 @@ where
                     writer,
                     &WireMessage::FileChunk {
                         transfer_id: transfer_id.clone(),
-                        data_b64: encode_bytes_b64(chunk),
+                        data: chunk.to_vec(),
                     },
-                    line_buffer,
+                    frame_buffer,
                 )
                 .await?;
             }
 
-            send_message(writer, &WireMessage::FileEnd { transfer_id }, line_buffer).await?;
+            send_message(writer, &WireMessage::FileEnd { transfer_id }, frame_buffer).await?;
             state
                 .record_outgoing_file(peer_id, file_name, total_bytes)
                 .await;
@@ -1018,7 +1029,7 @@ where
                     timestamp_unix_ms: *timestamp_unix_ms,
                     events: wire_events,
                 },
-                line_buffer,
+                frame_buffer,
             )
             .await?;
 
@@ -1030,42 +1041,35 @@ where
     }
 }
 
-async fn read_wire_line<R>(reader: &mut R, line: &mut Vec<u8>) -> Result<Option<usize>>
+async fn read_wire_frame_payload<R>(reader: &mut R, payload: &mut Vec<u8>) -> Result<Option<usize>>
 where
-    R: AsyncBufRead + Unpin,
+    R: AsyncRead + Unpin,
 {
-    line.clear();
-    loop {
-        let available = reader.fill_buf().await.context("fill transport buffer")?;
-        if available.is_empty() {
-            if line.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(line.len()));
-        }
-
-        let take = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|index| index + 1)
-            .unwrap_or(available.len());
-        let next_len = line.len().saturating_add(take);
-        let ended_with_newline = available.get(take - 1) == Some(&b'\n');
-        if next_len > MAX_WIRE_LINE_BYTES {
-            reader.consume(take);
-            bail!(
-                "wire frame exceeds max line length: {} > {}",
-                next_len,
-                MAX_WIRE_LINE_BYTES
-            );
-        }
-
-        line.extend_from_slice(&available[..take]);
-        reader.consume(take);
-        if ended_with_newline {
-            return Ok(Some(line.len()));
-        }
+    payload.clear();
+    let mut length_prefix = [0u8; WIRE_FRAME_LENGTH_PREFIX_BYTES];
+    match reader.read_exact(&mut length_prefix).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(anyhow::Error::from(error).context("read transport frame header")),
     }
+
+    let declared_len = u32::from_be_bytes(length_prefix) as usize;
+    if declared_len > MAX_WIRE_FRAME_BYTES {
+        bail!(
+            "wire frame exceeds max payload length: {} > {}",
+            declared_len,
+            MAX_WIRE_FRAME_BYTES
+        );
+    }
+
+    payload.clear();
+    payload.resize(declared_len, 0);
+    reader
+        .read_exact(payload)
+        .await
+        .context("read transport frame payload")?;
+
+    Ok(Some(declared_len))
 }
 
 async fn record_transport_frame_rejected(
