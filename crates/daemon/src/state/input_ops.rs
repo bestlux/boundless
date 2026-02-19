@@ -219,19 +219,42 @@ impl AppState {
     }
 
     pub async fn dequeue_pending_inject_input_frame(&self) -> Option<PendingInjectInputFrame> {
-        self.pending_inject_input_frames.write().await.pop_front()
+        let mut frames = self.dequeue_pending_inject_input_frames_up_to(1).await;
+        frames.pop()
     }
 
     pub async fn pending_inject_input_frame_count(&self) -> usize {
         self.pending_inject_input_frames.read().await.len()
     }
 
-    pub async fn requeue_pending_inject_input_frame_back(&self, frame: PendingInjectInputFrame) {
-        let mut queue = self.pending_inject_input_frames.write().await;
-        if queue.len() >= MAX_PENDING_INJECT_INPUT_FRAMES {
-            queue.pop_front();
+    pub async fn dequeue_pending_inject_input_frames_up_to(
+        &self,
+        max_frames: usize,
+    ) -> Vec<PendingInjectInputFrame> {
+        if max_frames == 0 {
+            return Vec::new();
         }
-        queue.push_back(frame);
+
+        let mut queue = self.pending_inject_input_frames.write().await;
+        let drain_count = queue.len().min(max_frames);
+        queue.drain(..drain_count).collect()
+    }
+
+    pub async fn requeue_pending_inject_input_frames_back(
+        &self,
+        frames: Vec<PendingInjectInputFrame>,
+    ) {
+        if frames.is_empty() {
+            return;
+        }
+
+        let mut queue = self.pending_inject_input_frames.write().await;
+        for frame in frames {
+            if queue.len() >= MAX_PENDING_INJECT_INPUT_FRAMES {
+                queue.pop_front();
+            }
+            queue.push_back(frame);
+        }
     }
 
     pub async fn record_input_inject_applied(
