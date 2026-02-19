@@ -364,6 +364,45 @@ impl AppState {
         Ok(final_path)
     }
 
+    pub async fn store_incoming_file_from_temp(
+        &self,
+        peer_id: &str,
+        file_name: &str,
+        temp_path: &Path,
+        size_bytes: u64,
+    ) -> Result<PathBuf> {
+        validate_transfer_size(size_bytes)?;
+        let sanitized_name = sanitize_incoming_file_name(file_name)?;
+
+        let peer_dir = self.inbox_root.join(peer_id);
+        tokio::fs::create_dir_all(&peer_dir).await?;
+
+        let final_path = resolve_conflict_path(&peer_dir, &sanitized_name);
+        if !final_path.starts_with(&peer_dir) {
+            anyhow::bail!("incoming file path escaped inbox root");
+        }
+
+        match tokio::fs::rename(temp_path, &final_path).await {
+            Ok(()) => {}
+            Err(_) => {
+                tokio::fs::copy(temp_path, &final_path).await?;
+                let _ = tokio::fs::remove_file(temp_path).await;
+            }
+        }
+
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "incoming".to_string(),
+            kind: "file".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: final_path.display().to_string(),
+            size_bytes,
+        })
+        .await;
+
+        Ok(final_path)
+    }
+
     pub async fn record_outgoing_file(&self, peer_id: &str, file_name: &str, size_bytes: u64) {
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),

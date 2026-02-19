@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::JoinHandle,
@@ -62,6 +62,9 @@ const OUTGOING_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
 const SUPERVISOR_TICK: Duration = Duration::from_secs(3);
 const MAX_BACKOFF_SECONDS: u64 = 30;
 const FILE_CHUNK_BYTES: usize = 48 * 1024;
+const MAX_WIRE_LINE_BYTES: usize = 256 * 1024;
+const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
+const MAX_INBOUND_TRANSFERS_PER_PEER: usize = 4;
 const FALLBACK_BIND_HOST: &str = "0.0.0.0";
 
 pub fn start(state: AppState, listener: Option<TcpListener>) {
@@ -156,6 +159,51 @@ mod tests {
                 calls: 0,
                 fail_after_calls,
             }
+        }
+    }
+
+    struct FlushFailWriter {
+        flush_calls: usize,
+        fail_on_flush_call: usize,
+    }
+
+    impl FlushFailWriter {
+        fn new(fail_on_flush_call: usize) -> Self {
+            Self {
+                flush_calls: 0,
+                fail_on_flush_call,
+            }
+        }
+    }
+
+    impl AsyncWrite for FlushFailWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            self.flush_calls += 1;
+            if self.flush_calls >= self.fail_on_flush_call {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "forced flush failure",
+                )));
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -457,22 +505,23 @@ mod tests {
     #[tokio::test]
     async fn flush_requeues_remaining_payloads_on_mid_flush_failure() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let large = "x".repeat(16 * 1024);
 
         state
-            .queue_clipboard_text(&peer_id, "one".to_string())
+            .queue_clipboard_text(&peer_id, large.clone())
             .await
             .expect("queue one");
         state
-            .queue_clipboard_text(&peer_id, "two".to_string())
+            .queue_clipboard_text(&peer_id, large.clone())
             .await
             .expect("queue two");
         state
-            .queue_clipboard_text(&peer_id, "three".to_string())
+            .queue_clipboard_text(&peer_id, large)
             .await
             .expect("queue three");
 
-        // Each successful payload costs write+flush (2 calls). Fail on second payload write.
-        let mut writer = FailAfterCallsWriter::new(3);
+        // Oversized lines force direct writes past BufWriter, so this fails on the second payload write.
+        let mut writer = FailAfterCallsWriter::new(2);
         let _ = flush_outgoing_payloads(
             &state,
             "local",
@@ -487,11 +536,50 @@ mod tests {
         assert_eq!(queued.len(), 2);
         assert!(matches!(
             queued.first(),
-            Some(OutboundPayload::ClipboardText { text }) if text == "two"
+            Some(OutboundPayload::ClipboardText { text }) if text.len() == 16 * 1024
         ));
         assert!(matches!(
             queued.get(1),
-            Some(OutboundPayload::ClipboardText { text }) if text == "three"
+            Some(OutboundPayload::ClipboardText { text }) if text.len() == 16 * 1024
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn flush_requeues_all_payloads_when_batch_flush_fails() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+
+        state
+            .queue_clipboard_text(&peer_id, "one".to_string())
+            .await
+            .expect("queue one");
+        state
+            .queue_clipboard_text(&peer_id, "two".to_string())
+            .await
+            .expect("queue two");
+
+        // Writes succeed; final flush fails deterministically.
+        let mut writer = FlushFailWriter::new(1);
+        let _ = flush_outgoing_payloads(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            &mut writer,
+        )
+        .await
+        .expect_err("must fail");
+
+        let queued = state.drain_outgoing(&peer_id).await;
+        assert_eq!(queued.len(), 2);
+        assert!(matches!(
+            queued.first(),
+            Some(OutboundPayload::ClipboardText { text }) if text == "one"
+        ));
+        assert!(matches!(
+            queued.get(1),
+            Some(OutboundPayload::ClipboardText { text }) if text == "two"
         ));
 
         let _ = std::fs::remove_dir_all(root);
@@ -522,6 +610,38 @@ mod tests {
 
         let queued = state.drain_outgoing(&peer_id).await;
         assert!(queued.is_empty(), "dropped image must not be requeued");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn flush_drops_clipboard_image_that_exceeds_wire_line_cap() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        state
+            .requeue_outgoing_front(
+                &peer_id,
+                vec![OutboundPayload::ClipboardImage {
+                    image_bmp: vec![0u8; 220 * 1024],
+                }],
+            )
+            .await;
+
+        let mut writer = FailAfterCallsWriter::new(1);
+        flush_outgoing_payloads(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            &mut writer,
+        )
+        .await
+        .expect("oversized clipboard image should be dropped before write");
+
+        let queued = state.drain_outgoing(&peer_id).await;
+        assert!(
+            queued.is_empty(),
+            "oversized dropped image must not remain queued"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
