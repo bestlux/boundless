@@ -22,7 +22,9 @@ pub(super) fn spawn_raw_input_thread() -> Result<(u32, JoinHandle<()>)> {
 
         let _ = startup_tx.send(Ok(thread_id));
         unsafe {
-            run_raw_input_message_loop();
+            if let Err(error) = run_raw_input_message_loop() {
+                warn!(error = ?error, "raw input message loop exited with error");
+            }
             let _ = DestroyWindow(hwnd);
         }
     });
@@ -89,12 +91,16 @@ fn register_raw_input_mouse_device(hwnd: HWND) -> Result<()> {
 }
 
 #[cfg(windows)]
-unsafe fn run_raw_input_message_loop() {
+unsafe fn run_raw_input_message_loop() -> Result<()> {
     let mut warned_once = false;
     let mut msg = MSG::default();
     loop {
         let result = unsafe { GetMessageW(&mut msg as *mut MSG, std::ptr::null_mut(), 0, 0) };
-        if result <= 0 {
+        if result == -1 {
+            return Err(std::io::Error::last_os_error())
+                .context("GetMessageW raw input message loop");
+        }
+        if result == 0 {
             break;
         }
 
@@ -116,6 +122,7 @@ unsafe fn run_raw_input_message_loop() {
             DispatchMessageW(&msg as *const MSG);
         }
     }
+    Ok(())
 }
 
 #[cfg(windows)]

@@ -16,6 +16,8 @@ pub(super) async fn run(state: AppState) -> Result<()> {
     .await;
     let mut inject_ticker = time::interval(INPUT_TICK);
     let mut capture_ticker = time::interval(INPUT_CAPTURE_TICK);
+    inject_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    capture_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut last_capture_target: Option<String> = None;
     let mut edge_switch_state = EdgeSwitchState::default();
 
@@ -49,7 +51,20 @@ pub(super) async fn run(state: AppState) -> Result<()> {
 }
 
 pub(super) async fn drain_pending_inject_frames(state: &AppState, backend: &mut dyn InputBackend) {
-    while let Some(frame) = state.dequeue_pending_inject_input_frame().await {
+    let cycle_len = state.pending_inject_input_frame_count().await;
+    for _ in 0..cycle_len {
+        let Some(mut frame) = state.dequeue_pending_inject_input_frame().await else {
+            break;
+        };
+
+        if frame
+            .next_retry_at
+            .is_some_and(|next| std::time::Instant::now() < next)
+        {
+            state.requeue_pending_inject_input_frame_back(frame).await;
+            continue;
+        }
+
         if !state.input_injection_allowed_for_peer(&frame.peer_id).await {
             state
                 .record_input_inject_skipped(
@@ -85,8 +100,47 @@ pub(super) async fn drain_pending_inject_frames(state: &AppState, backend: &mut 
                         &message,
                     )
                     .await;
-                state.requeue_pending_inject_input_frame_front(frame).await;
-                break;
+
+                let now_ms = Utc::now().timestamp_millis();
+                let frame_age_ms = now_ms.saturating_sub(frame.capture_timestamp_unix_ms);
+                if frame.retry_count >= INPUT_INJECT_MAX_RETRIES
+                    || frame_age_ms >= INPUT_INJECT_MAX_AGE_MS
+                {
+                    state
+                        .record_input_inject_dropped_permanent(
+                            &frame.peer_id,
+                            frame.sequence,
+                            frame.events.len(),
+                            frame.timing(),
+                            if frame.retry_count >= INPUT_INJECT_MAX_RETRIES {
+                                "retry_limit"
+                            } else {
+                                "age_limit"
+                            },
+                            &message,
+                        )
+                        .await;
+                    continue;
+                }
+
+                frame.retry_count = frame.retry_count.saturating_add(1);
+                let exponent = u32::from(frame.retry_count.saturating_sub(1)).min(8);
+                let backoff_ms = (INPUT_INJECT_RETRY_BASE_BACKOFF_MS
+                    .saturating_mul(1u64 << exponent))
+                .min(INPUT_INJECT_RETRY_MAX_BACKOFF_MS);
+                frame.next_retry_at =
+                    Some(std::time::Instant::now() + Duration::from_millis(backoff_ms));
+                state
+                    .record_input_inject_retry_scheduled(
+                        &frame.peer_id,
+                        frame.sequence,
+                        frame.retry_count,
+                        backoff_ms,
+                        frame.events.len(),
+                        frame.timing(),
+                    )
+                    .await;
+                state.requeue_pending_inject_input_frame_back(frame).await;
             }
         }
     }
@@ -96,10 +150,7 @@ pub(super) fn apply_frame(
     backend: &mut dyn InputBackend,
     frame: &PendingInjectInputFrame,
 ) -> Result<()> {
-    for event in &frame.events {
-        backend.apply(event)?;
-    }
-    Ok(())
+    backend.apply_frame(&frame.events)
 }
 
 pub(super) async fn capture_and_queue_outgoing_frames(
@@ -142,6 +193,16 @@ pub(super) async fn capture_and_queue_outgoing_frames(
             Vec::new()
         }
     };
+    let dropped_event_count = backend.take_dropped_event_count();
+    if dropped_event_count > 0 {
+        record_local_input_runtime_event(
+            state,
+            "input_hook_queue_dropped",
+            &format!("dropped_events={dropped_event_count}"),
+            "none",
+        )
+        .await;
+    }
     let cursor_position = backend.cursor_position();
     let screen_bounds = local_virtual_screen_bounds();
 
@@ -163,8 +224,10 @@ pub(super) async fn capture_and_queue_outgoing_frames(
             edge_switch_state.last_direction = None;
             edge_switch_state.x_pressure = 0;
             edge_switch_state.y_pressure = 0;
-            edge_switch_state.suppress_until_unix_ms =
-                Some(unix_now_ms().saturating_add(ESCAPE_EDGE_RECAPTURE_SUPPRESS_MS));
+            edge_switch_state.suppress_until_instant = Some(
+                std::time::Instant::now()
+                    + Duration::from_millis(ESCAPE_EDGE_RECAPTURE_SUPPRESS_MS),
+            );
             capture_target = None;
             sync_local_input_lock(state, backend, false).await;
             escape_triggered = true;
@@ -209,7 +272,7 @@ pub(super) async fn capture_and_queue_outgoing_frames(
         return;
     };
 
-    let replay_events = if edge_switch_state.suppress_until_unix_ms.is_some() {
+    let replay_events = if edge_switch_state.suppress_until_instant.is_some() {
         filter_edge_start_replay_events(&events)
     } else {
         events

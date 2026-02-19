@@ -26,11 +26,14 @@ pub(super) unsafe fn install_mouse_hook() -> Result<HHOOK> {
 }
 
 #[cfg(windows)]
-pub(super) unsafe fn run_hook_message_loop() {
+pub(super) unsafe fn run_hook_message_loop() -> Result<()> {
     let mut msg = MSG::default();
     loop {
         let result = unsafe { GetMessageW(&mut msg as *mut MSG, std::ptr::null_mut(), 0, 0) };
-        if result <= 0 {
+        if result == -1 {
+            return Err(std::io::Error::last_os_error()).context("GetMessageW hook message loop");
+        }
+        if result == 0 {
             break;
         }
         unsafe {
@@ -38,6 +41,7 @@ pub(super) unsafe fn run_hook_message_loop() {
             DispatchMessageW(&msg as *const MSG);
         }
     }
+    Ok(())
 }
 
 #[cfg(windows)]

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::collections::VecDeque;
@@ -53,6 +53,10 @@ use windows_sys::Win32::{
 
 const INPUT_TICK: Duration = Duration::from_millis(5);
 const INPUT_CAPTURE_TICK: Duration = Duration::from_millis(8);
+const INPUT_INJECT_RETRY_BASE_BACKOFF_MS: u64 = 12;
+const INPUT_INJECT_RETRY_MAX_BACKOFF_MS: u64 = 160;
+const INPUT_INJECT_MAX_RETRIES: u8 = 5;
+const INPUT_INJECT_MAX_AGE_MS: i64 = 1_500;
 const EDGE_PRESSURE_THRESHOLD: i32 = 300;
 const EDGE_REMOTE_PRESSURE_THRESHOLD_MAX: i32 = 2400;
 const EDGE_REMOTE_PRESSURE_THRESHOLD_NUMERATOR: i32 = 4;
@@ -66,6 +70,8 @@ const ESCAPE_DOUBLE_CTRL_WINDOW_MS: u64 = 400;
 const RAW_INPUT_USAGE_PAGE_GENERIC: u16 = 0x01;
 #[cfg(windows)]
 const RAW_INPUT_USAGE_MOUSE: u16 = 0x02;
+#[cfg(windows)]
+const HOOK_EVENT_QUEUE_CAP: usize = 4096;
 #[cfg(windows)]
 const STATIC_WINDOW_CLASS_NAME: [u16; 7] = [83, 84, 65, 84, 73, 67, 0];
 #[cfg(windows)]
@@ -89,7 +95,7 @@ mod windows_raw_input;
 use edge_switch::{edge_switch_direction_from_motion, handoff_anchor_event};
 use edge_switch::{
     filter_edge_start_replay_events, local_virtual_screen_bounds,
-    maybe_handoff_capture_target_from_motion, unix_now_ms,
+    maybe_handoff_capture_target_from_motion,
 };
 #[cfg(all(test, not(windows)))]
 use runtime::apply_frame;
@@ -100,7 +106,7 @@ use runtime::{record_local_input_runtime_event, run};
 use windows_hook_runtime::{
     HookSenderGuard, captured_key_virtual_keys, is_hook_lock_active, mouse_button_from_virtual_key,
     mouse_button_virtual_keys, send_hook_event, set_hook_event_sender, set_hook_lock_active,
-    update_escape_state_for_key, virtual_key_for_mouse_button,
+    take_hook_dropped_event_count, update_escape_state_for_key, virtual_key_for_mouse_button,
 };
 #[cfg(windows)]
 use windows_hooks::{install_keyboard_hook, install_mouse_hook, run_hook_message_loop};
@@ -129,7 +135,7 @@ struct EdgeSwitchState {
     last_direction: Option<SwitchDirection>,
     x_pressure: i32,
     y_pressure: i32,
-    suppress_until_unix_ms: Option<u64>,
+    suppress_until_instant: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -150,6 +156,13 @@ pub fn start(state: AppState) {
 
 trait InputBackend: Send {
     fn apply(&mut self, event: &InputEvent) -> Result<()>;
+
+    fn apply_frame(&mut self, events: &[InputEvent]) -> Result<()> {
+        for event in events {
+            self.apply(event)?;
+        }
+        Ok(())
+    }
 }
 
 trait InputCaptureBackend: Send {
@@ -162,6 +175,10 @@ trait InputCaptureBackend: Send {
     fn backend_mode(&self) -> &'static str;
     fn cursor_position(&self) -> Option<(i32, i32)> {
         None
+    }
+
+    fn take_dropped_event_count(&mut self) -> u64 {
+        0
     }
 }
 
@@ -258,6 +275,8 @@ mod tests {
             capture_timestamp_unix_ms: 1,
             received_timestamp_unix_ms: 2,
             queued_timestamp_unix_ms: 3,
+            retry_count: 0,
+            next_retry_at: None,
             events: vec![
                 InputEvent::MouseMove { dx: 1, dy: -1 },
                 InputEvent::Key {
@@ -1251,7 +1270,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn send_input_records_with_sender_sends_one_record_per_call() {
+    fn send_input_records_with_sender_batches_records_per_call() {
         let records = input_records_for_event(&InputEvent::MouseWheel {
             delta_x: 120,
             delta_y: -120,
@@ -1260,12 +1279,12 @@ mod tests {
 
         send_input_records_with_sender(&records, |chunk| {
             call_count += 1;
-            assert_eq!(chunk.len(), 1);
-            Ok(1)
+            assert_eq!(chunk.len(), records.len());
+            Ok(chunk.len() as u32)
         })
         .expect("send should succeed");
 
-        assert_eq!(call_count, 2);
+        assert_eq!(call_count, 1);
     }
 
     #[cfg(windows)]

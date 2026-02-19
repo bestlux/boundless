@@ -23,6 +23,7 @@ impl AppState {
         self.input_sequence_by_peer.write().await.clear();
         self.pending_inject_input_frames.write().await.clear();
         *self.input_capture_target_peer_id.write().await = None;
+        *self.input_owner_last_changed_at.write().await = None;
         *self.input_lock_active.write().await = false;
         self.reconnect_generation_by_peer.write().await.clear();
         self.pairing_codes.write().await.clear();

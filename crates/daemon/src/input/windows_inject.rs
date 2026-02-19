@@ -153,8 +153,14 @@ pub(super) fn send_input_records(inputs: &[INPUT]) -> Result<()> {
         return Ok(());
     }
 
-    send_input_records_with_sender(inputs, |record| {
-        let sent = unsafe { SendInput(1, record.as_ptr(), std::mem::size_of::<INPUT>() as i32) };
+    send_input_records_with_sender(inputs, |records| {
+        let sent = unsafe {
+            SendInput(
+                records.len() as u32,
+                records.as_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            )
+        };
         if sent == 0 {
             return Err(std::io::Error::last_os_error()).context("SendInput returned 0");
         }
@@ -167,12 +173,26 @@ pub(super) fn send_input_records_with_sender<F>(inputs: &[INPUT], mut sender: F)
 where
     F: FnMut(&[INPUT]) -> Result<u32>,
 {
-    for (index, input) in inputs.iter().enumerate() {
-        let sent = sender(std::slice::from_ref(input))
-            .with_context(|| format!("send input record at index {index}"))?;
-        if sent != 1 {
-            bail!("partial send at index {index}: sent {sent} / 1 input records");
+    let mut offset = 0usize;
+    while offset < inputs.len() {
+        let chunk = &inputs[offset..];
+        let sent = sender(chunk).with_context(|| format!("send input record at index {offset}"))?;
+        let sent = sent as usize;
+
+        if sent == 0 {
+            bail!(
+                "partial send at index {offset}: sent 0 / {} input records",
+                chunk.len()
+            );
         }
+        if sent > chunk.len() {
+            bail!(
+                "invalid send count at index {offset}: sent {sent} / {} input records",
+                chunk.len()
+            );
+        }
+
+        offset += sent;
     }
     Ok(())
 }

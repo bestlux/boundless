@@ -115,26 +115,52 @@ impl AppState {
             events: Vec::with_capacity(frame.events.len()),
         };
         let received_timestamp_unix_ms = Utc::now().timestamp_millis();
-        let (decision, auto_claimed_owner) = {
+        let mut decision = {
             let mut router = self.input_router.write().await;
-            let mut decision = router
+            router
                 .route_frame(&frame, &mut sink)
-                .map_err(anyhow::Error::from)?;
-            let mut auto_claimed_owner = false;
-
-            if matches!(
-                decision,
-                RouteDecision::IgnoredNoOwner | RouteDecision::IgnoredWrongOwner { .. }
-            ) && router.claim_owner(peer_id, true)
-            {
-                auto_claimed_owner = true;
-                decision = router
-                    .route_frame(&frame, &mut sink)
-                    .map_err(anyhow::Error::from)?;
-            }
-
-            (decision, auto_claimed_owner)
+                .map_err(anyhow::Error::from)?
         };
+        let mut auto_claimed_owner = false;
+
+        if matches!(
+            decision,
+            RouteDecision::IgnoredNoOwner | RouteDecision::IgnoredWrongOwner { .. }
+        ) {
+            let mut retry_sink = RecordingInputSink {
+                events: Vec::with_capacity(frame.events.len()),
+            };
+            let mut blocked_reason: Option<&'static str> = None;
+            decision = {
+                let mut router = self.input_router.write().await;
+                let mut retried_decision = router
+                    .route_frame(&frame, &mut retry_sink)
+                    .map_err(anyhow::Error::from)?;
+                if matches!(
+                    retried_decision,
+                    RouteDecision::IgnoredNoOwner | RouteDecision::IgnoredWrongOwner { .. }
+                ) {
+                    let (allow_auto_claim, block_reason) =
+                        self.auto_claim_input_owner_allowed_now(&retried_decision);
+                    if allow_auto_claim && router.claim_owner(peer_id, true) {
+                        auto_claimed_owner = true;
+                        retried_decision = router
+                            .route_frame(&frame, &mut retry_sink)
+                            .map_err(anyhow::Error::from)?;
+                    } else if !allow_auto_claim {
+                        blocked_reason = Some(block_reason);
+                    }
+                }
+                retried_decision
+            };
+            sink = retry_sink;
+            if auto_claimed_owner {
+                self.note_input_owner_transition().await;
+            } else if let Some(block_reason) = blocked_reason {
+                self.record_input_owner_auto_claim_blocked(peer_id, frame.sequence, block_reason)
+                    .await;
+            }
+        }
 
         if matches!(decision, RouteDecision::Applied { .. }) {
             let queued_timestamp_unix_ms = Utc::now().timestamp_millis();
@@ -149,6 +175,8 @@ impl AppState {
                 capture_timestamp_unix_ms: timing.capture_timestamp_unix_ms,
                 received_timestamp_unix_ms: timing.received_timestamp_unix_ms,
                 queued_timestamp_unix_ms: timing.queued_timestamp_unix_ms,
+                retry_count: 0,
+                next_retry_at: None,
                 events: sink.events,
             };
             let (depth, dropped) = self.enqueue_pending_inject_input_frame(pending).await;
@@ -194,12 +222,16 @@ impl AppState {
         self.pending_inject_input_frames.write().await.pop_front()
     }
 
-    pub async fn requeue_pending_inject_input_frame_front(&self, frame: PendingInjectInputFrame) {
+    pub async fn pending_inject_input_frame_count(&self) -> usize {
+        self.pending_inject_input_frames.read().await.len()
+    }
+
+    pub async fn requeue_pending_inject_input_frame_back(&self, frame: PendingInjectInputFrame) {
         let mut queue = self.pending_inject_input_frames.write().await;
         if queue.len() >= MAX_PENDING_INJECT_INPUT_FRAMES {
-            queue.pop_back();
+            queue.pop_front();
         }
-        queue.push_front(frame);
+        queue.push_back(frame);
     }
 
     pub async fn record_input_inject_applied(
@@ -251,12 +283,68 @@ impl AppState {
         .await;
     }
 
+    pub async fn record_input_inject_retry_scheduled(
+        &self,
+        peer_id: &str,
+        sequence: u64,
+        retry_count: u8,
+        backoff_ms: u64,
+        event_count: usize,
+        timing: InputFrameTiming,
+    ) {
+        let now_ms = Utc::now().timestamp_millis();
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: "input_inject_retry_scheduled".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!(
+                "sequence={sequence} retry_count={retry_count} backoff_ms={backoff_ms} queue_wait_ms={} capture_to_retry_ms={} receive_to_retry_ms={}",
+                elapsed_ms(timing.queued_timestamp_unix_ms, now_ms),
+                elapsed_ms(timing.capture_timestamp_unix_ms, now_ms),
+                elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
+            ),
+            size_bytes: event_count as u64,
+        })
+        .await;
+    }
+
+    pub async fn record_input_inject_dropped_permanent(
+        &self,
+        peer_id: &str,
+        sequence: u64,
+        event_count: usize,
+        timing: InputFrameTiming,
+        reason: &str,
+        message: &str,
+    ) {
+        let now_ms = Utc::now().timestamp_millis();
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: "input_inject_dropped_permanent".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!(
+                "sequence={sequence} reason={reason} queue_wait_ms={} capture_to_drop_ms={} receive_to_drop_ms={} {message}",
+                elapsed_ms(timing.queued_timestamp_unix_ms, now_ms),
+                elapsed_ms(timing.capture_timestamp_unix_ms, now_ms),
+                elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
+            ),
+            size_bytes: event_count as u64,
+        })
+        .await;
+    }
+
     pub async fn claim_input_owner(&self, peer_id: &str, force: bool) -> Result<bool> {
         if self.get_peer(peer_id).await.is_none() {
             anyhow::bail!("unknown peer {peer_id}");
         }
 
-        Ok(self.input_router.write().await.claim_owner(peer_id, force))
+        let claimed = self.input_router.write().await.claim_owner(peer_id, force);
+        if claimed {
+            self.note_input_owner_transition().await;
+        }
+        Ok(claimed)
     }
 
     pub async fn input_injection_allowed_for_peer(&self, peer_id: &str) -> bool {
@@ -265,7 +353,15 @@ impl AppState {
     }
 
     pub async fn release_input_owner(&self, peer_id: &str) -> bool {
-        self.input_router.write().await.release_owner(peer_id)
+        let released = self.input_router.write().await.release_owner(peer_id);
+        if released {
+            self.note_input_owner_transition().await;
+        }
+        released
+    }
+
+    pub async fn note_input_owner_transition(&self) {
+        *self.input_owner_last_changed_at.write().await = Some(std::time::Instant::now());
     }
 
     pub async fn input_owner(&self) -> Option<String> {
@@ -327,5 +423,64 @@ impl AppState {
         let active = *self.input_lock_active.read().await;
         let supported = *self.input_lock_supported.read().await;
         (active, supported)
+    }
+
+    fn auto_claim_input_owner_allowed_now(&self, decision: &RouteDecision) -> (bool, &'static str) {
+        match decision {
+            RouteDecision::IgnoredNoOwner => (true, "no_owner"),
+            RouteDecision::IgnoredWrongOwner { owner_peer_id } => {
+                let owner_connected = self
+                    .config
+                    .try_read()
+                    .ok()
+                    .map(|config| {
+                        config
+                            .peers
+                            .iter()
+                            .any(|peer| peer.peer_id == *owner_peer_id && peer.connected)
+                    })
+                    .unwrap_or(true);
+                if !owner_connected {
+                    return (true, "owner_disconnected");
+                }
+
+                let cooldown = Duration::from_millis(INPUT_OWNER_AUTO_STEAL_COOLDOWN_MS);
+                let cooldown_ready = self
+                    .input_owner_last_changed_at
+                    .try_read()
+                    .ok()
+                    .map(|last_changed| {
+                        last_changed
+                            .as_ref()
+                            .map(|last| last.elapsed() >= cooldown)
+                            .unwrap_or(true)
+                    })
+                    .unwrap_or(false);
+
+                if cooldown_ready {
+                    (true, "cooldown_elapsed")
+                } else {
+                    (false, "cooldown_active")
+                }
+            }
+            _ => (false, "not_eligible"),
+        }
+    }
+
+    async fn record_input_owner_auto_claim_blocked(
+        &self,
+        peer_id: &str,
+        sequence: u64,
+        reason: &str,
+    ) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: "input_owner_auto_claim_blocked".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("sequence={sequence} reason={reason}"),
+            size_bytes: 0,
+        })
+        .await;
     }
 }

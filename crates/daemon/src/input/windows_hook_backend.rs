@@ -2,7 +2,7 @@ use super::*;
 
 impl WindowsHookCaptureBackend {
     pub(super) fn new() -> Result<Self> {
-        let (event_tx, event_rx) = mpsc::channel::<HookCaptureEvent>();
+        let (event_tx, event_rx) = mpsc::sync_channel::<HookCaptureEvent>(HOOK_EVENT_QUEUE_CAP);
         let (startup_tx, startup_rx) = mpsc::channel::<Result<u32>>();
 
         let hook_thread = thread::spawn(move || {
@@ -18,7 +18,9 @@ impl WindowsHookCaptureBackend {
             match (keyboard_hook, mouse_hook) {
                 (Ok(keyboard_hook), Ok(mouse_hook)) => {
                     let _ = startup_tx.send(Ok(thread_id));
-                    unsafe { run_hook_message_loop() };
+                    if let Err(error) = unsafe { run_hook_message_loop() } {
+                        warn!(error = ?error, "hook message loop exited with error");
+                    }
                     unsafe {
                         let _ = UnhookWindowsHookEx(keyboard_hook);
                         let _ = UnhookWindowsHookEx(mouse_hook);
@@ -281,5 +283,9 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
 
     fn cursor_position(&self) -> Option<(i32, i32)> {
         self.last_cursor
+    }
+
+    fn take_dropped_event_count(&mut self) -> u64 {
+        take_hook_dropped_event_count()
     }
 }

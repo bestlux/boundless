@@ -1,4 +1,5 @@
 use core_input::{EasyMouseMode, InputEvent, SwitchDirection};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::state::{AppState, CaptureHandoffTarget};
@@ -34,17 +35,16 @@ pub(super) fn edge_switch_direction_from_motion(
     let pressure_threshold = edge_switch_pressure_threshold(current_target, screen_bounds);
     let pressure_limit = pressure_threshold.saturating_mul(2);
 
-    let now_ms = unix_now_ms();
     if state
-        .suppress_until_unix_ms
-        .is_some_and(|until| now_ms < until)
+        .suppress_until_instant
+        .is_some_and(|until| Instant::now() < until)
     {
         state.last_direction = None;
         state.x_pressure = 0;
         state.y_pressure = 0;
         return None;
     }
-    state.suppress_until_unix_ms = None;
+    state.suppress_until_instant = None;
 
     let mut batch_dx: i32 = 0;
     let mut batch_dy: i32 = 0;
@@ -162,13 +162,6 @@ fn batch_direction(dx: i32, dy: i32, wrap_mouse: bool) -> Option<SwitchDirection
     None
 }
 
-pub(super) fn unix_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 pub(super) async fn maybe_handoff_capture_target_from_motion(
     state: &AppState,
     events: &[InputEvent],
@@ -243,8 +236,10 @@ pub(super) async fn maybe_handoff_capture_target_from_motion(
                     .await;
                     edge_switch_state.x_pressure = 0;
                     edge_switch_state.y_pressure = 0;
-                    edge_switch_state.suppress_until_unix_ms =
-                        Some(unix_now_ms().saturating_add(EDGE_SWITCH_POST_HANDOFF_SUPPRESS_MS));
+                    edge_switch_state.suppress_until_instant = Some(
+                        Instant::now()
+                            + Duration::from_millis(EDGE_SWITCH_POST_HANDOFF_SUPPRESS_MS),
+                    );
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -279,8 +274,8 @@ pub(super) async fn maybe_handoff_capture_target_from_motion(
             .await;
             edge_switch_state.x_pressure = 0;
             edge_switch_state.y_pressure = 0;
-            edge_switch_state.suppress_until_unix_ms =
-                Some(unix_now_ms().saturating_add(EDGE_SWITCH_POST_HANDOFF_SUPPRESS_MS));
+            edge_switch_state.suppress_until_instant =
+                Some(Instant::now() + Duration::from_millis(EDGE_SWITCH_POST_HANDOFF_SUPPRESS_MS));
         }
     }
 }

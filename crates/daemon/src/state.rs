@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -35,6 +35,7 @@ use crate::config::{
 const MAX_TRANSPORT_EVENTS: usize = 512;
 const MAX_PENDING_REMOTE_CLIPBOARD_ITEMS: usize = 64;
 const MAX_PENDING_INJECT_INPUT_FRAMES: usize = 128;
+const INPUT_OWNER_AUTO_STEAL_COOLDOWN_MS: u64 = 1_000;
 const NEARBY_PAIRING_DECISION_RETENTION_MINUTES: i64 = 10;
 
 mod clipboard_ops;
@@ -116,6 +117,8 @@ pub struct PendingInjectInputFrame {
     pub capture_timestamp_unix_ms: i64,
     pub received_timestamp_unix_ms: i64,
     pub queued_timestamp_unix_ms: i64,
+    pub retry_count: u8,
+    pub next_retry_at: Option<Instant>,
     pub events: Vec<InputEvent>,
 }
 
@@ -195,6 +198,7 @@ pub struct AppState {
     input_sequence_by_peer: Arc<RwLock<HashMap<String, u64>>>,
     pending_inject_input_frames: Arc<RwLock<VecDeque<PendingInjectInputFrame>>>,
     input_capture_target_peer_id: Arc<RwLock<Option<String>>>,
+    input_owner_last_changed_at: Arc<RwLock<Option<Instant>>>,
     input_lock_active: Arc<RwLock<bool>>,
     input_lock_supported: Arc<RwLock<bool>>,
     reconnect_generation_by_peer: Arc<RwLock<HashMap<String, u64>>>,
@@ -277,6 +281,7 @@ impl AppState {
             input_sequence_by_peer: Arc::new(RwLock::new(HashMap::new())),
             pending_inject_input_frames: Arc::new(RwLock::new(VecDeque::new())),
             input_capture_target_peer_id: Arc::new(RwLock::new(None)),
+            input_owner_last_changed_at: Arc::new(RwLock::new(None)),
             input_lock_active: Arc::new(RwLock::new(false)),
             input_lock_supported: Arc::new(RwLock::new(cfg!(windows))),
             reconnect_generation_by_peer: Arc::new(RwLock::new(HashMap::new())),
