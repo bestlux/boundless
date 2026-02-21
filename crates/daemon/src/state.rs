@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -38,8 +38,15 @@ use crate::config::{
 const MAX_TRANSPORT_EVENTS: usize = 512;
 const MAX_PENDING_REMOTE_CLIPBOARD_ITEMS: usize = 64;
 const MAX_PENDING_INJECT_INPUT_FRAMES: usize = 128;
+const MAX_PENDING_NEARBY_PAIRING_REQUESTS: usize = 128;
+const MAX_PENDING_NEARBY_CODE_CHALLENGES: usize = 64;
 const INPUT_OWNER_AUTO_STEAL_COOLDOWN_MS: u64 = 1_000;
 const NEARBY_PAIRING_DECISION_RETENTION_MINUTES: i64 = 10;
+const NEARBY_PAIRING_CHALLENGE_MAX_ATTEMPTS: u8 = 5;
+const NEARBY_PAIRING_CODE_REQUEST_COOLDOWN_SECONDS: i64 = 3;
+const NEARBY_PAIRING_CODE_SUBMISSION_FAILURE_WINDOW_SECONDS: i64 = 300;
+const NEARBY_PAIRING_CODE_SUBMISSION_MAX_FAILURES: usize = 8;
+const NEARBY_PAIRING_CODE_SUBMISSION_LOCKOUT_SECONDS: i64 = 600;
 pub(crate) const FILE_TRANSFER_CHUNK_BYTES: usize = 48 * 1024;
 
 mod clipboard_ops;
@@ -165,6 +172,8 @@ pub struct PendingNearbyPairingRequest {
     pub requester_machine_id: String,
     pub requester_display_name: String,
     pub created_at: DateTime<Utc>,
+    pub verification_code: Option<String>,
+    pub verification_expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +195,17 @@ struct PendingNearbyPairingRequestRecord {
     summary: PendingNearbyPairingRequest,
     requester_bundle: TrustBundle,
     requester_alias: Option<String>,
+    mode: PendingNearbyPairingMode,
+}
+
+#[derive(Debug, Clone)]
+enum PendingNearbyPairingMode {
+    ManualApproval,
+    CodeChallenge {
+        code: String,
+        expires_at: DateTime<Utc>,
+        attempts_left: u8,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +262,9 @@ pub struct AppState {
     pending_nearby_pairing_requests:
         Arc<RwLock<HashMap<String, PendingNearbyPairingRequestRecord>>>,
     nearby_pairing_decisions: Arc<RwLock<HashMap<String, NearbyPairingDecisionRecord>>>,
+    nearby_code_request_last_seen_by_ip: Arc<RwLock<HashMap<IpAddr, DateTime<Utc>>>>,
+    nearby_code_submission_failures_by_ip: Arc<RwLock<HashMap<IpAddr, Vec<DateTime<Utc>>>>>,
+    nearby_code_submission_lockout_by_ip: Arc<RwLock<HashMap<IpAddr, DateTime<Utc>>>>,
     pending_transport_session_abort_handles: Arc<RwLock<HashMap<u64, AbortHandle>>>,
     transport_session_abort_handles_by_peer:
         Arc<RwLock<HashMap<String, HashMap<u64, AbortHandle>>>>,
@@ -331,6 +354,9 @@ impl AppState {
             outgoing_flush_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_nearby_pairing_requests: Arc::new(RwLock::new(HashMap::new())),
             nearby_pairing_decisions: Arc::new(RwLock::new(HashMap::new())),
+            nearby_code_request_last_seen_by_ip: Arc::new(RwLock::new(HashMap::new())),
+            nearby_code_submission_failures_by_ip: Arc::new(RwLock::new(HashMap::new())),
+            nearby_code_submission_lockout_by_ip: Arc::new(RwLock::new(HashMap::new())),
             pending_transport_session_abort_handles: Arc::new(RwLock::new(HashMap::new())),
             transport_session_abort_handles_by_peer: Arc::new(RwLock::new(HashMap::new())),
             next_transport_session_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),

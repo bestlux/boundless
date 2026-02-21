@@ -43,6 +43,9 @@ message NearbyPairingRequestInfo {
   string requester_machine_id = 2;
   string requester_display_name = 3;
   string created_at = 4;
+  string verification_code = 5;
+  string verification_expires_at = 6;
+  bool requires_verification_code = 7;
 }
 
 message NearbyPairingRequestsReply {

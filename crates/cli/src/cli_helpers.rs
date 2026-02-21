@@ -14,13 +14,29 @@ pub(super) fn resolve_discovered_peer<'a>(
             .ok_or_else(|| anyhow::anyhow!("no discovered peer at index {index}"));
     }
 
+    let normalized = selector.trim();
+    if normalized.is_empty() {
+        bail!("selector must not be empty");
+    }
+    let selector_lower = normalized.to_ascii_lowercase();
     let matches = snapshot
         .discovered_peers
         .iter()
-        .filter(|peer| peer.machine_id == selector || peer.machine_id.starts_with(selector))
+        .filter(|peer| {
+            peer.machine_id.eq_ignore_ascii_case(normalized)
+                || peer
+                    .machine_id
+                    .to_ascii_lowercase()
+                    .starts_with(&selector_lower)
+                || peer.display_name.eq_ignore_ascii_case(normalized)
+                || peer
+                    .display_name
+                    .to_ascii_lowercase()
+                    .starts_with(&selector_lower)
+        })
         .collect::<Vec<_>>();
     if matches.is_empty() {
-        bail!("no discovered peer matching machine_id `{selector}`");
+        bail!("no discovered peer matching `{selector}`");
     }
     if matches.len() > 1 {
         bail!("multiple discovered peers match `{selector}`; use full machine_id or index");

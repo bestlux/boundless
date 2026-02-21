@@ -48,16 +48,36 @@ impl PairingService for PairingApi {
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<NearbyPairingRequestsReply>, Status> {
+        let snapshot = self.0.snapshot().await;
+        let expose_verification_code =
+            should_expose_verification_code(snapshot.api_transport.as_str(), &snapshot.api_bind);
         let requests = self
             .0
             .list_pending_nearby_pairing_requests()
             .await
             .into_iter()
-            .map(|request| NearbyPairingRequestInfo {
-                request_id: request.request_id,
-                requester_machine_id: request.requester_machine_id,
-                requester_display_name: request.requester_display_name,
-                created_at: request.created_at.to_rfc3339(),
+            .map(|request| {
+                let has_verification_code = request.verification_code.is_some();
+                NearbyPairingRequestInfo {
+                    request_id: request.request_id,
+                    requester_machine_id: request.requester_machine_id,
+                    requester_display_name: request.requester_display_name,
+                    created_at: request.created_at.to_rfc3339(),
+                    verification_code: if expose_verification_code {
+                        request.verification_code.unwrap_or_default()
+                    } else {
+                        String::new()
+                    },
+                    verification_expires_at: if expose_verification_code {
+                        request
+                            .verification_expires_at
+                            .map(|value| value.to_rfc3339())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    },
+                    requires_verification_code: has_verification_code,
+                }
             })
             .collect();
 
@@ -152,4 +172,22 @@ impl PairingService for PairingApi {
             message: "trust bundle imported".to_string(),
         }))
     }
+}
+
+fn should_expose_verification_code(api_transport: &str, api_bind: &str) -> bool {
+    if api_transport.eq_ignore_ascii_case("npipe")
+        || api_transport.eq_ignore_ascii_case("named_pipe")
+    {
+        return true;
+    }
+
+    let trimmed = api_bind.trim();
+    if trimmed.eq_ignore_ascii_case("localhost") || trimmed.starts_with("localhost:") {
+        return true;
+    }
+
+    trimmed
+        .parse::<std::net::SocketAddr>()
+        .map(|address| address.ip().is_loopback())
+        .unwrap_or(false)
 }

@@ -32,6 +32,18 @@ impl AppState {
         self.pairing_codes.write().await.clear();
         self.pending_nearby_pairing_requests.write().await.clear();
         self.nearby_pairing_decisions.write().await.clear();
+        self.nearby_code_request_last_seen_by_ip
+            .write()
+            .await
+            .clear();
+        self.nearby_code_submission_failures_by_ip
+            .write()
+            .await
+            .clear();
+        self.nearby_code_submission_lockout_by_ip
+            .write()
+            .await
+            .clear();
         self.pending_transport_session_abort_handles
             .write()
             .await

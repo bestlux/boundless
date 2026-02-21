@@ -86,85 +86,7 @@ pub(super) async fn console_run(endpoint: &str, start_daemon: bool) -> Result<()
 }
 
 async fn ensure_daemon_available(endpoint: &str, start_daemon: bool) -> Result<()> {
-    if channel(endpoint).await.is_ok() {
-        return Ok(());
-    }
-
-    if !start_daemon {
-        bail!("daemon is not reachable at {endpoint}; run boundlessd or pass --start-daemon");
-    }
-
-    let launched = spawn_daemon_process()?;
-    println!("daemon_start=spawned path={launched}");
-
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        match channel(endpoint).await {
-            Ok(_) => return Ok(()),
-            Err(error) => {
-                if Instant::now() >= deadline {
-                    bail!(
-                        "daemon did not become reachable at {endpoint} after start attempt: {error}"
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-fn spawn_daemon_process() -> Result<String> {
-    let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("BOUNDLESS_DAEMON_PATH") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            candidates.push(trimmed.to_string());
-        }
-    }
-
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(parent) = current_exe.parent()
-    {
-        #[cfg(windows)]
-        {
-            candidates.push(parent.join("boundlessd.exe").display().to_string());
-        }
-        #[cfg(not(windows))]
-        {
-            candidates.push(parent.join("boundlessd").display().to_string());
-        }
-    }
-
-    candidates.push("boundlessd".to_string());
-    #[cfg(windows)]
-    candidates.push("boundlessd.exe".to_string());
-
-    candidates.sort();
-    candidates.dedup();
-
-    let mut errors = Vec::new();
-    for candidate in candidates {
-        let mut command = ProcessCommand::new(&candidate);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(windows)]
-        command.creation_flags(CREATE_NO_WINDOW);
-
-        match command.spawn() {
-            Ok(_) => return Ok(candidate),
-            Err(error) => errors.push(format!("{candidate}: {error}")),
-        }
-    }
-
-    bail!(
-        "failed to start boundlessd; candidates attempted: {}",
-        errors.join("; ")
-    )
+    super::commands::ensure_daemon_available(endpoint, start_daemon).await
 }
 
 async fn fetch_console_snapshot(endpoint: &str) -> Result<ConsoleSnapshot> {
@@ -349,7 +271,7 @@ fn print_console_help() {
     println!("  pair pending");
     println!("  pair approve <request_id> [alias]");
     println!("  pair reject <request_id>");
-    println!("  pair request <index|machine_id> [code] [alias]");
+    println!("  pair request <index|machine_id|display-name> [code] [alias]");
     println!("  pair nearby <host> <code> [port] [alias]");
 }
 
@@ -463,16 +385,14 @@ async fn handle_console_pair_command(
         }
         "request" => {
             if args.len() < 2 {
-                bail!("usage: pair request <index|machine_id> [code] [alias]");
+                bail!("usage: pair request <index|machine_id|display-name> [code] [alias]");
             }
 
             let discovered = resolve_discovered_peer(snapshot, args[1])?;
-            let socket = discovered
-                .endpoint
-                .parse::<SocketAddr>()
-                .with_context(|| format!("invalid discovered endpoint {}", discovered.endpoint))?;
-            let host = socket.ip().to_string();
-            let pairing_port = nearby_pairing_port(socket.port());
+            let (host, pairing_port) = host_and_pairing_port_from_discovery_endpoint(
+                &discovered.endpoint,
+            )
+            .with_context(|| format!("invalid discovered endpoint {}", discovered.endpoint))?;
 
             let code = if let Some(code) = args.get(2) {
                 code.to_string()
