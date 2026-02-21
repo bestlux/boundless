@@ -213,10 +213,10 @@ pub(super) fn resolve_switch_all_target_order_from_matrix(
 
     for row in matrix {
         for token in row {
-            if is_local_layout_token(&token, config) {
+            if is_local_layout_token(token, config) {
                 continue;
             }
-            let Some(peer_id) = resolve_peer_layout_token(&token, &config.peers) else {
+            let Some(peer_id) = resolve_peer_layout_token(token, &config.peers) else {
                 continue;
             };
             if seen.insert(peer_id.clone()) {

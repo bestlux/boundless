@@ -162,15 +162,18 @@ where
                         &mut write_frame_buffer,
                     )
                     .await?;
+                    let mut writer_ctx = OutboundPayloadWriter {
+                        outbound_transfer_flow: &mut outbound_transfer_flow,
+                        writer: &mut writer,
+                        frame_buffer: &mut write_frame_buffer,
+                    };
                     flush_outgoing_bulk_payloads_with_buffer(
                         &state,
                         &snapshot.machine_id,
                         remote_peer_id.as_deref(),
                         remote_protocol,
                         OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
-                        &mut outbound_transfer_flow,
-                        &mut writer,
-                        &mut write_frame_buffer,
+                        &mut writer_ctx,
                     )
                     .await?;
                 }
@@ -220,15 +223,18 @@ where
                 }
 
                 if let Some(remote_protocol) = remote_protocol {
+                    let mut writer_ctx = OutboundPayloadWriter {
+                        outbound_transfer_flow: &mut outbound_transfer_flow,
+                        writer: &mut writer,
+                        frame_buffer: &mut write_frame_buffer,
+                    };
                     flush_outgoing_bulk_payloads_with_buffer(
                         &state,
                         &snapshot.machine_id,
                         remote_peer_id.as_deref(),
                         remote_protocol,
                         OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
-                        &mut outbound_transfer_flow,
-                        &mut writer,
-                        &mut write_frame_buffer,
+                        &mut writer_ctx,
                     )
                     .await?;
                 }
@@ -369,15 +375,18 @@ where
                                 &mut write_frame_buffer,
                             )
                             .await?;
+                            let mut writer_ctx = OutboundPayloadWriter {
+                                outbound_transfer_flow: &mut outbound_transfer_flow,
+                                writer: &mut writer,
+                                frame_buffer: &mut write_frame_buffer,
+                            };
                             flush_outgoing_bulk_payloads_with_buffer(
                                 &state,
                                 &snapshot.machine_id,
                                 remote_peer_id.as_deref(),
                                 remote_protocol,
                                 OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
-                                &mut outbound_transfer_flow,
-                                &mut writer,
-                                &mut write_frame_buffer,
+                                &mut writer_ctx,
                             )
                             .await?;
                         }
@@ -399,15 +408,18 @@ where
                                 &mut write_frame_buffer,
                             )
                             .await?;
+                            let mut writer_ctx = OutboundPayloadWriter {
+                                outbound_transfer_flow: &mut outbound_transfer_flow,
+                                writer: &mut writer,
+                                frame_buffer: &mut write_frame_buffer,
+                            };
                             flush_outgoing_bulk_payloads_with_buffer(
                                 &state,
                                 &snapshot.machine_id,
                                 remote_peer_id.as_deref(),
                                 remote_protocol,
                                 OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
-                                &mut outbound_transfer_flow,
-                                &mut writer,
-                                &mut write_frame_buffer,
+                                &mut writer_ctx,
                             )
                             .await?;
                         }
@@ -722,15 +734,18 @@ where
                             .min(FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS);
 
                         if let Some(remote_protocol) = remote_protocol {
+                            let mut writer_ctx = OutboundPayloadWriter {
+                                outbound_transfer_flow: &mut outbound_transfer_flow,
+                                writer: &mut writer,
+                                frame_buffer: &mut write_frame_buffer,
+                            };
                             flush_outgoing_bulk_payloads_with_buffer(
                                 &state,
                                 &snapshot.machine_id,
                                 remote_peer_id.as_deref(),
                                 remote_protocol,
                                 OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
-                                &mut outbound_transfer_flow,
-                                &mut writer,
-                                &mut write_frame_buffer,
+                                &mut writer_ctx,
                             )
                             .await?;
                             writer
@@ -972,6 +987,12 @@ enum SendPayloadOutcome {
     DeferredForBackpressure,
 }
 
+struct OutboundPayloadWriter<'a, W> {
+    outbound_transfer_flow: &'a mut HashMap<String, OutboundTransferFlow>,
+    writer: &'a mut W,
+    frame_buffer: &'a mut Vec<u8>,
+}
+
 fn restore_outbound_chunk_credits_for_payloads(
     outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
     payloads: &[OutboundPayload],
@@ -1016,15 +1037,18 @@ where
         &mut frame_buffer,
     )
     .await?;
+    let mut writer_ctx = OutboundPayloadWriter {
+        outbound_transfer_flow: &mut outbound_transfer_flow,
+        writer,
+        frame_buffer: &mut frame_buffer,
+    };
     flush_outgoing_bulk_payloads_with_buffer(
         state,
         local_machine_id,
         remote_peer_id,
         remote_protocol,
         usize::MAX,
-        &mut outbound_transfer_flow,
-        writer,
-        &mut frame_buffer,
+        &mut writer_ctx,
     )
     .await
 }
@@ -1045,15 +1069,18 @@ where
         return Ok(());
     };
     let pending = state.drain_outgoing_input(peer_id, usize::MAX).await;
+    let mut writer_ctx = OutboundPayloadWriter {
+        outbound_transfer_flow,
+        writer,
+        frame_buffer,
+    };
     flush_pending_payloads_with_buffer(
         state,
         local_machine_id,
         peer_id,
         remote_protocol,
         pending,
-        outbound_transfer_flow,
-        writer,
-        frame_buffer,
+        &mut writer_ctx,
     )
     .await
 }
@@ -1064,9 +1091,7 @@ async fn flush_outgoing_bulk_payloads_with_buffer<W>(
     remote_peer_id: Option<&str>,
     remote_protocol: ProtocolVersion,
     max_payloads: usize,
-    outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
-    writer: &mut W,
-    frame_buffer: &mut Vec<u8>,
+    writer_ctx: &mut OutboundPayloadWriter<'_, W>,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -1084,9 +1109,7 @@ where
         peer_id,
         remote_protocol,
         pending,
-        outbound_transfer_flow,
-        writer,
-        frame_buffer,
+        writer_ctx,
     )
     .await
 }
@@ -1097,9 +1120,7 @@ async fn flush_pending_payloads_with_buffer<W>(
     peer_id: &str,
     remote_protocol: ProtocolVersion,
     pending_payloads: Vec<OutboundPayload>,
-    outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
-    writer: &mut W,
-    frame_buffer: &mut Vec<u8>,
+    writer_ctx: &mut OutboundPayloadWriter<'_, W>,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -1118,9 +1139,7 @@ where
             peer_id,
             remote_protocol,
             &payload,
-            outbound_transfer_flow,
-            writer,
-            frame_buffer,
+            writer_ctx,
         )
         .await
         {
@@ -1143,7 +1162,7 @@ where
                 state.requeue_outgoing_front(peer_id, unsent).await;
                 if !sent_for_flush.is_empty() {
                     restore_outbound_chunk_credits_for_payloads(
-                        outbound_transfer_flow,
+                        writer_ctx.outbound_transfer_flow,
                         &sent_for_flush,
                     );
                 }
@@ -1152,17 +1171,21 @@ where
         }
     }
 
-    if sent_any {
-        if let Err(error) = writer.flush().await.context("flush outbound payload batch") {
-            if !sent_for_flush.is_empty() {
-                restore_outbound_chunk_credits_for_payloads(
-                    outbound_transfer_flow,
-                    &sent_for_flush,
-                );
-                state.requeue_outgoing_front(peer_id, sent_for_flush).await;
-            }
-            return Err(error);
+    if sent_any
+        && let Err(error) = writer_ctx
+            .writer
+            .flush()
+            .await
+            .context("flush outbound payload batch")
+    {
+        if !sent_for_flush.is_empty() {
+            restore_outbound_chunk_credits_for_payloads(
+                writer_ctx.outbound_transfer_flow,
+                &sent_for_flush,
+            );
+            state.requeue_outgoing_front(peer_id, sent_for_flush).await;
         }
+        return Err(error);
     }
 
     Ok(())
@@ -1174,9 +1197,7 @@ async fn send_outbound_payload<W>(
     peer_id: &str,
     remote_protocol: ProtocolVersion,
     payload: &OutboundPayload,
-    outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
-    writer: &mut W,
-    frame_buffer: &mut Vec<u8>,
+    writer_ctx: &mut OutboundPayloadWriter<'_, W>,
 ) -> Result<SendPayloadOutcome>
 where
     W: AsyncWrite + Unpin,
@@ -1187,7 +1208,7 @@ where
                 machine_id: local_machine_id.to_string(),
                 text: text.clone(),
             };
-            if let Err(error) = encode_frame_to_vec(&message, frame_buffer) {
+            if let Err(error) = encode_frame_to_vec(&message, writer_ctx.frame_buffer) {
                 if matches!(error, WireCodecError::FrameTooLargeToEncode { .. }) {
                     warn!(
                         peer_id = %peer_id,
@@ -1199,7 +1220,8 @@ where
                 }
                 return Err(anyhow::Error::from(error));
             }
-            let payload_bytes = frame_buffer
+            let payload_bytes = writer_ctx
+                .frame_buffer
                 .len()
                 .saturating_sub(WIRE_FRAME_LENGTH_PREFIX_BYTES);
             if payload_bytes > MAX_WIRE_FRAME_BYTES {
@@ -1211,8 +1233,9 @@ where
                 );
                 return Ok(SendPayloadOutcome::Dropped);
             }
-            writer
-                .write_all(frame_buffer.as_slice())
+            writer_ctx
+                .writer
+                .write_all(writer_ctx.frame_buffer.as_slice())
                 .await
                 .context("write transport frame")?;
             state.record_outgoing_clipboard_text(peer_id, text).await;
@@ -1233,7 +1256,7 @@ where
                 machine_id: local_machine_id.to_string(),
                 data: image_bmp.clone(),
             };
-            if let Err(error) = encode_frame_to_vec(&message, frame_buffer) {
+            if let Err(error) = encode_frame_to_vec(&message, writer_ctx.frame_buffer) {
                 if matches!(error, WireCodecError::FrameTooLargeToEncode { .. }) {
                     warn!(
                         peer_id = %peer_id,
@@ -1245,7 +1268,8 @@ where
                 }
                 return Err(anyhow::Error::from(error));
             }
-            let payload_bytes = frame_buffer
+            let payload_bytes = writer_ctx
+                .frame_buffer
                 .len()
                 .saturating_sub(WIRE_FRAME_LENGTH_PREFIX_BYTES);
             if payload_bytes > MAX_WIRE_FRAME_BYTES {
@@ -1258,8 +1282,9 @@ where
                 );
                 return Ok(SendPayloadOutcome::Dropped);
             }
-            writer
-                .write_all(frame_buffer.as_slice())
+            writer_ctx
+                .writer
+                .write_all(writer_ctx.frame_buffer.as_slice())
                 .await
                 .context("write transport frame")?;
             state
@@ -1274,17 +1299,17 @@ where
         } => {
             validate_transfer_size(*total_bytes)?;
             send_message(
-                writer,
+                writer_ctx.writer,
                 &WireMessage::FileStart {
                     machine_id: local_machine_id.to_string(),
                     transfer_id: transfer_id.clone(),
                     file_name: file_name.clone(),
                     total_bytes: *total_bytes,
                 },
-                frame_buffer,
+                writer_ctx.frame_buffer,
             )
             .await?;
-            outbound_transfer_flow.insert(
+            writer_ctx.outbound_transfer_flow.insert(
                 transfer_id.clone(),
                 OutboundTransferFlow {
                     available_chunk_credits: 0,
@@ -1299,7 +1324,7 @@ where
             offset_bytes,
             length_bytes,
         } => {
-            let Some(flow) = outbound_transfer_flow.get(transfer_id) else {
+            let Some(flow) = writer_ctx.outbound_transfer_flow.get(transfer_id) else {
                 warn!(
                     peer_id = %peer_id,
                     transfer_id = %transfer_id,
@@ -1337,15 +1362,15 @@ where
             })?;
 
             send_message(
-                writer,
+                writer_ctx.writer,
                 &WireMessage::FileChunk {
                     transfer_id: transfer_id.clone(),
                     data,
                 },
-                frame_buffer,
+                writer_ctx.frame_buffer,
             )
             .await?;
-            if let Some(flow) = outbound_transfer_flow.get_mut(transfer_id)
+            if let Some(flow) = writer_ctx.outbound_transfer_flow.get_mut(transfer_id)
                 && flow.credit_managed
             {
                 flow.available_chunk_credits = flow.available_chunk_credits.saturating_sub(1);
@@ -1358,14 +1383,14 @@ where
             total_bytes,
         } => {
             send_message(
-                writer,
+                writer_ctx.writer,
                 &WireMessage::FileEnd {
                     transfer_id: transfer_id.clone(),
                 },
-                frame_buffer,
+                writer_ctx.frame_buffer,
             )
             .await?;
-            outbound_transfer_flow.remove(transfer_id);
+            writer_ctx.outbound_transfer_flow.remove(transfer_id);
 
             state
                 .record_outgoing_file(peer_id, file_name, *total_bytes)
@@ -1390,14 +1415,14 @@ where
             }
 
             send_message(
-                writer,
+                writer_ctx.writer,
                 &WireMessage::InputFrame {
                     machine_id: local_machine_id.to_string(),
                     sequence: *sequence,
                     timestamp_unix_ms: *timestamp_unix_ms,
                     events: wire_events,
                 },
-                frame_buffer,
+                writer_ctx.frame_buffer,
             )
             .await?;
 
