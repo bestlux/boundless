@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.0](https://github.com/bestlux/boundless/compare/v1.0.0...v1.1.0) (2026-02-21)
+
+
+### Features
+
+* **input:** harden injection runtime and ownership gating ([7c5a9e6](https://github.com/bestlux/boundless/commit/7c5a9e6ceb1c78293e6e0896066ac1bf470f5d88))
+* **network:** harden framing, flushing, and inbound file handling ([1698d2d](https://github.com/bestlux/boundless/commit/1698d2da0103b534e6d99946dc532dbfed1d0474))
+
+
+### Performance Improvements
+
+* improve performance + tray UI ([#3](https://github.com/bestlux/boundless/issues/3)) ([71db535](https://github.com/bestlux/boundless/commit/71db5356d549a011204c4d6ff72ae2cea7f71028))
+
 ## 1.0.0 (2026-02-18)
 
 
