@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::JoinHandle,
@@ -25,9 +25,10 @@ use tracing::{error, info, warn};
 
 use core_input::{InputEvent, InputFrame, KeyState, MouseButton};
 use core_protocol::{
-    PROTOCOL_CLIPBOARD_IMAGE_MIN, PROTOCOL_CURRENT, PROTOCOL_INPUT_ANCHOR_MIN, ProtocolVersion,
-    WireInputEvent, WireKeyState, WireMessage, WireMouseButton, decode_bytes_b64, decode_line,
-    encode_bytes_b64, encode_line,
+    MAX_WIRE_PAYLOAD_BYTES, PROTOCOL_CLIPBOARD_IMAGE_MIN, PROTOCOL_CURRENT,
+    PROTOCOL_FILE_CHUNK_CREDIT_MIN, PROTOCOL_INPUT_ANCHOR_MIN, ProtocolVersion,
+    WIRE_FRAME_LENGTH_PREFIX_BYTES, WireCodecError, WireInputEvent, WireKeyState, WireMessage,
+    WireMouseButton, decode_frame_payload, encode_frame_to_vec,
 };
 use core_transfer::validate_transfer_size;
 
@@ -42,7 +43,7 @@ mod tls;
 use codec::protocol_supports_input_anchor;
 use codec::{
     input_event_from_wire, input_events_to_wire_for_protocol, now_millis,
-    protocol_supports_clipboard_image,
+    protocol_supports_clipboard_image, protocol_supports_file_chunk_credit,
 };
 #[cfg(test)]
 use runtime::outbound_target_candidates;
@@ -58,11 +59,12 @@ use tls::{
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
-const OUTGOING_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
+const OUTGOING_INPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(4);
+const OUTGOING_BULK_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
+const OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH: usize = 4;
 const SUPERVISOR_TICK: Duration = Duration::from_secs(3);
 const MAX_BACKOFF_SECONDS: u64 = 30;
-const FILE_CHUNK_BYTES: usize = 48 * 1024;
-const MAX_WIRE_LINE_BYTES: usize = 256 * 1024;
+const MAX_WIRE_FRAME_BYTES: usize = MAX_WIRE_PAYLOAD_BYTES;
 const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
 const MAX_INBOUND_TRANSFERS_PER_PEER: usize = 4;
 const FALLBACK_BIND_HOST: &str = "0.0.0.0";
@@ -245,6 +247,56 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CaptureWriter {
+        bytes: Vec<u8>,
+    }
+
+    impl AsyncWrite for CaptureWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            self.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn decode_written_frames(bytes: &[u8]) -> Vec<WireMessage> {
+        let mut cursor = bytes;
+        let mut frames = Vec::new();
+        while !cursor.is_empty() {
+            assert!(
+                cursor.len() >= WIRE_FRAME_LENGTH_PREFIX_BYTES,
+                "frame must include length prefix"
+            );
+            let payload_len =
+                u32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]) as usize;
+            assert!(
+                cursor.len() >= WIRE_FRAME_LENGTH_PREFIX_BYTES + payload_len,
+                "buffer must contain full frame payload"
+            );
+            let payload = &cursor
+                [WIRE_FRAME_LENGTH_PREFIX_BYTES..WIRE_FRAME_LENGTH_PREFIX_BYTES + payload_len];
+            let frame = decode_frame_payload(payload).expect("decode frame payload");
+            frames.push(frame);
+            cursor = &cursor[WIRE_FRAME_LENGTH_PREFIX_BYTES + payload_len..];
+        }
+        frames
+    }
+
     #[test]
     fn extracts_server_name_from_ipv4_socket() {
         let server_name = parse_server_name("127.0.0.1:15100").expect("server name");
@@ -415,6 +467,34 @@ mod tests {
             minor: 2,
             patch: 0,
         }));
+    }
+
+    #[test]
+    fn perf_probe_outgoing_flush_tick_rate() {
+        let input_flush_ms = OUTGOING_INPUT_FLUSH_INTERVAL.as_millis() as f64;
+        let bulk_flush_ms = OUTGOING_BULK_FLUSH_INTERVAL.as_millis() as f64;
+        let input_theoretical_max_hz = if input_flush_ms > 0.0 {
+            1000.0 / input_flush_ms
+        } else {
+            0.0
+        };
+        let bulk_theoretical_max_hz = if bulk_flush_ms > 0.0 {
+            1000.0 / bulk_flush_ms
+        } else {
+            0.0
+        };
+        eprintln!(
+            "PERF_PROBE outgoing_flush input_interval_ms={} input_theoretical_max_hz={:.2} bulk_interval_ms={} bulk_theoretical_max_hz={:.2} bulk_max_payloads_per_flush={}",
+            input_flush_ms,
+            input_theoretical_max_hz,
+            bulk_flush_ms,
+            bulk_theoretical_max_hz,
+            OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH
+        );
+        assert!(
+            input_flush_ms > 0.0 && bulk_flush_ms > 0.0,
+            "flush intervals must be positive"
+        );
     }
 
     #[test]
@@ -615,13 +695,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_drops_clipboard_image_that_exceeds_wire_line_cap() {
+    async fn flush_drops_clipboard_image_that_exceeds_wire_frame_cap() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         state
             .requeue_outgoing_front(
                 &peer_id,
                 vec![OutboundPayload::ClipboardImage {
-                    image_bmp: vec![0u8; 220 * 1024],
+                    image_bmp: vec![0u8; 300 * 1024],
                 }],
             )
             .await;
@@ -641,6 +721,126 @@ mod tests {
         assert!(
             queued.is_empty(),
             "oversized dropped image must not remain queued"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn flush_applies_file_chunk_backpressure_contract() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let file_path = root.join("flow.bin");
+        let payload = vec![9u8; crate::state::FILE_TRANSFER_CHUNK_BYTES + 7];
+        tokio::fs::write(&file_path, &payload)
+            .await
+            .expect("write payload");
+
+        state
+            .queue_file_from_path(&peer_id, &file_path)
+            .await
+            .expect("queue file");
+
+        let mut writer = CaptureWriter::default();
+        flush_outgoing_payloads(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            &mut writer,
+        )
+        .await
+        .expect("flush file transfer");
+
+        let frames = decode_written_frames(&writer.bytes);
+        assert_eq!(
+            frames.len(),
+            1,
+            "without chunk credit only file-start should be sent"
+        );
+        let transfer_id = match frames.first() {
+            Some(WireMessage::FileStart { transfer_id, .. }) => transfer_id.clone(),
+            other => panic!("expected first wire frame to be file start, got {other:?}"),
+        };
+
+        let queued = state.drain_outgoing_bulk(&peer_id, usize::MAX).await;
+        assert_eq!(
+            queued.len(),
+            3,
+            "two file chunks and file-end should remain queued after backpressure defer"
+        );
+        assert!(matches!(
+            queued.first(),
+            Some(OutboundPayload::FileChunk {
+                transfer_id: chunk_transfer_id,
+                ..
+            }) if chunk_transfer_id == &transfer_id
+        ));
+        assert!(matches!(
+            queued.get(1),
+            Some(OutboundPayload::FileChunk {
+                transfer_id: chunk_transfer_id,
+                ..
+            }) if chunk_transfer_id == &transfer_id
+        ));
+        assert!(matches!(
+            queued.get(2),
+            Some(OutboundPayload::FileEnd {
+                transfer_id: end_transfer_id,
+                ..
+            }) if end_transfer_id == &transfer_id
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn flush_file_transfer_falls_back_for_legacy_peer_without_chunk_credit() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let file_path = root.join("legacy-flow.bin");
+        let payload = vec![5u8; crate::state::FILE_TRANSFER_CHUNK_BYTES + 7];
+        tokio::fs::write(&file_path, &payload)
+            .await
+            .expect("write payload");
+
+        state
+            .queue_file_from_path(&peer_id, &file_path)
+            .await
+            .expect("queue file");
+
+        let mut writer = CaptureWriter::default();
+        flush_outgoing_payloads(
+            &state,
+            "local",
+            Some(&peer_id),
+            ProtocolVersion {
+                major: 2,
+                minor: 0,
+                patch: 0,
+            },
+            &mut writer,
+        )
+        .await
+        .expect("flush file transfer for legacy peer");
+
+        let frames = decode_written_frames(&writer.bytes);
+        assert_eq!(
+            frames.len(),
+            4,
+            "legacy peers should receive full file transfer without chunk credits"
+        );
+        assert!(matches!(
+            frames.first(),
+            Some(WireMessage::FileStart { .. })
+        ));
+        assert!(matches!(frames.get(1), Some(WireMessage::FileChunk { .. })));
+        assert!(matches!(frames.get(2), Some(WireMessage::FileChunk { .. })));
+        assert!(matches!(frames.get(3), Some(WireMessage::FileEnd { .. })));
+        assert!(
+            state
+                .drain_outgoing_bulk(&peer_id, usize::MAX)
+                .await
+                .is_empty(),
+            "legacy transfer should not stall in outbound queue"
         );
 
         let _ = std::fs::remove_dir_all(root);

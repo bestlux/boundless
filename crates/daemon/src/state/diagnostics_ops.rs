@@ -14,8 +14,11 @@ impl AppState {
             config.peers.clear();
         }
 
-        self.outgoing_payloads.write().await.clear();
-        self.transport_events.write().await.clear();
+        self.outgoing_input_payloads.write().await.clear();
+        self.outgoing_bulk_payloads.write().await.clear();
+        if let Ok(mut events) = self.transport_events.lock() {
+            events.clear();
+        }
         *self.clipboard_sync.write().await = ClipboardSyncState::default();
         self.discovered_endpoints.write().await.clear();
         *self.input_router.write().await =
@@ -29,6 +32,18 @@ impl AppState {
         self.pairing_codes.write().await.clear();
         self.pending_nearby_pairing_requests.write().await.clear();
         self.nearby_pairing_decisions.write().await.clear();
+        self.nearby_code_request_last_seen_by_ip
+            .write()
+            .await
+            .clear();
+        self.nearby_code_submission_failures_by_ip
+            .write()
+            .await
+            .clear();
+        self.nearby_code_submission_lockout_by_ip
+            .write()
+            .await
+            .clear();
         self.pending_transport_session_abort_handles
             .write()
             .await
@@ -37,6 +52,7 @@ impl AppState {
             .write()
             .await
             .clear();
+        self.invalidate_cached_layout_matrix().await;
 
         save_config_at(&self.config_path, &config)
     }
@@ -61,7 +77,11 @@ impl AppState {
             .await
             .map(|items| items.len())
             .unwrap_or(0);
-        let event_count = self.transport_events.read().await.len();
+        let event_count = self
+            .transport_events
+            .lock()
+            .map(|events| events.len())
+            .unwrap_or(0);
         let input_owner = self
             .input_owner()
             .await

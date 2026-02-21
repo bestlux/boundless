@@ -13,6 +13,15 @@ struct InboundTransfer {
     temp_file: tokio::fs::File,
 }
 
+#[derive(Debug, Default)]
+struct OutboundTransferFlow {
+    available_chunk_credits: u32,
+    credit_managed: bool,
+}
+
+const FILE_TRANSFER_INITIAL_CHUNK_CREDITS: u32 = 8;
+const FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS: u32 = 256;
+
 pub(super) async fn connect_and_run_outbound(
     state: AppState,
     peer_id: &str,
@@ -91,9 +100,15 @@ where
     let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
-    let mut line = Vec::<u8>::with_capacity(4096);
+    let mut frame_payload = Vec::<u8>::with_capacity(4096);
+    let mut write_frame_buffer = Vec::<u8>::with_capacity(4096);
     let mut heartbeat_interval = time::interval(HEARTBEAT_INTERVAL);
-    let mut outgoing_flush_interval = time::interval(OUTGOING_FLUSH_INTERVAL);
+    let mut outgoing_input_flush_interval = time::interval(OUTGOING_INPUT_FLUSH_INTERVAL);
+    let mut outgoing_bulk_flush_interval = time::interval(OUTGOING_BULK_FLUSH_INTERVAL);
+    let mut outgoing_flush_signal = state.subscribe_outgoing_flush_signal();
+    heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    outgoing_input_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    outgoing_bulk_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     let snapshot = state.snapshot().await;
     let local_hello = WireMessage::Hello {
@@ -103,7 +118,7 @@ where
         capability_count: core_protocol::default_capabilities().len(),
     };
 
-    send_message(&mut writer, &local_hello).await?;
+    send_message(&mut writer, &local_hello, &mut write_frame_buffer).await?;
     writer.flush().await.context("flush local hello")?;
 
     let remote_peer_id = Some(authenticated_peer_id.clone());
@@ -112,6 +127,7 @@ where
         .await;
     let mut remote_protocol: Option<ProtocolVersion> = None;
     let mut inbound_transfers: HashMap<String, InboundTransfer> = HashMap::new();
+    let mut outbound_transfer_flow: HashMap<String, OutboundTransferFlow> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -134,20 +150,33 @@ where
                     machine_id: snapshot.machine_id.clone(),
                     timestamp_unix_ms: now_millis(),
                 };
-                send_message(&mut writer, &heartbeat).await?;
+                send_message(&mut writer, &heartbeat, &mut write_frame_buffer).await?;
                 if let Some(remote_protocol) = remote_protocol {
-                    flush_outgoing_payloads(
+                    flush_outgoing_input_payloads_with_buffer(
                         &state,
                         &snapshot.machine_id,
                         remote_peer_id.as_deref(),
                         remote_protocol,
+                        &mut outbound_transfer_flow,
                         &mut writer,
+                        &mut write_frame_buffer,
+                    )
+                    .await?;
+                    flush_outgoing_bulk_payloads_with_buffer(
+                        &state,
+                        &snapshot.machine_id,
+                        remote_peer_id.as_deref(),
+                        remote_protocol,
+                        OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
+                        &mut outbound_transfer_flow,
+                        &mut writer,
+                        &mut write_frame_buffer,
                     )
                     .await?;
                 }
                 writer.flush().await.context("flush heartbeat batch")?;
             }
-            _ = outgoing_flush_interval.tick(), if remote_protocol.is_some() => {
+            _ = outgoing_input_flush_interval.tick(), if remote_protocol.is_some() => {
                 if reconnect_requested_for_peer(
                     &state,
                     &authenticated_peer_id,
@@ -163,17 +192,81 @@ where
                 }
 
                 if let Some(remote_protocol) = remote_protocol {
-                    flush_outgoing_payloads(
+                    flush_outgoing_input_payloads_with_buffer(
                         &state,
                         &snapshot.machine_id,
                         remote_peer_id.as_deref(),
                         remote_protocol,
+                        &mut outbound_transfer_flow,
                         &mut writer,
+                        &mut write_frame_buffer,
                     )
                     .await?;
                 }
             }
-            read = read_wire_line(&mut reader, &mut line) => {
+            _ = outgoing_bulk_flush_interval.tick(), if remote_protocol.is_some() => {
+                if reconnect_requested_for_peer(
+                    &state,
+                    &authenticated_peer_id,
+                    &mut observed_reconnect_generation,
+                )
+                .await
+                {
+                    info!(
+                        peer_id = %authenticated_peer_id,
+                        "ending session due to explicit reconnect request"
+                    );
+                    break;
+                }
+
+                if let Some(remote_protocol) = remote_protocol {
+                    flush_outgoing_bulk_payloads_with_buffer(
+                        &state,
+                        &snapshot.machine_id,
+                        remote_peer_id.as_deref(),
+                        remote_protocol,
+                        OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
+                        &mut outbound_transfer_flow,
+                        &mut writer,
+                        &mut write_frame_buffer,
+                    )
+                    .await?;
+                }
+            }
+            changed = outgoing_flush_signal.changed(), if remote_protocol.is_some() => {
+                if changed.is_err() {
+                    // State dropped; session will naturally unwind shortly.
+                    break;
+                }
+
+                if reconnect_requested_for_peer(
+                    &state,
+                    &authenticated_peer_id,
+                    &mut observed_reconnect_generation,
+                )
+                .await
+                {
+                    info!(
+                        peer_id = %authenticated_peer_id,
+                        "ending session due to explicit reconnect request"
+                    );
+                    break;
+                }
+
+                if let Some(remote_protocol) = remote_protocol {
+                    flush_outgoing_input_payloads_with_buffer(
+                        &state,
+                        &snapshot.machine_id,
+                        remote_peer_id.as_deref(),
+                        remote_protocol,
+                        &mut outbound_transfer_flow,
+                        &mut writer,
+                        &mut write_frame_buffer,
+                    )
+                    .await?;
+                }
+            }
+            read = read_wire_frame_payload(&mut reader, &mut frame_payload) => {
                 if reconnect_requested_for_peer(
                     &state,
                     &authenticated_peer_id,
@@ -194,14 +287,14 @@ where
                         record_transport_frame_rejected(
                             &state,
                             &authenticated_peer_id,
-                            format!("reason=line_too_large error={error:#}"),
-                            line.len() as u64,
+                            format!("reason=invalid_frame error={error:#}"),
+                            frame_payload.len() as u64,
                         )
                         .await;
                         warn!(
                             peer_id = %authenticated_peer_id,
                             error = ?error,
-                            "transport frame exceeded max line length"
+                            "transport frame rejected"
                         );
                         break;
                     }
@@ -209,37 +302,14 @@ where
                     break;
                 };
 
-                if read == 0 {
-                    break;
-                }
-
-                let line_text = match std::str::from_utf8(&line) {
-                    Ok(text) => text,
-                    Err(error) => {
-                        record_transport_frame_rejected(
-                            &state,
-                            &authenticated_peer_id,
-                            format!("reason=invalid_utf8 error={error}"),
-                            line.len() as u64,
-                        )
-                        .await;
-                        warn!(
-                            peer_id = %authenticated_peer_id,
-                            error = ?error,
-                            "dropping invalid utf8 transport frame"
-                        );
-                        continue;
-                    }
-                };
-
-                let message = match decode_line(line_text) {
+                let message = match decode_frame_payload(&frame_payload) {
                     Ok(message) => message,
                     Err(error) => {
                         record_transport_frame_rejected(
                             &state,
                             &authenticated_peer_id,
                             format!("reason=decode_failed error={error}"),
-                            line.len() as u64,
+                            read as u64,
                         )
                         .await;
                         warn!(
@@ -268,6 +338,7 @@ where
                                 &WireMessage::Error {
                                     message: "hello machine_id mismatch".to_string(),
                                 },
+                                &mut write_frame_buffer,
                             )
                             .await;
                             let _ = writer.flush().await;
@@ -284,16 +355,29 @@ where
                                 machine_id: snapshot.machine_id.clone(),
                                 accepted: true,
                             };
-                            send_message(&mut writer, &ack).await?;
+                            send_message(&mut writer, &ack, &mut write_frame_buffer).await?;
                         }
 
                         if let Some(remote_protocol) = remote_protocol {
-                            flush_outgoing_payloads(
+                            flush_outgoing_input_payloads_with_buffer(
                                 &state,
                                 &snapshot.machine_id,
                                 remote_peer_id.as_deref(),
                                 remote_protocol,
+                                &mut outbound_transfer_flow,
                                 &mut writer,
+                                &mut write_frame_buffer,
+                            )
+                            .await?;
+                            flush_outgoing_bulk_payloads_with_buffer(
+                                &state,
+                                &snapshot.machine_id,
+                                remote_peer_id.as_deref(),
+                                remote_protocol,
+                                OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
+                                &mut outbound_transfer_flow,
+                                &mut writer,
+                                &mut write_frame_buffer,
                             )
                             .await?;
                         }
@@ -305,12 +389,25 @@ where
                         }
 
                         if let Some(remote_protocol) = remote_protocol {
-                            flush_outgoing_payloads(
+                            flush_outgoing_input_payloads_with_buffer(
                                 &state,
                                 &snapshot.machine_id,
                                 remote_peer_id.as_deref(),
                                 remote_protocol,
+                                &mut outbound_transfer_flow,
                                 &mut writer,
+                                &mut write_frame_buffer,
+                            )
+                            .await?;
+                            flush_outgoing_bulk_payloads_with_buffer(
+                                &state,
+                                &snapshot.machine_id,
+                                remote_peer_id.as_deref(),
+                                remote_protocol,
+                                OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
+                                &mut outbound_transfer_flow,
+                                &mut writer,
+                                &mut write_frame_buffer,
                             )
                             .await?;
                         }
@@ -366,7 +463,7 @@ where
                     }
                     WireMessage::ClipboardImage {
                         machine_id,
-                        data_b64,
+                        data,
                     } => {
                         if !remote_protocol.is_some_and(protocol_supports_clipboard_image) {
                             warn!(
@@ -387,13 +484,7 @@ where
                             continue;
                         }
 
-                        let image_bmp = match decode_bytes_b64(&data_b64) {
-                            Ok(bytes) => bytes,
-                            Err(error) => {
-                                warn!(error = ?error, "failed to decode clipboard image payload");
-                                continue;
-                            }
-                        };
+                        let image_bmp = data;
 
                         if let Some(peer_id) = &remote_peer_id {
                             let size_bytes = image_bmp.len();
@@ -511,25 +602,33 @@ where
                                 total_bytes,
                                 "started inbound file transfer"
                             );
+                            if remote_protocol
+                                .is_some_and(protocol_supports_file_chunk_credit)
+                            {
+                                send_file_chunk_credit(
+                                    &mut writer,
+                                    &transfer_id,
+                                    FILE_TRANSFER_INITIAL_CHUNK_CREDITS,
+                                    &mut write_frame_buffer,
+                                )
+                                .await?;
+                                writer
+                                    .flush()
+                                    .await
+                                    .context("flush inbound file transfer initial credit")?;
+                            }
                         }
                     }
                     WireMessage::FileChunk {
                         transfer_id,
-                        data_b64,
+                        data,
                     } => {
                         let Some(mut transfer) = inbound_transfers.remove(&transfer_id) else {
                             warn!(transfer_id = %transfer_id, "received file chunk for unknown transfer");
                             continue;
                         };
 
-                        let chunk = match decode_bytes_b64(&data_b64) {
-                            Ok(chunk) => chunk,
-                            Err(error) => {
-                                warn!(transfer_id = %transfer_id, error = ?error, "failed to decode file chunk");
-                                discard_inbound_transfer(transfer).await;
-                                continue;
-                            }
-                        };
+                        let chunk = data;
 
                         let next_size = transfer.bytes_received.saturating_add(chunk.len() as u64);
                         if let Err(error) = validate_transfer_size(next_size) {
@@ -582,7 +681,63 @@ where
                         }
 
                         transfer.bytes_received = next_size;
-                        inbound_transfers.insert(transfer_id, transfer);
+                        inbound_transfers.insert(transfer_id.clone(), transfer);
+                        if remote_protocol.is_some_and(protocol_supports_file_chunk_credit) {
+                            send_file_chunk_credit(
+                                &mut writer,
+                                &transfer_id,
+                                1,
+                                &mut write_frame_buffer,
+                            )
+                            .await?;
+                            writer
+                                .flush()
+                                .await
+                                .context("flush inbound file transfer chunk credit")?;
+                        }
+                    }
+                    WireMessage::FileChunkCredit {
+                        transfer_id,
+                        chunk_credits,
+                    } => {
+                        if chunk_credits == 0 {
+                            continue;
+                        }
+
+                        let Some(flow) = outbound_transfer_flow.get_mut(&transfer_id) else {
+                            warn!(
+                                transfer_id = %transfer_id,
+                                chunk_credits,
+                                "dropping file chunk credit for unknown outbound transfer"
+                            );
+                            continue;
+                        };
+                        if !flow.credit_managed {
+                            continue;
+                        }
+
+                        flow.available_chunk_credits = flow
+                            .available_chunk_credits
+                            .saturating_add(chunk_credits)
+                            .min(FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS);
+
+                        if let Some(remote_protocol) = remote_protocol {
+                            flush_outgoing_bulk_payloads_with_buffer(
+                                &state,
+                                &snapshot.machine_id,
+                                remote_peer_id.as_deref(),
+                                remote_protocol,
+                                OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
+                                &mut outbound_transfer_flow,
+                                &mut writer,
+                                &mut write_frame_buffer,
+                            )
+                            .await?;
+                            writer
+                                .flush()
+                                .await
+                                .context("flush outbound bulk after receiving file chunk credit")?;
+                        }
                     }
                     WireMessage::FileEnd { transfer_id } => {
                         let Some(mut transfer) = inbound_transfers.remove(&transfer_id) else {
@@ -770,17 +925,75 @@ async fn authenticated_peer_machine_id<S>(
     Ok(machine_id)
 }
 
-async fn send_message<W>(writer: &mut W, message: &WireMessage) -> Result<()>
+async fn send_message<W>(
+    writer: &mut W,
+    message: &WireMessage,
+    frame_buffer: &mut Vec<u8>,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    encode_frame_to_vec(message, frame_buffer)?;
     writer
-        .write_all(encode_line(message)?.as_bytes())
+        .write_all(frame_buffer.as_slice())
         .await
         .context("write transport frame")?;
     Ok(())
 }
 
+async fn send_file_chunk_credit<W>(
+    writer: &mut W,
+    transfer_id: &str,
+    chunk_credits: u32,
+    frame_buffer: &mut Vec<u8>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if chunk_credits == 0 {
+        return Ok(());
+    }
+
+    send_message(
+        writer,
+        &WireMessage::FileChunkCredit {
+            transfer_id: transfer_id.to_string(),
+            chunk_credits,
+        },
+        frame_buffer,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendPayloadOutcome {
+    Sent,
+    Dropped,
+    DeferredForBackpressure,
+}
+
+fn restore_outbound_chunk_credits_for_payloads(
+    outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
+    payloads: &[OutboundPayload],
+) {
+    for payload in payloads {
+        let OutboundPayload::FileChunk { transfer_id, .. } = payload else {
+            continue;
+        };
+        let Some(flow) = outbound_transfer_flow.get_mut(transfer_id) else {
+            continue;
+        };
+        if !flow.credit_managed {
+            continue;
+        }
+        flow.available_chunk_credits = flow
+            .available_chunk_credits
+            .saturating_add(1)
+            .min(FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS);
+    }
+}
+
+#[cfg(test)]
 pub(super) async fn flush_outgoing_payloads<W>(
     state: &AppState,
     local_machine_id: &str,
@@ -791,11 +1004,111 @@ pub(super) async fn flush_outgoing_payloads<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    let mut frame_buffer = Vec::with_capacity(4096);
+    let mut outbound_transfer_flow = HashMap::new();
+    flush_outgoing_input_payloads_with_buffer(
+        state,
+        local_machine_id,
+        remote_peer_id,
+        remote_protocol,
+        &mut outbound_transfer_flow,
+        writer,
+        &mut frame_buffer,
+    )
+    .await?;
+    flush_outgoing_bulk_payloads_with_buffer(
+        state,
+        local_machine_id,
+        remote_peer_id,
+        remote_protocol,
+        usize::MAX,
+        &mut outbound_transfer_flow,
+        writer,
+        &mut frame_buffer,
+    )
+    .await
+}
+
+async fn flush_outgoing_input_payloads_with_buffer<W>(
+    state: &AppState,
+    local_machine_id: &str,
+    remote_peer_id: Option<&str>,
+    remote_protocol: ProtocolVersion,
+    outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
+    writer: &mut W,
+    frame_buffer: &mut Vec<u8>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let Some(peer_id) = remote_peer_id else {
         return Ok(());
     };
+    let pending = state.drain_outgoing_input(peer_id, usize::MAX).await;
+    flush_pending_payloads_with_buffer(
+        state,
+        local_machine_id,
+        peer_id,
+        remote_protocol,
+        pending,
+        outbound_transfer_flow,
+        writer,
+        frame_buffer,
+    )
+    .await
+}
 
-    let mut pending = VecDeque::from(state.drain_outgoing(peer_id).await);
+async fn flush_outgoing_bulk_payloads_with_buffer<W>(
+    state: &AppState,
+    local_machine_id: &str,
+    remote_peer_id: Option<&str>,
+    remote_protocol: ProtocolVersion,
+    max_payloads: usize,
+    outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
+    writer: &mut W,
+    frame_buffer: &mut Vec<u8>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if max_payloads == 0 {
+        return Ok(());
+    }
+    let Some(peer_id) = remote_peer_id else {
+        return Ok(());
+    };
+    let pending = state.drain_outgoing_bulk(peer_id, max_payloads).await;
+    flush_pending_payloads_with_buffer(
+        state,
+        local_machine_id,
+        peer_id,
+        remote_protocol,
+        pending,
+        outbound_transfer_flow,
+        writer,
+        frame_buffer,
+    )
+    .await
+}
+
+async fn flush_pending_payloads_with_buffer<W>(
+    state: &AppState,
+    local_machine_id: &str,
+    peer_id: &str,
+    remote_protocol: ProtocolVersion,
+    pending_payloads: Vec<OutboundPayload>,
+    outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
+    writer: &mut W,
+    frame_buffer: &mut Vec<u8>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if pending_payloads.is_empty() {
+        return Ok(());
+    }
+
+    let mut pending = VecDeque::from(pending_payloads);
     let mut sent_for_flush = Vec::<OutboundPayload>::new();
     let mut sent_any = false;
     while let Some(payload) = pending.pop_front() {
@@ -805,21 +1118,35 @@ where
             peer_id,
             remote_protocol,
             &payload,
+            outbound_transfer_flow,
             writer,
+            frame_buffer,
         )
         .await
         {
-            Ok(sent_payload) => {
-                sent_any = sent_any || sent_payload;
-                if sent_payload {
-                    sent_for_flush.push(payload);
-                }
+            Ok(SendPayloadOutcome::Sent) => {
+                sent_any = true;
+                sent_for_flush.push(payload);
+            }
+            Ok(SendPayloadOutcome::Dropped) => {}
+            Ok(SendPayloadOutcome::DeferredForBackpressure) => {
+                let mut unsent = Vec::with_capacity(pending.len() + 1);
+                unsent.push(payload);
+                unsent.extend(pending.into_iter());
+                state.requeue_outgoing_front(peer_id, unsent).await;
+                break;
             }
             Err(error) => {
                 let mut unsent = Vec::with_capacity(pending.len() + 1);
                 unsent.push(payload);
                 unsent.extend(pending.into_iter());
                 state.requeue_outgoing_front(peer_id, unsent).await;
+                if !sent_for_flush.is_empty() {
+                    restore_outbound_chunk_credits_for_payloads(
+                        outbound_transfer_flow,
+                        &sent_for_flush,
+                    );
+                }
                 return Err(error);
             }
         }
@@ -828,6 +1155,10 @@ where
     if sent_any {
         if let Err(error) = writer.flush().await.context("flush outbound payload batch") {
             if !sent_for_flush.is_empty() {
+                restore_outbound_chunk_credits_for_payloads(
+                    outbound_transfer_flow,
+                    &sent_for_flush,
+                );
                 state.requeue_outgoing_front(peer_id, sent_for_flush).await;
             }
             return Err(error);
@@ -843,8 +1174,10 @@ async fn send_outbound_payload<W>(
     peer_id: &str,
     remote_protocol: ProtocolVersion,
     payload: &OutboundPayload,
+    outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
     writer: &mut W,
-) -> Result<bool>
+    frame_buffer: &mut Vec<u8>,
+) -> Result<SendPayloadOutcome>
 where
     W: AsyncWrite + Unpin,
 {
@@ -854,22 +1187,36 @@ where
                 machine_id: local_machine_id.to_string(),
                 text: text.clone(),
             };
-            let line = encode_line(&message)?;
-            if line.len() > MAX_WIRE_LINE_BYTES {
+            if let Err(error) = encode_frame_to_vec(&message, frame_buffer) {
+                if matches!(error, WireCodecError::FrameTooLargeToEncode { .. }) {
+                    warn!(
+                        peer_id = %peer_id,
+                        payload_bytes = text.len(),
+                        limit_bytes = MAX_WIRE_FRAME_BYTES,
+                        "dropping clipboard text payload that exceeds wire frame cap"
+                    );
+                    return Ok(SendPayloadOutcome::Dropped);
+                }
+                return Err(anyhow::Error::from(error));
+            }
+            let payload_bytes = frame_buffer
+                .len()
+                .saturating_sub(WIRE_FRAME_LENGTH_PREFIX_BYTES);
+            if payload_bytes > MAX_WIRE_FRAME_BYTES {
                 warn!(
                     peer_id = %peer_id,
-                    size_bytes = line.len(),
-                    limit_bytes = MAX_WIRE_LINE_BYTES,
-                    "dropping clipboard text payload that exceeds wire line cap"
+                    size_bytes = payload_bytes,
+                    limit_bytes = MAX_WIRE_FRAME_BYTES,
+                    "dropping clipboard text payload that exceeds wire frame cap"
                 );
-                return Ok(false);
+                return Ok(SendPayloadOutcome::Dropped);
             }
             writer
-                .write_all(line.as_bytes())
+                .write_all(frame_buffer.as_slice())
                 .await
                 .context("write transport frame")?;
             state.record_outgoing_clipboard_text(peer_id, text).await;
-            Ok(true)
+            Ok(SendPayloadOutcome::Sent)
         }
         OutboundPayload::ClipboardImage { image_bmp } => {
             if !protocol_supports_clipboard_image(remote_protocol) {
@@ -879,65 +1226,151 @@ where
                     required_protocol = %PROTOCOL_CLIPBOARD_IMAGE_MIN,
                     "dropping clipboard image payload for peer without image-frame support"
                 );
-                return Ok(false);
+                return Ok(SendPayloadOutcome::Dropped);
             }
 
             let message = WireMessage::ClipboardImage {
                 machine_id: local_machine_id.to_string(),
-                data_b64: encode_bytes_b64(image_bmp),
+                data: image_bmp.clone(),
             };
-            let line = encode_line(&message)?;
-            if line.len() > MAX_WIRE_LINE_BYTES {
+            if let Err(error) = encode_frame_to_vec(&message, frame_buffer) {
+                if matches!(error, WireCodecError::FrameTooLargeToEncode { .. }) {
+                    warn!(
+                        peer_id = %peer_id,
+                        payload_bytes = image_bmp.len(),
+                        limit_bytes = MAX_WIRE_FRAME_BYTES,
+                        "dropping clipboard image payload that exceeds wire frame cap"
+                    );
+                    return Ok(SendPayloadOutcome::Dropped);
+                }
+                return Err(anyhow::Error::from(error));
+            }
+            let payload_bytes = frame_buffer
+                .len()
+                .saturating_sub(WIRE_FRAME_LENGTH_PREFIX_BYTES);
+            if payload_bytes > MAX_WIRE_FRAME_BYTES {
                 warn!(
                     peer_id = %peer_id,
                     payload_bytes = image_bmp.len(),
-                    line_bytes = line.len(),
-                    limit_bytes = MAX_WIRE_LINE_BYTES,
-                    "dropping clipboard image payload that exceeds wire line cap"
+                    frame_bytes = payload_bytes,
+                    limit_bytes = MAX_WIRE_FRAME_BYTES,
+                    "dropping clipboard image payload that exceeds wire frame cap"
                 );
-                return Ok(false);
+                return Ok(SendPayloadOutcome::Dropped);
             }
             writer
-                .write_all(line.as_bytes())
+                .write_all(frame_buffer.as_slice())
                 .await
                 .context("write transport frame")?;
             state
                 .record_outgoing_clipboard_image(peer_id, image_bmp.len())
                 .await;
-            Ok(true)
+            Ok(SendPayloadOutcome::Sent)
         }
-        OutboundPayload::File { file_name, bytes } => {
-            let total_bytes = bytes.len() as u64;
-            validate_transfer_size(total_bytes)?;
-
-            let transfer_id = uuid::Uuid::new_v4().to_string();
+        OutboundPayload::FileStart {
+            transfer_id,
+            file_name,
+            total_bytes,
+        } => {
+            validate_transfer_size(*total_bytes)?;
             send_message(
                 writer,
                 &WireMessage::FileStart {
                     machine_id: local_machine_id.to_string(),
                     transfer_id: transfer_id.clone(),
                     file_name: file_name.clone(),
-                    total_bytes,
+                    total_bytes: *total_bytes,
                 },
+                frame_buffer,
             )
             .await?;
+            outbound_transfer_flow.insert(
+                transfer_id.clone(),
+                OutboundTransferFlow {
+                    available_chunk_credits: 0,
+                    credit_managed: protocol_supports_file_chunk_credit(remote_protocol),
+                },
+            );
+            Ok(SendPayloadOutcome::Sent)
+        }
+        OutboundPayload::FileChunk {
+            transfer_id,
+            source_path,
+            offset_bytes,
+            length_bytes,
+        } => {
+            let Some(flow) = outbound_transfer_flow.get(transfer_id) else {
+                warn!(
+                    peer_id = %peer_id,
+                    transfer_id = %transfer_id,
+                    "dropping outbound file chunk without active transfer flow state"
+                );
+                return Ok(SendPayloadOutcome::Dropped);
+            };
 
-            for chunk in bytes.chunks(FILE_CHUNK_BYTES) {
-                send_message(
-                    writer,
-                    &WireMessage::FileChunk {
-                        transfer_id: transfer_id.clone(),
-                        data_b64: encode_bytes_b64(chunk),
-                    },
-                )
-                .await?;
+            if flow.credit_managed && flow.available_chunk_credits == 0 {
+                return Ok(SendPayloadOutcome::DeferredForBackpressure);
             }
 
-            send_message(writer, &WireMessage::FileEnd { transfer_id }).await?;
+            let mut source_file = tokio::fs::File::open(source_path).await.with_context(|| {
+                format!("open outbound file chunk source {}", source_path.display())
+            })?;
+            source_file
+                .seek(std::io::SeekFrom::Start(*offset_bytes))
+                .await
+                .with_context(|| {
+                    format!(
+                        "seek outbound file chunk source {} to offset {}",
+                        source_path.display(),
+                        offset_bytes
+                    )
+                })?;
+
+            let mut data = vec![0u8; *length_bytes];
+            source_file.read_exact(&mut data).await.with_context(|| {
+                format!(
+                    "read outbound file chunk source {} offset {} length {}",
+                    source_path.display(),
+                    offset_bytes,
+                    length_bytes
+                )
+            })?;
+
+            send_message(
+                writer,
+                &WireMessage::FileChunk {
+                    transfer_id: transfer_id.clone(),
+                    data,
+                },
+                frame_buffer,
+            )
+            .await?;
+            if let Some(flow) = outbound_transfer_flow.get_mut(transfer_id)
+                && flow.credit_managed
+            {
+                flow.available_chunk_credits = flow.available_chunk_credits.saturating_sub(1);
+            }
+            Ok(SendPayloadOutcome::Sent)
+        }
+        OutboundPayload::FileEnd {
+            transfer_id,
+            file_name,
+            total_bytes,
+        } => {
+            send_message(
+                writer,
+                &WireMessage::FileEnd {
+                    transfer_id: transfer_id.clone(),
+                },
+                frame_buffer,
+            )
+            .await?;
+            outbound_transfer_flow.remove(transfer_id);
+
             state
-                .record_outgoing_file(peer_id, file_name, total_bytes)
+                .record_outgoing_file(peer_id, file_name, *total_bytes)
                 .await;
-            Ok(true)
+            Ok(SendPayloadOutcome::Sent)
         }
         OutboundPayload::InputFrame {
             sequence,
@@ -953,7 +1386,7 @@ where
                     required_protocol = %PROTOCOL_INPUT_ANCHOR_MIN,
                     "dropping input frame with unsupported events for negotiated protocol"
                 );
-                return Ok(false);
+                return Ok(SendPayloadOutcome::Dropped);
             }
 
             send_message(
@@ -964,53 +1397,47 @@ where
                     timestamp_unix_ms: *timestamp_unix_ms,
                     events: wire_events,
                 },
+                frame_buffer,
             )
             .await?;
 
             state
                 .record_outgoing_input_frame(peer_id, *sequence, events.len(), *timestamp_unix_ms)
                 .await;
-            Ok(true)
+            Ok(SendPayloadOutcome::Sent)
         }
     }
 }
 
-async fn read_wire_line<R>(reader: &mut R, line: &mut Vec<u8>) -> Result<Option<usize>>
+async fn read_wire_frame_payload<R>(reader: &mut R, payload: &mut Vec<u8>) -> Result<Option<usize>>
 where
-    R: AsyncBufRead + Unpin,
+    R: AsyncRead + Unpin,
 {
-    line.clear();
-    loop {
-        let available = reader.fill_buf().await.context("fill transport buffer")?;
-        if available.is_empty() {
-            if line.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(line.len()));
-        }
-
-        let take = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|index| index + 1)
-            .unwrap_or(available.len());
-        let next_len = line.len().saturating_add(take);
-        let ended_with_newline = available.get(take - 1) == Some(&b'\n');
-        if next_len > MAX_WIRE_LINE_BYTES {
-            reader.consume(take);
-            bail!(
-                "wire frame exceeds max line length: {} > {}",
-                next_len,
-                MAX_WIRE_LINE_BYTES
-            );
-        }
-
-        line.extend_from_slice(&available[..take]);
-        reader.consume(take);
-        if ended_with_newline {
-            return Ok(Some(line.len()));
-        }
+    payload.clear();
+    let mut length_prefix = [0u8; WIRE_FRAME_LENGTH_PREFIX_BYTES];
+    match reader.read_exact(&mut length_prefix).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(anyhow::Error::from(error).context("read transport frame header")),
     }
+
+    let declared_len = u32::from_be_bytes(length_prefix) as usize;
+    if declared_len > MAX_WIRE_FRAME_BYTES {
+        bail!(
+            "wire frame exceeds max payload length: {} > {}",
+            declared_len,
+            MAX_WIRE_FRAME_BYTES
+        );
+    }
+
+    payload.clear();
+    payload.resize(declared_len, 0);
+    reader
+        .read_exact(payload)
+        .await
+        .context("read transport frame payload")?;
+
+    Ok(Some(declared_len))
 }
 
 async fn record_transport_frame_rejected(
@@ -1019,16 +1446,14 @@ async fn record_transport_frame_rejected(
     detail: String,
     size_bytes: u64,
 ) {
-    state
-        .record_transport_event(TransportEventRecord {
-            timestamp: Utc::now(),
-            direction: "incoming".to_string(),
-            kind: "transport_frame_rejected".to_string(),
-            peer_id: peer_id.to_string(),
-            detail,
-            size_bytes,
-        })
-        .await;
+    state.record_transport_event(TransportEventRecord {
+        timestamp: Utc::now(),
+        direction: "incoming".to_string(),
+        kind: "transport_frame_rejected".to_string(),
+        peer_id: peer_id.to_string(),
+        detail,
+        size_bytes,
+    });
 }
 
 async fn record_transport_transfer_rejected(
@@ -1037,14 +1462,12 @@ async fn record_transport_transfer_rejected(
     detail: String,
     size_bytes: u64,
 ) {
-    state
-        .record_transport_event(TransportEventRecord {
-            timestamp: Utc::now(),
-            direction: "incoming".to_string(),
-            kind: "transport_transfer_rejected".to_string(),
-            peer_id: peer_id.to_string(),
-            detail,
-            size_bytes,
-        })
-        .await;
+    state.record_transport_event(TransportEventRecord {
+        timestamp: Utc::now(),
+        direction: "incoming".to_string(),
+        kind: "transport_transfer_rejected".to_string(),
+        peer_id: peer_id.to_string(),
+        detail,
+        size_bytes,
+    });
 }

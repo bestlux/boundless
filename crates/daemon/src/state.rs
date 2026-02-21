@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -9,7 +9,10 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
-use tokio::{sync::RwLock, task::AbortHandle};
+use tokio::{
+    sync::{RwLock, watch},
+    task::AbortHandle,
+};
 use tracing::info;
 
 use core_clipboard::{
@@ -35,8 +38,16 @@ use crate::config::{
 const MAX_TRANSPORT_EVENTS: usize = 512;
 const MAX_PENDING_REMOTE_CLIPBOARD_ITEMS: usize = 64;
 const MAX_PENDING_INJECT_INPUT_FRAMES: usize = 128;
+const MAX_PENDING_NEARBY_PAIRING_REQUESTS: usize = 128;
+const MAX_PENDING_NEARBY_CODE_CHALLENGES: usize = 64;
 const INPUT_OWNER_AUTO_STEAL_COOLDOWN_MS: u64 = 1_000;
 const NEARBY_PAIRING_DECISION_RETENTION_MINUTES: i64 = 10;
+const NEARBY_PAIRING_CHALLENGE_MAX_ATTEMPTS: u8 = 5;
+const NEARBY_PAIRING_CODE_REQUEST_COOLDOWN_SECONDS: i64 = 3;
+const NEARBY_PAIRING_CODE_SUBMISSION_FAILURE_WINDOW_SECONDS: i64 = 300;
+const NEARBY_PAIRING_CODE_SUBMISSION_MAX_FAILURES: usize = 8;
+const NEARBY_PAIRING_CODE_SUBMISSION_LOCKOUT_SECONDS: i64 = 600;
+pub(crate) const FILE_TRANSFER_CHUNK_BYTES: usize = 48 * 1024;
 
 mod clipboard_ops;
 mod config_ops;
@@ -51,6 +62,11 @@ mod validation;
 
 #[cfg(test)]
 use layout_resolver::resolve_capture_handoff_target;
+use layout_resolver::{
+    parse_layout_matrix, resolve_capture_handoff_target_with_fallback_from_matrix,
+    resolve_switch_all_target_order_from_matrix,
+};
+#[cfg(test)]
 use layout_resolver::{
     resolve_capture_handoff_target_with_fallback, resolve_switch_all_target_order,
 };
@@ -69,15 +85,33 @@ pub enum OutboundPayload {
     ClipboardImage {
         image_bmp: Vec<u8>,
     },
-    File {
+    FileStart {
+        transfer_id: String,
         file_name: String,
-        bytes: Vec<u8>,
+        total_bytes: u64,
+    },
+    FileChunk {
+        transfer_id: String,
+        source_path: PathBuf,
+        offset_bytes: u64,
+        length_bytes: usize,
+    },
+    FileEnd {
+        transfer_id: String,
+        file_name: String,
+        total_bytes: u64,
     },
     InputFrame {
         sequence: u64,
         timestamp_unix_ms: i64,
         events: Vec<InputEvent>,
     },
+}
+
+#[derive(Debug, Default)]
+struct OutgoingPeerQueues {
+    input: VecDeque<OutboundPayload>,
+    bulk: VecDeque<OutboundPayload>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +172,8 @@ pub struct PendingNearbyPairingRequest {
     pub requester_machine_id: String,
     pub requester_display_name: String,
     pub created_at: DateTime<Utc>,
+    pub verification_code: Option<String>,
+    pub verification_expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +195,17 @@ struct PendingNearbyPairingRequestRecord {
     summary: PendingNearbyPairingRequest,
     requester_bundle: TrustBundle,
     requester_alias: Option<String>,
+    mode: PendingNearbyPairingMode,
+}
+
+#[derive(Debug, Clone)]
+enum PendingNearbyPairingMode {
+    ManualApproval,
+    CodeChallenge {
+        code: String,
+        expires_at: DateTime<Utc>,
+        attempts_left: u8,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +227,12 @@ struct ClipboardSyncState {
     pending_remote: VecDeque<PendingRemoteClipboardPayload>,
 }
 
+#[derive(Debug, Clone)]
+struct ParsedLayoutMatrixCache {
+    spec: String,
+    matrix: Arc<Vec<Vec<String>>>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     config_path: Arc<PathBuf>,
@@ -188,12 +241,14 @@ pub struct AppState {
     security_paths: Arc<SecurityPaths>,
     identity: Arc<DeviceIdentity>,
     device_fingerprint: Arc<String>,
-    outgoing_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
-    transport_events: Arc<RwLock<VecDeque<TransportEventRecord>>>,
+    outgoing_input_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
+    outgoing_bulk_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
+    transport_events: Arc<std::sync::Mutex<VecDeque<TransportEventRecord>>>,
     clipboard_sync: Arc<RwLock<ClipboardSyncState>>,
     discovered_endpoints: Arc<RwLock<HashMap<String, DiscoveredPeerEndpoint>>>,
     mdns_active: Arc<RwLock<bool>>,
     inbox_root: Arc<PathBuf>,
+    parsed_layout_matrix_cache: Arc<RwLock<Option<ParsedLayoutMatrixCache>>>,
     input_router: Arc<RwLock<InputRouter>>,
     input_sequence_by_peer: Arc<RwLock<HashMap<String, u64>>>,
     pending_inject_input_frames: Arc<RwLock<VecDeque<PendingInjectInputFrame>>>,
@@ -202,9 +257,14 @@ pub struct AppState {
     input_lock_active: Arc<RwLock<bool>>,
     input_lock_supported: Arc<RwLock<bool>>,
     reconnect_generation_by_peer: Arc<RwLock<HashMap<String, u64>>>,
+    outgoing_flush_signal: watch::Sender<u64>,
+    outgoing_flush_generation: Arc<std::sync::atomic::AtomicU64>,
     pending_nearby_pairing_requests:
         Arc<RwLock<HashMap<String, PendingNearbyPairingRequestRecord>>>,
     nearby_pairing_decisions: Arc<RwLock<HashMap<String, NearbyPairingDecisionRecord>>>,
+    nearby_code_request_last_seen_by_ip: Arc<RwLock<HashMap<IpAddr, DateTime<Utc>>>>,
+    nearby_code_submission_failures_by_ip: Arc<RwLock<HashMap<IpAddr, Vec<DateTime<Utc>>>>>,
+    nearby_code_submission_lockout_by_ip: Arc<RwLock<HashMap<IpAddr, DateTime<Utc>>>>,
     pending_transport_session_abort_handles: Arc<RwLock<HashMap<u64, AbortHandle>>>,
     transport_session_abort_handles_by_peer:
         Arc<RwLock<HashMap<String, HashMap<u64, AbortHandle>>>>,
@@ -263,6 +323,7 @@ impl AppState {
         );
 
         let input_enabled = config.features.get("share_input").copied().unwrap_or(true);
+        let (outgoing_flush_signal, _outgoing_flush_rx) = watch::channel(0u64);
 
         Ok(Self {
             config_path: Arc::new(config_path),
@@ -271,12 +332,16 @@ impl AppState {
             security_paths: Arc::new(paths),
             identity: Arc::new(identity),
             device_fingerprint: Arc::new(fingerprint),
-            outgoing_payloads: Arc::new(RwLock::new(HashMap::new())),
-            transport_events: Arc::new(RwLock::new(VecDeque::new())),
+            outgoing_input_payloads: Arc::new(RwLock::new(HashMap::new())),
+            outgoing_bulk_payloads: Arc::new(RwLock::new(HashMap::new())),
+            transport_events: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(
+                MAX_TRANSPORT_EVENTS,
+            ))),
             clipboard_sync: Arc::new(RwLock::new(ClipboardSyncState::default())),
             discovered_endpoints: Arc::new(RwLock::new(HashMap::new())),
             mdns_active: Arc::new(RwLock::new(false)),
             inbox_root: Arc::new(inbox_root),
+            parsed_layout_matrix_cache: Arc::new(RwLock::new(None)),
             input_router: Arc::new(RwLock::new(InputRouter::new(input_enabled))),
             input_sequence_by_peer: Arc::new(RwLock::new(HashMap::new())),
             pending_inject_input_frames: Arc::new(RwLock::new(VecDeque::new())),
@@ -285,8 +350,13 @@ impl AppState {
             input_lock_active: Arc::new(RwLock::new(false)),
             input_lock_supported: Arc::new(RwLock::new(cfg!(windows))),
             reconnect_generation_by_peer: Arc::new(RwLock::new(HashMap::new())),
+            outgoing_flush_signal,
+            outgoing_flush_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_nearby_pairing_requests: Arc::new(RwLock::new(HashMap::new())),
             nearby_pairing_decisions: Arc::new(RwLock::new(HashMap::new())),
+            nearby_code_request_last_seen_by_ip: Arc::new(RwLock::new(HashMap::new())),
+            nearby_code_submission_failures_by_ip: Arc::new(RwLock::new(HashMap::new())),
+            nearby_code_submission_lockout_by_ip: Arc::new(RwLock::new(HashMap::new())),
             pending_transport_session_abort_handles: Arc::new(RwLock::new(HashMap::new())),
             transport_session_abort_handles_by_peer: Arc::new(RwLock::new(HashMap::new())),
             next_transport_session_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -365,6 +435,43 @@ impl AppState {
 
     pub async fn snapshot(&self) -> RuntimeConfig {
         self.config.read().await.clone()
+    }
+
+    pub(crate) async fn cached_layout_matrix_for_spec(&self, spec: &str) -> Arc<Vec<Vec<String>>> {
+        if let Some(cached) = self.parsed_layout_matrix_cache.read().await.as_ref()
+            && cached.spec == spec
+        {
+            return cached.matrix.clone();
+        }
+
+        let parsed = Arc::new(parse_layout_matrix(spec));
+        let mut cache = self.parsed_layout_matrix_cache.write().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.spec == spec
+        {
+            return cached.matrix.clone();
+        }
+        *cache = Some(ParsedLayoutMatrixCache {
+            spec: spec.to_string(),
+            matrix: parsed.clone(),
+        });
+        parsed
+    }
+
+    pub(crate) async fn invalidate_cached_layout_matrix(&self) {
+        *self.parsed_layout_matrix_cache.write().await = None;
+    }
+
+    pub fn subscribe_outgoing_flush_signal(&self) -> watch::Receiver<u64> {
+        self.outgoing_flush_signal.subscribe()
+    }
+
+    pub(crate) fn notify_outgoing_flush_signal(&self) {
+        let next = self
+            .outgoing_flush_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        let _ = self.outgoing_flush_signal.send(next);
     }
 }
 
@@ -1452,6 +1559,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transport_events_ring_buffer_keeps_most_recent_records() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-transport-event-ring-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        for index in 0..(MAX_TRANSPORT_EVENTS + 8) {
+            state.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: "local".to_string(),
+                kind: "ring_probe".to_string(),
+                peer_id: "peer-a".to_string(),
+                detail: format!("idx={index}"),
+                size_bytes: index as u64,
+            });
+        }
+
+        let events = state.transport_events().await;
+        assert_eq!(events.len(), MAX_TRANSPORT_EVENTS);
+        assert!(
+            events
+                .first()
+                .is_some_and(|event| event.detail == "idx=8" && event.size_bytes == 8),
+            "oldest retained event should reflect dropped head records"
+        );
+        assert!(
+            events
+                .last()
+                .is_some_and(|event| event.detail == format!("idx={}", MAX_TRANSPORT_EVENTS + 7)),
+            "newest event should always be retained"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn disconnect_clears_pending_injection_frames_for_peer() {
         let root = std::env::temp_dir().join(format!(
             "boundless-input-clear-queue-test-{}",
@@ -1630,6 +1777,278 @@ mod tests {
             queued.get(1),
             Some(OutboundPayload::InputFrame { sequence: 2, events, .. }) if events.len() == 1
         ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn queue_input_events_notifies_outgoing_flush_signal() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-outgoing-flush-signal-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        let mut flush_signal = state.subscribe_outgoing_flush_signal();
+        state
+            .queue_input_events(&peer_id, vec![InputEvent::MouseMove { dx: 1, dy: 1 }])
+            .await
+            .expect("queue frame");
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            flush_signal.changed(),
+        )
+        .await
+        .expect("flush signal should be observed")
+        .expect("flush signal channel should remain open");
+        assert!(
+            *flush_signal.borrow_and_update() > 0,
+            "flush signal generation should advance after enqueue"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn drain_outgoing_prioritizes_input_frames_over_bulk_payloads() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-outgoing-priority-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        state
+            .queue_clipboard_text(&peer_id, "bulk".to_string())
+            .await
+            .expect("queue bulk");
+        state
+            .queue_input_events(&peer_id, vec![InputEvent::MouseMove { dx: 1, dy: 2 }])
+            .await
+            .expect("queue input");
+
+        let drained = state.drain_outgoing(&peer_id).await;
+        assert_eq!(drained.len(), 2);
+        assert!(
+            matches!(drained.first(), Some(OutboundPayload::InputFrame { .. })),
+            "input frame should drain before bulk payloads"
+        );
+        assert!(
+            matches!(drained.get(1), Some(OutboundPayload::ClipboardText { .. })),
+            "bulk payload should follow drained input frame"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn drain_outgoing_bulk_respects_max_payloads() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-outgoing-bulk-limit-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        state
+            .queue_clipboard_text(&peer_id, "one".to_string())
+            .await
+            .expect("queue one");
+        state
+            .queue_clipboard_text(&peer_id, "two".to_string())
+            .await
+            .expect("queue two");
+        state
+            .queue_clipboard_text(&peer_id, "three".to_string())
+            .await
+            .expect("queue three");
+
+        let first_batch = state.drain_outgoing_bulk(&peer_id, 2).await;
+        assert_eq!(first_batch.len(), 2);
+        assert!(matches!(
+            first_batch.first(),
+            Some(OutboundPayload::ClipboardText { text }) if text == "one"
+        ));
+        assert!(matches!(
+            first_batch.get(1),
+            Some(OutboundPayload::ClipboardText { text }) if text == "two"
+        ));
+
+        let second_batch = state.drain_outgoing_bulk(&peer_id, usize::MAX).await;
+        assert_eq!(second_batch.len(), 1);
+        assert!(matches!(
+            second_batch.first(),
+            Some(OutboundPayload::ClipboardText { text }) if text == "three"
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn queue_file_from_path_enqueues_chunked_bulk_transfer() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-file-outgoing-chunk-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        let file_path = root.join("payload.bin");
+        let payload = vec![7u8; FILE_TRANSFER_CHUNK_BYTES * 2 + 17];
+        tokio::fs::write(&file_path, &payload)
+            .await
+            .expect("write payload");
+
+        state
+            .queue_file_from_path(&peer_id, &file_path)
+            .await
+            .expect("queue file");
+
+        let queued = state.drain_outgoing_bulk(&peer_id, usize::MAX).await;
+        assert_eq!(queued.len(), 5, "start + 3 chunks + end expected");
+
+        let transfer_id = match queued.first() {
+            Some(OutboundPayload::FileStart {
+                transfer_id,
+                file_name,
+                total_bytes,
+            }) => {
+                assert_eq!(file_name, "payload.bin");
+                assert_eq!(*total_bytes, payload.len() as u64);
+                transfer_id.clone()
+            }
+            other => panic!("expected file start payload, got {other:?}"),
+        };
+
+        let expected_chunks = [
+            (0u64, FILE_TRANSFER_CHUNK_BYTES),
+            (FILE_TRANSFER_CHUNK_BYTES as u64, FILE_TRANSFER_CHUNK_BYTES),
+            ((FILE_TRANSFER_CHUNK_BYTES * 2) as u64, 17usize),
+        ];
+        for (payload_item, (expected_offset, expected_size)) in queued
+            .iter()
+            .skip(1)
+            .take(3)
+            .zip(expected_chunks.into_iter())
+        {
+            match payload_item {
+                OutboundPayload::FileChunk {
+                    transfer_id: chunk_transfer_id,
+                    source_path,
+                    offset_bytes,
+                    length_bytes,
+                } => {
+                    assert_eq!(chunk_transfer_id, &transfer_id);
+                    assert_eq!(source_path, &file_path);
+                    assert_eq!(*offset_bytes, expected_offset);
+                    assert_eq!(*length_bytes, expected_size);
+                }
+                other => panic!("expected file chunk payload, got {other:?}"),
+            }
+        }
+
+        match queued.get(4) {
+            Some(OutboundPayload::FileEnd {
+                transfer_id: end_transfer_id,
+                file_name,
+                total_bytes,
+            }) => {
+                assert_eq!(end_transfer_id, &transfer_id);
+                assert_eq!(file_name, "payload.bin");
+                assert_eq!(*total_bytes, payload.len() as u64);
+            }
+            other => panic!("expected file end payload, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn queue_file_from_path_rejects_non_regular_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-file-outgoing-invalid-path-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        let err = state
+            .queue_file_from_path(&peer_id, &root)
+            .await
+            .expect_err("directory path must fail");
+        assert!(
+            err.to_string().contains("regular file"),
+            "error should indicate non-regular input"
+        );
+        assert!(
+            state
+                .drain_outgoing_bulk(&peer_id, usize::MAX)
+                .await
+                .is_empty(),
+            "invalid source path must not enqueue bulk payloads"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
