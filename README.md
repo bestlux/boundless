@@ -22,6 +22,7 @@ This repository now contains an alpha-oriented workspace scaffold with:
 - `crates/ipc-api`
 - `crates/daemon` (`boundlessd`)
 - `crates/cli` (`boundlessctl`)
+- `crates/tray` (`boundlesstray`, Windows)
 
 ## Build and test
 
@@ -73,7 +74,27 @@ cargo run -p boundless-cli -- console
 
 The `console` command shows daemon health, mDNS discovery status, discovered endpoints, trusted/connected peers, feature toggles, input owner/capture target, and pending pairing requests. It also provides quick commands for toggles and nearby pairing actions.
 
-Inside console, use `pair request <index|machine_id> [code] [alias]` to send a strict nearby pairing request to a discovered peer without manually typing host/port (pairing port is derived automatically from discovered transport endpoint).
+Inside console, use `pair request <index|machine_id>` to start guided nearby pairing for a discovered peer without manually typing host/port (pairing port is derived automatically from discovered transport endpoint).
+
+First-run setup wizard (recommended for new installs):
+
+```bash
+cargo run -p boundless-cli -- setup
+```
+
+The setup wizard auto-checks daemon reachability, guides pairing (discovered peer or manual host fallback), and can apply initial left/right/up/down orientation for the newly paired peer.
+
+Windows tray UI (minimal utilitarian control surface):
+
+```bash
+cargo run -p boundless-tray
+```
+
+`boundlesstray` provides:
+- live discovered/paired/connected/pending visibility
+- right-click pairing actions for discovered peers (guided request -> target shows code -> submit code)
+- first-run setup dialog flow
+- layout wizard dialog flow for left/right/up/down orientation
 
 On Windows, the daemon now defaults to a local named pipe control endpoint (`npipe://./pipe/boundlessd-api`) and the CLI default endpoint matches that. Use `--endpoint http://127.0.0.1:50051` to target loopback TCP explicitly.
 
@@ -82,11 +103,19 @@ Nearby pairing (approval-based, no trust-bundle file copy):
 ```bash
 cargo run -p boundless-cli -- pair create-code --ttl 120
 cargo run -p boundless-cli -- pair nearby-join 123456 --host <target-host-or-ip> --port 15200
+cargo run -p boundless-cli -- pair discover
+cargo run -p boundless-cli -- pair request <index|machine_id|display-name>
+cargo run -p boundless-cli -- pair request <index|machine_id|display-name> --request-id <request_id> --code 123456
+# compatibility fallback against older peers:
+cargo run -p boundless-cli -- pair request <index|machine_id|display-name> --code 123456
 cargo run -p boundless-cli -- pair pending
 cargo run -p boundless-cli -- pair approve <request_id>
 ```
 
-`nearby-join` waits for remote approval and then imports trust automatically on success.  
+`pair request <selector>` starts a guided request-code flow and prints a `request_id`.
+The target tray/CLI shows the generated 6-digit verification code.
+Use `--request-id` and `--code` to submit and complete pairing.
+`nearby-join` remains available and waits for remote approval before importing trust.  
 The daemon nearby pairing listener defaults to `network_port + 100` (for example `15200` when transport network port is `15100`).
 
 Export/import trust bundles (fallback or offline workflow):
@@ -138,6 +167,9 @@ Configure topology-driven edge handoff (tokens can be `self`/`local`/`me`, machi
 
 ```bash
 cargo run -p boundless-cli -- layout set "left,self,right"
+cargo run -p boundless-cli -- layout preview
+cargo run -p boundless-cli -- layout orient --left <peer> --right <peer>
+cargo run -p boundless-cli -- layout wizard
 ```
 
 ## Release model

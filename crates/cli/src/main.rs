@@ -47,7 +47,6 @@ mod console;
 
 #[cfg(windows)]
 use cli_helpers::NamedPipeConnector;
-#[cfg(test)]
 use cli_helpers::extract_port_from_network_address;
 #[cfg(all(test, windows))]
 use cli_helpers::is_pipe_busy_error;
@@ -77,6 +76,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Setup {
+        #[arg(long, default_value_t = true)]
+        start_daemon: bool,
+    },
     Console {
         #[arg(long, default_value_t = true)]
         start_daemon: bool,
@@ -117,6 +120,10 @@ enum Command {
         #[command(subcommand)]
         command: DiagnosticsCommand,
     },
+    Ui {
+        #[command(subcommand)]
+        command: UiCommand,
+    },
     SafeReset {
         #[arg(long, default_value_t = false)]
         network: bool,
@@ -132,9 +139,25 @@ enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 enum PairCommand {
+    Discover,
     CreateCode {
         #[arg(long, default_value_t = 300)]
         ttl: u32,
+    },
+    Request {
+        selector: String,
+        #[arg(long)]
+        request_id: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        code: Option<String>,
+        #[arg(long)]
+        alias: Option<String>,
+        #[arg(long, default_value_t = 120)]
+        timeout_seconds: u64,
     },
     Join {
         code: String,
@@ -184,7 +207,21 @@ enum PeerCommand {
 #[derive(Debug, Subcommand)]
 enum LayoutCommand {
     Show,
-    Set { matrix: String },
+    Preview,
+    Set {
+        matrix: String,
+    },
+    Orient {
+        #[arg(long)]
+        left: Option<String>,
+        #[arg(long)]
+        right: Option<String>,
+        #[arg(long)]
+        up: Option<String>,
+        #[arg(long)]
+        down: Option<String>,
+    },
+    Wizard,
 }
 
 #[derive(Debug, Subcommand)]
@@ -276,6 +313,14 @@ enum DiagnosticsCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum UiCommand {
+    Snapshot {
+        #[arg(long, default_value_t = false)]
+        start_daemon: bool,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredTrustBundle {
     machine_id: String,
@@ -287,6 +332,15 @@ struct StoredTrustBundle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum NearbyJoinWireRequest {
+    NearbyRequestCode {
+        requester_bundle: StoredTrustBundle,
+        requester_alias: Option<String>,
+    },
+    NearbySubmitCode {
+        request_id: String,
+        code: String,
+        requester_alias: Option<String>,
+    },
     NearbyJoin {
         code: String,
         requester_bundle: StoredTrustBundle,
@@ -300,6 +354,11 @@ enum NearbyJoinWireRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum NearbyJoinWireResponse {
+    CodeRequired {
+        request_id: String,
+        message: String,
+        expires_at: String,
+    },
     Pending {
         request_id: String,
         message: String,
@@ -323,12 +382,35 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Setup { start_daemon } => setup_wizard(&cli.endpoint, start_daemon).await,
         Command::Console { start_daemon } => console_run(&cli.endpoint, start_daemon).await,
         Command::Daemon { command } => match command {
             DaemonCommand::Status => daemon_status(&cli.endpoint).await,
         },
         Command::Pair { command } => match command {
+            PairCommand::Discover => pair_discover(&cli.endpoint).await,
             PairCommand::CreateCode { ttl } => pair_create_code(&cli.endpoint, ttl).await,
+            PairCommand::Request {
+                selector,
+                request_id,
+                host,
+                port,
+                code,
+                alias,
+                timeout_seconds,
+            } => {
+                pair_request(
+                    &cli.endpoint,
+                    selector,
+                    request_id,
+                    host,
+                    port,
+                    code,
+                    alias,
+                    timeout_seconds,
+                )
+                .await
+            }
             PairCommand::Join { code, host, alias } => {
                 pair_join(&cli.endpoint, code, host, alias).await
             }
@@ -355,7 +437,15 @@ async fn main() -> Result<()> {
         },
         Command::Layout { command } => match command {
             LayoutCommand::Show => layout_show(&cli.endpoint).await,
+            LayoutCommand::Preview => layout_preview(&cli.endpoint).await,
             LayoutCommand::Set { matrix } => layout_set(&cli.endpoint, matrix).await,
+            LayoutCommand::Orient {
+                left,
+                right,
+                up,
+                down,
+            } => layout_orient(&cli.endpoint, left, right, up, down).await,
+            LayoutCommand::Wizard => layout_wizard(&cli.endpoint).await,
         },
         Command::Feature { command } => match command {
             FeatureCommand::List => feature_list(&cli.endpoint).await,
@@ -399,6 +489,9 @@ async fn main() -> Result<()> {
             DiagnosticsCommand::RunAction { action } => {
                 diagnostics_run_action(&cli.endpoint, action).await
             }
+        },
+        Command::Ui { command } => match command {
+            UiCommand::Snapshot { start_daemon } => ui_snapshot(&cli.endpoint, start_daemon).await,
         },
         Command::SafeReset { network, all } => safe_reset(&cli.endpoint, network, all).await,
     }

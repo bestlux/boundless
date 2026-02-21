@@ -45,8 +45,7 @@ impl AppState {
                 "sequence={sequence} queue_depth={depth} capture_to_queue_ms={capture_to_queue_ms} receive_to_queue_ms={receive_to_queue_ms}"
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 
     async fn record_input_inject_dropped(
@@ -67,8 +66,7 @@ impl AppState {
                 elapsed_ms(capture_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn record_input_inject_skipped(
@@ -92,8 +90,7 @@ impl AppState {
                 elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn route_incoming_input_frame(
@@ -212,26 +209,50 @@ impl AppState {
                 auto_claimed_owner,
             ),
             size_bytes: frame.events.len() as u64,
-        })
-        .await;
+        });
 
         Ok(decision)
     }
 
+    #[cfg(test)]
     pub async fn dequeue_pending_inject_input_frame(&self) -> Option<PendingInjectInputFrame> {
-        self.pending_inject_input_frames.write().await.pop_front()
+        let mut frames = self.dequeue_pending_inject_input_frames_up_to(1).await;
+        frames.pop()
     }
 
+    #[cfg(test)]
     pub async fn pending_inject_input_frame_count(&self) -> usize {
         self.pending_inject_input_frames.read().await.len()
     }
 
-    pub async fn requeue_pending_inject_input_frame_back(&self, frame: PendingInjectInputFrame) {
-        let mut queue = self.pending_inject_input_frames.write().await;
-        if queue.len() >= MAX_PENDING_INJECT_INPUT_FRAMES {
-            queue.pop_front();
+    pub async fn dequeue_pending_inject_input_frames_up_to(
+        &self,
+        max_frames: usize,
+    ) -> Vec<PendingInjectInputFrame> {
+        if max_frames == 0 {
+            return Vec::new();
         }
-        queue.push_back(frame);
+
+        let mut queue = self.pending_inject_input_frames.write().await;
+        let drain_count = queue.len().min(max_frames);
+        queue.drain(..drain_count).collect()
+    }
+
+    pub async fn requeue_pending_inject_input_frames_back(
+        &self,
+        frames: Vec<PendingInjectInputFrame>,
+    ) {
+        if frames.is_empty() {
+            return;
+        }
+
+        let mut queue = self.pending_inject_input_frames.write().await;
+        for frame in frames {
+            if queue.len() >= MAX_PENDING_INJECT_INPUT_FRAMES {
+                queue.pop_front();
+            }
+            queue.push_back(frame);
+        }
     }
 
     pub async fn record_input_inject_applied(
@@ -254,8 +275,7 @@ impl AppState {
                 elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn record_input_inject_failed(
@@ -279,8 +299,7 @@ impl AppState {
                 elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn record_input_inject_retry_scheduled(
@@ -305,8 +324,7 @@ impl AppState {
                 elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn record_input_inject_dropped_permanent(
@@ -331,8 +349,7 @@ impl AppState {
                 elapsed_ms(timing.received_timestamp_unix_ms, now_ms)
             ),
             size_bytes: event_count as u64,
-        })
-        .await;
+        });
     }
 
     pub async fn claim_input_owner(&self, peer_id: &str, force: bool) -> Result<bool> {
@@ -480,7 +497,6 @@ impl AppState {
             peer_id: peer_id.to_string(),
             detail: format!("sequence={sequence} reason={reason}"),
             size_bytes: 0,
-        })
-        .await;
+        });
     }
 }
