@@ -401,13 +401,15 @@ async fn main() -> Result<()> {
             } => {
                 pair_request(
                     &cli.endpoint,
-                    selector,
-                    request_id,
-                    host,
-                    port,
-                    code,
-                    alias,
-                    timeout_seconds,
+                    PairRequestArgs {
+                        selector,
+                        request_id,
+                        host_override: host,
+                        port_override: port,
+                        code,
+                        alias,
+                        timeout_seconds,
+                    },
                 )
                 .await
             }

@@ -861,7 +861,9 @@ mod windows_app {
         fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
 
         fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
-            if cause == StartCause::Init && let Err(error) = self.initialize() {
+            if cause == StartCause::Init
+                && let Err(error) = self.initialize()
+            {
                 message_box_ok(
                     "Boundless Tray",
                     &format!("failed to initialize tray UI: {error}"),
