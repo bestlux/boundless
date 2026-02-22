@@ -139,16 +139,26 @@ pub(super) async fn pair_discover(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn pair_request(
-    endpoint: &str,
-    selector: String,
-    request_id: Option<String>,
-    host_override: Option<String>,
-    port_override: Option<u16>,
-    code: Option<String>,
-    alias: Option<String>,
-    timeout_seconds: u64,
-) -> Result<()> {
+pub(super) struct PairRequestArgs {
+    pub(super) selector: String,
+    pub(super) request_id: Option<String>,
+    pub(super) host_override: Option<String>,
+    pub(super) port_override: Option<u16>,
+    pub(super) code: Option<String>,
+    pub(super) alias: Option<String>,
+    pub(super) timeout_seconds: u64,
+}
+
+pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Result<()> {
+    let PairRequestArgs {
+        selector,
+        request_id,
+        host_override,
+        port_override,
+        code,
+        alias,
+        timeout_seconds,
+    } = args;
     let (host, pairing_port, default_alias, selector_hint, target_label, target_endpoint) =
         if let Some(host_override) = host_override {
             let host = host_override.trim().to_string();
@@ -567,7 +577,7 @@ async fn wait_for_nearby_pairing_approval(
 
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 poll_count += 1;
-                if poll_count % 5 == 0 {
+                if poll_count.is_multiple_of(5) {
                     println!(
                         "pending=true request_id={} waited={}s",
                         request_id, poll_count
