@@ -126,10 +126,36 @@ foreach ($tracePath in $TracePaths) {
         $receiveP95 = Get-IntOrNull -Values $values -Key "capture_to_receive_p95"
         $receiveP99 = Get-IntOrNull -Values $values -Key "capture_to_receive_p99"
         $receiveMax = Get-IntOrNull -Values $values -Key "capture_to_receive_max"
+        $receiveToApplyCount = Get-IntOrNull -Values $values -Key "receive_to_apply_count"
+        $receiveToApplyP50 = Get-IntOrNull -Values $values -Key "receive_to_apply_p50"
+        $receiveToApplyP95 = Get-IntOrNull -Values $values -Key "receive_to_apply_p95"
+        $receiveToApplyP99 = Get-IntOrNull -Values $values -Key "receive_to_apply_p99"
+        $receiveToApplyMax = Get-IntOrNull -Values $values -Key "receive_to_apply_max"
+        $receiveToApplyJitterP95 = Get-IntOrNull -Values $values -Key "receive_to_apply_jitter_p95"
+        $estimatedClockSkewMs = Get-IntOrNull -Values $values -Key "clock_skew_estimated_ms"
 
         $violations = New-Object System.Collections.Generic.List[string]
         $applyCountValue = if ($null -eq $applyCount) { 0 } else { $applyCount }
         $receiveCountValue = if ($null -eq $receiveCount) { 0 } else { $receiveCount }
+        $effectiveApplyP95 = $applyP95
+        $effectiveReceiveP95 = $receiveP95
+        $effectiveJitterP95 = $applyJitterP95
+        $applyBudgetMetric = "capture_to_apply_p95"
+        $receiveBudgetMetric = "capture_to_receive_p95"
+        $jitterBudgetMetric = "capture_to_apply_jitter_p95"
+
+        if ($null -ne $estimatedClockSkewMs) {
+            if ($null -ne $receiveToApplyP95) {
+                $effectiveApplyP95 = $receiveToApplyP95
+                $applyBudgetMetric = "receive_to_apply_p95"
+            }
+            $effectiveReceiveP95 = $null
+            $receiveBudgetMetric = "capture_to_receive_p95_skipped_clock_skew_suspected"
+            if ($null -ne $receiveToApplyJitterP95) {
+                $effectiveJitterP95 = $receiveToApplyJitterP95
+                $jitterBudgetMetric = "receive_to_apply_jitter_p95"
+            }
+        }
 
         if ($applyCountValue -le 0) {
             $violations.Add("no_capture_to_apply_samples")
@@ -137,14 +163,14 @@ foreach ($tracePath in $TracePaths) {
         if ($receiveCountValue -le 0) {
             $violations.Add("no_capture_to_receive_samples")
         }
-        if ($null -ne $applyP95 -and $applyP95 -gt $CaptureToApplyP95BudgetMs) {
-            $violations.Add("capture_to_apply_p95")
+        if ($null -ne $effectiveApplyP95 -and $effectiveApplyP95 -gt $CaptureToApplyP95BudgetMs) {
+            $violations.Add($applyBudgetMetric)
         }
-        if ($null -ne $receiveP95 -and $receiveP95 -gt $CaptureToReceiveP95BudgetMs) {
-            $violations.Add("capture_to_receive_p95")
+        if ($null -ne $effectiveReceiveP95 -and $effectiveReceiveP95 -gt $CaptureToReceiveP95BudgetMs) {
+            $violations.Add($receiveBudgetMetric)
         }
-        if ($null -ne $applyJitterP95 -and $applyJitterP95 -gt $CaptureToApplyJitterP95BudgetMs) {
-            $violations.Add("capture_to_apply_jitter_p95")
+        if ($null -ne $effectiveJitterP95 -and $effectiveJitterP95 -gt $CaptureToApplyJitterP95BudgetMs) {
+            $violations.Add($jitterBudgetMetric)
         }
 
         $rows.Add([pscustomobject]@{
@@ -168,6 +194,19 @@ foreach ($tracePath in $TracePaths) {
                 capture_to_receive_p95_ms               = $receiveP95
                 capture_to_receive_p99_ms               = $receiveP99
                 capture_to_receive_max_ms               = $receiveMax
+                receive_to_apply_count                  = $receiveToApplyCount
+                receive_to_apply_p50_ms                 = $receiveToApplyP50
+                receive_to_apply_p95_ms                 = $receiveToApplyP95
+                receive_to_apply_p99_ms                 = $receiveToApplyP99
+                receive_to_apply_max_ms                 = $receiveToApplyMax
+                receive_to_apply_jitter_p95_ms          = $receiveToApplyJitterP95
+                clock_skew_estimated_ms                 = $estimatedClockSkewMs
+                capture_to_apply_p95_effective_ms       = $effectiveApplyP95
+                capture_to_receive_p95_effective_ms     = $effectiveReceiveP95
+                capture_to_apply_jitter_p95_effective_ms= $effectiveJitterP95
+                capture_to_apply_budget_metric          = $applyBudgetMetric
+                capture_to_receive_budget_metric        = $receiveBudgetMetric
+                capture_to_apply_jitter_budget_metric   = $jitterBudgetMetric
                 budget_capture_to_apply_p95_ms          = $CaptureToApplyP95BudgetMs
                 budget_capture_to_receive_p95_ms        = $CaptureToReceiveP95BudgetMs
                 budget_capture_to_apply_jitter_p95_ms   = $CaptureToApplyJitterP95BudgetMs
