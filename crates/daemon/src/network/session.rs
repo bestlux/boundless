@@ -4,13 +4,16 @@ use chrono::Utc;
 
 use crate::state::TransportEventRecord;
 
-use super::codec::{input_event_from_wire, now_millis};
+use super::codec::now_millis;
 use super::control::{
     HelloHandling, handle_heartbeat_message, handle_hello_ack_message, handle_hello_message,
 };
 use super::inbound::{
     InboundTransfer, discard_inbound_transfer, handle_file_chunk, handle_file_end,
     handle_file_start,
+};
+use super::inbound_payload::{
+    handle_clipboard_image_message, handle_clipboard_text_message, handle_input_frame_message,
 };
 use super::outbound::{
     FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS, OutboundTransferFlow,
@@ -358,82 +361,27 @@ where
                         handle_heartbeat_message(&state, remote_peer_id.as_deref()).await;
                     }
                     WireMessage::ClipboardText { machine_id, text } => {
-                        if machine_id != authenticated_peer_id {
-                            warn!(
-                                claimed_machine_id = %machine_id,
-                                authenticated_machine_id = %authenticated_peer_id,
-                                "dropping clipboard payload with mismatched machine_id"
-                            );
-                            continue;
-                        }
-
-                        if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
-                            record_transport_frame_rejected(
-                                &state,
-                                &authenticated_peer_id,
-                                format!(
-                                    "reason=clipboard_text_too_large size={} limit={}",
-                                    text.len(),
-                                    MAX_CLIPBOARD_TEXT_BYTES
-                                ),
-                                text.len() as u64,
-                            )
-                            .await;
-                            continue;
-                        }
-
-                        if let Some(peer_id) = &remote_peer_id {
-                            if let Err(error) =
-                                state.enqueue_remote_clipboard_text(peer_id, text.clone()).await
-                            {
-                                warn!(
-                                    peer_id = %peer_id,
-                                    error = ?error,
-                                    "failed to enqueue incoming clipboard text payload"
-                                );
-                            } else {
-                                info!(
-                                    peer_id = %peer_id,
-                                    size_bytes = text.len(),
-                                    "received clipboard text payload"
-                                );
-                            }
-                        }
+                        handle_clipboard_text_message(
+                            &state,
+                            &authenticated_peer_id,
+                            remote_peer_id.as_deref(),
+                            machine_id,
+                            text,
+                        )
+                        .await;
                     }
                     WireMessage::ClipboardImage {
                         machine_id,
                         data,
                     } => {
-                        if machine_id != authenticated_peer_id {
-                            warn!(
-                                claimed_machine_id = %machine_id,
-                                authenticated_machine_id = %authenticated_peer_id,
-                                "dropping clipboard image payload with mismatched machine_id"
-                            );
-                            continue;
-                        }
-
-                        let image_bmp = data;
-
-                        if let Some(peer_id) = &remote_peer_id {
-                            let size_bytes = image_bmp.len();
-                            if let Err(error) = state
-                                .enqueue_remote_clipboard_image(peer_id, image_bmp)
-                                .await
-                            {
-                                warn!(
-                                    peer_id = %peer_id,
-                                    error = ?error,
-                                    "failed to enqueue incoming clipboard image payload"
-                                );
-                            } else {
-                                info!(
-                                    peer_id = %peer_id,
-                                    size_bytes,
-                                    "received clipboard image payload"
-                                );
-                            }
-                        }
+                        handle_clipboard_image_message(
+                            &state,
+                            &authenticated_peer_id,
+                            remote_peer_id.as_deref(),
+                            machine_id,
+                            data,
+                        )
+                        .await;
                     }
                     WireMessage::FileStart {
                         machine_id,
@@ -518,45 +466,16 @@ where
                         timestamp_unix_ms,
                         events,
                     } => {
-                        if machine_id != authenticated_peer_id {
-                            warn!(
-                                claimed_machine_id = %machine_id,
-                                authenticated_machine_id = %authenticated_peer_id,
-                                "dropping input frame with mismatched machine_id"
-                            );
-                            continue;
-                        }
-
-                        if let Some(peer_id) = &remote_peer_id {
-                            let frame = InputFrame {
-                                source_peer_id: peer_id.clone(),
-                                sequence,
-                                timestamp_unix_ms,
-                                events: events
-                                    .into_iter()
-                                    .map(input_event_from_wire)
-                                    .collect(),
-                            };
-
-                            match state.route_incoming_input_frame(peer_id, frame).await {
-                                Ok(decision) => {
-                                    info!(
-                                        peer_id = %peer_id,
-                                        sequence,
-                                        decision = ?decision,
-                                        "processed inbound input frame"
-                                    );
-                                }
-                                Err(error) => {
-                                    warn!(
-                                        peer_id = %peer_id,
-                                        sequence,
-                                        error = ?error,
-                                        "failed to process inbound input frame"
-                                    );
-                                }
-                            }
-                        }
+                        handle_input_frame_message(
+                            &state,
+                            &authenticated_peer_id,
+                            remote_peer_id.as_deref(),
+                            machine_id,
+                            sequence,
+                            timestamp_unix_ms,
+                            events,
+                        )
+                        .await;
                     }
                     WireMessage::Error { message } => {
                         warn!(%message, "remote error frame");

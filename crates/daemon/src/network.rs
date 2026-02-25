@@ -35,6 +35,7 @@ use crate::state::{AppState, OutboundPayload};
 mod codec;
 mod control;
 mod inbound;
+mod inbound_payload;
 mod outbound;
 mod runtime;
 mod session;
