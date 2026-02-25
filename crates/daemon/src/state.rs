@@ -2425,6 +2425,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diagnostics_dump_reports_nonce_challenge_rejections() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-pairing-diagnostics-dump-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let requester_paths =
+            core_security::SecurityPaths::for_root(root.join("requester-security"));
+        let requester_identity = core_security::ensure_device_identity(
+            &requester_paths,
+            "requester-machine",
+            "requester",
+            Some("10.10.0.5"),
+        )
+        .expect("requester identity");
+        let requester_bundle = core_security::TrustBundle {
+            machine_id: "requester-machine".to_string(),
+            display_name: "requester".to_string(),
+            network_address: "10.10.0.5:15100".to_string(),
+            ca_cert_pem: requester_identity.ca_cert_pem,
+        };
+
+        let challenge = state
+            .queue_nearby_pairing_code_challenge(requester_bundle, None, 120)
+            .await
+            .expect("queue challenge");
+        let request_id = challenge.request_id.clone();
+        let verification_code = challenge
+            .verification_code
+            .clone()
+            .expect("verification code");
+
+        for _ in 0..5 {
+            let _ = state
+                .submit_nearby_pairing_code(&request_id, &verification_code, "wrong-nonce", None)
+                .await;
+        }
+        assert!(
+            matches!(
+                state.nearby_pairing_status(&request_id).await,
+                NearbyPairingStatus::Rejected { .. }
+            ),
+            "nonce failures should reject the request after max attempts"
+        );
+
+        let output_dir = root.join("diagnostics");
+        let dump_path = state
+            .diagnostics_dump(Some(output_dir.to_string_lossy().to_string()))
+            .await
+            .expect("diagnostics dump path");
+        let dump_content = std::fs::read_to_string(&dump_path).expect("read diagnostics dump");
+        assert!(
+            dump_content.contains("Pairing Diagnostics"),
+            "diagnostics dump should include pairing diagnostics section"
+        );
+        assert!(
+            dump_content.contains("pairing_decisions_rejected=1"),
+            "diagnostics should include one rejected decision"
+        );
+        assert!(
+            dump_content.contains("pairing_rejections_nonce_attempts=1"),
+            "diagnostics should classify nonce challenge rejections"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn clipboard_sync_dedupes_and_suppresses_remote_echo() {
         let root =
             std::env::temp_dir().join(format!("boundless-clipboard-test-{}", uuid::Uuid::new_v4()));

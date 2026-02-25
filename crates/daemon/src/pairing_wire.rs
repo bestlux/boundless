@@ -302,6 +302,8 @@ async fn rewrite_requester_bundle_for_remote(
 fn is_invalid_nearby_verification_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     message.contains("verification code is invalid")
+        || message.contains("verification nonce is invalid")
+        || message.contains("verification code and nonce are invalid")
         || message.contains("verification code expired")
         || message.contains("pairing request rejected")
 }

@@ -1,5 +1,30 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
+enum VerificationMismatchKind {
+    Code,
+    Nonce,
+    CodeAndNonce,
+}
+
+impl VerificationMismatchKind {
+    fn invalid_message(self) -> &'static str {
+        match self {
+            VerificationMismatchKind::Code => "verification code is invalid",
+            VerificationMismatchKind::Nonce => "verification nonce is invalid",
+            VerificationMismatchKind::CodeAndNonce => "verification code and nonce are invalid",
+        }
+    }
+
+    fn rejection_message(self) -> &'static str {
+        match self {
+            VerificationMismatchKind::Code => "verification code rejected",
+            VerificationMismatchKind::Nonce => "verification nonce rejected",
+            VerificationMismatchKind::CodeAndNonce => "verification code and nonce rejected",
+        }
+    }
+}
+
 impl AppState {
     pub async fn create_pairing_code(&self, ttl_secs: u64) -> (String, DateTime<Utc>) {
         let code = generate_pairing_code(Duration::from_secs(ttl_secs));
@@ -301,7 +326,7 @@ impl AppState {
         .ok_or_else(|| anyhow::anyhow!("nearby pairing request not found"))?;
 
         let now = Utc::now();
-        let mut invalid_attempts_remaining: Option<u8> = None;
+        let mut invalid_attempt: Option<(u8, VerificationMismatchKind)> = None;
         match &mut pending.mode {
             PendingNearbyPairingMode::ManualApproval => {
                 self.pending_nearby_pairing_requests
@@ -328,25 +353,35 @@ impl AppState {
                     );
                     anyhow::bail!("verification code expired");
                 }
-                if !code.eq_ignore_ascii_case(normalized_code) || nonce != normalized_nonce {
+                let mismatch = match (
+                    code.eq_ignore_ascii_case(normalized_code),
+                    nonce == normalized_nonce,
+                ) {
+                    (true, true) => None,
+                    (false, true) => Some(VerificationMismatchKind::Code),
+                    (true, false) => Some(VerificationMismatchKind::Nonce),
+                    (false, false) => Some(VerificationMismatchKind::CodeAndNonce),
+                };
+                if let Some(kind) = mismatch {
                     if *attempts_left > 1 {
                         *attempts_left -= 1;
-                        invalid_attempts_remaining = Some(*attempts_left);
+                        invalid_attempt = Some((*attempts_left, kind));
                     } else {
-                        invalid_attempts_remaining = Some(0);
+                        invalid_attempt = Some((0, kind));
                     }
                 }
             }
         };
 
-        if let Some(attempts_remaining) = invalid_attempts_remaining {
+        if let Some((attempts_remaining, mismatch_kind)) = invalid_attempt {
             if attempts_remaining > 0 {
                 self.pending_nearby_pairing_requests
                     .write()
                     .await
                     .insert(request_id.to_string(), pending);
                 anyhow::bail!(
-                    "verification code is invalid; attempts_remaining={attempts_remaining}"
+                    "{}; attempts_remaining={attempts_remaining}",
+                    mismatch_kind.invalid_message()
                 );
             }
 
@@ -354,12 +389,18 @@ impl AppState {
                 request_id.to_string(),
                 NearbyPairingDecisionRecord {
                     decision: NearbyPairingDecision::Rejected {
-                        message: "verification code rejected: too many attempts".to_string(),
+                        message: format!(
+                            "{}: too many attempts",
+                            mismatch_kind.rejection_message()
+                        ),
                     },
                     decided_at: now,
                 },
             );
-            anyhow::bail!("verification code is invalid; pairing request rejected");
+            anyhow::bail!(
+                "{}; pairing request rejected",
+                mismatch_kind.invalid_message()
+            );
         }
 
         let peer_id = pending.summary.requester_machine_id.clone();
