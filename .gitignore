@@ -20,4 +20,47 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Local/private workspace notes
 .agents/
+
+# Environment and local config
+.env
+.env.*
+!.env.example
+!.env.sample
+*.env
+*.local
+.envrc
+.direnv/
+
+# Secrets and credentials
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.kdbx
+*.crt
+*.cer
+id_rsa
+id_dsa
+secrets.*
+credentials.*
+
+# Editor and OS artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+*.tmp
+*.temp
+*.orig
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and temp outputs
+*.log
+logs/
+tmp/
+temp/
