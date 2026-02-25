@@ -670,9 +670,37 @@ mod windows_app {
                 bail!("host/IP is required");
             }
 
+            let port = input_box("Boundless Setup", "Pairing port:", "15200")
+                .unwrap_or_else(|| "15200".to_string());
+            let port = port
+                .trim()
+                .parse::<u16>()
+                .context("pairing port must be a number in 1..=65535")?;
+            if port == 0 {
+                bail!("pairing port must be in 1..=65535");
+            }
+
+            let (request_id, verification_nonce, expires_at) =
+                match pair_nearby_request_code_blocking(&self.ctx.endpoint, host.clone(), port)? {
+                    NearbyRequestCodeStart::CodeRequired {
+                        request_id,
+                        verification_nonce,
+                        expires_at,
+                    } => (request_id, verification_nonce, expires_at),
+                    NearbyRequestCodeStart::Unsupported { reason } => {
+                        bail!(
+                            "target does not support guided nearby pairing on {host}:{port} ({reason})"
+                        );
+                    }
+                };
+
             let code = input_box(
                 "Boundless Setup",
-                "Enter the 6-digit code shown on the target machine:",
+                &format!(
+                    "Request sent to target.\nAsk for the 6-digit code shown there.\nRequest ID: {}\nExpires: {}\n\nEnter code:",
+                    short_token(&request_id),
+                    expires_at
+                ),
                 "",
             )
             .ok_or_else(|| anyhow::anyhow!("setup cancelled"))?;
@@ -681,37 +709,30 @@ mod windows_app {
                 bail!("pairing code cannot be empty");
             }
 
-            let port = input_box("Boundless Setup", "Pairing port:", "15200")
-                .unwrap_or_else(|| "15200".to_string());
             let alias = input_box("Boundless Setup", "Alias for this peer (optional):", "")
                 .unwrap_or_default();
-
-            let mut args = vec![
-                "pair".to_string(),
-                "nearby-join".to_string(),
+            let alias = alias.trim().to_string();
+            let peer_machine_id = pair_nearby_submit_code_blocking(
+                &self.ctx.endpoint,
+                request_id,
                 code,
-                "--host".to_string(),
+                verification_nonce,
                 host.clone(),
-                "--port".to_string(),
-                port.trim().to_string(),
-            ];
-            if !alias.trim().is_empty() {
-                args.push("--alias".to_string());
-                args.push(alias.trim().to_string());
-            }
-
-            let output = run_boundlessctl(&self.ctx, &args)?;
+                port,
+                Some(alias.clone()).filter(|value| !value.is_empty()),
+            )?;
             message_box_ok(
                 "Boundless Setup",
-                &format!("Pairing completed:\n{output}"),
+                &format!(
+                    "Pairing completed.\npeer_machine_id={}\ntarget={}:{}",
+                    short_token(&peer_machine_id),
+                    host,
+                    port
+                ),
                 MessageBoxIcon::Info,
             );
 
-            let orientation_selector = if !alias.trim().is_empty() {
-                alias.trim().to_string()
-            } else {
-                host
-            };
+            let orientation_selector = if !alias.is_empty() { alias } else { host };
             self.prompt_orientation(orientation_selector)
         }
 
