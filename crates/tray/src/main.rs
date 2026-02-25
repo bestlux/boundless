@@ -522,7 +522,11 @@ mod windows_app {
             };
 
             if let Err(error) = result {
-                message_box_ok("Boundless", &error.to_string(), MessageBoxIcon::Error);
+                message_box_ok(
+                    "Boundless",
+                    &format_error_for_dialog(&error),
+                    MessageBoxIcon::Error,
+                );
             }
             self.refresh_snapshot();
             self.rebuild_menu();
@@ -1561,6 +1565,70 @@ mod windows_app {
 
     fn short_token(value: &str) -> &str {
         value.get(..8).unwrap_or(value)
+    }
+
+    fn format_error_for_dialog(error: &anyhow::Error) -> String {
+        let message = error.to_string();
+        let lowered = message.to_ascii_lowercase();
+
+        if lowered.contains("attempts_remaining=") {
+            if let Some(attempts_remaining) = extract_attempts_remaining(&message) {
+                return format!(
+                    "{message}\n\nCode confirmation failed.\nDouble-check the 6-digit code and retry.\nAttempts remaining: {attempts_remaining}."
+                );
+            }
+            return format!(
+                "{message}\n\nCode confirmation failed.\nDouble-check the 6-digit code and retry."
+            );
+        }
+
+        if lowered.contains("temporarily locked") {
+            return format!(
+                "{message}\n\nToo many invalid attempts were submitted.\nWait for lockout to expire, then start a new pairing request."
+            );
+        }
+
+        if lowered.contains("verification nonce is invalid")
+            || lowered.contains("verification code and nonce are invalid")
+        {
+            return format!(
+                "{message}\n\nThis pairing request is stale or mismatched.\nStart a new request and enter the fresh code from the target machine."
+            );
+        }
+
+        if lowered.contains("pairing request rejected") {
+            return format!(
+                "{message}\n\nThe target rejected the request.\nStart a new pairing request from the tray and confirm on the target machine."
+            );
+        }
+
+        if lowered.contains("timed out waiting for nearby pairing approval") {
+            return format!(
+                "{message}\n\nThe target did not approve in time.\nStart a new pairing request and approve it on the target before timeout."
+            );
+        }
+
+        if lowered.contains("nearby code request rate limited") {
+            return format!(
+                "{message}\n\nCode requests are briefly rate-limited.\nWait a few seconds and retry."
+            );
+        }
+
+        message
+    }
+
+    fn extract_attempts_remaining(message: &str) -> Option<u8> {
+        const MARKER: &str = "attempts_remaining=";
+        let marker_index = message.find(MARKER)?;
+        let start = marker_index + MARKER.len();
+        let digits = message[start..]
+            .chars()
+            .take_while(|char| char.is_ascii_digit())
+            .collect::<String>();
+        if digits.is_empty() {
+            return None;
+        }
+        digits.parse::<u8>().ok()
     }
 
     fn truncate(value: &str, max_chars: usize) -> String {
