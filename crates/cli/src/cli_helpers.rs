@@ -54,6 +54,16 @@ pub(super) fn prompt_pairing_code() -> Result<String> {
     Ok(line.trim().to_string())
 }
 
+pub(super) fn prompt_pairing_nonce() -> Result<String> {
+    print!("pairing nonce: ");
+    io::stdout().flush().context("flush stdout")?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .context("read pairing nonce")?;
+    Ok(line.trim().to_string())
+}
+
 pub(super) fn nearby_pairing_port(transport_port: u16) -> u16 {
     if transport_port <= u16::MAX - 100 {
         return transport_port + 100;

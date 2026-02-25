@@ -34,6 +34,7 @@ impl AppState {
             requester_display_name: requester_bundle.display_name.clone(),
             created_at: Utc::now(),
             verification_code: None,
+            verification_nonce: None,
             verification_expires_at: None,
         };
         let request_id = summary.request_id.clone();
@@ -75,12 +76,14 @@ impl AppState {
         }
 
         let code = generate_pairing_code(Duration::from_secs(ttl_secs.max(30)));
+        let verification_nonce = uuid::Uuid::new_v4().simple().to_string();
         let summary = PendingNearbyPairingRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
             requester_machine_id: requester_bundle.machine_id.clone(),
             requester_display_name: requester_bundle.display_name.clone(),
             created_at: Utc::now(),
             verification_code: Some(code.value.clone()),
+            verification_nonce: Some(verification_nonce.clone()),
             verification_expires_at: Some(code.expires_at),
         };
         let request_id = summary.request_id.clone();
@@ -93,6 +96,7 @@ impl AppState {
                 requester_alias: requester_alias.and_then(normalize_optional_alias),
                 mode: PendingNearbyPairingMode::CodeChallenge {
                     code: code.value,
+                    nonce: verification_nonce,
                     expires_at: code.expires_at,
                     attempts_left: NEARBY_PAIRING_CHALLENGE_MAX_ATTEMPTS,
                 },
@@ -274,6 +278,7 @@ impl AppState {
         &self,
         request_id: &str,
         code: &str,
+        verification_nonce: &str,
         alias_override: Option<String>,
     ) -> Result<TrustBundle> {
         self.expire_nearby_pairing_challenges().await;
@@ -281,6 +286,10 @@ impl AppState {
         let normalized_code = code.trim();
         if normalized_code.is_empty() {
             anyhow::bail!("verification code must not be empty");
+        }
+        let normalized_nonce = verification_nonce.trim();
+        if normalized_nonce.is_empty() {
+            anyhow::bail!("verification nonce must not be empty");
         }
 
         let mut pending = {
@@ -303,6 +312,7 @@ impl AppState {
             }
             PendingNearbyPairingMode::CodeChallenge {
                 code,
+                nonce,
                 expires_at,
                 attempts_left,
             } => {
@@ -318,7 +328,7 @@ impl AppState {
                     );
                     anyhow::bail!("verification code expired");
                 }
-                if !code.eq_ignore_ascii_case(normalized_code) {
+                if !code.eq_ignore_ascii_case(normalized_code) || nonce != normalized_nonce {
                     if *attempts_left > 1 {
                         *attempts_left -= 1;
                         invalid_attempts_remaining = Some(*attempts_left);

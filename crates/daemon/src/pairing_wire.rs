@@ -30,6 +30,7 @@ enum PairingWireRequest {
     NearbySubmitCode {
         request_id: String,
         code: String,
+        verification_nonce: String,
         requester_alias: Option<String>,
     },
     NearbyJoin {
@@ -48,6 +49,7 @@ enum PairingWireResponse {
     CodeRequired {
         request_id: String,
         message: String,
+        verification_nonce: String,
         expires_at: String,
     },
     Pending {
@@ -177,6 +179,10 @@ async fn process_pairing_request(
             Ok(PairingWireResponse::CodeRequired {
                 request_id: challenge.request_id,
                 message: "enter code shown on target machine".to_string(),
+                verification_nonce: challenge
+                    .verification_nonce
+                    .clone()
+                    .context("nearby pairing code challenge missing verification nonce")?,
                 expires_at: challenge
                     .verification_expires_at
                     .map(|value| value.to_rfc3339())
@@ -186,6 +192,7 @@ async fn process_pairing_request(
         PairingWireRequest::NearbySubmitCode {
             request_id,
             code,
+            verification_nonce,
             requester_alias,
         } => {
             state
@@ -195,6 +202,7 @@ async fn process_pairing_request(
                 .submit_nearby_pairing_code(
                     &request_id,
                     &code,
+                    &verification_nonce,
                     requester_alias.and_then(|value| {
                         let trimmed = value.trim().to_string();
                         if trimmed.is_empty() {
@@ -452,14 +460,19 @@ mod tests {
         )
         .await
         .expect("request code");
-        let request_id = match code_request {
+        let (request_id, verification_nonce) = match code_request {
             PairingWireResponse::CodeRequired {
                 request_id,
+                verification_nonce,
                 expires_at,
                 ..
             } => {
                 assert!(!expires_at.is_empty(), "expires_at should be present");
-                request_id
+                assert!(
+                    !verification_nonce.is_empty(),
+                    "verification_nonce should be present"
+                );
+                (request_id, verification_nonce)
             }
             other => panic!("expected code_required response, got {other:?}"),
         };
@@ -478,6 +491,7 @@ mod tests {
             PairingWireRequest::NearbySubmitCode {
                 request_id,
                 code: verification_code,
+                verification_nonce,
                 requester_alias: None,
             },
         )
@@ -532,8 +546,12 @@ mod tests {
         )
         .await
         .expect("request code");
-        let request_id = match code_request {
-            PairingWireResponse::CodeRequired { request_id, .. } => request_id,
+        let (request_id, verification_nonce) = match code_request {
+            PairingWireResponse::CodeRequired {
+                request_id,
+                verification_nonce,
+                ..
+            } => (request_id, verification_nonce),
             other => panic!("expected code_required response, got {other:?}"),
         };
 
@@ -544,6 +562,7 @@ mod tests {
                 PairingWireRequest::NearbySubmitCode {
                     request_id: request_id.clone(),
                     code: "000000".to_string(),
+                    verification_nonce: verification_nonce.clone(),
                     requester_alias: None,
                 },
             )
@@ -563,6 +582,7 @@ mod tests {
             PairingWireRequest::NearbySubmitCode {
                 request_id: request_id.clone(),
                 code: "000000".to_string(),
+                verification_nonce,
                 requester_alias: None,
             },
         )
@@ -577,6 +597,98 @@ mod tests {
             state.nearby_pairing_status(&request_id).await,
             NearbyPairingStatus::Rejected { .. }
         ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn request_code_rejects_invalid_nonce_and_accepts_correct_nonce() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-nearby-code-nonce-mismatch-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let receiver_config_path = root.join("receiver-config.json");
+        let receiver_security_root = root.join("receiver-security");
+        let state =
+            AppState::load_or_create_with_paths(receiver_config_path, receiver_security_root)
+                .expect("receiver state");
+
+        let requester_paths = SecurityPaths::for_root(root.join("requester-security"));
+        let requester_identity = ensure_device_identity(
+            &requester_paths,
+            "requester-machine",
+            "requester",
+            Some("10.10.0.5"),
+        )
+        .expect("requester identity");
+        let requester_bundle = TrustBundle {
+            machine_id: "requester-machine".to_string(),
+            display_name: "requester".to_string(),
+            network_address: "some-host:17777".to_string(),
+            ca_cert_pem: requester_identity.ca_cert_pem,
+        };
+
+        let code_request = process_pairing_request(
+            &state,
+            "192.168.1.44".parse().expect("ip"),
+            PairingWireRequest::NearbyRequestCode {
+                requester_bundle,
+                requester_alias: None,
+            },
+        )
+        .await
+        .expect("request code");
+        let (request_id, verification_nonce) = match code_request {
+            PairingWireResponse::CodeRequired {
+                request_id,
+                verification_nonce,
+                ..
+            } => (request_id, verification_nonce),
+            other => panic!("expected code_required response, got {other:?}"),
+        };
+
+        let pending = state.list_pending_nearby_pairing_requests().await;
+        assert_eq!(pending.len(), 1);
+        let verification_code = pending[0]
+            .verification_code
+            .clone()
+            .expect("verification code");
+
+        let wrong_nonce_error = process_pairing_request(
+            &state,
+            "192.168.1.44".parse().expect("ip"),
+            PairingWireRequest::NearbySubmitCode {
+                request_id: request_id.clone(),
+                code: verification_code.clone(),
+                verification_nonce: "wrong-nonce".to_string(),
+                requester_alias: None,
+            },
+        )
+        .await
+        .expect_err("must reject incorrect nonce");
+        assert!(
+            wrong_nonce_error
+                .to_string()
+                .contains("attempts_remaining=4"),
+            "wrong nonce should consume an attempt"
+        );
+
+        let approved = process_pairing_request(
+            &state,
+            "192.168.1.44".parse().expect("ip"),
+            PairingWireRequest::NearbySubmitCode {
+                request_id,
+                code: verification_code,
+                verification_nonce,
+                requester_alias: None,
+            },
+        )
+        .await
+        .expect("submit with correct nonce");
+        assert!(
+            matches!(approved, PairingWireResponse::Approved { .. }),
+            "correct nonce should approve"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -619,8 +731,12 @@ mod tests {
         )
         .await
         .expect("first request code");
-        let first_request_id = match first_request {
-            PairingWireResponse::CodeRequired { request_id, .. } => request_id,
+        let (first_request_id, first_verification_nonce) = match first_request {
+            PairingWireResponse::CodeRequired {
+                request_id,
+                verification_nonce,
+                ..
+            } => (request_id, verification_nonce),
             other => panic!("expected code_required response, got {other:?}"),
         };
 
@@ -631,6 +747,7 @@ mod tests {
                 PairingWireRequest::NearbySubmitCode {
                     request_id: first_request_id.clone(),
                     code: "000000".to_string(),
+                    verification_nonce: first_verification_nonce.clone(),
                     requester_alias: None,
                 },
             )
@@ -649,8 +766,12 @@ mod tests {
         )
         .await
         .expect("second request code");
-        let second_request_id = match second_request {
-            PairingWireResponse::CodeRequired { request_id, .. } => request_id,
+        let (second_request_id, second_verification_nonce) = match second_request {
+            PairingWireResponse::CodeRequired {
+                request_id,
+                verification_nonce,
+                ..
+            } => (request_id, verification_nonce),
             other => panic!("expected code_required response, got {other:?}"),
         };
 
@@ -661,6 +782,7 @@ mod tests {
                 PairingWireRequest::NearbySubmitCode {
                     request_id: second_request_id.clone(),
                     code: "000000".to_string(),
+                    verification_nonce: second_verification_nonce.clone(),
                     requester_alias: None,
                 },
             )
@@ -673,6 +795,7 @@ mod tests {
             PairingWireRequest::NearbySubmitCode {
                 request_id: second_request_id,
                 code: "000000".to_string(),
+                verification_nonce: second_verification_nonce,
                 requester_alias: None,
             },
         )

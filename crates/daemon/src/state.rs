@@ -173,6 +173,7 @@ pub struct PendingNearbyPairingRequest {
     pub requester_display_name: String,
     pub created_at: DateTime<Utc>,
     pub verification_code: Option<String>,
+    pub verification_nonce: Option<String>,
     pub verification_expires_at: Option<DateTime<Utc>>,
 }
 
@@ -203,6 +204,7 @@ enum PendingNearbyPairingMode {
     ManualApproval,
     CodeChallenge {
         code: String,
+        nonce: String,
         expires_at: DateTime<Utc>,
         attempts_left: u8,
     },

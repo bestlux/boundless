@@ -52,8 +52,8 @@ use cli_helpers::extract_port_from_network_address;
 use cli_helpers::is_pipe_busy_error;
 use cli_helpers::{
     format_host_port, nearby_pairing_port, normalize_bundle_address_for_host, parse_npipe_endpoint,
-    prompt_pairing_code, resolve_discovered_peer, send_nearby_pairing_request, short_machine_id,
-    validate_bmp_payload,
+    prompt_pairing_code, prompt_pairing_nonce, resolve_discovered_peer,
+    send_nearby_pairing_request, short_machine_id, validate_bmp_payload,
 };
 use commands::*;
 use console::console_run;
@@ -148,6 +148,8 @@ enum PairCommand {
         selector: String,
         #[arg(long)]
         request_id: Option<String>,
+        #[arg(long)]
+        nonce: Option<String>,
         #[arg(long)]
         host: Option<String>,
         #[arg(long)]
@@ -339,6 +341,7 @@ enum NearbyJoinWireRequest {
     NearbySubmitCode {
         request_id: String,
         code: String,
+        verification_nonce: String,
         requester_alias: Option<String>,
     },
     NearbyJoin {
@@ -357,6 +360,7 @@ enum NearbyJoinWireResponse {
     CodeRequired {
         request_id: String,
         message: String,
+        verification_nonce: String,
         expires_at: String,
     },
     Pending {
@@ -393,6 +397,7 @@ async fn main() -> Result<()> {
             PairCommand::Request {
                 selector,
                 request_id,
+                nonce,
                 host,
                 port,
                 code,
@@ -404,6 +409,7 @@ async fn main() -> Result<()> {
                     PairRequestArgs {
                         selector,
                         request_id,
+                        verification_nonce: nonce,
                         host_override: host,
                         port_override: port,
                         code,

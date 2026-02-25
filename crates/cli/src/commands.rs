@@ -142,6 +142,7 @@ pub(super) async fn pair_discover(endpoint: &str) -> Result<()> {
 pub(super) struct PairRequestArgs {
     pub(super) selector: String,
     pub(super) request_id: Option<String>,
+    pub(super) verification_nonce: Option<String>,
     pub(super) host_override: Option<String>,
     pub(super) port_override: Option<u16>,
     pub(super) code: Option<String>,
@@ -153,6 +154,7 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
     let PairRequestArgs {
         selector,
         request_id,
+        verification_nonce,
         host_override,
         port_override,
         code,
@@ -219,10 +221,19 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
         if code.trim().is_empty() {
             bail!("pairing code must not be empty");
         }
+        let verification_nonce = if let Some(value) = verification_nonce {
+            value
+        } else {
+            prompt_pairing_nonce()?
+        };
+        if verification_nonce.trim().is_empty() {
+            bail!("pairing nonce must not be empty");
+        }
         return pair_nearby_submit_code(
             endpoint,
             request_id,
             code,
+            verification_nonce,
             host,
             pairing_port,
             timeout_seconds,
@@ -241,16 +252,17 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
     match pair_nearby_request_code(endpoint, host.clone(), pairing_port).await? {
         NearbyRequestCodeStart::CodeRequired {
             request_id,
+            verification_nonce,
             expires_at,
         } => {
             println!(
-                "pair_request_code_started=true request_id={} expires_at={}",
-                request_id, expires_at
+                "pair_request_code_started=true request_id={} verification_nonce={} expires_at={}",
+                request_id, verification_nonce, expires_at
             );
             println!("enter code shown on target machine, then submit:");
             println!(
-                "  boundlessctl pair request {} --request-id {} --code <6-digit-code> --host {} --port {}",
-                selector_hint, request_id, host, pairing_port
+                "  boundlessctl pair request {} --request-id {} --nonce {} --code <6-digit-code> --host {} --port {}",
+                selector_hint, request_id, verification_nonce, host, pairing_port
             );
             Ok(())
         }
@@ -412,6 +424,7 @@ pub(super) async fn pair_nearby_join(
 enum NearbyRequestCodeStart {
     CodeRequired {
         request_id: String,
+        verification_nonce: String,
         expires_at: String,
     },
     Unsupported {
@@ -449,10 +462,12 @@ async fn pair_nearby_request_code(
     match response {
         NearbyJoinWireResponse::CodeRequired {
             request_id,
+            verification_nonce,
             expires_at,
             ..
         } => Ok(NearbyRequestCodeStart::CodeRequired {
             request_id,
+            verification_nonce,
             expires_at,
         }),
         NearbyJoinWireResponse::Error { message } => {
@@ -481,6 +496,7 @@ async fn pair_nearby_submit_code(
     endpoint: &str,
     request_id: String,
     code: String,
+    verification_nonce: String,
     host: String,
     port: u16,
     timeout_seconds: u64,
@@ -492,6 +508,7 @@ async fn pair_nearby_submit_code(
         NearbyJoinWireRequest::NearbySubmitCode {
             request_id: request_id.clone(),
             code,
+            verification_nonce,
             requester_alias: None,
         },
     )
