@@ -546,14 +546,7 @@ mod windows_app {
             } else if menu_id == ACTION_LAYOUT {
                 self.run_layout_wizard()
             } else if menu_id == ACTION_RECONNECT {
-                self.run_simple_command(
-                    vec![
-                        "diagnostics".to_string(),
-                        "run-action".to_string(),
-                        "reconnect".to_string(),
-                    ],
-                    "Reconnect",
-                )
+                self.run_reconnect_action()
             } else if menu_id == ACTION_QUIT {
                 event_loop.exit();
                 Ok(())
@@ -578,11 +571,11 @@ mod windows_app {
             self.rebuild_menu();
         }
 
-        fn run_simple_command(&self, args: Vec<String>, title: &str) -> Result<()> {
-            let output = run_boundlessctl(&self.ctx, &args)?;
+        fn run_reconnect_action(&self) -> Result<()> {
+            let output = trigger_hotkey_action_blocking(&self.ctx.endpoint, "reconnect")?;
             message_box_ok(
                 "Boundless",
-                &format!("{title} completed:\n{output}"),
+                &format!("Reconnect completed:\n{output}"),
                 MessageBoxIcon::Info,
             );
             Ok(())
@@ -1149,6 +1142,10 @@ mod windows_app {
         ))
     }
 
+    fn trigger_hotkey_action_blocking(endpoint: &str, action: &str) -> Result<String> {
+        block_on_result(trigger_hotkey_action(endpoint, action.to_string()))
+    }
+
     fn block_on_result<F, T>(future: F) -> Result<T>
     where
         F: Future<Output = Result<T>>,
@@ -1156,8 +1153,17 @@ mod windows_app {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .context("create tokio runtime for tray pairing flow")?;
+            .context("create tokio runtime for tray async flow")?;
         runtime.block_on(future)
+    }
+
+    async fn trigger_hotkey_action(endpoint: &str, action: String) -> Result<String> {
+        let mut diagnostics_client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+        let response = diagnostics_client
+            .trigger_hotkey_action(HotkeyTriggerRequest { action })
+            .await?
+            .into_inner();
+        Ok(response.message)
     }
 
     async fn fetch_ui_snapshot(endpoint: &str) -> Result<UiSnapshot> {
