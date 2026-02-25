@@ -23,6 +23,7 @@ This repository now contains an alpha-oriented workspace scaffold with:
 - `crates/daemon` (`boundlessd`)
 - `crates/cli` (`boundlessctl`)
 - `crates/tray` (`boundlesstray`, Windows)
+- `docs/architecture` (v1 architecture maps and ownership boundaries)
 
 ## Build and test
 
@@ -106,8 +107,6 @@ cargo run -p boundless-cli -- pair nearby-join 123456 --host <target-host-or-ip>
 cargo run -p boundless-cli -- pair discover
 cargo run -p boundless-cli -- pair request <index|machine_id|display-name>
 cargo run -p boundless-cli -- pair request <index|machine_id|display-name> --request-id <request_id> --code 123456
-# compatibility fallback against older peers:
-cargo run -p boundless-cli -- pair request <index|machine_id|display-name> --code 123456
 cargo run -p boundless-cli -- pair pending
 cargo run -p boundless-cli -- pair approve <request_id>
 ```
