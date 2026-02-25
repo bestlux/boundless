@@ -1,5 +1,4 @@
 use std::{
-    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -34,18 +33,21 @@ use core_transfer::validate_transfer_size;
 use crate::state::{AppState, OutboundPayload};
 
 mod codec;
+mod outbound;
 mod runtime;
 mod session;
 mod tls;
 
 #[cfg(test)]
-use codec::{input_event_from_wire, input_events_to_wire, now_millis};
+use codec::input_events_to_wire;
+#[cfg(test)]
+use outbound::flush_outgoing_payloads;
 #[cfg(test)]
 use runtime::outbound_target_candidates;
 use runtime::{listener_loop, supervisor_loop};
-use session::{connect_and_run_outbound, handle_incoming_connection};
 #[cfg(test)]
-use session::{flush_outgoing_payloads, reconnect_requested_for_peer};
+use session::reconnect_requested_for_peer;
+use session::{connect_and_run_outbound, handle_incoming_connection};
 #[cfg(test)]
 use tls::parse_server_name;
 use tls::{
