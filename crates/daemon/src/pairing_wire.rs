@@ -510,6 +510,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_nearby_join_reports_pending_then_approved_for_manual_flow() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-nearby-check-status-manual-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let receiver_config_path = root.join("receiver-config.json");
+        let receiver_security_root = root.join("receiver-security");
+        let state =
+            AppState::load_or_create_with_paths(receiver_config_path, receiver_security_root)
+                .expect("receiver state");
+
+        let requester_paths = SecurityPaths::for_root(root.join("requester-security"));
+        let requester_identity = ensure_device_identity(
+            &requester_paths,
+            "requester-machine",
+            "requester",
+            Some("10.10.0.5"),
+        )
+        .expect("requester identity");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let join = process_pairing_request(
+            &state,
+            "192.168.1.44".parse().expect("ip"),
+            PairingWireRequest::NearbyJoin {
+                code,
+                requester_bundle: TrustBundle {
+                    machine_id: "requester-machine".to_string(),
+                    display_name: "requester".to_string(),
+                    network_address: "some-host:17777".to_string(),
+                    ca_cert_pem: requester_identity.ca_cert_pem,
+                },
+                requester_alias: None,
+            },
+        )
+        .await
+        .expect("process nearby join");
+        let request_id = match join {
+            PairingWireResponse::Pending { request_id, .. } => request_id,
+            other => panic!("expected pending response, got {other:?}"),
+        };
+
+        let pending_status = process_pairing_request(
+            &state,
+            "192.168.1.44".parse().expect("ip"),
+            PairingWireRequest::CheckNearbyJoin {
+                request_id: request_id.clone(),
+            },
+        )
+        .await
+        .expect("check pending status");
+        assert!(
+            matches!(pending_status, PairingWireResponse::Pending { .. }),
+            "status should be pending before approval"
+        );
+
+        state
+            .approve_nearby_pairing_request(&request_id, None)
+            .await
+            .expect("approve request");
+
+        let approved_status = process_pairing_request(
+            &state,
+            "192.168.1.44".parse().expect("ip"),
+            PairingWireRequest::CheckNearbyJoin { request_id },
+        )
+        .await
+        .expect("check approved status");
+        assert!(
+            matches!(approved_status, PairingWireResponse::Approved { .. }),
+            "status should be approved after local approval"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn request_code_replay_submission_is_rejected_and_status_stays_approved() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-nearby-code-replay-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let receiver_config_path = root.join("receiver-config.json");
+        let receiver_security_root = root.join("receiver-security");
+        let state =
+            AppState::load_or_create_with_paths(receiver_config_path, receiver_security_root)
+                .expect("receiver state");
+
+        let requester_paths = SecurityPaths::for_root(root.join("requester-security"));
+        let requester_identity = ensure_device_identity(
+            &requester_paths,
+            "requester-machine",
+            "requester",
+            Some("10.10.0.5"),
+        )
+        .expect("requester identity");
+        let requester_bundle = TrustBundle {
+            machine_id: "requester-machine".to_string(),
+            display_name: "requester".to_string(),
+            network_address: "some-host:17777".to_string(),
+            ca_cert_pem: requester_identity.ca_cert_pem,
+        };
+
+        let code_request = process_pairing_request(
+            &state,
+            "192.168.1.44".parse().expect("ip"),
+            PairingWireRequest::NearbyRequestCode {
+                requester_bundle,
+                requester_alias: None,
+            },
+        )
+        .await
+        .expect("request code");
+        let (request_id, verification_nonce) = match code_request {
+            PairingWireResponse::CodeRequired {
+                request_id,
+                verification_nonce,
+                ..
+            } => (request_id, verification_nonce),
+            other => panic!("expected code_required response, got {other:?}"),
+        };
+
+        let verification_code = state
+            .list_pending_nearby_pairing_requests()
+            .await
+            .into_iter()
+            .find(|request| request.request_id == request_id)
+            .and_then(|request| request.verification_code)
+            .expect("verification code");
+
+        let first_submit = process_pairing_request(
+            &state,
+            "192.168.1.44".parse().expect("ip"),
+            PairingWireRequest::NearbySubmitCode {
+                request_id: request_id.clone(),
+                code: verification_code.clone(),
+                verification_nonce: verification_nonce.clone(),
+                requester_alias: None,
+            },
+        )
+        .await
+        .expect("first submit should approve");
+        assert!(
+            matches!(first_submit, PairingWireResponse::Approved { .. }),
+            "first submit should approve"
+        );
+
+        let replay_error = process_pairing_request(
+            &state,
+            "192.168.1.44".parse().expect("ip"),
+            PairingWireRequest::NearbySubmitCode {
+                request_id: request_id.clone(),
+                code: verification_code,
+                verification_nonce,
+                requester_alias: None,
+            },
+        )
+        .await
+        .expect_err("replay submission must fail");
+        assert!(
+            replay_error.to_string().contains("not found"),
+            "replay should fail because request is already finalized"
+        );
+
+        let status_after_replay = process_pairing_request(
+            &state,
+            "192.168.1.44".parse().expect("ip"),
+            PairingWireRequest::CheckNearbyJoin {
+                request_id: request_id.clone(),
+            },
+        )
+        .await
+        .expect("status after replay");
+        assert!(
+            matches!(status_after_replay, PairingWireResponse::Approved { .. }),
+            "diagnostic status should remain approved after replay attempt"
+        );
+
+        let requester_peer = state.get_peer("requester-machine").await.expect("peer");
+        assert_eq!(requester_peer.address, "192.168.1.44:17777");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn request_code_rejects_after_max_invalid_attempts() {
         let root = std::env::temp_dir().join(format!(
             "boundless-nearby-code-invalid-attempts-test-{}",
@@ -597,6 +782,84 @@ mod tests {
             state.nearby_pairing_status(&request_id).await,
             NearbyPairingStatus::Rejected { .. }
         ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn check_nearby_join_reports_rejected_after_code_attempts_exhausted() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-nearby-check-status-rejected-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let receiver_config_path = root.join("receiver-config.json");
+        let receiver_security_root = root.join("receiver-security");
+        let state =
+            AppState::load_or_create_with_paths(receiver_config_path, receiver_security_root)
+                .expect("receiver state");
+
+        let requester_paths = SecurityPaths::for_root(root.join("requester-security"));
+        let requester_identity = ensure_device_identity(
+            &requester_paths,
+            "requester-machine",
+            "requester",
+            Some("10.10.0.5"),
+        )
+        .expect("requester identity");
+        let requester_bundle = TrustBundle {
+            machine_id: "requester-machine".to_string(),
+            display_name: "requester".to_string(),
+            network_address: "some-host:17777".to_string(),
+            ca_cert_pem: requester_identity.ca_cert_pem,
+        };
+
+        let code_request = process_pairing_request(
+            &state,
+            "192.168.1.44".parse().expect("ip"),
+            PairingWireRequest::NearbyRequestCode {
+                requester_bundle,
+                requester_alias: None,
+            },
+        )
+        .await
+        .expect("request code");
+        let (request_id, verification_nonce) = match code_request {
+            PairingWireResponse::CodeRequired {
+                request_id,
+                verification_nonce,
+                ..
+            } => (request_id, verification_nonce),
+            other => panic!("expected code_required response, got {other:?}"),
+        };
+
+        for _ in 0..5 {
+            let _ = process_pairing_request(
+                &state,
+                "192.168.1.44".parse().expect("ip"),
+                PairingWireRequest::NearbySubmitCode {
+                    request_id: request_id.clone(),
+                    code: "000000".to_string(),
+                    verification_nonce: verification_nonce.clone(),
+                    requester_alias: None,
+                },
+            )
+            .await;
+        }
+
+        let rejected_status = process_pairing_request(
+            &state,
+            "192.168.1.44".parse().expect("ip"),
+            PairingWireRequest::CheckNearbyJoin { request_id },
+        )
+        .await
+        .expect("check rejected status");
+        match rejected_status {
+            PairingWireResponse::Rejected { message, .. } => assert!(
+                message.contains("too many attempts"),
+                "rejected status should carry rejection reason"
+            ),
+            other => panic!("expected rejected response, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }
