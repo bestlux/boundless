@@ -12,14 +12,32 @@ fn main() -> anyhow::Result<()> {
 mod windows_app {
     use anyhow::{Context, Result, bail};
     use clap::Parser;
-    use serde::Deserialize;
+    use hyper_util::rt::TokioIo;
+    use ipc_api::boundless::v1::{
+        Empty, HotkeyTriggerRequest, ImportTrustBundleRequest,
+        diagnostics_service_client::DiagnosticsServiceClient,
+        pairing_service_client::PairingServiceClient,
+    };
+    use serde::{Deserialize, Serialize};
     use std::{
+        future::Future,
         os::windows::process::CommandExt,
+        pin::Pin,
         process::{Command as ProcessCommand, Stdio},
+        task::{Context as TaskContext, Poll},
         thread::sleep,
         time::{Duration, Instant},
     };
     use tinyfiledialogs::{MessageBoxIcon, YesNo, input_box, message_box_ok, message_box_yes_no};
+    use tokio::net::windows::named_pipe::NamedPipeClient;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::{TcpStream, windows::named_pipe::ClientOptions},
+    };
+    use tonic::{
+        codegen::Service,
+        transport::{Channel, Endpoint, Uri},
+    };
     use tray_icon::{
         Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
         menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
@@ -102,6 +120,68 @@ mod windows_app {
         verification_expires_at: String,
         #[serde(default)]
         requires_verification_code: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct StoredTrustBundle {
+        machine_id: String,
+        display_name: String,
+        network_address: String,
+        ca_cert_pem: String,
+    }
+
+    #[derive(Debug, Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum NearbyJoinWireRequest {
+        NearbyRequestCode {
+            requester_bundle: StoredTrustBundle,
+            requester_alias: Option<String>,
+        },
+        NearbySubmitCode {
+            request_id: String,
+            code: String,
+            verification_nonce: String,
+            requester_alias: Option<String>,
+        },
+        CheckNearbyJoin {
+            request_id: String,
+        },
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "status", rename_all = "snake_case")]
+    enum NearbyJoinWireResponse {
+        Pending {
+            request_id: String,
+            message: String,
+        },
+        Approved {
+            request_id: String,
+            responder_bundle: StoredTrustBundle,
+        },
+        Rejected {
+            message: String,
+        },
+        Error {
+            message: String,
+        },
+        CodeRequired {
+            request_id: String,
+            message: String,
+            verification_nonce: String,
+            expires_at: String,
+        },
+    }
+
+    enum NearbyRequestCodeStart {
+        CodeRequired {
+            request_id: String,
+            verification_nonce: String,
+            expires_at: String,
+        },
+        Unsupported {
+            reason: String,
+        },
     }
 
     #[derive(Debug)]
@@ -473,41 +553,36 @@ mod windows_app {
         }
 
         fn run_pair_request(&self, machine_id: &str) -> Result<()> {
-            let default_alias = self
+            let discovered_peer = self
                 .snapshot
                 .discovered_peers
                 .iter()
                 .find(|peer| peer.machine_id == machine_id)
-                .map(|peer| peer.display_name.as_str())
-                .unwrap_or("");
-            let target_override = self
-                .snapshot
-                .discovered_peers
-                .iter()
-                .find(|peer| peer.machine_id == machine_id)
-                .and_then(|peer| host_and_pairing_port_from_discovery_endpoint(&peer.endpoint));
+                .ok_or_else(|| anyhow::anyhow!("discovered peer not found for {machine_id}"))?;
+            let default_alias = discovered_peer.display_name.as_str();
+            let (host, pairing_port) =
+                host_and_pairing_port_from_discovery_endpoint(&discovered_peer.endpoint)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("invalid discovered endpoint {}", discovered_peer.endpoint)
+                    })?;
 
-            let mut start_args = vec![
-                "pair".to_string(),
-                "request".to_string(),
-                machine_id.to_string(),
-                "--timeout-seconds".to_string(),
-                "120".to_string(),
-            ];
-            if let Some((host, pairing_port)) = &target_override {
-                start_args.push("--host".to_string());
-                start_args.push(host.clone());
-                start_args.push("--port".to_string());
-                start_args.push(pairing_port.to_string());
-            }
-
-            let start_output = run_boundlessctl(&self.ctx, &start_args)?;
-
-            let request_id = parse_key_value(&start_output, "request_id").ok_or_else(|| {
-                anyhow::anyhow!("pairing response missing request_id: {start_output}")
-            })?;
-            let expires_at =
-                parse_key_value(&start_output, "expires_at").unwrap_or_else(|| "soon".to_string());
+            let (request_id, verification_nonce, expires_at) =
+                match pair_nearby_request_code_blocking(
+                    &self.ctx.endpoint,
+                    host.clone(),
+                    pairing_port,
+                )? {
+                    NearbyRequestCodeStart::CodeRequired {
+                        request_id,
+                        verification_nonce,
+                        expires_at,
+                    } => (request_id, verification_nonce, expires_at),
+                    NearbyRequestCodeStart::Unsupported { reason } => {
+                        bail!(
+                            "target does not support guided nearby pairing on {host}:{pairing_port} ({reason})"
+                        );
+                    }
+                };
 
             let code = input_box(
                 "Boundless Pairing",
@@ -530,33 +605,24 @@ mod windows_app {
                 default_alias,
             )
             .unwrap_or_default();
-
-            let mut submit_args = vec![
-                "pair".to_string(),
-                "request".to_string(),
-                machine_id.to_string(),
-                "--request-id".to_string(),
+            let alias = alias.trim().to_string();
+            let peer_machine_id = pair_nearby_submit_code_blocking(
+                &self.ctx.endpoint,
                 request_id,
-                "--code".to_string(),
                 code,
-                "--timeout-seconds".to_string(),
-                "120".to_string(),
-            ];
-            if let Some((host, pairing_port)) = &target_override {
-                submit_args.push("--host".to_string());
-                submit_args.push(host.clone());
-                submit_args.push("--port".to_string());
-                submit_args.push(pairing_port.to_string());
-            }
-            if !alias.trim().is_empty() {
-                submit_args.push("--alias".to_string());
-                submit_args.push(alias.trim().to_string());
-            }
-
-            let output = run_boundlessctl(&self.ctx, &submit_args)?;
+                verification_nonce,
+                host.clone(),
+                pairing_port,
+                Some(alias.clone()).filter(|value| !value.is_empty()),
+            )?;
             message_box_ok(
                 "Boundless",
-                &format!("Pairing request completed:\n{output}"),
+                &format!(
+                    "Pairing request completed.\npeer_machine_id={}\ntarget={}:{}",
+                    short_token(&peer_machine_id),
+                    host,
+                    pairing_port
+                ),
                 MessageBoxIcon::Info,
             );
             Ok(())
@@ -931,12 +997,397 @@ mod windows_app {
         )
     }
 
-    fn parse_key_value(output: &str, key: &str) -> Option<String> {
-        let prefix = format!("{key}=");
-        output
-            .split_whitespace()
-            .find_map(|token| token.strip_prefix(&prefix))
-            .map(ToString::to_string)
+    fn pair_nearby_request_code_blocking(
+        endpoint: &str,
+        host: String,
+        port: u16,
+    ) -> Result<NearbyRequestCodeStart> {
+        block_on_result(pair_nearby_request_code(endpoint, host, port))
+    }
+
+    fn pair_nearby_submit_code_blocking(
+        endpoint: &str,
+        request_id: String,
+        code: String,
+        verification_nonce: String,
+        host: String,
+        port: u16,
+        alias: Option<String>,
+    ) -> Result<String> {
+        block_on_result(pair_nearby_submit_code(
+            endpoint,
+            request_id,
+            code,
+            verification_nonce,
+            host,
+            port,
+            alias,
+        ))
+    }
+
+    fn block_on_result<F, T>(future: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("create tokio runtime for tray pairing flow")?;
+        runtime.block_on(future)
+    }
+
+    async fn pair_nearby_request_code(
+        endpoint: &str,
+        host: String,
+        port: u16,
+    ) -> Result<NearbyRequestCodeStart> {
+        let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
+        let local_bundle = pairing_client
+            .export_trust_bundle(Empty {})
+            .await?
+            .into_inner();
+        let requester_bundle = StoredTrustBundle {
+            machine_id: local_bundle.machine_id,
+            display_name: local_bundle.display_name,
+            network_address: local_bundle.network_address,
+            ca_cert_pem: local_bundle.ca_cert_pem,
+        };
+
+        let target = format_host_port(&host, port);
+        let response = send_nearby_pairing_request(
+            &target,
+            NearbyJoinWireRequest::NearbyRequestCode {
+                requester_bundle,
+                requester_alias: None,
+            },
+        )
+        .await?;
+
+        match response {
+            NearbyJoinWireResponse::CodeRequired {
+                request_id,
+                verification_nonce,
+                expires_at,
+                ..
+            } => Ok(NearbyRequestCodeStart::CodeRequired {
+                request_id,
+                verification_nonce,
+                expires_at,
+            }),
+            NearbyJoinWireResponse::Error { message } => {
+                let lowered = message.to_ascii_lowercase();
+                if lowered.contains("unknown variant")
+                    || lowered.contains("parse pairing request")
+                    || lowered.contains("missing field")
+                {
+                    return Ok(NearbyRequestCodeStart::Unsupported { reason: message });
+                }
+                bail!("nearby pairing request failed: {message}");
+            }
+            NearbyJoinWireResponse::Rejected { message, .. } => {
+                bail!("nearby pairing request rejected: {message}");
+            }
+            NearbyJoinWireResponse::Pending { message, .. } => {
+                bail!("unexpected nearby pairing status: {message}");
+            }
+            NearbyJoinWireResponse::Approved { .. } => {
+                bail!("unexpected nearby pairing status: approved");
+            }
+        }
+    }
+
+    async fn pair_nearby_submit_code(
+        endpoint: &str,
+        request_id: String,
+        code: String,
+        verification_nonce: String,
+        host: String,
+        port: u16,
+        alias: Option<String>,
+    ) -> Result<String> {
+        let target = format_host_port(&host, port);
+        let response = send_nearby_pairing_request(
+            &target,
+            NearbyJoinWireRequest::NearbySubmitCode {
+                request_id: request_id.clone(),
+                code,
+                verification_nonce,
+                requester_alias: None,
+            },
+        )
+        .await?;
+
+        let responder_bundle =
+            wait_for_nearby_pairing_approval(&target, response, 120, &request_id).await?;
+        import_nearby_responder_bundle(endpoint, responder_bundle, &host, alias).await
+    }
+
+    async fn wait_for_nearby_pairing_approval(
+        target: &str,
+        initial_response: NearbyJoinWireResponse,
+        timeout_seconds: u64,
+        expected_request_id: &str,
+    ) -> Result<StoredTrustBundle> {
+        match initial_response {
+            NearbyJoinWireResponse::Approved {
+                request_id,
+                responder_bundle,
+                ..
+            } => {
+                if !expected_request_id.is_empty() && !request_id.eq(expected_request_id) {
+                    bail!("nearby pairing request id mismatch");
+                }
+                Ok(responder_bundle)
+            }
+            NearbyJoinWireResponse::Pending {
+                request_id,
+                message: _,
+            } => {
+                let deadline = Instant::now() + Duration::from_secs(timeout_seconds.max(5));
+                loop {
+                    if Instant::now() >= deadline {
+                        bail!(
+                            "timed out waiting for nearby pairing approval request_id={request_id}"
+                        );
+                    }
+
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let status_response = send_nearby_pairing_request(
+                        target,
+                        NearbyJoinWireRequest::CheckNearbyJoin {
+                            request_id: request_id.clone(),
+                        },
+                    )
+                    .await?;
+
+                    match status_response {
+                        NearbyJoinWireResponse::Pending { .. } => continue,
+                        NearbyJoinWireResponse::Approved {
+                            request_id: approved_request_id,
+                            responder_bundle,
+                            ..
+                        } => {
+                            if !request_id.eq(&approved_request_id) {
+                                bail!("nearby pairing request id mismatch");
+                            }
+                            return Ok(responder_bundle);
+                        }
+                        NearbyJoinWireResponse::Rejected { message, .. } => {
+                            bail!("nearby pairing rejected: {message}");
+                        }
+                        NearbyJoinWireResponse::Error { message } => {
+                            bail!("nearby pairing failed: {message}");
+                        }
+                        NearbyJoinWireResponse::CodeRequired { message, .. } => {
+                            bail!("nearby pairing failed: {message}");
+                        }
+                    }
+                }
+            }
+            NearbyJoinWireResponse::Rejected { message, .. } => {
+                bail!("nearby pairing rejected: {message}");
+            }
+            NearbyJoinWireResponse::Error { message } => {
+                bail!("nearby pairing failed: {message}");
+            }
+            NearbyJoinWireResponse::CodeRequired { message, .. } => {
+                bail!("nearby pairing failed: {message}");
+            }
+        }
+    }
+
+    async fn import_nearby_responder_bundle(
+        endpoint: &str,
+        mut responder_bundle: StoredTrustBundle,
+        host: &str,
+        alias: Option<String>,
+    ) -> Result<String> {
+        normalize_bundle_address_for_host(&mut responder_bundle, host)?;
+
+        let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
+        pairing_client
+            .import_trust_bundle(ImportTrustBundleRequest {
+                machine_id: responder_bundle.machine_id.clone(),
+                display_name: responder_bundle.display_name,
+                network_address: responder_bundle.network_address,
+                ca_cert_pem: responder_bundle.ca_cert_pem,
+                alias: alias.unwrap_or_default(),
+            })
+            .await?
+            .into_inner();
+
+        let mut diagnostics_client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+        let _ = diagnostics_client
+            .trigger_hotkey_action(HotkeyTriggerRequest {
+                action: "reconnect".to_string(),
+            })
+            .await;
+
+        Ok(responder_bundle.machine_id)
+    }
+
+    async fn send_nearby_pairing_request(
+        target: &str,
+        request: NearbyJoinWireRequest,
+    ) -> Result<NearbyJoinWireResponse> {
+        let mut socket = TcpStream::connect(target)
+            .await
+            .with_context(|| format!("connect nearby pairing endpoint {target}"))?;
+        let payload =
+            serde_json::to_string(&request).context("serialize nearby pairing request")?;
+        socket
+            .write_all(payload.as_bytes())
+            .await
+            .context("send nearby pairing request")?;
+        socket
+            .write_all(b"\n")
+            .await
+            .context("terminate nearby pairing request")?;
+        socket
+            .flush()
+            .await
+            .context("flush nearby pairing request")?;
+
+        let mut reader = BufReader::new(socket);
+        let mut response_line = String::new();
+        let read = reader
+            .read_line(&mut response_line)
+            .await
+            .context("read nearby pairing response")?;
+        if read == 0 {
+            bail!("nearby pairing endpoint closed without a response");
+        }
+        serde_json::from_str(&response_line).context("parse nearby pairing response")
+    }
+
+    async fn channel(endpoint: &str) -> Result<Channel> {
+        if let Some(pipe_path) = parse_npipe_endpoint(endpoint)? {
+            return Endpoint::from_static("http://[::]:50051")
+                .connect_with_connector(NamedPipeConnector::new(pipe_path))
+                .await
+                .with_context(|| format!("failed to connect to named pipe endpoint {endpoint}"));
+        }
+
+        Endpoint::from_shared(endpoint.to_string())
+            .with_context(|| format!("invalid endpoint {endpoint}"))?
+            .connect()
+            .await
+            .with_context(|| format!("failed to connect to {endpoint}"))
+    }
+
+    fn parse_npipe_endpoint(endpoint: &str) -> Result<Option<String>> {
+        let Some(rest) = endpoint.strip_prefix("npipe://") else {
+            return Ok(None);
+        };
+        if let Some(name) = rest.strip_prefix("./pipe/") {
+            return pipe_path_from_name(name).map(Some);
+        }
+        if let Some(name) = rest.strip_prefix(r"\\.\pipe\") {
+            return pipe_path_from_name(name).map(Some);
+        }
+        bail!("invalid named-pipe endpoint {endpoint}; expected npipe://./pipe/<name>");
+    }
+
+    fn pipe_path_from_name(name: &str) -> Result<String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            bail!("named-pipe endpoint is missing pipe name");
+        }
+        if trimmed.contains('/') || trimmed.contains('\\') {
+            bail!("named-pipe endpoint pipe name must not contain path separators");
+        }
+        Ok(format!(r"\\.\pipe\{trimmed}"))
+    }
+
+    #[derive(Clone)]
+    struct NamedPipeConnector {
+        pipe_path: String,
+    }
+
+    impl NamedPipeConnector {
+        fn new(pipe_path: String) -> Self {
+            Self { pipe_path }
+        }
+    }
+
+    impl Service<Uri> for NamedPipeConnector {
+        type Response = TokioIo<NamedPipeClient>;
+        type Error = std::io::Error;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Uri) -> Self::Future {
+            let pipe_path = self.pipe_path.clone();
+            Box::pin(async move {
+                let client = open_named_pipe_with_retry(pipe_path).await?;
+                Ok(TokioIo::new(client))
+            })
+        }
+    }
+
+    const ERROR_PIPE_BUSY_CODE: i32 = 231;
+    const PIPE_BUSY_MAX_RETRIES: u32 = 20;
+    const PIPE_BUSY_BACKOFF_MS: u64 = 25;
+
+    async fn open_named_pipe_with_retry(pipe_path: String) -> std::io::Result<NamedPipeClient> {
+        let mut attempt = 0_u32;
+        loop {
+            match ClientOptions::new().open(pipe_path.as_str()) {
+                Ok(client) => return Ok(client),
+                Err(error)
+                    if error.raw_os_error() == Some(ERROR_PIPE_BUSY_CODE)
+                        && attempt < PIPE_BUSY_MAX_RETRIES =>
+                {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(PIPE_BUSY_BACKOFF_MS)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn format_host_port(host: &str, port: u16) -> String {
+        let trimmed = host.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            format!("{trimmed}:{port}")
+        } else if trimmed.contains(':') {
+            format!("[{trimmed}]:{port}")
+        } else {
+            format!("{trimmed}:{port}")
+        }
+    }
+
+    fn normalize_bundle_address_for_host(bundle: &mut StoredTrustBundle, host: &str) -> Result<()> {
+        let port = extract_port_from_network_address(bundle.network_address.trim())?;
+        bundle.network_address = format_host_port(host, port);
+        Ok(())
+    }
+
+    fn extract_port_from_network_address(address: &str) -> Result<u16> {
+        let trimmed = address.trim();
+        if trimmed.is_empty() {
+            bail!("invalid responder network address: empty");
+        }
+        if let Ok(socket) = trimmed.parse::<std::net::SocketAddr>() {
+            return Ok(socket.port());
+        }
+        if let Some((host_part, port_part)) = trimmed.rsplit_once(':') {
+            if host_part.trim().is_empty() {
+                bail!("invalid responder network address: missing host");
+            }
+            let port = port_part
+                .trim()
+                .parse::<u16>()
+                .context("invalid responder network address port")?;
+            if port == 0 {
+                bail!("invalid responder network address port: 0");
+            }
+            return Ok(port);
+        }
+        bail!("invalid responder network address: missing port");
     }
 
     fn host_and_pairing_port_from_discovery_endpoint(endpoint: &str) -> Option<(String, u16)> {

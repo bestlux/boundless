@@ -426,9 +426,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hyper-util",
+ "ipc-api",
  "serde",
  "serde_json",
  "tinyfiledialogs",
+ "tokio",
+ "tonic",
  "tray-icon",
  "winit",
 ]
