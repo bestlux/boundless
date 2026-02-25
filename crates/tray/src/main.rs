@@ -651,44 +651,10 @@ mod windows_app {
                 return self.run_setup_wizard_manual();
             }
 
-            let code = input_box(
-                "Boundless Setup",
-                "Enter the 6-digit code shown on the target machine:",
-                "",
-            )
-            .ok_or_else(|| anyhow::anyhow!("setup cancelled"))?;
-            let code = code.trim().to_string();
-            if code.is_empty() {
-                bail!("pairing code cannot be empty");
-            }
-            let alias = input_box("Boundless Setup", "Alias for this peer (optional):", "")
-                .unwrap_or_default();
-
-            let mut args = vec![
-                "pair".to_string(),
-                "request".to_string(),
-                selector.clone(),
-                "--code".to_string(),
-                code,
-                "--timeout-seconds".to_string(),
-                "120".to_string(),
-            ];
-            if !alias.trim().is_empty() {
-                args.push("--alias".to_string());
-                args.push(alias.trim().to_string());
-            }
-            let output = run_boundlessctl(&self.ctx, &args)?;
-            message_box_ok(
-                "Boundless Setup",
-                &format!("Pairing completed:\n{output}"),
-                MessageBoxIcon::Info,
-            );
-
-            let orientation_selector = if !alias.trim().is_empty() {
-                alias.trim().to_string()
-            } else {
-                selector
-            };
+            let selected =
+                resolve_discovered_peer(&self.snapshot.discovered_peers, &selector)?.clone();
+            self.run_pair_request(&selected.machine_id)?;
+            let orientation_selector = selected.display_name;
             self.prompt_orientation(orientation_selector)
         }
 
@@ -1388,6 +1354,48 @@ mod windows_app {
             return Ok(port);
         }
         bail!("invalid responder network address: missing port");
+    }
+
+    fn resolve_discovered_peer<'a>(
+        peers: &'a [UiDiscoveredPeer],
+        selector: &str,
+    ) -> Result<&'a UiDiscoveredPeer> {
+        if let Ok(index) = selector.parse::<usize>() {
+            if index == 0 {
+                bail!("setup selector index must start at 1");
+            }
+            return peers
+                .get(index - 1)
+                .ok_or_else(|| anyhow::anyhow!("no discovered peer at index {index}"));
+        }
+
+        let normalized = selector.trim();
+        if normalized.is_empty() {
+            bail!("setup selector must not be empty");
+        }
+        let selector_lower = normalized.to_ascii_lowercase();
+        let matches = peers
+            .iter()
+            .filter(|peer| {
+                peer.machine_id.eq_ignore_ascii_case(normalized)
+                    || peer
+                        .machine_id
+                        .to_ascii_lowercase()
+                        .starts_with(&selector_lower)
+                    || peer.display_name.eq_ignore_ascii_case(normalized)
+                    || peer
+                        .display_name
+                        .to_ascii_lowercase()
+                        .starts_with(&selector_lower)
+            })
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            bail!("no discovered peer matching `{selector}`");
+        }
+        if matches.len() > 1 {
+            bail!("multiple discovered peers match `{selector}`; use full machine_id or index");
+        }
+        Ok(matches[0])
     }
 
     fn host_and_pairing_port_from_discovery_endpoint(endpoint: &str) -> Option<(String, u16)> {
