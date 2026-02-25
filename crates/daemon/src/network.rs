@@ -33,6 +33,7 @@ use core_transfer::validate_transfer_size;
 use crate::state::{AppState, OutboundPayload};
 
 mod codec;
+mod inbound;
 mod outbound;
 mod runtime;
 mod session;

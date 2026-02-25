@@ -5,21 +5,15 @@ use chrono::Utc;
 use crate::state::TransportEventRecord;
 
 use super::codec::{input_event_from_wire, now_millis};
+use super::inbound::{
+    InboundTransfer, discard_inbound_transfer, handle_file_chunk, handle_file_end,
+    handle_file_start,
+};
 use super::outbound::{
-    FILE_TRANSFER_INITIAL_CHUNK_CREDITS, FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS,
-    OutboundTransferFlow, flush_outgoing_bulk_payloads_with_buffer,
-    flush_outgoing_input_payloads_with_buffer, send_file_chunk_credit,
+    FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS, OutboundTransferFlow,
+    flush_outgoing_bulk_payloads_with_buffer, flush_outgoing_input_payloads_with_buffer,
 };
 use super::*;
-
-struct InboundTransfer {
-    peer_id: String,
-    file_name: String,
-    total_bytes: u64,
-    bytes_received: u64,
-    temp_path: std::path::PathBuf,
-    temp_file: tokio::fs::File,
-}
 
 pub(super) async fn connect_and_run_outbound(
     state: AppState,
@@ -522,183 +516,33 @@ where
                         file_name,
                         total_bytes,
                     } => {
-                        if machine_id != authenticated_peer_id {
-                            warn!(
-                                claimed_machine_id = %machine_id,
-                                authenticated_machine_id = %authenticated_peer_id,
-                                transfer_id = %transfer_id,
-                                "dropping file start with mismatched machine_id"
-                            );
-                            continue;
-                        }
-
-                        if inbound_transfers.len() >= MAX_INBOUND_TRANSFERS_PER_PEER {
-                            record_transport_transfer_rejected(
-                                &state,
-                                &authenticated_peer_id,
-                                format!(
-                                    "reason=too_many_transfers active={} limit={}",
-                                    inbound_transfers.len(),
-                                    MAX_INBOUND_TRANSFERS_PER_PEER
-                                ),
-                                0,
-                            )
-                            .await;
-                            continue;
-                        }
-
-                        if inbound_transfers.contains_key(&transfer_id) {
-                            record_transport_transfer_rejected(
-                                &state,
-                                &authenticated_peer_id,
-                                format!("reason=duplicate_transfer_id transfer_id={transfer_id}"),
-                                0,
-                            )
-                            .await;
-                            continue;
-                        }
-
-                        if let Err(error) = validate_transfer_size(total_bytes) {
-                            record_transport_transfer_rejected(
-                                &state,
-                                &authenticated_peer_id,
-                                format!(
-                                    "reason=invalid_total_size transfer_id={transfer_id} error={error}"
-                                ),
-                                total_bytes,
-                            )
-                            .await;
-                            continue;
-                        }
-
-                        let temp_path = std::env::temp_dir().join(format!(
-                            "boundless-inbound-{}-{}-{}.part",
-                            authenticated_peer_id,
-                            now_millis(),
-                            transfer_id
-                        ));
-                        let temp_file = match tokio::fs::File::create(&temp_path).await {
-                            Ok(file) => file,
-                            Err(error) => {
-                                record_transport_transfer_rejected(
-                                    &state,
-                                    &authenticated_peer_id,
-                                    format!(
-                                        "reason=temp_create_failed transfer_id={transfer_id} error={error}"
-                                    ),
-                                    total_bytes,
-                                )
-                                .await;
-                                continue;
-                            }
-                        };
-
-                        if let Some(peer_id) = &remote_peer_id {
-                            inbound_transfers.insert(
-                                transfer_id.clone(),
-                                InboundTransfer {
-                                    peer_id: peer_id.clone(),
-                                    file_name: file_name.clone(),
-                                    total_bytes,
-                                    bytes_received: 0,
-                                    temp_path,
-                                    temp_file,
-                                },
-                            );
-                            info!(
-                                peer_id = %peer_id,
-                                transfer_id = %transfer_id,
-                                file_name = %file_name,
-                                total_bytes,
-                                "started inbound file transfer"
-                            );
-                            send_file_chunk_credit(
-                                &mut writer,
-                                &transfer_id,
-                                FILE_TRANSFER_INITIAL_CHUNK_CREDITS,
-                                &mut write_frame_buffer,
-                            )
-                            .await?;
-                            writer
-                                .flush()
-                                .await
-                                .context("flush inbound file transfer initial credit")?;
-                        }
+                        handle_file_start(
+                            &state,
+                            &authenticated_peer_id,
+                            remote_peer_id.as_deref(),
+                            machine_id,
+                            transfer_id,
+                            file_name,
+                            total_bytes,
+                            &mut inbound_transfers,
+                            &mut writer,
+                            &mut write_frame_buffer,
+                        )
+                        .await?;
                     }
                     WireMessage::FileChunk {
                         transfer_id,
                         data,
                     } => {
-                        let Some(mut transfer) = inbound_transfers.remove(&transfer_id) else {
-                            warn!(transfer_id = %transfer_id, "received file chunk for unknown transfer");
-                            continue;
-                        };
-
-                        let chunk = data;
-
-                        let next_size = transfer.bytes_received.saturating_add(chunk.len() as u64);
-                        if let Err(error) = validate_transfer_size(next_size) {
-                            record_transport_transfer_rejected(
-                                &state,
-                                &transfer.peer_id,
-                                format!(
-                                    "reason=chunk_size_invalid transfer_id={transfer_id} error={error}"
-                                ),
-                                next_size,
-                            )
-                            .await;
-                            discard_inbound_transfer(transfer).await;
-                            continue;
-                        }
-
-                        if next_size > transfer.total_bytes {
-                            warn!(
-                                transfer_id = %transfer_id,
-                                announced_total = transfer.total_bytes,
-                                attempted_total = next_size,
-                                "inbound file exceeded announced total bytes"
-                            );
-                            record_transport_transfer_rejected(
-                                &state,
-                                &transfer.peer_id,
-                                format!(
-                                    "reason=chunk_exceeds_total transfer_id={transfer_id} announced_total={} attempted_total={next_size}",
-                                    transfer.total_bytes
-                                ),
-                                next_size,
-                            )
-                            .await;
-                            discard_inbound_transfer(transfer).await;
-                            continue;
-                        }
-
-                        if let Err(error) = transfer.temp_file.write_all(&chunk).await {
-                            record_transport_transfer_rejected(
-                                &state,
-                                &transfer.peer_id,
-                                format!(
-                                    "reason=temp_write_failed transfer_id={transfer_id} error={error}"
-                                ),
-                                next_size,
-                            )
-                            .await;
-                            discard_inbound_transfer(transfer).await;
-                            continue;
-                        }
-
-                        transfer.bytes_received = next_size;
-                        inbound_transfers.insert(transfer_id.clone(), transfer);
-                        send_file_chunk_credit(
+                        handle_file_chunk(
+                            &state,
+                            transfer_id,
+                            data,
+                            &mut inbound_transfers,
                             &mut writer,
-                            &transfer_id,
-                            1,
                             &mut write_frame_buffer,
                         )
                         .await?;
-                        writer
-                            .flush()
-                            .await
-                            .context("flush inbound file transfer chunk credit")?;
                     }
                     WireMessage::FileChunkCredit {
                         transfer_id,
@@ -741,76 +585,7 @@ where
                         }
                     }
                     WireMessage::FileEnd { transfer_id } => {
-                        let Some(mut transfer) = inbound_transfers.remove(&transfer_id) else {
-                            warn!(transfer_id = %transfer_id, "received file end for unknown transfer");
-                            continue;
-                        };
-
-                        if transfer.bytes_received != transfer.total_bytes {
-                            warn!(
-                                transfer_id = %transfer_id,
-                                expected = transfer.total_bytes,
-                                actual = transfer.bytes_received,
-                                "inbound file transfer ended with size mismatch"
-                            );
-                            record_transport_transfer_rejected(
-                                &state,
-                                &transfer.peer_id,
-                                format!(
-                                    "reason=size_mismatch transfer_id={transfer_id} expected={} actual={}",
-                                    transfer.total_bytes,
-                                    transfer.bytes_received
-                                ),
-                                transfer.bytes_received,
-                            )
-                            .await;
-                            discard_inbound_transfer(transfer).await;
-                            continue;
-                        }
-
-                        if let Err(error) = transfer.temp_file.flush().await {
-                            record_transport_transfer_rejected(
-                                &state,
-                                &transfer.peer_id,
-                                format!(
-                                    "reason=temp_flush_failed transfer_id={transfer_id} error={error}"
-                                ),
-                                transfer.bytes_received,
-                            )
-                            .await;
-                            discard_inbound_transfer(transfer).await;
-                            continue;
-                        }
-                        drop(transfer.temp_file);
-
-                        match state
-                            .store_incoming_file_from_temp(
-                                &transfer.peer_id,
-                                &transfer.file_name,
-                                &transfer.temp_path,
-                                transfer.bytes_received,
-                            )
-                            .await
-                        {
-                            Ok(path) => {
-                                info!(
-                                    peer_id = %transfer.peer_id,
-                                    transfer_id = %transfer_id,
-                                    file_name = %transfer.file_name,
-                                    path = %path.display(),
-                                    "stored inbound file payload"
-                                );
-                            }
-                            Err(error) => {
-                                warn!(
-                                    peer_id = %transfer.peer_id,
-                                    transfer_id = %transfer_id,
-                                    error = ?error,
-                                    "failed to store inbound file payload"
-                                );
-                                let _ = tokio::fs::remove_file(&transfer.temp_path).await;
-                            }
-                        }
+                        handle_file_end(&state, transfer_id, &mut inbound_transfers).await?;
                     }
                     WireMessage::InputFrame {
                         machine_id,
@@ -875,16 +650,6 @@ where
     }
 
     Ok(())
-}
-
-async fn discard_inbound_transfer(transfer: InboundTransfer) {
-    let InboundTransfer {
-        temp_path,
-        temp_file,
-        ..
-    } = transfer;
-    drop(temp_file);
-    let _ = tokio::fs::remove_file(temp_path).await;
 }
 
 pub(super) async fn reconnect_requested_for_peer(
@@ -983,22 +748,6 @@ async fn record_transport_frame_rejected(
         timestamp: Utc::now(),
         direction: "incoming".to_string(),
         kind: "transport_frame_rejected".to_string(),
-        peer_id: peer_id.to_string(),
-        detail,
-        size_bytes,
-    });
-}
-
-async fn record_transport_transfer_rejected(
-    state: &AppState,
-    peer_id: &str,
-    detail: String,
-    size_bytes: u64,
-) {
-    state.record_transport_event(TransportEventRecord {
-        timestamp: Utc::now(),
-        direction: "incoming".to_string(),
-        kind: "transport_transfer_rejected".to_string(),
         peer_id: peer_id.to_string(),
         detail,
         size_bytes,
