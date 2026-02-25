@@ -1097,41 +1097,58 @@ mod windows_app {
             .into_inner()
             .requests;
 
+        let mut discovered_peers = discovery
+            .peers
+            .into_iter()
+            .map(|peer| UiDiscoveredPeer {
+                machine_id: peer.machine_id,
+                display_name: peer.display_name,
+                endpoint: peer.endpoint,
+            })
+            .collect::<Vec<_>>();
+        discovered_peers.sort_by(|left, right| {
+            left.display_name
+                .cmp(&right.display_name)
+                .then_with(|| left.machine_id.cmp(&right.machine_id))
+        });
+
+        let mut paired_peers = peers
+            .into_iter()
+            .map(|peer| UiPairedPeer {
+                peer_id: peer.peer_id,
+                display_name: peer.display_name,
+                address: peer.address,
+                connected: peer.connected,
+            })
+            .collect::<Vec<_>>();
+        paired_peers.sort_by(|left, right| {
+            left.display_name
+                .cmp(&right.display_name)
+                .then_with(|| left.peer_id.cmp(&right.peer_id))
+        });
+
+        let mut pending_requests = pending
+            .into_iter()
+            .map(|request| UiPendingRequest {
+                request_id: request.request_id,
+                requester_machine_id: request.requester_machine_id,
+                requester_display_name: request.requester_display_name,
+                created_at: request.created_at,
+                verification_code: request.verification_code,
+                verification_expires_at: request.verification_expires_at,
+                requires_verification_code: request.requires_verification_code,
+            })
+            .collect::<Vec<_>>();
+        pending_requests.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+
         Ok(UiSnapshot {
             generated_at: String::new(),
             daemon_online: status.running,
             machine_id: status.machine_id,
             layout_matrix: layout,
-            discovered_peers: discovery
-                .peers
-                .into_iter()
-                .map(|peer| UiDiscoveredPeer {
-                    machine_id: peer.machine_id,
-                    display_name: peer.display_name,
-                    endpoint: peer.endpoint,
-                })
-                .collect(),
-            paired_peers: peers
-                .into_iter()
-                .map(|peer| UiPairedPeer {
-                    peer_id: peer.peer_id,
-                    display_name: peer.display_name,
-                    address: peer.address,
-                    connected: peer.connected,
-                })
-                .collect(),
-            pending_requests: pending
-                .into_iter()
-                .map(|request| UiPendingRequest {
-                    request_id: request.request_id,
-                    requester_machine_id: request.requester_machine_id,
-                    requester_display_name: request.requester_display_name,
-                    created_at: request.created_at,
-                    verification_code: request.verification_code,
-                    verification_expires_at: request.verification_expires_at,
-                    requires_verification_code: request.requires_verification_code,
-                })
-                .collect(),
+            discovered_peers,
+            paired_peers,
+            pending_requests,
         })
     }
 
