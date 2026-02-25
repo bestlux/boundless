@@ -48,6 +48,16 @@ Profiles:
 ./scripts/dev/test-suite.ps1 -Profile trace -TraceEnforceBudgets -TraceCaptureToApplyP95BudgetMs 45 -TraceCaptureToReceiveP95BudgetMs 20 -TraceCaptureToApplyJitterP95BudgetMs 18
 ```
 
+`-Profile trace` now also exports matrix artifacts beside the trace log by default:
+- `<trace>.matrix.csv`
+- `<trace>.matrix.json`
+
+Standalone matrix export for one or more trace logs:
+
+```powershell
+./scripts/dev/input-trace-matrix.ps1 -TraceDir ./artifacts/input-trace -Scenario edge_handoff -Topology topology_a
+```
+
 Compatibility wrapper (legacy command still works):
 
 ```powershell

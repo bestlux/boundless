@@ -8,6 +8,12 @@ param(
     [int]$TraceCaptureToReceiveP95BudgetMs = 20,
     [int]$TraceCaptureToApplyJitterP95BudgetMs = 18,
     [switch]$TraceEnforceBudgets,
+    [string]$TraceOutputPath = "",
+    [string]$TraceMatrixCsvPath = "",
+    [string]$TraceMatrixJsonPath = "",
+    [string]$TraceScenario = "trace",
+    [string]$TraceTopology = "",
+    [switch]$TraceSkipMatrixExport,
     [string]$EndpointA = "http://127.0.0.1:50051",
     [string]$EndpointB = "",
     [string]$LabelA = "machine-a",
@@ -76,10 +82,18 @@ function Run-ThreeNodeSmoke {
 }
 
 function Run-TraceCapture {
+    $resolvedTraceOutputPath = $TraceOutputPath
+    if ([string]::IsNullOrWhiteSpace($resolvedTraceOutputPath)) {
+        $traceOutDir = Join-Path $repoRoot "artifacts/input-trace"
+        $null = New-Item -ItemType Directory -Force -Path $traceOutDir
+        $resolvedTraceOutputPath = Join-Path $traceOutDir ("edge-handoff-trace-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+    }
+
     $commandParams = @{
         EndpointA = $EndpointA
         LabelA = $LabelA
         DurationSeconds = $TraceDurationSeconds
+        OutputPath = $resolvedTraceOutputPath
         CaptureToApplyP95BudgetMs = $TraceCaptureToApplyP95BudgetMs
         CaptureToReceiveP95BudgetMs = $TraceCaptureToReceiveP95BudgetMs
         CaptureToApplyJitterP95BudgetMs = $TraceCaptureToApplyJitterP95BudgetMs
@@ -94,6 +108,32 @@ function Run-TraceCapture {
 
     Invoke-CheckedCommand -Label "scripts/dev/edge-handoff-trace.ps1" -Action {
         & (Join-Path $repoRoot "scripts/dev/edge-handoff-trace.ps1") @commandParams | Out-Host
+    }
+
+    if (-not $TraceSkipMatrixExport) {
+        $resolvedMatrixCsvPath = $TraceMatrixCsvPath
+        if ([string]::IsNullOrWhiteSpace($resolvedMatrixCsvPath)) {
+            $resolvedMatrixCsvPath = [System.IO.Path]::ChangeExtension($resolvedTraceOutputPath, ".matrix.csv")
+        }
+        $resolvedMatrixJsonPath = $TraceMatrixJsonPath
+        if ([string]::IsNullOrWhiteSpace($resolvedMatrixJsonPath)) {
+            $resolvedMatrixJsonPath = [System.IO.Path]::ChangeExtension($resolvedTraceOutputPath, ".matrix.json")
+        }
+
+        $exportParams = @{
+            TracePaths = @($resolvedTraceOutputPath)
+            OutputCsvPath = $resolvedMatrixCsvPath
+            OutputJsonPath = $resolvedMatrixJsonPath
+            Scenario = $TraceScenario
+            Topology = $TraceTopology
+            CaptureToApplyP95BudgetMs = $TraceCaptureToApplyP95BudgetMs
+            CaptureToReceiveP95BudgetMs = $TraceCaptureToReceiveP95BudgetMs
+            CaptureToApplyJitterP95BudgetMs = $TraceCaptureToApplyJitterP95BudgetMs
+        }
+
+        Invoke-CheckedCommand -Label "scripts/dev/input-trace-matrix.ps1" -Action {
+            & (Join-Path $repoRoot "scripts/dev/input-trace-matrix.ps1") @exportParams | Out-Host
+        }
     }
 }
 

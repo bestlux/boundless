@@ -124,8 +124,10 @@ function Summarize-Metrics {
     $receiveValues = $CaptureToReceive.ToArray()
     $applyP50 = Get-Percentile -Values $applyValues -Percentile 50
     $applyP95 = Get-Percentile -Values $applyValues -Percentile 95
+    $applyP99 = Get-Percentile -Values $applyValues -Percentile 99
     $receiveP50 = Get-Percentile -Values $receiveValues -Percentile 50
     $receiveP95 = Get-Percentile -Values $receiveValues -Percentile 95
+    $receiveP99 = Get-Percentile -Values $receiveValues -Percentile 99
     $applyJitterP95 = Get-JitterP95 -Series $applyValues
     $applyMax = if ($applyValues.Count -gt 0) { ($applyValues | Measure-Object -Maximum).Maximum } else { $null }
     $receiveMax = if ($receiveValues.Count -gt 0) { ($receiveValues | Measure-Object -Maximum).Maximum } else { $null }
@@ -136,10 +138,12 @@ function Summarize-Metrics {
         CaptureToReceiveCount = $receiveValues.Count
         CaptureToApplyP50 = $applyP50
         CaptureToApplyP95 = $applyP95
+        CaptureToApplyP99 = $applyP99
         CaptureToApplyMax = $applyMax
         CaptureToApplyJitterP95 = $applyJitterP95
         CaptureToReceiveP50 = $receiveP50
         CaptureToReceiveP95 = $receiveP95
+        CaptureToReceiveP99 = $receiveP99
         CaptureToReceiveMax = $receiveMax
     }
 }
@@ -284,16 +288,18 @@ foreach ($target in $targets) {
         -CaptureToReceive $metric.CaptureToReceive
 
     Write-TraceLine (
-        "latency_summary label={0} capture_to_apply_count={1} capture_to_apply_p50={2} capture_to_apply_p95={3} capture_to_apply_max={4} capture_to_apply_jitter_p95={5} capture_to_receive_count={6} capture_to_receive_p50={7} capture_to_receive_p95={8} capture_to_receive_max={9}" -f
+        "latency_summary label={0} capture_to_apply_count={1} capture_to_apply_p50={2} capture_to_apply_p95={3} capture_to_apply_p99={4} capture_to_apply_max={5} capture_to_apply_jitter_p95={6} capture_to_receive_count={7} capture_to_receive_p50={8} capture_to_receive_p95={9} capture_to_receive_p99={10} capture_to_receive_max={11}" -f
         $summary.Label,
         $summary.CaptureToApplyCount,
         $summary.CaptureToApplyP50,
         $summary.CaptureToApplyP95,
+        $summary.CaptureToApplyP99,
         $summary.CaptureToApplyMax,
         $summary.CaptureToApplyJitterP95,
         $summary.CaptureToReceiveCount,
         $summary.CaptureToReceiveP50,
         $summary.CaptureToReceiveP95,
+        $summary.CaptureToReceiveP99,
         $summary.CaptureToReceiveMax
     )
 
