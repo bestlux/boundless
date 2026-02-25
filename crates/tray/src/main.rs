@@ -212,7 +212,7 @@ mod windows_app {
                 .filter(|peer| peer.connected)
                 .count();
 
-            menu.append(&MenuItem::new("Boundless Tray v2", false, None))?;
+            menu.append(&MenuItem::new("Boundless Tray v1", false, None))?;
             menu.append(&MenuItem::new(
                 if self.snapshot.daemon_online {
                     "daemon=online"
@@ -501,16 +501,7 @@ mod windows_app {
                 start_args.push(pairing_port.to_string());
             }
 
-            let start_output = match run_boundlessctl(&self.ctx, &start_args) {
-                Ok(output) => output,
-                Err(error) => {
-                    let message = error.to_string();
-                    if message.contains("does not support guided pairing request flow") {
-                        return self.run_pair_request_legacy(machine_id, default_alias);
-                    }
-                    return Err(error);
-                }
-            };
+            let start_output = run_boundlessctl(&self.ctx, &start_args)?;
 
             let request_id = parse_key_value(&start_output, "request_id").ok_or_else(|| {
                 anyhow::anyhow!("pairing response missing request_id: {start_output}")
@@ -570,49 +561,6 @@ mod windows_app {
             );
             Ok(())
         }
-
-        fn run_pair_request_legacy(&self, machine_id: &str, default_alias: &str) -> Result<()> {
-            let code = input_box(
-                "Boundless Pairing",
-                "Target does not support guided pairing yet.\nEnter the 6-digit code shown on the target machine:",
-                "",
-            )
-            .ok_or_else(|| anyhow::anyhow!("pair request cancelled"))?;
-            let code = code.trim().to_string();
-            if code.is_empty() {
-                bail!("pairing code cannot be empty");
-            }
-
-            let alias = input_box(
-                "Boundless Pairing",
-                "Alias for this peer (optional):",
-                default_alias,
-            )
-            .unwrap_or_default();
-
-            let mut args = vec![
-                "pair".to_string(),
-                "request".to_string(),
-                machine_id.to_string(),
-                "--code".to_string(),
-                code,
-                "--timeout-seconds".to_string(),
-                "120".to_string(),
-            ];
-            if !alias.trim().is_empty() {
-                args.push("--alias".to_string());
-                args.push(alias.trim().to_string());
-            }
-
-            let output = run_boundlessctl(&self.ctx, &args)?;
-            message_box_ok(
-                "Boundless",
-                &format!("Pairing request completed:\n{output}"),
-                MessageBoxIcon::Info,
-            );
-            Ok(())
-        }
-
         fn run_setup_wizard(&self) -> Result<()> {
             if self.snapshot.discovered_peers.is_empty() {
                 return self.run_setup_wizard_manual();

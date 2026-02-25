@@ -1,32 +1,7 @@
 use super::*;
 
-pub(super) fn protocol_supports_clipboard_image(protocol: ProtocolVersion) -> bool {
-    protocol.as_tuple() >= PROTOCOL_CLIPBOARD_IMAGE_MIN.as_tuple()
-}
-
-pub(super) fn protocol_supports_input_anchor(protocol: ProtocolVersion) -> bool {
-    protocol.as_tuple() >= PROTOCOL_INPUT_ANCHOR_MIN.as_tuple()
-}
-
-pub(super) fn protocol_supports_file_chunk_credit(protocol: ProtocolVersion) -> bool {
-    protocol.as_tuple() >= PROTOCOL_FILE_CHUNK_CREDIT_MIN.as_tuple()
-}
-
-pub(super) fn input_events_to_wire_for_protocol(
-    events: &[InputEvent],
-    remote_protocol: ProtocolVersion,
-) -> Vec<WireInputEvent> {
-    events
-        .iter()
-        .filter_map(|event| {
-            if matches!(event, InputEvent::MouseMoveAbsolute { .. })
-                && !protocol_supports_input_anchor(remote_protocol)
-            {
-                return None;
-            }
-            Some(input_event_to_wire(event))
-        })
-        .collect()
+pub(super) fn input_events_to_wire(events: &[InputEvent]) -> Vec<WireInputEvent> {
+    events.iter().map(input_event_to_wire).collect()
 }
 
 fn input_event_to_wire(event: &InputEvent) -> WireInputEvent {

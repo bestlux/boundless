@@ -16,7 +16,6 @@ struct InboundTransfer {
 #[derive(Debug, Default)]
 struct OutboundTransferFlow {
     available_chunk_credits: u32,
-    credit_managed: bool,
 }
 
 const FILE_TRANSFER_INITIAL_CHUNK_CREDITS: u32 = 8;
@@ -350,6 +349,27 @@ where
                             let _ = writer.flush().await;
                             break;
                         }
+                        if protocol != PROTOCOL_CURRENT {
+                            warn!(
+                                peer_id = %authenticated_peer_id,
+                                remote_protocol = %protocol,
+                                expected_protocol = %PROTOCOL_CURRENT,
+                                "rejecting peer with non-canonical protocol version"
+                            );
+                            let _ = send_message(
+                                &mut writer,
+                                &WireMessage::Error {
+                                    message: format!(
+                                        "unsupported protocol version: remote={} expected={}",
+                                        protocol, PROTOCOL_CURRENT
+                                    ),
+                                },
+                                &mut write_frame_buffer,
+                            )
+                            .await;
+                            let _ = writer.flush().await;
+                            break;
+                        }
                         remote_protocol = Some(protocol);
 
                         if let Some(peer_id) = &remote_peer_id {
@@ -477,16 +497,6 @@ where
                         machine_id,
                         data,
                     } => {
-                        if !remote_protocol.is_some_and(protocol_supports_clipboard_image) {
-                            warn!(
-                                peer_id = %authenticated_peer_id,
-                                remote_protocol = ?remote_protocol,
-                                required_protocol = %PROTOCOL_CLIPBOARD_IMAGE_MIN,
-                                "dropping clipboard image payload from peer without image-frame support"
-                            );
-                            continue;
-                        }
-
                         if machine_id != authenticated_peer_id {
                             warn!(
                                 claimed_machine_id = %machine_id,
@@ -614,21 +624,17 @@ where
                                 total_bytes,
                                 "started inbound file transfer"
                             );
-                            if remote_protocol
-                                .is_some_and(protocol_supports_file_chunk_credit)
-                            {
-                                send_file_chunk_credit(
-                                    &mut writer,
-                                    &transfer_id,
-                                    FILE_TRANSFER_INITIAL_CHUNK_CREDITS,
-                                    &mut write_frame_buffer,
-                                )
-                                .await?;
-                                writer
-                                    .flush()
-                                    .await
-                                    .context("flush inbound file transfer initial credit")?;
-                            }
+                            send_file_chunk_credit(
+                                &mut writer,
+                                &transfer_id,
+                                FILE_TRANSFER_INITIAL_CHUNK_CREDITS,
+                                &mut write_frame_buffer,
+                            )
+                            .await?;
+                            writer
+                                .flush()
+                                .await
+                                .context("flush inbound file transfer initial credit")?;
                         }
                     }
                     WireMessage::FileChunk {
@@ -694,19 +700,17 @@ where
 
                         transfer.bytes_received = next_size;
                         inbound_transfers.insert(transfer_id.clone(), transfer);
-                        if remote_protocol.is_some_and(protocol_supports_file_chunk_credit) {
-                            send_file_chunk_credit(
-                                &mut writer,
-                                &transfer_id,
-                                1,
-                                &mut write_frame_buffer,
-                            )
-                            .await?;
-                            writer
-                                .flush()
-                                .await
-                                .context("flush inbound file transfer chunk credit")?;
-                        }
+                        send_file_chunk_credit(
+                            &mut writer,
+                            &transfer_id,
+                            1,
+                            &mut write_frame_buffer,
+                        )
+                        .await?;
+                        writer
+                            .flush()
+                            .await
+                            .context("flush inbound file transfer chunk credit")?;
                     }
                     WireMessage::FileChunkCredit {
                         transfer_id,
@@ -724,9 +728,6 @@ where
                             );
                             continue;
                         };
-                        if !flow.credit_managed {
-                            continue;
-                        }
 
                         flow.available_chunk_credits = flow
                             .available_chunk_credits
@@ -1004,9 +1005,6 @@ fn restore_outbound_chunk_credits_for_payloads(
         let Some(flow) = outbound_transfer_flow.get_mut(transfer_id) else {
             continue;
         };
-        if !flow.credit_managed {
-            continue;
-        }
         flow.available_chunk_credits = flow
             .available_chunk_credits
             .saturating_add(1)
@@ -1202,6 +1200,14 @@ async fn send_outbound_payload<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    if remote_protocol != PROTOCOL_CURRENT {
+        bail!(
+            "unsupported peer protocol for canonical v1: remote={} expected={}",
+            remote_protocol,
+            PROTOCOL_CURRENT
+        );
+    }
+
     match payload {
         OutboundPayload::ClipboardText { text } => {
             let message = WireMessage::ClipboardText {
@@ -1242,16 +1248,6 @@ where
             Ok(SendPayloadOutcome::Sent)
         }
         OutboundPayload::ClipboardImage { image_bmp } => {
-            if !protocol_supports_clipboard_image(remote_protocol) {
-                warn!(
-                    peer_id = %peer_id,
-                    remote_protocol = %remote_protocol,
-                    required_protocol = %PROTOCOL_CLIPBOARD_IMAGE_MIN,
-                    "dropping clipboard image payload for peer without image-frame support"
-                );
-                return Ok(SendPayloadOutcome::Dropped);
-            }
-
             let message = WireMessage::ClipboardImage {
                 machine_id: local_machine_id.to_string(),
                 data: image_bmp.clone(),
@@ -1313,7 +1309,6 @@ where
                 transfer_id.clone(),
                 OutboundTransferFlow {
                     available_chunk_credits: 0,
-                    credit_managed: protocol_supports_file_chunk_credit(remote_protocol),
                 },
             );
             Ok(SendPayloadOutcome::Sent)
@@ -1333,7 +1328,7 @@ where
                 return Ok(SendPayloadOutcome::Dropped);
             };
 
-            if flow.credit_managed && flow.available_chunk_credits == 0 {
+            if flow.available_chunk_credits == 0 {
                 return Ok(SendPayloadOutcome::DeferredForBackpressure);
             }
 
@@ -1370,9 +1365,7 @@ where
                 writer_ctx.frame_buffer,
             )
             .await?;
-            if let Some(flow) = writer_ctx.outbound_transfer_flow.get_mut(transfer_id)
-                && flow.credit_managed
-            {
+            if let Some(flow) = writer_ctx.outbound_transfer_flow.get_mut(transfer_id) {
                 flow.available_chunk_credits = flow.available_chunk_credits.saturating_sub(1);
             }
             Ok(SendPayloadOutcome::Sent)
@@ -1402,25 +1395,13 @@ where
             timestamp_unix_ms,
             events,
         } => {
-            let wire_events = input_events_to_wire_for_protocol(events, remote_protocol);
-            if wire_events.is_empty() {
-                warn!(
-                    peer_id = %peer_id,
-                    sequence = *sequence,
-                    remote_protocol = %remote_protocol,
-                    required_protocol = %PROTOCOL_INPUT_ANCHOR_MIN,
-                    "dropping input frame with unsupported events for negotiated protocol"
-                );
-                return Ok(SendPayloadOutcome::Dropped);
-            }
-
             send_message(
                 writer_ctx.writer,
                 &WireMessage::InputFrame {
                     machine_id: local_machine_id.to_string(),
                     sequence: *sequence,
                     timestamp_unix_ms: *timestamp_unix_ms,
-                    events: wire_events,
+                    events: input_events_to_wire(events),
                 },
                 writer_ctx.frame_buffer,
             )

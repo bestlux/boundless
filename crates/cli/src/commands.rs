@@ -255,10 +255,7 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
             Ok(())
         }
         NearbyRequestCodeStart::Unsupported { reason } => {
-            bail!(
-                "target does not support guided pairing request flow ({reason}); retry with `pair request {} --code <pairing-code>`",
-                selector_hint
-            );
+            bail!("target does not support the canonical guided pairing request flow ({reason})");
         }
     }
 }

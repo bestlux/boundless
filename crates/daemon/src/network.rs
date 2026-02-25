@@ -25,10 +25,9 @@ use tracing::{error, info, warn};
 
 use core_input::{InputEvent, InputFrame, KeyState, MouseButton};
 use core_protocol::{
-    MAX_WIRE_PAYLOAD_BYTES, PROTOCOL_CLIPBOARD_IMAGE_MIN, PROTOCOL_CURRENT,
-    PROTOCOL_FILE_CHUNK_CREDIT_MIN, PROTOCOL_INPUT_ANCHOR_MIN, ProtocolVersion,
-    WIRE_FRAME_LENGTH_PREFIX_BYTES, WireCodecError, WireInputEvent, WireKeyState, WireMessage,
-    WireMouseButton, decode_frame_payload, encode_frame_to_vec,
+    MAX_WIRE_PAYLOAD_BYTES, PROTOCOL_CURRENT, ProtocolVersion, WIRE_FRAME_LENGTH_PREFIX_BYTES,
+    WireCodecError, WireInputEvent, WireKeyState, WireMessage, WireMouseButton,
+    decode_frame_payload, encode_frame_to_vec,
 };
 use core_transfer::validate_transfer_size;
 
@@ -40,11 +39,7 @@ mod session;
 mod tls;
 
 #[cfg(test)]
-use codec::protocol_supports_input_anchor;
-use codec::{
-    input_event_from_wire, input_events_to_wire_for_protocol, now_millis,
-    protocol_supports_clipboard_image, protocol_supports_file_chunk_credit,
-};
+use codec::{input_event_from_wire, input_events_to_wire, now_millis};
 #[cfg(test)]
 use runtime::outbound_target_candidates;
 use runtime::{listener_loop, supervisor_loop};
@@ -442,34 +437,6 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_image_support_requires_protocol_1_1_or_newer() {
-        assert!(!protocol_supports_clipboard_image(ProtocolVersion {
-            major: 1,
-            minor: 0,
-            patch: 9,
-        }));
-        assert!(protocol_supports_clipboard_image(ProtocolVersion {
-            major: 1,
-            minor: 1,
-            patch: 0,
-        }));
-    }
-
-    #[test]
-    fn input_anchor_support_requires_protocol_1_2_or_newer() {
-        assert!(!protocol_supports_input_anchor(ProtocolVersion {
-            major: 1,
-            minor: 1,
-            patch: 9,
-        }));
-        assert!(protocol_supports_input_anchor(ProtocolVersion {
-            major: 1,
-            minor: 2,
-            patch: 0,
-        }));
-    }
-
-    #[test]
     fn perf_probe_outgoing_flush_tick_rate() {
         let input_flush_ms = OUTGOING_INPUT_FLUSH_INTERVAL.as_millis() as f64;
         let bulk_flush_ms = OUTGOING_BULK_FLUSH_INTERVAL.as_millis() as f64;
@@ -498,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn input_wire_filter_drops_absolute_move_for_legacy_peer() {
+    fn input_wire_conversion_preserves_all_event_types() {
         let events = vec![
             InputEvent::MouseMoveAbsolute {
                 x_norm: 10,
@@ -506,41 +473,17 @@ mod tests {
             },
             InputEvent::MouseMove { dx: 3, dy: -4 },
         ];
-        let wire = input_events_to_wire_for_protocol(
-            &events,
-            ProtocolVersion {
-                major: 1,
-                minor: 1,
-                patch: 0,
-            },
-        );
+        let wire = input_events_to_wire(&events);
 
-        assert_eq!(wire.len(), 1);
-        assert!(matches!(
-            wire.first(),
-            Some(WireInputEvent::MouseMove { dx, dy }) if *dx == 3 && *dy == -4
-        ));
-    }
-
-    #[test]
-    fn input_wire_filter_keeps_absolute_move_for_supported_peer() {
-        let events = vec![InputEvent::MouseMoveAbsolute {
-            x_norm: 100,
-            y_norm: 200,
-        }];
-        let wire = input_events_to_wire_for_protocol(
-            &events,
-            ProtocolVersion {
-                major: 1,
-                minor: 2,
-                patch: 0,
-            },
-        );
-
+        assert_eq!(wire.len(), 2);
         assert!(matches!(
             wire.first(),
             Some(WireInputEvent::MouseMoveAbsolute { x_norm, y_norm })
-                if *x_norm == 100 && *y_norm == 200
+                if *x_norm == 10 && *y_norm == 20
+        ));
+        assert!(matches!(
+            wire.get(1),
+            Some(WireInputEvent::MouseMove { dx, dy }) if *dx == 3 && *dy == -4
         ));
     }
 
@@ -666,7 +609,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_drops_clipboard_image_for_legacy_protocol_peer() {
+    async fn flush_rejects_non_canonical_protocol_version() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         state
             .queue_clipboard_image(&peer_id, minimal_bmp_payload())
@@ -674,7 +617,7 @@ mod tests {
             .expect("queue image");
 
         let mut writer = FailAfterCallsWriter::new(1);
-        flush_outgoing_payloads(
+        let error = flush_outgoing_payloads(
             &state,
             "local",
             Some(&peer_id),
@@ -686,10 +629,16 @@ mod tests {
             &mut writer,
         )
         .await
-        .expect("legacy peer image should be dropped, not sent");
+        .expect_err("non-canonical protocol should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported peer protocol for canonical v1"),
+            "unexpected error: {error:#}"
+        );
 
-        let queued = state.drain_outgoing(&peer_id).await;
-        assert!(queued.is_empty(), "dropped image must not be requeued");
+        let queued = state.drain_outgoing_bulk(&peer_id, usize::MAX).await;
+        assert_eq!(queued.len(), 1, "payload should remain queued on rejection");
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -789,59 +738,6 @@ mod tests {
                 ..
             }) if end_transfer_id == &transfer_id
         ));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn flush_file_transfer_falls_back_for_legacy_peer_without_chunk_credit() {
-        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
-        let file_path = root.join("legacy-flow.bin");
-        let payload = vec![5u8; crate::state::FILE_TRANSFER_CHUNK_BYTES + 7];
-        tokio::fs::write(&file_path, &payload)
-            .await
-            .expect("write payload");
-
-        state
-            .queue_file_from_path(&peer_id, &file_path)
-            .await
-            .expect("queue file");
-
-        let mut writer = CaptureWriter::default();
-        flush_outgoing_payloads(
-            &state,
-            "local",
-            Some(&peer_id),
-            ProtocolVersion {
-                major: 2,
-                minor: 0,
-                patch: 0,
-            },
-            &mut writer,
-        )
-        .await
-        .expect("flush file transfer for legacy peer");
-
-        let frames = decode_written_frames(&writer.bytes);
-        assert_eq!(
-            frames.len(),
-            4,
-            "legacy peers should receive full file transfer without chunk credits"
-        );
-        assert!(matches!(
-            frames.first(),
-            Some(WireMessage::FileStart { .. })
-        ));
-        assert!(matches!(frames.get(1), Some(WireMessage::FileChunk { .. })));
-        assert!(matches!(frames.get(2), Some(WireMessage::FileChunk { .. })));
-        assert!(matches!(frames.get(3), Some(WireMessage::FileEnd { .. })));
-        assert!(
-            state
-                .drain_outgoing_bulk(&peer_id, usize::MAX)
-                .await
-                .is_empty(),
-            "legacy transfer should not stall in outbound queue"
-        );
 
         let _ = std::fs::remove_dir_all(root);
     }

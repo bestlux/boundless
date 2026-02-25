@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -12,7 +12,7 @@ use uuid::Uuid;
 use core_protocol::PROTOCOL_CURRENT;
 
 const DEFAULT_LAYOUT_MATRIX: &str = "self";
-const LEGACY_LAYOUT_MATRIX_PLACEHOLDER: &str = "A,B;C,D";
+const RUNTIME_CONFIG_VERSION: &str = "2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerConfig {
@@ -56,7 +56,6 @@ impl ApiTransport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
-    #[serde(default = "default_config_version")]
     pub config_version: String,
     pub machine_id: String,
     pub device_name: String,
@@ -121,7 +120,7 @@ impl Default for RuntimeConfig {
 }
 
 fn default_config_version() -> String {
-    "1".to_string()
+    RUNTIME_CONFIG_VERSION.to_string()
 }
 
 fn default_api_transport() -> ApiTransport {
@@ -159,20 +158,34 @@ pub fn load_or_create_config_at(path: &Path) -> Result<RuntimeConfig> {
     }
 
     let data = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut config: RuntimeConfig =
+    let config: RuntimeConfig =
         serde_json::from_str(&data).with_context(|| format!("parse {}", path.display()))?;
 
-    let mut changed = false;
-    let layout = config.layout_matrix.trim();
-    if layout.is_empty() || layout.eq_ignore_ascii_case(LEGACY_LAYOUT_MATRIX_PLACEHOLDER) {
-        config.layout_matrix = DEFAULT_LAYOUT_MATRIX.to_string();
-        changed = true;
+    if config.config_version != RUNTIME_CONFIG_VERSION {
+        bail!(
+            "unsupported config version `{}`; expected `{}`. remove `{}` to regenerate config for this build",
+            config.config_version,
+            RUNTIME_CONFIG_VERSION,
+            path.display()
+        );
     }
 
-    config.updated_at = Utc::now();
-    if changed {
-        save_config_at(path, &config)?;
+    if config.protocol_version != PROTOCOL_CURRENT.to_string() {
+        bail!(
+            "unsupported protocol version `{}` in config; expected `{}`. remove `{}` to regenerate config for this build",
+            config.protocol_version,
+            PROTOCOL_CURRENT,
+            path.display()
+        );
     }
+
+    if config.layout_matrix.trim().is_empty() {
+        bail!(
+            "invalid config: layout_matrix must not be empty in `{}`",
+            path.display()
+        );
+    }
+
     Ok(config)
 }
 
@@ -197,10 +210,8 @@ fn hostname() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ApiTransport, DEFAULT_LAYOUT_MATRIX, LEGACY_LAYOUT_MATRIX_PLACEHOLDER, RuntimeConfig,
-        load_or_create_config_at, save_config_at,
-    };
+    use super::{ApiTransport, RuntimeConfig, load_or_create_config_at, save_config_at};
+    use core_protocol::PROTOCOL_CURRENT;
 
     #[test]
     fn tcp_effective_transport_is_tcp() {
@@ -226,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_defaults_missing_config_version_on_deserialize() {
+    fn load_or_create_config_rejects_missing_config_version() {
         let json = r#"{
   "machine_id": "m1",
   "device_name": "node",
@@ -234,7 +245,7 @@ mod tests {
   "api_transport": "tcp",
   "api_pipe_name": "boundlessd-api",
   "protocol_version": "1.1.0",
-  "layout_matrix": "A,B;C,D",
+  "layout_matrix": "self",
   "auto_start": true,
   "network_port": 15100,
   "features": {
@@ -254,32 +265,72 @@ mod tests {
   "updated_at": "2026-01-01T00:00:00Z"
 }"#;
 
-        let parsed: RuntimeConfig = serde_json::from_str(json).expect("parse legacy config");
-        assert_eq!(parsed.config_version, "1");
+        let root = std::env::temp_dir().join(format!(
+            "boundless-config-missing-version-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("config.json");
+        std::fs::create_dir_all(&root).expect("create temp root");
+        std::fs::write(&path, json).expect("write seeded config");
+
+        let _error = load_or_create_config_at(&path).expect_err("must reject missing version");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn load_or_create_config_migrates_placeholder_layout_matrix() {
+    fn load_or_create_config_rejects_protocol_version_mismatch() {
         let root = std::env::temp_dir().join(format!(
-            "boundless-config-layout-migration-test-{}",
+            "boundless-config-protocol-mismatch-test-{}",
             uuid::Uuid::new_v4()
         ));
         let path = root.join("config.json");
         std::fs::create_dir_all(&root).expect("create temp root");
 
         let seed = RuntimeConfig {
-            layout_matrix: LEGACY_LAYOUT_MATRIX_PLACEHOLDER.to_string(),
+            protocol_version: "2.0.0".to_string(),
             ..RuntimeConfig::default()
         };
-        save_config_at(&path, &seed).expect("seed legacy config");
+        save_config_at(&path, &seed).expect("seed stale config");
 
-        let loaded = load_or_create_config_at(&path).expect("load config");
-        assert_eq!(loaded.layout_matrix, DEFAULT_LAYOUT_MATRIX);
+        let error = load_or_create_config_at(&path).expect_err("must reject stale protocol");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("expected `{}`", PROTOCOL_CURRENT)),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("regenerate config"),
+            "unexpected error: {error:#}"
+        );
 
-        let persisted = std::fs::read_to_string(&path).expect("read persisted config");
-        let parsed: RuntimeConfig = serde_json::from_str(&persisted).expect("parse persisted json");
-        assert_eq!(parsed.layout_matrix, DEFAULT_LAYOUT_MATRIX);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
-        let _ = std::fs::remove_dir_all(&root);
+    #[test]
+    fn load_or_create_config_rejects_empty_layout_matrix() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-config-empty-layout-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("config.json");
+        std::fs::create_dir_all(&root).expect("create temp root");
+
+        let seed = RuntimeConfig {
+            layout_matrix: "   ".to_string(),
+            ..RuntimeConfig::default()
+        };
+        save_config_at(&path, &seed).expect("seed invalid config");
+
+        let error = load_or_create_config_at(&path).expect_err("must reject empty layout");
+        assert!(
+            error
+                .to_string()
+                .contains("layout_matrix must not be empty"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
