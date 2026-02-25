@@ -186,6 +186,40 @@ mod windows_app {
         },
     }
 
+    #[derive(Debug, Clone)]
+    struct GuidedPairingFlow {
+        dialog_title: String,
+        host: String,
+        pairing_port: u16,
+        default_alias: String,
+        orientation_selector_fallback: String,
+    }
+
+    #[derive(Debug, Clone)]
+    struct PairingChallengeState {
+        request_id: String,
+        verification_nonce: String,
+        expires_at: String,
+    }
+
+    #[derive(Debug, Clone)]
+    struct PairingSubmissionState {
+        code: String,
+        alias: String,
+    }
+
+    #[derive(Debug, Clone)]
+    struct GuidedPairingResult {
+        peer_machine_id: String,
+        orientation_selector: String,
+    }
+
+    #[derive(Debug, Clone)]
+    enum SetupWizardTarget {
+        Discovered(UiDiscoveredPeer),
+        Manual { host: String, pairing_port: u16 },
+    }
+
     #[derive(Debug)]
     enum UserEvent {
         Menu(MenuEvent),
@@ -575,83 +609,42 @@ mod windows_app {
         }
 
         fn run_pair_request(&self, machine_id: &str) -> Result<()> {
-            let discovered_peer = self
-                .snapshot
-                .discovered_peers
-                .iter()
-                .find(|peer| peer.machine_id == machine_id)
-                .ok_or_else(|| anyhow::anyhow!("discovered peer not found for {machine_id}"))?;
-            let default_alias = discovered_peer.display_name.as_str();
-            let (host, pairing_port) =
-                host_and_pairing_port_from_discovery_endpoint(&discovered_peer.endpoint)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("invalid discovered endpoint {}", discovered_peer.endpoint)
-                    })?;
-
-            let (request_id, verification_nonce, expires_at) =
-                match pair_nearby_request_code_blocking(
-                    &self.ctx.endpoint,
-                    host.clone(),
-                    pairing_port,
-                )? {
-                    NearbyRequestCodeStart::CodeRequired {
-                        request_id,
-                        verification_nonce,
-                        expires_at,
-                    } => (request_id, verification_nonce, expires_at),
-                    NearbyRequestCodeStart::Unsupported { reason } => {
-                        bail!(
-                            "target does not support guided nearby pairing on {host}:{pairing_port} ({reason})"
-                        );
-                    }
-                };
-
-            let code = input_box(
-                "Boundless Pairing",
-                &format!(
-                    "Request sent to target.\nAsk for the 6-digit code shown there.\nRequest ID: {}\nExpires: {}\n\nEnter code:",
-                    short_token(&request_id),
-                    expires_at
-                ),
-                "",
-            )
-            .ok_or_else(|| anyhow::anyhow!("pair request cancelled"))?;
-            let code = code.trim().to_string();
-            if code.is_empty() {
-                bail!("pairing code cannot be empty");
-            }
-
-            let alias = input_box(
-                "Boundless Pairing",
-                "Alias for this peer (optional):",
-                default_alias,
-            )
-            .unwrap_or_default();
-            let alias = alias.trim().to_string();
-            let peer_machine_id = pair_nearby_submit_code_blocking(
-                &self.ctx.endpoint,
-                request_id,
-                code,
-                verification_nonce,
-                host.clone(),
-                pairing_port,
-                Some(alias.clone()).filter(|value| !value.is_empty()),
-            )?;
+            let flow = self.guided_pairing_flow_for_discovered(machine_id, "Boundless Pairing")?;
+            let result = self.run_guided_pairing_flow(&flow)?;
             message_box_ok(
                 "Boundless",
                 &format!(
                     "Pairing request completed.\npeer_machine_id={}\ntarget={}:{}",
-                    short_token(&peer_machine_id),
-                    host,
-                    pairing_port
+                    short_token(&result.peer_machine_id),
+                    flow.host,
+                    flow.pairing_port
                 ),
                 MessageBoxIcon::Info,
             );
             Ok(())
         }
+
         fn run_setup_wizard(&self) -> Result<()> {
+            let target = self.select_setup_wizard_target()?;
+            let flow = self.guided_pairing_flow_for_setup_target(target)?;
+            let result = self.run_guided_pairing_flow(&flow)?;
+            message_box_ok(
+                "Boundless Setup",
+                &format!(
+                    "Pairing completed.\npeer_machine_id={}\ntarget={}:{}",
+                    short_token(&result.peer_machine_id),
+                    flow.host,
+                    flow.pairing_port
+                ),
+                MessageBoxIcon::Info,
+            );
+            self.prompt_orientation(result.orientation_selector)
+        }
+
+        fn select_setup_wizard_target(&self) -> Result<SetupWizardTarget> {
             if self.snapshot.discovered_peers.is_empty() {
-                return self.run_setup_wizard_manual();
+                return self
+                    .prompt_manual_setup_target("No discovered peers found.\nEnter host/IP:");
             }
 
             let mut choices =
@@ -670,23 +663,17 @@ mod windows_app {
                 .ok_or_else(|| anyhow::anyhow!("setup cancelled"))?;
             let selector = selector.trim().to_string();
             if selector.eq_ignore_ascii_case("manual") {
-                return self.run_setup_wizard_manual();
+                return self.prompt_manual_setup_target("Enter host/IP:");
             }
 
             let selected =
                 resolve_discovered_peer(&self.snapshot.discovered_peers, &selector)?.clone();
-            self.run_pair_request(&selected.machine_id)?;
-            let orientation_selector = selected.display_name;
-            self.prompt_orientation(orientation_selector)
+            Ok(SetupWizardTarget::Discovered(selected))
         }
 
-        fn run_setup_wizard_manual(&self) -> Result<()> {
-            let host = input_box(
-                "Boundless Setup",
-                "No discovered peers found.\nEnter host/IP:",
-                "",
-            )
-            .ok_or_else(|| anyhow::anyhow!("setup cancelled"))?;
+        fn prompt_manual_setup_target(&self, host_prompt: &str) -> Result<SetupWizardTarget> {
+            let host = input_box("Boundless Setup", host_prompt, "")
+                .ok_or_else(|| anyhow::anyhow!("setup cancelled"))?;
             let host = host.trim().to_string();
             if host.is_empty() {
                 bail!("host/IP is required");
@@ -694,68 +681,145 @@ mod windows_app {
 
             let port = input_box("Boundless Setup", "Pairing port:", "15200")
                 .unwrap_or_else(|| "15200".to_string());
-            let port = port
-                .trim()
-                .parse::<u16>()
-                .context("pairing port must be a number in 1..=65535")?;
-            if port == 0 {
-                bail!("pairing port must be in 1..=65535");
+            let pairing_port = parse_pairing_port(port.trim())?;
+            Ok(SetupWizardTarget::Manual { host, pairing_port })
+        }
+
+        fn guided_pairing_flow_for_setup_target(
+            &self,
+            target: SetupWizardTarget,
+        ) -> Result<GuidedPairingFlow> {
+            match target {
+                SetupWizardTarget::Discovered(peer) => {
+                    self.guided_pairing_flow_for_discovered(&peer.machine_id, "Boundless Setup")
+                }
+                SetupWizardTarget::Manual { host, pairing_port } => Ok(GuidedPairingFlow {
+                    dialog_title: "Boundless Setup".to_string(),
+                    host: host.clone(),
+                    pairing_port,
+                    default_alias: String::new(),
+                    orientation_selector_fallback: host,
+                }),
             }
+        }
 
-            let (request_id, verification_nonce, expires_at) =
-                match pair_nearby_request_code_blocking(&self.ctx.endpoint, host.clone(), port)? {
-                    NearbyRequestCodeStart::CodeRequired {
-                        request_id,
-                        verification_nonce,
-                        expires_at,
-                    } => (request_id, verification_nonce, expires_at),
-                    NearbyRequestCodeStart::Unsupported { reason } => {
-                        bail!(
-                            "target does not support guided nearby pairing on {host}:{port} ({reason})"
-                        );
-                    }
-                };
+        fn guided_pairing_flow_for_discovered(
+            &self,
+            machine_id: &str,
+            dialog_title: &str,
+        ) -> Result<GuidedPairingFlow> {
+            let discovered_peer = self
+                .snapshot
+                .discovered_peers
+                .iter()
+                .find(|peer| peer.machine_id == machine_id)
+                .ok_or_else(|| anyhow::anyhow!("discovered peer not found for {machine_id}"))?;
+            let (host, pairing_port) =
+                host_and_pairing_port_from_discovery_endpoint(&discovered_peer.endpoint)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("invalid discovered endpoint {}", discovered_peer.endpoint)
+                    })?;
 
+            Ok(GuidedPairingFlow {
+                dialog_title: dialog_title.to_string(),
+                host,
+                pairing_port,
+                default_alias: discovered_peer.display_name.clone(),
+                orientation_selector_fallback: discovered_peer.display_name.clone(),
+            })
+        }
+
+        fn run_guided_pairing_flow(&self, flow: &GuidedPairingFlow) -> Result<GuidedPairingResult> {
+            let challenge = self.request_pairing_challenge_state(flow)?;
+            let submission = self.prompt_pairing_submission_state(flow, &challenge)?;
+            self.submit_pairing_submission_state(flow, challenge, submission)
+        }
+
+        fn request_pairing_challenge_state(
+            &self,
+            flow: &GuidedPairingFlow,
+        ) -> Result<PairingChallengeState> {
+            match pair_nearby_request_code_blocking(
+                &self.ctx.endpoint,
+                flow.host.clone(),
+                flow.pairing_port,
+            )? {
+                NearbyRequestCodeStart::CodeRequired {
+                    request_id,
+                    verification_nonce,
+                    expires_at,
+                } => Ok(PairingChallengeState {
+                    request_id,
+                    verification_nonce,
+                    expires_at,
+                }),
+                NearbyRequestCodeStart::Unsupported { reason } => {
+                    bail!(
+                        "target does not support guided nearby pairing on {}:{} ({reason})",
+                        flow.host,
+                        flow.pairing_port
+                    );
+                }
+            }
+        }
+
+        fn prompt_pairing_submission_state(
+            &self,
+            flow: &GuidedPairingFlow,
+            challenge: &PairingChallengeState,
+        ) -> Result<PairingSubmissionState> {
             let code = input_box(
-                "Boundless Setup",
+                &flow.dialog_title,
                 &format!(
                     "Request sent to target.\nAsk for the 6-digit code shown there.\nRequest ID: {}\nExpires: {}\n\nEnter code:",
-                    short_token(&request_id),
-                    expires_at
+                    short_token(&challenge.request_id),
+                    challenge.expires_at
                 ),
                 "",
             )
-            .ok_or_else(|| anyhow::anyhow!("setup cancelled"))?;
+            .ok_or_else(|| anyhow::anyhow!("pairing cancelled"))?;
             let code = code.trim().to_string();
             if code.is_empty() {
                 bail!("pairing code cannot be empty");
             }
 
-            let alias = input_box("Boundless Setup", "Alias for this peer (optional):", "")
-                .unwrap_or_default();
-            let alias = alias.trim().to_string();
+            let alias = input_box(
+                &flow.dialog_title,
+                "Alias for this peer (optional):",
+                &flow.default_alias,
+            )
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+            Ok(PairingSubmissionState { code, alias })
+        }
+
+        fn submit_pairing_submission_state(
+            &self,
+            flow: &GuidedPairingFlow,
+            challenge: PairingChallengeState,
+            submission: PairingSubmissionState,
+        ) -> Result<GuidedPairingResult> {
             let peer_machine_id = pair_nearby_submit_code_blocking(
                 &self.ctx.endpoint,
-                request_id,
-                code,
-                verification_nonce,
-                host.clone(),
-                port,
-                Some(alias.clone()).filter(|value| !value.is_empty()),
+                challenge.request_id,
+                submission.code,
+                challenge.verification_nonce,
+                flow.host.clone(),
+                flow.pairing_port,
+                Some(submission.alias.clone()).filter(|value| !value.is_empty()),
             )?;
-            message_box_ok(
-                "Boundless Setup",
-                &format!(
-                    "Pairing completed.\npeer_machine_id={}\ntarget={}:{}",
-                    short_token(&peer_machine_id),
-                    host,
-                    port
-                ),
-                MessageBoxIcon::Info,
-            );
+            let orientation_selector = if submission.alias.is_empty() {
+                flow.orientation_selector_fallback.clone()
+            } else {
+                submission.alias
+            };
 
-            let orientation_selector = if !alias.is_empty() { alias } else { host };
-            self.prompt_orientation(orientation_selector)
+            Ok(GuidedPairingResult {
+                peer_machine_id,
+                orientation_selector,
+            })
         }
 
         fn prompt_orientation(&self, default_selector: String) -> Result<()> {
@@ -1610,6 +1674,16 @@ mod windows_app {
             .filter(|port| *port != 0)
     }
 
+    fn parse_pairing_port(value: &str) -> Result<u16> {
+        let pairing_port = value
+            .parse::<u16>()
+            .context("pairing port must be a number in 1..=65535")?;
+        if pairing_port == 0 {
+            bail!("pairing port must be in 1..=65535");
+        }
+        Ok(pairing_port)
+    }
+
     fn nearby_pairing_port(transport_port: u16) -> u16 {
         if transport_port <= u16::MAX - 100 {
             return transport_port + 100;
@@ -1807,6 +1881,19 @@ mod windows_app {
                     .to_string()
                     .contains("multiple discovered peers match"),
                 "ambiguous selector should be rejected"
+            );
+        }
+
+        #[test]
+        fn parse_pairing_port_validates_range() {
+            assert_eq!(parse_pairing_port("15200").expect("valid port"), 15200);
+            assert!(
+                parse_pairing_port("0").is_err(),
+                "port zero must be rejected"
+            );
+            assert!(
+                parse_pairing_port("not-a-number").is_err(),
+                "non-numeric input must be rejected"
             );
         }
     }
