@@ -194,6 +194,14 @@ impl AppState {
                 self.clear_pending_inject_input_frames_for_peer(peer_id)
                     .await;
             }
+
+            let mut capture_target = self.input_capture_target_peer_id.write().await;
+            if capture_target
+                .as_deref()
+                .is_some_and(|peer_id| disconnected_peer_ids.iter().any(|id| id == peer_id))
+            {
+                *capture_target = None;
+            }
         }
 
         Ok(disconnected_peer_ids.len())

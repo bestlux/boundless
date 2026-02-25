@@ -1317,6 +1317,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_all_peers_reconnect_and_reset_clears_shared_input_state() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-reconnect-reset-all-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_one, _) = state.create_pairing_code(120).await;
+        let peer_one = state
+            .join_peer(
+                code_one,
+                "127.0.0.1:15100".to_string(),
+                Some("peer-one".to_string()),
+            )
+            .await
+            .expect("join peer one");
+        let (code_two, _) = state.create_pairing_code(120).await;
+        let peer_two = state
+            .join_peer(
+                code_two,
+                "127.0.0.1:15101".to_string(),
+                Some("peer-two".to_string()),
+            )
+            .await
+            .expect("join peer two");
+
+        state
+            .set_peer_connected(&peer_one, true)
+            .await
+            .expect("connect peer one");
+        state
+            .set_peer_connected(&peer_two, true)
+            .await
+            .expect("connect peer two");
+        assert!(
+            state
+                .claim_input_owner(&peer_one, false)
+                .await
+                .expect("claim owner"),
+            "owner claim should succeed"
+        );
+        state
+            .set_input_capture_target(Some(&peer_one))
+            .await
+            .expect("set capture target");
+
+        state
+            .route_incoming_input_frame(
+                &peer_one,
+                InputFrame {
+                    source_peer_id: peer_one.clone(),
+                    sequence: 1,
+                    timestamp_unix_ms: 1,
+                    events: vec![InputEvent::MouseMove { dx: 1, dy: 1 }],
+                },
+            )
+            .await
+            .expect("queue incoming frame");
+
+        let session_one = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let session_two = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        state
+            .register_transport_session_for_peer(&peer_one, session_one.abort_handle())
+            .await;
+        state
+            .register_transport_session_for_peer(&peer_two, session_two.abort_handle())
+            .await;
+
+        let (disconnected, aborted_sessions) = state
+            .request_all_peers_reconnect_and_reset()
+            .await
+            .expect("request all reconnect reset");
+        assert_eq!(
+            disconnected, 2,
+            "both connected peers should be disconnected"
+        );
+        assert_eq!(
+            aborted_sessions, 2,
+            "both active sessions should be aborted"
+        );
+
+        assert_eq!(state.input_owner().await, None, "owner should be released");
+        assert!(
+            state.input_capture_target().await.is_none(),
+            "capture target should be cleared"
+        );
+        assert!(
+            state.dequeue_pending_inject_input_frame().await.is_none(),
+            "pending inject frames should be cleared"
+        );
+
+        let peers = state.list_peers().await;
+        assert!(
+            peers.iter().all(|peer| !peer.connected),
+            "all peers should be marked disconnected"
+        );
+        assert!(
+            state.peer_reconnect_generation(&peer_one).await > 0,
+            "peer one reconnect generation should increment"
+        );
+        assert!(
+            state.peer_reconnect_generation(&peer_two).await > 0,
+            "peer two reconnect generation should increment"
+        );
+
+        let join_error_one = session_one
+            .await
+            .expect_err("session one should be aborted");
+        assert!(join_error_one.is_cancelled());
+        let join_error_two = session_two
+            .await
+            .expect_err("session two should be aborted");
+        assert!(join_error_two.is_cancelled());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn store_incoming_file_rejects_unsafe_name() {
         let root = std::env::temp_dir().join(format!(
             "boundless-incoming-file-test-{}",
