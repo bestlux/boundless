@@ -45,6 +45,7 @@ Profiles:
 ./scripts/dev/test-suite.ps1 -Profile smoke   # quick + 2-node smoke
 ./scripts/dev/test-suite.ps1 -Profile full    # smoke + 3-node smoke
 ./scripts/dev/test-suite.ps1 -Profile trace -EndpointA http://127.0.0.1:50051 -EndpointB http://10.0.0.5:50051
+./scripts/dev/test-suite.ps1 -Profile trace -TraceEnforceBudgets -TraceCaptureToApplyP95BudgetMs 45 -TraceCaptureToReceiveP95BudgetMs 20 -TraceCaptureToApplyJitterP95BudgetMs 18
 ```
 
 Compatibility wrapper (legacy command still works):

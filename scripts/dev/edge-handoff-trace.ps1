@@ -6,7 +6,11 @@ param(
     [int]$DurationSeconds = 30,
     [int]$PollMilliseconds = 150,
     [int]$EventsLimit = 200,
-    [string]$OutputPath = ""
+    [string]$OutputPath = "",
+    [int]$CaptureToApplyP95BudgetMs = 45,
+    [int]$CaptureToReceiveP95BudgetMs = 20,
+    [int]$CaptureToApplyJitterP95BudgetMs = 18,
+    [switch]$EnforceBudgets
 )
 
 Set-StrictMode -Version Latest
@@ -70,6 +74,76 @@ function Parse-CaptureTarget {
     return "unknown"
 }
 
+function Get-MetricValue {
+    param(
+        [string]$Line,
+        [string]$MetricName
+    )
+    $match = [regex]::Match($Line, "$MetricName=([0-9]+)")
+    if (-not $match.Success) {
+        return $null
+    }
+    return [int]$match.Groups[1].Value
+}
+
+function Get-Percentile {
+    param(
+        [int[]]$Values,
+        [double]$Percentile
+    )
+    if ($null -eq $Values -or $Values.Count -eq 0) {
+        return $null
+    }
+    $sorted = $Values | Sort-Object
+    $rank = [Math]::Ceiling(($Percentile / 100.0) * $sorted.Count)
+    $index = [Math]::Max(0, [Math]::Min($sorted.Count - 1, $rank - 1))
+    return [int]$sorted[$index]
+}
+
+function Get-JitterP95 {
+    param([int[]]$Series)
+    if ($null -eq $Series -or $Series.Count -lt 2) {
+        return $null
+    }
+
+    $deltas = New-Object System.Collections.Generic.List[int]
+    for ($i = 1; $i -lt $Series.Count; $i++) {
+        $deltas.Add([Math]::Abs($Series[$i] - $Series[$i - 1]))
+    }
+    return Get-Percentile -Values $deltas.ToArray() -Percentile 95
+}
+
+function Summarize-Metrics {
+    param(
+        [string]$Label,
+        [System.Collections.Generic.List[int]]$CaptureToApply,
+        [System.Collections.Generic.List[int]]$CaptureToReceive
+    )
+
+    $applyValues = $CaptureToApply.ToArray()
+    $receiveValues = $CaptureToReceive.ToArray()
+    $applyP50 = Get-Percentile -Values $applyValues -Percentile 50
+    $applyP95 = Get-Percentile -Values $applyValues -Percentile 95
+    $receiveP50 = Get-Percentile -Values $receiveValues -Percentile 50
+    $receiveP95 = Get-Percentile -Values $receiveValues -Percentile 95
+    $applyJitterP95 = Get-JitterP95 -Series $applyValues
+    $applyMax = if ($applyValues.Count -gt 0) { ($applyValues | Measure-Object -Maximum).Maximum } else { $null }
+    $receiveMax = if ($receiveValues.Count -gt 0) { ($receiveValues | Measure-Object -Maximum).Maximum } else { $null }
+
+    return @{
+        Label = $Label
+        CaptureToApplyCount = $applyValues.Count
+        CaptureToReceiveCount = $receiveValues.Count
+        CaptureToApplyP50 = $applyP50
+        CaptureToApplyP95 = $applyP95
+        CaptureToApplyMax = $applyMax
+        CaptureToApplyJitterP95 = $applyJitterP95
+        CaptureToReceiveP50 = $receiveP50
+        CaptureToReceiveP95 = $receiveP95
+        CaptureToReceiveMax = $receiveMax
+    }
+}
+
 $targets = @(
     @{ Endpoint = $EndpointA; Label = $LabelA }
 )
@@ -79,6 +153,7 @@ if (-not [string]::IsNullOrWhiteSpace($EndpointB)) {
 
 $states = @{}
 $seenEvents = @{}
+$metricsByLabel = @{}
 
 $commit = (& git rev-parse --short HEAD 2>$null)
 if ($LASTEXITCODE -ne 0) {
@@ -92,6 +167,10 @@ foreach ($target in $targets) {
         LastCaptureTarget = $null
         LastStatus = $null
         NextStatusAt = Get-Date
+    }
+    $metricsByLabel[$target.Label] = @{
+        CaptureToApply = New-Object System.Collections.Generic.List[int]
+        CaptureToReceive = New-Object System.Collections.Generic.List[int]
     }
     Write-TraceLine "target label=$($target.Label) endpoint=$($target.Endpoint)"
 
@@ -169,6 +248,21 @@ while ((Get-Date) -lt $deadline) {
                 }
                 $seenEvents[$dedupeKey] = $true
                 Write-TraceLine "event label=$label endpoint=$endpoint $line"
+
+                $metrics = $metricsByLabel[$label]
+                if ($line -match "kind=input_inject_applied") {
+                    $captureToApply = Get-MetricValue -Line $line -MetricName "capture_to_apply_ms"
+                    if ($null -ne $captureToApply) {
+                        $metrics.CaptureToApply.Add($captureToApply)
+                    }
+                }
+                if ($line -match "kind=input_frame") {
+                    $captureToReceive = Get-MetricValue -Line $line -MetricName "capture_to_receive_ms"
+                    if ($null -ne $captureToReceive) {
+                        $metrics.CaptureToReceive.Add($captureToReceive)
+                    }
+                }
+                $metricsByLabel[$label] = $metrics
             }
         }
         else {
@@ -179,6 +273,41 @@ while ((Get-Date) -lt $deadline) {
     }
 
     Start-Sleep -Milliseconds $PollMilliseconds
+}
+
+foreach ($target in $targets) {
+    $label = $target.Label
+    $metric = $metricsByLabel[$label]
+    $summary = Summarize-Metrics `
+        -Label $label `
+        -CaptureToApply $metric.CaptureToApply `
+        -CaptureToReceive $metric.CaptureToReceive
+
+    Write-TraceLine (
+        "latency_summary label={0} capture_to_apply_count={1} capture_to_apply_p50={2} capture_to_apply_p95={3} capture_to_apply_max={4} capture_to_apply_jitter_p95={5} capture_to_receive_count={6} capture_to_receive_p50={7} capture_to_receive_p95={8} capture_to_receive_max={9}" -f
+        $summary.Label,
+        $summary.CaptureToApplyCount,
+        $summary.CaptureToApplyP50,
+        $summary.CaptureToApplyP95,
+        $summary.CaptureToApplyMax,
+        $summary.CaptureToApplyJitterP95,
+        $summary.CaptureToReceiveCount,
+        $summary.CaptureToReceiveP50,
+        $summary.CaptureToReceiveP95,
+        $summary.CaptureToReceiveMax
+    )
+
+    if ($EnforceBudgets) {
+        if ($null -ne $summary.CaptureToApplyP95 -and $summary.CaptureToApplyP95 -gt $CaptureToApplyP95BudgetMs) {
+            throw "capture_to_apply_p95 budget exceeded for ${label}: actual=$($summary.CaptureToApplyP95)ms budget=${CaptureToApplyP95BudgetMs}ms"
+        }
+        if ($null -ne $summary.CaptureToReceiveP95 -and $summary.CaptureToReceiveP95 -gt $CaptureToReceiveP95BudgetMs) {
+            throw "capture_to_receive_p95 budget exceeded for ${label}: actual=$($summary.CaptureToReceiveP95)ms budget=${CaptureToReceiveP95BudgetMs}ms"
+        }
+        if ($null -ne $summary.CaptureToApplyJitterP95 -and $summary.CaptureToApplyJitterP95 -gt $CaptureToApplyJitterP95BudgetMs) {
+            throw "capture_to_apply_jitter_p95 budget exceeded for ${label}: actual=$($summary.CaptureToApplyJitterP95)ms budget=${CaptureToApplyJitterP95BudgetMs}ms"
+        }
+    }
 }
 
 Write-TraceLine "trace_end"

@@ -4,6 +4,10 @@ param(
     [int]$TimeoutSeconds = 60,
     [switch]$KeepArtifacts,
     [int]$TraceDurationSeconds = 45,
+    [int]$TraceCaptureToApplyP95BudgetMs = 45,
+    [int]$TraceCaptureToReceiveP95BudgetMs = 20,
+    [int]$TraceCaptureToApplyJitterP95BudgetMs = 18,
+    [switch]$TraceEnforceBudgets,
     [string]$EndpointA = "http://127.0.0.1:50051",
     [string]$EndpointB = "",
     [string]$LabelA = "machine-a",
@@ -76,6 +80,12 @@ function Run-TraceCapture {
         EndpointA = $EndpointA
         LabelA = $LabelA
         DurationSeconds = $TraceDurationSeconds
+        CaptureToApplyP95BudgetMs = $TraceCaptureToApplyP95BudgetMs
+        CaptureToReceiveP95BudgetMs = $TraceCaptureToReceiveP95BudgetMs
+        CaptureToApplyJitterP95BudgetMs = $TraceCaptureToApplyJitterP95BudgetMs
+    }
+    if ($TraceEnforceBudgets) {
+        $commandParams.EnforceBudgets = $true
     }
     if (-not [string]::IsNullOrWhiteSpace($EndpointB)) {
         $commandParams.EndpointB = $EndpointB
