@@ -165,6 +165,21 @@ pub fn upsert_trust_record(paths: &SecurityPaths, record: TrustRecord) -> anyhow
     Ok(())
 }
 
+pub fn remove_trust_record(paths: &SecurityPaths, machine_id: &str) -> anyhow::Result<bool> {
+    let mut records = load_trust_records(paths)?;
+    let before = records.len();
+    records.retain(|record| record.machine_id != machine_id);
+    let removed = before != records.len();
+    if !removed {
+        return Ok(false);
+    }
+
+    let payload = serde_json::to_string_pretty(&records).context("serialize trust store")?;
+    fs::write(&paths.trust_store, payload)
+        .with_context(|| format!("write {}", paths.trust_store.display()))?;
+    Ok(true)
+}
+
 pub fn ensure_device_identity(
     paths: &SecurityPaths,
     machine_id: &str,
@@ -307,5 +322,32 @@ mod tests {
         assert!(identity.ca_cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(identity.device_key_pem.contains("BEGIN"));
         assert!(paths.trust_store.exists());
+    }
+
+    #[test]
+    fn remove_trust_record_removes_matching_machine_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = SecurityPaths::for_root(dir.path().join("security"));
+        ensure_trust_store(&paths).expect("trust store");
+
+        upsert_trust_record(
+            &paths,
+            TrustRecord {
+                machine_id: "peer-a".to_string(),
+                ca_cert_pem: "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----"
+                    .to_string(),
+                added_at: Utc::now(),
+            },
+        )
+        .expect("insert peer-a");
+
+        let removed = remove_trust_record(&paths, "peer-a").expect("remove peer-a");
+        assert!(removed, "record should be removed");
+
+        let records = load_trust_records(&paths).expect("read trust records");
+        assert!(
+            records.iter().all(|record| record.machine_id != "peer-a"),
+            "removed machine id should not be present"
+        );
     }
 }

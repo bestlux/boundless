@@ -68,6 +68,7 @@ impl AppState {
             if capture_target.as_deref() == Some(peer_id) {
                 *capture_target = None;
             }
+            let _ = remove_trust_record(&self.security_paths, peer_id)?;
         }
         Ok(removed)
     }
