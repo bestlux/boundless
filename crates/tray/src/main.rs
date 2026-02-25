@@ -610,7 +610,9 @@ mod windows_app {
 
         fn run_pair_request(&self, machine_id: &str) -> Result<()> {
             let flow = self.guided_pairing_flow_for_discovered(machine_id, "Boundless Pairing")?;
-            let result = self.run_guided_pairing_flow(&flow)?;
+            let Some(result) = self.run_guided_pairing_flow_with_recovery(&flow)? else {
+                return Ok(());
+            };
             message_box_ok(
                 "Boundless",
                 &format!(
@@ -627,7 +629,9 @@ mod windows_app {
         fn run_setup_wizard(&self) -> Result<()> {
             let target = self.select_setup_wizard_target()?;
             let flow = self.guided_pairing_flow_for_setup_target(target)?;
-            let result = self.run_guided_pairing_flow(&flow)?;
+            let Some(result) = self.run_guided_pairing_flow_with_recovery(&flow)? else {
+                return Ok(());
+            };
             message_box_ok(
                 "Boundless Setup",
                 &format!(
@@ -733,6 +737,35 @@ mod windows_app {
             let challenge = self.request_pairing_challenge_state(flow)?;
             let submission = self.prompt_pairing_submission_state(flow, &challenge)?;
             self.submit_pairing_submission_state(flow, challenge, submission)
+        }
+
+        fn run_guided_pairing_flow_with_recovery(
+            &self,
+            flow: &GuidedPairingFlow,
+        ) -> Result<Option<GuidedPairingResult>> {
+            loop {
+                match self.run_guided_pairing_flow(flow) {
+                    Ok(result) => return Ok(Some(result)),
+                    Err(error) => {
+                        if !should_offer_new_request_retry(&error) {
+                            return Err(error);
+                        }
+
+                        let retry = message_box_yes_no(
+                            "Boundless Pairing",
+                            &format!(
+                                "{}\n\nWould you like to start a new pairing request now?",
+                                format_error_for_dialog(&error)
+                            ),
+                            MessageBoxIcon::Warning,
+                            YesNo::No,
+                        );
+                        if retry != YesNo::Yes {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
         }
 
         fn request_pairing_challenge_state(
@@ -1796,6 +1829,14 @@ mod windows_app {
         message
     }
 
+    fn should_offer_new_request_retry(error: &anyhow::Error) -> bool {
+        let lowered = error.to_string().to_ascii_lowercase();
+        lowered.contains("pairing request rejected")
+            || lowered.contains("verification code expired")
+            || lowered.contains("timed out waiting for nearby pairing approval")
+            || lowered.contains("nearby pairing request not found")
+    }
+
     fn extract_attempts_remaining(message: &str) -> Option<u8> {
         const MARKER: &str = "attempts_remaining=";
         let marker_index = message.find(MARKER)?;
@@ -1894,6 +1935,34 @@ mod windows_app {
             assert!(
                 parse_pairing_port("not-a-number").is_err(),
                 "non-numeric input must be rejected"
+            );
+        }
+
+        #[test]
+        fn should_offer_new_request_retry_matches_rejected_and_timeout() {
+            let rejected =
+                anyhow::anyhow!("verification code is invalid; pairing request rejected");
+            assert!(
+                should_offer_new_request_retry(&rejected),
+                "rejected requests should offer retry"
+            );
+
+            let timeout =
+                anyhow::anyhow!("timed out waiting for nearby pairing approval request_id=abc");
+            assert!(
+                should_offer_new_request_retry(&timeout),
+                "timeout should offer retry"
+            );
+        }
+
+        #[test]
+        fn should_offer_new_request_retry_ignores_lockout() {
+            let lockout = anyhow::anyhow!(
+                "verification temporarily locked after repeated invalid attempts; retry later"
+            );
+            assert!(
+                !should_offer_new_request_retry(&lockout),
+                "lockout should not offer immediate retry"
             );
         }
     }
