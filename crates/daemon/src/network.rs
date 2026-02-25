@@ -44,6 +44,8 @@ mod tls;
 #[cfg(test)]
 use codec::input_events_to_wire;
 #[cfg(test)]
+use control::{HelloHandling, handle_hello_ack_message, handle_hello_message};
+#[cfg(test)]
 use outbound::flush_outgoing_payloads;
 #[cfg(test)]
 use runtime::outbound_target_candidates;
@@ -817,6 +819,122 @@ mod tests {
             reconnect_requested_for_peer(&state, &peer_id, &mut observed).await,
             "next generation should retrigger"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn hello_handler_rejects_machine_id_mismatch_with_error_frame() {
+        let (state, root) = state_for_listener_test().await;
+        let mut remote_protocol = None;
+        let mut outbound_transfer_flow = std::collections::HashMap::new();
+        let mut writer = CaptureWriter::default();
+        let mut frame_buffer = Vec::with_capacity(256);
+
+        let handling = handle_hello_message(
+            &state,
+            "expected-machine-id",
+            None,
+            true,
+            "local-machine-id",
+            "claimed-machine-id".to_string(),
+            PROTOCOL_CURRENT,
+            &mut remote_protocol,
+            &mut outbound_transfer_flow,
+            &mut writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("handle hello mismatch");
+
+        assert!(matches!(handling, HelloHandling::TerminateSession));
+        assert!(remote_protocol.is_none());
+
+        let frames = decode_written_frames(&writer.bytes);
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            frames.first(),
+            Some(WireMessage::Error { message }) if message.contains("hello machine_id mismatch")
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn hello_handler_accepts_canonical_protocol_and_emits_ack_for_inbound() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let mut remote_protocol = None;
+        let mut outbound_transfer_flow = std::collections::HashMap::new();
+        let mut writer = CaptureWriter::default();
+        let mut frame_buffer = Vec::with_capacity(256);
+
+        let handling = handle_hello_message(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            false,
+            "local-machine-id",
+            peer_id.clone(),
+            PROTOCOL_CURRENT,
+            &mut remote_protocol,
+            &mut outbound_transfer_flow,
+            &mut writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("handle canonical hello");
+
+        assert!(matches!(handling, HelloHandling::Continue));
+        assert_eq!(remote_protocol, Some(PROTOCOL_CURRENT));
+
+        let frames = decode_written_frames(&writer.bytes);
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            frames.first(),
+            Some(WireMessage::HelloAck {
+                machine_id,
+                accepted: true
+            }) if machine_id == "local-machine-id"
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn hello_ack_handler_flushes_pending_outgoing_payloads() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        state
+            .queue_clipboard_text(&peer_id, "hello-control".to_string())
+            .await
+            .expect("queue clipboard text");
+
+        let mut outbound_transfer_flow = std::collections::HashMap::new();
+        let mut writer = CaptureWriter::default();
+        let mut frame_buffer = Vec::with_capacity(256);
+
+        handle_hello_ack_message(
+            &state,
+            Some(&peer_id),
+            "local-machine-id",
+            Some(PROTOCOL_CURRENT),
+            &mut outbound_transfer_flow,
+            true,
+            &mut writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("handle hello ack");
+
+        let frames = decode_written_frames(&writer.bytes);
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            frames.first(),
+            Some(WireMessage::ClipboardText { machine_id, text })
+                if machine_id == "local-machine-id" && text == "hello-control"
+        ));
+
+        let queued = state.drain_outgoing(&peer_id).await;
+        assert!(queued.is_empty(), "payload should be flushed from queue");
 
         let _ = std::fs::remove_dir_all(root);
     }
