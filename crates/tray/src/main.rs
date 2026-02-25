@@ -14,7 +14,7 @@ mod windows_app {
     use clap::Parser;
     use hyper_util::rt::TokioIo;
     use ipc_api::boundless::v1::{
-        Empty, HotkeyTriggerRequest, ImportTrustBundleRequest,
+        Empty, HotkeyTriggerRequest, ImportTrustBundleRequest, NearbyPairingDecisionRequest,
         diagnostics_service_client::DiagnosticsServiceClient,
         pairing_service_client::PairingServiceClient,
     };
@@ -514,23 +514,9 @@ mod windows_app {
             } else if let Some(machine_id) = menu_id.strip_prefix(ACTION_DISCOVER_PREFIX) {
                 self.run_pair_request(machine_id)
             } else if let Some(request_id) = menu_id.strip_prefix(ACTION_APPROVE_PREFIX) {
-                self.run_simple_command(
-                    vec![
-                        "pair".to_string(),
-                        "approve".to_string(),
-                        request_id.to_string(),
-                    ],
-                    "Approve Request",
-                )
+                self.approve_pending_request(request_id)
             } else if let Some(request_id) = menu_id.strip_prefix(ACTION_REJECT_PREFIX) {
-                self.run_simple_command(
-                    vec![
-                        "pair".to_string(),
-                        "reject".to_string(),
-                        request_id.to_string(),
-                    ],
-                    "Reject Request",
-                )
+                self.reject_pending_request(request_id)
             } else {
                 Ok(())
             };
@@ -547,6 +533,26 @@ mod windows_app {
             message_box_ok(
                 "Boundless",
                 &format!("{title} completed:\n{output}"),
+                MessageBoxIcon::Info,
+            );
+            Ok(())
+        }
+
+        fn approve_pending_request(&self, request_id: &str) -> Result<()> {
+            let message = approve_nearby_pairing_request_blocking(&self.ctx.endpoint, request_id)?;
+            message_box_ok(
+                "Boundless",
+                &format!("Approve Request completed:\n{message}"),
+                MessageBoxIcon::Info,
+            );
+            Ok(())
+        }
+
+        fn reject_pending_request(&self, request_id: &str) -> Result<()> {
+            let message = reject_nearby_pairing_request_blocking(&self.ctx.endpoint, request_id)?;
+            message_box_ok(
+                "Boundless",
+                &format!("Reject Request completed:\n{message}"),
                 MessageBoxIcon::Info,
             );
             Ok(())
@@ -1012,6 +1018,20 @@ mod windows_app {
         ))
     }
 
+    fn approve_nearby_pairing_request_blocking(endpoint: &str, request_id: &str) -> Result<String> {
+        block_on_result(approve_nearby_pairing_request(
+            endpoint,
+            request_id.to_string(),
+        ))
+    }
+
+    fn reject_nearby_pairing_request_blocking(endpoint: &str, request_id: &str) -> Result<String> {
+        block_on_result(reject_nearby_pairing_request(
+            endpoint,
+            request_id.to_string(),
+        ))
+    }
+
     fn block_on_result<F, T>(future: F) -> Result<T>
     where
         F: Future<Output = Result<T>>,
@@ -1107,6 +1127,30 @@ mod windows_app {
         let responder_bundle =
             wait_for_nearby_pairing_approval(&target, response, 120, &request_id).await?;
         import_nearby_responder_bundle(endpoint, responder_bundle, &host, alias).await
+    }
+
+    async fn approve_nearby_pairing_request(endpoint: &str, request_id: String) -> Result<String> {
+        let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
+        let response = pairing_client
+            .approve_nearby_pairing_request(NearbyPairingDecisionRequest {
+                request_id,
+                alias: String::new(),
+            })
+            .await?
+            .into_inner();
+        Ok(response.message)
+    }
+
+    async fn reject_nearby_pairing_request(endpoint: &str, request_id: String) -> Result<String> {
+        let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
+        let response = pairing_client
+            .reject_nearby_pairing_request(NearbyPairingDecisionRequest {
+                request_id,
+                alias: String::new(),
+            })
+            .await?
+            .into_inner();
+        Ok(response.message)
     }
 
     async fn wait_for_nearby_pairing_approval(
