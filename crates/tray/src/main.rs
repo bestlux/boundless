@@ -15,8 +15,10 @@ mod windows_app {
     use hyper_util::rt::TokioIo;
     use ipc_api::boundless::v1::{
         Empty, HotkeyTriggerRequest, ImportTrustBundleRequest, NearbyPairingDecisionRequest,
+        StatusRequest, daemon_service_client::DaemonServiceClient,
         diagnostics_service_client::DiagnosticsServiceClient,
         pairing_service_client::PairingServiceClient,
+        topology_service_client::TopologyServiceClient,
     };
     use serde::{Deserialize, Serialize};
     use std::{
@@ -248,24 +250,34 @@ mod windows_app {
         }
 
         fn refresh_snapshot(&mut self) {
-            let mut args = vec!["ui".to_string(), "snapshot".to_string()];
-            if self.ctx.start_daemon {
-                args.push("--start-daemon".to_string());
-            }
-            match run_boundlessctl_with_timeout(&self.ctx, &args, Duration::from_secs(4)) {
-                Ok(stdout) => match serde_json::from_str::<UiSnapshot>(&stdout) {
-                    Ok(snapshot) => {
-                        self.snapshot = snapshot;
-                        self.last_error = None;
+            match fetch_ui_snapshot_blocking(&self.ctx.endpoint) {
+                Ok(snapshot) => {
+                    self.snapshot = snapshot;
+                    self.last_error = None;
+                }
+                Err(api_error) => {
+                    let mut args = vec!["ui".to_string(), "snapshot".to_string()];
+                    if self.ctx.start_daemon {
+                        args.push("--start-daemon".to_string());
                     }
-                    Err(error) => {
-                        self.last_error = Some(format!("parse snapshot: {error}"));
-                        self.snapshot = UiSnapshot::default();
+                    match run_boundlessctl_with_timeout(&self.ctx, &args, Duration::from_secs(4)) {
+                        Ok(stdout) => match serde_json::from_str::<UiSnapshot>(&stdout) {
+                            Ok(snapshot) => {
+                                self.snapshot = snapshot;
+                                self.last_error = None;
+                            }
+                            Err(error) => {
+                                self.last_error = Some(format!("parse snapshot fallback: {error}"));
+                                self.snapshot = UiSnapshot::default();
+                            }
+                        },
+                        Err(fallback_error) => {
+                            self.last_error = Some(format!(
+                                "snapshot fetch failed (api: {api_error}; fallback: {fallback_error})"
+                            ));
+                            self.snapshot = UiSnapshot::default();
+                        }
                     }
-                },
-                Err(error) => {
-                    self.last_error = Some(error.to_string());
-                    self.snapshot = UiSnapshot::default();
                 }
             }
         }
@@ -994,6 +1006,10 @@ mod windows_app {
         )
     }
 
+    fn fetch_ui_snapshot_blocking(endpoint: &str) -> Result<UiSnapshot> {
+        block_on_result(fetch_ui_snapshot(endpoint))
+    }
+
     fn pair_nearby_request_code_blocking(
         endpoint: &str,
         host: String,
@@ -1045,6 +1061,78 @@ mod windows_app {
             .build()
             .context("create tokio runtime for tray pairing flow")?;
         runtime.block_on(future)
+    }
+
+    async fn fetch_ui_snapshot(endpoint: &str) -> Result<UiSnapshot> {
+        let channel = channel(endpoint).await?;
+
+        let mut daemon_client = DaemonServiceClient::new(channel.clone());
+        let status = daemon_client
+            .get_status(StatusRequest {})
+            .await?
+            .into_inner();
+
+        let mut topology_client = TopologyServiceClient::new(channel.clone());
+        let peers = topology_client
+            .list_peers(Empty {})
+            .await?
+            .into_inner()
+            .peers;
+        let layout = topology_client
+            .layout_show(Empty {})
+            .await?
+            .into_inner()
+            .matrix_spec;
+
+        let mut diagnostics_client = DiagnosticsServiceClient::new(channel.clone());
+        let discovery = diagnostics_client
+            .list_discovery_peers(Empty {})
+            .await?
+            .into_inner();
+
+        let mut pairing_client = PairingServiceClient::new(channel);
+        let pending = pairing_client
+            .list_nearby_pairing_requests(Empty {})
+            .await?
+            .into_inner()
+            .requests;
+
+        Ok(UiSnapshot {
+            generated_at: String::new(),
+            daemon_online: status.running,
+            machine_id: status.machine_id,
+            layout_matrix: layout,
+            discovered_peers: discovery
+                .peers
+                .into_iter()
+                .map(|peer| UiDiscoveredPeer {
+                    machine_id: peer.machine_id,
+                    display_name: peer.display_name,
+                    endpoint: peer.endpoint,
+                })
+                .collect(),
+            paired_peers: peers
+                .into_iter()
+                .map(|peer| UiPairedPeer {
+                    peer_id: peer.peer_id,
+                    display_name: peer.display_name,
+                    address: peer.address,
+                    connected: peer.connected,
+                })
+                .collect(),
+            pending_requests: pending
+                .into_iter()
+                .map(|request| UiPendingRequest {
+                    request_id: request.request_id,
+                    requester_machine_id: request.requester_machine_id,
+                    requester_display_name: request.requester_display_name,
+                    created_at: request.created_at,
+                    verification_code: request.verification_code,
+                    verification_expires_at: request.verification_expires_at,
+                    requires_verification_code: request.requires_verification_code,
+                })
+                .collect(),
+        })
     }
 
     async fn pair_nearby_request_code(
