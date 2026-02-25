@@ -1642,4 +1642,67 @@ mod windows_app {
     fn default_endpoint() -> String {
         "npipe://./pipe/boundlessd-api".to_string()
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn extract_attempts_remaining_reads_numeric_suffix() {
+            let message = "verification code is invalid; attempts_remaining=4";
+            assert_eq!(extract_attempts_remaining(message), Some(4));
+        }
+
+        #[test]
+        fn extract_attempts_remaining_ignores_missing_marker() {
+            assert_eq!(extract_attempts_remaining("no attempts here"), None);
+        }
+
+        #[test]
+        fn resolve_discovered_peer_supports_index_and_prefix() {
+            let peers = vec![
+                UiDiscoveredPeer {
+                    machine_id: "machine-alpha-1234".to_string(),
+                    display_name: "Office Desktop".to_string(),
+                    endpoint: "10.10.0.10:15100".to_string(),
+                },
+                UiDiscoveredPeer {
+                    machine_id: "machine-bravo-5678".to_string(),
+                    display_name: "Living Room".to_string(),
+                    endpoint: "10.10.0.11:15100".to_string(),
+                },
+            ];
+
+            let by_index = resolve_discovered_peer(&peers, "1").expect("peer by index");
+            assert_eq!(by_index.machine_id, "machine-alpha-1234");
+
+            let by_prefix = resolve_discovered_peer(&peers, "living").expect("peer by prefix");
+            assert_eq!(by_prefix.machine_id, "machine-bravo-5678");
+        }
+
+        #[test]
+        fn resolve_discovered_peer_rejects_ambiguous_matches() {
+            let peers = vec![
+                UiDiscoveredPeer {
+                    machine_id: "machine-alpha-1234".to_string(),
+                    display_name: "Office".to_string(),
+                    endpoint: "10.10.0.10:15100".to_string(),
+                },
+                UiDiscoveredPeer {
+                    machine_id: "machine-beta-5678".to_string(),
+                    display_name: "Office Laptop".to_string(),
+                    endpoint: "10.10.0.11:15100".to_string(),
+                },
+            ];
+
+            let error =
+                resolve_discovered_peer(&peers, "office").expect_err("must reject ambiguous");
+            assert!(
+                error
+                    .to_string()
+                    .contains("multiple discovered peers match"),
+                "ambiguous selector should be rejected"
+            );
+        }
+    }
 }
