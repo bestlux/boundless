@@ -17,6 +17,52 @@ impl AppState {
             .unwrap_or(&0)
     }
 
+    pub async fn request_peer_reconnect_and_reset(&self, peer_id: &str) -> Result<(u64, usize)> {
+        let generation = self.request_peer_reconnect(peer_id).await;
+        let aborted_sessions = self.abort_transport_sessions_for_peer(peer_id).await;
+        self.set_peer_connected(peer_id, false).await?;
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: "peer_reconnect_requested".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("generation={generation} aborted_sessions={aborted_sessions}"),
+            size_bytes: 0,
+        });
+        Ok((generation, aborted_sessions))
+    }
+
+    pub async fn request_all_peers_reconnect_and_reset(&self) -> Result<(usize, usize)> {
+        let peer_ids = self
+            .list_peers()
+            .await
+            .into_iter()
+            .map(|peer| peer.peer_id)
+            .collect::<Vec<_>>();
+
+        for peer_id in &peer_ids {
+            self.request_peer_reconnect(peer_id).await;
+        }
+
+        let aborted_sessions = self.abort_transport_sessions_for_peers(&peer_ids).await;
+        let disconnected_peers = self.mark_all_peers_disconnected().await?;
+
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: "peers_reconnect_requested".to_string(),
+            peer_id: "all".to_string(),
+            detail: format!(
+                "requested_peers={} disconnected_peers={} aborted_sessions={aborted_sessions}",
+                peer_ids.len(),
+                disconnected_peers
+            ),
+            size_bytes: 0,
+        });
+
+        Ok((disconnected_peers, aborted_sessions))
+    }
+
     fn next_transport_session_id(&self) -> u64 {
         self.next_transport_session_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)

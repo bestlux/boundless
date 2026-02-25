@@ -263,7 +263,10 @@ impl AppState {
                 decided_at: Utc::now(),
             },
         );
-        self.request_peer_reconnect(&peer_id).await;
+        let _ = self
+            .request_peer_reconnect_and_reset(&peer_id)
+            .await
+            .context("request reconnect after nearby pairing approval")?;
         Ok(responder_bundle)
     }
 
@@ -375,7 +378,10 @@ impl AppState {
                 decided_at: Utc::now(),
             },
         );
-        self.request_peer_reconnect(&peer_id).await;
+        let _ = self
+            .request_peer_reconnect_and_reset(&peer_id)
+            .await
+            .context("request reconnect after nearby pairing code confirmation")?;
         Ok(responder_bundle)
     }
 

@@ -240,20 +240,10 @@ async fn apply_hotkey_action(state: &AppState, action: HotkeyAction) -> Result<(
             info!("hotkey lock_machine executed");
         }
         HotkeyAction::Reconnect => {
-            let peers = state.list_peers().await;
-            for peer in &peers {
-                state.request_peer_reconnect(&peer.peer_id).await;
-            }
-            let peer_ids = peers
-                .iter()
-                .map(|peer| peer.peer_id.clone())
-                .collect::<Vec<_>>();
-            let aborted_sessions = state.abort_transport_sessions_for_peers(&peer_ids).await;
-
-            let peer_count = state
-                .mark_all_peers_disconnected()
+            let (peer_count, aborted_sessions) = state
+                .request_all_peers_reconnect_and_reset()
                 .await
-                .context("mark peers disconnected")?;
+                .context("request reconnect for all peers")?;
             info!(peer_count, aborted_sessions, "hotkey reconnect requested");
         }
         HotkeyAction::SwitchAll => {

@@ -1228,6 +1228,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_peer_reconnect_and_reset_clears_input_state_and_sessions() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-reconnect-reset-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect peer");
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim owner"),
+            "owner claim should succeed"
+        );
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set capture target");
+
+        state
+            .route_incoming_input_frame(
+                &peer_id,
+                InputFrame {
+                    source_peer_id: peer_id.clone(),
+                    sequence: 1,
+                    timestamp_unix_ms: 1,
+                    events: vec![InputEvent::MouseMove { dx: 1, dy: 1 }],
+                },
+            )
+            .await
+            .expect("queue incoming frame");
+
+        let session = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        state
+            .register_transport_session_for_peer(&peer_id, session.abort_handle())
+            .await;
+
+        let (generation, aborted_sessions) = state
+            .request_peer_reconnect_and_reset(&peer_id)
+            .await
+            .expect("request reconnect reset");
+        assert!(generation > 0, "reconnect generation should increment");
+        assert_eq!(aborted_sessions, 1, "active session should be aborted");
+
+        assert_eq!(state.input_owner().await, None, "owner should be released");
+        assert!(
+            state.input_capture_target().await.is_none(),
+            "capture target should be cleared"
+        );
+        assert!(
+            state.dequeue_pending_inject_input_frame().await.is_none(),
+            "pending inject frames should be cleared"
+        );
+        let peer = state
+            .get_peer(&peer_id)
+            .await
+            .expect("peer must still exist");
+        assert!(!peer.connected, "peer should be marked disconnected");
+        assert!(
+            state.peer_reconnect_generation(&peer_id).await >= generation,
+            "reconnect generation should be visible"
+        );
+
+        let join_error = session.await.expect_err("session should be aborted");
+        assert!(join_error.is_cancelled());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn store_incoming_file_rejects_unsafe_name() {
         let root = std::env::temp_dir().join(format!(
             "boundless-incoming-file-test-{}",
