@@ -5,6 +5,9 @@ use chrono::Utc;
 use crate::state::TransportEventRecord;
 
 use super::codec::{input_event_from_wire, now_millis};
+use super::control::{
+    HelloHandling, handle_heartbeat_message, handle_hello_ack_message, handle_hello_message,
+};
 use super::inbound::{
     InboundTransfer, discard_inbound_transfer, handle_file_chunk, handle_file_end,
     handle_file_start,
@@ -320,117 +323,39 @@ where
                         protocol,
                         ..
                     } => {
-                        if machine_id != authenticated_peer_id {
-                            warn!(
-                                claimed_machine_id = %machine_id,
-                                authenticated_machine_id = %authenticated_peer_id,
-                                "hello machine_id mismatch from authenticated peer"
-                            );
-                            let _ = send_message(
-                                &mut writer,
-                                &WireMessage::Error {
-                                    message: "hello machine_id mismatch".to_string(),
-                                },
-                                &mut write_frame_buffer,
-                            )
-                            .await;
-                            let _ = writer.flush().await;
+                        let handling = handle_hello_message(
+                            &state,
+                            &authenticated_peer_id,
+                            remote_peer_id.as_deref(),
+                            is_outbound,
+                            &snapshot.machine_id,
+                            machine_id,
+                            protocol,
+                            &mut remote_protocol,
+                            &mut outbound_transfer_flow,
+                            &mut writer,
+                            &mut write_frame_buffer,
+                        )
+                        .await?;
+                        if matches!(handling, HelloHandling::TerminateSession) {
                             break;
                         }
-                        if protocol != PROTOCOL_CURRENT {
-                            warn!(
-                                peer_id = %authenticated_peer_id,
-                                remote_protocol = %protocol,
-                                expected_protocol = %PROTOCOL_CURRENT,
-                                "rejecting peer with non-canonical protocol version"
-                            );
-                            let _ = send_message(
-                                &mut writer,
-                                &WireMessage::Error {
-                                    message: format!(
-                                        "unsupported protocol version: remote={} expected={}",
-                                        protocol, PROTOCOL_CURRENT
-                                    ),
-                                },
-                                &mut write_frame_buffer,
-                            )
-                            .await;
-                            let _ = writer.flush().await;
-                            break;
-                        }
-                        remote_protocol = Some(protocol);
-
-                        if let Some(peer_id) = &remote_peer_id {
-                            let _ = state.set_peer_connected(peer_id, true).await;
-                        }
-
-                        if !is_outbound {
-                            let ack = WireMessage::HelloAck {
-                                machine_id: snapshot.machine_id.clone(),
-                                accepted: true,
-                            };
-                            send_message(&mut writer, &ack, &mut write_frame_buffer).await?;
-                        }
-
-                        if let Some(remote_protocol) = remote_protocol {
-                            flush_outgoing_input_payloads_with_buffer(
-                                &state,
-                                &snapshot.machine_id,
-                                remote_peer_id.as_deref(),
-                                remote_protocol,
-                                &mut outbound_transfer_flow,
-                                &mut writer,
-                                &mut write_frame_buffer,
-                            )
-                            .await?;
-                            flush_outgoing_bulk_payloads_with_buffer(
-                                &state,
-                                &snapshot.machine_id,
-                                remote_peer_id.as_deref(),
-                                remote_protocol,
-                                OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
-                                &mut outbound_transfer_flow,
-                                &mut writer,
-                                &mut write_frame_buffer,
-                            )
-                            .await?;
-                        }
-                        writer.flush().await.context("flush hello/ack batch")?;
                     }
                     WireMessage::HelloAck { accepted, .. } => {
-                        if accepted && let Some(peer_id) = &remote_peer_id {
-                            let _ = state.set_peer_connected(peer_id, true).await;
-                        }
-
-                        if let Some(remote_protocol) = remote_protocol {
-                            flush_outgoing_input_payloads_with_buffer(
-                                &state,
-                                &snapshot.machine_id,
-                                remote_peer_id.as_deref(),
-                                remote_protocol,
-                                &mut outbound_transfer_flow,
-                                &mut writer,
-                                &mut write_frame_buffer,
-                            )
-                            .await?;
-                            flush_outgoing_bulk_payloads_with_buffer(
-                                &state,
-                                &snapshot.machine_id,
-                                remote_peer_id.as_deref(),
-                                remote_protocol,
-                                OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
-                                &mut outbound_transfer_flow,
-                                &mut writer,
-                                &mut write_frame_buffer,
-                            )
-                            .await?;
-                        }
-                        writer.flush().await.context("flush hello-ack batch")?;
+                        handle_hello_ack_message(
+                            &state,
+                            remote_peer_id.as_deref(),
+                            &snapshot.machine_id,
+                            remote_protocol,
+                            &mut outbound_transfer_flow,
+                            accepted,
+                            &mut writer,
+                            &mut write_frame_buffer,
+                        )
+                        .await?;
                     }
                     WireMessage::Heartbeat { .. } => {
-                        if let Some(peer_id) = &remote_peer_id {
-                            let _ = state.touch_peer(peer_id).await;
-                        }
+                        handle_heartbeat_message(&state, remote_peer_id.as_deref()).await;
                     }
                     WireMessage::ClipboardText { machine_id, text } => {
                         if machine_id != authenticated_peer_id {
