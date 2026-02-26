@@ -86,6 +86,7 @@ mod windows_app {
         endpoint: String,
         start_daemon: bool,
         ctl_candidates: Vec<String>,
+        daemon_candidates: Vec<String>,
     }
 
     #[derive(Debug, Clone, Deserialize, Default)]
@@ -247,6 +248,7 @@ mod windows_app {
             endpoint: cli.endpoint,
             start_daemon: cli.start_daemon,
             ctl_candidates: resolve_boundlessctl_candidates(),
+            daemon_candidates: resolve_boundlessd_candidates(),
         });
         event_loop.run_app(&mut app).context("run tray event loop")
     }
@@ -292,28 +294,38 @@ mod windows_app {
                     self.last_error = None;
                 }
                 Err(api_error) => {
-                    let mut args = vec!["ui".to_string(), "snapshot".to_string()];
+                    let mut start_message = String::new();
                     if self.ctx.start_daemon {
-                        args.push("--start-daemon".to_string());
-                    }
-                    match run_boundlessctl_with_timeout(&self.ctx, &args, Duration::from_secs(4)) {
-                        Ok(stdout) => match serde_json::from_str::<UiSnapshot>(&stdout) {
+                        match ensure_daemon_available_blocking(&self.ctx) {
+                            Ok(Some(started_path)) => {
+                                start_message = format!("started daemon via `{started_path}`; ");
+                            }
+                            Ok(None) => {}
+                            Err(start_error) => {
+                                self.last_error = Some(format!(
+                                    "snapshot fetch failed (api: {api_error}; start-daemon: {start_error})"
+                                ));
+                                self.snapshot = UiSnapshot::default();
+                                return;
+                            }
+                        }
+                        match fetch_ui_snapshot_blocking(&self.ctx.endpoint) {
                             Ok(snapshot) => {
                                 self.snapshot = snapshot;
                                 self.last_error = None;
+                                return;
                             }
-                            Err(error) => {
-                                self.last_error = Some(format!("parse snapshot fallback: {error}"));
+                            Err(retry_error) => {
+                                self.last_error = Some(format!(
+                                    "snapshot fetch failed (api: {api_error}; {start_message}retry: {retry_error})"
+                                ));
                                 self.snapshot = UiSnapshot::default();
+                                return;
                             }
-                        },
-                        Err(fallback_error) => {
-                            self.last_error = Some(format!(
-                                "snapshot fetch failed (api: {api_error}; fallback: {fallback_error})"
-                            ));
-                            self.snapshot = UiSnapshot::default();
                         }
                     }
+                    self.last_error = Some(format!("snapshot fetch failed (api: {api_error})"));
+                    self.snapshot = UiSnapshot::default();
                 }
             }
         }
@@ -1148,6 +1160,14 @@ mod windows_app {
         block_on_result(trigger_hotkey_action(endpoint, action.to_string()))
     }
 
+    fn ensure_daemon_available_blocking(ctx: &AppContext) -> Result<Option<String>> {
+        block_on_result(ensure_daemon_available(
+            &ctx.endpoint,
+            ctx.start_daemon,
+            &ctx.daemon_candidates,
+        ))
+    }
+
     fn block_on_result<F, T>(future: F) -> Result<T>
     where
         F: Future<Output = Result<T>>,
@@ -1166,6 +1186,58 @@ mod windows_app {
             .await?
             .into_inner();
         Ok(response.message)
+    }
+
+    async fn ensure_daemon_available(
+        endpoint: &str,
+        start_daemon: bool,
+        daemon_candidates: &[String],
+    ) -> Result<Option<String>> {
+        if channel(endpoint).await.is_ok() {
+            return Ok(None);
+        }
+
+        if !start_daemon {
+            bail!("daemon is not reachable at {endpoint}; run boundlessd or pass --start-daemon");
+        }
+
+        let launched = spawn_daemon_process(daemon_candidates)?;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            match channel(endpoint).await {
+                Ok(_) => return Ok(Some(launched)),
+                Err(error) => {
+                    if Instant::now() >= deadline {
+                        bail!(
+                            "daemon did not become reachable at {endpoint} after start attempt: {error}"
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+    }
+
+    fn spawn_daemon_process(candidates: &[String]) -> Result<String> {
+        let mut errors = Vec::new();
+        for candidate in candidates {
+            let mut command = ProcessCommand::new(candidate);
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command.creation_flags(CREATE_NO_WINDOW);
+
+            match command.spawn() {
+                Ok(_) => return Ok(candidate.clone()),
+                Err(error) => errors.push(format!("{candidate}: {error}")),
+            }
+        }
+
+        bail!(
+            "failed to start boundlessd; candidates attempted: {}",
+            errors.join("; ")
+        )
     }
 
     async fn fetch_ui_snapshot(endpoint: &str) -> Result<UiSnapshot> {
@@ -1731,6 +1803,29 @@ mod windows_app {
 
         candidates.push("boundlessctl.exe".to_string());
         candidates.push("boundlessctl".to_string());
+        candidates.sort();
+        candidates.dedup();
+        candidates
+    }
+
+    fn resolve_boundlessd_candidates() -> Vec<String> {
+        let mut candidates = Vec::<String>::new();
+        if let Ok(path) = std::env::var("BOUNDLESS_DAEMON_PATH") {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                candidates.push(trimmed.to_string());
+            }
+        }
+
+        if let Ok(current_exe) = std::env::current_exe()
+            && let Some(parent) = current_exe.parent()
+        {
+            candidates.push(parent.join("boundlessd.exe").display().to_string());
+            candidates.push(parent.join("boundlessd").display().to_string());
+        }
+
+        candidates.push("boundlessd.exe".to_string());
+        candidates.push("boundlessd".to_string());
         candidates.sort();
         candidates.dedup();
         candidates
