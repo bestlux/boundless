@@ -145,16 +145,14 @@ mod windows_app {
             verification_nonce: String,
             requester_alias: Option<String>,
         },
-        CheckNearbyJoin {
-            request_id: String,
-        },
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(tag = "status", rename_all = "snake_case")]
     enum NearbyJoinWireResponse {
         Pending {
-            request_id: String,
+            #[serde(rename = "request_id")]
+            _request_id: String,
             message: String,
         },
         Approved {
@@ -1335,9 +1333,32 @@ mod windows_app {
             },
         )
         .await?;
-
-        let responder_bundle =
-            wait_for_nearby_pairing_approval(&target, response, 120, &request_id).await?;
+        let responder_bundle = match response {
+            NearbyJoinWireResponse::Approved {
+                request_id: approved_request_id,
+                responder_bundle,
+                ..
+            } => {
+                if approved_request_id != request_id {
+                    bail!("nearby pairing request id mismatch");
+                }
+                responder_bundle
+            }
+            NearbyJoinWireResponse::Pending { .. } => {
+                bail!(
+                    "unexpected pending response for code submission; start a new pairing request"
+                );
+            }
+            NearbyJoinWireResponse::Rejected { message, .. } => {
+                bail!("nearby pairing rejected: {message}");
+            }
+            NearbyJoinWireResponse::Error { message } => {
+                bail!("nearby pairing failed: {message}");
+            }
+            NearbyJoinWireResponse::CodeRequired { message, .. } => {
+                bail!("nearby pairing failed: {message}");
+            }
+        };
         import_nearby_responder_bundle(endpoint, responder_bundle, &host, alias).await
     }
 
@@ -1363,80 +1384,6 @@ mod windows_app {
             .await?
             .into_inner();
         Ok(response.message)
-    }
-
-    async fn wait_for_nearby_pairing_approval(
-        target: &str,
-        initial_response: NearbyJoinWireResponse,
-        timeout_seconds: u64,
-        expected_request_id: &str,
-    ) -> Result<StoredTrustBundle> {
-        match initial_response {
-            NearbyJoinWireResponse::Approved {
-                request_id,
-                responder_bundle,
-                ..
-            } => {
-                if !expected_request_id.is_empty() && !request_id.eq(expected_request_id) {
-                    bail!("nearby pairing request id mismatch");
-                }
-                Ok(responder_bundle)
-            }
-            NearbyJoinWireResponse::Pending {
-                request_id,
-                message: _,
-            } => {
-                let deadline = Instant::now() + Duration::from_secs(timeout_seconds.max(5));
-                loop {
-                    if Instant::now() >= deadline {
-                        bail!(
-                            "timed out waiting for nearby pairing approval request_id={request_id}"
-                        );
-                    }
-
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    let status_response = send_nearby_pairing_request(
-                        target,
-                        NearbyJoinWireRequest::CheckNearbyJoin {
-                            request_id: request_id.clone(),
-                        },
-                    )
-                    .await?;
-
-                    match status_response {
-                        NearbyJoinWireResponse::Pending { .. } => continue,
-                        NearbyJoinWireResponse::Approved {
-                            request_id: approved_request_id,
-                            responder_bundle,
-                            ..
-                        } => {
-                            if !request_id.eq(&approved_request_id) {
-                                bail!("nearby pairing request id mismatch");
-                            }
-                            return Ok(responder_bundle);
-                        }
-                        NearbyJoinWireResponse::Rejected { message, .. } => {
-                            bail!("nearby pairing rejected: {message}");
-                        }
-                        NearbyJoinWireResponse::Error { message } => {
-                            bail!("nearby pairing failed: {message}");
-                        }
-                        NearbyJoinWireResponse::CodeRequired { message, .. } => {
-                            bail!("nearby pairing failed: {message}");
-                        }
-                    }
-                }
-            }
-            NearbyJoinWireResponse::Rejected { message, .. } => {
-                bail!("nearby pairing rejected: {message}");
-            }
-            NearbyJoinWireResponse::Error { message } => {
-                bail!("nearby pairing failed: {message}");
-            }
-            NearbyJoinWireResponse::CodeRequired { message, .. } => {
-                bail!("nearby pairing failed: {message}");
-            }
-        }
     }
 
     async fn import_nearby_responder_bundle(
@@ -1832,6 +1779,12 @@ mod windows_app {
             );
         }
 
+        if lowered.contains("nearby pairing endpoint closed without a response") {
+            return format!(
+                "{message}\n\nThe remote pairing service did not respond.\nVerify both trays are updated and retry."
+            );
+        }
+
         message
     }
 
@@ -1841,6 +1794,7 @@ mod windows_app {
             || lowered.contains("verification code expired")
             || lowered.contains("timed out waiting for nearby pairing approval")
             || lowered.contains("nearby pairing request not found")
+            || lowered.contains("nearby pairing endpoint closed without a response")
     }
 
     fn extract_attempts_remaining(message: &str) -> Option<u8> {
