@@ -46,11 +46,15 @@ impl PairingService for PairingApi {
 
     async fn list_nearby_pairing_requests(
         &self,
-        _request: Request<Empty>,
+        request: Request<Empty>,
     ) -> Result<Response<NearbyPairingRequestsReply>, Status> {
+        let remote_addr = request.remote_addr();
         let snapshot = self.0.snapshot().await;
-        let expose_verification_code =
-            should_expose_verification_code(snapshot.api_transport.as_str(), &snapshot.api_bind);
+        let expose_verification_code = should_expose_verification_code(
+            snapshot.api_transport.as_str(),
+            &snapshot.api_bind,
+            remote_addr,
+        );
         let requests = self
             .0
             .list_pending_nearby_pairing_requests()
@@ -174,7 +178,11 @@ impl PairingService for PairingApi {
     }
 }
 
-fn should_expose_verification_code(api_transport: &str, api_bind: &str) -> bool {
+fn should_expose_verification_code(
+    api_transport: &str,
+    api_bind: &str,
+    remote_addr: Option<std::net::SocketAddr>,
+) -> bool {
     if api_transport.eq_ignore_ascii_case("npipe")
         || api_transport.eq_ignore_ascii_case("named_pipe")
     {
@@ -190,4 +198,45 @@ fn should_expose_verification_code(api_transport: &str, api_bind: &str) -> bool 
         .parse::<std::net::SocketAddr>()
         .map(|address| address.ip().is_loopback())
         .unwrap_or(false)
+        || remote_addr.is_some_and(|address| address.ip().is_loopback())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_expose_verification_code;
+
+    #[test]
+    fn should_expose_verification_code_allows_npipe_transport() {
+        assert!(should_expose_verification_code(
+            "npipe",
+            "0.0.0.0:50051",
+            None
+        ));
+    }
+
+    #[test]
+    fn should_expose_verification_code_allows_loopback_bind() {
+        assert!(should_expose_verification_code(
+            "tcp",
+            "127.0.0.1:50051",
+            None
+        ));
+    }
+
+    #[test]
+    fn should_expose_verification_code_allows_loopback_client_on_wildcard_bind() {
+        let remote = "127.0.0.1:53429"
+            .parse()
+            .expect("parse loopback client socket");
+        assert!(should_expose_verification_code(
+            "tcp",
+            "0.0.0.0:50051",
+            Some(remote)
+        ));
+        assert!(!should_expose_verification_code(
+            "tcp",
+            "0.0.0.0:50051",
+            None
+        ));
+    }
 }
