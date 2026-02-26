@@ -9,7 +9,9 @@ param(
     [string]$ScenarioPrefix = "s4_recovery",
     [int]$PendingWaitSeconds = 20,
     [int]$PostExpiryGraceSeconds = 2,
-    [string]$SuccessCode = ""
+    [string]$SuccessCode = "",
+    [ValidateSet("full", "success-only", "lockout-only", "success-and-lockout")]
+    [string]$Mode = "full"
 )
 
 Set-StrictMode -Version Latest
@@ -230,55 +232,100 @@ function Read-SuccessCodeFromOperator {
     }
 }
 
+function Start-LockoutScenario {
+    Write-Host "[s4-recovery] lockout scenario"
+
+    $first = Start-PairRequestCode
+    Write-Host "[s4-recovery] lockout pass1 request_id=$($first.RequestId)"
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        $result = Submit-PairRequestCode -RequestId $first.RequestId -Nonce $first.Nonce -Code "000000"
+        if ($result.ExitCode -eq 0) {
+            throw "lockout scenario pass1 attempt $attempt unexpectedly succeeded"
+        }
+    }
+
+    Start-Sleep -Seconds 3
+
+    $second = Start-PairRequestCode
+    Write-Host "[s4-recovery] lockout pass2 request_id=$($second.RequestId)"
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $result = Submit-PairRequestCode -RequestId $second.RequestId -Nonce $second.Nonce -Code "000000"
+        if ($result.ExitCode -eq 0) {
+            throw "lockout scenario pass2 attempt $attempt unexpectedly succeeded"
+        }
+    }
+
+    $lockout = Submit-PairRequestCode -RequestId $second.RequestId -Nonce $second.Nonce -Code "000000"
+    if ($lockout.ExitCode -eq 0) {
+        throw "lockout scenario expected lockout failure but submission succeeded"
+    }
+    if (-not $lockout.Output.ToLowerInvariant().Contains("temporarily locked")) {
+        throw "lockout scenario expected temporary lockout message`n$($lockout.Output)"
+    }
+}
+
 Write-Host "[s4-recovery] validating endpoint reachability"
 Invoke-CliChecked -Endpoint $EndpointA -CommandArgs @("daemon", "status") | Out-Host
 Invoke-CliChecked -Endpoint $EndpointB -CommandArgs @("daemon", "status") | Out-Host
 
 $captures = [ordered]@{}
 
+$runFull = $Mode -eq "full"
+$runSuccess = $runFull -or $Mode -eq "success-only" -or $Mode -eq "success-and-lockout"
+$runLockout = $Mode -eq "lockout-only" -or $Mode -eq "success-and-lockout"
+
 Write-Host "[s4-recovery] capture before"
 $captures["before"] = Invoke-Capture -Scenario "${ScenarioPrefix}_matrix" -Phase "before"
 
-Write-Host "[s4-recovery] reject scenario"
-$reject = Start-PairRequestCode
-$rejectPending = Wait-ForPendingRequestOnResponder -RequestId $reject.RequestId -TimeoutSeconds $PendingWaitSeconds
-Write-Host "[s4-recovery] reject request_id=$($reject.RequestId)"
-Invoke-CliChecked -Endpoint $EndpointB -CommandArgs @("pair", "reject", $reject.RequestId) | Out-Host
-$rejectSubmit = Submit-PairRequestCode -RequestId $reject.RequestId -Nonce $reject.Nonce -Code "000000"
-if ($rejectSubmit.ExitCode -eq 0) {
-    throw "reject scenario unexpectedly succeeded for request_id=$($reject.RequestId)`n$($rejectSubmit.Output)"
-}
-$captures["reject_failure"] = Invoke-Capture -Scenario "${ScenarioPrefix}_reject" -Phase "failure"
-
-Write-Host "[s4-recovery] timeout scenario"
-$timeout = Start-PairRequestCode
-$null = Wait-ForPendingRequestOnResponder -RequestId $timeout.RequestId -TimeoutSeconds $PendingWaitSeconds
-Write-Host "[s4-recovery] waiting for code expiry request_id=$($timeout.RequestId) expires_at=$($timeout.ExpiresAt)"
-Wait-UntilAfterExpiration -ExpiresAt $timeout.ExpiresAt -GraceSeconds $PostExpiryGraceSeconds
-$timeoutSubmit = Submit-PairRequestCode -RequestId $timeout.RequestId -Nonce $timeout.Nonce -Code "000000"
-if ($timeoutSubmit.ExitCode -eq 0) {
-    throw "timeout scenario unexpectedly succeeded for request_id=$($timeout.RequestId)`n$($timeoutSubmit.Output)"
-}
-$captures["timeout_failure"] = Invoke-Capture -Scenario "${ScenarioPrefix}_timeout" -Phase "failure"
-
-Write-Host "[s4-recovery] success recovery scenario"
-$success = Start-PairRequestCode
-$successPending = Wait-ForPendingRequestOnResponder -RequestId $success.RequestId -TimeoutSeconds $PendingWaitSeconds
-$successCodeToUse = $SuccessCode.Trim()
-if ([string]::IsNullOrWhiteSpace($successCodeToUse)) {
-    if ($null -ne $successPending -and -not [string]::IsNullOrWhiteSpace($successPending.Code) -and $successPending.Code -ne "(hidden)") {
-        $successCodeToUse = $successPending.Code
+if ($runFull) {
+    Write-Host "[s4-recovery] reject scenario"
+    $reject = Start-PairRequestCode
+    $null = Wait-ForPendingRequestOnResponder -RequestId $reject.RequestId -TimeoutSeconds $PendingWaitSeconds
+    Write-Host "[s4-recovery] reject request_id=$($reject.RequestId)"
+    Invoke-CliChecked -Endpoint $EndpointB -CommandArgs @("pair", "reject", $reject.RequestId) | Out-Host
+    $rejectSubmit = Submit-PairRequestCode -RequestId $reject.RequestId -Nonce $reject.Nonce -Code "000000"
+    if ($rejectSubmit.ExitCode -eq 0) {
+        throw "reject scenario unexpectedly succeeded for request_id=$($reject.RequestId)`n$($rejectSubmit.Output)"
     }
-}
-if ([string]::IsNullOrWhiteSpace($successCodeToUse)) {
-    $successCodeToUse = Read-SuccessCodeFromOperator -RequestId $success.RequestId
+    $captures["reject_failure"] = Invoke-Capture -Scenario "${ScenarioPrefix}_reject" -Phase "failure"
+
+    Write-Host "[s4-recovery] timeout scenario"
+    $timeout = Start-PairRequestCode
+    $null = Wait-ForPendingRequestOnResponder -RequestId $timeout.RequestId -TimeoutSeconds $PendingWaitSeconds
+    Write-Host "[s4-recovery] waiting for code expiry request_id=$($timeout.RequestId) expires_at=$($timeout.ExpiresAt)"
+    Wait-UntilAfterExpiration -ExpiresAt $timeout.ExpiresAt -GraceSeconds $PostExpiryGraceSeconds
+    $timeoutSubmit = Submit-PairRequestCode -RequestId $timeout.RequestId -Nonce $timeout.Nonce -Code "000000"
+    if ($timeoutSubmit.ExitCode -eq 0) {
+        throw "timeout scenario unexpectedly succeeded for request_id=$($timeout.RequestId)`n$($timeoutSubmit.Output)"
+    }
+    $captures["timeout_failure"] = Invoke-Capture -Scenario "${ScenarioPrefix}_timeout" -Phase "failure"
 }
 
-$successSubmit = Submit-PairRequestCode -RequestId $success.RequestId -Nonce $success.Nonce -Code $successCodeToUse
-if ($successSubmit.ExitCode -ne 0) {
-    throw "success scenario failed for request_id=$($success.RequestId)`n$($successSubmit.Output)"
+if ($runSuccess) {
+    Write-Host "[s4-recovery] success recovery scenario"
+    $success = Start-PairRequestCode
+    $successPending = Wait-ForPendingRequestOnResponder -RequestId $success.RequestId -TimeoutSeconds $PendingWaitSeconds
+    $successCodeToUse = $SuccessCode.Trim()
+    if ([string]::IsNullOrWhiteSpace($successCodeToUse)) {
+        if ($null -ne $successPending -and -not [string]::IsNullOrWhiteSpace($successPending.Code) -and $successPending.Code -ne "(hidden)") {
+            $successCodeToUse = $successPending.Code
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($successCodeToUse)) {
+        $successCodeToUse = Read-SuccessCodeFromOperator -RequestId $success.RequestId
+    }
+
+    $successSubmit = Submit-PairRequestCode -RequestId $success.RequestId -Nonce $success.Nonce -Code $successCodeToUse
+    if ($successSubmit.ExitCode -ne 0) {
+        throw "success scenario failed for request_id=$($success.RequestId)`n$($successSubmit.Output)"
+    }
+    $captures["after"] = Invoke-Capture -Scenario "${ScenarioPrefix}_matrix" -Phase "after"
 }
-$captures["after"] = Invoke-Capture -Scenario "${ScenarioPrefix}_matrix" -Phase "after"
+
+if ($runLockout) {
+    Start-LockoutScenario
+    $captures["lockout_failure"] = Invoke-Capture -Scenario "${ScenarioPrefix}_lockout" -Phase "failure"
+}
 
 Write-Host "[s4-recovery] diagnostics dump"
 $dumpA = Invoke-CliChecked -Endpoint $EndpointA -CommandArgs @(
@@ -291,9 +338,8 @@ $dumpB = Invoke-CliChecked -Endpoint $EndpointB -CommandArgs @(
 )
 
 Write-Host "[s4-recovery] complete"
-Write-Host "captures.before=$($captures["before"])"
-Write-Host "captures.reject_failure=$($captures["reject_failure"])"
-Write-Host "captures.timeout_failure=$($captures["timeout_failure"])"
-Write-Host "captures.after=$($captures["after"])"
+foreach ($entry in $captures.GetEnumerator()) {
+    Write-Host "captures.$($entry.Key)=$($entry.Value)"
+}
 Write-Host ($dumpA.Trim())
 Write-Host ($dumpB.Trim())

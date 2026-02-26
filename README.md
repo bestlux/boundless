@@ -66,6 +66,10 @@ Automated pairing recovery matrix (reject + timeout + recovery success) with cap
 ```
 
 If responder verification codes are hidden over remote API, the recovery script prompts once for the 6-digit success code shown on the responder tray. You can also pass `-RecoverySuccessCode <code>` / `-SuccessCode <code>` to avoid prompts.
+Follow-up modes:
+- `-Mode success-only`
+- `-Mode lockout-only`
+- `-Mode success-and-lockout`
 
 Compatibility wrapper (legacy command still works):
 

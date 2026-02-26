@@ -24,7 +24,9 @@ param(
     [int]$RecoveryPendingWaitSeconds = 20,
     [int]$RecoveryPostExpiryGraceSeconds = 2,
     [int]$RecoveryEventsLimit = 300,
-    [string]$RecoverySuccessCode = ""
+    [string]$RecoverySuccessCode = "",
+    [ValidateSet("full", "success-only", "lockout-only", "success-and-lockout")]
+    [string]$RecoveryMode = "full"
 )
 
 Set-StrictMode -Version Latest
@@ -183,6 +185,7 @@ function Run-RecoveryMatrix {
         ScenarioPrefix = $RecoveryScenarioPrefix
         PendingWaitSeconds = $RecoveryPendingWaitSeconds
         PostExpiryGraceSeconds = $RecoveryPostExpiryGraceSeconds
+        Mode = $RecoveryMode
     }
     if (-not [string]::IsNullOrWhiteSpace($RecoverySuccessCode)) {
         $commandParams.SuccessCode = $RecoverySuccessCode
