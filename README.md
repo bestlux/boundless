@@ -109,19 +109,34 @@ cargo run -p boundless-cli -- setup
 
 The setup wizard auto-checks daemon reachability, guides pairing (discovered peer or manual host fallback), and can apply initial left/right/up/down orientation for the newly paired peer.
 
-Windows tray UI (minimal utilitarian control surface):
+Windows tray dashboard UI (Windows):
 
 ```bash
 cargo run -p boundless-tray
 ```
 
 `boundlesstray` provides:
-- live discovered/paired/connected/pending visibility
-- right-click pairing actions for discovered peers (guided request -> target shows code -> submit code)
-- first-run setup dialog flow
-- layout wizard dialog flow for left/right/up/down orientation
+- tray icon + dashboard window (`Dashboard` / `Quit` menu)
+- `Status & Pairing` tab for discovered peers, manual connect, paired peers, and pending requests
+- guided challenge-confirm pairing dialog (request code, submit code, retry affordances)
+- `Layout Manager` tab for orientation (`left/right/up/down`) and apply action
+- `Settings` tab for machine/runtime diagnostics and reconnect action
+- API-first background refresh + optional daemon auto-start attempts (`--start-daemon`, default `true`)
 
-On Windows, the daemon now defaults to a local named pipe control endpoint (`npipe://./pipe/boundlessd-api`) and the CLI default endpoint matches that. Use `--endpoint http://127.0.0.1:50051` to target loopback TCP explicitly.
+On Windows, the daemon defaults to a local named pipe control endpoint (`npipe://./pipe/boundlessd-api`) and the tray/CLI default endpoint matches that.
+
+If your local daemon config is TCP (`"api_transport": "tcp"`), launch tray/CLI with explicit TCP endpoint:
+
+```bash
+cargo run -p boundless-tray -- --endpoint http://127.0.0.1:50051
+cargo run -p boundless-cli -- --endpoint http://127.0.0.1:50051 daemon status
+```
+
+You can inspect daemon config path with:
+
+```bash
+cargo run -p boundless-daemon -- print-config-path
+```
 
 Nearby pairing (approval-based, no trust-bundle file copy):
 

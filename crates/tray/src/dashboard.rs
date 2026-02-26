@@ -1,7 +1,7 @@
 use eframe::egui;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
-
 pub(super) fn run() -> Result<()> {
     let cli = Cli::parse();
     let ctx = Arc::new(AppContext {
@@ -46,6 +46,86 @@ enum Tab {
     Settings,
 }
 
+const CANONICAL_LOCAL_LAYOUT_TOKEN: &str = "self";
+
+fn is_local_layout_token(token: &str, local_machine_id: &str) -> bool {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "self" | "local" | "this" | "me"
+    ) || trimmed.eq_ignore_ascii_case(local_machine_id)
+}
+
+fn count_local_layout_cells(
+    layout_grid: &HashMap<(i32, i32), String>,
+    local_machine_id: &str,
+) -> usize {
+    layout_grid
+        .values()
+        .filter(|id| id.eq_ignore_ascii_case(local_machine_id))
+        .count()
+}
+
+fn validate_layout_before_apply(
+    layout_grid: &HashMap<(i32, i32), String>,
+    local_machine_id: &str,
+) -> Result<()> {
+    match count_local_layout_cells(layout_grid, local_machine_id) {
+        1 => Ok(()),
+        0 => anyhow::bail!("layout must include This PC exactly once before applying"),
+        _ => anyhow::bail!("layout must include This PC exactly once before applying"),
+    }
+}
+
+fn serialize_layout_matrix(layout_grid: &HashMap<(i32, i32), String>, local_machine_id: &str) -> String {
+    let mut positions = layout_grid.keys();
+    let Some(&(first_x, first_y)) = positions.next() else {
+        return String::new();
+    };
+
+    let mut min_x = first_x;
+    let mut max_x = first_x;
+    let mut min_y = first_y;
+    let mut max_y = first_y;
+
+    for (x, y) in positions {
+        if *x < min_x {
+            min_x = *x;
+        }
+        if *x > max_x {
+            max_x = *x;
+        }
+        if *y < min_y {
+            min_y = *y;
+        }
+        if *y > max_y {
+            max_y = *y;
+        }
+    }
+
+    let mut rows = Vec::new();
+    for y in min_y..=max_y {
+        let mut cols = Vec::new();
+        for x in min_x..=max_x {
+            if let Some(id) = layout_grid.get(&(x, y)) {
+                cols.push(if id.eq_ignore_ascii_case(local_machine_id) {
+                    CANONICAL_LOCAL_LAYOUT_TOKEN.to_string()
+                } else {
+                    id.clone()
+                });
+            } else {
+                cols.push(String::new());
+            }
+        }
+        rows.push(cols.join(","));
+    }
+
+    rows.join(";")
+}
+
 struct DashboardApp {
     ctx: Arc<AppContext>,
     _tray_icon: Option<TrayIcon>,
@@ -71,10 +151,11 @@ struct DashboardApp {
     pairing_retry_available: bool,
 
     // Layout manager state
-    layout_up: String,
-    layout_down: String,
-    layout_left: String,
-    layout_right: String,
+    layout_grid: HashMap<(i32, i32), String>,
+    layout_unassigned: Vec<String>,
+    layout_initialized: bool,
+    dragging_peer: Option<(String, (i32, i32))>,
+    last_layout_matrix: String,
 }
 
 impl DashboardApp {
@@ -155,10 +236,11 @@ impl DashboardApp {
             pairing_alias: String::new(),
             pairing_in_progress: false,
             pairing_retry_available: false,
-            layout_up: String::new(),
-            layout_down: String::new(),
-            layout_left: String::new(),
-            layout_right: String::new(),
+            layout_grid: HashMap::new(),
+            layout_unassigned: Vec::new(),
+            layout_initialized: false,
+            dragging_peer: None,
+            last_layout_matrix: String::new(),
         }
     }
 
@@ -501,66 +583,273 @@ impl eframe::App for DashboardApp {
                     });
                 }
                 Tab::Layout => {
-                    ui.heading("Visual Layout Manager");
-                    ui.label("Configure the topology around This PC using aliases or IDs.");
-                    ui.add_space(16.0);
-                    
-                    let pc_box = |ui: &mut egui::Ui, title: &str, field: &mut String| {
-                        ui.group(|ui| {
-                            ui.set_width(120.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(egui::RichText::new(title).strong());
-                                ui.text_edit_singleline(field);
-                            });
-                        });
+                    if (!self.layout_initialized && !self.snapshot.machine_id.is_empty()) || 
+                       (self.layout_initialized && self.snapshot.layout_matrix != self.last_layout_matrix && self.dragging_peer.is_none()) {
+                        
+                        self.layout_initialized = true;
+                        self.last_layout_matrix = self.snapshot.layout_matrix.clone();
+                        self.layout_grid.clear();
+                        self.layout_unassigned.clear();
+                        
+                        let matrix_str = &self.snapshot.layout_matrix;
+                        let peers = &self.snapshot.paired_peers;
+                        let local_id = &self.snapshot.machine_id;
+                        
+                        if matrix_str.trim().is_empty() {
+                            self.layout_grid.insert((3, 3), local_id.clone());
+                            let mut left_x = 2;
+                            let mut right_x = 4;
+                            let mut toggle = true;
+                            for p in peers {
+                                if toggle && left_x >= 0 {
+                                    self.layout_grid.insert((left_x, 3), p.peer_id.clone());
+                                    left_x -= 1;
+                                } else if right_x < 7 {
+                                    self.layout_grid.insert((right_x, 3), p.peer_id.clone());
+                                    right_x += 1;
+                                } else if left_x >= 0 {
+                                    self.layout_grid.insert((left_x, 3), p.peer_id.clone());
+                                    left_x -= 1;
+                                }
+                                toggle = !toggle;
+                            }
+                        } else {
+                            let rows: Vec<Vec<String>> = matrix_str.split(';').map(|r| r.split(',').map(|s| s.trim().to_string()).collect()).collect();
+                            let h = rows.len() as i32;
+                            let w = rows.iter().map(|r| r.len()).max().unwrap_or(0) as i32;
+                            let offset_x = (7 - w) / 2;
+                            let offset_y = (7 - h) / 2;
+                            
+                            for (y, row) in rows.iter().enumerate() {
+                                for (x, token) in row.iter().enumerate() {
+                                    if token.is_empty() { continue; }
+                                    let peer_id = if is_local_layout_token(token, local_id) {
+                                        local_id.clone()
+                                    } else if let Some(p) = peers.iter().find(|p| p.display_name == *token || p.peer_id == *token) {
+                                        p.peer_id.clone()
+                                    } else {
+                                        token.clone()
+                                    };
+                                    
+                                    let gx = x as i32 + offset_x;
+                                    let gy = y as i32 + offset_y;
+                                    if gx >= 0 && gx < 7 && gy >= 0 && gy < 7 {
+                                        self.layout_grid.insert((gx, gy), peer_id.clone());
+                                    } else {
+                                        self.layout_unassigned.push(peer_id.clone());
+                                    }
+                                }
+                            }
+                        }
+                        
+                        let all_placed: Vec<String> = self.layout_grid.values().cloned().collect();
+                        for p in peers {
+                            if !all_placed.contains(&p.peer_id) && !self.layout_unassigned.contains(&p.peer_id) {
+                                self.layout_unassigned.push(p.peer_id.clone());
+                            }
+                        }
+                        if !all_placed.contains(local_id) && !self.layout_unassigned.contains(local_id) {
+                            self.layout_unassigned.push(local_id.clone());
+                        }
+                    }
+
+                    let get_display_name = |id: &str| -> String {
+                        if id == self.snapshot.machine_id {
+                            return "This PC".to_string();
+                        }
+                        if let Some(p) = self.snapshot.paired_peers.iter().find(|p| p.peer_id == id) {
+                            return p.display_name.clone();
+                        }
+                        short_token(id).to_string()
                     };
 
-                    ui.vertical_centered(|ui| {
-                        pc_box(ui, "Up", &mut self.layout_up);
-                        ui.horizontal(|ui| {
-                            ui.add_space((ui.available_width() - 360.0) / 2.0);
-                            pc_box(ui, "Left", &mut self.layout_left);
-                            ui.group(|ui| {
-                                ui.set_width(120.0);
-                                ui.vertical_centered(|ui| {
-                                    ui.label(egui::RichText::new("This PC").strong().color(egui::Color32::LIGHT_BLUE));
-                                    ui.label(short_token(&self.snapshot.machine_id));
-                                });
-                            });
-                            pc_box(ui, "Right", &mut self.layout_right);
+                    ui.heading("Visual Layout Manager");
+                    ui.label("Drag and drop devices onto the grid to configure your layout.");
+                    ui.add_space(8.0);
+
+                    let mut drag_stopped = false;
+                    let mut pointer_pos_at_drop = None;
+                    let mut cell_rects = Vec::new();
+                    let mut unassigned_rects = Vec::new();
+
+                    let cell_size = egui::vec2(90.0, 60.0);
+                    let mut new_grid = self.layout_grid.clone();
+                    let mut new_unassigned = self.layout_unassigned.clone();
+
+                    ui.group(|ui| {
+                        ui.label("Unassigned Devices");
+                        ui.horizontal_wrapped(|ui| {
+                            if self.layout_unassigned.is_empty() {
+                                ui.label(egui::RichText::new("None").italics());
+                            }
+                            for (i, peer_id) in self.layout_unassigned.iter().enumerate() {
+                                let (rect, response) = ui.allocate_exact_size(cell_size, egui::Sense::click_and_drag());
+                                unassigned_rects.push((rect, i));
+                                
+                                let is_being_dragged = self.dragging_peer.is_some() && response.dragged();
+                                
+                                if response.drag_started() {
+                                    self.dragging_peer = Some((peer_id.clone(), (-1, i as i32)));
+                                    new_unassigned.remove(i);
+                                }
+                                
+                                if response.drag_stopped() {
+                                    drag_stopped = true;
+                                    pointer_pos_at_drop = ctx.pointer_interact_pos();
+                                }
+                                
+                                let painter = ui.painter();
+                                if !is_being_dragged {
+                                    painter.rect_filled(rect.shrink(4.0), 6.0, egui::Color32::from_rgb(50, 60, 70));
+                                    painter.rect_stroke(rect.shrink(4.0), 6.0, egui::Stroke::new(1.0, egui::Color32::DARK_GRAY));
+                                    let text = get_display_name(peer_id);
+                                    let color = if peer_id == &self.snapshot.machine_id { egui::Color32::LIGHT_BLUE } else { egui::Color32::WHITE };
+                                    let mut job = egui::text::LayoutJob::simple(text, egui::FontId::proportional(12.0), color, rect.width() - 8.0);
+                                    job.halign = egui::Align::Center;
+                                    let galley = ctx.fonts(|f| f.layout_job(job));
+                                    painter.galley(rect.center() - galley.size() / 2.0, galley, color);
+                                }
+                            }
                         });
-                        pc_box(ui, "Down", &mut self.layout_down);
                     });
 
                     ui.add_space(16.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Apply Layout").clicked() {
-                            let mut args = vec!["layout".to_string(), "orient".to_string()];
-                            if !self.layout_left.trim().is_empty() {
-                                args.push("--left".to_string()); args.push(self.layout_left.trim().to_string());
-                            }
-                            if !self.layout_right.trim().is_empty() {
-                                args.push("--right".to_string()); args.push(self.layout_right.trim().to_string());
-                            }
-                            if !self.layout_up.trim().is_empty() {
-                                args.push("--up".to_string()); args.push(self.layout_up.trim().to_string());
-                            }
-                            if !self.layout_down.trim().is_empty() {
-                                args.push("--down".to_string()); args.push(self.layout_down.trim().to_string());
-                            }
-                            
-                            let ctx_clone = self.ctx.clone();
-                            let tx = self.tx.clone();
-                            std::thread::spawn(move || {
-                                match run_boundlessctl(&ctx_clone, &args) {
-                                    Ok(msg) => { let _ = tx.send(AppMsg::ActionComplete(format!("Layout applied: {}", msg))); }
-                                    Err(e) => { let _ = tx.send(AppMsg::ActionFailed(format!("Layout failed: {}", e))); }
+
+                    ui.vertical_centered(|ui| {
+                        egui::Frame::canvas(ui.style()).fill(egui::Color32::from_rgb(25, 30, 35)).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                            for y in 0..7 {
+                                ui.horizontal(|ui| {
+                                for x in 0..7 {
+                                    let (rect, response) = ui.allocate_exact_size(cell_size, egui::Sense::click_and_drag());
+                                    cell_rects.push((rect, x, y));
+                                    
+                                    let is_hovered = response.hovered() && self.dragging_peer.is_some();
+                                    let is_being_dragged = self.dragging_peer.is_some() && response.dragged();
+                                    
+                                    if response.drag_started() {
+                                        if let Some(peer_id) = self.layout_grid.get(&(x, y)) {
+                                            self.dragging_peer = Some((peer_id.clone(), (x, y)));
+                                            new_grid.remove(&(x, y));
+                                        }
+                                    }
+                                    
+                                    if response.drag_stopped() {
+                                        drag_stopped = true;
+                                        pointer_pos_at_drop = ctx.pointer_interact_pos();
+                                    }
+                                    
+                                    let painter = ui.painter();
+                                    if is_hovered {
+                                        painter.rect_filled(rect.shrink(2.0), 4.0, egui::Color32::from_rgb(40, 50, 60));
+                                    }
+                                    painter.rect_stroke(rect.shrink(2.0), 4.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 50, 55)));
+                                    
+                                    if let Some(peer_id) = self.layout_grid.get(&(x, y)) {
+                                        if !is_being_dragged {
+                                            let is_local = peer_id == &self.snapshot.machine_id;
+                                            let bg_color = if is_local { egui::Color32::from_rgb(30, 70, 110) } else { egui::Color32::from_rgb(50, 60, 70) };
+                                            painter.rect_filled(rect.shrink(4.0), 6.0, bg_color);
+                                            let border_color = if is_local { egui::Color32::LIGHT_BLUE } else { egui::Color32::DARK_GRAY };
+                                            painter.rect_stroke(rect.shrink(4.0), 6.0, egui::Stroke::new(1.5, border_color));
+                                            let text = get_display_name(peer_id);
+                                            let mut job = egui::text::LayoutJob::simple(text, egui::FontId::proportional(12.0), egui::Color32::WHITE, rect.width() - 8.0);
+                                            job.halign = egui::Align::Center;
+                                            let galley = ctx.fonts(|f| f.layout_job(job));
+                                            painter.galley(rect.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
+                                        }
+                                    }
                                 }
                             });
                         }
                     });
-                    
+                    });
+
+                    if drag_stopped {
+                        if let Some((peer_id, old_pos)) = self.dragging_peer.take() {
+                            if let Some(pos) = pointer_pos_at_drop {
+                                let mut dropped_in_cell = None;
+                                for (rect, x, y) in &cell_rects {
+                                    if rect.contains(pos) { dropped_in_cell = Some((*x, *y)); break; }
+                                }
+                                
+                                if let Some(new_pos) = dropped_in_cell {
+                                    if let Some(occupant) = self.layout_grid.get(&new_pos).cloned() {
+                                        if old_pos.0 == -1 {
+                                            new_unassigned.insert(old_pos.1 as usize, occupant);
+                                        } else {
+                                            new_grid.insert(old_pos, occupant);
+                                        }
+                                    } else if old_pos.0 == -1 {
+                                        // Removed from unassigned already above
+                                    }
+                                    new_grid.insert(new_pos, peer_id);
+                                } else {
+                                    if old_pos.0 != -1 {
+                                        new_unassigned.push(peer_id);
+                                    } else {
+                                        new_unassigned.insert(old_pos.1 as usize, peer_id);
+                                    }
+                                }
+                            } else {
+                                if old_pos.0 != -1 {
+                                    new_grid.insert(old_pos, peer_id);
+                                } else {
+                                    new_unassigned.insert(old_pos.1 as usize, peer_id);
+                                }
+                            }
+                        }
+                    }
+
+                    self.layout_grid = new_grid;
+                    self.layout_unassigned = new_unassigned;
+
+                    if let Some((peer_id, _)) = &self.dragging_peer {
+                        if let Some(pos) = ctx.pointer_hover_pos() {
+                            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("drag_layer")));
+                            let rect = egui::Rect::from_center_size(pos, cell_size);
+                            let is_local = peer_id == &self.snapshot.machine_id;
+                            let bg_color = if is_local { egui::Color32::from_rgb(40, 90, 140) } else { egui::Color32::from_rgb(70, 80, 90) };
+                            painter.rect_filled(rect.shrink(4.0), 6.0, bg_color);
+                            painter.rect_stroke(rect.shrink(4.0), 6.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                            let text = get_display_name(peer_id);
+                            let mut job = egui::text::LayoutJob::simple(text, egui::FontId::proportional(12.0), egui::Color32::WHITE, rect.width() - 8.0);
+                            job.halign = egui::Align::Center;
+                            let galley = ctx.fonts(|f| f.layout_job(job));
+                            painter.galley(rect.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
+                        }
+                    }
+
                     ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply Layout").clicked() {
+                            match validate_layout_before_apply(&self.layout_grid, &self.snapshot.machine_id) {
+                                Ok(()) => {
+                                    let matrix_str = serialize_layout_matrix(&self.layout_grid, &self.snapshot.machine_id);
+                                    let args = vec!["layout".to_string(), "set".to_string(), matrix_str];
+                                    let ctx_clone = self.ctx.clone();
+                                    let tx = self.tx.clone();
+                                    std::thread::spawn(move || {
+                                        match run_boundlessctl(&ctx_clone, &args) {
+                                            Ok(msg) => { let _ = tx.send(AppMsg::ActionComplete(format!("Layout applied: {}", msg))); }
+                                            Err(e) => { let _ = tx.send(AppMsg::ActionFailed(format!("Layout failed: {}", e))); }
+                                        }
+                                    });
+                                }
+                                Err(error) => {
+                                    self.last_error = Some(error.to_string());
+                                    self.last_message_is_error = true;
+                                }
+                            }
+                        }
+                        
+                        if ui.button("Reset Layout").clicked() {
+                            self.layout_initialized = false;
+                            self.snapshot.layout_matrix = String::new();
+                        }
+                    });
+
+                    ui.add_space(8.0);
                     ui.label(format!("Current Matrix: {}", self.snapshot.layout_matrix));
                 }
                 Tab::Settings => {

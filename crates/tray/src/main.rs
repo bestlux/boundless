@@ -1261,5 +1261,52 @@ mod windows_app {
                 "response timeout should offer retry"
             );
         }
+
+        #[test]
+        fn layout_local_token_recognizes_canonical_aliases_and_machine_id() {
+            let machine_id = "local-machine-id";
+            assert!(is_local_layout_token("self", machine_id));
+            assert!(is_local_layout_token("local", machine_id));
+            assert!(is_local_layout_token("this", machine_id));
+            assert!(is_local_layout_token("me", machine_id));
+            assert!(is_local_layout_token("LOCAL-MACHINE-ID", machine_id));
+        }
+
+        #[test]
+        fn layout_local_token_rejects_legacy_this_pc() {
+            assert!(!is_local_layout_token("THIS-PC", "local-machine-id"));
+        }
+
+        #[test]
+        fn layout_serialization_uses_canonical_self_token() {
+            let mut grid = std::collections::HashMap::<(i32, i32), String>::new();
+            grid.insert((1, 1), "local-machine-id".to_string());
+            grid.insert((2, 1), "peer-right".to_string());
+
+            let matrix = serialize_layout_matrix(&grid, "local-machine-id");
+            assert_eq!(matrix, "self,peer-right");
+        }
+
+        #[test]
+        fn layout_apply_validation_requires_exactly_one_local_cell() {
+            let mut grid = std::collections::HashMap::<(i32, i32), String>::new();
+            grid.insert((0, 0), "peer-a".to_string());
+            assert!(
+                validate_layout_before_apply(&grid, "local-machine-id").is_err(),
+                "layout with zero local cells must fail apply validation"
+            );
+
+            grid.insert((1, 0), "local-machine-id".to_string());
+            assert!(
+                validate_layout_before_apply(&grid, "local-machine-id").is_ok(),
+                "layout with one local cell should pass apply validation"
+            );
+
+            grid.insert((2, 0), "LOCAL-MACHINE-ID".to_string());
+            assert!(
+                validate_layout_before_apply(&grid, "local-machine-id").is_err(),
+                "layout with multiple local cells must fail apply validation"
+            );
+        }
     }
 }
