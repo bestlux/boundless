@@ -46,6 +46,7 @@ Profiles:
 ./scripts/dev/test-suite.ps1 -Profile full    # smoke + 3-node smoke
 ./scripts/dev/test-suite.ps1 -Profile trace -EndpointA http://127.0.0.1:50051 -EndpointB http://10.0.0.5:50051
 ./scripts/dev/test-suite.ps1 -Profile trace -TraceEnforceBudgets -TraceCaptureToApplyP95BudgetMs 45 -TraceCaptureToReceiveP95BudgetMs 20 -TraceCaptureToApplyJitterP95BudgetMs 18
+./scripts/dev/test-suite.ps1 -Profile recovery -EndpointA http://127.0.0.1:50051 -EndpointB http://10.0.0.5:50051
 ```
 
 `-Profile trace` now also exports matrix artifacts beside the trace log by default:
@@ -56,6 +57,12 @@ Standalone matrix export for one or more trace logs:
 
 ```powershell
 ./scripts/dev/input-trace-matrix.ps1 -TraceDir ./artifacts/input-trace -Scenario edge_handoff -Topology topology_a
+```
+
+Automated pairing recovery matrix (reject + timeout + recovery success) with captures and diagnostics:
+
+```powershell
+./scripts/dev/s4-recovery-automation.ps1 -EndpointA http://127.0.0.1:50051 -EndpointB http://10.0.0.5:50051 -ResponderHost 10.0.0.5
 ```
 
 Compatibility wrapper (legacy command still works):

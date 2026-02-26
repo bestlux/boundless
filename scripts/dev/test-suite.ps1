@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("quick", "smoke", "full", "trace")]
+    [ValidateSet("quick", "smoke", "full", "trace", "recovery")]
     [string]$Profile = "smoke",
     [int]$TimeoutSeconds = 60,
     [switch]$KeepArtifacts,
@@ -17,7 +17,13 @@ param(
     [string]$EndpointA = "http://127.0.0.1:50051",
     [string]$EndpointB = "",
     [string]$LabelA = "machine-a",
-    [string]$LabelB = "machine-b"
+    [string]$LabelB = "machine-b",
+    [string]$RecoveryResponderHost = "",
+    [int]$RecoveryResponderPairingPort = 15200,
+    [string]$RecoveryScenarioPrefix = "s4_recovery",
+    [int]$RecoveryPendingWaitSeconds = 20,
+    [int]$RecoveryPostExpiryGraceSeconds = 2,
+    [int]$RecoveryEventsLimit = 300
 )
 
 Set-StrictMode -Version Latest
@@ -137,6 +143,52 @@ function Run-TraceCapture {
     }
 }
 
+function Resolve-HostFromEndpoint {
+    param([string]$Endpoint)
+
+    try {
+        $uri = [System.Uri]$Endpoint
+        if (-not [string]::IsNullOrWhiteSpace($uri.Host)) {
+            return $uri.Host
+        }
+    }
+    catch {
+    }
+
+    return ""
+}
+
+function Run-RecoveryMatrix {
+    if ([string]::IsNullOrWhiteSpace($EndpointB)) {
+        throw "-Profile recovery requires -EndpointB"
+    }
+
+    $responderHost = $RecoveryResponderHost
+    if ([string]::IsNullOrWhiteSpace($responderHost)) {
+        $responderHost = Resolve-HostFromEndpoint -Endpoint $EndpointB
+    }
+    if ([string]::IsNullOrWhiteSpace($responderHost)) {
+        throw "Unable to infer responder host from -EndpointB '$EndpointB'; pass -RecoveryResponderHost explicitly"
+    }
+
+    $commandParams = @{
+        EndpointA = $EndpointA
+        EndpointB = $EndpointB
+        LabelA = $LabelA
+        LabelB = $LabelB
+        ResponderHost = $responderHost
+        ResponderPairingPort = $RecoveryResponderPairingPort
+        EventsLimit = $RecoveryEventsLimit
+        ScenarioPrefix = $RecoveryScenarioPrefix
+        PendingWaitSeconds = $RecoveryPendingWaitSeconds
+        PostExpiryGraceSeconds = $RecoveryPostExpiryGraceSeconds
+    }
+
+    Invoke-CheckedCommand -Label "scripts/dev/s4-recovery-automation.ps1" -Action {
+        & (Join-Path $repoRoot "scripts/dev/s4-recovery-automation.ps1") @commandParams | Out-Host
+    }
+}
+
 $originalCargoIncremental = $env:CARGO_INCREMENTAL
 $env:CARGO_INCREMENTAL = "0"
 
@@ -156,6 +208,9 @@ try {
         }
         "trace" {
             Run-TraceCapture
+        }
+        "recovery" {
+            Run-RecoveryMatrix
         }
     }
 
