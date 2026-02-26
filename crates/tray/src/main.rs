@@ -133,7 +133,7 @@ mod windows_app {
     }
 
     #[derive(Debug, Serialize)]
-    #[serde(tag = "type", rename_all = "snake_case")]
+    #[serde(tag = "op", rename_all = "snake_case")]
     enum NearbyJoinWireRequest {
         NearbyRequestCode {
             requester_bundle: StoredTrustBundle,
