@@ -87,6 +87,11 @@ function Invoke-Capture {
         -LabelB $LabelB `
         -EventsLimit $EventsLimit 2>&1 | Out-String
 
+    $line = ($output -split "\r?\n" | Where-Object { $_ -like "*snapshot written to *" } | Select-Object -Last 1)
+    if (-not [string]::IsNullOrWhiteSpace($line)) {
+        return ($line -replace ".*snapshot written to ", "").Trim()
+    }
+
     $match = [regex]::Match($output, "snapshot written to (?<path>.+)")
     if ($match.Success) {
         return $match.Groups["path"].Value.Trim()
