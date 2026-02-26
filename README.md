@@ -65,6 +65,8 @@ Automated pairing recovery matrix (reject + timeout + recovery success) with cap
 ./scripts/dev/s4-recovery-automation.ps1 -EndpointA http://127.0.0.1:50051 -EndpointB http://10.0.0.5:50051 -ResponderHost 10.0.0.5
 ```
 
+If responder verification codes are hidden over remote API, the recovery script prompts once for the 6-digit success code shown on the responder tray. You can also pass `-RecoverySuccessCode <code>` / `-SuccessCode <code>` to avoid prompts.
+
 Compatibility wrapper (legacy command still works):
 
 ```powershell

@@ -23,7 +23,8 @@ param(
     [string]$RecoveryScenarioPrefix = "s4_recovery",
     [int]$RecoveryPendingWaitSeconds = 20,
     [int]$RecoveryPostExpiryGraceSeconds = 2,
-    [int]$RecoveryEventsLimit = 300
+    [int]$RecoveryEventsLimit = 300,
+    [string]$RecoverySuccessCode = ""
 )
 
 Set-StrictMode -Version Latest
@@ -182,6 +183,9 @@ function Run-RecoveryMatrix {
         ScenarioPrefix = $RecoveryScenarioPrefix
         PendingWaitSeconds = $RecoveryPendingWaitSeconds
         PostExpiryGraceSeconds = $RecoveryPostExpiryGraceSeconds
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RecoverySuccessCode)) {
+        $commandParams.SuccessCode = $RecoverySuccessCode
     }
 
     Invoke-CheckedCommand -Label "scripts/dev/s4-recovery-automation.ps1" -Action {

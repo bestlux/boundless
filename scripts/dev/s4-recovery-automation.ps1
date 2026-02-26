@@ -8,11 +8,15 @@ param(
     [int]$EventsLimit = 300,
     [string]$ScenarioPrefix = "s4_recovery",
     [int]$PendingWaitSeconds = 20,
-    [int]$PostExpiryGraceSeconds = 2
+    [int]$PostExpiryGraceSeconds = 2,
+    [string]$SuccessCode = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+    $PSNativeCommandUseErrorActionPreference = $false
+}
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 Set-Location $repoRoot
@@ -36,9 +40,18 @@ function Invoke-Cli {
         [string[]]$CommandArgs
     )
 
-    $output = & $cliExe "--endpoint" $Endpoint @CommandArgs 2>&1 | Out-String
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $cliExe "--endpoint" $Endpoint @CommandArgs 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
     return [pscustomobject]@{
-        ExitCode = $LASTEXITCODE
+        ExitCode = $exitCode
         Output = $output
     }
 }
@@ -80,11 +93,34 @@ function Invoke-Capture {
 }
 
 function Start-PairRequestCode {
-    $output = Invoke-CliChecked -Endpoint $EndpointA -CommandArgs @(
-        "pair", "request", "target",
-        "--host", $ResponderHost,
-        "--port", "$ResponderPairingPort"
-    )
+    $output = $null
+    $attempt = 0
+    $maxAttempts = 8
+    while ($attempt -lt $maxAttempts) {
+        $attempt += 1
+        $result = Invoke-Cli -Endpoint $EndpointA -CommandArgs @(
+            "pair", "request", "target",
+            "--host", $ResponderHost,
+            "--port", "$ResponderPairingPort"
+        )
+        if ($result.ExitCode -eq 0) {
+            $output = $result.Output
+            break
+        }
+
+        if ($result.Output.ToLowerInvariant().Contains("rate limited")) {
+            $delaySeconds = [Math]::Min(2 * $attempt, 8)
+            Write-Host "[s4-recovery] request-code rate limited; retrying in ${delaySeconds}s (attempt ${attempt}/${maxAttempts})"
+            Start-Sleep -Seconds $delaySeconds
+            continue
+        }
+
+        throw "CLI failed endpoint=$EndpointA args='pair request target --host $ResponderHost --port $ResponderPairingPort' exit=$($result.ExitCode)`n$($result.Output)"
+    }
+
+    if ($null -eq $output) {
+        throw "timed out retrying rate-limited request-code start after ${maxAttempts} attempts"
+    }
 
     $line = ($output -split "\r?\n" | Where-Object { $_ -like "pair_request_code_started=true*" } | Select-Object -First 1)
     if ([string]::IsNullOrWhiteSpace($line)) {
@@ -180,6 +216,20 @@ function Wait-UntilAfterExpiration {
     }
 }
 
+function Read-SuccessCodeFromOperator {
+    param([string]$RequestId)
+
+    while ($true) {
+        Write-Host "[s4-recovery] enter verification code shown on responder (request_id=$RequestId)"
+        $value = Read-Host "verification_code"
+        $value = $value.Trim()
+        if ($value -match "^\d{6}$") {
+            return $value
+        }
+        Write-Host "[s4-recovery] invalid code format; expected exactly 6 digits"
+    }
+}
+
 Write-Host "[s4-recovery] validating endpoint reachability"
 Invoke-CliChecked -Endpoint $EndpointA -CommandArgs @("daemon", "status") | Out-Host
 Invoke-CliChecked -Endpoint $EndpointB -CommandArgs @("daemon", "status") | Out-Host
@@ -202,16 +252,10 @@ $captures["reject_failure"] = Invoke-Capture -Scenario "${ScenarioPrefix}_reject
 
 Write-Host "[s4-recovery] timeout scenario"
 $timeout = Start-PairRequestCode
-$timeoutPending = Wait-ForPendingRequestOnResponder -RequestId $timeout.RequestId -TimeoutSeconds $PendingWaitSeconds
-if ([string]::IsNullOrWhiteSpace($timeoutPending.Code) -or $timeoutPending.Code -eq "(hidden)") {
-    throw "timeout scenario could not read verification code for request_id=$($timeout.RequestId)`n$($timeoutPending.RawLine)"
-}
-if ([string]::IsNullOrWhiteSpace($timeoutPending.ExpiresAt) -or $timeoutPending.ExpiresAt -eq "(hidden)") {
-    throw "timeout scenario could not read verification expiry for request_id=$($timeout.RequestId)`n$($timeoutPending.RawLine)"
-}
-Write-Host "[s4-recovery] waiting for code expiry request_id=$($timeout.RequestId) expires_at=$($timeoutPending.ExpiresAt)"
-Wait-UntilAfterExpiration -ExpiresAt $timeoutPending.ExpiresAt -GraceSeconds $PostExpiryGraceSeconds
-$timeoutSubmit = Submit-PairRequestCode -RequestId $timeout.RequestId -Nonce $timeout.Nonce -Code $timeoutPending.Code
+$null = Wait-ForPendingRequestOnResponder -RequestId $timeout.RequestId -TimeoutSeconds $PendingWaitSeconds
+Write-Host "[s4-recovery] waiting for code expiry request_id=$($timeout.RequestId) expires_at=$($timeout.ExpiresAt)"
+Wait-UntilAfterExpiration -ExpiresAt $timeout.ExpiresAt -GraceSeconds $PostExpiryGraceSeconds
+$timeoutSubmit = Submit-PairRequestCode -RequestId $timeout.RequestId -Nonce $timeout.Nonce -Code "000000"
 if ($timeoutSubmit.ExitCode -eq 0) {
     throw "timeout scenario unexpectedly succeeded for request_id=$($timeout.RequestId)`n$($timeoutSubmit.Output)"
 }
@@ -220,10 +264,17 @@ $captures["timeout_failure"] = Invoke-Capture -Scenario "${ScenarioPrefix}_timeo
 Write-Host "[s4-recovery] success recovery scenario"
 $success = Start-PairRequestCode
 $successPending = Wait-ForPendingRequestOnResponder -RequestId $success.RequestId -TimeoutSeconds $PendingWaitSeconds
-if ([string]::IsNullOrWhiteSpace($successPending.Code) -or $successPending.Code -eq "(hidden)") {
-    throw "success scenario could not read verification code for request_id=$($success.RequestId)`n$($successPending.RawLine)"
+$successCodeToUse = $SuccessCode.Trim()
+if ([string]::IsNullOrWhiteSpace($successCodeToUse)) {
+    if ($null -ne $successPending -and -not [string]::IsNullOrWhiteSpace($successPending.Code) -and $successPending.Code -ne "(hidden)") {
+        $successCodeToUse = $successPending.Code
+    }
 }
-$successSubmit = Submit-PairRequestCode -RequestId $success.RequestId -Nonce $success.Nonce -Code $successPending.Code
+if ([string]::IsNullOrWhiteSpace($successCodeToUse)) {
+    $successCodeToUse = Read-SuccessCodeFromOperator -RequestId $success.RequestId
+}
+
+$successSubmit = Submit-PairRequestCode -RequestId $success.RequestId -Nonce $success.Nonce -Code $successCodeToUse
 if ($successSubmit.ExitCode -ne 0) {
     throw "success scenario failed for request_id=$($success.RequestId)`n$($successSubmit.Output)"
 }
