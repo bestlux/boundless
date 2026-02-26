@@ -35,6 +35,7 @@ mod windows_app {
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::{TcpStream, windows::named_pipe::ClientOptions},
+        time::timeout,
     };
     use tonic::{
         codegen::Service,
@@ -59,6 +60,9 @@ mod windows_app {
     const ACTION_DISCOVER_PREFIX: &str = "discover.";
     const ACTION_APPROVE_PREFIX: &str = "pending.approve.";
     const ACTION_REJECT_PREFIX: &str = "pending.reject.";
+    const NEARBY_PAIRING_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+    const NEARBY_PAIRING_IO_TIMEOUT: Duration = Duration::from_secs(6);
+    const NEARBY_PAIRING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
     #[derive(Debug, Parser)]
     #[command(
@@ -1420,30 +1424,62 @@ mod windows_app {
         target: &str,
         request: NearbyJoinWireRequest,
     ) -> Result<NearbyJoinWireResponse> {
-        let mut socket = TcpStream::connect(target)
+        let mut socket = timeout(NEARBY_PAIRING_CONNECT_TIMEOUT, TcpStream::connect(target))
             .await
+            .with_context(|| {
+                format!(
+                    "connect nearby pairing endpoint {target} timed out after {}s",
+                    NEARBY_PAIRING_CONNECT_TIMEOUT.as_secs()
+                )
+            })?
             .with_context(|| format!("connect nearby pairing endpoint {target}"))?;
         let payload =
             serde_json::to_string(&request).context("serialize nearby pairing request")?;
-        socket
-            .write_all(payload.as_bytes())
+        timeout(
+            NEARBY_PAIRING_IO_TIMEOUT,
+            socket.write_all(payload.as_bytes()),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "send nearby pairing request timed out after {}s",
+                NEARBY_PAIRING_IO_TIMEOUT.as_secs()
+            )
+        })?
+        .context("send nearby pairing request")?;
+        timeout(NEARBY_PAIRING_IO_TIMEOUT, socket.write_all(b"\n"))
             .await
-            .context("send nearby pairing request")?;
-        socket
-            .write_all(b"\n")
-            .await
+            .with_context(|| {
+                format!(
+                    "terminate nearby pairing request timed out after {}s",
+                    NEARBY_PAIRING_IO_TIMEOUT.as_secs()
+                )
+            })?
             .context("terminate nearby pairing request")?;
-        socket
-            .flush()
+        timeout(NEARBY_PAIRING_IO_TIMEOUT, socket.flush())
             .await
+            .with_context(|| {
+                format!(
+                    "flush nearby pairing request timed out after {}s",
+                    NEARBY_PAIRING_IO_TIMEOUT.as_secs()
+                )
+            })?
             .context("flush nearby pairing request")?;
 
         let mut reader = BufReader::new(socket);
         let mut response_line = String::new();
-        let read = reader
-            .read_line(&mut response_line)
-            .await
-            .context("read nearby pairing response")?;
+        let read = timeout(
+            NEARBY_PAIRING_RESPONSE_TIMEOUT,
+            reader.read_line(&mut response_line),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "read nearby pairing response timed out after {}s",
+                NEARBY_PAIRING_RESPONSE_TIMEOUT.as_secs()
+            )
+        })?
+        .context("read nearby pairing response")?;
         if read == 0 {
             bail!("nearby pairing endpoint closed without a response");
         }
@@ -1784,6 +1820,14 @@ mod windows_app {
                 "{message}\n\nThe remote pairing service did not respond.\nVerify both trays are updated and retry."
             );
         }
+        if lowered.contains("read nearby pairing response timed out")
+            || lowered.contains("connect nearby pairing endpoint")
+            || lowered.contains("send nearby pairing request timed out")
+        {
+            return format!(
+                "{message}\n\nThe remote pairing service stalled.\nRetry pairing. If this repeats, restart the target daemon and tray."
+            );
+        }
 
         message
     }
@@ -1795,6 +1839,9 @@ mod windows_app {
             || lowered.contains("timed out waiting for nearby pairing approval")
             || lowered.contains("nearby pairing request not found")
             || lowered.contains("nearby pairing endpoint closed without a response")
+            || lowered.contains("read nearby pairing response timed out")
+            || lowered.contains("connect nearby pairing endpoint")
+            || lowered.contains("send nearby pairing request timed out")
     }
 
     fn extract_attempts_remaining(message: &str) -> Option<u8> {
@@ -1923,6 +1970,23 @@ mod windows_app {
             assert!(
                 !should_offer_new_request_retry(&lockout),
                 "lockout should not offer immediate retry"
+            );
+        }
+
+        #[test]
+        fn should_offer_new_request_retry_matches_transport_stall_signals() {
+            let endpoint_closed =
+                anyhow::anyhow!("nearby pairing endpoint closed without a response");
+            assert!(
+                should_offer_new_request_retry(&endpoint_closed),
+                "closed endpoint should offer retry"
+            );
+
+            let response_timeout =
+                anyhow::anyhow!("read nearby pairing response timed out after 20s");
+            assert!(
+                should_offer_new_request_retry(&response_timeout),
+                "response timeout should offer retry"
             );
         }
     }
