@@ -74,6 +74,19 @@ pub enum WireMessage {
         machine_id: String,
         data: Vec<u8>,
     },
+    ClipboardImageStart {
+        machine_id: String,
+        transfer_id: String,
+        total_bytes: u64,
+        hash_hex: String,
+    },
+    ClipboardImageChunk {
+        transfer_id: String,
+        data: Vec<u8>,
+    },
+    ClipboardImageEnd {
+        transfer_id: String,
+    },
     FileStart {
         machine_id: String,
         transfer_id: String,
@@ -294,6 +307,32 @@ mod tests {
     }
 
     #[test]
+    fn wire_message_clipboard_image_chunk_round_trip() {
+        let original = WireMessage::ClipboardImageStart {
+            machine_id: "machine-a".to_string(),
+            transfer_id: "clip-1".to_string(),
+            total_bytes: 4,
+            hash_hex: "abcd".to_string(),
+        };
+
+        let encoded = encode_frame(&original).expect("encode");
+        let decoded = decode_frame(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn wire_message_clipboard_image_chunk_data_round_trip() {
+        let original = WireMessage::ClipboardImageChunk {
+            transfer_id: "clip-1".to_string(),
+            data: vec![1u8, 2, 3, 4],
+        };
+
+        let encoded = encode_frame(&original).expect("encode");
+        let decoded = decode_frame(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
     fn wire_message_input_frame_round_trip() {
         let original = WireMessage::InputFrame {
             machine_id: "machine-a".to_string(),
@@ -330,8 +369,8 @@ mod tests {
 
     #[test]
     fn encode_frame_rejects_payload_over_limit() {
-        let oversized = WireMessage::ClipboardImage {
-            machine_id: "machine-a".to_string(),
+        let oversized = WireMessage::ClipboardImageChunk {
+            transfer_id: "clip-1".to_string(),
             data: vec![0u8; MAX_WIRE_PAYLOAD_BYTES + 1],
         };
 

@@ -46,6 +46,10 @@ use codec::input_events_to_wire;
 #[cfg(test)]
 use control::{HelloHandling, handle_hello_ack_message, handle_hello_message};
 #[cfg(test)]
+use inbound::{
+    handle_clipboard_image_chunk, handle_clipboard_image_end, handle_clipboard_image_start,
+};
+#[cfg(test)]
 use outbound::flush_outgoing_payloads;
 #[cfg(test)]
 use runtime::outbound_target_candidates;
@@ -142,6 +146,7 @@ pub async fn prepare_listener(state: &AppState) -> Option<TcpListener> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         io,
         pin::Pin,
         task::{Context, Poll},
@@ -149,6 +154,7 @@ mod tests {
 
     use super::*;
     use chrono::Utc;
+    use core_clipboard::{ClipboardPayload, payload_hash_hex};
     use core_security::{SecurityPaths, TrustRecord, ensure_device_identity};
     use tokio::io::AsyncWrite;
 
@@ -651,18 +657,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_drops_clipboard_image_that_exceeds_wire_frame_cap() {
+    async fn flush_chunks_clipboard_image_that_exceeds_wire_frame_cap() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let image_bmp = vec![0u8; 300 * 1024];
         state
             .requeue_outgoing_front(
                 &peer_id,
                 vec![OutboundPayload::ClipboardImage {
-                    image_bmp: vec![0u8; 300 * 1024],
+                    image_bmp: image_bmp.clone(),
                 }],
             )
             .await;
 
-        let mut writer = FailAfterCallsWriter::new(1);
+        let mut writer = CaptureWriter::default();
         flush_outgoing_payloads(
             &state,
             "local",
@@ -676,8 +683,70 @@ mod tests {
         let queued = state.drain_outgoing(&peer_id).await;
         assert!(
             queued.is_empty(),
-            "oversized dropped image must not remain queued"
+            "chunked clipboard image must not remain queued after send"
         );
+
+        let frames = decode_written_frames(&writer.bytes);
+        assert!(matches!(
+            frames.first(),
+            Some(WireMessage::ClipboardImageStart {
+                machine_id,
+                total_bytes,
+                hash_hex,
+                ..
+            }) if machine_id == "local"
+                && *total_bytes == image_bmp.len() as u64
+                && hash_hex == &payload_hash_hex(&ClipboardPayload::Image(image_bmp.clone()))
+        ));
+        assert!(matches!(
+            frames.last(),
+            Some(WireMessage::ClipboardImageEnd { .. })
+        ));
+        assert!(
+            frames
+                .iter()
+                .filter(|frame| matches!(frame, WireMessage::ClipboardImageChunk { .. }))
+                .count()
+                >= 2,
+            "oversized image should be split across multiple chunk frames"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn flush_requeues_chunked_clipboard_image_on_mid_transfer_failure() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        state
+            .requeue_outgoing_front(
+                &peer_id,
+                vec![OutboundPayload::ClipboardImage {
+                    image_bmp: vec![0u8; 300 * 1024],
+                }],
+            )
+            .await;
+
+        let mut writer = FailAfterCallsWriter::new(3);
+        let _ = flush_outgoing_payloads(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            &mut writer,
+        )
+        .await
+        .expect_err("chunked clipboard image should requeue on mid-transfer failure");
+
+        let queued = state.drain_outgoing(&peer_id).await;
+        assert_eq!(
+            queued.len(),
+            1,
+            "failed chunked transfer should requeue the original clipboard image payload"
+        );
+        assert!(matches!(
+            queued.first(),
+            Some(OutboundPayload::ClipboardImage { image_bmp }) if image_bmp.len() == 300 * 1024
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -991,6 +1060,103 @@ mod tests {
 
         let queued = state.drain_outgoing(&peer_id).await;
         assert!(queued.is_empty(), "payload should be flushed from queue");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn chunked_clipboard_image_transfer_reassembles_and_queues_remote_payload() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let image = minimal_bmp_payload();
+        let hash_hex = payload_hash_hex(&ClipboardPayload::Image(image.clone()));
+        let mut inbound_transfers = HashMap::new();
+        let split = image.len() / 2;
+
+        handle_clipboard_image_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            "clip-1".to_string(),
+            image.len() as u64,
+            hash_hex,
+            &mut inbound_transfers,
+        )
+        .await
+        .expect("start chunked clipboard image transfer");
+        handle_clipboard_image_chunk(
+            &state,
+            "clip-1".to_string(),
+            image[..split].to_vec(),
+            &mut inbound_transfers,
+        )
+        .await
+        .expect("first chunk");
+        handle_clipboard_image_chunk(
+            &state,
+            "clip-1".to_string(),
+            image[split..].to_vec(),
+            &mut inbound_transfers,
+        )
+        .await
+        .expect("second chunk");
+        handle_clipboard_image_end(&state, "clip-1".to_string(), &mut inbound_transfers)
+            .await
+            .expect("end chunked clipboard image transfer");
+
+        let queued = state
+            .dequeue_remote_clipboard_payload()
+            .await
+            .expect("queued remote clipboard image");
+        assert!(matches!(
+            queued.payload,
+            ClipboardPayload::Image(ref image_bmp) if image_bmp == &image
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn chunked_clipboard_image_transfer_rejects_hash_mismatch() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let image = minimal_bmp_payload();
+        let mut inbound_transfers = HashMap::new();
+
+        handle_clipboard_image_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            "clip-bad".to_string(),
+            image.len() as u64,
+            "deadbeef".to_string(),
+            &mut inbound_transfers,
+        )
+        .await
+        .expect("start chunked clipboard image transfer");
+        handle_clipboard_image_chunk(
+            &state,
+            "clip-bad".to_string(),
+            image,
+            &mut inbound_transfers,
+        )
+        .await
+        .expect("chunk");
+        handle_clipboard_image_end(&state, "clip-bad".to_string(), &mut inbound_transfers)
+            .await
+            .expect("end chunked clipboard image transfer");
+
+        assert!(
+            state.dequeue_remote_clipboard_payload().await.is_none(),
+            "hash-mismatched chunked clipboard image should be rejected"
+        );
+        assert!(
+            state.transport_events().await.into_iter().any(|event| {
+                event.kind == "transport_transfer_rejected"
+                    && event.detail.contains("reason=hash_mismatch")
+            }),
+            "hash mismatch should be recorded as a transport rejection"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

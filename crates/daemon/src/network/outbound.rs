@@ -1,5 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
+use core_clipboard::{ClipboardPayload, payload_hash_hex};
+
 use super::codec::input_events_to_wire;
 use super::*;
 
@@ -10,6 +12,7 @@ pub(super) struct OutboundTransferFlow {
 
 pub(super) const FILE_TRANSFER_INITIAL_CHUNK_CREDITS: u32 = 8;
 pub(super) const FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS: u32 = 256;
+const CLIPBOARD_IMAGE_CHUNK_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendPayloadOutcome {
@@ -288,13 +291,17 @@ where
             };
             if let Err(error) = encode_frame_to_vec(&message, writer_ctx.frame_buffer) {
                 if matches!(error, WireCodecError::FrameTooLargeToEncode { .. }) {
-                    warn!(
-                        peer_id = %peer_id,
-                        payload_bytes = image_bmp.len(),
-                        limit_bytes = MAX_WIRE_FRAME_BYTES,
-                        "dropping clipboard image payload that exceeds wire frame cap"
-                    );
-                    return Ok(SendPayloadOutcome::Dropped);
+                    send_chunked_clipboard_image(
+                        writer_ctx.writer,
+                        writer_ctx.frame_buffer,
+                        local_machine_id,
+                        image_bmp,
+                    )
+                    .await?;
+                    state
+                        .record_outgoing_clipboard_image(peer_id, image_bmp.len())
+                        .await;
+                    return Ok(SendPayloadOutcome::Sent);
                 }
                 return Err(anyhow::Error::from(error));
             }
@@ -303,14 +310,17 @@ where
                 .len()
                 .saturating_sub(WIRE_FRAME_LENGTH_PREFIX_BYTES);
             if payload_bytes > MAX_WIRE_FRAME_BYTES {
-                warn!(
-                    peer_id = %peer_id,
-                    payload_bytes = image_bmp.len(),
-                    frame_bytes = payload_bytes,
-                    limit_bytes = MAX_WIRE_FRAME_BYTES,
-                    "dropping clipboard image payload that exceeds wire frame cap"
-                );
-                return Ok(SendPayloadOutcome::Dropped);
+                send_chunked_clipboard_image(
+                    writer_ctx.writer,
+                    writer_ctx.frame_buffer,
+                    local_machine_id,
+                    image_bmp,
+                )
+                .await?;
+                state
+                    .record_outgoing_clipboard_image(peer_id, image_bmp.len())
+                    .await;
+                return Ok(SendPayloadOutcome::Sent);
             }
             writer_ctx
                 .writer
@@ -447,6 +457,49 @@ where
             Ok(SendPayloadOutcome::Sent)
         }
     }
+}
+
+async fn send_chunked_clipboard_image<W>(
+    writer: &mut W,
+    frame_buffer: &mut Vec<u8>,
+    local_machine_id: &str,
+    image_bmp: &[u8],
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+    let hash_hex = payload_hash_hex(&ClipboardPayload::Image(image_bmp.to_vec()));
+    send_message(
+        writer,
+        &WireMessage::ClipboardImageStart {
+            machine_id: local_machine_id.to_string(),
+            transfer_id: transfer_id.clone(),
+            total_bytes: image_bmp.len() as u64,
+            hash_hex,
+        },
+        frame_buffer,
+    )
+    .await?;
+
+    for chunk in image_bmp.chunks(CLIPBOARD_IMAGE_CHUNK_BYTES) {
+        send_message(
+            writer,
+            &WireMessage::ClipboardImageChunk {
+                transfer_id: transfer_id.clone(),
+                data: chunk.to_vec(),
+            },
+            frame_buffer,
+        )
+        .await?;
+    }
+
+    send_message(
+        writer,
+        &WireMessage::ClipboardImageEnd { transfer_id },
+        frame_buffer,
+    )
+    .await
 }
 
 pub(super) async fn send_file_chunk_credit<W>(

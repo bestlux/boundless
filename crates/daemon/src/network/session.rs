@@ -9,8 +9,9 @@ use super::control::{
     HelloHandling, handle_heartbeat_message, handle_hello_ack_message, handle_hello_message,
 };
 use super::inbound::{
-    InboundTransfer, discard_inbound_transfer, handle_file_chunk, handle_file_end,
-    handle_file_start,
+    InboundClipboardImageTransfer, InboundTransfer, discard_inbound_clipboard_image_transfer,
+    discard_inbound_transfer, handle_clipboard_image_chunk, handle_clipboard_image_end,
+    handle_clipboard_image_start, handle_file_chunk, handle_file_end, handle_file_start,
 };
 use super::inbound_payload::{
     handle_clipboard_image_message, handle_clipboard_text_message, handle_input_frame_message,
@@ -126,6 +127,8 @@ where
         .await;
     let mut remote_protocol: Option<ProtocolVersion> = None;
     let mut inbound_transfers: HashMap<String, InboundTransfer> = HashMap::new();
+    let mut inbound_clipboard_image_transfers: HashMap<String, InboundClipboardImageTransfer> =
+        HashMap::new();
     let mut outbound_transfer_flow: HashMap<String, OutboundTransferFlow> = HashMap::new();
 
     loop {
@@ -383,6 +386,42 @@ where
                         )
                         .await;
                     }
+                    WireMessage::ClipboardImageStart {
+                        machine_id,
+                        transfer_id,
+                        total_bytes,
+                        hash_hex,
+                        ..
+                    } => {
+                        handle_clipboard_image_start(
+                            &state,
+                            &authenticated_peer_id,
+                            remote_peer_id.as_deref(),
+                            machine_id,
+                            transfer_id,
+                            total_bytes,
+                            hash_hex,
+                            &mut inbound_clipboard_image_transfers,
+                        )
+                        .await?;
+                    }
+                    WireMessage::ClipboardImageChunk { transfer_id, data } => {
+                        handle_clipboard_image_chunk(
+                            &state,
+                            transfer_id,
+                            data,
+                            &mut inbound_clipboard_image_transfers,
+                        )
+                        .await?;
+                    }
+                    WireMessage::ClipboardImageEnd { transfer_id, .. } => {
+                        handle_clipboard_image_end(
+                            &state,
+                            transfer_id,
+                            &mut inbound_clipboard_image_transfers,
+                        )
+                        .await?;
+                    }
                     WireMessage::FileStart {
                         machine_id,
                         transfer_id,
@@ -487,6 +526,9 @@ where
 
     for transfer in inbound_transfers.into_values() {
         discard_inbound_transfer(transfer).await;
+    }
+    for transfer in inbound_clipboard_image_transfers.into_values() {
+        discard_inbound_clipboard_image_transfer(transfer).await;
     }
 
     if let Some(peer_id) = &remote_peer_id {

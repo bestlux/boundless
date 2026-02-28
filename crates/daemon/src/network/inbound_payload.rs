@@ -74,20 +74,31 @@ pub(super) async fn handle_clipboard_image_message(
     }
 
     if let Some(peer_id) = remote_peer_id {
-        let size_bytes = data.len();
-        if let Err(error) = state.enqueue_remote_clipboard_image(peer_id, data).await {
-            warn!(
-                peer_id = %peer_id,
-                error = ?error,
-                "failed to enqueue incoming clipboard image payload"
-            );
-        } else {
-            info!(
-                peer_id = %peer_id,
-                size_bytes,
-                "received clipboard image payload"
-            );
-        }
+        enqueue_clipboard_image_payload(state, peer_id, data, "received clipboard image payload")
+            .await;
+    }
+}
+
+pub(super) async fn enqueue_clipboard_image_payload(
+    state: &AppState,
+    peer_id: &str,
+    data: Vec<u8>,
+    success_message: &str,
+) {
+    let size_bytes = data.len();
+    if let Err(error) = state.enqueue_remote_clipboard_image(peer_id, data).await {
+        warn!(
+            peer_id = %peer_id,
+            error = ?error,
+            "failed to enqueue incoming clipboard image payload"
+        );
+    } else {
+        info!(
+            peer_id = %peer_id,
+            size_bytes,
+            message = success_message,
+            "clipboard image payload enqueued"
+        );
     }
 }
 
