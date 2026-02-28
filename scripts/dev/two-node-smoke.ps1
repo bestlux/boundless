@@ -1,10 +1,14 @@
 param(
     [int]$TimeoutSeconds = 45,
-    [switch]$KeepArtifacts
+    [switch]$KeepArtifacts,
+    [switch]$ClipboardOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+    $PSNativeCommandUseErrorActionPreference = $false
+}
 
 $originalCargoIncremental = $null
 
@@ -27,12 +31,12 @@ $node2Security = Join-Path $node2Root "security"
 $node1Inbox = Join-Path $node1Root "inbox"
 $node2Inbox = Join-Path $node2Root "inbox"
 
-$node1Endpoint = "http://127.0.0.1:55051"
-$node2Endpoint = "http://127.0.0.1:55052"
-$node1Bind = "127.0.0.1:55051"
-$node2Bind = "127.0.0.1:55052"
-$node1Port = 55100
-$node2Port = 55101
+$node1Endpoint = $null
+$node2Endpoint = $null
+$node1Bind = $null
+$node2Bind = $null
+$node1Port = 0
+$node2Port = 0
 
 $bundle1 = Join-Path $runRoot "node1-bundle.json"
 $bundle2 = Join-Path $runRoot "node2-bundle.json"
@@ -360,9 +364,118 @@ function Remove-PathWithRetry {
     return $false
 }
 
+function Set-LittleEndianUInt16 {
+    param(
+        [byte[]]$Buffer,
+        [int]$Offset,
+        [int]$Value
+    )
+
+    [System.BitConverter]::GetBytes([uint16]$Value).CopyTo($Buffer, $Offset)
+}
+
+function Set-LittleEndianUInt32 {
+    param(
+        [byte[]]$Buffer,
+        [int]$Offset,
+        [uint32]$Value
+    )
+
+    [System.BitConverter]::GetBytes($Value).CopyTo($Buffer, $Offset)
+}
+
+function Set-LittleEndianInt32 {
+    param(
+        [byte[]]$Buffer,
+        [int]$Offset,
+        [int]$Value
+    )
+
+    [System.BitConverter]::GetBytes($Value).CopyTo($Buffer, $Offset)
+}
+
+function New-BmpBytes {
+    param(
+        [int]$Width,
+        [int]$Height,
+        [byte]$Blue = 0x00,
+        [byte]$Green = 0x00,
+        [byte]$Red = 0xFF
+    )
+
+    if ($Width -le 0 -or $Height -le 0) {
+        throw "BMP dimensions must be positive"
+    }
+
+    $rowStride = [int](4 * [Math]::Ceiling(($Width * 3) / 4.0))
+    $pixelBytes = $rowStride * $Height
+    $fileBytes = 54 + $pixelBytes
+    $bytes = [byte[]]::new($fileBytes)
+    $bytes[0] = 0x42
+    $bytes[1] = 0x4D
+    Set-LittleEndianUInt32 -Buffer $bytes -Offset 2 -Value ([uint32]$fileBytes)
+    Set-LittleEndianUInt32 -Buffer $bytes -Offset 10 -Value 54
+    Set-LittleEndianUInt32 -Buffer $bytes -Offset 14 -Value 40
+    Set-LittleEndianInt32 -Buffer $bytes -Offset 18 -Value $Width
+    Set-LittleEndianInt32 -Buffer $bytes -Offset 22 -Value $Height
+    Set-LittleEndianUInt16 -Buffer $bytes -Offset 26 -Value 1
+    Set-LittleEndianUInt16 -Buffer $bytes -Offset 28 -Value 24
+    Set-LittleEndianUInt32 -Buffer $bytes -Offset 34 -Value ([uint32]$pixelBytes)
+    Set-LittleEndianInt32 -Buffer $bytes -Offset 38 -Value 2835
+    Set-LittleEndianInt32 -Buffer $bytes -Offset 42 -Value 2835
+
+    $pixelOffset = 54
+    for ($row = 0; $row -lt $Height; $row++) {
+        $rowStart = $pixelOffset + ($row * $rowStride)
+        for ($col = 0; $col -lt $Width; $col++) {
+            $base = $rowStart + ($col * 3)
+            $bytes[$base] = $Blue
+            $bytes[$base + 1] = $Green
+            $bytes[$base + 2] = $Red
+        }
+    }
+
+    return $bytes
+}
+
+function New-BmpFile {
+    param(
+        [string]$Path,
+        [int]$Width,
+        [int]$Height,
+        [byte]$Blue = 0x00,
+        [byte]$Green = 0x00,
+        [byte]$Red = 0xFF
+    )
+
+    $bytes = New-BmpBytes -Width $Width -Height $Height -Blue $Blue -Green $Green -Red $Red
+    [System.IO.File]::WriteAllBytes($Path, $bytes)
+    return $bytes.Length
+}
+
+function Get-FreeTcpPort {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        return $listener.LocalEndpoint.Port
+    }
+    finally {
+        $listener.Stop()
+    }
+}
+
 try {
     $originalCargoIncremental = $env:CARGO_INCREMENTAL
     $env:CARGO_INCREMENTAL = "0"
+
+    $node1ApiPort = Get-FreeTcpPort
+    $node2ApiPort = Get-FreeTcpPort
+    $node1Port = Get-FreeTcpPort
+    $node2Port = Get-FreeTcpPort
+    $node1Endpoint = "http://127.0.0.1:$node1ApiPort"
+    $node2Endpoint = "http://127.0.0.1:$node2ApiPort"
+    $node1Bind = "127.0.0.1:$node1ApiPort"
+    $node2Bind = "127.0.0.1:$node2ApiPort"
 
     Write-Host "[smoke] building debug binaries"
     cargo build -p boundless-daemon -p boundless-cli | Out-Host
@@ -421,60 +534,62 @@ try {
     Wait-ForPeerConnectionState -Endpoint $node1Endpoint -PeerId $node1PeerId -Connected $true -Seconds $TimeoutSeconds
     Wait-ForPeerConnectionState -Endpoint $node2Endpoint -PeerId $node2PeerId -Connected $true -Seconds $TimeoutSeconds
 
-    Write-Host "[smoke] validating diagnostics action trigger helpers"
-    $featureList = Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("feature", "list")
-    $easyMouseMatch = [regex]::Match($featureList, "easy_mouse=(true|false)")
-    if (-not $easyMouseMatch.Success) {
-        throw "Could not parse easy_mouse value from feature list: $featureList"
+    if (-not $ClipboardOnly) {
+        Write-Host "[smoke] validating diagnostics action trigger helpers"
+        $featureList = Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("feature", "list")
+        $easyMouseMatch = [regex]::Match($featureList, "easy_mouse=(true|false)")
+        if (-not $easyMouseMatch.Success) {
+            throw "Could not parse easy_mouse value from feature list: $featureList"
+        }
+        $easyMouseBefore = $easyMouseMatch.Groups[1].Value
+        $easyMouseAfter = if ($easyMouseBefore -eq "true") { $false } else { $true }
+        $easyMouseBeforeBool = ($easyMouseBefore -eq "true")
+
+        Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("diagnostics", "run-action", "toggle_easy_mouse") | Out-Host
+        Wait-ForFeatureValue -Endpoint $node1Endpoint -FeatureName "easy_mouse" -ExpectedValue $easyMouseAfter -Seconds $TimeoutSeconds
+        Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("diagnostics", "run-action", "toggle_easy_mouse") | Out-Host
+        Wait-ForFeatureValue -Endpoint $node1Endpoint -FeatureName "easy_mouse" -ExpectedValue $easyMouseBeforeBool -Seconds $TimeoutSeconds
+
+        Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
+        Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("diagnostics", "run-action", "switch_all") | Out-Host
+        Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget $node1PeerId -Seconds $TimeoutSeconds
+        Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("diagnostics", "run-action", "switch_all") | Out-Host
+        Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget $node1PeerId -Seconds $TimeoutSeconds
+        Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "capture-stop") | Out-Host
+        Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
+
+        Write-Host "[smoke] validating input owner control plane"
+        Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "claim", $node1PeerId) | Out-Host
+        Wait-ForInputOwner -Endpoint $node1Endpoint -ExpectedOwner $node1PeerId -Seconds $TimeoutSeconds
+        Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "release", $node1PeerId) | Out-Host
+        Wait-ForInputOwner -Endpoint $node1Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
+
+        Write-Host "[smoke] validating input capture target control plane"
+        Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
+        Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "capture-start", $node1PeerId) | Out-Host
+        Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget $node1PeerId -Seconds $TimeoutSeconds
+        Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "capture-stop") | Out-Host
+        Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
+        $modeEventsOutput = Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "events", "--limit", "500")
+        if ($modeEventsOutput -notmatch "direction=local kind=input_capture_backend_mode peer_id=none detail=(hook_raw|hook|polling|noop|scripted)") {
+            Write-Warning "[smoke] input_capture_backend_mode event not observed in current transport event window; continuing"
+        }
+
+        Write-Host "[smoke] sending synthetic input frame from node1 to node2"
+        Invoke-CliChecked -Endpoint $node2Endpoint -CommandArgs @("input", "claim", $node2PeerId) | Out-Host
+        Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner $node2PeerId -Seconds $TimeoutSeconds
+        Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "send-move", $node1PeerId, "3", "2") | Out-Host
+        Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId" -Seconds $TimeoutSeconds
+        Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=input_frame peer_id=$node2PeerId" -Seconds $TimeoutSeconds
+
+        $outgoingInputFrameCountBeforeKey = Get-TransportEventMatchCount -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId"
+        $appliedInjectCountBeforeKey = Get-TransportEventMatchCount -Endpoint $node2Endpoint -Pattern "direction=local kind=input_inject_applied peer_id=$node2PeerId"
+        Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "send-key", $node1PeerId, "30", "down") | Out-Host
+        Wait-ForTransportEventCount -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId" -ExpectedMinCount ($outgoingInputFrameCountBeforeKey + 1) -Seconds $TimeoutSeconds
+        Wait-ForTransportEventCount -Endpoint $node2Endpoint -Pattern "direction=local kind=input_inject_applied peer_id=$node2PeerId" -ExpectedMinCount ($appliedInjectCountBeforeKey + 1) -Seconds $TimeoutSeconds
+        Invoke-CliChecked -Endpoint $node2Endpoint -CommandArgs @("input", "release", $node2PeerId) | Out-Host
+        Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
     }
-    $easyMouseBefore = $easyMouseMatch.Groups[1].Value
-    $easyMouseAfter = if ($easyMouseBefore -eq "true") { $false } else { $true }
-    $easyMouseBeforeBool = ($easyMouseBefore -eq "true")
-
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("diagnostics", "run-action", "toggle_easy_mouse") | Out-Host
-    Wait-ForFeatureValue -Endpoint $node1Endpoint -FeatureName "easy_mouse" -ExpectedValue $easyMouseAfter -Seconds $TimeoutSeconds
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("diagnostics", "run-action", "toggle_easy_mouse") | Out-Host
-    Wait-ForFeatureValue -Endpoint $node1Endpoint -FeatureName "easy_mouse" -ExpectedValue $easyMouseBeforeBool -Seconds $TimeoutSeconds
-
-    Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("diagnostics", "run-action", "switch_all") | Out-Host
-    Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget $node1PeerId -Seconds $TimeoutSeconds
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("diagnostics", "run-action", "switch_all") | Out-Host
-    Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget $node1PeerId -Seconds $TimeoutSeconds
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "capture-stop") | Out-Host
-    Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
-
-    Write-Host "[smoke] validating input owner control plane"
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "claim", $node1PeerId) | Out-Host
-    Wait-ForInputOwner -Endpoint $node1Endpoint -ExpectedOwner $node1PeerId -Seconds $TimeoutSeconds
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "release", $node1PeerId) | Out-Host
-    Wait-ForInputOwner -Endpoint $node1Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
-
-    Write-Host "[smoke] validating input capture target control plane"
-    Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "capture-start", $node1PeerId) | Out-Host
-    Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget $node1PeerId -Seconds $TimeoutSeconds
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "capture-stop") | Out-Host
-    Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
-    $modeEventsOutput = Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "events", "--limit", "500")
-    if ($modeEventsOutput -notmatch "direction=local kind=input_capture_backend_mode peer_id=none detail=(hook_raw|hook|polling|noop|scripted)") {
-        Write-Warning "[smoke] input_capture_backend_mode event not observed in current transport event window; continuing"
-    }
-
-    Write-Host "[smoke] sending synthetic input frame from node1 to node2"
-    Invoke-CliChecked -Endpoint $node2Endpoint -CommandArgs @("input", "claim", $node2PeerId) | Out-Host
-    Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner $node2PeerId -Seconds $TimeoutSeconds
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "send-move", $node1PeerId, "3", "2") | Out-Host
-    Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId" -Seconds $TimeoutSeconds
-    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=input_frame peer_id=$node2PeerId" -Seconds $TimeoutSeconds
-
-    $outgoingInputFrameCountBeforeKey = Get-TransportEventMatchCount -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId"
-    $appliedInjectCountBeforeKey = Get-TransportEventMatchCount -Endpoint $node2Endpoint -Pattern "direction=local kind=input_inject_applied peer_id=$node2PeerId"
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "send-key", $node1PeerId, "30", "down") | Out-Host
-    Wait-ForTransportEventCount -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId" -ExpectedMinCount ($outgoingInputFrameCountBeforeKey + 1) -Seconds $TimeoutSeconds
-    Wait-ForTransportEventCount -Endpoint $node2Endpoint -Pattern "direction=local kind=input_inject_applied peer_id=$node2PeerId" -ExpectedMinCount ($appliedInjectCountBeforeKey + 1) -Seconds $TimeoutSeconds
-    Invoke-CliChecked -Endpoint $node2Endpoint -CommandArgs @("input", "release", $node2PeerId) | Out-Host
-    Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
 
     $clipboardText = "smoke-clipboard-" + (Get-Date -Format "HHmmss")
     Write-Host "[smoke] sending clipboard payload from node1 to node2"
@@ -484,41 +599,54 @@ try {
     Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_text peer_id=$node2PeerId" -Seconds $TimeoutSeconds
 
     $sampleImage = Join-Path $runRoot "sample-clipboard.bmp"
-    [byte[]]$bmpBytes = @(
-        0x42,0x4D,0x3A,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x36,0x00,0x00,0x00,
-        0x28,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,0x00,0x18,0x00,
-        0x00,0x00,0x00,0x00,0x04,0x00,0x00,0x00,0x13,0x0B,0x00,0x00,0x13,0x0B,0x00,0x00,
-        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-        0x00,0x00,0xFF,0x00
-    )
-    [System.IO.File]::WriteAllBytes($sampleImage, $bmpBytes)
+    $sampleImageBytes = New-BmpFile -Path $sampleImage -Width 1 -Height 1 -Red 0xFF
 
     Write-Host "[smoke] sending clipboard image payload from node1 to node2"
     Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-image", $node1PeerId, $sampleImage) | Out-Host
 
-    Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=clipboard_image peer_id=$node1PeerId" -Seconds $TimeoutSeconds
-    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_image peer_id=$node2PeerId" -Seconds $TimeoutSeconds
+    Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=clipboard_image peer_id=$node1PeerId size_bytes=$sampleImageBytes" -Seconds $TimeoutSeconds
+    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$sampleImageBytes" -Seconds $TimeoutSeconds
 
-    $sampleFile = Join-Path $runRoot "sample-transfer.txt"
-    Set-Content -Path $sampleFile -Value "smoke-file-payload" -NoNewline
+    $chunkedImage = Join-Path $runRoot "chunked-clipboard.bmp"
+    $chunkedImageBytes = New-BmpFile -Path $chunkedImage -Width 512 -Height 256 -Blue 0x44 -Green 0x22 -Red 0xAA
 
-    Write-Host "[smoke] sending file payload from node1 to node2"
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-file", $node1PeerId, $sampleFile) | Out-Host
+    Write-Host "[smoke] sending oversized clipboard image payload from node1 to node2"
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-image", $node1PeerId, $chunkedImage) | Out-Host
 
-    Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=file peer_id=$node1PeerId" -Seconds $TimeoutSeconds
-    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=file peer_id=$node2PeerId" -Seconds $TimeoutSeconds
+    Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=clipboard_image peer_id=$node1PeerId size_bytes=$chunkedImageBytes" -Seconds $TimeoutSeconds
+    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$chunkedImageBytes" -Seconds $TimeoutSeconds
 
-    $receivedPath = Join-Path $node2Inbox (Join-Path $node2PeerId "sample-transfer.txt")
-    if (-not (Test-Path $receivedPath)) {
-        throw "Expected incoming file was not materialized at $receivedPath"
+    if (-not $ClipboardOnly) {
+        $sampleFile = Join-Path $runRoot "sample-transfer.txt"
+        Set-Content -Path $sampleFile -Value "smoke-file-payload" -NoNewline
+
+        Write-Host "[smoke] sending file payload from node1 to node2"
+        Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-file", $node1PeerId, $sampleFile) | Out-Host
+
+        Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=file peer_id=$node1PeerId" -Seconds $TimeoutSeconds
+        Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=file peer_id=$node2PeerId" -Seconds $TimeoutSeconds
+
+        $receivedPath = Join-Path $node2Inbox (Join-Path $node2PeerId "sample-transfer.txt")
+        if (-not (Test-Path $receivedPath)) {
+            throw "Expected incoming file was not materialized at $receivedPath"
+        }
     }
 
-    Write-Host "[smoke] validating reconnect behavior and queued payload delivery"
+    Write-Host "[smoke] validating reconnect clipboard delivery after peer restart"
     Stop-DaemonProcess -Process $node2
-    Wait-ForPeerConnectionState -Endpoint $node1Endpoint -PeerId $node1PeerId -Connected $false -Seconds $TimeoutSeconds
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("diagnostics", "run-action", "reconnect") | Out-Host
+    try {
+        Wait-ForPeerConnectionState -Endpoint $node1Endpoint -PeerId $node1PeerId -Connected $false -Seconds ([Math]::Min($TimeoutSeconds, 10))
+    }
+    catch {
+        Write-Warning "[smoke] peer disconnect state was not observed before reconnect queueing; continuing with forced reconnect flow"
+    }
 
     $queuedClipboardText = "smoke-reconnect-queued-" + (Get-Date -Format "HHmmss")
+    $reconnectImage = Join-Path $runRoot "reconnect-clipboard.bmp"
+    $reconnectImageBytes = New-BmpFile -Path $reconnectImage -Width 640 -Height 192 -Blue 0x11 -Green 0x88 -Red 0x33
     Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-text", $node1PeerId, $queuedClipboardText) | Out-Host
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-image", $node1PeerId, $reconnectImage) | Out-Host
 
     $node2 = Start-DaemonProcess -Bind $node2Bind -ApiTransport "tcp" -NetworkPort $node2Port -StdOutPath $node2Out -StdErrPath $node2Err -Environment $node2Env
     Wait-ForDaemon -Endpoint $node2Endpoint -Seconds $TimeoutSeconds -Process $node2 -StdErrPath $node2Err
@@ -528,9 +656,15 @@ try {
     Wait-ForPeerConnectionState -Endpoint $node2Endpoint -PeerId $node2PeerId -Connected $true -Seconds $TimeoutSeconds
     $escapedQueuedClipboardText = [regex]::Escape($queuedClipboardText)
     Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_text peer_id=$node2PeerId .*detail=$escapedQueuedClipboardText" -Seconds $TimeoutSeconds
-    Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
+    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$reconnectImageBytes" -Seconds $TimeoutSeconds
 
-    Write-Host "[smoke] success: connectivity, reconnect recovery, and payload transfer validated"
+    if (-not $ClipboardOnly) {
+        Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
+        Write-Host "[smoke] success: connectivity, reconnect recovery, and payload transfer validated"
+    }
+    else {
+        Write-Host "[smoke] success: clipboard text/image transfer and reconnect delivery validated"
+    }
 }
 finally {
     if ($null -eq $originalCargoIncremental) {

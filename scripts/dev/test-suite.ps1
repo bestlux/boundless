@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("quick", "smoke", "full", "trace", "recovery")]
+    [ValidateSet("quick", "smoke", "full", "trace", "recovery", "clipboard")]
     [string]$Profile = "smoke",
     [int]$TimeoutSeconds = 60,
     [switch]$KeepArtifacts,
@@ -31,6 +31,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+    $PSNativeCommandUseErrorActionPreference = $false
+}
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 Set-Location $repoRoot
@@ -196,6 +199,24 @@ function Run-RecoveryMatrix {
     }
 }
 
+function Run-ClipboardMatrix {
+    Invoke-CheckedCommand -Label "scripts/dev/clipboard-matrix.ps1" -Action {
+        & (Join-Path $repoRoot "scripts/dev/clipboard-matrix.ps1") | Out-Host
+    }
+
+    $smokeParams = @{
+        TimeoutSeconds = $TimeoutSeconds
+        ClipboardOnly = $true
+    }
+    if ($KeepArtifacts) {
+        $smokeParams.KeepArtifacts = $true
+    }
+
+    Invoke-CheckedCommand -Label "scripts/dev/two-node-smoke.ps1 -ClipboardOnly" -Action {
+        & (Join-Path $repoRoot "scripts/dev/two-node-smoke.ps1") @smokeParams | Out-Host
+    }
+}
+
 $originalCargoIncremental = $env:CARGO_INCREMENTAL
 $env:CARGO_INCREMENTAL = "0"
 
@@ -218,6 +239,9 @@ try {
         }
         "recovery" {
             Run-RecoveryMatrix
+        }
+        "clipboard" {
+            Run-ClipboardMatrix
         }
     }
 
