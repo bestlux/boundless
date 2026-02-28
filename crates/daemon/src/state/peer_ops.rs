@@ -65,6 +65,8 @@ impl AppState {
             self.clear_pending_inject_input_frames_for_peer(peer_id)
                 .await;
             self.clear_pending_clipboard_replay_for_peer(peer_id).await;
+            self.clear_obsolete_inflight_clipboard_replays_for_peer(peer_id)
+                .await;
             self.reconnect_generation_by_peer
                 .write()
                 .await
@@ -122,6 +124,8 @@ impl AppState {
             self.clear_pending_inject_input_frames_for_peer(peer_id)
                 .await;
             self.clear_pending_clipboard_replay_for_peer(peer_id).await;
+            self.clear_obsolete_inflight_clipboard_replays_for_peer(peer_id)
+                .await;
         } else if transitioned_to_connected
             && !self
                 .has_current_clipboard_replay_delivery_pending_for_peer(peer_id)

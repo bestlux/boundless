@@ -31,6 +31,18 @@ fn clipboard_payload_from_outbound_payload(payload: &OutboundPayload) -> Option<
 }
 
 impl AppState {
+    fn capture_obsolete_inflight_replay(
+        sync: &mut ClipboardSyncState,
+        replay: &ClipboardReplayState,
+    ) {
+        for peer_id in &replay.inflight_peer_ids {
+            sync.obsolete_inflight_replay_hashes_by_peer
+                .entry(peer_id.clone())
+                .or_default()
+                .insert(replay.hash.clone());
+        }
+    }
+
     async fn prune_stale_outgoing_clipboard_payloads(&self) {
         let mut queue_map = self.outgoing_bulk_payloads.write().await;
         queue_map.retain(|_, queue| {
@@ -48,17 +60,47 @@ impl AppState {
         &self,
         payload: ClipboardPayload,
         hash: String,
-        source_peer_id: Option<String>,
+        source_peer_ids: HashSet<String>,
     ) {
         let mut sync = self.clipboard_sync.write().await;
+        let previous = sync.pending_replay.clone();
+        if let Some(previous) = previous.as_ref() {
+            Self::capture_obsolete_inflight_replay(&mut sync, previous);
+        }
         sync.pending_replay = Some(ClipboardReplayState {
             payload,
             hash: hash.clone(),
-            source_peer_id,
+            source_peer_ids,
             scheduled_peer_ids: HashSet::new(),
             inflight_peer_ids: HashSet::new(),
         });
         sync.last_observed_hash = Some(hash);
+    }
+
+    async fn should_drop_obsolete_inflight_clipboard_payload(
+        &self,
+        peer_id: &str,
+        payload: &OutboundPayload,
+    ) -> bool {
+        let Some(clipboard_payload) = clipboard_payload_from_outbound_payload(payload) else {
+            return false;
+        };
+        let hash = payload_hash_hex(&clipboard_payload);
+
+        let mut sync = self.clipboard_sync.write().await;
+        let Some(obsolete_hashes) = sync
+            .obsolete_inflight_replay_hashes_by_peer
+            .get_mut(peer_id)
+        else {
+            return false;
+        };
+        if !obsolete_hashes.remove(hash.as_str()) {
+            return false;
+        }
+        if obsolete_hashes.is_empty() {
+            sync.obsolete_inflight_replay_hashes_by_peer.remove(peer_id);
+        }
+        true
     }
 
     pub(crate) async fn has_current_clipboard_replay_delivery_pending_for_peer(
@@ -72,7 +114,7 @@ impl AppState {
         let Some(replay_state) = replay_state else {
             return false;
         };
-        if replay_state.source_peer_id.as_deref() == Some(peer_id)
+        if replay_state.source_peer_ids.contains(peer_id)
             || replay_state.scheduled_peer_ids.contains(peer_id)
             || replay_state.inflight_peer_ids.contains(peer_id)
         {
@@ -93,7 +135,7 @@ impl AppState {
         let Some(replay) = sync.pending_replay.as_mut() else {
             return false;
         };
-        if replay.source_peer_id.as_deref() == Some(peer_id)
+        if replay.source_peer_ids.contains(peer_id)
             || replay.scheduled_peer_ids.contains(peer_id)
             || replay.inflight_peer_ids.contains(peer_id)
         {
@@ -109,6 +151,14 @@ impl AppState {
         };
         replay.scheduled_peer_ids.remove(peer_id);
         replay.inflight_peer_ids.remove(peer_id);
+    }
+
+    pub(crate) async fn clear_obsolete_inflight_clipboard_replays_for_peer(&self, peer_id: &str) {
+        self.clipboard_sync
+            .write()
+            .await
+            .obsolete_inflight_replay_hashes_by_peer
+            .remove(peer_id);
     }
 
     async fn take_scheduled_clipboard_replay_for_peer(
@@ -232,7 +282,7 @@ impl AppState {
         }
 
         self.prune_stale_outgoing_clipboard_payloads().await;
-        self.store_latest_clipboard_replay(payload.clone(), hash, None)
+        self.store_latest_clipboard_replay(payload.clone(), hash, HashSet::new())
             .await;
 
         let currently_connected_peer_ids = self.connected_peer_ids().await;
@@ -319,6 +369,11 @@ impl AppState {
 
         let mut sync = self.clipboard_sync.write().await;
         if sync.last_observed_hash.as_deref() == Some(hash.as_str()) {
+            if let Some(replay) = sync.pending_replay.as_mut()
+                && replay.hash == hash
+            {
+                replay.source_peer_ids.insert(peer_id.to_string());
+            }
             return Ok(());
         }
         if sync.pending_remote.back().map(|item| item.hash.as_str()) == Some(hash.as_str()) {
@@ -360,12 +415,18 @@ impl AppState {
     ) {
         self.prune_stale_outgoing_clipboard_payloads().await;
         let mut sync = self.clipboard_sync.write().await;
+        let previous = sync.pending_replay.clone();
+        if let Some(previous) = previous.as_ref() {
+            Self::capture_obsolete_inflight_replay(&mut sync, previous);
+        }
+        let mut source_peer_ids = HashSet::new();
+        source_peer_ids.insert(source_peer_id.to_string());
         sync.suppress_echo_hash = Some(hash.to_string());
         sync.last_observed_hash = Some(hash.to_string());
         sync.pending_replay = Some(ClipboardReplayState {
             payload: payload.clone(),
             hash: hash.to_string(),
-            source_peer_id: Some(source_peer_id.to_string()),
+            source_peer_ids,
             scheduled_peer_ids: HashSet::new(),
             inflight_peer_ids: HashSet::new(),
         });
@@ -570,6 +631,12 @@ impl AppState {
                 .await
             {
                 restored_replay = true;
+                continue;
+            }
+            if self
+                .should_drop_obsolete_inflight_clipboard_payload(peer_id, &payload)
+                .await
+            {
                 continue;
             }
             requeued_bulk.push_back(payload);
