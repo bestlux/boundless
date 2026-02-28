@@ -42,6 +42,26 @@ impl AppState {
         sync.last_observed_hash = Some(hash);
     }
 
+    pub(crate) async fn has_current_clipboard_replay_queued_for_peer(&self, peer_id: &str) -> bool {
+        let replay_hash = {
+            let sync = self.clipboard_sync.read().await;
+            sync.pending_replay
+                .as_ref()
+                .map(|replay| replay.hash.clone())
+        };
+        let Some(replay_hash) = replay_hash else {
+            return false;
+        };
+
+        let queue_map = self.outgoing_bulk_payloads.read().await;
+        queue_map.get(peer_id).is_some_and(|queue| {
+            queue.iter().any(|payload| {
+                clipboard_payload_from_outbound_payload(payload)
+                    .is_some_and(|payload| payload_hash_hex(&payload) == replay_hash)
+            })
+        })
+    }
+
     pub(crate) async fn schedule_pending_clipboard_replay_for_peer(&self, peer_id: &str) -> bool {
         let mut sync = self.clipboard_sync.write().await;
         let Some(replay) = sync.pending_replay.as_mut() else {
@@ -159,7 +179,7 @@ impl AppState {
         &self,
         payload: ClipboardPayload,
     ) -> Result<bool> {
-        let connected_peer_ids = self.connected_peer_ids().await;
+        let initially_connected_peer_ids = self.connected_peer_ids().await;
         let hash = match self.validated_clipboard_payload_hash(&payload).await? {
             Some(hash) => hash,
             None => return Ok(false),
@@ -185,13 +205,30 @@ impl AppState {
         self.store_latest_clipboard_replay(payload.clone(), hash)
             .await;
 
-        if connected_peer_ids.is_empty() {
+        let currently_connected_peer_ids = self.connected_peer_ids().await;
+        let late_connected_peer_ids = currently_connected_peer_ids
+            .iter()
+            .filter(|peer_id| !initially_connected_peer_ids.contains(*peer_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut scheduled_late_replay = false;
+        for peer_id in &late_connected_peer_ids {
+            if self
+                .schedule_pending_clipboard_replay_for_peer(peer_id.as_str())
+                .await
+            {
+                scheduled_late_replay = true;
+            }
+        }
+
+        if initially_connected_peer_ids.is_empty() && !scheduled_late_replay {
             return Ok(false);
         }
 
         {
             let mut queue_map = self.outgoing_bulk_payloads.write().await;
-            for peer_id in &connected_peer_ids {
+            for peer_id in &initially_connected_peer_ids {
                 let outbound = match &payload {
                     ClipboardPayload::Text(text) => {
                         OutboundPayload::ClipboardText { text: text.clone() }
@@ -209,7 +246,7 @@ impl AppState {
         }
         self.notify_outgoing_flush_signal();
 
-        Ok(true)
+        Ok(!initially_connected_peer_ids.is_empty() || scheduled_late_replay)
     }
 
     pub async fn enqueue_remote_clipboard_text(&self, peer_id: &str, text: String) -> Result<()> {
@@ -277,11 +314,16 @@ impl AppState {
         sync.pending_remote.push_front(item);
     }
 
-    pub async fn mark_remote_clipboard_applied(&self, hash: &str) {
+    pub async fn mark_remote_clipboard_applied(&self, payload: &ClipboardPayload, hash: &str) {
         let mut sync = self.clipboard_sync.write().await;
         sync.suppress_echo_hash = Some(hash.to_string());
         sync.last_observed_hash = Some(hash.to_string());
-        sync.pending_replay = None;
+        sync.pending_replay = Some(ClipboardReplayState {
+            payload: payload.clone(),
+            hash: hash.to_string(),
+            scheduled_peer_ids: HashSet::new(),
+            inflight_peer_ids: HashSet::new(),
+        });
     }
 
     pub async fn queue_file_from_path(&self, peer_id: &str, file_path: &Path) -> Result<()> {

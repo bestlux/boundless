@@ -13,7 +13,7 @@ const CLIPBOARD_TICK: Duration = Duration::from_millis(200);
 trait ClipboardRuntimeState {
     async fn dequeue_remote_clipboard_payload(&self) -> Option<PendingRemoteClipboardPayload>;
     async fn requeue_remote_clipboard_payload_front(&self, item: PendingRemoteClipboardPayload);
-    async fn mark_remote_clipboard_applied(&self, hash: &str);
+    async fn mark_remote_clipboard_applied(&self, payload: &ClipboardPayload, hash: &str);
     async fn queue_local_clipboard_payload_for_connected_peers(
         &self,
         payload: ClipboardPayload,
@@ -29,8 +29,8 @@ impl ClipboardRuntimeState for AppState {
         AppState::requeue_remote_clipboard_payload_front(self, item).await;
     }
 
-    async fn mark_remote_clipboard_applied(&self, hash: &str) {
-        AppState::mark_remote_clipboard_applied(self, hash).await;
+    async fn mark_remote_clipboard_applied(&self, payload: &ClipboardPayload, hash: &str) {
+        AppState::mark_remote_clipboard_applied(self, payload, hash).await;
     }
 
     async fn queue_local_clipboard_payload_for_connected_peers(
@@ -128,7 +128,9 @@ async fn apply_remote_payload<S: ClipboardRuntimeState>(
 
     match backend.write_payload(&item.payload) {
         Ok(()) => {
-            state.mark_remote_clipboard_applied(&item.hash).await;
+            state
+                .mark_remote_clipboard_applied(&item.payload, &item.hash)
+                .await;
             info!(
                 peer_id = %item.peer_id,
                 payload_kind,
@@ -305,7 +307,7 @@ mod tests {
                 .push_front(item);
         }
 
-        async fn mark_remote_clipboard_applied(&self, hash: &str) {
+        async fn mark_remote_clipboard_applied(&self, _payload: &ClipboardPayload, hash: &str) {
             self.log
                 .lock()
                 .expect("log")

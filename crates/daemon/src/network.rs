@@ -956,7 +956,7 @@ mod tests {
             &state,
             &peer_id,
             Some(&peer_id),
-            false,
+            true,
             "local-machine-id",
             peer_id.clone(),
             PROTOCOL_CURRENT,
@@ -972,18 +972,11 @@ mod tests {
         let hello_frames = decode_written_frames(&hello_writer.bytes);
         assert_eq!(
             hello_frames.len(),
-            2,
-            "hello should flush ack plus one replay"
+            1,
+            "outbound hello should flush one replay"
         );
         assert!(matches!(
             hello_frames.first(),
-            Some(WireMessage::HelloAck {
-                machine_id,
-                accepted: true
-            }) if machine_id == "local-machine-id"
-        ));
-        assert!(matches!(
-            hello_frames.get(1),
             Some(WireMessage::ClipboardText { machine_id, text })
                 if machine_id == "local-machine-id" && text == "replay-once"
         ));

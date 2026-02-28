@@ -975,6 +975,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_peer_connected_rolls_back_in_memory_state_when_config_save_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-peer-connect-save-fail-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let mut state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        let blocked_path = root.join("blocked-config-path");
+        std::fs::create_dir_all(&blocked_path).expect("create blocked path directory");
+        *std::sync::Arc::make_mut(&mut state.config_path) = blocked_path;
+
+        let error = state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect_err("save failure should bubble up");
+        assert!(
+            error.to_string().contains("write"),
+            "unexpected error: {error:#}"
+        );
+
+        let peer = state
+            .get_peer(&peer_id)
+            .await
+            .expect("peer must still exist");
+        assert!(
+            !peer.connected,
+            "failed persistence must not leave the in-memory peer marked connected"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn active_input_capture_target_requires_connected_peer_and_feature_enabled() {
         let root = std::env::temp_dir().join(format!(
             "boundless-capture-active-test-{}",
@@ -2556,10 +2602,12 @@ mod tests {
             .await
             .expect("remote item");
         assert!(matches!(
-            remote.payload,
-            ClipboardPayload::Text(ref text) if text == "remote"
+            &remote.payload,
+            ClipboardPayload::Text(text) if text == "remote"
         ));
-        state.mark_remote_clipboard_applied(&remote.hash).await;
+        state
+            .mark_remote_clipboard_applied(&remote.payload, &remote.hash)
+            .await;
 
         let suppressed = state
             .queue_local_clipboard_text_for_connected_peers("remote".to_string())
@@ -2822,6 +2870,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_origin_reconnect_replays_latest_clipboard_snapshot_to_late_peer() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-clipboard-remote-origin-reconnect-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_a, _) = state.create_pairing_code(120).await;
+        let peer_a = state
+            .join_peer(
+                code_a,
+                "127.0.0.1:15100".to_string(),
+                Some("peer-a".to_string()),
+            )
+            .await
+            .expect("join peer-a");
+        let (code_b, _) = state.create_pairing_code(120).await;
+        let peer_b = state
+            .join_peer(
+                code_b,
+                "127.0.0.1:15101".to_string(),
+                Some("peer-b".to_string()),
+            )
+            .await
+            .expect("join peer-b");
+
+        state
+            .set_peer_connected(&peer_a, true)
+            .await
+            .expect("connect peer-a");
+
+        state
+            .enqueue_remote_clipboard_text(&peer_a, "remote-shared".to_string())
+            .await
+            .expect("enqueue remote");
+        let remote = state
+            .dequeue_remote_clipboard_payload()
+            .await
+            .expect("remote item");
+        state
+            .mark_remote_clipboard_applied(&remote.payload, &remote.hash)
+            .await;
+
+        assert!(
+            state.drain_outgoing(&peer_a).await.is_empty(),
+            "applying a remote payload should not immediately echo it back to the source peer"
+        );
+
+        state
+            .set_peer_connected(&peer_b, true)
+            .await
+            .expect("connect peer-b");
+
+        let outgoing_b = state.drain_outgoing(&peer_b).await;
+        assert_eq!(
+            outgoing_b.len(),
+            1,
+            "late peer should receive the applied remote snapshot on reconnect"
+        );
+        assert!(matches!(
+            outgoing_b.first(),
+            Some(OutboundPayload::ClipboardText { text }) if text == "remote-shared"
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn reconnect_does_not_schedule_duplicate_replay_when_live_payload_is_already_queued() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-clipboard-no-duplicate-reconnect-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_a, _) = state.create_pairing_code(120).await;
+        let peer_a = state
+            .join_peer(
+                code_a,
+                "127.0.0.1:15100".to_string(),
+                Some("peer-a".to_string()),
+            )
+            .await
+            .expect("join peer-a");
+
+        state
+            .set_peer_connected(&peer_a, true)
+            .await
+            .expect("connect peer-a");
+        let queued = state
+            .queue_local_clipboard_text_for_connected_peers("hello".to_string())
+            .await
+            .expect("queue local clipboard");
+        assert!(
+            queued,
+            "connected peer should get the live clipboard payload"
+        );
+
+        state
+            .set_peer_connected(&peer_a, false)
+            .await
+            .expect("disconnect peer-a");
+        state
+            .set_peer_connected(&peer_a, true)
+            .await
+            .expect("reconnect peer-a");
+
+        let outgoing = state.drain_outgoing(&peer_a).await;
+        assert_eq!(
+            outgoing.len(),
+            1,
+            "reconnect should not schedule a duplicate replay when the same payload is already queued"
+        );
+        assert!(matches!(
+            outgoing.first(),
+            Some(OutboundPayload::ClipboardText { text }) if text == "hello"
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn remote_clipboard_apply_cancels_pending_replay() {
         let root = std::env::temp_dir().join(format!(
             "boundless-clipboard-remote-cancel-test-{}",
@@ -2859,7 +3035,9 @@ mod tests {
             .dequeue_remote_clipboard_payload()
             .await
             .expect("remote item");
-        state.mark_remote_clipboard_applied(&remote.hash).await;
+        state
+            .mark_remote_clipboard_applied(&remote.payload, &remote.hash)
+            .await;
 
         assert!(
             state.drain_outgoing(&peer_a).await.is_empty(),
@@ -2902,7 +3080,9 @@ mod tests {
             .dequeue_remote_clipboard_payload()
             .await
             .expect("remote item");
-        state.mark_remote_clipboard_applied(&remote.hash).await;
+        state
+            .mark_remote_clipboard_applied(&remote.payload, &remote.hash)
+            .await;
 
         let different = state
             .queue_local_clipboard_text_for_connected_peers("different".to_string())
@@ -2979,10 +3159,12 @@ mod tests {
             .await
             .expect("remote image item");
         assert!(matches!(
-            remote.payload,
-            ClipboardPayload::Image(ref image_bmp) if image_bmp == &image
+            &remote.payload,
+            ClipboardPayload::Image(image_bmp) if image_bmp == &image
         ));
-        state.mark_remote_clipboard_applied(&remote.hash).await;
+        state
+            .mark_remote_clipboard_applied(&remote.payload, &remote.hash)
+            .await;
 
         let suppressed = state
             .queue_local_clipboard_image_for_connected_peers(image.clone())

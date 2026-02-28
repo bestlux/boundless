@@ -85,15 +85,19 @@ impl AppState {
             let mut peer_found = false;
             let mut transitioned_to_connected = false;
 
-            if let Some(peer) = config.peers.iter_mut().find(|p| p.peer_id == peer_id) {
-                transitioned_to_connected = !peer.connected && connected;
-                peer.connected = connected;
-                peer.last_seen = Utc::now();
+            if let Some(peer_index) = config.peers.iter().position(|p| p.peer_id == peer_id) {
+                let previous_connected = config.peers[peer_index].connected;
+                let previous_last_seen = config.peers[peer_index].last_seen;
+                transitioned_to_connected = !previous_connected && connected;
+                config.peers[peer_index].connected = connected;
+                config.peers[peer_index].last_seen = Utc::now();
                 peer_found = true;
-            }
 
-            if peer_found {
-                save_config_at(&self.config_path, &config)?;
+                if let Err(error) = save_config_at(&self.config_path, &config) {
+                    config.peers[peer_index].connected = previous_connected;
+                    config.peers[peer_index].last_seen = previous_last_seen;
+                    return Err(error);
+                }
             }
 
             (peer_found, transitioned_to_connected)
@@ -119,6 +123,9 @@ impl AppState {
                 .await;
             self.clear_pending_clipboard_replay_for_peer(peer_id).await;
         } else if transitioned_to_connected
+            && !self
+                .has_current_clipboard_replay_queued_for_peer(peer_id)
+                .await
             && self
                 .schedule_pending_clipboard_replay_for_peer(peer_id)
                 .await
