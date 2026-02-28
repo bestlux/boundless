@@ -124,7 +124,7 @@ impl AppState {
             self.clear_pending_clipboard_replay_for_peer(peer_id).await;
         } else if transitioned_to_connected
             && !self
-                .has_current_clipboard_replay_queued_for_peer(peer_id)
+                .has_current_clipboard_replay_delivery_pending_for_peer(peer_id)
                 .await
             && self
                 .schedule_pending_clipboard_replay_for_peer(peer_id)

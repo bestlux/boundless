@@ -9,11 +9,23 @@ use core_clipboard::ClipboardPayload;
 use crate::state::{AppState, PendingRemoteClipboardPayload};
 
 const CLIPBOARD_TICK: Duration = Duration::from_millis(200);
+const MAX_REMOTE_CLIPBOARD_APPLY_RETRIES: u8 = 3;
+
+enum RemoteApplyOutcome {
+    Applied,
+    Requeued,
+    Dropped,
+}
 
 trait ClipboardRuntimeState {
     async fn dequeue_remote_clipboard_payload(&self) -> Option<PendingRemoteClipboardPayload>;
     async fn requeue_remote_clipboard_payload_front(&self, item: PendingRemoteClipboardPayload);
-    async fn mark_remote_clipboard_applied(&self, payload: &ClipboardPayload, hash: &str);
+    async fn mark_remote_clipboard_applied(
+        &self,
+        source_peer_id: &str,
+        payload: &ClipboardPayload,
+        hash: &str,
+    );
     async fn queue_local_clipboard_payload_for_connected_peers(
         &self,
         payload: ClipboardPayload,
@@ -29,8 +41,13 @@ impl ClipboardRuntimeState for AppState {
         AppState::requeue_remote_clipboard_payload_front(self, item).await;
     }
 
-    async fn mark_remote_clipboard_applied(&self, payload: &ClipboardPayload, hash: &str) {
-        AppState::mark_remote_clipboard_applied(self, payload, hash).await;
+    async fn mark_remote_clipboard_applied(
+        &self,
+        source_peer_id: &str,
+        payload: &ClipboardPayload,
+        hash: &str,
+    ) {
+        AppState::mark_remote_clipboard_applied(self, source_peer_id, payload, hash).await;
     }
 
     async fn queue_local_clipboard_payload_for_connected_peers(
@@ -83,9 +100,9 @@ async fn drain_remote_queue<S: ClipboardRuntimeState>(
     backend: &mut dyn ClipboardBackend,
 ) {
     while let Some(item) = state.dequeue_remote_clipboard_payload().await {
-        if let Err(error) = apply_remote_payload(state, backend, item).await {
-            warn!(error = ?error, "failed to apply remote clipboard payload");
-            break;
+        match apply_remote_payload(state, backend, item).await {
+            RemoteApplyOutcome::Applied | RemoteApplyOutcome::Dropped => {}
+            RemoteApplyOutcome::Requeued => break,
         }
     }
 }
@@ -121,15 +138,15 @@ async fn poll_local_clipboard<S: ClipboardRuntimeState>(
 async fn apply_remote_payload<S: ClipboardRuntimeState>(
     state: &S,
     backend: &mut dyn ClipboardBackend,
-    item: PendingRemoteClipboardPayload,
-) -> Result<()> {
+    mut item: PendingRemoteClipboardPayload,
+) -> RemoteApplyOutcome {
     let payload_kind = clipboard_payload_kind(&item.payload);
     let payload_size = clipboard_payload_size(&item.payload);
 
     match backend.write_payload(&item.payload) {
         Ok(()) => {
             state
-                .mark_remote_clipboard_applied(&item.payload, &item.hash)
+                .mark_remote_clipboard_applied(&item.peer_id, &item.payload, &item.hash)
                 .await;
             info!(
                 peer_id = %item.peer_id,
@@ -137,11 +154,31 @@ async fn apply_remote_payload<S: ClipboardRuntimeState>(
                 size_bytes = payload_size,
                 "applied remote clipboard payload to local system clipboard"
             );
-            Ok(())
+            RemoteApplyOutcome::Applied
         }
         Err(error) => {
+            item.retry_count = item.retry_count.saturating_add(1);
+            if item.retry_count > MAX_REMOTE_CLIPBOARD_APPLY_RETRIES {
+                warn!(
+                    peer_id = %item.peer_id,
+                    payload_kind,
+                    size_bytes = payload_size,
+                    retry_count = item.retry_count,
+                    error = ?error,
+                    "dropping remote clipboard payload after bounded retries"
+                );
+                return RemoteApplyOutcome::Dropped;
+            }
+            warn!(
+                peer_id = %item.peer_id,
+                payload_kind,
+                size_bytes = payload_size,
+                retry_count = item.retry_count,
+                error = ?error,
+                "failed to apply remote clipboard payload; requeueing for retry"
+            );
             state.requeue_remote_clipboard_payload_front(item).await;
-            Err(error)
+            RemoteApplyOutcome::Requeued
         }
     }
 }
@@ -307,7 +344,12 @@ mod tests {
                 .push_front(item);
         }
 
-        async fn mark_remote_clipboard_applied(&self, _payload: &ClipboardPayload, hash: &str) {
+        async fn mark_remote_clipboard_applied(
+            &self,
+            _source_peer_id: &str,
+            _payload: &ClipboardPayload,
+            hash: &str,
+        ) {
             self.log
                 .lock()
                 .expect("log")
@@ -420,6 +462,7 @@ mod tests {
             peer_id: "peer-a".to_string(),
             payload: ClipboardPayload::Text("remote".to_string()),
             hash: "hash-1".to_string(),
+            retry_count: 0,
         };
         state.push_remote(remote.clone());
         let mut backend = FakeClipboardBackend::new(log)
@@ -465,6 +508,7 @@ mod tests {
             peer_id: "peer-a".to_string(),
             payload: ClipboardPayload::Text("remote".to_string()),
             hash: "hash-remote".to_string(),
+            retry_count: 0,
         });
         let mut backend = FakeClipboardBackend::new(log.clone())
             .with_sequence_values([Some(10)])
@@ -486,6 +530,63 @@ mod tests {
         assert!(
             remote_write < local_queue,
             "remote queue should be processed before local polling"
+        );
+    }
+
+    #[tokio::test]
+    async fn clipboard_tick_drops_remote_after_bounded_retries_and_allows_next_item() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let state = FakeRuntimeState::with_log(log);
+        let stuck = PendingRemoteClipboardPayload {
+            peer_id: "peer-a".to_string(),
+            payload: ClipboardPayload::Text("stuck".to_string()),
+            hash: "hash-stuck".to_string(),
+            retry_count: 0,
+        };
+        let next = PendingRemoteClipboardPayload {
+            peer_id: "peer-b".to_string(),
+            payload: ClipboardPayload::Text("next".to_string()),
+            hash: "hash-next".to_string(),
+            retry_count: 0,
+        };
+        state.push_remote(stuck.clone());
+        state.push_remote(next.clone());
+
+        let mut backend = FakeClipboardBackend::new(Arc::new(Mutex::new(Vec::new())))
+            .with_write_results([
+                Err(anyhow!("clipboard busy")),
+                Err(anyhow!("clipboard busy")),
+                Err(anyhow!("clipboard busy")),
+                Err(anyhow!("clipboard busy")),
+                Ok(()),
+            ]);
+        let mut last_sequence = None;
+
+        for _ in 0..MAX_REMOTE_CLIPBOARD_APPLY_RETRIES {
+            tick_clipboard_runtime(&state, &mut backend, &mut last_sequence).await;
+        }
+
+        let queued_before_drop = state.remote_queue_snapshot();
+        assert_eq!(
+            queued_before_drop.len(),
+            2,
+            "bounded retries should keep the stuck item queued until the retry budget is exhausted"
+        );
+        assert_eq!(
+            queued_before_drop[0].retry_count, MAX_REMOTE_CLIPBOARD_APPLY_RETRIES,
+            "retry count should advance each failed tick"
+        );
+
+        tick_clipboard_runtime(&state, &mut backend, &mut last_sequence).await;
+
+        assert!(
+            state.remote_queue_snapshot().is_empty(),
+            "dropping the exhausted item should let the next queued remote payload apply in the same tick"
+        );
+        assert_eq!(
+            state.remote_applied_hashes(),
+            vec![next.hash],
+            "only the later payload should remain after the exhausted head item is dropped"
         );
     }
 }

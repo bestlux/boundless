@@ -901,6 +901,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_hello_flushes_ack_and_pending_clipboard_replay_once() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        state
+            .queue_local_clipboard_text_for_connected_peers("replay-inbound".to_string())
+            .await
+            .expect("retain disconnected clipboard snapshot");
+
+        let mut remote_protocol = None;
+        let mut outbound_transfer_flow = std::collections::HashMap::new();
+        let mut writer = CaptureWriter::default();
+        let mut frame_buffer = Vec::with_capacity(256);
+
+        let handling = handle_hello_message(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            false,
+            "local-machine-id",
+            peer_id.clone(),
+            PROTOCOL_CURRENT,
+            &mut remote_protocol,
+            &mut outbound_transfer_flow,
+            &mut writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("handle inbound hello");
+
+        assert!(matches!(handling, HelloHandling::Continue));
+        let frames = decode_written_frames(&writer.bytes);
+        assert_eq!(
+            frames.len(),
+            2,
+            "inbound hello should flush ack plus one replay"
+        );
+        assert!(matches!(
+            frames.first(),
+            Some(WireMessage::HelloAck {
+                machine_id,
+                accepted: true
+            }) if machine_id == "local-machine-id"
+        ));
+        assert!(matches!(
+            frames.get(1),
+            Some(WireMessage::ClipboardText { machine_id, text })
+                if machine_id == "local-machine-id" && text == "replay-inbound"
+        ));
+        assert!(
+            state.drain_outgoing(&peer_id).await.is_empty(),
+            "inbound hello should consume the pending replay exactly once"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn hello_ack_handler_flushes_pending_outgoing_payloads() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         state
