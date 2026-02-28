@@ -938,4 +938,80 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[tokio::test]
+    async fn hello_then_hello_ack_only_flushes_pending_clipboard_replay_once() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        state
+            .queue_local_clipboard_text_for_connected_peers("replay-once".to_string())
+            .await
+            .expect("retain disconnected clipboard snapshot");
+
+        let mut remote_protocol = None;
+        let mut outbound_transfer_flow = std::collections::HashMap::new();
+        let mut hello_writer = CaptureWriter::default();
+        let mut frame_buffer = Vec::with_capacity(256);
+
+        let handling = handle_hello_message(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            false,
+            "local-machine-id",
+            peer_id.clone(),
+            PROTOCOL_CURRENT,
+            &mut remote_protocol,
+            &mut outbound_transfer_flow,
+            &mut hello_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("handle canonical hello");
+
+        assert!(matches!(handling, HelloHandling::Continue));
+        let hello_frames = decode_written_frames(&hello_writer.bytes);
+        assert_eq!(
+            hello_frames.len(),
+            2,
+            "hello should flush ack plus one replay"
+        );
+        assert!(matches!(
+            hello_frames.first(),
+            Some(WireMessage::HelloAck {
+                machine_id,
+                accepted: true
+            }) if machine_id == "local-machine-id"
+        ));
+        assert!(matches!(
+            hello_frames.get(1),
+            Some(WireMessage::ClipboardText { machine_id, text })
+                if machine_id == "local-machine-id" && text == "replay-once"
+        ));
+
+        let mut ack_writer = CaptureWriter::default();
+        handle_hello_ack_message(
+            &state,
+            Some(&peer_id),
+            "local-machine-id",
+            Some(PROTOCOL_CURRENT),
+            &mut outbound_transfer_flow,
+            true,
+            &mut ack_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("handle hello ack");
+
+        let ack_frames = decode_written_frames(&ack_writer.bytes);
+        assert!(
+            ack_frames.is_empty(),
+            "hello ack must not reschedule an already-flushed replay"
+        );
+        assert!(
+            state.drain_outgoing(&peer_id).await.is_empty(),
+            "no replay payload should remain queued after hello plus hello ack"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

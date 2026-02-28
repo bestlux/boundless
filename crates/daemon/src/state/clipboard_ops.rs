@@ -11,7 +11,91 @@ fn drain_queue_up_to(
     queue.drain(..drain_count).collect()
 }
 
+fn outbound_payload_from_clipboard_payload(payload: &ClipboardPayload) -> OutboundPayload {
+    match payload {
+        ClipboardPayload::Text(text) => OutboundPayload::ClipboardText { text: text.clone() },
+        ClipboardPayload::Image(image_bmp) => OutboundPayload::ClipboardImage {
+            image_bmp: image_bmp.clone(),
+        },
+    }
+}
+
+fn clipboard_payload_from_outbound_payload(payload: &OutboundPayload) -> Option<ClipboardPayload> {
+    match payload {
+        OutboundPayload::ClipboardText { text } => Some(ClipboardPayload::Text(text.clone())),
+        OutboundPayload::ClipboardImage { image_bmp } => {
+            Some(ClipboardPayload::Image(image_bmp.clone()))
+        }
+        _ => None,
+    }
+}
+
 impl AppState {
+    async fn store_latest_clipboard_replay(&self, payload: ClipboardPayload, hash: String) {
+        let mut sync = self.clipboard_sync.write().await;
+        sync.pending_replay = Some(ClipboardReplayState {
+            payload,
+            hash: hash.clone(),
+            scheduled_peer_ids: HashSet::new(),
+            inflight_peer_ids: HashSet::new(),
+        });
+        sync.last_observed_hash = Some(hash);
+    }
+
+    pub(crate) async fn schedule_pending_clipboard_replay_for_peer(&self, peer_id: &str) -> bool {
+        let mut sync = self.clipboard_sync.write().await;
+        let Some(replay) = sync.pending_replay.as_mut() else {
+            return false;
+        };
+        if replay.inflight_peer_ids.contains(peer_id) {
+            return false;
+        }
+        replay.scheduled_peer_ids.insert(peer_id.to_string())
+    }
+
+    pub(crate) async fn clear_pending_clipboard_replay_for_peer(&self, peer_id: &str) {
+        let mut sync = self.clipboard_sync.write().await;
+        let Some(replay) = sync.pending_replay.as_mut() else {
+            return;
+        };
+        replay.scheduled_peer_ids.remove(peer_id);
+        replay.inflight_peer_ids.remove(peer_id);
+    }
+
+    async fn take_scheduled_clipboard_replay_for_peer(
+        &self,
+        peer_id: &str,
+    ) -> Option<OutboundPayload> {
+        let mut sync = self.clipboard_sync.write().await;
+        let replay = sync.pending_replay.as_mut()?;
+        if !replay.scheduled_peer_ids.remove(peer_id) {
+            return None;
+        }
+        replay.inflight_peer_ids.insert(peer_id.to_string());
+        Some(outbound_payload_from_clipboard_payload(&replay.payload))
+    }
+
+    async fn restore_replayed_clipboard_payload(
+        &self,
+        peer_id: &str,
+        payload: &OutboundPayload,
+    ) -> bool {
+        let Some(clipboard_payload) = clipboard_payload_from_outbound_payload(payload) else {
+            return false;
+        };
+        let hash = payload_hash_hex(&clipboard_payload);
+
+        let mut sync = self.clipboard_sync.write().await;
+        let Some(replay) = sync.pending_replay.as_mut() else {
+            return false;
+        };
+        if replay.hash != hash || !replay.inflight_peer_ids.remove(peer_id) {
+            return false;
+        }
+        replay.scheduled_peer_ids.insert(peer_id.to_string());
+        true
+    }
+
     async fn queue_outgoing_bulk_payload(&self, peer_id: &str, payload: OutboundPayload) {
         {
             let mut queue_map = self.outgoing_bulk_payloads.write().await;
@@ -93,17 +177,16 @@ impl AppState {
                 sync.suppress_echo_hash = None;
             }
 
-            if connected_peer_ids.is_empty() {
-                // Do not cache disconnected observations. On next peer connect we should
-                // still broadcast current clipboard contents.
-                sync.last_observed_hash = None;
-                return Ok(false);
-            }
-
             if sync.last_observed_hash.as_deref() == Some(hash.as_str()) {
                 return Ok(false);
             }
-            sync.last_observed_hash = Some(hash);
+        }
+
+        self.store_latest_clipboard_replay(payload.clone(), hash)
+            .await;
+
+        if connected_peer_ids.is_empty() {
+            return Ok(false);
         }
 
         {
@@ -198,6 +281,7 @@ impl AppState {
         let mut sync = self.clipboard_sync.write().await;
         sync.suppress_echo_hash = Some(hash.to_string());
         sync.last_observed_hash = Some(hash.to_string());
+        sync.pending_replay = None;
     }
 
     pub async fn queue_file_from_path(&self, peer_id: &str, file_path: &Path) -> Result<()> {
@@ -335,16 +419,32 @@ impl AppState {
         peer_id: &str,
         max_payloads: usize,
     ) -> Vec<OutboundPayload> {
+        if max_payloads == 0 {
+            return Vec::new();
+        }
+
+        let replay = self.take_scheduled_clipboard_replay_for_peer(peer_id).await;
         let mut queue_map = self.outgoing_bulk_payloads.write().await;
-        let mut drained = {
-            let Some(queue) = queue_map.get_mut(peer_id) else {
-                return Vec::new();
+        let mut drained = Vec::new();
+        if let Some(payload) = replay {
+            drained.push(payload);
+        }
+
+        let remaining_capacity = max_payloads.saturating_sub(drained.len());
+        if remaining_capacity > 0 {
+            let queued = match queue_map.get_mut(peer_id) {
+                Some(queue) => drain_queue_up_to(queue, remaining_capacity),
+                None => Vec::new(),
             };
-            drain_queue_up_to(queue, max_payloads)
-        };
+            drained.extend(queued);
+        }
 
         if queue_map.get(peer_id).is_some_and(VecDeque::is_empty) {
             queue_map.remove(peer_id);
+        }
+
+        if drained.is_empty() {
+            return drained;
         }
 
         drained.shrink_to_fit();
@@ -375,7 +475,21 @@ impl AppState {
             }
         }
 
-        if !split.input.is_empty() {
+        let mut restored_replay = false;
+        let mut requeued_bulk = VecDeque::new();
+        while let Some(payload) = split.bulk.pop_front() {
+            if self
+                .restore_replayed_clipboard_payload(peer_id, &payload)
+                .await
+            {
+                restored_replay = true;
+                continue;
+            }
+            requeued_bulk.push_back(payload);
+        }
+
+        let has_input = !split.input.is_empty();
+        if has_input {
             let mut queue_map = self.outgoing_input_payloads.write().await;
             let queue = queue_map.entry(peer_id.to_string()).or_default();
             for payload in split.input.into_iter().rev() {
@@ -383,15 +497,18 @@ impl AppState {
             }
         }
 
-        if !split.bulk.is_empty() {
+        let has_bulk = !requeued_bulk.is_empty();
+        if has_bulk {
             let mut queue_map = self.outgoing_bulk_payloads.write().await;
             let queue = queue_map.entry(peer_id.to_string()).or_default();
-            for payload in split.bulk.into_iter().rev() {
+            for payload in requeued_bulk.into_iter().rev() {
                 queue.push_front(payload);
             }
         }
 
-        self.notify_outgoing_flush_signal();
+        if restored_replay || has_input || has_bulk {
+            self.notify_outgoing_flush_signal();
+        }
     }
 
     pub fn record_transport_event(&self, event: TransportEventRecord) {

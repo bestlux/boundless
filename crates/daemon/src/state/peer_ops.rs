@@ -42,12 +42,17 @@ impl AppState {
     }
 
     pub async fn remove_peer(&self, peer_id: &str) -> Result<bool> {
-        let mut config = self.config.write().await;
-        let before = config.peers.len();
-        config.peers.retain(|p| p.peer_id != peer_id);
-        let removed = before != config.peers.len();
+        let removed = {
+            let mut config = self.config.write().await;
+            let before = config.peers.len();
+            config.peers.retain(|p| p.peer_id != peer_id);
+            let removed = before != config.peers.len();
+            if removed {
+                save_config_at(&self.config_path, &config)?;
+            }
+            removed
+        };
         if removed {
-            save_config_at(&self.config_path, &config)?;
             let mut router = self.input_router.write().await;
             let released_owner = router.release_owner(peer_id);
             router.clear_peer_state(peer_id);
@@ -59,6 +64,7 @@ impl AppState {
             self.discovered_endpoints.write().await.remove(peer_id);
             self.clear_pending_inject_input_frames_for_peer(peer_id)
                 .await;
+            self.clear_pending_clipboard_replay_for_peer(peer_id).await;
             self.reconnect_generation_by_peer
                 .write()
                 .await
@@ -74,17 +80,27 @@ impl AppState {
     }
 
     pub async fn set_peer_connected(&self, peer_id: &str, connected: bool) -> Result<()> {
-        let mut config = self.config.write().await;
-        let mut changed = false;
+        let (peer_found, transitioned_to_connected) = {
+            let mut config = self.config.write().await;
+            let mut peer_found = false;
+            let mut transitioned_to_connected = false;
 
-        if let Some(peer) = config.peers.iter_mut().find(|p| p.peer_id == peer_id) {
-            peer.connected = connected;
-            peer.last_seen = Utc::now();
-            changed = true;
-        }
+            if let Some(peer) = config.peers.iter_mut().find(|p| p.peer_id == peer_id) {
+                transitioned_to_connected = !peer.connected && connected;
+                peer.connected = connected;
+                peer.last_seen = Utc::now();
+                peer_found = true;
+            }
 
-        if changed {
-            save_config_at(&self.config_path, &config)?;
+            if peer_found {
+                save_config_at(&self.config_path, &config)?;
+            }
+
+            (peer_found, transitioned_to_connected)
+        };
+
+        if !peer_found {
+            return Ok(());
         }
 
         if !connected {
@@ -101,6 +117,13 @@ impl AppState {
             }
             self.clear_pending_inject_input_frames_for_peer(peer_id)
                 .await;
+            self.clear_pending_clipboard_replay_for_peer(peer_id).await;
+        } else if transitioned_to_connected
+            && self
+                .schedule_pending_clipboard_replay_for_peer(peer_id)
+                .await
+        {
+            self.notify_outgoing_flush_signal();
         }
 
         Ok(())

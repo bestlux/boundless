@@ -222,11 +222,20 @@ struct NearbyPairingDecisionRecord {
     decided_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+struct ClipboardReplayState {
+    payload: ClipboardPayload,
+    hash: String,
+    scheduled_peer_ids: HashSet<String>,
+    inflight_peer_ids: HashSet<String>,
+}
+
 #[derive(Debug, Default)]
 struct ClipboardSyncState {
     last_observed_hash: Option<String>,
     suppress_echo_hash: Option<String>,
     pending_remote: VecDeque<PendingRemoteClipboardPayload>,
+    pending_replay: Option<ClipboardReplayState>,
 }
 
 #[derive(Debug, Clone)]
@@ -2565,7 +2574,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clipboard_sync_does_not_cache_hash_when_no_peers_connected() {
+    async fn clipboard_sync_persists_disconnected_local_text_for_replay_without_immediate_queueing()
+    {
         let root = std::env::temp_dir().join(format!(
             "boundless-clipboard-connect-test-{}",
             uuid::Uuid::new_v4()
@@ -2603,16 +2613,258 @@ mod tests {
             .await
             .expect("connect peer-a");
 
-        let queued_connected = state
+        let outgoing = state.drain_outgoing(&peer_a).await;
+        assert_eq!(
+            outgoing.len(),
+            1,
+            "reconnect should replay retained text once"
+        );
+        assert!(matches!(
+            outgoing.first(),
+            Some(OutboundPayload::ClipboardText { text }) if text == "hello"
+        ));
+        assert!(
+            state.drain_outgoing(&peer_a).await.is_empty(),
+            "replayed clipboard snapshot should not remain queued after one drain"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn clipboard_sync_persists_disconnected_local_image_for_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-clipboard-image-replay-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_a, _) = state.create_pairing_code(120).await;
+        let peer_a = state
+            .join_peer(
+                code_a,
+                "127.0.0.1:15100".to_string(),
+                Some("peer-a".to_string()),
+            )
+            .await
+            .expect("join peer-a");
+
+        let image = minimal_bmp_payload(128);
+        let queued_disconnected = state
+            .queue_local_clipboard_image_for_connected_peers(image.clone())
+            .await
+            .expect("queue image while disconnected");
+        assert!(
+            !queued_disconnected,
+            "must not queue image payloads without connected peers"
+        );
+        assert!(
+            state.drain_outgoing(&peer_a).await.is_empty(),
+            "no image payload should be queued while disconnected"
+        );
+
+        state
+            .set_peer_connected(&peer_a, true)
+            .await
+            .expect("connect peer-a");
+
+        let outgoing = state.drain_outgoing(&peer_a).await;
+        assert_eq!(
+            outgoing.len(),
+            1,
+            "reconnect should replay retained image once"
+        );
+        assert!(matches!(
+            outgoing.first(),
+            Some(OutboundPayload::ClipboardImage { image_bmp }) if image_bmp == &image
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn peer_connect_schedules_clipboard_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-clipboard-reconnect-schedule-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_a, _) = state.create_pairing_code(120).await;
+        let peer_a = state
+            .join_peer(
+                code_a,
+                "127.0.0.1:15100".to_string(),
+                Some("peer-a".to_string()),
+            )
+            .await
+            .expect("join peer-a");
+
+        state
             .queue_local_clipboard_text_for_connected_peers("hello".to_string())
             .await
-            .expect("queue on connect");
+            .expect("queue while disconnected");
+        let mut flush_signal = state.subscribe_outgoing_flush_signal();
+
+        state
+            .set_peer_connected(&peer_a, true)
+            .await
+            .expect("connect peer-a");
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            flush_signal.changed(),
+        )
+        .await
+        .expect("connect should notify replay work")
+        .expect("flush signal channel should remain open");
         assert!(
-            queued_connected,
-            "same clipboard value should queue once peers are connected"
+            *flush_signal.borrow_and_update() > 0,
+            "replay scheduling should advance the flush generation"
         );
-        let outgoing = state.drain_outgoing(&peer_a).await;
-        assert_eq!(outgoing.len(), 1);
+
+        let outgoing = state.drain_outgoing_bulk(&peer_a, usize::MAX).await;
+        assert_eq!(
+            outgoing.len(),
+            1,
+            "connect should schedule one replay payload"
+        );
+        assert!(matches!(
+            outgoing.first(),
+            Some(OutboundPayload::ClipboardText { text }) if text == "hello"
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn mixed_topology_reconnect_replays_latest_clipboard_snapshot_to_late_peer() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-clipboard-mixed-reconnect-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_a, _) = state.create_pairing_code(120).await;
+        let peer_a = state
+            .join_peer(
+                code_a,
+                "127.0.0.1:15100".to_string(),
+                Some("peer-a".to_string()),
+            )
+            .await
+            .expect("join peer-a");
+        let (code_b, _) = state.create_pairing_code(120).await;
+        let peer_b = state
+            .join_peer(
+                code_b,
+                "127.0.0.1:15101".to_string(),
+                Some("peer-b".to_string()),
+            )
+            .await
+            .expect("join peer-b");
+
+        state
+            .set_peer_connected(&peer_a, true)
+            .await
+            .expect("connect peer-a");
+
+        let queued = state
+            .queue_local_clipboard_text_for_connected_peers("shared".to_string())
+            .await
+            .expect("queue local clipboard");
+        assert!(
+            queued,
+            "connected peers should receive the live clipboard update"
+        );
+
+        let outgoing_a = state.drain_outgoing(&peer_a).await;
+        assert_eq!(
+            outgoing_a.len(),
+            1,
+            "connected peer should get direct payload"
+        );
+        assert!(matches!(
+            outgoing_a.first(),
+            Some(OutboundPayload::ClipboardText { text }) if text == "shared"
+        ));
+        assert!(
+            state.drain_outgoing(&peer_b).await.is_empty(),
+            "disconnected peer must not receive a queued payload before reconnect"
+        );
+
+        state
+            .set_peer_connected(&peer_b, true)
+            .await
+            .expect("connect peer-b");
+
+        let outgoing_b = state.drain_outgoing(&peer_b).await;
+        assert_eq!(
+            outgoing_b.len(),
+            1,
+            "late peer should receive the retained latest snapshot on reconnect"
+        );
+        assert!(matches!(
+            outgoing_b.first(),
+            Some(OutboundPayload::ClipboardText { text }) if text == "shared"
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn remote_clipboard_apply_cancels_pending_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-clipboard-remote-cancel-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code_a, _) = state.create_pairing_code(120).await;
+        let peer_a = state
+            .join_peer(
+                code_a,
+                "127.0.0.1:15100".to_string(),
+                Some("peer-a".to_string()),
+            )
+            .await
+            .expect("join peer-a");
+
+        state
+            .queue_local_clipboard_text_for_connected_peers("local".to_string())
+            .await
+            .expect("queue while disconnected");
+        state
+            .set_peer_connected(&peer_a, true)
+            .await
+            .expect("connect peer-a");
+
+        state
+            .enqueue_remote_clipboard_text(&peer_a, "remote".to_string())
+            .await
+            .expect("enqueue remote");
+        let remote = state
+            .dequeue_remote_clipboard_payload()
+            .await
+            .expect("remote item");
+        state.mark_remote_clipboard_applied(&remote.hash).await;
+
+        assert!(
+            state.drain_outgoing(&peer_a).await.is_empty(),
+            "remote apply should cancel stale replay before it is sent"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
