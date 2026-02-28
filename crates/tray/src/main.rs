@@ -201,6 +201,18 @@ mod windows_app {
 
     include!("dashboard.rs");
 
+    #[cfg(test)]
+    #[path = "../dashboard_test_support.rs"]
+    mod dashboard_test_support;
+
+    #[cfg(test)]
+    #[path = "../dashboard_pairing_target_selection_tests.rs"]
+    mod dashboard_pairing_target_selection_tests;
+
+    #[cfg(test)]
+    #[path = "../dashboard_pairing_transition_tests.rs"]
+    mod dashboard_pairing_transition_tests;
+
     fn run_boundlessctl(ctx: &AppContext, args: &[String]) -> Result<String> {
         run_boundlessctl_with_timeout(ctx, args, Duration::from_secs(20))
     }

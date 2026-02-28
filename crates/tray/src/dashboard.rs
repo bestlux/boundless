@@ -32,14 +32,23 @@ pub(super) fn run() -> Result<()> {
 enum AppMsg {
     SnapshotUpdated(UiSnapshot),
     SnapshotError(String),
-    PairingChallenge(PairingChallengeState),
-    PairingComplete(GuidedPairingResult),
-    PairingFailed(String),
+    PairingChallenge {
+        attempt_id: u64,
+        challenge: PairingChallengeState,
+    },
+    PairingComplete {
+        attempt_id: u64,
+        result: GuidedPairingResult,
+    },
+    PairingFailed {
+        attempt_id: u64,
+        error: String,
+    },
     ActionComplete(String),
     ActionFailed(String),
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum Tab {
     Status,
     Layout,
@@ -126,6 +135,38 @@ fn serialize_layout_matrix(layout_grid: &HashMap<(i32, i32), String>, local_mach
     rows.join(";")
 }
 
+fn validate_pairing_code(code: &str) -> Result<()> {
+    if code.trim().is_empty() {
+        anyhow::bail!("pairing code cannot be empty");
+    }
+    Ok(())
+}
+
+fn guided_flow_from_discovered_peer(peer: &UiDiscoveredPeer) -> Result<GuidedPairingFlow> {
+    let Some((host, pairing_port)) = host_and_pairing_port_from_discovery_endpoint(&peer.endpoint)
+    else {
+        anyhow::bail!("Failed to parse peer endpoint");
+    };
+
+    Ok(GuidedPairingFlow {
+        dialog_title: format!("Pair with {}", peer.display_name),
+        host,
+        pairing_port,
+        default_alias: peer.display_name.clone(),
+        orientation_selector_fallback: peer.display_name.clone(),
+    })
+}
+
+fn guided_flow_from_manual_input(host: &str, port_text: &str) -> Result<GuidedPairingFlow> {
+    Ok(GuidedPairingFlow {
+        dialog_title: format!("Manual Pair {}", host),
+        host: host.to_string(),
+        pairing_port: parse_pairing_port(port_text)?,
+        default_alias: String::new(),
+        orientation_selector_fallback: host.to_string(),
+    })
+}
+
 struct DashboardApp {
     ctx: Arc<AppContext>,
     _tray_icon: Option<TrayIcon>,
@@ -149,6 +190,8 @@ struct DashboardApp {
     pairing_alias: String,
     pairing_in_progress: bool,
     pairing_retry_available: bool,
+    pairing_attempt_seq: u64,
+    active_pairing_attempt_id: Option<u64>,
 
     // Layout manager state
     layout_grid: HashMap<(i32, i32), String>,
@@ -236,6 +279,8 @@ impl DashboardApp {
             pairing_alias: String::new(),
             pairing_in_progress: false,
             pairing_retry_available: false,
+            pairing_attempt_seq: 0,
+            active_pairing_attempt_id: None,
             layout_grid: HashMap::new(),
             layout_unassigned: Vec::new(),
             layout_initialized: false,
@@ -244,14 +289,87 @@ impl DashboardApp {
         }
     }
 
-    fn start_pairing(&mut self, flow: GuidedPairingFlow, egui_ctx: egui::Context) {
+    fn begin_pairing_flow(&mut self, flow: GuidedPairingFlow) -> u64 {
+        self.pairing_attempt_seq = self.pairing_attempt_seq.saturating_add(1);
+        let attempt_id = self.pairing_attempt_seq;
         self.pairing_in_progress = true;
         self.pairing_flow = Some(flow.clone());
         self.pairing_challenge = None;
         self.pairing_code.clear();
-        self.pairing_alias = flow.default_alias.clone();
+        self.pairing_alias = flow.default_alias;
         self.last_error = None;
         self.pairing_retry_available = false;
+        self.active_pairing_attempt_id = Some(attempt_id);
+        attempt_id
+    }
+
+    fn cancel_pairing_flow(&mut self) {
+        self.pairing_in_progress = false;
+        self.pairing_challenge = None;
+        self.pairing_flow = None;
+        self.pairing_retry_available = false;
+        self.active_pairing_attempt_id = None;
+    }
+
+    fn apply_app_msg(&mut self, msg: AppMsg) {
+        match msg {
+            AppMsg::SnapshotUpdated(snap) => {
+                self.snapshot = snap;
+            }
+            AppMsg::SnapshotError(err) => {
+                self.last_error = Some(err);
+                self.last_message_is_error = true;
+            }
+            AppMsg::PairingChallenge {
+                attempt_id,
+                challenge,
+            } => {
+                if Some(attempt_id) != self.active_pairing_attempt_id {
+                    return;
+                }
+                self.pairing_in_progress = false;
+                self.pairing_challenge = Some(challenge);
+            }
+            AppMsg::PairingComplete { attempt_id, result } => {
+                if Some(attempt_id) != self.active_pairing_attempt_id {
+                    return;
+                }
+                self.pairing_in_progress = false;
+                self.pairing_challenge = None;
+                self.pairing_flow = None;
+                self.active_pairing_attempt_id = None;
+                self.selected_tab = Tab::Layout;
+                self.last_error = Some(format!(
+                    "Pairing successful with {} (selector: {})",
+                    short_token(&result.peer_machine_id),
+                    result.orientation_selector
+                ));
+                self.last_message_is_error = false;
+                self.pairing_retry_available = false;
+            }
+            AppMsg::PairingFailed { attempt_id, error } => {
+                if Some(attempt_id) != self.active_pairing_attempt_id {
+                    return;
+                }
+                self.pairing_in_progress = false;
+                let error = anyhow::anyhow!(error);
+                self.last_error = Some(format_error_for_dialog(&error));
+                self.last_message_is_error = true;
+                self.pairing_retry_available = should_offer_new_request_retry(&error);
+            }
+            AppMsg::ActionComplete(msg) => {
+                self.last_error = Some(msg);
+                self.last_message_is_error = false;
+            }
+            AppMsg::ActionFailed(err) => {
+                self.last_error = Some(err);
+                self.last_message_is_error = true;
+            }
+        }
+    }
+
+    fn start_pairing(&mut self, flow: GuidedPairingFlow, egui_ctx: egui::Context) {
+        let attempt_id = self.begin_pairing_flow(flow.clone());
 
         let tx = self.tx.clone();
         let endpoint = self.ctx.endpoint.clone();
@@ -259,13 +377,19 @@ impl DashboardApp {
             match pair_nearby_request_code_blocking(&endpoint, flow.host.clone(), flow.pairing_port) {
                 Ok(NearbyRequestCodeStart::CodeRequired { request_id, verification_nonce, expires_at }) => {
                     let challenge = PairingChallengeState { request_id, verification_nonce, expires_at };
-                    let _ = tx.send(AppMsg::PairingChallenge(challenge));
+                    let _ = tx.send(AppMsg::PairingChallenge { attempt_id, challenge });
                 }
                 Ok(NearbyRequestCodeStart::Unsupported { reason }) => {
-                    let _ = tx.send(AppMsg::PairingFailed(format!("Target does not support guided pairing: {}", reason)));
+                    let _ = tx.send(AppMsg::PairingFailed {
+                        attempt_id,
+                        error: format!("Target does not support guided pairing: {}", reason),
+                    });
                 }
                 Err(e) => {
-                    let _ = tx.send(AppMsg::PairingFailed(e.to_string()));
+                    let _ = tx.send(AppMsg::PairingFailed {
+                        attempt_id,
+                        error: e.to_string(),
+                    });
                 }
             }
             egui_ctx.request_repaint();
@@ -273,7 +397,11 @@ impl DashboardApp {
     }
 
     fn submit_pairing_code(&mut self, egui_ctx: egui::Context) {
-        if let (Some(challenge), Some(flow)) = (self.pairing_challenge.clone(), self.pairing_flow.clone()) {
+        if let (Some(challenge), Some(flow), Some(attempt_id)) = (
+            self.pairing_challenge.clone(),
+            self.pairing_flow.clone(),
+            self.active_pairing_attempt_id,
+        ) {
             let tx = self.tx.clone();
             let endpoint = self.ctx.endpoint.clone();
             let code = self.pairing_code.clone();
@@ -293,18 +421,34 @@ impl DashboardApp {
                     alias.clone(),
                 ) {
                     Ok(peer_machine_id) => {
-                        let _ = tx.send(AppMsg::PairingComplete(GuidedPairingResult {
-                            peer_machine_id,
-                            orientation_selector: alias.unwrap_or(fallback_alias),
-                        }));
+                        let _ = tx.send(AppMsg::PairingComplete {
+                            attempt_id,
+                            result: GuidedPairingResult {
+                                peer_machine_id,
+                                orientation_selector: alias.unwrap_or(fallback_alias),
+                            },
+                        });
                     }
                     Err(e) => {
-                        let _ = tx.send(AppMsg::PairingFailed(e.to_string()));
+                        let _ = tx.send(AppMsg::PairingFailed {
+                            attempt_id,
+                            error: e.to_string(),
+                        });
                     }
                 }
                 egui_ctx.request_repaint();
             });
         }
+    }
+
+    fn confirm_pairing_code(&mut self, egui_ctx: egui::Context) {
+        if let Err(error) = validate_pairing_code(&self.pairing_code) {
+            self.last_error = Some(error.to_string());
+            self.last_message_is_error = true;
+            return;
+        }
+
+        self.submit_pairing_code(egui_ctx);
     }
 
     fn render_pairing_dialog(&mut self, ctx: &egui::Context) {
@@ -320,9 +464,7 @@ impl DashboardApp {
                     ui.label("Requesting pairing challenge from target...");
                 });
                 if ui.button("Cancel").clicked() {
-                    self.pairing_in_progress = false;
-                    self.pairing_flow = None;
-                    self.pairing_retry_available = false;
+                    self.cancel_pairing_flow();
                 }
             });
         } else if let Some(challenge) = self.pairing_challenge.clone() {
@@ -353,18 +495,10 @@ impl DashboardApp {
                 } else {
                     ui.horizontal(|ui| {
                         if ui.button("Confirm").clicked() {
-                            if self.pairing_code.trim().is_empty() {
-                                self.last_error = Some("pairing code cannot be empty".to_string());
-                                self.last_message_is_error = true;
-                            } else {
-                                self.submit_pairing_code(ctx.clone());
-                            }
+                            self.confirm_pairing_code(ctx.clone());
                         }
                         if ui.button("Cancel").clicked() {
-                            self.pairing_in_progress = false;
-                            self.pairing_challenge = None;
-                            self.pairing_flow = None;
-                            self.pairing_retry_available = false;
+                            self.cancel_pairing_flow();
                         }
                     });
                 }
@@ -387,47 +521,7 @@ impl eframe::App for DashboardApp {
 
         // Poll messages from background threads
         while let Ok(msg) = self.rx.try_recv() {
-            match msg {
-                AppMsg::SnapshotUpdated(snap) => {
-                    self.snapshot = snap;
-                }
-                AppMsg::SnapshotError(err) => {
-                    self.last_error = Some(err);
-                    self.last_message_is_error = true;
-                }
-                AppMsg::PairingChallenge(challenge) => {
-                    self.pairing_in_progress = false;
-                    self.pairing_challenge = Some(challenge);
-                }
-                AppMsg::PairingComplete(result) => {
-                    self.pairing_in_progress = false;
-                    self.pairing_challenge = None;
-                    self.pairing_flow = None;
-                    self.selected_tab = Tab::Layout;
-                    self.last_error = Some(format!(
-                        "Pairing successful with {} (selector: {})",
-                        short_token(&result.peer_machine_id),
-                        result.orientation_selector
-                    ));
-                    self.last_message_is_error = false;
-                    self.pairing_retry_available = false;
-                }
-                AppMsg::PairingFailed(err) => {
-                    self.pairing_in_progress = false;
-                    let error = anyhow::anyhow!(err);
-                    self.last_error = Some(format_error_for_dialog(&error));
-                    self.last_message_is_error = true;
-                    self.pairing_retry_available = should_offer_new_request_retry(&error);
-                }
-                AppMsg::ActionComplete(msg) => {
-                    self.last_error = Some(msg);
-                    self.last_message_is_error = false;
-                }
-                AppMsg::ActionFailed(err) => {
-                    self.last_error = Some(err);
-                    self.last_message_is_error = true;
-                }
-            }
+            self.apply_app_msg(msg);
         }
 
         self.render_pairing_dialog(ctx);
@@ -472,16 +566,11 @@ impl eframe::App for DashboardApp {
                                     ui.label(short_token(&peer.machine_id));
                                     ui.label(&peer.endpoint);
                                     if ui.button("Connect").clicked() {
-                                        if let Some((host, port)) = host_and_pairing_port_from_discovery_endpoint(&peer.endpoint) {
-                                            self.start_pairing(GuidedPairingFlow {
-                                                dialog_title: format!("Pair with {}", peer.display_name),
-                                                host,
-                                                pairing_port: port,
-                                                default_alias: peer.display_name.clone(),
-                                                orientation_selector_fallback: peer.display_name.clone(),
-                                            }, ctx.clone());
-                                        } else {
-                                            self.last_error = Some("Failed to parse peer endpoint".into());
+                                        match guided_flow_from_discovered_peer(&peer) {
+                                            Ok(flow) => self.start_pairing(flow, ctx.clone()),
+                                            Err(error) => {
+                                                self.last_error = Some(error.to_string());
+                                            }
                                         }
                                     }
                                     ui.end_row();
@@ -497,18 +586,12 @@ impl eframe::App for DashboardApp {
                             ui.label("Port:");
                             ui.text_edit_singleline(&mut self.manual_port);
                             if ui.button("Connect").clicked()
-                                && let Ok(port) = parse_pairing_port(&self.manual_port)
+                                && let Ok(flow) = guided_flow_from_manual_input(
+                                    &self.manual_host,
+                                    &self.manual_port,
+                                )
                             {
-                                self.start_pairing(
-                                    GuidedPairingFlow {
-                                        dialog_title: format!("Manual Pair {}", self.manual_host),
-                                        host: self.manual_host.clone(),
-                                        pairing_port: port,
-                                        default_alias: String::new(),
-                                        orientation_selector_fallback: self.manual_host.clone(),
-                                    },
-                                    ctx.clone(),
-                                );
+                                self.start_pairing(flow, ctx.clone());
                             }
                         });
 
@@ -633,7 +716,7 @@ impl eframe::App for DashboardApp {
                                     
                                     let gx = x as i32 + offset_x;
                                     let gy = y as i32 + offset_y;
-                                    if gx >= 0 && gx < 7 && gy >= 0 && gy < 7 {
+                                    if (0..7).contains(&gx) && (0..7).contains(&gy) {
                                         self.layout_grid.insert((gx, gy), peer_id.clone());
                                     } else {
                                         self.layout_unassigned.push(peer_id.clone());
@@ -727,11 +810,11 @@ impl eframe::App for DashboardApp {
                                     let is_hovered = response.hovered() && self.dragging_peer.is_some();
                                     let is_being_dragged = self.dragging_peer.is_some() && response.dragged();
                                     
-                                    if response.drag_started() {
-                                        if let Some(peer_id) = self.layout_grid.get(&(x, y)) {
-                                            self.dragging_peer = Some((peer_id.clone(), (x, y)));
-                                            new_grid.remove(&(x, y));
-                                        }
+                                    if response.drag_started()
+                                        && let Some(peer_id) = self.layout_grid.get(&(x, y))
+                                    {
+                                        self.dragging_peer = Some((peer_id.clone(), (x, y)));
+                                        new_grid.remove(&(x, y));
                                     }
                                     
                                     if response.drag_stopped() {
@@ -745,19 +828,19 @@ impl eframe::App for DashboardApp {
                                     }
                                     painter.rect_stroke(rect.shrink(2.0), 4.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 50, 55)));
                                     
-                                    if let Some(peer_id) = self.layout_grid.get(&(x, y)) {
-                                        if !is_being_dragged {
-                                            let is_local = peer_id == &self.snapshot.machine_id;
-                                            let bg_color = if is_local { egui::Color32::from_rgb(30, 70, 110) } else { egui::Color32::from_rgb(50, 60, 70) };
-                                            painter.rect_filled(rect.shrink(4.0), 6.0, bg_color);
-                                            let border_color = if is_local { egui::Color32::LIGHT_BLUE } else { egui::Color32::DARK_GRAY };
-                                            painter.rect_stroke(rect.shrink(4.0), 6.0, egui::Stroke::new(1.5, border_color));
-                                            let text = get_display_name(peer_id);
-                                            let mut job = egui::text::LayoutJob::simple(text, egui::FontId::proportional(12.0), egui::Color32::WHITE, rect.width() - 8.0);
-                                            job.halign = egui::Align::Center;
-                                            let galley = ctx.fonts(|f| f.layout_job(job));
-                                            painter.galley(rect.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
-                                        }
+                                    if let Some(peer_id) = self.layout_grid.get(&(x, y))
+                                        && !is_being_dragged
+                                    {
+                                        let is_local = peer_id == &self.snapshot.machine_id;
+                                        let bg_color = if is_local { egui::Color32::from_rgb(30, 70, 110) } else { egui::Color32::from_rgb(50, 60, 70) };
+                                        painter.rect_filled(rect.shrink(4.0), 6.0, bg_color);
+                                        let border_color = if is_local { egui::Color32::LIGHT_BLUE } else { egui::Color32::DARK_GRAY };
+                                        painter.rect_stroke(rect.shrink(4.0), 6.0, egui::Stroke::new(1.5, border_color));
+                                        let text = get_display_name(peer_id);
+                                        let mut job = egui::text::LayoutJob::simple(text, egui::FontId::proportional(12.0), egui::Color32::WHITE, rect.width() - 8.0);
+                                        job.halign = egui::Align::Center;
+                                        let galley = ctx.fonts(|f| f.layout_job(job));
+                                        painter.galley(rect.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
                                     }
                                 }
                             });
@@ -765,59 +848,55 @@ impl eframe::App for DashboardApp {
                     });
                     });
 
-                    if drag_stopped {
-                        if let Some((peer_id, old_pos)) = self.dragging_peer.take() {
-                            if let Some(pos) = pointer_pos_at_drop {
-                                let mut dropped_in_cell = None;
-                                for (rect, x, y) in &cell_rects {
-                                    if rect.contains(pos) { dropped_in_cell = Some((*x, *y)); break; }
-                                }
-                                
-                                if let Some(new_pos) = dropped_in_cell {
-                                    if let Some(occupant) = self.layout_grid.get(&new_pos).cloned() {
-                                        if old_pos.0 == -1 {
-                                            new_unassigned.insert(old_pos.1 as usize, occupant);
-                                        } else {
-                                            new_grid.insert(old_pos, occupant);
-                                        }
-                                    } else if old_pos.0 == -1 {
-                                        // Removed from unassigned already above
-                                    }
-                                    new_grid.insert(new_pos, peer_id);
-                                } else {
-                                    if old_pos.0 != -1 {
-                                        new_unassigned.push(peer_id);
-                                    } else {
-                                        new_unassigned.insert(old_pos.1 as usize, peer_id);
-                                    }
-                                }
-                            } else {
-                                if old_pos.0 != -1 {
-                                    new_grid.insert(old_pos, peer_id);
-                                } else {
-                                    new_unassigned.insert(old_pos.1 as usize, peer_id);
-                                }
+                    if drag_stopped
+                        && let Some((peer_id, old_pos)) = self.dragging_peer.take()
+                    {
+                        if let Some(pos) = pointer_pos_at_drop {
+                            let mut dropped_in_cell = None;
+                            for (rect, x, y) in &cell_rects {
+                                if rect.contains(pos) { dropped_in_cell = Some((*x, *y)); break; }
                             }
+                            
+                            if let Some(new_pos) = dropped_in_cell {
+                                if let Some(occupant) = self.layout_grid.get(&new_pos).cloned() {
+                                    if old_pos.0 == -1 {
+                                        new_unassigned.insert(old_pos.1 as usize, occupant);
+                                    } else {
+                                        new_grid.insert(old_pos, occupant);
+                                    }
+                                } else if old_pos.0 == -1 {
+                                    // Removed from unassigned already above
+                                }
+                                new_grid.insert(new_pos, peer_id);
+                            } else if old_pos.0 != -1 {
+                                new_unassigned.push(peer_id);
+                            } else {
+                                new_unassigned.insert(old_pos.1 as usize, peer_id);
+                            }
+                        } else if old_pos.0 != -1 {
+                            new_grid.insert(old_pos, peer_id);
+                        } else {
+                            new_unassigned.insert(old_pos.1 as usize, peer_id);
                         }
                     }
 
                     self.layout_grid = new_grid;
                     self.layout_unassigned = new_unassigned;
 
-                    if let Some((peer_id, _)) = &self.dragging_peer {
-                        if let Some(pos) = ctx.pointer_hover_pos() {
-                            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("drag_layer")));
-                            let rect = egui::Rect::from_center_size(pos, cell_size);
-                            let is_local = peer_id == &self.snapshot.machine_id;
-                            let bg_color = if is_local { egui::Color32::from_rgb(40, 90, 140) } else { egui::Color32::from_rgb(70, 80, 90) };
-                            painter.rect_filled(rect.shrink(4.0), 6.0, bg_color);
-                            painter.rect_stroke(rect.shrink(4.0), 6.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
-                            let text = get_display_name(peer_id);
-                            let mut job = egui::text::LayoutJob::simple(text, egui::FontId::proportional(12.0), egui::Color32::WHITE, rect.width() - 8.0);
-                            job.halign = egui::Align::Center;
-                            let galley = ctx.fonts(|f| f.layout_job(job));
-                            painter.galley(rect.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
-                        }
+                    if let Some((peer_id, _)) = &self.dragging_peer
+                        && let Some(pos) = ctx.pointer_hover_pos()
+                    {
+                        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("drag_layer")));
+                        let rect = egui::Rect::from_center_size(pos, cell_size);
+                        let is_local = peer_id == &self.snapshot.machine_id;
+                        let bg_color = if is_local { egui::Color32::from_rgb(40, 90, 140) } else { egui::Color32::from_rgb(70, 80, 90) };
+                        painter.rect_filled(rect.shrink(4.0), 6.0, bg_color);
+                        painter.rect_stroke(rect.shrink(4.0), 6.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                        let text = get_display_name(peer_id);
+                        let mut job = egui::text::LayoutJob::simple(text, egui::FontId::proportional(12.0), egui::Color32::WHITE, rect.width() - 8.0);
+                        job.halign = egui::Align::Center;
+                        let galley = ctx.fonts(|f| f.layout_job(job));
+                        painter.galley(rect.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
                     }
 
                     ui.add_space(16.0);
