@@ -138,6 +138,22 @@ You can inspect daemon config path with:
 cargo run -p boundless-daemon -- print-config-path
 ```
 
+Windows package flow:
+
+```powershell
+./scripts/dev/package-smoke.ps1 -KeepArtifacts
+```
+
+The Windows release artifact now packages:
+- `boundlesstray.exe`
+- `boundlessd.exe`
+- `boundlessctl.exe`
+- `Boundless-Install.ps1`
+- `Boundless-Uninstall.ps1`
+- `Boundless-Reset.ps1`
+
+The default per-user install root is `%LocalAppData%\Programs\Boundless`, and the installer creates a Startup-folder shortcut for the tray.
+
 Nearby pairing (approval-based, no trust-bundle file copy):
 
 ```bash

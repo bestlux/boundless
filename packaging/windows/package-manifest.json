@@ -1,0 +1,24 @@
+{
+  "app_id": "boundless",
+  "display_name": "Boundless",
+  "publisher": "Boundless",
+  "version": "0.0.0-dev",
+  "generated_at_utc": "",
+  "package_name": "",
+  "default_install_root": "%LocalAppData%\\Programs\\Boundless",
+  "startup_shortcut_name": "Boundless.lnk",
+  "executables": {
+    "tray": "boundlesstray.exe",
+    "daemon": "boundlessd.exe",
+    "cli": "boundlessctl.exe"
+  },
+  "scripts": {
+    "install": "Boundless-Install.ps1",
+    "uninstall": "Boundless-Uninstall.ps1",
+    "reset": "Boundless-Reset.ps1"
+  },
+  "reset_modes": [
+    "network",
+    "all"
+  ]
+}

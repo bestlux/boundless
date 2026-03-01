@@ -18,10 +18,13 @@ jobs:
             artifact_suffix: linux-x64
             daemon_path: target/release/boundlessd
             cli_path: target/release/boundlessctl
+            artifact_name: boundless-linux-x64
           - os: windows-latest
             artifact_suffix: windows-x64
             daemon_path: target/release/boundlessd.exe
             cli_path: target/release/boundlessctl.exe
+            tray_path: target/release/boundlesstray.exe
+            artifact_name: boundless-windows-x64
 
     runs-on: ${{ matrix.os }}
 
@@ -35,8 +38,13 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release binaries
+      - name: Build release binaries (Unix)
+        if: runner.os != 'Windows'
         run: cargo build --release -p boundless-daemon -p boundless-cli
+
+      - name: Build release binaries (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray
 
       - name: Package artifacts (Unix)
         if: runner.os != 'Windows'
@@ -46,27 +54,48 @@ jobs:
           cp ${{ matrix.cli_path }} dist/
           tar -czf boundless-${{ github.ref_name }}-${{ matrix.artifact_suffix }}.tar.gz -C dist .
 
+      - name: Sign Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_SIGN_CERT_PATH: ${{ vars.WINDOWS_SIGN_CERT_PATH }}
+          WINDOWS_SIGN_CERT_BASE64: ${{ secrets.WINDOWS_SIGN_CERT_BASE64 }}
+          WINDOWS_SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGN_CERT_PASSWORD }}
+          WINDOWS_SIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_SIGN_TIMESTAMP_URL }}
+          WINDOWS_SIGN_DESCRIPTION: ${{ vars.WINDOWS_SIGN_DESCRIPTION }}
+          WINDOWS_SIGN_DESCRIPTION_URL: ${{ vars.WINDOWS_SIGN_DESCRIPTION_URL }}
+          WINDOWS_SIGN_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_DIGEST_ALGORITHM }}
+          WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM }}
+        run: |
+          ./scripts/release/sign-windows-artifacts.ps1 -Files @(
+            "${{ matrix.daemon_path }}",
+            "${{ matrix.cli_path }}",
+            "${{ matrix.tray_path }}"
+          )
+
       - name: Package artifacts (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "${{ matrix.daemon_path }}" dist/
-          Copy-Item "${{ matrix.cli_path }}" dist/
-          Compress-Archive -Path dist\* -DestinationPath "boundless-${{ github.ref_name }}-${{ matrix.artifact_suffix }}.zip"
+          ./scripts/release/package-windows.ps1 `
+            -Version "${{ github.ref_name }}" `
+            -DaemonPath "${{ matrix.daemon_path }}" `
+            -CliPath "${{ matrix.cli_path }}" `
+            -TrayPath "${{ matrix.tray_path }}" `
+            -OutputPath "boundless-${{ github.ref_name }}-${{ matrix.artifact_suffix }}.zip"
 
       - name: Upload release artifact (Unix)
         if: runner.os != 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: boundless-${{ matrix.artifact_suffix }}
+          name: ${{ matrix.artifact_name }}
           path: boundless-${{ github.ref_name }}-${{ matrix.artifact_suffix }}.tar.gz
 
       - name: Upload release artifact (Windows)
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: boundless-${{ matrix.artifact_suffix }}
+          name: ${{ matrix.artifact_name }}
           path: boundless-${{ github.ref_name }}-${{ matrix.artifact_suffix }}.zip
 
   publish:
