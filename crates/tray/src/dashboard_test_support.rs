@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::*;
 
 pub(super) fn test_app() -> DashboardApp {
