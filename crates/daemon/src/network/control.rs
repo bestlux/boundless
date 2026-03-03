@@ -15,6 +15,10 @@ pub(super) enum HelloHandling {
     TerminateSession,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "wire control handlers operate on explicit session state and IO buffers"
+)]
 pub(super) async fn handle_hello_message<W>(
     state: &AppState,
     authenticated_peer_id: &str,
@@ -101,6 +105,10 @@ where
     Ok(HelloHandling::Continue)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "wire control handlers operate on explicit session state and IO buffers"
+)]
 pub(super) async fn handle_hello_ack_message<W>(
     state: &AppState,
     remote_peer_id: Option<&str>,

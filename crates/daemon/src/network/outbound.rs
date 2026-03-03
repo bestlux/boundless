@@ -113,6 +113,10 @@ where
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "bulk flush coordinates protocol state, credits, and writer buffers in one step"
+)]
 pub(super) async fn flush_outgoing_bulk_payloads_with_buffer<W>(
     state: &AppState,
     local_machine_id: &str,

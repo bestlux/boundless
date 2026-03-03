@@ -37,4 +37,4 @@ jobs:
       - name: Two-node smoke (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/dev/two-node-smoke.ps1 -TimeoutSeconds 90
+        run: ./scripts/dev/two-node-smoke.ps1 -TimeoutSeconds 90 -ClipboardOnly

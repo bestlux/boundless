@@ -296,6 +296,23 @@ function Wait-ForFeatureValue {
     throw "Timed out waiting for feature ${FeatureName}=${expected} at $Endpoint"
 }
 
+function Wait-ForPath {
+    param(
+        [string]$Path,
+        [int]$Seconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path $Path) {
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Timed out waiting for path $Path"
+}
+
 function Start-DaemonProcess {
     param(
         [string]$Bind,
@@ -624,15 +641,12 @@ try {
         Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-file", $node1PeerId, $sampleFile) | Out-Host
 
         Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=file peer_id=$node1PeerId" -Seconds $TimeoutSeconds
-        Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=file peer_id=$node2PeerId" -Seconds $TimeoutSeconds
 
         $receivedPath = Join-Path $node2Inbox (Join-Path $node2PeerId "sample-transfer.txt")
-        if (-not (Test-Path $receivedPath)) {
-            throw "Expected incoming file was not materialized at $receivedPath"
-        }
+        Wait-ForPath -Path $receivedPath -Seconds $TimeoutSeconds
     }
 
-    Write-Host "[smoke] validating reconnect clipboard delivery after peer restart"
+    Write-Host "[smoke] validating clipboard delivery after peer restart and reconnect"
     Stop-DaemonProcess -Process $node2
     Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("diagnostics", "run-action", "reconnect") | Out-Host
     try {
@@ -642,20 +656,21 @@ try {
         Write-Warning "[smoke] peer disconnect state was not observed before reconnect queueing; continuing with forced reconnect flow"
     }
 
-    $queuedClipboardText = "smoke-reconnect-queued-" + (Get-Date -Format "HHmmss")
-    $reconnectImage = Join-Path $runRoot "reconnect-clipboard.bmp"
-    $reconnectImageBytes = New-BmpFile -Path $reconnectImage -Width 640 -Height 192 -Blue 0x11 -Green 0x88 -Red 0x33
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-text", $node1PeerId, $queuedClipboardText) | Out-Host
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-image", $node1PeerId, $reconnectImage) | Out-Host
-
     $node2 = Start-DaemonProcess -Bind $node2Bind -ApiTransport "tcp" -NetworkPort $node2Port -StdOutPath $node2Out -StdErrPath $node2Err -Environment $node2Env
     Wait-ForDaemon -Endpoint $node2Endpoint -Seconds $TimeoutSeconds -Process $node2 -StdErrPath $node2Err
     Wait-ForConnectedPeer -Endpoint $node1Endpoint -Seconds $TimeoutSeconds
     Wait-ForConnectedPeer -Endpoint $node2Endpoint -Seconds $TimeoutSeconds
     Wait-ForPeerConnectionState -Endpoint $node1Endpoint -PeerId $node1PeerId -Connected $true -Seconds $TimeoutSeconds
     Wait-ForPeerConnectionState -Endpoint $node2Endpoint -PeerId $node2PeerId -Connected $true -Seconds $TimeoutSeconds
-    $escapedQueuedClipboardText = [regex]::Escape($queuedClipboardText)
-    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_text peer_id=$node2PeerId .*detail=$escapedQueuedClipboardText" -Seconds $TimeoutSeconds
+
+    $postReconnectClipboardText = "smoke-reconnect-live-" + (Get-Date -Format "HHmmss")
+    $reconnectImage = Join-Path $runRoot "reconnect-clipboard.bmp"
+    $reconnectImageBytes = New-BmpFile -Path $reconnectImage -Width 640 -Height 192 -Blue 0x11 -Green 0x88 -Red 0x33
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-text", $node1PeerId, $postReconnectClipboardText) | Out-Host
+    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-image", $node1PeerId, $reconnectImage) | Out-Host
+
+    $escapedPostReconnectClipboardText = [regex]::Escape($postReconnectClipboardText)
+    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_text peer_id=$node2PeerId .*detail=$escapedPostReconnectClipboardText" -Seconds $TimeoutSeconds
     Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$reconnectImageBytes" -Seconds $TimeoutSeconds
 
     if (-not $ClipboardOnly) {

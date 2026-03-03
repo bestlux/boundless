@@ -30,6 +30,10 @@ pub(super) struct InboundClipboardImageTransfer {
     pub(super) data: Vec<u8>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "file transfer start needs frame metadata plus mutable session IO state"
+)]
 pub(super) async fn handle_file_start<W>(
     state: &AppState,
     authenticated_peer_id: &str,
@@ -146,6 +150,10 @@ where
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "clipboard image start needs frame metadata plus transfer tracking state"
+)]
 pub(super) async fn handle_clipboard_image_start(
     state: &AppState,
     authenticated_peer_id: &str,

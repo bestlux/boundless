@@ -231,13 +231,15 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
         }
         return pair_nearby_submit_code(
             endpoint,
-            request_id,
-            code,
-            verification_nonce,
-            host,
-            pairing_port,
-            timeout_seconds,
-            alias,
+            NearbySubmitCodeRequest {
+                request_id,
+                code,
+                verification_nonce,
+                host,
+                port: pairing_port,
+                timeout_seconds,
+                alias,
+            },
         )
         .await;
     }
@@ -432,6 +434,16 @@ enum NearbyRequestCodeStart {
     },
 }
 
+struct NearbySubmitCodeRequest {
+    request_id: String,
+    code: String,
+    verification_nonce: String,
+    host: String,
+    port: u16,
+    timeout_seconds: u64,
+    alias: Option<String>,
+}
+
 async fn pair_nearby_request_code(
     endpoint: &str,
     host: String,
@@ -492,31 +504,28 @@ async fn pair_nearby_request_code(
     }
 }
 
-async fn pair_nearby_submit_code(
-    endpoint: &str,
-    request_id: String,
-    code: String,
-    verification_nonce: String,
-    host: String,
-    port: u16,
-    timeout_seconds: u64,
-    alias: Option<String>,
-) -> Result<()> {
-    let target = format_host_port(&host, port);
+async fn pair_nearby_submit_code(endpoint: &str, request: NearbySubmitCodeRequest) -> Result<()> {
+    let target = format_host_port(&request.host, request.port);
     let response = send_nearby_pairing_request(
         &target,
         NearbyJoinWireRequest::NearbySubmitCode {
-            request_id: request_id.clone(),
-            code,
-            verification_nonce,
+            request_id: request.request_id.clone(),
+            code: request.code,
+            verification_nonce: request.verification_nonce,
             requester_alias: None,
         },
     )
     .await?;
-    let responder_bundle =
-        wait_for_nearby_pairing_approval(&target, response, timeout_seconds, &request_id).await?;
+    let responder_bundle = wait_for_nearby_pairing_approval(
+        &target,
+        response,
+        request.timeout_seconds,
+        &request.request_id,
+    )
+    .await?;
     let peer_machine_id =
-        import_nearby_responder_bundle(endpoint, responder_bundle, &host, alias).await?;
+        import_nearby_responder_bundle(endpoint, responder_bundle, &request.host, request.alias)
+            .await?;
     println!("accepted=true peer_machine_id={peer_machine_id} message=nearby pairing complete");
     Ok(())
 }

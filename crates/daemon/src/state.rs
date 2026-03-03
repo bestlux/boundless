@@ -3744,7 +3744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clipboard_image_sync_dedupes_and_suppresses_remote_echo() {
+    async fn clipboard_image_sync_dedupes_current_snapshot_and_blocks_echo() {
         let root = std::env::temp_dir().join(format!(
             "boundless-clipboard-image-test-{}",
             uuid::Uuid::new_v4()
@@ -3792,25 +3792,18 @@ mod tests {
             .enqueue_remote_clipboard_image(&peer_a, image.clone())
             .await
             .expect("enqueue remote image");
-        let remote = state
-            .dequeue_remote_clipboard_payload()
-            .await
-            .expect("remote image item");
-        assert!(matches!(
-            &remote.payload,
-            ClipboardPayload::Image(image_bmp) if image_bmp == &image
-        ));
-        state
-            .mark_remote_clipboard_applied(&remote.peer_id, &remote.payload, &remote.hash)
-            .await;
+        assert!(
+            state.dequeue_remote_clipboard_payload().await.is_none(),
+            "resend of the current authoritative image snapshot should not be requeued"
+        );
 
         let suppressed = state
             .queue_local_clipboard_image_for_connected_peers(image.clone())
             .await
-            .expect("suppress remote image echo");
+            .expect("ignore image echo");
         assert!(
             !suppressed,
-            "clipboard observer should suppress immediate image echo after remote apply"
+            "clipboard observer should still ignore the unchanged image after a remote resend"
         );
 
         let changed = state
