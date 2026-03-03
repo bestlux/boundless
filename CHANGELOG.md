@@ -1,5 +1,56 @@
 # Changelog
 
+## [2.0.0](https://github.com/bestlux/boundless/compare/v1.1.0...v2.0.0) (2026-03-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* pre-reset protocol/config compatibility paths are removed; existing local configs may require clean bootstrap.
+
+### Features
+
+* **diagnostics:** surface pairing nonce/code failure breakdown ([4372ac1](https://github.com/bestlux/boundless/commit/4372ac1b2f6cf6dfd5ceb62681602dfb02865e06))
+* **pairing:** bind nearby code confirmation to nonce ([eac0bb2](https://github.com/bestlux/boundless/commit/eac0bb234ae04e9cd19135f578613ad094d7aaec))
+* **release:** add windows package bundle ([5de9800](https://github.com/bestlux/boundless/commit/5de9800a889f37c7ee190144f6630cfb0c8807a8))
+* **scripts:** add input latency and jitter budget gates to trace profile ([e6b28d8](https://github.com/bestlux/boundless/commit/e6b28d87c8a80c38af46d811b89ccffe0bf14fa4))
+* **scripts:** export input trace latency matrix as csv and json ([c78dd82](https://github.com/bestlux/boundless/commit/c78dd8272f2ef305206a9f6e649a26b1ef386f29))
+* **security:** revoke trust records when removing peers ([9fb5641](https://github.com/bestlux/boundless/commit/9fb564170e945099b24e49d661fa2183bd64bc25))
+* **test:** add success and lockout recovery modes ([7e82a69](https://github.com/bestlux/boundless/commit/7e82a69fc31b3b78d6101ed3b836ece4e0115463))
+* **test:** automate pairing recovery matrix workflow ([e645992](https://github.com/bestlux/boundless/commit/e6459922df26131ac71ba86c26893637c3d0189e))
+* **tray:** add actionable pairing recovery error messaging ([79f3419](https://github.com/bestlux/boundless/commit/79f3419e464a91e43bcaeb2b27f6b3386d9121b0))
+* **tray:** add guided pairing retry loop for recoverable failures ([6b52907](https://github.com/bestlux/boundless/commit/6b529079cf1c20a68c335b9764ad0eeb5c041a55))
+* **tray:** canonicalize layout local tokens and harden apply flow ([cd2916d](https://github.com/bestlux/boundless/commit/cd2916d99412fc5cd55e9e8496f4933d73aa5913))
+* **tray:** introduce dashboard ui for onboarding and control ([ce3c963](https://github.com/bestlux/boundless/commit/ce3c963a359d742107984b033211552c6e993a5f))
+* **tray:** pair discovered peers via direct API and wire flow ([284b4be](https://github.com/bestlux/boundless/commit/284b4be0daf753cd4a8f8ff6d6d01fe088acaeaa))
+
+
+### Bug Fixes
+
+* CI Clippy ([#4](https://github.com/bestlux/boundless/issues/4)) ([aff8e5c](https://github.com/bestlux/boundless/commit/aff8e5c92347b4e44965d7a7ae04a7f663d76902))
+* **cli:** bound nearby pairing wire calls with timeouts ([49d6539](https://github.com/bestlux/boundless/commit/49d6539534da42a3da39f19e1a6ec280a2d48925))
+* **daemon:** chunk oversized clipboard image transport ([9ae84b5](https://github.com/bestlux/boundless/commit/9ae84b5f60883191a062a326de71be3264973d4f))
+* **daemon:** clear capture target during all-peer reconnect reset ([7e7768f](https://github.com/bestlux/boundless/commit/7e7768f9b8bd77ba919df03253d9f613c634bc43))
+* **daemon:** close clipboard reconnect replay gaps ([58b72f5](https://github.com/bestlux/boundless/commit/58b72f5f45b245b856aacb31810d690102ea53c1))
+* **daemon:** enforce clipboard conflict semantics ([f95ebf1](https://github.com/bestlux/boundless/commit/f95ebf1e96ae7ed3e6d6a76252ea0e19630ff9bb))
+* **daemon:** replay latest clipboard snapshot on reconnect ([d9456c7](https://github.com/bestlux/boundless/commit/d9456c7007a228473dc3c1a7e5d47987a837ad41))
+* **daemon:** tighten clipboard replay supersession ([b8df638](https://github.com/bestlux/boundless/commit/b8df6387dbe35e86908d4364526edafc362bcfb0))
+* make tray test modules rustfmt-safe ([21f1707](https://github.com/bestlux/boundless/commit/21f17070aa3ac410d1a7f0a0d5f425624ea4f10d))
+* **pairing:** expose nearby verification code to loopback tcp clients ([b86239e](https://github.com/bestlux/boundless/commit/b86239e21bc5f5a67888ba4aba45a020a9595263))
+* retry reconnect image smoke assertion ([0e986fb](https://github.com/bestlux/boundless/commit/0e986fbb0659c6926f4cea98d941011f15d38319))
+* **scripts:** make trace budgets clock-skew safe ([e9b80ef](https://github.com/bestlux/boundless/commit/e9b80ef8bc7d852ea7912849fb77189ed10b952f))
+* stabilize verify checks ([e59a3f5](https://github.com/bestlux/boundless/commit/e59a3f5d14d46e796d3e3a971e10decbded2f771))
+* **test:** make recovery automation resilient to hidden-code flows ([9bc27f1](https://github.com/bestlux/boundless/commit/9bc27f1266c2af22e8b9ea6bbeccb7515ebbf4c4))
+* **test:** robustly parse capture output paths ([ec8a3aa](https://github.com/bestlux/boundless/commit/ec8a3aaaa98dc44666e3bcc2eb2b76dd1791ee03))
+* **tray:** bound nearby pairing wire calls with timeouts ([d1509b5](https://github.com/bestlux/boundless/commit/d1509b509396357449b3cc5f158d180db25d7ef1))
+* **tray:** harden pairing onboarding state flow ([323a43c](https://github.com/bestlux/boundless/commit/323a43cfbdb3d61756b9672532516105f14c1f1f))
+* **tray:** make code-submit flow immediate and retry-safe ([1fcf963](https://github.com/bestlux/boundless/commit/1fcf9630930a3b28f140918c1242a9ea6744a02c))
+* **tray:** use canonical nearby pairing wire op tag ([72e87fb](https://github.com/bestlux/boundless/commit/72e87fbc77fe026db782d5b196fb7b3f277b4c31))
+
+
+### Code Refactoring
+
+* enforce canonical v1 contract and remove legacy compatibility ([cb5dbe9](https://github.com/bestlux/boundless/commit/cb5dbe92aedc283d6c1a87485e50875f273dd638))
+
 ## [1.1.0](https://github.com/bestlux/boundless/compare/v1.0.0...v1.1.0) (2026-02-21)
 
 
