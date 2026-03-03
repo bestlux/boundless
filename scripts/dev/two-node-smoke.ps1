@@ -226,6 +226,35 @@ function Wait-ForTransportEventCount {
     throw "Timed out waiting for transport event count >= $ExpectedMinCount for '$Pattern' at $Endpoint"
 }
 
+function Send-ClipboardImageUntilObserved {
+    param(
+        [string]$SendEndpoint,
+        [string]$PeerId,
+        [string]$ImagePath,
+        [string]$ObserveEndpoint,
+        [string]$ObservePattern,
+        [int]$Attempts = 2,
+        [int]$ObserveSeconds = 20
+    )
+
+    $baselineCount = Get-TransportEventMatchCount -Endpoint $ObserveEndpoint -Pattern $ObservePattern
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        Invoke-CliChecked -Endpoint $SendEndpoint -CommandArgs @("transport", "send-image", $PeerId, $ImagePath) | Out-Host
+
+        try {
+            Wait-ForTransportEventCount -Endpoint $ObserveEndpoint -Pattern $ObservePattern -ExpectedMinCount ($baselineCount + 1) -Seconds $ObserveSeconds
+            return
+        }
+        catch {
+            if ($attempt -eq $Attempts) {
+                throw
+            }
+            Write-Warning "[smoke] reconnect clipboard image was not observed after attempt $attempt; retrying"
+            Start-Sleep -Seconds 2
+        }
+    }
+}
+
 function Wait-ForInputOwner {
     param(
         [string]$Endpoint,
@@ -667,11 +696,11 @@ try {
     $reconnectImage = Join-Path $runRoot "reconnect-clipboard.bmp"
     $reconnectImageBytes = New-BmpFile -Path $reconnectImage -Width 640 -Height 192 -Blue 0x11 -Green 0x88 -Red 0x33
     Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-text", $node1PeerId, $postReconnectClipboardText) | Out-Host
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-image", $node1PeerId, $reconnectImage) | Out-Host
 
     $escapedPostReconnectClipboardText = [regex]::Escape($postReconnectClipboardText)
     Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_text peer_id=$node2PeerId .*detail=$escapedPostReconnectClipboardText" -Seconds $TimeoutSeconds
-    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$reconnectImageBytes" -Seconds $TimeoutSeconds
+    $reconnectImagePattern = "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$reconnectImageBytes"
+    Send-ClipboardImageUntilObserved -SendEndpoint $node1Endpoint -PeerId $node1PeerId -ImagePath $reconnectImage -ObserveEndpoint $node2Endpoint -ObservePattern $reconnectImagePattern -ObserveSeconds ([Math]::Min($TimeoutSeconds, 20))
 
     if (-not $ClipboardOnly) {
         Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
