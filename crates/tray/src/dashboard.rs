@@ -167,6 +167,18 @@ fn guided_flow_from_manual_input(host: &str, port_text: &str) -> Result<GuidedPa
     })
 }
 
+fn should_offer_first_run_onboarding(snapshot: &UiSnapshot) -> bool {
+    snapshot.daemon_online
+        && !snapshot.machine_id.trim().is_empty()
+        && snapshot.paired_peers.is_empty()
+        && snapshot.pending_requests.is_empty()
+        && snapshot.layout_matrix.trim() == CANONICAL_LOCAL_LAYOUT_TOKEN
+}
+
+fn should_hide_on_close(exit_requested: bool, tray_available: bool) -> bool {
+    tray_available && !exit_requested
+}
+
 struct DashboardApp {
     ctx: Arc<AppContext>,
     _tray_icon: Option<TrayIcon>,
@@ -192,6 +204,9 @@ struct DashboardApp {
     pairing_retry_available: bool,
     pairing_attempt_seq: u64,
     active_pairing_attempt_id: Option<u64>,
+    pending_onboarding_focus: bool,
+    onboarding_focus_shown: bool,
+    exit_requested: bool,
 
     // Layout manager state
     layout_grid: HashMap<(i32, i32), String>,
@@ -224,13 +239,41 @@ impl DashboardApp {
                         if bg_ctx.start_daemon && Instant::now() >= next_start_attempt {
                             match ensure_daemon_available_blocking(&bg_ctx) {
                                 Ok(Some(path)) => {
-                                    message = format!("{message}\nstarted daemon via `{path}`");
                                     next_start_attempt = Instant::now() + Duration::from_secs(8);
                                     start_backoff = Duration::from_secs(2);
+                                    match fetch_ui_snapshot_blocking(&bg_ctx.endpoint) {
+                                        Ok(snapshot) => {
+                                            let _ = bg_tx.send(AppMsg::SnapshotUpdated(snapshot));
+                                            let _ = bg_tx.send(AppMsg::ActionComplete(format!(
+                                                "Started daemon via `{path}`"
+                                            )));
+                                            egui_ctx.request_repaint();
+                                            std::thread::sleep(Duration::from_secs(4));
+                                            continue;
+                                        }
+                                        Err(refetch_error) => {
+                                            message = format!(
+                                                "{message}\nstarted daemon via `{path}`\nfollow-up refresh failed: {refetch_error}"
+                                            );
+                                        }
+                                    }
                                 }
                                 Ok(None) => {
                                     next_start_attempt = Instant::now() + Duration::from_secs(8);
                                     start_backoff = Duration::from_secs(2);
+                                    match fetch_ui_snapshot_blocking(&bg_ctx.endpoint) {
+                                        Ok(snapshot) => {
+                                            let _ = bg_tx.send(AppMsg::SnapshotUpdated(snapshot));
+                                            egui_ctx.request_repaint();
+                                            std::thread::sleep(Duration::from_secs(4));
+                                            continue;
+                                        }
+                                        Err(refetch_error) => {
+                                            message = format!(
+                                                "{message}\nfollow-up refresh failed: {refetch_error}"
+                                            );
+                                        }
+                                    }
                                 }
                                 Err(start_error) => {
                                     message =
@@ -281,6 +324,9 @@ impl DashboardApp {
             pairing_retry_available: false,
             pairing_attempt_seq: 0,
             active_pairing_attempt_id: None,
+            pending_onboarding_focus: false,
+            onboarding_focus_shown: false,
+            exit_requested: false,
             layout_grid: HashMap::new(),
             layout_unassigned: Vec::new(),
             layout_initialized: false,
@@ -315,6 +361,11 @@ impl DashboardApp {
         match msg {
             AppMsg::SnapshotUpdated(snap) => {
                 self.snapshot = snap;
+                self.last_error = None;
+                self.last_message_is_error = false;
+                if should_offer_first_run_onboarding(&self.snapshot) && !self.onboarding_focus_shown {
+                    self.pending_onboarding_focus = true;
+                }
             }
             AppMsg::SnapshotError(err) => {
                 self.last_error = Some(err);
@@ -515,13 +566,30 @@ impl eframe::App for DashboardApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             } else if event.id.as_ref() == ACTION_QUIT {
+                self.exit_requested = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+
+        if ctx.input(|input| input.viewport().close_requested()) {
+            if should_hide_on_close(self.exit_requested, self._tray_icon.is_some()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                self.exit_requested = true;
             }
         }
 
         // Poll messages from background threads
         while let Ok(msg) = self.rx.try_recv() {
             self.apply_app_msg(msg);
+        }
+
+        if self.pending_onboarding_focus {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.pending_onboarding_focus = false;
+            self.onboarding_focus_shown = true;
         }
 
         self.render_pairing_dialog(ctx);
@@ -556,6 +624,20 @@ impl eframe::App for DashboardApp {
             match self.selected_tab {
                 Tab::Status => {
                     egui::ScrollArea::vertical().show(ui, |ui| {
+                        if should_offer_first_run_onboarding(&self.snapshot) {
+                            ui.group(|ui| {
+                                ui.heading("Get Started");
+                                ui.label("Boundless is ready for first-run setup on this machine.");
+                                if self.snapshot.discovered_peers.is_empty() {
+                                    ui.label("Waiting for a peer on the local network. If discovery stays empty, use Manual Setup with the other machine's host/IP.");
+                                } else {
+                                    ui.label("Choose a discovered peer below to begin guided pairing.");
+                                }
+                                ui.label("Next steps: pair with the other machine, approve the verification code there, then arrange the layout in Layout Manager.");
+                            });
+                            ui.add_space(16.0);
+                        }
+
                         ui.heading("Discovered Peers");
                         if self.snapshot.discovered_peers.is_empty() {
                             ui.label(egui::RichText::new("No peers discovered on local network.").italics());

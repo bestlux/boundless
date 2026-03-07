@@ -1,5 +1,6 @@
 use super::dashboard_test_support::{
-    sample_guided_flow, sample_pairing_challenge, sample_pairing_result, test_app,
+    sample_first_run_snapshot, sample_guided_flow, sample_paired_snapshot,
+    sample_pairing_challenge, sample_pairing_result, test_app,
 };
 use super::*;
 
@@ -315,4 +316,61 @@ fn stale_messages_from_a_canceled_attempt_are_ignored_after_restart() {
         "the restarted attempt should still accept its own challenge"
     );
     assert_challenge_matches(&app, &fresh_challenge);
+}
+
+#[test]
+fn first_run_snapshot_triggers_onboarding_focus_once() {
+    let mut app = test_app();
+
+    app.apply_app_msg(AppMsg::SnapshotUpdated(sample_first_run_snapshot()));
+
+    assert!(
+        app.pending_onboarding_focus,
+        "fresh unpaired snapshot should request onboarding focus"
+    );
+    assert!(
+        should_offer_first_run_onboarding(&app.snapshot),
+        "fresh unpaired snapshot should count as first-run onboarding"
+    );
+
+    app.pending_onboarding_focus = false;
+    app.onboarding_focus_shown = true;
+    app.apply_app_msg(AppMsg::SnapshotUpdated(sample_first_run_snapshot()));
+
+    assert!(
+        !app.pending_onboarding_focus,
+        "onboarding focus should not retrigger after it has already been shown"
+    );
+}
+
+#[test]
+fn paired_snapshot_does_not_trigger_onboarding_focus() {
+    let mut app = test_app();
+
+    app.apply_app_msg(AppMsg::SnapshotUpdated(sample_paired_snapshot()));
+
+    assert!(
+        !app.pending_onboarding_focus,
+        "paired machines should not be treated as first-run onboarding"
+    );
+    assert!(
+        !should_offer_first_run_onboarding(&app.snapshot),
+        "paired machines should not show first-run onboarding"
+    );
+}
+
+#[test]
+fn close_request_hides_to_tray_only_when_tray_exists_and_exit_was_not_requested() {
+    assert!(
+        should_hide_on_close(false, true),
+        "close button should hide the window when tray integration is available"
+    );
+    assert!(
+        !should_hide_on_close(true, true),
+        "explicit quit should allow the app to exit"
+    );
+    assert!(
+        !should_hide_on_close(false, false),
+        "without a tray icon, close should not hide the only window"
+    );
 }

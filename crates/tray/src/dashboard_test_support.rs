@@ -27,6 +27,9 @@ pub(super) fn test_app() -> DashboardApp {
         pairing_retry_available: false,
         pairing_attempt_seq: 0,
         active_pairing_attempt_id: None,
+        pending_onboarding_focus: false,
+        onboarding_focus_shown: false,
+        exit_requested: false,
         layout_grid: HashMap::new(),
         layout_unassigned: Vec::new(),
         layout_initialized: false,
@@ -65,5 +68,29 @@ pub(super) fn sample_pairing_result() -> GuidedPairingResult {
     GuidedPairingResult {
         peer_machine_id: "peer-machine-1234".to_string(),
         orientation_selector: "Office Desktop".to_string(),
+    }
+}
+
+pub(super) fn sample_first_run_snapshot() -> UiSnapshot {
+    UiSnapshot {
+        generated_at: "2026-03-03T18:00:00Z".to_string(),
+        daemon_online: true,
+        machine_id: "local-machine-1234".to_string(),
+        layout_matrix: "self".to_string(),
+        discovered_peers: Vec::new(),
+        paired_peers: Vec::new(),
+        pending_requests: Vec::new(),
+    }
+}
+
+pub(super) fn sample_paired_snapshot() -> UiSnapshot {
+    UiSnapshot {
+        paired_peers: vec![UiPairedPeer {
+            peer_id: "peer-1234".to_string(),
+            display_name: "Office Desktop".to_string(),
+            address: "10.0.0.25:15100".to_string(),
+            connected: false,
+        }],
+        ..sample_first_run_snapshot()
     }
 }

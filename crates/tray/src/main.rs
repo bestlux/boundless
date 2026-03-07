@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 #[cfg(not(windows))]
 fn main() {
     eprintln!("boundlesstray is currently supported on Windows only");
