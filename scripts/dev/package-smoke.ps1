@@ -96,18 +96,24 @@ try {
 
     $installRoot = Join-Path $OutputRoot "install-root"
     $startupRoot = Join-Path $OutputRoot "startup"
+    $startMenuRoot = Join-Path $OutputRoot "start-menu"
+    $desktopRoot = Join-Path $OutputRoot "desktop"
     $stateRoot = Join-Path $OutputRoot "state"
     $configPath = Join-Path $stateRoot "config.json"
     $dataRoot = Join-Path $stateRoot "Boundless"
     $securityRoot = Join-Path $dataRoot "security"
     $uninstallKey = "Registry::HKEY_CURRENT_USER\Software\Boundless\PackageSmoke"
     Ensure-Directory -Path $startupRoot
+    Ensure-Directory -Path $startMenuRoot
+    Ensure-Directory -Path $desktopRoot
     Ensure-Directory -Path $dataRoot
     Ensure-Directory -Path $securityRoot
 
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $packageRoot.FullName "Boundless-Install.ps1") `
         -InstallRoot $installRoot `
         -StartupFolderPath $startupRoot `
+        -StartMenuProgramsPath $startMenuRoot `
+        -DesktopFolderPath $desktopRoot `
         -UninstallRegistryKeyPath $uninstallKey `
         -NoLaunch
     if ($LASTEXITCODE -ne 0) {
@@ -118,11 +124,23 @@ try {
     Assert-PathExists -Path (Join-Path $installRoot "boundlessctl.exe") -Message "Installed CLI binary is missing."
     Assert-PathExists -Path (Join-Path $installRoot "boundlesstray.exe") -Message "Installed tray binary is missing."
     $shortcutPath = Join-Path $startupRoot "Boundless.lnk"
+    $startMenuShortcutPath = Join-Path $startMenuRoot "Boundless.lnk"
+    $desktopShortcutPath = Join-Path $desktopRoot "Boundless.lnk"
     Assert-PathExists -Path $shortcutPath -Message "Startup shortcut is missing."
+    Assert-PathExists -Path $startMenuShortcutPath -Message "Start menu shortcut is missing."
+    Assert-PathExists -Path $desktopShortcutPath -Message "Desktop shortcut is missing."
 
     $shortcutTarget = Get-ShortcutTarget -ShortcutPath $shortcutPath
     if ($shortcutTarget -ne (Join-Path $installRoot "boundlesstray.exe")) {
         throw "Startup shortcut target was unexpected: $shortcutTarget"
+    }
+    $startMenuShortcutTarget = Get-ShortcutTarget -ShortcutPath $startMenuShortcutPath
+    if ($startMenuShortcutTarget -ne (Join-Path $installRoot "boundlesstray.exe")) {
+        throw "Start menu shortcut target was unexpected: $startMenuShortcutTarget"
+    }
+    $desktopShortcutTarget = Get-ShortcutTarget -ShortcutPath $desktopShortcutPath
+    if ($desktopShortcutTarget -ne (Join-Path $installRoot "boundlesstray.exe")) {
+        throw "Desktop shortcut target was unexpected: $desktopShortcutTarget"
     }
 
     $uninstallItem = Get-ItemProperty -Path $uninstallKey
@@ -204,6 +222,8 @@ try {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $packageRoot.FullName "Boundless-Install.ps1") `
         -InstallRoot $installRoot `
         -StartupFolderPath $startupRoot `
+        -StartMenuProgramsPath $startMenuRoot `
+        -DesktopFolderPath $desktopRoot `
         -UninstallRegistryKeyPath $uninstallKey `
         -NoLaunch
     if ($LASTEXITCODE -ne 0) {
@@ -213,6 +233,8 @@ try {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $installRoot "Boundless-Uninstall.ps1") `
         -InstallRoot $installRoot `
         -StartupFolderPath $startupRoot `
+        -StartMenuProgramsPath $startMenuRoot `
+        -DesktopFolderPath $desktopRoot `
         -UninstallRegistryKeyPath $uninstallKey `
         -RemoveState `
         -ConfigPath $configPath `
@@ -226,6 +248,12 @@ try {
     if (Test-Path -LiteralPath $shortcutPath) {
         throw "Uninstall did not remove startup shortcut."
     }
+    if (Test-Path -LiteralPath $startMenuShortcutPath) {
+        throw "Uninstall did not remove start menu shortcut."
+    }
+    if (Test-Path -LiteralPath $desktopShortcutPath) {
+        throw "Uninstall did not remove desktop shortcut."
+    }
     if (Test-Path -LiteralPath $uninstallKey) {
         throw "Uninstall did not remove uninstall registry key."
     }
@@ -235,6 +263,8 @@ try {
         package_root = $packageRoot.FullName
         install_root = $installRoot
         startup_root = $startupRoot
+        start_menu_root = $startMenuRoot
+        desktop_root = $desktopRoot
         uninstall_key = $uninstallKey
         status = "passed"
     }

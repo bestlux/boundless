@@ -3,6 +3,8 @@ param(
     [string]$PackageRoot = "",
     [string]$InstallRoot = "",
     [string]$StartupFolderPath = "",
+    [string]$StartMenuProgramsPath = "",
+    [string]$DesktopFolderPath = "",
     [string]$UninstallRegistryKeyPath = "",
     [switch]$NoLaunch
 )
@@ -20,6 +22,14 @@ function Get-DefaultInstallRoot {
 
 function Get-DefaultStartupFolderPath {
     return [Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)
+}
+
+function Get-DefaultStartMenuProgramsPath {
+    return [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)
+}
+
+function Get-DefaultDesktopFolderPath {
+    return [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
 }
 
 function Get-DefaultUninstallRegistryKeyPath {
@@ -46,11 +56,12 @@ function Ensure-Directory {
     New-Item -ItemType Directory -Force -Path $Path | Out-Null
 }
 
-function New-StartupShortcut {
+function New-Shortcut {
     param(
         [string]$ShortcutPath,
         [string]$TargetPath,
-        [string]$WorkingDirectory
+        [string]$WorkingDirectory,
+        [string]$Description
     )
 
     $shell = New-Object -ComObject WScript.Shell
@@ -58,7 +69,7 @@ function New-StartupShortcut {
     $shortcut.TargetPath = $TargetPath
     $shortcut.WorkingDirectory = $WorkingDirectory
     $shortcut.IconLocation = $TargetPath
-    $shortcut.Description = "Launch Boundless tray at sign-in"
+    $shortcut.Description = $Description
     $shortcut.Save()
 }
 
@@ -70,6 +81,12 @@ if ([string]::IsNullOrWhiteSpace($PackageRoot)) {
 }
 if ([string]::IsNullOrWhiteSpace($StartupFolderPath)) {
     $StartupFolderPath = Get-DefaultStartupFolderPath
+}
+if ([string]::IsNullOrWhiteSpace($StartMenuProgramsPath)) {
+    $StartMenuProgramsPath = Get-DefaultStartMenuProgramsPath
+}
+if ([string]::IsNullOrWhiteSpace($DesktopFolderPath)) {
+    $DesktopFolderPath = Get-DefaultDesktopFolderPath
 }
 if ([string]::IsNullOrWhiteSpace($UninstallRegistryKeyPath)) {
     $UninstallRegistryKeyPath = Get-DefaultUninstallRegistryKeyPath
@@ -100,8 +117,28 @@ foreach ($file in $payloadFiles) {
 
 Ensure-Directory -Path $StartupFolderPath
 $trayPath = Join-Path $InstallRoot "boundlesstray.exe"
-$shortcutPath = Join-Path $StartupFolderPath "Boundless.lnk"
-New-StartupShortcut -ShortcutPath $shortcutPath -TargetPath $trayPath -WorkingDirectory $InstallRoot
+$startupShortcutPath = Join-Path $StartupFolderPath "Boundless.lnk"
+New-Shortcut `
+    -ShortcutPath $startupShortcutPath `
+    -TargetPath $trayPath `
+    -WorkingDirectory $InstallRoot `
+    -Description "Launch Boundless tray at sign-in"
+
+Ensure-Directory -Path $StartMenuProgramsPath
+$startMenuShortcutPath = Join-Path $StartMenuProgramsPath "Boundless.lnk"
+New-Shortcut `
+    -ShortcutPath $startMenuShortcutPath `
+    -TargetPath $trayPath `
+    -WorkingDirectory $InstallRoot `
+    -Description "Launch Boundless"
+
+Ensure-Directory -Path $DesktopFolderPath
+$desktopShortcutPath = Join-Path $DesktopFolderPath "Boundless.lnk"
+New-Shortcut `
+    -ShortcutPath $desktopShortcutPath `
+    -TargetPath $trayPath `
+    -WorkingDirectory $InstallRoot `
+    -Description "Launch Boundless"
 
 $uninstallCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $InstallRoot "Boundless-Uninstall.ps1")
 New-Item -Path $UninstallRegistryKeyPath -Force | Out-Null
@@ -120,5 +157,7 @@ if (-not $NoLaunch) {
 }
 
 Write-Host "install_root=$InstallRoot"
-Write-Host "startup_shortcut=$shortcutPath"
+Write-Host "startup_shortcut=$startupShortcutPath"
+Write-Host "start_menu_shortcut=$startMenuShortcutPath"
+Write-Host "desktop_shortcut=$desktopShortcutPath"
 Write-Host "uninstall_key=$UninstallRegistryKeyPath"

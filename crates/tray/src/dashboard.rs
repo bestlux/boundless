@@ -32,6 +32,8 @@ pub(super) fn run() -> Result<()> {
 enum AppMsg {
     SnapshotUpdated(UiSnapshot),
     SnapshotError(String),
+    ShowDashboard,
+    QuitRequested,
     PairingChallenge {
         attempt_id: u64,
         challenge: PairingChallengeState,
@@ -293,6 +295,24 @@ impl DashboardApp {
             }
         });
 
+        let menu_tx = tx.clone();
+        let menu_ctx = cc.egui_ctx.clone();
+        tray_icon::menu::MenuEvent::set_event_handler(Some(
+            move |event: tray_icon::menu::MenuEvent| {
+            let msg = if event.id.as_ref() == ACTION_DASHBOARD {
+                Some(AppMsg::ShowDashboard)
+            } else if event.id.as_ref() == ACTION_QUIT {
+                Some(AppMsg::QuitRequested)
+            } else {
+                None
+            };
+
+            if let Some(msg) = msg {
+                let _ = menu_tx.send(msg);
+                menu_ctx.request_repaint();
+            }
+        }));
+
         let (tray_icon, tray_init_error) = match build_dashboard_tray_icon() {
             Ok(tray) => (Some(tray), None),
             Err(error) => (
@@ -370,6 +390,12 @@ impl DashboardApp {
             AppMsg::SnapshotError(err) => {
                 self.last_error = Some(err);
                 self.last_message_is_error = true;
+            }
+            AppMsg::ShowDashboard => {
+                self.pending_onboarding_focus = true;
+            }
+            AppMsg::QuitRequested => {
+                self.exit_requested = true;
             }
             AppMsg::PairingChallenge {
                 attempt_id,
@@ -560,17 +586,6 @@ impl DashboardApp {
 
 impl eframe::App for DashboardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Poll Tray events
-        if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-            if event.id.as_ref() == ACTION_DASHBOARD {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            } else if event.id.as_ref() == ACTION_QUIT {
-                self.exit_requested = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        }
-
         if ctx.input(|input| input.viewport().close_requested()) {
             if should_hide_on_close(self.exit_requested, self._tray_icon.is_some()) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -590,6 +605,10 @@ impl eframe::App for DashboardApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.pending_onboarding_focus = false;
             self.onboarding_focus_shown = true;
+        }
+
+        if self.exit_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
         self.render_pairing_dialog(ctx);

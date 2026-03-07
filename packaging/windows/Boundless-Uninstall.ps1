@@ -2,6 +2,8 @@
 param(
     [string]$InstallRoot = "",
     [string]$StartupFolderPath = "",
+    [string]$StartMenuProgramsPath = "",
+    [string]$DesktopFolderPath = "",
     [string]$UninstallRegistryKeyPath = "",
     [switch]$RemoveState,
     [string]$ConfigPath = "",
@@ -18,6 +20,14 @@ function Get-LocalAppDataPath {
 
 function Get-DefaultStartupFolderPath {
     return [Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)
+}
+
+function Get-DefaultStartMenuProgramsPath {
+    return [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)
+}
+
+function Get-DefaultDesktopFolderPath {
+    return [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
 }
 
 function Get-DefaultUninstallRegistryKeyPath {
@@ -63,6 +73,12 @@ function Schedule-InstallRootRemoval {
 if ([string]::IsNullOrWhiteSpace($StartupFolderPath)) {
     $StartupFolderPath = Get-DefaultStartupFolderPath
 }
+if ([string]::IsNullOrWhiteSpace($StartMenuProgramsPath)) {
+    $StartMenuProgramsPath = Get-DefaultStartMenuProgramsPath
+}
+if ([string]::IsNullOrWhiteSpace($DesktopFolderPath)) {
+    $DesktopFolderPath = Get-DefaultDesktopFolderPath
+}
 if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
     $InstallRoot = $PSScriptRoot
 }
@@ -81,9 +97,16 @@ if ([string]::IsNullOrWhiteSpace($SecurityRoot)) {
 
 Get-Process -Name "boundlesstray", "boundlessd" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
-$shortcutPath = Join-Path $StartupFolderPath "Boundless.lnk"
-if (Test-Path -LiteralPath $shortcutPath) {
-    Remove-Item -LiteralPath $shortcutPath -Force
+$shortcutPaths = @(
+    (Join-Path $StartupFolderPath "Boundless.lnk"),
+    (Join-Path $StartMenuProgramsPath "Boundless.lnk"),
+    (Join-Path $DesktopFolderPath "Boundless.lnk")
+)
+
+foreach ($shortcutPath in $shortcutPaths) {
+    if (Test-Path -LiteralPath $shortcutPath) {
+        Remove-Item -LiteralPath $shortcutPath -Force
+    }
 }
 
 if (Test-Path -LiteralPath $UninstallRegistryKeyPath) {
@@ -102,6 +125,6 @@ $InstallRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFrom
 Set-Location -LiteralPath ([System.IO.Path]::GetTempPath())
 Schedule-InstallRootRemoval -TargetPath $InstallRoot
 
-Write-Host "startup_shortcut_removed=$shortcutPath"
+Write-Host "shortcuts_removed=$($shortcutPaths -join ';')"
 Write-Host "uninstall_key_removed=$UninstallRegistryKeyPath"
 Write-Host "install_root_removal_scheduled=$InstallRoot"

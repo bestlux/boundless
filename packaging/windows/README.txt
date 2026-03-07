@@ -19,6 +19,8 @@ Install behavior
 ----------------
 - Default install root: %LocalAppData%\Programs\Boundless
 - Default startup integration: user Startup-folder shortcut for boundlesstray.exe
+- Default Start Menu entry: user Start Menu Programs shortcut for Boundless
+- Default desktop entry: user Desktop shortcut for Boundless
 - Default uninstall entry: HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Boundless
 
 State roots
