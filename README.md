@@ -101,13 +101,13 @@ The `console` command shows daemon health, mDNS discovery status, discovered end
 
 Inside console, use `pair request <index|machine_id>` to start guided nearby pairing for a discovered peer without manually typing host/port (pairing port is derived automatically from discovered transport endpoint).
 
-First-run setup wizard (recommended for new installs):
+CLI setup wizard (automation/debug fallback):
 
 ```bash
 cargo run -p boundless-cli -- setup
 ```
 
-The setup wizard auto-checks daemon reachability, guides pairing (discovered peer or manual host fallback), and can apply initial left/right/up/down orientation for the newly paired peer.
+The setup wizard auto-checks daemon reachability, guides pairing (discovered peer or manual host fallback), and can apply initial left/right/up/down orientation for the newly paired peer. The tray dashboard is the canonical first-run UX on Windows.
 
 Windows tray dashboard UI (Windows):
 
@@ -117,7 +117,9 @@ cargo run -p boundless-tray
 
 `boundlesstray` provides:
 - tray icon + dashboard window (`Dashboard` / `Quit` menu)
+- close-to-tray behavior on window `X`; use tray `Quit` for full exit
 - `Status & Pairing` tab for discovered peers, manual connect, paired peers, and pending requests
+- first-run `Get Started` guidance for fresh installs
 - guided challenge-confirm pairing dialog (request code, submit code, retry affordances)
 - `Layout Manager` tab for orientation (`left/right/up/down`) and apply action
 - `Settings` tab for machine/runtime diagnostics and reconnect action
@@ -138,21 +140,60 @@ You can inspect daemon config path with:
 cargo run -p boundless-daemon -- print-config-path
 ```
 
-Windows package flow:
+Windows package smoke/validation:
 
 ```powershell
 ./scripts/dev/package-smoke.ps1 -KeepArtifacts
 ```
 
-The Windows release artifact now packages:
+Build a local Windows package zip:
+
+```powershell
+cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\release\package-windows.ps1 `
+  -Version 1.0.0-local `
+  -DaemonPath .\target\release\boundlessd.exe `
+  -CliPath .\target\release\boundlessctl.exe `
+  -TrayPath .\target\release\boundlesstray.exe `
+  -OutputPath .\artifacts\package-validation\boundless-1.0.0-local-windows-x64.zip
+```
+
+Install locally from the packaged zip:
+
+```powershell
+Expand-Archive `
+  -LiteralPath .\artifacts\package-validation\boundless-1.0.0-local-windows-x64.zip `
+  -DestinationPath .\artifacts\package-validation\local-install `
+  -Force
+
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  .\artifacts\package-validation\local-install\boundless-1.0.0-local-windows-x64\Boundless-Install.ps1
+```
+
+The Windows release artifact packages:
 - `boundlesstray.exe`
 - `boundlessd.exe`
 - `boundlessctl.exe`
+- `Boundless.ico`
 - `Boundless-Install.ps1`
 - `Boundless-Uninstall.ps1`
 - `Boundless-Reset.ps1`
 
-The default per-user install root is `%LocalAppData%\Programs\Boundless`, and the installer creates a Startup-folder shortcut for the tray.
+Install behavior:
+- default per-user install root: `%LocalAppData%\Programs\Boundless`
+- Startup shortcut: `%AppData%\Microsoft\Windows\Start Menu\Programs\Startup\Boundless.lnk`
+- Start Menu shortcut: `%AppData%\Microsoft\Windows\Start Menu\Programs\Boundless.lnk`
+- Desktop shortcut: `%UserProfile%\Desktop\Boundless.lnk`
+- installed shortcuts and uninstall metadata use the packaged Boundless icon asset
+- tray launch is the primary entrypoint and auto-starts `boundlessd` when needed
+
+Recovery helpers:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Boundless\Boundless-Reset.ps1" -NetworkOnly
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Boundless\Boundless-Reset.ps1" -All
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Boundless\Boundless-Uninstall.ps1" -RemoveState
+```
 
 Nearby pairing (approval-based, no trust-bundle file copy):
 

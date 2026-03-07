@@ -61,14 +61,19 @@ function New-Shortcut {
         [string]$ShortcutPath,
         [string]$TargetPath,
         [string]$WorkingDirectory,
-        [string]$Description
+        [string]$Description,
+        [string]$IconLocation
     )
 
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($ShortcutPath)
     $shortcut.TargetPath = $TargetPath
     $shortcut.WorkingDirectory = $WorkingDirectory
-    $shortcut.IconLocation = $TargetPath
+    if (-not [string]::IsNullOrWhiteSpace($IconLocation)) {
+        $shortcut.IconLocation = $IconLocation
+    } else {
+        $shortcut.IconLocation = $TargetPath
+    }
     $shortcut.Description = $Description
     $shortcut.Save()
 }
@@ -100,6 +105,7 @@ $payloadFiles = @(
     "boundlessd.exe"
     "boundlessctl.exe"
     "boundlesstray.exe"
+    "Boundless.ico"
     "Boundless-Install.ps1"
     "Boundless-Uninstall.ps1"
     "Boundless-Reset.ps1"
@@ -117,12 +123,14 @@ foreach ($file in $payloadFiles) {
 
 Ensure-Directory -Path $StartupFolderPath
 $trayPath = Join-Path $InstallRoot "boundlesstray.exe"
+$iconPath = Join-Path $InstallRoot "Boundless.ico"
 $startupShortcutPath = Join-Path $StartupFolderPath "Boundless.lnk"
 New-Shortcut `
     -ShortcutPath $startupShortcutPath `
     -TargetPath $trayPath `
     -WorkingDirectory $InstallRoot `
-    -Description "Launch Boundless tray at sign-in"
+    -Description "Launch Boundless tray at sign-in" `
+    -IconLocation $iconPath
 
 Ensure-Directory -Path $StartMenuProgramsPath
 $startMenuShortcutPath = Join-Path $StartMenuProgramsPath "Boundless.lnk"
@@ -130,7 +138,8 @@ New-Shortcut `
     -ShortcutPath $startMenuShortcutPath `
     -TargetPath $trayPath `
     -WorkingDirectory $InstallRoot `
-    -Description "Launch Boundless"
+    -Description "Launch Boundless" `
+    -IconLocation $iconPath
 
 Ensure-Directory -Path $DesktopFolderPath
 $desktopShortcutPath = Join-Path $DesktopFolderPath "Boundless.lnk"
@@ -138,7 +147,8 @@ New-Shortcut `
     -ShortcutPath $desktopShortcutPath `
     -TargetPath $trayPath `
     -WorkingDirectory $InstallRoot `
-    -Description "Launch Boundless"
+    -Description "Launch Boundless" `
+    -IconLocation $iconPath
 
 $uninstallCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $InstallRoot "Boundless-Uninstall.ps1")
 New-Item -Path $UninstallRegistryKeyPath -Force | Out-Null
@@ -146,7 +156,7 @@ Set-ItemProperty -Path $UninstallRegistryKeyPath -Name DisplayName -Value "Bound
 Set-ItemProperty -Path $UninstallRegistryKeyPath -Name DisplayVersion -Value $manifest.version
 Set-ItemProperty -Path $UninstallRegistryKeyPath -Name Publisher -Value $manifest.publisher
 Set-ItemProperty -Path $UninstallRegistryKeyPath -Name InstallLocation -Value $InstallRoot
-Set-ItemProperty -Path $UninstallRegistryKeyPath -Name DisplayIcon -Value $trayPath
+Set-ItemProperty -Path $UninstallRegistryKeyPath -Name DisplayIcon -Value $iconPath
 Set-ItemProperty -Path $UninstallRegistryKeyPath -Name UninstallString -Value $uninstallCommand
 Set-ItemProperty -Path $UninstallRegistryKeyPath -Name QuietUninstallString -Value $uninstallCommand
 Set-ItemProperty -Path $UninstallRegistryKeyPath -Name NoModify -Value 1 -Type DWord

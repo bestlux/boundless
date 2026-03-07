@@ -54,6 +54,14 @@ function Get-ShortcutTarget {
     return $shortcut.TargetPath
 }
 
+function Get-ShortcutIconLocation {
+    param([string]$ShortcutPath)
+
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($ShortcutPath)
+    return $shortcut.IconLocation
+}
+
 if ((Get-Variable -Name IsWindows -ErrorAction SilentlyContinue) -and (-not $IsWindows)) {
     throw "package-smoke.ps1 is supported on Windows only."
 }
@@ -123,6 +131,7 @@ try {
     Assert-PathExists -Path (Join-Path $installRoot "boundlessd.exe") -Message "Installed daemon binary is missing."
     Assert-PathExists -Path (Join-Path $installRoot "boundlessctl.exe") -Message "Installed CLI binary is missing."
     Assert-PathExists -Path (Join-Path $installRoot "boundlesstray.exe") -Message "Installed tray binary is missing."
+    Assert-PathExists -Path (Join-Path $installRoot "Boundless.ico") -Message "Installed icon asset is missing."
     $shortcutPath = Join-Path $startupRoot "Boundless.lnk"
     $startMenuShortcutPath = Join-Path $startMenuRoot "Boundless.lnk"
     $desktopShortcutPath = Join-Path $desktopRoot "Boundless.lnk"
@@ -143,9 +152,26 @@ try {
         throw "Desktop shortcut target was unexpected: $desktopShortcutTarget"
     }
 
+    $expectedIconLocation = Join-Path $installRoot "Boundless.ico"
+    $startupShortcutIconLocation = Get-ShortcutIconLocation -ShortcutPath $shortcutPath
+    if ($startupShortcutIconLocation -notlike "$expectedIconLocation*") {
+        throw "Startup shortcut icon location was unexpected: $startupShortcutIconLocation"
+    }
+    $startMenuShortcutIconLocation = Get-ShortcutIconLocation -ShortcutPath $startMenuShortcutPath
+    if ($startMenuShortcutIconLocation -notlike "$expectedIconLocation*") {
+        throw "Start menu shortcut icon location was unexpected: $startMenuShortcutIconLocation"
+    }
+    $desktopShortcutIconLocation = Get-ShortcutIconLocation -ShortcutPath $desktopShortcutPath
+    if ($desktopShortcutIconLocation -notlike "$expectedIconLocation*") {
+        throw "Desktop shortcut icon location was unexpected: $desktopShortcutIconLocation"
+    }
+
     $uninstallItem = Get-ItemProperty -Path $uninstallKey
     if ($uninstallItem.DisplayName -ne "Boundless") {
         throw "Unexpected uninstall DisplayName: $($uninstallItem.DisplayName)"
+    }
+    if ($uninstallItem.DisplayIcon -ne $expectedIconLocation) {
+        throw "Unexpected uninstall DisplayIcon: $($uninstallItem.DisplayIcon)"
     }
 
     $seedConfig = @{

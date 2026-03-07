@@ -13,6 +13,7 @@ anyhow.workspace = true
 clap.workspace = true
 eframe = "0.28.1"
 egui = "0.28.1"
+image = { version = "0.25.5", default-features = false, features = ["png"] }
 ipc-api = { path = "../ipc-api" }
 raw-window-handle = "0.6.2"
 serde.workspace = true
@@ -27,3 +28,6 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Wind
 
 tray-icon = "0.21.3"
 winit = "0.30"
+
+[build-dependencies]
+winres = "0.1.12"

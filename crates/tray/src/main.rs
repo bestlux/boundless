@@ -15,6 +15,7 @@ mod windows_app {
     use anyhow::{Context, Result, bail};
     use clap::Parser;
     use hyper_util::rt::TokioIo;
+    use image::ImageFormat;
     use ipc_api::boundless::v1::{
         Empty, HotkeyTriggerRequest, ImportTrustBundleRequest, NearbyPairingDecisionRequest,
         StatusRequest, daemon_service_client::DaemonServiceClient,
@@ -47,6 +48,7 @@ mod windows_app {
         menu::{Menu, MenuItem, PredefinedMenuItem},
     };
 
+    const TRAY_ICON_BYTES: &[u8] = include_bytes!("../assets/tray-icon.png");
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     const ACTION_DASHBOARD: &str = "dashboard";
     const ACTION_QUIT: &str = "quit";
@@ -1027,31 +1029,11 @@ mod windows_app {
     }
 
     fn make_tray_icon() -> Result<Icon> {
-        let width = 16_u32;
-        let height = 16_u32;
-        let mut rgba = vec![0_u8; (width * height * 4) as usize];
-
-        for y in 0..height {
-            for x in 0..width {
-                let idx = ((y * width + x) * 4) as usize;
-                let is_border = x == 0 || y == 0 || x == width - 1 || y == height - 1;
-                let is_cross = x == width / 2 || y == height / 2;
-
-                let (r, g, b) = if is_border {
-                    (220, 224, 228)
-                } else if is_cross {
-                    (78, 148, 188)
-                } else {
-                    (24, 30, 36)
-                };
-                rgba[idx] = r;
-                rgba[idx + 1] = g;
-                rgba[idx + 2] = b;
-                rgba[idx + 3] = 255;
-            }
-        }
-
-        Icon::from_rgba(rgba, width, height).context("create tray icon image")
+        let image = image::load_from_memory_with_format(TRAY_ICON_BYTES, ImageFormat::Png)
+            .context("decode tray icon asset")?
+            .into_rgba8();
+        let (width, height) = image.dimensions();
+        Icon::from_rgba(image.into_raw(), width, height).context("create tray icon image")
     }
 
     fn short_token(value: &str) -> &str {
@@ -1325,6 +1307,11 @@ mod windows_app {
                 validate_layout_before_apply(&grid, "local-machine-id").is_err(),
                 "layout with multiple local cells must fail apply validation"
             );
+        }
+
+        #[test]
+        fn tray_icon_asset_decodes() {
+            make_tray_icon().expect("tray icon asset should decode");
         }
     }
 }

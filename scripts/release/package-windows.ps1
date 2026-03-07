@@ -47,6 +47,7 @@ $daemonBinary = Resolve-RequiredPath -Path $DaemonPath -Label "Daemon binary"
 $cliBinary = Resolve-RequiredPath -Path $CliPath -Label "CLI binary"
 $trayBinary = Resolve-RequiredPath -Path $TrayPath -Label "Tray binary"
 $packageAssetRoot = Resolve-RequiredPath -Path (Join-Path $repoRoot "packaging\windows") -Label "Packaging asset root"
+$trayIconPath = Resolve-RequiredPath -Path (Join-Path $repoRoot "crates\tray\assets\app-icon.ico") -Label "Tray app icon"
 $licensePath = Resolve-RequiredPath -Path (Join-Path $repoRoot "LICENSE") -Label "LICENSE"
 $changeLogPath = Resolve-RequiredPath -Path (Join-Path $repoRoot "CHANGELOG.md") -Label "CHANGELOG"
 
@@ -69,6 +70,7 @@ Ensure-Directory -Path $stageRoot
 Copy-Item -LiteralPath $daemonBinary -Destination (Join-Path $stageRoot "boundlessd.exe")
 Copy-Item -LiteralPath $cliBinary -Destination (Join-Path $stageRoot "boundlessctl.exe")
 Copy-Item -LiteralPath $trayBinary -Destination (Join-Path $stageRoot "boundlesstray.exe")
+Copy-Item -LiteralPath $trayIconPath -Destination (Join-Path $stageRoot "Boundless.ico")
 Copy-Item -LiteralPath $licensePath -Destination (Join-Path $stageRoot "LICENSE.txt")
 Copy-Item -LiteralPath $changeLogPath -Destination (Join-Path $stageRoot "CHANGELOG.md")
 
