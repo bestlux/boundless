@@ -1,7 +1,15 @@
 use eframe::egui;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HWND;
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    PostMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow, WM_CLOSE,
+};
 pub(super) fn run() -> Result<()> {
     let cli = Cli::parse();
     let ctx = Arc::new(AppContext {
@@ -32,8 +40,6 @@ pub(super) fn run() -> Result<()> {
 enum AppMsg {
     SnapshotUpdated(UiSnapshot),
     SnapshotError(String),
-    ShowDashboard,
-    QuitRequested,
     PairingChallenge {
         attempt_id: u64,
         challenge: PairingChallengeState,
@@ -181,6 +187,64 @@ fn should_hide_on_close(exit_requested: bool, tray_available: bool) -> bool {
     tray_available && !exit_requested
 }
 
+#[cfg(windows)]
+fn native_window_handle_from_creation_context(cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    match cc.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
+        _ => None,
+    }
+}
+
+#[cfg(not(windows))]
+fn native_window_handle_from_creation_context(_cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    None
+}
+
+fn show_dashboard_window(native_window_handle: Option<isize>, ctx: &egui::Context) {
+    #[cfg(windows)]
+    if let Some(hwnd) = native_window_handle {
+        unsafe {
+            ShowWindow(hwnd as HWND, SW_SHOW);
+            ShowWindow(hwnd as HWND, SW_RESTORE);
+            SetForegroundWindow(hwnd as HWND);
+        }
+        return;
+    }
+
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+}
+
+fn hide_dashboard_window(native_window_handle: Option<isize>, ctx: &egui::Context) {
+    #[cfg(windows)]
+    if let Some(hwnd) = native_window_handle {
+        unsafe {
+            ShowWindow(hwnd as HWND, SW_HIDE);
+        }
+        return;
+    }
+
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+}
+
+fn request_dashboard_exit(
+    native_window_handle: Option<isize>,
+    ctx: &egui::Context,
+    exit_requested: &Arc<AtomicBool>,
+) {
+    exit_requested.store(true, Ordering::SeqCst);
+
+    #[cfg(windows)]
+    if let Some(hwnd) = native_window_handle {
+        unsafe {
+            PostMessageW(hwnd as HWND, WM_CLOSE, 0, 0);
+        }
+        return;
+    }
+
+    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+}
+
 struct DashboardApp {
     ctx: Arc<AppContext>,
     _tray_icon: Option<TrayIcon>,
@@ -209,6 +273,8 @@ struct DashboardApp {
     pending_onboarding_focus: bool,
     onboarding_focus_shown: bool,
     exit_requested: bool,
+    exit_requested_signal: Arc<AtomicBool>,
+    native_window_handle: Option<isize>,
 
     // Layout manager state
     layout_grid: HashMap<(i32, i32), String>,
@@ -221,6 +287,8 @@ struct DashboardApp {
 impl DashboardApp {
     fn new(cc: &eframe::CreationContext<'_>, app_ctx: Arc<AppContext>) -> Self {
         let (tx, rx) = mpsc::channel();
+        let exit_requested_signal = Arc::new(AtomicBool::new(false));
+        let native_window_handle = native_window_handle_from_creation_context(cc);
 
         let bg_ctx = app_ctx.clone();
         let bg_tx = tx.clone();
@@ -295,23 +363,18 @@ impl DashboardApp {
             }
         });
 
-        let menu_tx = tx.clone();
         let menu_ctx = cc.egui_ctx.clone();
+        let menu_exit_requested = exit_requested_signal.clone();
+        let menu_window_handle = native_window_handle;
         tray_icon::menu::MenuEvent::set_event_handler(Some(
             move |event: tray_icon::menu::MenuEvent| {
-            let msg = if event.id.as_ref() == ACTION_DASHBOARD {
-                Some(AppMsg::ShowDashboard)
-            } else if event.id.as_ref() == ACTION_QUIT {
-                Some(AppMsg::QuitRequested)
-            } else {
-                None
-            };
-
-            if let Some(msg) = msg {
-                let _ = menu_tx.send(msg);
-                menu_ctx.request_repaint();
-            }
-        }));
+                if event.id.as_ref() == ACTION_DASHBOARD {
+                    show_dashboard_window(menu_window_handle, &menu_ctx);
+                } else if event.id.as_ref() == ACTION_QUIT {
+                    request_dashboard_exit(menu_window_handle, &menu_ctx, &menu_exit_requested);
+                }
+            },
+        ));
 
         let (tray_icon, tray_init_error) = match build_dashboard_tray_icon() {
             Ok(tray) => (Some(tray), None),
@@ -347,6 +410,8 @@ impl DashboardApp {
             pending_onboarding_focus: false,
             onboarding_focus_shown: false,
             exit_requested: false,
+            exit_requested_signal,
+            native_window_handle,
             layout_grid: HashMap::new(),
             layout_unassigned: Vec::new(),
             layout_initialized: false,
@@ -390,12 +455,6 @@ impl DashboardApp {
             AppMsg::SnapshotError(err) => {
                 self.last_error = Some(err);
                 self.last_message_is_error = true;
-            }
-            AppMsg::ShowDashboard => {
-                self.pending_onboarding_focus = true;
-            }
-            AppMsg::QuitRequested => {
-                self.exit_requested = true;
             }
             AppMsg::PairingChallenge {
                 attempt_id,
@@ -586,10 +645,12 @@ impl DashboardApp {
 
 impl eframe::App for DashboardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.exit_requested |= self.exit_requested_signal.load(Ordering::SeqCst);
+
         if ctx.input(|input| input.viewport().close_requested()) {
             if should_hide_on_close(self.exit_requested, self._tray_icon.is_some()) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                hide_dashboard_window(self.native_window_handle, ctx);
             } else {
                 self.exit_requested = true;
             }
@@ -601,8 +662,7 @@ impl eframe::App for DashboardApp {
         }
 
         if self.pending_onboarding_focus {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            show_dashboard_window(self.native_window_handle, ctx);
             self.pending_onboarding_focus = false;
             self.onboarding_focus_shown = true;
         }

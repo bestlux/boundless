@@ -832,11 +832,13 @@ dependencies = [
  "egui",
  "hyper-util",
  "ipc-api",
+ "raw-window-handle 0.6.2",
  "serde",
  "serde_json",
  "tokio",
  "tonic",
  "tray-icon",
+ "windows-sys 0.61.2",
  "winit 0.30.12",
 ]
 

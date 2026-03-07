@@ -30,6 +30,8 @@ pub(super) fn test_app() -> DashboardApp {
         pending_onboarding_focus: false,
         onboarding_focus_shown: false,
         exit_requested: false,
+        exit_requested_signal: Arc::new(AtomicBool::new(false)),
+        native_window_handle: None,
         layout_grid: HashMap::new(),
         layout_unassigned: Vec::new(),
         layout_initialized: false,
