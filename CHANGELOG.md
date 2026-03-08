@@ -1,5 +1,28 @@
 # Changelog
 
+## [2.0.3](https://github.com/bestlux/boundless/compare/v2.0.2...v2.0.3) (2026-03-08)
+
+
+### Bug Fixes
+
+* **tray:** refresh window and icon assets ([e9fa360](https://github.com/bestlux/boundless/commit/e9fa3603de9a9fe22ac35893c3a0eddc50a41f42))
+
+## [2.0.2](https://github.com/bestlux/boundless/compare/v2.0.1...v2.0.2) (2026-03-08)
+
+
+### Features
+
+* **tray:** ship branded Windows icon assets ([31e195b](https://github.com/bestlux/boundless/commit/31e195bafd0356b6e79a1df5f498030f3541cc35))
+
+## [2.0.1](https://github.com/bestlux/boundless/compare/v2.0.0...v2.0.1) (2026-03-07)
+
+
+### Bug Fixes
+
+* **packaging:** restore tray menu and add app shortcuts ([af17db3](https://github.com/bestlux/boundless/commit/af17db36a6fc8896d005cddee4175b2ed48f861b))
+* **tray:** improve onboarding and window lifecycle ([81f02bb](https://github.com/bestlux/boundless/commit/81f02bb105bf951bafad00ded59a4a375c02ca3f))
+* **tray:** use native window show/hide on windows ([39d054c](https://github.com/bestlux/boundless/commit/39d054cf603fb4c3e7c0e5b714ee0afe5bdb96d7))
+
 ## [2.0.0](https://github.com/bestlux/boundless/compare/v1.1.0...v2.0.0) (2026-03-03)
 
 
