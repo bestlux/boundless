@@ -14,6 +14,7 @@ fn main() -> anyhow::Result<()> {
 mod windows_app {
     use anyhow::{Context, Result, bail};
     use clap::Parser;
+    use eframe::icon_data;
     use hyper_util::rt::TokioIo;
     use image::ImageFormat;
     use ipc_api::boundless::v1::{
@@ -48,7 +49,8 @@ mod windows_app {
         menu::{Menu, MenuItem, PredefinedMenuItem},
     };
 
-    const TRAY_ICON_BYTES: &[u8] = include_bytes!("../assets/tray-icon.png");
+    const APP_ICON_BYTES: &[u8] = include_bytes!("../assets/app-icon.png");
+    const TRAY_ICON_BYTES: &[u8] = include_bytes!("../assets/tray-icon-20.png");
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     const ACTION_DASHBOARD: &str = "dashboard";
     const ACTION_QUIT: &str = "quit";
@@ -1036,6 +1038,10 @@ mod windows_app {
         Icon::from_rgba(image.into_raw(), width, height).context("create tray icon image")
     }
 
+    fn make_window_icon() -> Result<egui::IconData> {
+        icon_data::from_png_bytes(APP_ICON_BYTES).context("decode window icon asset")
+    }
+
     fn short_token(value: &str) -> &str {
         value.get(..8).unwrap_or(value)
     }
@@ -1312,6 +1318,11 @@ mod windows_app {
         #[test]
         fn tray_icon_asset_decodes() {
             make_tray_icon().expect("tray icon asset should decode");
+        }
+
+        #[test]
+        fn window_icon_asset_decodes() {
+            make_window_icon().expect("window icon asset should decode");
         }
     }
 }

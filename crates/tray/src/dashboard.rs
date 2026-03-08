@@ -23,6 +23,7 @@ pub(super) fn run() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_visible(false) // hidden on start, shown via tray
             .with_inner_size([760.0, 560.0])
+            .with_icon(make_window_icon()?)
             .with_title("Boundless Dashboard"),
         ..Default::default()
     };
