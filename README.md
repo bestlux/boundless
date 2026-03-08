@@ -2,6 +2,38 @@
 
 Boundless is a Rust-first, performance-oriented alternative to Mouse Without Borders.
 
+Boundless is currently an alpha-stage project. Windows is the primary target today; cross-platform runtime coverage is still in progress.
+
+## Quick start
+
+For local development:
+
+```bash
+cargo fmt
+cargo test
+```
+
+For the Windows desktop flow:
+
+```bash
+cargo run -p boundless-daemon
+cargo run -p boundless-tray
+```
+
+## Project scope
+
+- Primary target: Windows
+- First-run UX: tray dashboard + local daemon
+- Public status: alpha, APIs and runtime behavior may still change
+- License: MIT; see [LICENSE](LICENSE)
+
+## Community
+
+- Contributions: see [CONTRIBUTING.md](CONTRIBUTING.md)
+- Bug reports and feature requests: use GitHub Issues
+- Security reports: see [SECURITY.md](SECURITY.md)
+- Support and triage guidance: see [SUPPORT.md](SUPPORT.md)
+
 ## Current status
 
 This repository now contains an alpha-oriented workspace scaffold with:
@@ -44,9 +76,9 @@ Profiles:
 ./scripts/dev/test-suite.ps1 -Profile quick   # fmt + test + clippy
 ./scripts/dev/test-suite.ps1 -Profile smoke   # quick + 2-node smoke
 ./scripts/dev/test-suite.ps1 -Profile full    # smoke + 3-node smoke
-./scripts/dev/test-suite.ps1 -Profile trace -EndpointA http://127.0.0.1:50051 -EndpointB http://10.0.0.5:50051
+./scripts/dev/test-suite.ps1 -Profile trace -EndpointA http://127.0.0.1:50051 -EndpointB http://192.0.2.10:50051
 ./scripts/dev/test-suite.ps1 -Profile trace -TraceEnforceBudgets -TraceCaptureToApplyP95BudgetMs 45 -TraceCaptureToReceiveP95BudgetMs 20 -TraceCaptureToApplyJitterP95BudgetMs 18
-./scripts/dev/test-suite.ps1 -Profile recovery -EndpointA http://127.0.0.1:50051 -EndpointB http://10.0.0.5:50051
+./scripts/dev/test-suite.ps1 -Profile recovery -EndpointA http://127.0.0.1:50051 -EndpointB http://192.0.2.10:50051
 ```
 
 `-Profile trace` now also exports matrix artifacts beside the trace log by default:
@@ -62,7 +94,7 @@ Standalone matrix export for one or more trace logs:
 Automated pairing recovery matrix (reject + timeout + recovery success) with captures and diagnostics:
 
 ```powershell
-./scripts/dev/s4-recovery-automation.ps1 -EndpointA http://127.0.0.1:50051 -EndpointB http://10.0.0.5:50051 -ResponderHost 10.0.0.5
+./scripts/dev/s4-recovery-automation.ps1 -EndpointA http://127.0.0.1:50051 -EndpointB http://192.0.2.10:50051 -ResponderHost 192.0.2.10
 ```
 
 If responder verification codes are hidden over remote API, the recovery script prompts once for the 6-digit success code shown on the responder tray. You can also pass `-RecoverySuccessCode <code>` / `-SuccessCode <code>` to avoid prompts.

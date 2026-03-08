@@ -1,9 +1,9 @@
 param(
     [string]$EndpointA = "http://127.0.0.1:50051",
-    [string]$EndpointB = "http://10.10.0.149:50051",
+    [string]$EndpointB = "http://192.0.2.10:50051",
     [string]$LabelA = "machine-a",
     [string]$LabelB = "machine-b",
-    [string]$ResponderHost = "10.10.0.149",
+    [string]$ResponderHost = "192.0.2.10",
     [int]$ResponderPairingPort = 15200,
     [int]$EventsLimit = 300,
     [string]$ScenarioPrefix = "s4_recovery",

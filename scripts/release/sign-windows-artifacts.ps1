@@ -3,6 +3,8 @@ param(
     [Parameter(Position = 0)]
     [string[]]$Files = @(),
 
+    [switch]$RequireSigning,
+
     [string]$CertificatePath = $env:WINDOWS_SIGN_CERT_PATH,
 
     [string]$CertificateBase64 = $env:WINDOWS_SIGN_CERT_BASE64,
@@ -112,6 +114,10 @@ try {
         -WorkingDirectory $tempDirectory
 
     if ([string]::IsNullOrWhiteSpace($certificateFile)) {
+        if ($RequireSigning) {
+            throw "Windows code signing is required for this release, but no signing certificate was configured."
+        }
+
         Write-Host "Windows code signing is not configured; skipping."
         return
     }

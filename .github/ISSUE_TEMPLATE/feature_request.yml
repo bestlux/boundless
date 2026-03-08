@@ -1,0 +1,57 @@
+name: Feature request
+description: Propose a scoped improvement to Boundless
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the user or operator problem first. Requests that only name a solution are harder to review.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What limitation, pain point, or missing workflow are you trying to solve?
+      placeholder: When I try to ...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the behavior you want and how it would be used.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: List workarounds, rejected ideas, or existing commands that almost solve it.
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Expected impact area
+      options:
+        - CLI workflow
+        - daemon / transport
+        - tray UX
+        - pairing / discovery
+        - input routing
+        - clipboard / file transfer
+        - packaging / install
+        - docs
+        - other
+    validations:
+      required: true
+  - type: checkboxes
+    id: expectations
+    attributes:
+      label: Request quality check
+      options:
+        - label: I searched for existing issues or PRs related to this request
+          required: true
+        - label: This request is narrow enough to discuss and review incrementally
+          required: true
+        - label: I understand that maintainability and project scope may limit whether this is accepted
+          required: true
