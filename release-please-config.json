@@ -6,6 +6,7 @@
   ],
   "packages": {
     ".": {
+      "package-name": "boundless",
       "release-type": "rust"
     }
   }
