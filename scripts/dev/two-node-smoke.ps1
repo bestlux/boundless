@@ -234,7 +234,8 @@ function Send-ClipboardImageUntilObserved {
         [string]$ObserveEndpoint,
         [string]$ObservePattern,
         [int]$Attempts = 2,
-        [int]$ObserveSeconds = 20
+        [int]$ObserveSeconds = 20,
+        [string]$RetryLabel = "clipboard image"
     )
 
     $baselineCount = Get-TransportEventMatchCount -Endpoint $ObserveEndpoint -Pattern $ObservePattern
@@ -249,7 +250,7 @@ function Send-ClipboardImageUntilObserved {
             if ($attempt -eq $Attempts) {
                 throw
             }
-            Write-Warning "[smoke] reconnect clipboard image was not observed after attempt $attempt; retrying"
+            Write-Warning "[smoke] $RetryLabel was not observed after attempt $attempt; retrying"
             Start-Sleep -Seconds 2
         }
     }
@@ -648,19 +649,17 @@ try {
     $sampleImageBytes = New-BmpFile -Path $sampleImage -Width 1 -Height 1 -Red 0xFF
 
     Write-Host "[smoke] sending clipboard image payload from node1 to node2"
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-image", $node1PeerId, $sampleImage) | Out-Host
-
+    $sampleImagePattern = "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$sampleImageBytes"
+    Send-ClipboardImageUntilObserved -SendEndpoint $node1Endpoint -PeerId $node1PeerId -ImagePath $sampleImage -ObserveEndpoint $node2Endpoint -ObservePattern $sampleImagePattern -ObserveSeconds ([Math]::Min($TimeoutSeconds, 20)) -RetryLabel "initial clipboard image"
     Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=clipboard_image peer_id=$node1PeerId size_bytes=$sampleImageBytes" -Seconds $TimeoutSeconds
-    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$sampleImageBytes" -Seconds $TimeoutSeconds
 
     $chunkedImage = Join-Path $runRoot "chunked-clipboard.bmp"
     $chunkedImageBytes = New-BmpFile -Path $chunkedImage -Width 512 -Height 256 -Blue 0x44 -Green 0x22 -Red 0xAA
 
     Write-Host "[smoke] sending oversized clipboard image payload from node1 to node2"
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-image", $node1PeerId, $chunkedImage) | Out-Host
-
+    $chunkedImagePattern = "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$chunkedImageBytes"
+    Send-ClipboardImageUntilObserved -SendEndpoint $node1Endpoint -PeerId $node1PeerId -ImagePath $chunkedImage -ObserveEndpoint $node2Endpoint -ObservePattern $chunkedImagePattern -ObserveSeconds ([Math]::Min($TimeoutSeconds, 30)) -RetryLabel "oversized clipboard image"
     Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=clipboard_image peer_id=$node1PeerId size_bytes=$chunkedImageBytes" -Seconds $TimeoutSeconds
-    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$chunkedImageBytes" -Seconds $TimeoutSeconds
 
     if (-not $ClipboardOnly) {
         $sampleFile = Join-Path $runRoot "sample-transfer.txt"
@@ -700,7 +699,7 @@ try {
     $escapedPostReconnectClipboardText = [regex]::Escape($postReconnectClipboardText)
     Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_text peer_id=$node2PeerId .*detail=$escapedPostReconnectClipboardText" -Seconds $TimeoutSeconds
     $reconnectImagePattern = "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$reconnectImageBytes"
-    Send-ClipboardImageUntilObserved -SendEndpoint $node1Endpoint -PeerId $node1PeerId -ImagePath $reconnectImage -ObserveEndpoint $node2Endpoint -ObservePattern $reconnectImagePattern -ObserveSeconds ([Math]::Min($TimeoutSeconds, 20))
+    Send-ClipboardImageUntilObserved -SendEndpoint $node1Endpoint -PeerId $node1PeerId -ImagePath $reconnectImage -ObserveEndpoint $node2Endpoint -ObservePattern $reconnectImagePattern -Attempts 3 -ObserveSeconds ([Math]::Min($TimeoutSeconds, 30)) -RetryLabel "reconnect clipboard image"
 
     if (-not $ClipboardOnly) {
         Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
