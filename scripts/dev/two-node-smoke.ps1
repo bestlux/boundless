@@ -694,7 +694,9 @@ try {
 
     $postReconnectClipboardText = "smoke-reconnect-live-" + (Get-Date -Format "HHmmss")
     $reconnectImage = Join-Path $runRoot "reconnect-clipboard.bmp"
-    $reconnectImageBytes = New-BmpFile -Path $reconnectImage -Width 640 -Height 192 -Blue 0x11 -Green 0x88 -Red 0x33
+    # The large-image path is already covered before reconnect. Keep the reconnect
+    # assertion focused on post-reconnect delivery rather than chunked-transfer timing.
+    $reconnectImageBytes = New-BmpFile -Path $reconnectImage -Width 32 -Height 32 -Blue 0x11 -Green 0x88 -Red 0x33
     Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-text", $node1PeerId, $postReconnectClipboardText) | Out-Host
 
     $escapedPostReconnectClipboardText = [regex]::Escape($postReconnectClipboardText)
