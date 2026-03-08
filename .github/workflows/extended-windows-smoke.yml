@@ -1,0 +1,33 @@
+name: Extended Windows Smoke
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  extended-windows-smoke:
+    runs-on: windows-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Extended two-node smoke
+        shell: pwsh
+        run: ./scripts/dev/two-node-smoke.ps1 -TimeoutSeconds 120 -ExtendedCoverage
