@@ -648,19 +648,17 @@ try {
     $sampleImageBytes = New-BmpFile -Path $sampleImage -Width 1 -Height 1 -Red 0xFF
 
     Write-Host "[smoke] sending clipboard image payload from node1 to node2"
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-image", $node1PeerId, $sampleImage) | Out-Host
-
+    $sampleImagePattern = "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$sampleImageBytes"
+    Send-ClipboardImageUntilObserved -SendEndpoint $node1Endpoint -PeerId $node1PeerId -ImagePath $sampleImage -ObserveEndpoint $node2Endpoint -ObservePattern $sampleImagePattern -ObserveSeconds ([Math]::Min($TimeoutSeconds, 20))
     Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=clipboard_image peer_id=$node1PeerId size_bytes=$sampleImageBytes" -Seconds $TimeoutSeconds
-    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$sampleImageBytes" -Seconds $TimeoutSeconds
 
     $chunkedImage = Join-Path $runRoot "chunked-clipboard.bmp"
     $chunkedImageBytes = New-BmpFile -Path $chunkedImage -Width 512 -Height 256 -Blue 0x44 -Green 0x22 -Red 0xAA
 
     Write-Host "[smoke] sending oversized clipboard image payload from node1 to node2"
-    Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-image", $node1PeerId, $chunkedImage) | Out-Host
-
+    $chunkedImagePattern = "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$chunkedImageBytes"
+    Send-ClipboardImageUntilObserved -SendEndpoint $node1Endpoint -PeerId $node1PeerId -ImagePath $chunkedImage -ObserveEndpoint $node2Endpoint -ObservePattern $chunkedImagePattern -ObserveSeconds ([Math]::Min($TimeoutSeconds, 30))
     Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=clipboard_image peer_id=$node1PeerId size_bytes=$chunkedImageBytes" -Seconds $TimeoutSeconds
-    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$chunkedImageBytes" -Seconds $TimeoutSeconds
 
     if (-not $ClipboardOnly) {
         $sampleFile = Join-Path $runRoot "sample-transfer.txt"

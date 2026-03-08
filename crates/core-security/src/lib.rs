@@ -7,7 +7,6 @@ use std::{
 use anyhow::Context;
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use rand::Rng;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
@@ -88,7 +87,7 @@ pub fn default_security_root() -> PathBuf {
 }
 
 pub fn generate_pairing_code(ttl: Duration) -> PairingCode {
-    let value = format!("{:06}", rand::rng().random_range(0..1_000_000));
+    let value = format!("{:06}", rand::random_range(0..1_000_000));
 
     PairingCode {
         value,
@@ -106,7 +105,7 @@ pub fn load_or_create_device_secret(paths: &SecurityPaths) -> anyhow::Result<Str
     }
 
     let mut bytes = [0u8; 32];
-    rand::rng().fill(&mut bytes);
+    rand::fill(&mut bytes);
     let value = base64::engine::general_purpose::STANDARD.encode(bytes);
     fs::write(&paths.device_secret, &value)
         .with_context(|| format!("write {}", paths.device_secret.display()))?;
