@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.0.4](https://github.com/bestlux/boundless/compare/v2.0.3...v2.0.4) (2026-03-08)
+
+
+### Bug Fixes
+
+* **ci:** split smoke coverage by stability ([#12](https://github.com/bestlux/boundless/issues/12)) ([f8b4a51](https://github.com/bestlux/boundless/commit/f8b4a51c4dca378000bf44700123c3f311579943))
+* **ci:** stabilize dependency verify path ([#10](https://github.com/bestlux/boundless/issues/10)) ([a3d1482](https://github.com/bestlux/boundless/commit/a3d1482d5f8e2d5867cf0d5dd6f964c985d65050))
+* restore stable release-please workflow ([138a5a8](https://github.com/bestlux/boundless/commit/138a5a8ef14e3e9ed1216c8e7e383e21f00d6dcb))
+* set release package name explicitly ([79fc31c](https://github.com/bestlux/boundless/commit/79fc31c64eba0486550ab48e7905ed59329c16ce))
+* use supported rust codeql build mode ([63b5276](https://github.com/bestlux/boundless/commit/63b5276d410c8c58b9dcb9e264f4876e3f489482))
+
 ## [2.0.3](https://github.com/bestlux/boundless/compare/v2.0.2...v2.0.3) (2026-03-08)
 
 
