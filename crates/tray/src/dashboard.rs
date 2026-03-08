@@ -946,12 +946,12 @@ impl eframe::App for DashboardApp {
                                 let painter = ui.painter();
                                 if !is_being_dragged {
                                     painter.rect_filled(rect.shrink(4.0), 6.0, egui::Color32::from_rgb(50, 60, 70));
-                                    painter.rect_stroke(rect.shrink(4.0), 6.0, egui::Stroke::new(1.0, egui::Color32::DARK_GRAY));
+                                    painter.rect_stroke(rect.shrink(4.0), 6.0, egui::Stroke::new(1.0, egui::Color32::DARK_GRAY), egui::StrokeKind::Inside);
                                     let text = get_display_name(peer_id);
                                     let color = if peer_id == &self.snapshot.machine_id { egui::Color32::LIGHT_BLUE } else { egui::Color32::WHITE };
                                     let mut job = egui::text::LayoutJob::simple(text, egui::FontId::proportional(12.0), color, rect.width() - 8.0);
                                     job.halign = egui::Align::Center;
-                                    let galley = ctx.fonts(|f| f.layout_job(job));
+                                    let galley = painter.layout_job(job);
                                     painter.galley(rect.center() - galley.size() / 2.0, galley, color);
                                 }
                             }
@@ -988,7 +988,7 @@ impl eframe::App for DashboardApp {
                                     if is_hovered {
                                         painter.rect_filled(rect.shrink(2.0), 4.0, egui::Color32::from_rgb(40, 50, 60));
                                     }
-                                    painter.rect_stroke(rect.shrink(2.0), 4.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 50, 55)));
+                                    painter.rect_stroke(rect.shrink(2.0), 4.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 50, 55)), egui::StrokeKind::Inside);
                                     
                                     if let Some(peer_id) = self.layout_grid.get(&(x, y))
                                         && !is_being_dragged
@@ -997,11 +997,11 @@ impl eframe::App for DashboardApp {
                                         let bg_color = if is_local { egui::Color32::from_rgb(30, 70, 110) } else { egui::Color32::from_rgb(50, 60, 70) };
                                         painter.rect_filled(rect.shrink(4.0), 6.0, bg_color);
                                         let border_color = if is_local { egui::Color32::LIGHT_BLUE } else { egui::Color32::DARK_GRAY };
-                                        painter.rect_stroke(rect.shrink(4.0), 6.0, egui::Stroke::new(1.5, border_color));
+                                        painter.rect_stroke(rect.shrink(4.0), 6.0, egui::Stroke::new(1.5, border_color), egui::StrokeKind::Inside);
                                         let text = get_display_name(peer_id);
                                         let mut job = egui::text::LayoutJob::simple(text, egui::FontId::proportional(12.0), egui::Color32::WHITE, rect.width() - 8.0);
                                         job.halign = egui::Align::Center;
-                                        let galley = ctx.fonts(|f| f.layout_job(job));
+                                        let galley = painter.layout_job(job);
                                         painter.galley(rect.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
                                     }
                                 }
@@ -1053,11 +1053,11 @@ impl eframe::App for DashboardApp {
                         let is_local = peer_id == &self.snapshot.machine_id;
                         let bg_color = if is_local { egui::Color32::from_rgb(40, 90, 140) } else { egui::Color32::from_rgb(70, 80, 90) };
                         painter.rect_filled(rect.shrink(4.0), 6.0, bg_color);
-                        painter.rect_stroke(rect.shrink(4.0), 6.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                        painter.rect_stroke(rect.shrink(4.0), 6.0, egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Inside);
                         let text = get_display_name(peer_id);
                         let mut job = egui::text::LayoutJob::simple(text, egui::FontId::proportional(12.0), egui::Color32::WHITE, rect.width() - 8.0);
                         job.halign = egui::Align::Center;
-                        let galley = ctx.fonts(|f| f.layout_job(job));
+                        let galley = painter.layout_job(job);
                         painter.galley(rect.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
                     }
 
