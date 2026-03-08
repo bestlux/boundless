@@ -24,7 +24,7 @@ jobs:
           - language: actions
             build_mode: none
           - language: rust
-            build_mode: autobuild
+            build_mode: none
 
     steps:
       - name: Checkout
@@ -37,10 +37,6 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build_mode }}
-
-      - name: Autobuild
-        if: matrix.build_mode == 'autobuild'
-        uses: github/codeql-action/autobuild@v3
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
