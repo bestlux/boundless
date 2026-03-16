@@ -223,6 +223,31 @@ mod windows_app {
         include!("dashboard_pairing_transition_tests.rs");
     }
 
+    fn filter_connectable_discovered_peers(
+        discovered_peers: Vec<UiDiscoveredPeer>,
+        local_machine_id: &str,
+        paired_peers: &[UiPairedPeer],
+    ) -> Vec<UiDiscoveredPeer> {
+        let local_machine_id = local_machine_id.to_ascii_lowercase();
+        let paired_peer_ids = paired_peers
+            .iter()
+            .map(|peer| peer.peer_id.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let mut discovered_peers = discovered_peers
+            .into_iter()
+            .filter(|peer| {
+                let machine_id = peer.machine_id.to_ascii_lowercase();
+                machine_id != local_machine_id && !paired_peer_ids.contains(&machine_id)
+            })
+            .collect::<Vec<_>>();
+        discovered_peers.sort_by(|left, right| {
+            left.display_name
+                .cmp(&right.display_name)
+                .then_with(|| left.machine_id.cmp(&right.machine_id))
+        });
+        discovered_peers
+    }
+
     fn run_boundlessctl(ctx: &AppContext, args: &[String]) -> Result<String> {
         run_boundlessctl_with_timeout(ctx, args, Duration::from_secs(20))
     }
@@ -472,21 +497,6 @@ mod windows_app {
             .into_inner()
             .requests;
 
-        let mut discovered_peers = discovery
-            .peers
-            .into_iter()
-            .map(|peer| UiDiscoveredPeer {
-                machine_id: peer.machine_id,
-                display_name: peer.display_name,
-                endpoint: peer.endpoint,
-            })
-            .collect::<Vec<_>>();
-        discovered_peers.sort_by(|left, right| {
-            left.display_name
-                .cmp(&right.display_name)
-                .then_with(|| left.machine_id.cmp(&right.machine_id))
-        });
-
         let mut paired_peers = peers
             .into_iter()
             .map(|peer| UiPairedPeer {
@@ -501,6 +511,20 @@ mod windows_app {
                 .cmp(&right.display_name)
                 .then_with(|| left.peer_id.cmp(&right.peer_id))
         });
+
+        let discovered_peers = filter_connectable_discovered_peers(
+            discovery
+                .peers
+                .into_iter()
+                .map(|peer| UiDiscoveredPeer {
+                    machine_id: peer.machine_id,
+                    display_name: peer.display_name,
+                    endpoint: peer.endpoint,
+                })
+                .collect::<Vec<_>>(),
+            &status.machine_id,
+            &paired_peers,
+        );
 
         let mut pending_requests = pending
             .into_iter()

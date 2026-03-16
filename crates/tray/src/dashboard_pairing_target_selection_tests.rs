@@ -124,3 +124,36 @@ fn cancel_pairing_flow_does_not_emit_success_state() {
         "cancel should not synthesize a success message"
     );
 }
+
+#[test]
+fn filter_connectable_discovered_peers_hides_self_and_existing_pairings() {
+    let discovered = vec![
+        UiDiscoveredPeer {
+            machine_id: "local-machine-1234".to_string(),
+            display_name: "This PC".to_string(),
+            endpoint: "10.0.0.1:15100".to_string(),
+        },
+        UiDiscoveredPeer {
+            machine_id: "peer-machine-1234".to_string(),
+            display_name: "Different Alias".to_string(),
+            endpoint: "10.0.0.25:15100".to_string(),
+        },
+        UiDiscoveredPeer {
+            machine_id: "peer-machine-5678".to_string(),
+            display_name: "Office Desktop".to_string(),
+            endpoint: "10.0.0.26:15100".to_string(),
+        },
+    ];
+    let paired = vec![UiPairedPeer {
+        peer_id: "peer-machine-1234".to_string(),
+        display_name: "Stored Alias".to_string(),
+        address: "10.0.0.25:15100".to_string(),
+        connected: true,
+    }];
+
+    let filtered = filter_connectable_discovered_peers(discovered, "LOCAL-MACHINE-1234", &paired);
+
+    assert_eq!(filtered.len(), 1, "only the new remote peer should remain");
+    assert_eq!(filtered[0].machine_id, "peer-machine-5678");
+    assert_eq!(filtered[0].display_name, "Office Desktop");
+}

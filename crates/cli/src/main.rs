@@ -51,9 +51,10 @@ use cli_helpers::extract_port_from_network_address;
 #[cfg(all(test, windows))]
 use cli_helpers::is_pipe_busy_error;
 use cli_helpers::{
-    format_host_port, nearby_pairing_port, normalize_bundle_address_for_host, parse_npipe_endpoint,
-    prompt_pairing_code, prompt_pairing_nonce, resolve_discovered_peer,
-    send_nearby_pairing_request, short_machine_id, validate_bmp_payload,
+    filter_connectable_discovery_records, format_host_port, nearby_pairing_port,
+    normalize_bundle_address_for_host, parse_npipe_endpoint, prompt_pairing_code,
+    prompt_pairing_nonce, resolve_discovered_peer, send_nearby_pairing_request, short_machine_id,
+    validate_bmp_payload,
 };
 use commands::*;
 use console::console_run;

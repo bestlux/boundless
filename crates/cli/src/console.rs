@@ -135,6 +135,22 @@ async fn fetch_console_snapshot(endpoint: &str) -> Result<ConsoleSnapshot> {
             endpoint: peer.endpoint,
         })
         .collect::<Vec<_>>();
+    let paired_peer_ids = peers
+        .iter()
+        .map(|peer| peer.peer_id.clone())
+        .collect::<Vec<_>>();
+    let mut discovered_peers = filter_connectable_discovery_records(
+        discovered_peers,
+        &status.machine_id,
+        &paired_peer_ids,
+        |peer| peer.machine_id.clone(),
+    );
+    discovered_peers.sort_by(|a, b| {
+        a.display_name
+            .to_ascii_lowercase()
+            .cmp(&b.display_name.to_ascii_lowercase())
+            .then_with(|| a.machine_id.cmp(&b.machine_id))
+    });
 
     let owner = diagnostics_client
         .get_input_owner(Empty {})

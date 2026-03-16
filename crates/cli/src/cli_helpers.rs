@@ -77,6 +77,30 @@ pub(super) fn short_machine_id(machine_id: &str) -> &str {
     machine_id.get(..8).unwrap_or(machine_id)
 }
 
+pub(super) fn filter_connectable_discovery_records<T, F>(
+    discovered_peers: Vec<T>,
+    local_machine_id: &str,
+    paired_peer_ids: &[String],
+    mut machine_id_of: F,
+) -> Vec<T>
+where
+    F: FnMut(&T) -> String,
+{
+    let local_machine_id = local_machine_id.to_ascii_lowercase();
+    let paired_peer_ids = paired_peer_ids
+        .iter()
+        .map(|peer_id| peer_id.to_ascii_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+
+    discovered_peers
+        .into_iter()
+        .filter(|peer| {
+            let machine_id = machine_id_of(peer).to_ascii_lowercase();
+            machine_id != local_machine_id && !paired_peer_ids.contains(&machine_id)
+        })
+        .collect()
+}
+
 pub(super) fn parse_npipe_endpoint(endpoint: &str) -> Result<Option<String>> {
     let Some(rest) = endpoint.strip_prefix("npipe://") else {
         return Ok(None);
@@ -282,5 +306,44 @@ pub(super) fn format_host_port(host: &str, port: u16) -> String {
         format!("[{trimmed}]:{port}")
     } else {
         format!("{trimmed}:{port}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    struct DiscoveryRecord {
+        machine_id: String,
+    }
+
+    #[test]
+    fn filter_connectable_discovery_records_removes_local_and_paired_machine_ids() {
+        let records = vec![
+            DiscoveryRecord {
+                machine_id: "local-machine".to_string(),
+            },
+            DiscoveryRecord {
+                machine_id: "paired-machine".to_string(),
+            },
+            DiscoveryRecord {
+                machine_id: "new-machine".to_string(),
+            },
+        ];
+
+        let filtered = filter_connectable_discovery_records(
+            records,
+            "LOCAL-MACHINE",
+            &["paired-machine".to_string()],
+            |record| record.machine_id.clone(),
+        );
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "only the unpaired remote peer should remain"
+        );
+        assert_eq!(filtered[0].machine_id, "new-machine");
     }
 }

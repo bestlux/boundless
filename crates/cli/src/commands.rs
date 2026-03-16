@@ -139,6 +139,28 @@ pub(super) async fn pair_discover(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
+fn filter_connectable_discovered_peer_records(
+    peers: Vec<DiscoveredPeerRecord>,
+    local_machine_id: &str,
+    paired_peers: &[PeerRecord],
+) -> Vec<DiscoveredPeerRecord> {
+    let paired_peer_ids = paired_peers
+        .iter()
+        .map(|peer| peer.peer_id.clone())
+        .collect::<Vec<_>>();
+    let mut peers =
+        filter_connectable_discovery_records(peers, local_machine_id, &paired_peer_ids, |peer| {
+            peer.machine_id.clone()
+        });
+    peers.sort_by(|a, b| {
+        a.display_name
+            .to_ascii_lowercase()
+            .cmp(&b.display_name.to_ascii_lowercase())
+            .then_with(|| a.machine_id.cmp(&b.machine_id))
+    });
+    peers
+}
+
 pub(super) struct PairRequestArgs {
     pub(super) selector: String,
     pub(super) request_id: Option<String>,
@@ -1353,6 +1375,22 @@ pub(super) async fn ui_snapshot(endpoint: &str, start_daemon: bool) -> Result<()
             endpoint: peer.endpoint,
         })
         .collect::<Vec<_>>();
+    let paired_peer_ids = paired_peers
+        .iter()
+        .map(|peer| peer.peer_id.clone())
+        .collect::<Vec<_>>();
+    let mut discovered_peers = filter_connectable_discovery_records(
+        discovered_peers,
+        &status.machine_id,
+        &paired_peer_ids,
+        |peer| peer.machine_id.clone(),
+    );
+    discovered_peers.sort_by(|a, b| {
+        a.display_name
+            .to_ascii_lowercase()
+            .cmp(&b.display_name.to_ascii_lowercase())
+            .then_with(|| a.machine_id.cmp(&b.machine_id))
+    });
 
     let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
     let pending_requests = pairing_client
@@ -1415,8 +1453,15 @@ struct LocalLayoutTokens {
 }
 
 async fn list_discovered_peer_records(endpoint: &str) -> Result<Vec<DiscoveredPeerRecord>> {
+    let mut daemon_client = DaemonServiceClient::new(channel(endpoint).await?);
+    let status = daemon_client
+        .get_status(StatusRequest {})
+        .await?
+        .into_inner();
+    let paired_peers = list_peer_records(endpoint).await?;
+
     let mut diagnostics_client = DiagnosticsServiceClient::new(channel(endpoint).await?);
-    let mut peers = diagnostics_client
+    let peers = diagnostics_client
         .list_discovery_peers(Empty {})
         .await?
         .into_inner()
@@ -1428,13 +1473,11 @@ async fn list_discovered_peer_records(endpoint: &str) -> Result<Vec<DiscoveredPe
             endpoint: peer.endpoint,
         })
         .collect::<Vec<_>>();
-    peers.sort_by(|a, b| {
-        a.display_name
-            .to_ascii_lowercase()
-            .cmp(&b.display_name.to_ascii_lowercase())
-            .then_with(|| a.machine_id.cmp(&b.machine_id))
-    });
-    Ok(peers)
+    Ok(filter_connectable_discovered_peer_records(
+        peers,
+        &status.machine_id,
+        &paired_peers,
+    ))
 }
 
 async fn list_peer_records(endpoint: &str) -> Result<Vec<PeerRecord>> {
@@ -1972,6 +2015,42 @@ mod tests {
 
         let selected = resolve_discovered_peer_record(&peers, "office").expect("resolve prefix");
         assert_eq!(selected.display_name, "office-desktop");
+    }
+
+    #[test]
+    fn filter_connectable_discovered_peer_records_hides_local_and_paired_peers() {
+        let discovered = vec![
+            DiscoveredPeerRecord {
+                machine_id: "local-machine".to_string(),
+                display_name: "This PC".to_string(),
+                endpoint: "10.0.0.1:15100".to_string(),
+            },
+            DiscoveredPeerRecord {
+                machine_id: "paired-machine".to_string(),
+                display_name: "Different Alias".to_string(),
+                endpoint: "10.0.0.2:15100".to_string(),
+            },
+            DiscoveredPeerRecord {
+                machine_id: "brand-new-machine".to_string(),
+                display_name: "Office Desktop".to_string(),
+                endpoint: "10.0.0.3:15100".to_string(),
+            },
+        ];
+        let paired = vec![PeerRecord {
+            peer_id: "paired-machine".to_string(),
+            display_name: "Stored Alias".to_string(),
+            connected: true,
+        }];
+
+        let filtered =
+            filter_connectable_discovered_peer_records(discovered, "LOCAL-MACHINE", &paired);
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "only the new peer should remain connectable"
+        );
+        assert_eq!(filtered[0].machine_id, "brand-new-machine");
     }
 
     #[test]
