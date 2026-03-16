@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.1.0](https://github.com/bestlux/boundless/compare/v2.0.4...v2.1.0) (2026-03-16)
+
+
+### Features
+
+* **daemon:** reduce peer control latency ([14fa18b](https://github.com/bestlux/boundless/commit/14fa18bc7c262d69a60cd143c0af612bca657f91))
+
+
+### Bug Fixes
+
+* **ci:** stabilize post-refactor validation ([e3ef94f](https://github.com/bestlux/boundless/commit/e3ef94f56937303deef99a2e3b9b591b8708faf3))
+* hide self and paired peers from discovery targets ([43a2669](https://github.com/bestlux/boundless/commit/43a26692819f59f8ab1261c444fbcf70da875ffd))
+
 ## [2.0.4](https://github.com/bestlux/boundless/compare/v2.0.3...v2.0.4) (2026-03-08)
 
 
