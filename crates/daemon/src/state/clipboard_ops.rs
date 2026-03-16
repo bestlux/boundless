@@ -1,5 +1,15 @@
 use super::*;
 
+#[derive(Debug)]
+#[allow(dead_code)]
+struct OutgoingInputQueueReport {
+    enqueued: bool,
+    depth: usize,
+    dropped: Option<(u64, &'static str)>,
+    coalesced: Option<(u64, u64, usize)>,
+    high_water: Option<usize>,
+}
+
 fn drain_queue_up_to(
     queue: &mut VecDeque<OutboundPayload>,
     max_payloads: usize,
@@ -28,6 +38,117 @@ fn clipboard_payload_from_outbound_payload(payload: &OutboundPayload) -> Option<
         }
         _ => None,
     }
+}
+
+fn outbound_input_move_only_delta(payload: &OutboundPayload) -> Option<(u64, i64, i32, i32)> {
+    let OutboundPayload::InputFrame {
+        sequence,
+        timestamp_unix_ms,
+        events,
+    } = payload
+    else {
+        return None;
+    };
+
+    let mut dx = 0i32;
+    let mut dy = 0i32;
+    let mut saw_event = false;
+    for event in events {
+        let InputEvent::MouseMove {
+            dx: event_dx,
+            dy: event_dy,
+        } = event
+        else {
+            return None;
+        };
+        dx = dx.saturating_add(*event_dx);
+        dy = dy.saturating_add(*event_dy);
+        saw_event = true;
+    }
+
+    saw_event.then_some((*sequence, *timestamp_unix_ms, dx, dy))
+}
+
+fn replace_outbound_input_move_only(
+    payload: &mut OutboundPayload,
+    sequence: u64,
+    timestamp_unix_ms: i64,
+    dx: i32,
+    dy: i32,
+) -> usize {
+    let OutboundPayload::InputFrame {
+        sequence: payload_sequence,
+        timestamp_unix_ms: payload_timestamp,
+        events,
+    } = payload
+    else {
+        return 0;
+    };
+
+    *payload_sequence = sequence;
+    *payload_timestamp = timestamp_unix_ms;
+    *events = if dx == 0 && dy == 0 {
+        Vec::new()
+    } else {
+        vec![InputEvent::MouseMove { dx, dy }]
+    };
+    events.len()
+}
+
+fn try_coalesce_outgoing_input_back(
+    queue: &mut VecDeque<OutboundPayload>,
+    newer: &OutboundPayload,
+) -> Option<(u64, u64, usize)> {
+    let (older_sequence, _, older_dx, older_dy) = outbound_input_move_only_delta(queue.back()?)?;
+    let (newer_sequence, newer_timestamp, newer_dx, newer_dy) =
+        outbound_input_move_only_delta(newer)?;
+    let merged_dx = older_dx.saturating_add(newer_dx);
+    let merged_dy = older_dy.saturating_add(newer_dy);
+    let merged_event_count = replace_outbound_input_move_only(
+        queue.back_mut()?,
+        newer_sequence,
+        newer_timestamp,
+        merged_dx,
+        merged_dy,
+    );
+    if merged_event_count == 0 {
+        queue.pop_back();
+    }
+    Some((older_sequence, newer_sequence, merged_event_count))
+}
+
+fn try_coalesce_outgoing_input_front(
+    queue: &mut VecDeque<OutboundPayload>,
+    older: &OutboundPayload,
+) -> Option<(u64, u64, usize)> {
+    let (older_sequence, _, older_dx, older_dy) = outbound_input_move_only_delta(older)?;
+    let (newer_sequence, newer_timestamp, newer_dx, newer_dy) =
+        outbound_input_move_only_delta(queue.front()?)?;
+    let merged_dx = older_dx.saturating_add(newer_dx);
+    let merged_dy = older_dy.saturating_add(newer_dy);
+    let merged_event_count = replace_outbound_input_move_only(
+        queue.front_mut()?,
+        newer_sequence,
+        newer_timestamp,
+        merged_dx,
+        merged_dy,
+    );
+    if merged_event_count == 0 {
+        queue.pop_front();
+    }
+    Some((older_sequence, newer_sequence, merged_event_count))
+}
+
+fn remove_oldest_coalescible_outgoing_input(queue: &mut VecDeque<OutboundPayload>) -> Option<u64> {
+    let index = queue
+        .iter()
+        .position(|payload| outbound_input_move_only_delta(payload).is_some())?;
+    queue.remove(index).and_then(|payload| {
+        let OutboundPayload::InputFrame { sequence, .. } = payload else {
+            return None;
+        };
+        Some(sequence)
+    })
 }
 
 impl AppState {
@@ -206,15 +327,90 @@ impl AppState {
         self.notify_outgoing_flush_signal();
     }
 
-    async fn queue_outgoing_input_payload(&self, peer_id: &str, payload: OutboundPayload) {
+    async fn queue_outgoing_input_payload(
+        &self,
+        peer_id: &str,
+        payload: OutboundPayload,
+    ) -> OutgoingInputQueueReport {
+        let mut queue_map = self.outgoing_input_payloads.write().await;
+        let queue = queue_map.entry(peer_id.to_string()).or_default();
+
+        if let Some((older_sequence, newer_sequence, merged_event_count)) =
+            try_coalesce_outgoing_input_back(queue, &payload)
         {
-            let mut queue_map = self.outgoing_input_payloads.write().await;
-            queue_map
-                .entry(peer_id.to_string())
-                .or_default()
-                .push_back(payload);
+            let depth = queue.len();
+            drop(queue_map);
+            let high_water = self.observe_outgoing_input_high_water(peer_id, depth);
+            if let Some(depth) = high_water {
+                self.record_input_queue_high_water("outgoing_input", peer_id, depth);
+            }
+            self.record_input_queue_coalesced(
+                "outgoing_input",
+                peer_id,
+                older_sequence,
+                newer_sequence,
+                merged_event_count,
+            );
+            self.notify_outgoing_flush_signal();
+            return OutgoingInputQueueReport {
+                enqueued: true,
+                depth,
+                dropped: None,
+                coalesced: Some((older_sequence, newer_sequence, merged_event_count)),
+                high_water,
+            };
+        }
+
+        let incoming_is_move_only = outbound_input_move_only_delta(&payload).is_some();
+        let mut maybe_payload = Some(payload);
+        let mut dropped = None;
+        if queue.len() >= MAX_PENDING_OUTGOING_INPUT_FRAMES {
+            dropped = remove_oldest_coalescible_outgoing_input(queue)
+                .map(|sequence| (sequence, "evict_oldest_move"));
+
+            if dropped.is_none() {
+                if incoming_is_move_only {
+                    dropped = maybe_payload.as_ref().and_then(|payload| {
+                        let OutboundPayload::InputFrame { sequence, .. } = payload else {
+                            return None;
+                        };
+                        Some((*sequence, "drop_new_move"))
+                    });
+                    maybe_payload = None;
+                } else {
+                    dropped = queue.pop_front().and_then(|payload| {
+                        let OutboundPayload::InputFrame { sequence, .. } = payload else {
+                            return None;
+                        };
+                        Some((sequence, "evict_oldest_fallback"))
+                    });
+                }
+            }
+        }
+
+        let enqueued = maybe_payload.is_some();
+        if let Some(payload) = maybe_payload.take() {
+            queue.push_back(payload);
+        }
+        let depth = queue.len();
+        drop(queue_map);
+        let high_water = self.observe_outgoing_input_high_water(peer_id, depth);
+
+        if let Some((sequence, reason)) = dropped {
+            self.record_input_queue_overflow_drop("outgoing_input", peer_id, sequence, reason);
+        }
+
+        if let Some(depth) = high_water {
+            self.record_input_queue_high_water("outgoing_input", peer_id, depth);
         }
         self.notify_outgoing_flush_signal();
+        OutgoingInputQueueReport {
+            enqueued,
+            depth,
+            dropped,
+            coalesced: None,
+            high_water,
+        }
     }
 
     pub async fn queue_clipboard_text(&self, peer_id: &str, text: String) -> Result<()> {
@@ -644,10 +840,55 @@ impl AppState {
 
         let has_input = !split.input.is_empty();
         if has_input {
+            let mut coalesced = Vec::<(u64, u64, usize)>::new();
+            let mut dropped = Vec::<(u64, &'static str)>::new();
             let mut queue_map = self.outgoing_input_payloads.write().await;
             let queue = queue_map.entry(peer_id.to_string()).or_default();
             for payload in split.input.into_iter().rev() {
+                if let Some(result) = try_coalesce_outgoing_input_front(queue, &payload) {
+                    coalesced.push(result);
+                    continue;
+                }
+
+                let incoming_is_move_only = outbound_input_move_only_delta(&payload).is_some();
+                if queue.len() >= MAX_PENDING_OUTGOING_INPUT_FRAMES {
+                    if let Some(sequence) = remove_oldest_coalescible_outgoing_input(queue) {
+                        dropped.push((sequence, "evict_oldest_move"));
+                    } else if incoming_is_move_only {
+                        if let Some((sequence, _, _, _)) = outbound_input_move_only_delta(&payload)
+                        {
+                            dropped.push((sequence, "drop_new_move"));
+                        }
+                        continue;
+                    } else if let Some(sequence) = queue.pop_back().and_then(|payload| {
+                        let OutboundPayload::InputFrame { sequence, .. } = payload else {
+                            return None;
+                        };
+                        Some(sequence)
+                    }) {
+                        dropped.push((sequence, "evict_newest_fallback"));
+                    }
+                }
+
                 queue.push_front(payload);
+            }
+            let depth = queue.len();
+            drop(queue_map);
+
+            for (older_sequence, newer_sequence, merged_event_count) in coalesced {
+                self.record_input_queue_coalesced(
+                    "outgoing_input",
+                    peer_id,
+                    older_sequence,
+                    newer_sequence,
+                    merged_event_count,
+                );
+            }
+            for (sequence, reason) in dropped {
+                self.record_input_queue_overflow_drop("outgoing_input", peer_id, sequence, reason);
+            }
+            if let Some(depth) = self.observe_outgoing_input_high_water(peer_id, depth) {
+                self.record_input_queue_high_water("outgoing_input", peer_id, depth);
             }
         }
 
@@ -663,6 +904,18 @@ impl AppState {
         if restored_replay || has_input || has_bulk {
             self.notify_outgoing_flush_signal();
         }
+    }
+
+    fn observe_outgoing_input_high_water(&self, peer_id: &str, depth: usize) -> Option<usize> {
+        let Ok(mut high_water) = self.outgoing_input_high_water_by_peer.lock() else {
+            return None;
+        };
+        let entry = high_water.entry(peer_id.to_string()).or_insert(0);
+        if depth > *entry {
+            *entry = depth;
+            return Some(depth);
+        }
+        None
     }
 
     pub fn record_transport_event(&self, event: TransportEventRecord) {

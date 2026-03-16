@@ -35,20 +35,26 @@ impl AppState {
         display_name: &str,
         endpoint: SocketAddr,
     ) -> Option<DiscoveredPeerEndpoint> {
-        self.discovered_endpoints.write().await.insert(
+        let previous = self.discovered_endpoints.write().await.insert(
             machine_id.to_string(),
             DiscoveredPeerEndpoint {
                 display_name: display_name.to_string(),
                 endpoint,
             },
-        )
+        );
+        self.notify_peer_reconcile_wake("discovered_endpoint");
+        previous
     }
 
     pub async fn clear_discovered_endpoint(
         &self,
         machine_id: &str,
     ) -> Option<DiscoveredPeerEndpoint> {
-        self.discovered_endpoints.write().await.remove(machine_id)
+        let removed = self.discovered_endpoints.write().await.remove(machine_id);
+        if removed.is_some() {
+            self.notify_peer_reconcile_wake("discovered_endpoint_removed");
+        }
+        removed
     }
 
     pub async fn discovered_endpoints(&self) -> Vec<(String, DiscoveredPeerEndpoint)> {
@@ -89,6 +95,7 @@ impl AppState {
         save_config_at(&self.config_path, &config)?;
         drop(config);
         self.invalidate_cached_layout_matrix().await;
+        self.notify_input_capture_wake("layout_changed");
         Ok(())
     }
 
@@ -166,8 +173,12 @@ impl AppState {
 
         if name == "share_input" {
             self.input_router.write().await.set_enabled(enabled);
+            self.notify_input_inject_wake("share_input_toggled");
+            self.notify_input_capture_wake("share_input_toggled");
         } else if name == "share_clipboard" && !enabled {
             *self.clipboard_sync.write().await = ClipboardSyncState::default();
+        } else if name == "easy_mouse" || name == "wrap_mouse" {
+            self.notify_input_capture_wake("input_policy_toggled");
         }
 
         Ok(())

@@ -1,18 +1,132 @@
 use super::*;
 
+#[derive(Debug)]
+struct PendingInjectEnqueueReport {
+    enqueued: bool,
+    depth: usize,
+    dropped: Option<(PendingInjectInputFrame, &'static str)>,
+    coalesced: Option<(u64, u64, usize)>,
+    high_water: Option<usize>,
+}
+
+fn move_only_delta(events: &[InputEvent]) -> Option<(i32, i32)> {
+    let mut dx = 0i32;
+    let mut dy = 0i32;
+    let mut saw_event = false;
+    for event in events {
+        let InputEvent::MouseMove {
+            dx: event_dx,
+            dy: event_dy,
+        } = event
+        else {
+            return None;
+        };
+        dx = dx.saturating_add(*event_dx);
+        dy = dy.saturating_add(*event_dy);
+        saw_event = true;
+    }
+
+    saw_event.then_some((dx, dy))
+}
+
+fn try_coalesce_pending_inject_back(
+    queue: &mut VecDeque<PendingInjectInputFrame>,
+    newer: &PendingInjectInputFrame,
+) -> Option<(u64, u64, usize)> {
+    let last = queue.back_mut()?;
+    if last.peer_id != newer.peer_id {
+        return None;
+    }
+
+    let (older_dx, older_dy) = move_only_delta(&last.events)?;
+    let (newer_dx, newer_dy) = move_only_delta(&newer.events)?;
+    let merged_dx = older_dx.saturating_add(newer_dx);
+    let merged_dy = older_dy.saturating_add(newer_dy);
+    let older_sequence = last.sequence;
+    let newer_sequence = newer.sequence;
+
+    last.sequence = newer.sequence;
+    last.capture_timestamp_unix_ms = newer.capture_timestamp_unix_ms;
+    last.received_timestamp_unix_ms = newer.received_timestamp_unix_ms;
+    last.queued_timestamp_unix_ms = newer.queued_timestamp_unix_ms;
+    last.retry_count = newer.retry_count;
+    last.next_retry_at = newer.next_retry_at;
+    last.events = if merged_dx == 0 && merged_dy == 0 {
+        Vec::new()
+    } else {
+        vec![InputEvent::MouseMove {
+            dx: merged_dx,
+            dy: merged_dy,
+        }]
+    };
+    let merged_event_count = last.events.len();
+    if merged_event_count == 0 {
+        queue.pop_back();
+    }
+    Some((older_sequence, newer_sequence, merged_event_count))
+}
+
+fn remove_oldest_coalescible_pending_inject_frame(
+    queue: &mut VecDeque<PendingInjectInputFrame>,
+) -> Option<PendingInjectInputFrame> {
+    let index = queue
+        .iter()
+        .position(|frame| move_only_delta(&frame.events).is_some())?;
+    queue.remove(index)
+}
+
 impl AppState {
     async fn enqueue_pending_inject_input_frame(
         &self,
         frame: PendingInjectInputFrame,
-    ) -> (usize, Option<PendingInjectInputFrame>) {
+    ) -> PendingInjectEnqueueReport {
         let mut queue = self.pending_inject_input_frames.write().await;
-        let dropped = if queue.len() >= MAX_PENDING_INJECT_INPUT_FRAMES {
-            queue.pop_front()
-        } else {
-            None
-        };
-        queue.push_back(frame);
-        (queue.len(), dropped)
+        let incoming_is_move_only = move_only_delta(&frame.events).is_some();
+        if let Some((older_sequence, newer_sequence, merged_event_count)) =
+            try_coalesce_pending_inject_back(&mut queue, &frame)
+        {
+            let depth = queue.len();
+            let high_water = self.observe_pending_inject_high_water(depth);
+            return PendingInjectEnqueueReport {
+                enqueued: true,
+                depth,
+                dropped: None,
+                coalesced: Some((older_sequence, newer_sequence, merged_event_count)),
+                high_water,
+            };
+        }
+
+        let mut maybe_frame = Some(frame);
+        let mut dropped = None;
+        if queue.len() >= MAX_PENDING_INJECT_INPUT_FRAMES {
+            dropped = remove_oldest_coalescible_pending_inject_frame(&mut queue)
+                .map(|frame| (frame, "evict_oldest_move"));
+
+            if dropped.is_none() {
+                if incoming_is_move_only {
+                    dropped = maybe_frame.take().map(|frame| (frame, "drop_new_move"));
+                } else {
+                    dropped = queue
+                        .pop_front()
+                        .map(|frame| (frame, "evict_oldest_fallback"));
+                }
+            }
+        }
+
+        let enqueued = maybe_frame.is_some();
+        if let Some(frame) = maybe_frame.take() {
+            queue.push_back(frame);
+        }
+
+        let depth = queue.len();
+        let high_water = self.observe_pending_inject_high_water(depth);
+        PendingInjectEnqueueReport {
+            enqueued,
+            depth,
+            dropped,
+            coalesced: None,
+            high_water,
+        }
     }
 
     pub(crate) async fn clear_pending_inject_input_frames_for_peer(&self, peer_id: &str) {
@@ -176,8 +290,26 @@ impl AppState {
                 next_retry_at: None,
                 events: sink.events,
             };
-            let (depth, dropped) = self.enqueue_pending_inject_input_frame(pending).await;
-            if let Some(dropped) = dropped {
+            let report = self.enqueue_pending_inject_input_frame(pending).await;
+            if let Some((older_sequence, newer_sequence, merged_event_count)) = report.coalesced {
+                self.record_input_queue_coalesced(
+                    "inject",
+                    peer_id,
+                    older_sequence,
+                    newer_sequence,
+                    merged_event_count,
+                );
+            }
+            if let Some(depth) = report.high_water {
+                self.record_input_queue_high_water("inject", peer_id, depth);
+            }
+            if let Some((dropped, reason)) = report.dropped {
+                self.record_input_queue_overflow_drop(
+                    "inject",
+                    &dropped.peer_id,
+                    dropped.sequence,
+                    reason,
+                );
                 self.record_input_inject_dropped(
                     &dropped.peer_id,
                     dropped.sequence,
@@ -186,14 +318,17 @@ impl AppState {
                 )
                 .await;
             }
-            self.record_input_inject_queued(
-                peer_id,
-                frame.sequence,
-                frame.events.len(),
-                depth,
-                timing,
-            )
-            .await;
+            if report.enqueued {
+                self.notify_input_inject_wake("incoming_frame");
+                self.record_input_inject_queued(
+                    peer_id,
+                    frame.sequence,
+                    frame.events.len(),
+                    report.depth,
+                    timing,
+                )
+                .await;
+            }
         }
 
         self.record_transport_event(TransportEventRecord {
@@ -248,11 +383,75 @@ impl AppState {
 
         let mut queue = self.pending_inject_input_frames.write().await;
         for frame in frames {
+            if let Some((older_sequence, newer_sequence, merged_event_count)) =
+                try_coalesce_pending_inject_back(&mut queue, &frame)
+            {
+                self.record_input_queue_coalesced(
+                    "inject",
+                    "requeue",
+                    older_sequence,
+                    newer_sequence,
+                    merged_event_count,
+                );
+                continue;
+            }
+
             if queue.len() >= MAX_PENDING_INJECT_INPUT_FRAMES {
-                queue.pop_front();
+                let dropped = remove_oldest_coalescible_pending_inject_frame(&mut queue)
+                    .map(|frame| (frame, "evict_oldest_move"))
+                    .or_else(|| {
+                        queue
+                            .pop_front()
+                            .map(|frame| (frame, "evict_oldest_fallback"))
+                    });
+                if let Some((dropped, reason)) = dropped {
+                    self.record_input_queue_overflow_drop(
+                        "inject",
+                        &dropped.peer_id,
+                        dropped.sequence,
+                        reason,
+                    );
+                }
             }
             queue.push_back(frame);
         }
+        let depth = queue.len();
+        drop(queue);
+        if let Some(depth) = self.observe_pending_inject_high_water(depth) {
+            self.record_input_queue_high_water("inject", "requeue", depth);
+        }
+        self.notify_input_inject_wake("retry_requeue");
+    }
+
+    pub async fn has_pending_inject_input_frames(&self) -> bool {
+        !self.pending_inject_input_frames.read().await.is_empty()
+    }
+
+    pub async fn next_pending_inject_retry_at(&self) -> Option<Instant> {
+        self.pending_inject_input_frames
+            .read()
+            .await
+            .iter()
+            .filter_map(|frame| frame.next_retry_at)
+            .min()
+    }
+
+    fn observe_pending_inject_high_water(&self, depth: usize) -> Option<usize> {
+        let mut current = self
+            .pending_inject_high_water
+            .load(std::sync::atomic::Ordering::Relaxed);
+        while depth > current {
+            match self.pending_inject_high_water.compare_exchange(
+                current,
+                depth,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(depth),
+                Err(observed) => current = observed,
+            }
+        }
+        None
     }
 
     pub async fn record_input_inject_applied(
@@ -379,6 +578,7 @@ impl AppState {
 
     pub async fn note_input_owner_transition(&self) {
         *self.input_owner_last_changed_at.write().await = Some(std::time::Instant::now());
+        self.notify_input_inject_wake("input_owner_changed");
     }
 
     pub async fn input_owner(&self) -> Option<String> {
@@ -402,11 +602,14 @@ impl AppState {
 
         let mut target = self.input_capture_target_peer_id.write().await;
         *target = next.clone();
+        drop(target);
+        self.notify_input_capture_wake("capture_target_changed");
         Ok(next)
     }
 
     pub async fn clear_input_capture_target(&self) {
         *self.input_capture_target_peer_id.write().await = None;
+        self.notify_input_capture_wake("capture_target_cleared");
     }
 
     pub async fn input_capture_target(&self) -> Option<String> {

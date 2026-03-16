@@ -5,7 +5,10 @@ impl AppState {
         let mut generations = self.reconnect_generation_by_peer.write().await;
         let entry = generations.entry(peer_id.to_string()).or_insert(0);
         *entry += 1;
-        *entry
+        let generation = *entry;
+        drop(generations);
+        self.notify_peer_reconcile_wake("peer_reconnect_requested");
+        generation
     }
 
     pub async fn peer_reconnect_generation(&self, peer_id: &str) -> u64 {
@@ -59,6 +62,7 @@ impl AppState {
             ),
             size_bytes: 0,
         });
+        self.notify_peer_reconcile_wake("all_peers_reconnect_requested");
 
         Ok((disconnected_peers, aborted_sessions))
     }
@@ -202,6 +206,9 @@ impl AppState {
             {
                 *capture_target = None;
             }
+            drop(capture_target);
+            self.notify_input_capture_wake("all_peers_disconnected");
+            self.notify_peer_reconcile_wake("all_peers_disconnected");
         }
 
         Ok(disconnected_peer_ids.len())

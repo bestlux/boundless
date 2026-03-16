@@ -51,9 +51,9 @@ use windows_sys::Win32::{
     },
 };
 
-const INPUT_TICK: Duration = Duration::from_millis(5);
-const INPUT_CAPTURE_TICK: Duration = Duration::from_millis(8);
-const INPUT_INJECT_MAX_FRAMES_PER_TICK: usize = 24;
+const INPUT_RUNTIME_SAFETY_TICK: Duration = Duration::from_millis(50);
+const INPUT_INJECT_MAX_FRAMES_PER_WAKE: usize = 64;
+const INPUT_INJECT_WORK_QUANTUM: Duration = Duration::from_millis(2);
 const INPUT_INJECT_RETRY_BASE_BACKOFF_MS: u64 = 12;
 const INPUT_INJECT_RETRY_MAX_BACKOFF_MS: u64 = 160;
 const INPUT_INJECT_MAX_RETRIES: u8 = 5;
@@ -107,7 +107,8 @@ use runtime::{record_local_input_runtime_event, run};
 use windows_hook_runtime::{
     HookSenderGuard, captured_key_virtual_keys, is_hook_lock_active, mouse_button_from_virtual_key,
     mouse_button_virtual_keys, send_hook_event, set_hook_event_sender, set_hook_lock_active,
-    take_hook_dropped_event_count, update_escape_state_for_key, virtual_key_for_mouse_button,
+    set_hook_wake_state, take_hook_dropped_event_count, update_escape_state_for_key,
+    virtual_key_for_mouse_button,
 };
 #[cfg(windows)]
 use windows_hooks::{install_keyboard_hook, install_mouse_hook, run_hook_message_loop};
@@ -195,10 +196,10 @@ fn input_backend() -> Box<dyn InputBackend> {
     }
 }
 
-fn input_capture_backend() -> Box<dyn InputCaptureBackend> {
+fn input_capture_backend(state: &AppState) -> Box<dyn InputCaptureBackend> {
     #[cfg(windows)]
     {
-        match WindowsHookCaptureBackend::new() {
+        match WindowsHookCaptureBackend::new(state) {
             Ok(backend) => Box::new(backend),
             Err(error) => {
                 warn!(
@@ -393,7 +394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn perf_probe_inject_tick_backlog_throughput() {
+    async fn perf_probe_inject_wake_backlog_throughput() {
         let (state, peer_id, root) = state_with_peer_for_input_test().await;
         state
             .set_peer_connected(&peer_id, true)
@@ -416,7 +417,10 @@ mod tests {
                         source_peer_id: peer_id.clone(),
                         sequence,
                         timestamp_unix_ms: Utc::now().timestamp_millis(),
-                        events: vec![InputEvent::MouseMove { dx: 1, dy: 0 }],
+                        events: vec![InputEvent::Key {
+                            scan_code: sequence as u16,
+                            state: KeyState::Down,
+                        }],
                     },
                 )
                 .await
@@ -430,7 +434,7 @@ mod tests {
         let remaining = state.pending_inject_input_frame_count().await;
 
         eprintln!(
-            "PERF_PROBE inject_tick frame_count={} processed={} remaining={} elapsed_us={}",
+            "PERF_PROBE inject_wake frame_count={} processed={} remaining={} elapsed_us={}",
             frame_count,
             backend.applied,
             remaining,
@@ -490,7 +494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_caps_work_per_tick_and_leaves_remainder_queued() {
+    async fn drain_caps_work_per_wake_and_leaves_remainder_queued() {
         let (state, peer_id, root) = state_with_peer_for_input_test().await;
         state
             .set_peer_connected(&peer_id, true)
@@ -504,7 +508,7 @@ mod tests {
             "owner claim should succeed"
         );
 
-        let frame_count = INPUT_INJECT_MAX_FRAMES_PER_TICK + 8;
+        let frame_count = INPUT_INJECT_MAX_FRAMES_PER_WAKE + 8;
         for sequence in 1..=frame_count as u64 {
             state
                 .route_incoming_input_frame(
@@ -513,7 +517,10 @@ mod tests {
                         source_peer_id: peer_id.clone(),
                         sequence,
                         timestamp_unix_ms: Utc::now().timestamp_millis(),
-                        events: vec![InputEvent::MouseMove { dx: 1, dy: 0 }],
+                        events: vec![InputEvent::Key {
+                            scan_code: sequence as u16,
+                            state: KeyState::Down,
+                        }],
                     },
                 )
                 .await
@@ -521,23 +528,31 @@ mod tests {
         }
 
         let mut backend = CountingBackend { applied: 0 };
-        drain_pending_inject_frames(&state, &mut backend).await;
+        let first_outcome = drain_pending_inject_frames(&state, &mut backend).await;
         assert_eq!(
-            backend.applied, INPUT_INJECT_MAX_FRAMES_PER_TICK,
-            "first tick should be bounded by inject frame budget"
+            backend.applied, INPUT_INJECT_MAX_FRAMES_PER_WAKE,
+            "first wake should be bounded by inject frame budget"
         );
         assert_eq!(
             state.pending_inject_input_frame_count().await,
             8,
-            "remaining frames should stay queued for next tick"
+            "remaining frames should stay queued for the next wake"
+        );
+        assert!(
+            first_outcome.continue_immediately,
+            "ready backlog should request another immediate drain without waiting for a timer"
         );
 
-        drain_pending_inject_frames(&state, &mut backend).await;
+        let second_outcome = drain_pending_inject_frames(&state, &mut backend).await;
         assert_eq!(
             backend.applied, frame_count,
-            "second tick should drain the remaining frames"
+            "second wake should drain the remaining frames"
         );
         assert_eq!(state.pending_inject_input_frame_count().await, 0);
+        assert!(
+            !second_outcome.continue_immediately,
+            "once the backlog is drained there should be no immediate follow-up drain request"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -554,7 +569,12 @@ mod tests {
             .await
             .expect("set target");
 
-        let events = vec![InputEvent::MouseMove { dx: 1, dy: 1 }; MAX_EVENTS_PER_FRAME + 1];
+        let events = (0..=MAX_EVENTS_PER_FRAME)
+            .map(|index| InputEvent::Key {
+                scan_code: index as u16 + 1,
+                state: KeyState::Down,
+            })
+            .collect::<Vec<_>>();
         let mut backend = ScriptedCaptureBackend::new(vec![events], Vec::new());
         let mut last_target = None;
         let mut edge_switch_state = EdgeSwitchState::default();

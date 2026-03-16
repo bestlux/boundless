@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio::{
-    sync::{RwLock, watch},
+    sync::{Notify, RwLock, watch},
     task::AbortHandle,
 };
 use tracing::info;
@@ -38,6 +38,7 @@ use crate::config::{
 const MAX_TRANSPORT_EVENTS: usize = 512;
 const MAX_PENDING_REMOTE_CLIPBOARD_ITEMS: usize = 64;
 const MAX_PENDING_INJECT_INPUT_FRAMES: usize = 128;
+const MAX_PENDING_OUTGOING_INPUT_FRAMES: usize = 128;
 const MAX_PENDING_NEARBY_PAIRING_REQUESTS: usize = 128;
 const MAX_PENDING_NEARBY_CODE_CHALLENGES: usize = 64;
 const INPUT_OWNER_AUTO_STEAL_COOLDOWN_MS: u64 = 1_000;
@@ -167,6 +168,35 @@ impl PendingInjectInputFrame {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeWakeSignal {
+    notify: Notify,
+    pending: std::sync::atomic::AtomicBool,
+}
+
+impl RuntimeWakeSignal {
+    fn trigger(&self) -> bool {
+        !self.pending.swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    fn clear(&self) -> bool {
+        self.pending
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_pending(&self) -> bool {
+        self.clear()
+    }
+
+    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
+    fn notify_one(&self) {
+        self.notify.notify_one();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingNearbyPairingRequest {
     pub request_id: String,
@@ -273,6 +303,11 @@ pub struct AppState {
     reconnect_generation_by_peer: Arc<RwLock<HashMap<String, u64>>>,
     outgoing_flush_signal: watch::Sender<u64>,
     outgoing_flush_generation: Arc<std::sync::atomic::AtomicU64>,
+    input_capture_wake: Arc<RuntimeWakeSignal>,
+    input_inject_wake: Arc<RuntimeWakeSignal>,
+    peer_reconcile_wake: Arc<RuntimeWakeSignal>,
+    pending_inject_high_water: Arc<std::sync::atomic::AtomicUsize>,
+    outgoing_input_high_water_by_peer: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     pending_nearby_pairing_requests:
         Arc<RwLock<HashMap<String, PendingNearbyPairingRequestRecord>>>,
     nearby_pairing_decisions: Arc<RwLock<HashMap<String, NearbyPairingDecisionRecord>>>,
@@ -366,6 +401,11 @@ impl AppState {
             reconnect_generation_by_peer: Arc::new(RwLock::new(HashMap::new())),
             outgoing_flush_signal,
             outgoing_flush_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            input_capture_wake: Arc::new(RuntimeWakeSignal::default()),
+            input_inject_wake: Arc::new(RuntimeWakeSignal::default()),
+            peer_reconcile_wake: Arc::new(RuntimeWakeSignal::default()),
+            pending_inject_high_water: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            outgoing_input_high_water_by_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_nearby_pairing_requests: Arc::new(RwLock::new(HashMap::new())),
             nearby_pairing_decisions: Arc::new(RwLock::new(HashMap::new())),
             nearby_code_request_last_seen_by_ip: Arc::new(RwLock::new(HashMap::new())),
@@ -486,6 +526,110 @@ impl AppState {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .wrapping_add(1);
         let _ = self.outgoing_flush_signal.send(next);
+    }
+
+    fn record_runtime_wake(&self, channel: &str, source: &str) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: "runtime_wake".to_string(),
+            peer_id: "none".to_string(),
+            detail: format!("channel={channel} source={source}"),
+            size_bytes: 0,
+        });
+    }
+
+    pub(crate) fn notify_input_capture_wake(&self, source: &str) {
+        if self.input_capture_wake.trigger() {
+            self.record_runtime_wake("input_capture", source);
+            self.input_capture_wake.notify_one();
+        }
+    }
+
+    pub(crate) fn input_capture_wake_signal(&self) -> Arc<RuntimeWakeSignal> {
+        self.input_capture_wake.clone()
+    }
+
+    pub(crate) fn input_inject_wake_signal(&self) -> Arc<RuntimeWakeSignal> {
+        self.input_inject_wake.clone()
+    }
+
+    pub(crate) fn notify_input_inject_wake(&self, source: &str) {
+        if self.input_inject_wake.trigger() {
+            self.record_runtime_wake("input_inject", source);
+            self.input_inject_wake.notify_one();
+        }
+    }
+
+    pub(crate) fn notify_peer_reconcile_wake(&self, source: &str) {
+        if self.peer_reconcile_wake.trigger() {
+            self.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: "local".to_string(),
+                kind: "peer_reconcile_trigger".to_string(),
+                peer_id: "all".to_string(),
+                detail: format!("source={source}"),
+                size_bytes: 0,
+            });
+            self.peer_reconcile_wake.notify_one();
+        }
+    }
+
+    pub(crate) fn peer_reconcile_wake_signal(&self) -> Arc<RuntimeWakeSignal> {
+        self.peer_reconcile_wake.clone()
+    }
+
+    pub(crate) fn record_input_queue_high_water(
+        &self,
+        queue_name: &str,
+        peer_id: &str,
+        depth: usize,
+    ) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: "input_queue_high_water".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("queue={queue_name} depth={depth}"),
+            size_bytes: depth as u64,
+        });
+    }
+
+    pub(crate) fn record_input_queue_overflow_drop(
+        &self,
+        queue_name: &str,
+        peer_id: &str,
+        sequence: u64,
+        reason: &str,
+    ) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: "input_queue_overflow_drop".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("queue={queue_name} sequence={sequence} reason={reason}"),
+            size_bytes: 0,
+        });
+    }
+
+    pub(crate) fn record_input_queue_coalesced(
+        &self,
+        queue_name: &str,
+        peer_id: &str,
+        older_sequence: u64,
+        newer_sequence: u64,
+        merged_event_count: usize,
+    ) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: "input_queue_coalesced".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!(
+                "queue={queue_name} older_sequence={older_sequence} newer_sequence={newer_sequence} merged_events={merged_event_count}"
+            ),
+            size_bytes: merged_event_count as u64,
+        });
     }
 }
 
@@ -1926,7 +2070,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_input_injection_queue_drops_oldest_when_full() {
+    async fn pending_input_injection_queue_coalesces_adjacent_move_frames() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-input-coalesce-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim owner")
+        );
+
+        for sequence in 1..=2u64 {
+            state
+                .route_incoming_input_frame(
+                    &peer_id,
+                    InputFrame {
+                        source_peer_id: peer_id.clone(),
+                        sequence,
+                        timestamp_unix_ms: sequence as i64,
+                        events: vec![InputEvent::MouseMove {
+                            dx: sequence as i32,
+                            dy: 1,
+                        }],
+                    },
+                )
+                .await
+                .expect("route");
+        }
+
+        let merged = state
+            .dequeue_pending_inject_input_frame()
+            .await
+            .expect("first queued");
+        assert_eq!(
+            merged.sequence, 2,
+            "merged frame should keep newest sequence"
+        );
+        assert!(matches!(
+            merged.events.as_slice(),
+            [InputEvent::MouseMove { dx, dy }] if *dx == 3 && *dy == 2
+        ));
+        assert!(
+            state.dequeue_pending_inject_input_frame().await.is_none(),
+            "adjacent move frames should collapse into one queue entry"
+        );
+
+        let events = state.transport_events().await;
+        assert!(
+            events.iter().any(|event| {
+                event.kind == "input_queue_coalesced"
+                    && event.detail.contains("queue=inject")
+                    && event.peer_id == peer_id
+            }),
+            "inject coalescing should be observable in diagnostics"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn pending_input_injection_queue_drops_new_move_when_full_of_non_move_frames() {
         let root = std::env::temp_dir().join(format!(
             "boundless-input-overflow-test-{}",
             uuid::Uuid::new_v4()
@@ -1953,7 +2173,7 @@ mod tests {
                 .expect("claim owner")
         );
 
-        for sequence in 1..=(MAX_PENDING_INJECT_INPUT_FRAMES as u64 + 1) {
+        for sequence in 1..=(MAX_PENDING_INJECT_INPUT_FRAMES as u64) {
             state
                 .route_incoming_input_frame(
                     &peer_id,
@@ -1961,24 +2181,53 @@ mod tests {
                         source_peer_id: peer_id.clone(),
                         sequence,
                         timestamp_unix_ms: sequence as i64,
-                        events: vec![InputEvent::MouseMove { dx: 1, dy: 1 }],
+                        events: vec![InputEvent::Key {
+                            scan_code: (sequence % 64) as u16 + 1,
+                            state: KeyState::Down,
+                        }],
                     },
                 )
                 .await
                 .expect("route");
         }
 
+        state
+            .route_incoming_input_frame(
+                &peer_id,
+                InputFrame {
+                    source_peer_id: peer_id.clone(),
+                    sequence: MAX_PENDING_INJECT_INPUT_FRAMES as u64 + 1,
+                    timestamp_unix_ms: 999,
+                    events: vec![InputEvent::MouseMove { dx: 5, dy: 7 }],
+                },
+            )
+            .await
+            .expect("route overflow");
+
         let first = state
             .dequeue_pending_inject_input_frame()
             .await
             .expect("first queued");
-        assert_eq!(first.sequence, 2, "oldest frame should have been dropped");
+        assert_eq!(
+            first.sequence, 1,
+            "new move should be dropped before older non-move control events"
+        );
 
         let mut count = 1usize;
         while state.dequeue_pending_inject_input_frame().await.is_some() {
             count += 1;
         }
         assert_eq!(count, MAX_PENDING_INJECT_INPUT_FRAMES);
+
+        let events = state.transport_events().await;
+        assert!(
+            events.iter().any(|event| {
+                event.kind == "input_queue_overflow_drop"
+                    && event.detail.contains("queue=inject")
+                    && event.detail.contains("reason=drop_new_move")
+            }),
+            "overflow policy should record why the move frame was dropped"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2098,6 +2347,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_incoming_input_frame_notifies_inject_wake_signal() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-inject-wake-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim owner")
+        );
+
+        let signal = state.input_inject_wake_signal();
+        let notified = signal.notified();
+        tokio::pin!(notified);
+
+        state
+            .route_incoming_input_frame(
+                &peer_id,
+                InputFrame {
+                    source_peer_id: peer_id.clone(),
+                    sequence: 1,
+                    timestamp_unix_ms: 1,
+                    events: vec![InputEvent::MouseMove { dx: 1, dy: 1 }],
+                },
+            )
+            .await
+            .expect("route");
+
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut notified)
+            .await
+            .expect("inject wake should fire promptly");
+        assert!(
+            signal.take_pending(),
+            "inject wake should remain pending for the runtime loop"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn set_input_capture_target_notifies_capture_wake_signal() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-capture-wake-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        let signal = state.input_capture_wake_signal();
+        let notified = signal.notified();
+        tokio::pin!(notified);
+
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set target");
+
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut notified)
+            .await
+            .expect("capture wake should fire promptly");
+        assert!(
+            signal.take_pending(),
+            "capture wake should remain pending for the runtime loop"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn drain_outgoing_prioritizes_input_frames_over_bulk_payloads() {
         let root = std::env::temp_dir().join(format!(
             "boundless-outgoing-priority-test-{}",
@@ -2137,6 +2482,109 @@ mod tests {
             matches!(drained.get(1), Some(OutboundPayload::ClipboardText { .. })),
             "bulk payload should follow drained input frame"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn queue_input_events_coalesces_adjacent_move_frames() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-outgoing-input-coalesce-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        state
+            .queue_input_events(&peer_id, vec![InputEvent::MouseMove { dx: 2, dy: 3 }])
+            .await
+            .expect("queue move one");
+        state
+            .queue_input_events(&peer_id, vec![InputEvent::MouseMove { dx: -1, dy: 4 }])
+            .await
+            .expect("queue move two");
+
+        let queued = state.drain_outgoing(&peer_id).await;
+        assert_eq!(
+            queued.len(),
+            1,
+            "adjacent outgoing move frames should collapse"
+        );
+        assert!(matches!(
+            queued.first(),
+            Some(OutboundPayload::InputFrame { sequence: 2, events, .. })
+                if matches!(events.as_slice(), [InputEvent::MouseMove { dx, dy }] if *dx == 1 && *dy == 7)
+        ));
+
+        let events = state.transport_events().await;
+        assert!(
+            events.iter().any(|event| {
+                event.kind == "input_queue_coalesced"
+                    && event.detail.contains("queue=outgoing_input")
+                    && event.peer_id == peer_id
+            }),
+            "outgoing coalescing should be observable in diagnostics"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn requeue_outgoing_front_coalesces_move_frames_across_boundary() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-outgoing-requeue-coalesce-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("peer".to_string()),
+            )
+            .await
+            .expect("join peer");
+
+        state
+            .queue_input_events(&peer_id, vec![InputEvent::MouseMove { dx: 3, dy: 1 }])
+            .await
+            .expect("queue first");
+        let drained = state.drain_outgoing_input(&peer_id, 1).await;
+        state
+            .queue_input_events(&peer_id, vec![InputEvent::MouseMove { dx: 4, dy: -2 }])
+            .await
+            .expect("queue second");
+
+        state.requeue_outgoing_front(&peer_id, drained).await;
+
+        let queued = state.drain_outgoing(&peer_id).await;
+        assert_eq!(
+            queued.len(),
+            1,
+            "requeue boundary should still collapse adjacent moves"
+        );
+        assert!(matches!(
+            queued.first(),
+            Some(OutboundPayload::InputFrame { sequence: 2, events, .. })
+                if matches!(events.as_slice(), [InputEvent::MouseMove { dx, dy }] if *dx == 7 && *dy == -1)
+        ));
 
         let _ = std::fs::remove_dir_all(&root);
     }

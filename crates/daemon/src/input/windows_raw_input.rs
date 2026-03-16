@@ -174,7 +174,7 @@ fn process_raw_input_message(lparam: LPARAM) -> Result<()> {
 
     let mouse = unsafe { raw.data.mouse };
     if let Some((dx, dy)) = raw_mouse_relative_delta(&mouse) {
-        send_hook_event(HookCaptureEvent::MouseDelta { dx, dy });
+        send_hook_event(HookCaptureEvent::MouseDelta { dx, dy }, "raw_input");
     }
 
     Ok(())

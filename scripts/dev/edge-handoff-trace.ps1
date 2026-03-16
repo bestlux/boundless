@@ -7,9 +7,10 @@ param(
     [int]$PollMilliseconds = 150,
     [int]$EventsLimit = 200,
     [string]$OutputPath = "",
-    [int]$CaptureToApplyP95BudgetMs = 45,
-    [int]$CaptureToReceiveP95BudgetMs = 20,
-    [int]$CaptureToApplyJitterP95BudgetMs = 18,
+    [int]$CaptureToApplyP95BudgetMs = 25,
+    [int]$CaptureToReceiveP95BudgetMs = 10,
+    [int]$ReceiveToApplyP95BudgetMs = 8,
+    [int]$CaptureToApplyJitterP95BudgetMs = 10,
     [int]$ClockSkewThresholdMs = 500,
     [bool]$AdjustForClockSkew = $true,
     [switch]$EnforceBudgets
@@ -370,6 +371,12 @@ foreach ($target in $targets) {
         }
         if ($null -ne $effectiveReceiveP95 -and $effectiveReceiveP95 -gt $CaptureToReceiveP95BudgetMs) {
             throw "$receiveMetricName budget exceeded for ${label}: actual=${effectiveReceiveP95}ms budget=${CaptureToReceiveP95BudgetMs}ms"
+        }
+        if ($null -eq $summary.ReceiveToApplyP95) {
+            throw "receive_to_apply_p95 missing for ${label}"
+        }
+        if ($summary.ReceiveToApplyP95 -gt $ReceiveToApplyP95BudgetMs) {
+            throw "receive_to_apply_p95 budget exceeded for ${label}: actual=$($summary.ReceiveToApplyP95)ms budget=${ReceiveToApplyP95BudgetMs}ms"
         }
         if ($null -ne $effectiveJitterP95 -and $effectiveJitterP95 -gt $CaptureToApplyJitterP95BudgetMs) {
             throw "$jitterMetricName budget exceeded for ${label}: actual=${effectiveJitterP95}ms budget=${CaptureToApplyJitterP95BudgetMs}ms"

@@ -51,6 +51,11 @@ impl AppState {
             InputRouter::new(config.features.get("share_input").copied().unwrap_or(true));
         self.input_sequence_by_peer.write().await.clear();
         self.pending_inject_input_frames.write().await.clear();
+        self.pending_inject_high_water
+            .store(0, std::sync::atomic::Ordering::Release);
+        if let Ok(mut high_water) = self.outgoing_input_high_water_by_peer.lock() {
+            high_water.clear();
+        }
         *self.input_capture_target_peer_id.write().await = None;
         *self.input_owner_last_changed_at.write().await = None;
         *self.input_lock_active.write().await = false;

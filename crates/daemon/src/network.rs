@@ -51,11 +51,11 @@ use inbound::{
 };
 #[cfg(test)]
 use outbound::flush_outgoing_payloads;
-#[cfg(test)]
-use runtime::outbound_target_candidates;
 use runtime::{listener_loop, supervisor_loop};
 #[cfg(test)]
-use session::reconnect_requested_for_peer;
+use runtime::{outbound_target_candidates, wait_for_reconcile_or_backoff};
+#[cfg(test)]
+use session::{configure_low_latency_socket, reconnect_requested_for_peer};
 use session::{connect_and_run_outbound, handle_incoming_connection};
 #[cfg(test)]
 use tls::parse_server_name;
@@ -68,7 +68,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const OUTGOING_INPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(4);
 const OUTGOING_BULK_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH: usize = 4;
-const SUPERVISOR_TICK: Duration = Duration::from_secs(3);
+const SUPERVISOR_TICK: Duration = Duration::from_secs(1);
 const MAX_BACKOFF_SECONDS: u64 = 30;
 const MAX_WIRE_FRAME_BYTES: usize = MAX_WIRE_PAYLOAD_BYTES;
 const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
@@ -887,6 +887,101 @@ mod tests {
         assert!(
             reconnect_requested_for_peer(&state, &peer_id, &mut observed).await,
             "next generation should retrigger"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn configure_low_latency_socket_enables_tcp_nodelay() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("listener addr");
+
+        let client_task =
+            tokio::spawn(async move { TcpStream::connect(address).await.expect("connect client") });
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        let client_stream = client_task.await.expect("join client task");
+
+        configure_low_latency_socket(&client_stream).expect("configure client TCP_NODELAY");
+        configure_low_latency_socket(&server_stream).expect("configure server TCP_NODELAY");
+
+        assert!(
+            client_stream.nodelay().expect("client nodelay"),
+            "outbound transport socket should enable TCP_NODELAY"
+        );
+        assert!(
+            server_stream.nodelay().expect("server nodelay"),
+            "accepted transport socket should enable TCP_NODELAY"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovered_endpoint_wake_interrupts_reconcile_backoff() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let reconcile_wake = state.peer_reconcile_wake_signal();
+        let wait_task = tokio::spawn({
+            let reconcile_wake = reconcile_wake.clone();
+            async move {
+                wait_for_reconcile_or_backoff(&reconcile_wake, Duration::from_secs(30)).await;
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        state
+            .set_discovered_endpoint(
+                &peer_id,
+                "peer",
+                "127.0.0.1:15100".parse().expect("endpoint"),
+            )
+            .await;
+
+        tokio::time::timeout(Duration::from_millis(200), wait_task)
+            .await
+            .expect("discovered endpoint wake should interrupt reconcile backoff")
+            .expect("wait task should finish cleanly");
+
+        assert!(
+            state.transport_events().await.iter().any(|event| {
+                event.kind == "peer_reconcile_trigger"
+                    && event.detail.contains("source=discovered_endpoint")
+            }),
+            "discovered endpoint updates should emit an explicit reconcile trigger"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn reconnect_request_wake_interrupts_reconcile_backoff() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let reconcile_wake = state.peer_reconcile_wake_signal();
+        let wait_task = tokio::spawn({
+            let reconcile_wake = reconcile_wake.clone();
+            async move {
+                wait_for_reconcile_or_backoff(&reconcile_wake, Duration::from_secs(30)).await;
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let generation = state.request_peer_reconnect(&peer_id).await;
+
+        tokio::time::timeout(Duration::from_millis(200), wait_task)
+            .await
+            .expect("reconnect request wake should interrupt reconcile backoff")
+            .expect("wait task should finish cleanly");
+
+        assert_eq!(
+            generation, 1,
+            "first reconnect request should increment generation"
+        );
+        assert!(
+            state.transport_events().await.iter().any(|event| {
+                event.kind == "peer_reconcile_trigger"
+                    && event.detail.contains("source=peer_reconnect_requested")
+            }),
+            "explicit reconnect requests should emit an explicit reconcile trigger"
         );
 
         let _ = std::fs::remove_dir_all(root);

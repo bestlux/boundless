@@ -40,6 +40,9 @@ pub(super) async fn listener_loop(state: AppState, listener: TcpListener) {
 pub(super) async fn supervisor_loop(state: AppState) {
     let mut workers: HashMap<String, JoinHandle<()>> = HashMap::new();
     let mut worker_session_ids: HashMap<String, u64> = HashMap::new();
+    let reconcile_wake = state.peer_reconcile_wake_signal();
+    let mut safety_ticker = time::interval(SUPERVISOR_TICK);
+    safety_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     loop {
         let finished_peers = workers
@@ -88,12 +91,24 @@ pub(super) async fn supervisor_loop(state: AppState) {
             worker_session_ids.insert(peer.peer_id, session_id);
         }
 
-        time::sleep(SUPERVISOR_TICK).await;
+        let wake_notified = reconcile_wake.notified();
+        tokio::pin!(wake_notified);
+        if reconcile_wake.take_pending() {
+            continue;
+        }
+
+        tokio::select! {
+            _ = &mut wake_notified => {
+                let _ = reconcile_wake.take_pending();
+            }
+            _ = safety_ticker.tick() => {}
+        }
     }
 }
 
 async fn peer_worker(state: AppState, peer_id: String) {
     let mut backoff_secs: u64 = 1;
+    let reconcile_wake = state.peer_reconcile_wake_signal();
 
     loop {
         let Some(peer) = state.get_peer(&peer_id).await else {
@@ -104,7 +119,7 @@ async fn peer_worker(state: AppState, peer_id: String) {
         let discovered_endpoint = state.discovered_endpoint(&peer_id).await;
         let target_candidates = outbound_target_candidates(&peer.address, discovered_endpoint);
         if target_candidates.is_empty() {
-            time::sleep(Duration::from_secs(backoff_secs)).await;
+            wait_for_reconcile_or_backoff(&reconcile_wake, Duration::from_secs(backoff_secs)).await;
             backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECONDS);
             continue;
         }
@@ -137,9 +152,27 @@ async fn peer_worker(state: AppState, peer_id: String) {
                 warn!(%mark_error, "failed to mark peer disconnected");
             }
 
-            time::sleep(Duration::from_secs(backoff_secs)).await;
+            wait_for_reconcile_or_backoff(&reconcile_wake, Duration::from_secs(backoff_secs)).await;
             backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECONDS);
         }
+    }
+}
+
+pub(super) async fn wait_for_reconcile_or_backoff(
+    reconcile_wake: &std::sync::Arc<crate::state::RuntimeWakeSignal>,
+    backoff: Duration,
+) {
+    let wake_notified = reconcile_wake.notified();
+    tokio::pin!(wake_notified);
+    if reconcile_wake.take_pending() {
+        return;
+    }
+
+    tokio::select! {
+        _ = &mut wake_notified => {
+            let _ = reconcile_wake.take_pending();
+        }
+        _ = time::sleep(backoff) => {}
     }
 }
 

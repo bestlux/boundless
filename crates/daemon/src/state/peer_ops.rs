@@ -24,6 +24,8 @@ impl AppState {
 
         config.peers.push(peer);
         save_config_at(&self.config_path, &config)?;
+        drop(config);
+        self.notify_peer_reconcile_wake("peer_joined");
         Ok(peer_id)
     }
 
@@ -77,6 +79,8 @@ impl AppState {
                 *capture_target = None;
             }
             let _ = remove_trust_record(&self.security_paths, peer_id)?;
+            self.notify_input_capture_wake("peer_removed");
+            self.notify_peer_reconcile_wake("peer_removed");
         }
         Ok(removed)
     }
@@ -126,6 +130,7 @@ impl AppState {
             self.clear_pending_clipboard_replay_for_peer(peer_id).await;
             self.clear_obsolete_inflight_clipboard_replays_for_peer(peer_id)
                 .await;
+            self.notify_input_capture_wake("peer_disconnected");
         } else if transitioned_to_connected
             && !self
                 .has_current_clipboard_replay_delivery_pending_for_peer(peer_id)
@@ -136,6 +141,12 @@ impl AppState {
         {
             self.notify_outgoing_flush_signal();
         }
+
+        self.notify_peer_reconcile_wake(if connected {
+            "peer_connected"
+        } else {
+            "peer_disconnected"
+        });
 
         Ok(())
     }

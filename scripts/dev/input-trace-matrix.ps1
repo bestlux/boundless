@@ -5,9 +5,10 @@ param(
     [string]$OutputJsonPath = "",
     [string]$Scenario = "trace",
     [string]$Topology = "",
-    [int]$CaptureToApplyP95BudgetMs = 45,
-    [int]$CaptureToReceiveP95BudgetMs = 20,
-    [int]$CaptureToApplyJitterP95BudgetMs = 18
+    [int]$CaptureToApplyP95BudgetMs = 25,
+    [int]$CaptureToReceiveP95BudgetMs = 10,
+    [int]$ReceiveToApplyP95BudgetMs = 8,
+    [int]$CaptureToApplyJitterP95BudgetMs = 10
 )
 
 Set-StrictMode -Version Latest
@@ -163,11 +164,17 @@ foreach ($tracePath in $TracePaths) {
         if ($receiveCountValue -le 0) {
             $violations.Add("no_capture_to_receive_samples")
         }
+        if ($null -eq $receiveToApplyCount -or $receiveToApplyCount -le 0) {
+            $violations.Add("no_receive_to_apply_samples")
+        }
         if ($null -ne $effectiveApplyP95 -and $effectiveApplyP95 -gt $CaptureToApplyP95BudgetMs) {
             $violations.Add($applyBudgetMetric)
         }
         if ($null -ne $effectiveReceiveP95 -and $effectiveReceiveP95 -gt $CaptureToReceiveP95BudgetMs) {
             $violations.Add($receiveBudgetMetric)
+        }
+        if ($null -ne $receiveToApplyP95 -and $receiveToApplyP95 -gt $ReceiveToApplyP95BudgetMs) {
+            $violations.Add("receive_to_apply_p95")
         }
         if ($null -ne $effectiveJitterP95 -and $effectiveJitterP95 -gt $CaptureToApplyJitterP95BudgetMs) {
             $violations.Add($jitterBudgetMetric)
@@ -209,6 +216,7 @@ foreach ($tracePath in $TracePaths) {
                 capture_to_apply_jitter_budget_metric   = $jitterBudgetMetric
                 budget_capture_to_apply_p95_ms          = $CaptureToApplyP95BudgetMs
                 budget_capture_to_receive_p95_ms        = $CaptureToReceiveP95BudgetMs
+                budget_receive_to_apply_p95_ms          = $ReceiveToApplyP95BudgetMs
                 budget_capture_to_apply_jitter_p95_ms   = $CaptureToApplyJitterP95BudgetMs
             })
     }

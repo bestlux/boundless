@@ -30,6 +30,7 @@ pub(super) async fn connect_and_run_outbound(
     let socket = TcpStream::connect(address)
         .await
         .with_context(|| format!("tcp connect {address}"))?;
+    configure_low_latency_socket(&socket).context("configure outbound low-latency socket")?;
 
     let connector = build_tls_connector(&state).await?;
     let server_name = parse_server_name_for_peer(peer_id, address)?;
@@ -53,6 +54,7 @@ pub(super) async fn handle_incoming_connection(
     socket: TcpStream,
     session_registration_id: Option<u64>,
 ) -> Result<()> {
+    configure_low_latency_socket(&socket).context("configure inbound low-latency socket")?;
     let acceptor = build_tls_acceptor(&state).await?;
     let stream = acceptor.accept(socket).await.context("tls accept")?;
     let result = run_session(
@@ -69,6 +71,11 @@ pub(super) async fn handle_incoming_connection(
     }
 
     result
+}
+
+pub(super) fn configure_low_latency_socket(socket: &TcpStream) -> Result<()> {
+    socket.set_nodelay(true).context("set TCP_NODELAY")?;
+    Ok(())
 }
 
 async fn run_session<S>(

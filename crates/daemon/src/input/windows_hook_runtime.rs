@@ -6,6 +6,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use super::*;
+use crate::state::AppState;
 
 const VK_LBUTTON_CODE: u16 = 0x01;
 const VK_RBUTTON_CODE: u16 = 0x02;
@@ -18,6 +19,7 @@ const VK_RCONTROL_CODE: u16 = 0xA3;
 
 static HOOK_EVENT_SENDER: OnceLock<Mutex<Option<mpsc::SyncSender<HookCaptureEvent>>>> =
     OnceLock::new();
+static HOOK_WAKE_STATE: OnceLock<Mutex<Option<AppState>>> = OnceLock::new();
 static HOOK_RUNTIME_STATE: OnceLock<Mutex<HookRuntimeState>> = OnceLock::new();
 static HOOK_LOCK_ACTIVE: AtomicBool = AtomicBool::new(false);
 static HOOK_DROPPED_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -119,6 +121,7 @@ pub(super) struct HookSenderGuard;
 impl Drop for HookSenderGuard {
     fn drop(&mut self) {
         let _ = set_hook_event_sender(None);
+        let _ = set_hook_wake_state(None);
     }
 }
 
@@ -136,14 +139,34 @@ pub(super) fn set_hook_event_sender(
     Ok(())
 }
 
-pub(super) fn send_hook_event(event: HookCaptureEvent) {
+fn hook_wake_state_cell() -> &'static Mutex<Option<AppState>> {
+    HOOK_WAKE_STATE.get_or_init(|| Mutex::new(None))
+}
+
+pub(super) fn set_hook_wake_state(state: Option<AppState>) -> Result<()> {
+    let mut guard = hook_wake_state_cell()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("hook wake mutex poisoned"))?;
+    *guard = state;
+    Ok(())
+}
+
+pub(super) fn send_hook_event(event: HookCaptureEvent, source: &'static str) {
     let sender = hook_sender_cell()
         .lock()
         .ok()
         .and_then(|guard| guard.as_ref().cloned());
     if let Some(sender) = sender {
         match sender.try_send(event) {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Some(state) = hook_wake_state_cell()
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().cloned())
+                {
+                    state.notify_input_capture_wake(source);
+                }
+            }
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 HOOK_DROPPED_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
             }
@@ -226,4 +249,70 @@ pub(super) fn update_escape_state_for_key(vk_code: u16, key_state: core_input::K
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::AppState;
+    use core_input::{InputEvent, KeyState};
+
+    #[tokio::test]
+    async fn send_hook_event_notifies_capture_wake_and_records_source() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-hook-runtime-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        let (sender, receiver) = mpsc::sync_channel::<HookCaptureEvent>(4);
+        set_hook_event_sender(Some(sender)).expect("set hook event sender");
+        set_hook_wake_state(Some(state.clone())).expect("set hook wake state");
+
+        let signal = state.input_capture_wake_signal();
+        let notified = signal.notified();
+        tokio::pin!(notified);
+
+        send_hook_event(
+            HookCaptureEvent::Input(InputEvent::Key {
+                scan_code: 30,
+                state: KeyState::Down,
+            }),
+            "raw_input",
+        );
+
+        let received = receiver
+            .recv_timeout(Duration::from_millis(200))
+            .expect("hook event should be forwarded into the queue");
+        assert!(matches!(
+            received,
+            HookCaptureEvent::Input(InputEvent::Key {
+                scan_code: 30,
+                state: KeyState::Down
+            })
+        ));
+
+        tokio::time::timeout(Duration::from_millis(200), &mut notified)
+            .await
+            .expect("capture wake should be observed immediately after queueing");
+        assert!(
+            signal.take_pending(),
+            "capture wake should remain pending for the runtime loop"
+        );
+        assert!(
+            state.transport_events().await.iter().any(|event| {
+                event.kind == "runtime_wake"
+                    && event.detail.contains("channel=input_capture")
+                    && event.detail.contains("source=raw_input")
+            }),
+            "hook capture wake should record the source in diagnostics"
+        );
+
+        set_hook_wake_state(None).expect("clear hook wake state");
+        set_hook_event_sender(None).expect("clear hook event sender");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -1,8 +1,13 @@
 use super::*;
 
+#[derive(Debug, Default)]
+pub(super) struct InjectDrainOutcome {
+    pub(super) continue_immediately: bool,
+}
+
 pub(super) async fn run(state: AppState) -> Result<()> {
     let mut inject_backend = input_backend();
-    let mut capture_backend = input_capture_backend();
+    let mut capture_backend = input_capture_backend(&state);
     state
         .set_input_lock_runtime(false, capture_backend.lock_supported())
         .await;
@@ -14,51 +19,141 @@ pub(super) async fn run(state: AppState) -> Result<()> {
         "none",
     )
     .await;
-    let mut inject_ticker = time::interval(INPUT_TICK);
-    let mut capture_ticker = time::interval(INPUT_CAPTURE_TICK);
-    inject_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    capture_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let capture_wake = state.input_capture_wake_signal();
+    let inject_wake = state.input_inject_wake_signal();
+    let mut safety_ticker = time::interval(INPUT_RUNTIME_SAFETY_TICK);
+    safety_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut last_capture_target: Option<String> = None;
     let mut edge_switch_state = EdgeSwitchState::default();
 
+    capture_and_queue_outgoing_frames(
+        &state,
+        capture_backend.as_mut(),
+        &mut last_capture_target,
+        &mut edge_switch_state,
+    )
+    .await;
+
     loop {
-        tokio::select! {
-            _ = inject_ticker.tick() => {
-                drain_pending_inject_frames(&state, inject_backend.as_mut()).await;
+        let mut run_capture = capture_wake.take_pending();
+        let mut run_inject = inject_wake.take_pending();
+        let next_retry_at = state.next_pending_inject_retry_at().await;
+
+        if !run_capture && !run_inject {
+            let capture_notified = capture_wake.notified();
+            let inject_notified = inject_wake.notified();
+            tokio::pin!(capture_notified);
+            tokio::pin!(inject_notified);
+
+            if let Some(deadline) = next_retry_at {
+                let retry_sleep = time::sleep_until(deadline.into());
+                tokio::pin!(retry_sleep);
+                tokio::select! {
+                    _ = &mut capture_notified => {
+                        run_capture = capture_wake.take_pending();
+                    }
+                    _ = &mut inject_notified => {
+                        run_inject = inject_wake.take_pending();
+                    }
+                    _ = &mut retry_sleep => {
+                        run_inject = true;
+                        record_local_input_runtime_event(
+                            &state,
+                            "input_runtime_wake",
+                            "channel=input_inject source=retry_deadline",
+                            "none",
+                        )
+                        .await;
+                    }
+                    _ = safety_ticker.tick() => {
+                        run_capture = true;
+                        run_inject = true;
+                        record_local_input_runtime_event(
+                            &state,
+                            "input_runtime_wake",
+                            "channel=all source=safety_tick",
+                            "none",
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = &mut capture_notified => {
+                        run_capture = capture_wake.take_pending();
+                    }
+                    _ = &mut inject_notified => {
+                        run_inject = inject_wake.take_pending();
+                    }
+                    _ = safety_ticker.tick() => {
+                        run_capture = true;
+                        run_inject = true;
+                        record_local_input_runtime_event(
+                            &state,
+                            "input_runtime_wake",
+                            "channel=all source=safety_tick",
+                            "none",
+                        )
+                        .await;
+                    }
+                }
             }
-            _ = capture_ticker.tick() => {
-                capture_and_queue_outgoing_frames(
+        }
+
+        if run_capture {
+            capture_and_queue_outgoing_frames(
+                &state,
+                capture_backend.as_mut(),
+                &mut last_capture_target,
+                &mut edge_switch_state,
+            )
+            .await;
+            let next_mode = capture_backend.backend_mode();
+            if next_mode != capture_backend_mode {
+                capture_backend_mode = next_mode;
+                record_local_input_runtime_event(
                     &state,
-                    capture_backend.as_mut(),
-                    &mut last_capture_target,
-                    &mut edge_switch_state,
+                    "input_capture_backend_mode",
+                    capture_backend_mode,
+                    "none",
                 )
                 .await;
-                let next_mode = capture_backend.backend_mode();
-                if next_mode != capture_backend_mode {
-                    capture_backend_mode = next_mode;
-                    record_local_input_runtime_event(
-                        &state,
-                        "input_capture_backend_mode",
-                        capture_backend_mode,
-                        "none",
-                    )
-                    .await;
-                }
+            }
+        }
+
+        if run_inject {
+            let outcome = drain_pending_inject_frames(&state, inject_backend.as_mut()).await;
+            if outcome.continue_immediately {
+                continue;
             }
         }
     }
 }
 
-pub(super) async fn drain_pending_inject_frames(state: &AppState, backend: &mut dyn InputBackend) {
+pub(super) async fn drain_pending_inject_frames(
+    state: &AppState,
+    backend: &mut dyn InputBackend,
+) -> InjectDrainOutcome {
     let frames = state
-        .dequeue_pending_inject_input_frames_up_to(INPUT_INJECT_MAX_FRAMES_PER_TICK)
+        .dequeue_pending_inject_input_frames_up_to(INPUT_INJECT_MAX_FRAMES_PER_WAKE)
         .await;
     if frames.is_empty() {
-        return;
+        return InjectDrainOutcome::default();
     }
+
+    let started = std::time::Instant::now();
     let mut deferred_frames = Vec::new();
-    for mut frame in frames {
+    let mut processed = 0usize;
+    let mut remaining = frames.into_iter();
+    while let Some(mut frame) = remaining.next() {
+        if processed >= INPUT_INJECT_MAX_FRAMES_PER_WAKE
+            || started.elapsed() >= INPUT_INJECT_WORK_QUANTUM
+        {
+            deferred_frames.push(frame);
+            deferred_frames.extend(remaining);
+            break;
+        }
+
         if frame
             .next_retry_at
             .is_some_and(|next| std::time::Instant::now() < next)
@@ -145,12 +240,23 @@ pub(super) async fn drain_pending_inject_frames(state: &AppState, backend: &mut 
                 deferred_frames.push(frame);
             }
         }
+        processed += 1;
     }
 
     if !deferred_frames.is_empty() {
         state
             .requeue_pending_inject_input_frames_back(deferred_frames)
             .await;
+    }
+
+    let now = std::time::Instant::now();
+    let continue_immediately = state.has_pending_inject_input_frames().await
+        && state
+            .next_pending_inject_retry_at()
+            .await
+            .is_none_or(|next| next <= now);
+    InjectDrainOutcome {
+        continue_immediately,
     }
 }
 

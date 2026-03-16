@@ -62,15 +62,16 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 if (keyboard.flags & LLKHF_EXTENDED_MASK) != 0 {
                     scan_code |= 0xE000;
                 }
-                send_hook_event(HookCaptureEvent::Input(InputEvent::Key {
-                    scan_code,
-                    state,
-                }));
+                send_hook_event(
+                    HookCaptureEvent::Input(InputEvent::Key { scan_code, state }),
+                    "keyboard_hook",
+                );
 
                 if lock_active && update_escape_state_for_key(keyboard.vkCode as u16, state) {
-                    send_hook_event(HookCaptureEvent::Control(
-                        CaptureControlAction::EscapeUnlock,
-                    ));
+                    send_hook_event(
+                        HookCaptureEvent::Control(CaptureControlAction::EscapeUnlock),
+                        "keyboard_hook",
+                    );
                 }
             }
         }
@@ -92,41 +93,56 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
             lock_active = is_hook_lock_active();
             match wparam as u32 {
                 WM_MOUSEMOVE => {
-                    send_hook_event(HookCaptureEvent::MousePosition {
-                        x: mouse.pt.x,
-                        y: mouse.pt.y,
-                    });
+                    send_hook_event(
+                        HookCaptureEvent::MousePosition {
+                            x: mouse.pt.x,
+                            y: mouse.pt.y,
+                        },
+                        "mouse_hook",
+                    );
                 }
-                WM_LBUTTONDOWN => {
-                    send_hook_event(HookCaptureEvent::Input(InputEvent::MouseButton {
+                WM_LBUTTONDOWN => send_hook_event(
+                    HookCaptureEvent::Input(InputEvent::MouseButton {
                         button: core_input::MouseButton::Left,
                         state: core_input::KeyState::Down,
-                    }))
-                }
-                WM_LBUTTONUP => send_hook_event(HookCaptureEvent::Input(InputEvent::MouseButton {
-                    button: core_input::MouseButton::Left,
-                    state: core_input::KeyState::Up,
-                })),
-                WM_RBUTTONDOWN => {
-                    send_hook_event(HookCaptureEvent::Input(InputEvent::MouseButton {
+                    }),
+                    "mouse_hook",
+                ),
+                WM_LBUTTONUP => send_hook_event(
+                    HookCaptureEvent::Input(InputEvent::MouseButton {
+                        button: core_input::MouseButton::Left,
+                        state: core_input::KeyState::Up,
+                    }),
+                    "mouse_hook",
+                ),
+                WM_RBUTTONDOWN => send_hook_event(
+                    HookCaptureEvent::Input(InputEvent::MouseButton {
                         button: core_input::MouseButton::Right,
                         state: core_input::KeyState::Down,
-                    }))
-                }
-                WM_RBUTTONUP => send_hook_event(HookCaptureEvent::Input(InputEvent::MouseButton {
-                    button: core_input::MouseButton::Right,
-                    state: core_input::KeyState::Up,
-                })),
-                WM_MBUTTONDOWN => {
-                    send_hook_event(HookCaptureEvent::Input(InputEvent::MouseButton {
+                    }),
+                    "mouse_hook",
+                ),
+                WM_RBUTTONUP => send_hook_event(
+                    HookCaptureEvent::Input(InputEvent::MouseButton {
+                        button: core_input::MouseButton::Right,
+                        state: core_input::KeyState::Up,
+                    }),
+                    "mouse_hook",
+                ),
+                WM_MBUTTONDOWN => send_hook_event(
+                    HookCaptureEvent::Input(InputEvent::MouseButton {
                         button: core_input::MouseButton::Middle,
                         state: core_input::KeyState::Down,
-                    }))
-                }
-                WM_MBUTTONUP => send_hook_event(HookCaptureEvent::Input(InputEvent::MouseButton {
-                    button: core_input::MouseButton::Middle,
-                    state: core_input::KeyState::Up,
-                })),
+                    }),
+                    "mouse_hook",
+                ),
+                WM_MBUTTONUP => send_hook_event(
+                    HookCaptureEvent::Input(InputEvent::MouseButton {
+                        button: core_input::MouseButton::Middle,
+                        state: core_input::KeyState::Up,
+                    }),
+                    "mouse_hook",
+                ),
                 WM_XBUTTONDOWN | WM_XBUTTONUP => {
                     let button = match high_word(mouse.mouseData) {
                         XBUTTON1_DATA => Some(core_input::MouseButton::X1),
@@ -134,26 +150,33 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                         _ => None,
                     };
                     if let Some(button) = button {
-                        send_hook_event(HookCaptureEvent::Input(InputEvent::MouseButton {
-                            button,
-                            state: if (wparam as u32) == WM_XBUTTONDOWN {
-                                core_input::KeyState::Down
-                            } else {
-                                core_input::KeyState::Up
-                            },
-                        }));
+                        send_hook_event(
+                            HookCaptureEvent::Input(InputEvent::MouseButton {
+                                button,
+                                state: if (wparam as u32) == WM_XBUTTONDOWN {
+                                    core_input::KeyState::Down
+                                } else {
+                                    core_input::KeyState::Up
+                                },
+                            }),
+                            "mouse_hook",
+                        );
                     }
                 }
-                WM_MOUSEWHEEL => send_hook_event(HookCaptureEvent::Input(InputEvent::MouseWheel {
-                    delta_x: 0,
-                    delta_y: signed_high_word(mouse.mouseData),
-                })),
-                WM_MOUSEHWHEEL => {
-                    send_hook_event(HookCaptureEvent::Input(InputEvent::MouseWheel {
+                WM_MOUSEWHEEL => send_hook_event(
+                    HookCaptureEvent::Input(InputEvent::MouseWheel {
+                        delta_x: 0,
+                        delta_y: signed_high_word(mouse.mouseData),
+                    }),
+                    "mouse_hook",
+                ),
+                WM_MOUSEHWHEEL => send_hook_event(
+                    HookCaptureEvent::Input(InputEvent::MouseWheel {
                         delta_x: signed_high_word(mouse.mouseData),
                         delta_y: 0,
-                    }))
-                }
+                    }),
+                    "mouse_hook",
+                ),
                 _ => {}
             }
         }

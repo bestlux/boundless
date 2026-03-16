@@ -1,7 +1,7 @@
 use super::*;
 
 impl WindowsHookCaptureBackend {
-    pub(super) fn new() -> Result<Self> {
+    pub(super) fn new(state: &AppState) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::sync_channel::<HookCaptureEvent>(HOOK_EVENT_QUEUE_CAP);
         let (startup_tx, startup_rx) = mpsc::channel::<Result<u32>>();
 
@@ -47,6 +47,7 @@ impl WindowsHookCaptureBackend {
         });
 
         let hook_thread_id = startup_rx.recv().context("hook startup channel closed")??;
+        set_hook_wake_state(Some(state.clone())).context("set hook wake state")?;
         let (raw_input_thread_id, raw_input_thread, raw_input_enabled) =
             match spawn_raw_input_thread() {
                 Ok((thread_id, thread)) => (Some(thread_id), Some(thread), true),
