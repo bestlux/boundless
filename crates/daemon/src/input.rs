@@ -213,6 +213,7 @@ fn input_capture_backend(state: &AppState) -> Box<dyn InputCaptureBackend> {
 
     #[cfg(not(windows))]
     {
+        let _ = state;
         Box::new(NoopCaptureBackend)
     }
 }

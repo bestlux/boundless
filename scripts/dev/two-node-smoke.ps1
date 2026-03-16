@@ -630,10 +630,10 @@ try {
         Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId" -Seconds $TimeoutSeconds
         Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=input_frame peer_id=$node2PeerId" -Seconds $TimeoutSeconds
 
-        $outgoingInputFrameCountBeforeKey = Get-TransportEventMatchCount -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId"
+        $incomingInputFrameCountBeforeKey = Get-TransportEventMatchCount -Endpoint $node2Endpoint -Pattern "direction=incoming kind=input_frame peer_id=$node2PeerId"
         $appliedInjectCountBeforeKey = Get-TransportEventMatchCount -Endpoint $node2Endpoint -Pattern "direction=local kind=input_inject_applied peer_id=$node2PeerId"
         Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "send-key", $node1PeerId, "30", "down") | Out-Host
-        Wait-ForTransportEventCount -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=input_frame peer_id=$node1PeerId" -ExpectedMinCount ($outgoingInputFrameCountBeforeKey + 1) -Seconds $TimeoutSeconds
+        Wait-ForTransportEventCount -Endpoint $node2Endpoint -Pattern "direction=incoming kind=input_frame peer_id=$node2PeerId" -ExpectedMinCount ($incomingInputFrameCountBeforeKey + 1) -Seconds $TimeoutSeconds
         Wait-ForTransportEventCount -Endpoint $node2Endpoint -Pattern "direction=local kind=input_inject_applied peer_id=$node2PeerId" -ExpectedMinCount ($appliedInjectCountBeforeKey + 1) -Seconds $TimeoutSeconds
         Invoke-CliChecked -Endpoint $node2Endpoint -CommandArgs @("input", "release", $node2PeerId) | Out-Host
         Wait-ForInputOwner -Endpoint $node2Endpoint -ExpectedOwner "none" -Seconds $TimeoutSeconds
