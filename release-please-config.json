@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "release-type": "rust",
+  "release-type": "simple",
   "draft": true,
   "force-tag-creation": true,
   "include-component-in-tag": false,
@@ -10,14 +10,66 @@
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
         {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/cli/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/core-clipboard/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/core-discovery/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/core-input/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/core-protocol/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/core-security/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/core-transfer/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/daemon/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/ipc-api/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/tray/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
           "type": "json",
           "path": "packaging/windows/package-manifest.json",
           "jsonpath": "$.version"
         }
       ]
     }
-  },
-  "plugins": [
-    "cargo-workspace"
-  ]
+  }
 }
