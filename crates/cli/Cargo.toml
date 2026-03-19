@@ -1,6 +1,6 @@
 [package]
 name = "boundless-cli"
-version.workspace = true
+version = "2.0.4"
 edition.workspace = true
 license.workspace = true
 
