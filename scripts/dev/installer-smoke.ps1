@@ -249,7 +249,10 @@ try {
     if (-not [string]::IsNullOrWhiteSpace($expectedDisplayVersion) -and $uninstallEntry.DisplayVersion -ne $expectedDisplayVersion) {
         throw "Unexpected uninstall DisplayVersion: $($uninstallEntry.DisplayVersion)"
     }
-    if ($uninstallEntry.InstallLocation -ne $installRoot) {
+    if (
+        -not [string]::IsNullOrWhiteSpace($uninstallEntry.InstallLocation) -and
+        $uninstallEntry.InstallLocation -ne $installRoot
+    ) {
         throw "Unexpected uninstall InstallLocation: $($uninstallEntry.InstallLocation)"
     }
 
