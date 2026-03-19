@@ -176,8 +176,9 @@ jobs:
           WINDOWS_SIGN_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_DIGEST_ALGORITHM }}
           WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM }}
         run: |
+          $requireSigning = [System.Convert]::ToBoolean('${{ !contains(needs.release-context.outputs.tag_name, '-') }}')
           ../.release-tooling/scripts/release/sign-windows-artifacts.ps1 `
-            -RequireSigning:${{ !contains(needs.release-context.outputs.tag_name, '-') }} `
+            -RequireSigning:$requireSigning `
             -Files @(
               "target/release/boundlessd.exe",
               "target/release/boundlessctl.exe",
@@ -211,8 +212,9 @@ jobs:
           WINDOWS_SIGN_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_DIGEST_ALGORITHM }}
           WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM }}
         run: |
+          $requireSigning = [System.Convert]::ToBoolean('${{ !contains(needs.release-context.outputs.tag_name, '-') }}')
           ./.release-tooling/scripts/release/sign-windows-artifacts.ps1 `
-            -RequireSigning:${{ !contains(needs.release-context.outputs.tag_name, '-') }} `
+            -RequireSigning:$requireSigning `
             -Files @("${{ steps.package.outputs.installer_path }}")
 
       - name: Validate Windows asset name
@@ -255,10 +257,11 @@ jobs:
           if (-not $installer) {
             throw "Downloaded installer artifact was not found."
           }
+          $requireSignature = [System.Convert]::ToBoolean('${{ !contains(needs.release-context.outputs.tag_name, '-') }}')
           ./.release-tooling/scripts/dev/installer-smoke.ps1 `
             -InstallerPath $installer `
             -OutputRoot (Join-Path (Resolve-Path .).Path "artifacts/installer-validation") `
-            -RequireSignature:${{ !contains(needs.release-context.outputs.tag_name, '-') }}
+            -RequireSignature:$requireSignature
 
   publish:
     runs-on: ubuntu-latest
