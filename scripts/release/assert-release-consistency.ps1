@@ -1,5 +1,6 @@
 [CmdletBinding()]
 param(
+    [string]$RepoRoot = "",
     [string]$Tag = "",
     [string[]]$AssetPaths = @(),
     [switch]$CheckWindowsInstallerVersion
@@ -58,7 +59,12 @@ function Get-MsiProductVersion {
     return $record.StringData(1)
 }
 
-$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$repoRoot = if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+}
+else {
+    (Resolve-Path -LiteralPath $RepoRoot).Path
+}
 $workspaceVersion = Get-WorkspaceVersion -CargoTomlPath (Join-Path $repoRoot "Cargo.toml")
 $changelogVersion = Get-ChangelogVersion -ChangeLogPath (Join-Path $repoRoot "CHANGELOG.md")
 $manifestVersion = (Get-Content -LiteralPath (Join-Path $repoRoot "packaging\windows\package-manifest.json") -Raw | ConvertFrom-Json).version
@@ -77,8 +83,14 @@ if ($workspaceVersion -ne $releasePleaseVersion) {
 $crateCargoTomls = Get-ChildItem -LiteralPath (Join-Path $repoRoot "crates") -Recurse -Filter Cargo.toml -File
 foreach ($crateCargoToml in $crateCargoTomls) {
     $crateManifest = Get-Content -LiteralPath $crateCargoToml.FullName -Raw
-    if ($crateManifest -notmatch '(?m)^version\.workspace\s*=\s*true\s*$') {
-        throw "Crate manifest must inherit workspace version: $($crateCargoToml.FullName)"
+    $crateVersionMatch = [regex]::Match($crateManifest, '(?m)^\s*version\s*=\s*"(?<version>[^"]+)"\s*$')
+    if (-not $crateVersionMatch.Success) {
+        throw "Crate manifest must declare a literal package version: $($crateCargoToml.FullName)"
+    }
+
+    $crateVersion = $crateVersionMatch.Groups["version"].Value
+    if ($crateVersion -ne $workspaceVersion) {
+        throw "Crate manifest version '$crateVersion' does not match workspace version '$workspaceVersion': $($crateCargoToml.FullName)"
     }
 }
 
