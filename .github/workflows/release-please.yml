@@ -1,4 +1,4 @@
-name: Release Please
+name: Release
 
 on:
   push:
@@ -6,16 +6,279 @@ on:
 
 permissions:
   contents: write
+  issues: write
   pull-requests: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     env:
       RELEASE_PLEASE_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
     steps:
       - name: Release Please
-        uses: googleapis/release-please-action@v4
+        id: release
+        uses: googleapis/release-please-action@c3fc4de07084f75a2b61a5b933069bda6edf3d5c
         with:
           token: ${{ env.RELEASE_PLEASE_TOKEN != '' && env.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
-          release-type: simple
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Validate release metadata
+        shell: pwsh
+        run: ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-please.outputs.tag_name }}"
+
+      - name: Build Linux binaries
+        run: cargo build --release -p boundless-daemon -p boundless-cli
+
+      - name: Package Linux release
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.release-please.outputs.tag_name }}"
+          version="${version#v}"
+          mkdir -p dist
+          cp target/release/boundlessd dist/
+          cp target/release/boundlessctl dist/
+          archive_path="$(pwd)/boundless-${version}-linux-x64.tar.gz"
+          tar -czf "$archive_path" -C dist .
+          echo "archive_path=$archive_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Linux release artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: boundless-linux-x64
+          path: ${{ steps.package.outputs.archive_path }}
+
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: read
+    environment: release
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Validate release metadata
+        shell: pwsh
+        run: ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-please.outputs.tag_name }}"
+
+      - name: Build Windows binaries
+        shell: pwsh
+        run: cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray
+
+      - name: Sign Windows binaries
+        shell: pwsh
+        env:
+          WINDOWS_SIGN_CERT_PATH: ${{ vars.WINDOWS_SIGN_CERT_PATH }}
+          WINDOWS_SIGN_CERT_BASE64: ${{ secrets.WINDOWS_SIGN_CERT_BASE64 }}
+          WINDOWS_SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGN_CERT_PASSWORD }}
+          WINDOWS_SIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_SIGN_TIMESTAMP_URL }}
+          WINDOWS_SIGN_DESCRIPTION: ${{ vars.WINDOWS_SIGN_DESCRIPTION }}
+          WINDOWS_SIGN_DESCRIPTION_URL: ${{ vars.WINDOWS_SIGN_DESCRIPTION_URL }}
+          WINDOWS_SIGN_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_DIGEST_ALGORITHM }}
+          WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM }}
+        run: |
+          ./scripts/release/sign-windows-artifacts.ps1 `
+            -RequireSigning:${{ !contains(needs.release-please.outputs.tag_name, '-') }} `
+            -Files @(
+              "target/release/boundlessd.exe",
+              "target/release/boundlessctl.exe",
+              "target/release/boundlesstray.exe"
+            )
+
+      - name: Package Windows installer
+        id: package
+        shell: pwsh
+        run: |
+          $version = "${{ needs.release-please.outputs.tag_name }}".TrimStart('v')
+          $outputPath = Join-Path (Resolve-Path .).Path "Boundless-$version-windows-x64.msi"
+          ./scripts/release/package-windows.ps1 `
+            -Version $version `
+            -DaemonPath "target/release/boundlessd.exe" `
+            -CliPath "target/release/boundlessctl.exe" `
+            -TrayPath "target/release/boundlesstray.exe" `
+            -OutputPath $outputPath
+          "installer_path=$outputPath" >> $env:GITHUB_OUTPUT
+
+      - name: Sign Windows installer
+        shell: pwsh
+        env:
+          WINDOWS_SIGN_CERT_PATH: ${{ vars.WINDOWS_SIGN_CERT_PATH }}
+          WINDOWS_SIGN_CERT_BASE64: ${{ secrets.WINDOWS_SIGN_CERT_BASE64 }}
+          WINDOWS_SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGN_CERT_PASSWORD }}
+          WINDOWS_SIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_SIGN_TIMESTAMP_URL }}
+          WINDOWS_SIGN_DESCRIPTION: ${{ vars.WINDOWS_SIGN_DESCRIPTION }}
+          WINDOWS_SIGN_DESCRIPTION_URL: ${{ vars.WINDOWS_SIGN_DESCRIPTION_URL }}
+          WINDOWS_SIGN_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_DIGEST_ALGORITHM }}
+          WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM }}
+        run: |
+          ./scripts/release/sign-windows-artifacts.ps1 `
+            -RequireSigning:${{ !contains(needs.release-please.outputs.tag_name, '-') }} `
+            -Files @("${{ steps.package.outputs.installer_path }}")
+
+      - name: Validate Windows asset name
+        shell: pwsh
+        run: ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-please.outputs.tag_name }}" -AssetPaths "${{ steps.package.outputs.installer_path }}" -CheckWindowsInstallerVersion
+
+      - name: Upload Windows release artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: boundless-windows-x64
+          path: ${{ steps.package.outputs.installer_path }}
+
+  validate-windows-installer:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    needs:
+      - release-please
+      - build-windows
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Download Windows installer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: boundless-windows-x64
+          path: artifacts
+
+      - name: Validate Windows installer
+        shell: pwsh
+        run: |
+          $installer = (Get-ChildItem -LiteralPath artifacts -Filter *.msi -File | Select-Object -First 1).FullName
+          if (-not $installer) {
+            throw "Downloaded installer artifact was not found."
+          }
+          ./scripts/dev/installer-smoke.ps1 `
+            -InstallerPath $installer `
+            -RequireSignature:${{ !contains(needs.release-please.outputs.tag_name, '-') }}
+
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - release-please
+      - build-linux
+      - build-windows
+      - validate-windows-installer
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          path: dist
+
+      - name: Normalize artifact layout
+        id: assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          find dist -mindepth 2 -type f -exec mv -t dist {} +
+          find dist -mindepth 1 -type d -empty -delete
+          windows_installer="$(find dist -maxdepth 1 -type f -name 'Boundless-*.msi' | head -n 1)"
+          linux_archive="$(find dist -maxdepth 1 -type f -name 'boundless-*-linux-x64.tar.gz' | head -n 1)"
+          if [[ -z "$windows_installer" || -z "$linux_archive" ]]; then
+            echo "Expected release artifacts were not found in dist/" >&2
+            exit 1
+          fi
+          echo "windows_installer=$windows_installer" >> "$GITHUB_OUTPUT"
+          echo "linux_archive=$linux_archive" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release metadata
+        shell: pwsh
+        run: |
+          $assets = Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName }
+          ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-please.outputs.tag_name }}" -AssetPaths $assets
+
+      - name: Write release checksums
+        shell: pwsh
+        run: |
+          $assets = Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName }
+          ./scripts/release/write-release-checksums.ps1 -AssetPaths $assets -OutputPath (Join-Path (Resolve-Path dist).Path "SHA256SUMS.txt")
+
+      - name: Attest Windows installer
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb
+        with:
+          subject-path: ${{ steps.assets.outputs.windows_installer }}
+
+      - name: Attest Linux tarball
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb
+        with:
+          subject-path: ${{ steps.assets.outputs.linux_archive }}
+
+      - name: Attest checksum manifest
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb
+        with:
+          subject-path: dist/SHA256SUMS.txt
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/* --clobber
+
+      - name: Publish draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.release-please.outputs.tag_name }}"
+          if [[ "$tag" == *-* ]]; then
+            gh release edit "$tag" --draft=false --prerelease
+          else
+            gh release edit "$tag" --draft=false --latest
+          fi

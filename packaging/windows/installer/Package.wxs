@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Boundless"
+    Manufacturer="Boundless"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="5A3406B6-73F7-4137-BF4D-4D4E4B75FC37"
+    Language="1033"
+    Scope="perUser"
+    InstallerVersion="500"
+    Compressed="yes">
+
+    <SummaryInformation Description="Boundless Installer" Manufacturer="Boundless" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Boundless is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="BoundlessIcon.ico" SourceFile="$(var.PayloadDir)\Boundless.ico" />
+    <Property Id="ARPPRODUCTICON" Value="BoundlessIcon.ico" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <Property Id="BOUNDLESSLEGACYSCRIPTINSTALL">
+      <DirectorySearch Id="LegacyScriptInstallDirSearch" Path="[LocalAppDataFolder]Programs\Boundless">
+        <FileSearch Id="LegacyScriptInstallFileSearch" Name="Boundless-Install.ps1" />
+      </DirectorySearch>
+    </Property>
+
+    <Launch
+      Condition="Installed OR NOT BOUNDLESSLEGACYSCRIPTINSTALL"
+      Message="A legacy script-installed Boundless build was detected in %LocalAppData%\Programs\Boundless. Uninstall the script-based package first, then rerun this installer." />
+
+    <Feature Id="MainFeature" Title="Boundless" Level="1">
+      <ComponentGroupRef Id="BoundlessPayload" />
+      <ComponentRef Id="BoundlessShortcuts" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="BoundlessProgramsRoot" Name="Programs">
+        <Directory Id="INSTALLDIR" Name="Boundless" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="DesktopFolder" />
+    <StandardDirectory Id="StartupFolder" />
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="BoundlessPayload" Directory="INSTALLDIR">
+      <Component Id="BoundlessPayloadComponent" Guid="70B4D0ED-BE16-4B0A-A5F0-C1987B909E6B">
+        <File Id="TrayBinaryFile" Source="$(var.PayloadDir)\boundlesstray.exe" />
+        <File Id="DaemonBinaryFile" Source="$(var.PayloadDir)\boundlessd.exe" />
+        <File Id="CliBinaryFile" Source="$(var.PayloadDir)\boundlessctl.exe" />
+        <File Id="IconFile" Source="$(var.PayloadDir)\Boundless.ico" />
+        <File Id="ResetScriptFile" Source="$(var.PayloadDir)\Boundless-Reset.ps1" />
+        <File Id="ReadmeFile" Source="$(var.PayloadDir)\README.txt" />
+        <File Id="LicenseFile" Source="$(var.PayloadDir)\LICENSE.txt" />
+        <File Id="ChangelogFile" Source="$(var.PayloadDir)\CHANGELOG.md" />
+        <File Id="ManifestFile" Source="$(var.PayloadDir)\package-manifest.json" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Boundless\Installer"
+          Name="PayloadInstalled"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <Component Id="BoundlessShortcuts" Directory="INSTALLDIR" Guid="2B6E9E42-EF5F-45A1-A2C4-AB1228598AF7">
+      <Shortcut
+        Id="StartupShortcut"
+        Directory="StartupFolder"
+        Name="Boundless"
+        Description="Launch Boundless tray at sign-in"
+        Target="[INSTALLDIR]boundlesstray.exe"
+        WorkingDirectory="INSTALLDIR"
+        Icon="BoundlessIcon.ico"
+        IconIndex="0" />
+      <Shortcut
+        Id="StartMenuShortcut"
+        Directory="ProgramMenuFolder"
+        Name="Boundless"
+        Description="Launch Boundless"
+        Target="[INSTALLDIR]boundlesstray.exe"
+        WorkingDirectory="INSTALLDIR"
+        Icon="BoundlessIcon.ico"
+        IconIndex="0" />
+      <Shortcut
+        Id="DesktopShortcut"
+        Directory="DesktopFolder"
+        Name="Boundless"
+        Description="Launch Boundless"
+        Target="[INSTALLDIR]boundlesstray.exe"
+        WorkingDirectory="INSTALLDIR"
+        Icon="BoundlessIcon.ico"
+        IconIndex="0" />
+
+      <RemoveFolder Id="RemoveInstallDirOnUninstall" Directory="INSTALLDIR" On="uninstall" />
+      <RegistryValue
+        Root="HKCU"
+        Key="Software\Boundless\Installer"
+        Name="Installed"
+        Type="integer"
+        Value="1"
+        KeyPath="yes" />
+    </Component>
+  </Fragment>
+</Wix>

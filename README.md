@@ -172,13 +172,13 @@ You can inspect daemon config path with:
 cargo run -p boundless-daemon -- print-config-path
 ```
 
-Windows package smoke/validation:
+Windows installer smoke/validation:
 
 ```powershell
-./scripts/dev/package-smoke.ps1 -KeepArtifacts
+./scripts/dev/installer-smoke.ps1 -KeepArtifacts
 ```
 
-Build a local Windows package zip:
+Build a local Windows installer:
 
 ```powershell
 cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray
@@ -187,44 +187,50 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\release\package-wi
   -DaemonPath .\target\release\boundlessd.exe `
   -CliPath .\target\release\boundlessctl.exe `
   -TrayPath .\target\release\boundlesstray.exe `
-  -OutputPath .\artifacts\package-validation\boundless-1.0.0-local-windows-x64.zip
+  -OutputPath .\artifacts\package-validation\Boundless-1.0.0-local-windows-x64.msi
 ```
 
-Install locally from the packaged zip:
+Install locally from the packaged MSI:
 
 ```powershell
-Expand-Archive `
-  -LiteralPath .\artifacts\package-validation\boundless-1.0.0-local-windows-x64.zip `
-  -DestinationPath .\artifacts\package-validation\local-install `
-  -Force
-
-powershell -NoProfile -ExecutionPolicy Bypass -File `
-  .\artifacts\package-validation\local-install\boundless-1.0.0-local-windows-x64\Boundless-Install.ps1
+Start-Process msiexec.exe -Wait -ArgumentList @(
+  '/i',
+  (Resolve-Path .\artifacts\package-validation\Boundless-1.0.0-local-windows-x64.msi),
+  '/qn',
+  '/norestart'
+)
 ```
 
-The Windows release artifact packages:
+The Windows release artifact is a signed MSI that installs:
 - `boundlesstray.exe`
 - `boundlessd.exe`
 - `boundlessctl.exe`
 - `Boundless.ico`
-- `Boundless-Install.ps1`
-- `Boundless-Uninstall.ps1`
 - `Boundless-Reset.ps1`
+- `README.txt`
+- `LICENSE.txt`
+- `CHANGELOG.md`
 
 Install behavior:
 - default per-user install root: `%LocalAppData%\Programs\Boundless`
 - Startup shortcut: `%AppData%\Microsoft\Windows\Start Menu\Programs\Startup\Boundless.lnk`
 - Start Menu shortcut: `%AppData%\Microsoft\Windows\Start Menu\Programs\Boundless.lnk`
 - Desktop shortcut: `%UserProfile%\Desktop\Boundless.lnk`
-- installed shortcuts and uninstall metadata use the packaged Boundless icon asset
+- installed shortcuts and ARP metadata use the packaged Boundless icon asset
 - tray launch is the primary entrypoint and auto-starts `boundlessd` when needed
+- first MSI releases intentionally block over legacy script-installed layouts; remove the old script-based install before running the MSI
 
 Recovery helpers:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Boundless\Boundless-Reset.ps1" -NetworkOnly
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Boundless\Boundless-Reset.ps1" -All
-powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Boundless\Boundless-Uninstall.ps1" -RemoveState
+Start-Process msiexec.exe -Wait -ArgumentList @(
+  '/x',
+  (Resolve-Path .\artifacts\package-validation\Boundless-1.0.0-local-windows-x64.msi),
+  '/qn',
+  '/norestart'
+)
 ```
 
 Nearby pairing (approval-based, no trust-bundle file copy):
@@ -302,8 +308,9 @@ cargo run -p boundless-cli -- layout wizard
 ## Release model
 
 - Conventional Commits drive semver intent
-- `release-please` prepares version/tag releases
-- Tag pushes like `v1.2.3` trigger binary build + GitHub Release publishing
+- manifest-mode `release-please` prepares version bumps, tags, and draft GitHub Releases
+- merges to `main` build the Linux tarball and Windows MSI from the tagged release commit
+- release assets are validated, checksummed, attached to the draft release, and then published automatically
 - If `release-please` cannot open PRs with `GITHUB_TOKEN`, either:
   - enable repository setting `Allow GitHub Actions to create and approve pull requests`, or
   - add a `RELEASE_PLEASE_TOKEN` secret (PAT with `contents` + `pull_requests` write access)
