@@ -152,6 +152,10 @@ function Get-UninstallEntry {
 }
 
 function Test-InteractiveDesktopSession {
+    if ($env:GITHUB_ACTIONS -eq "true") {
+        return $false
+    }
+
     if (-not [Environment]::UserInteractive) {
         return $false
     }
