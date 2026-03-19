@@ -201,7 +201,7 @@ Start-Process msiexec.exe -Wait -ArgumentList @(
 )
 ```
 
-The Windows release artifact is a signed MSI that installs:
+The Windows release artifact is an MSI that installs:
 - `boundlesstray.exe`
 - `boundlessd.exe`
 - `boundlessctl.exe`
@@ -210,6 +210,11 @@ The Windows release artifact is a signed MSI that installs:
 - `README.txt`
 - `LICENSE.txt`
 - `CHANGELOG.md`
+
+Release signing policy:
+- Windows signing is optional during the current alpha phase.
+- Set release environment variable `WINDOWS_SIGN_REQUIRED=true` and configure the signing secrets/vars to enforce signed stable releases.
+- If signing material is configured while `WINDOWS_SIGN_REQUIRED` is unset, the workflow still signs available Windows artifacts without making signing a release gate.
 
 Install behavior:
 - default per-user install root: `%LocalAppData%\Programs\Boundless`
