@@ -83,6 +83,28 @@ function Get-ShortcutIconLocation {
     return $shortcut.IconLocation
 }
 
+function Test-ExpectedShortcutIconLocation {
+    param(
+        [string]$IconLocation,
+        [string]$InstalledIconPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($IconLocation)) {
+        return $false
+    }
+
+    $resolvedLocation = $IconLocation.Split(',')[0].Trim()
+    if ([string]::IsNullOrWhiteSpace($resolvedLocation)) {
+        return $false
+    }
+
+    if ($resolvedLocation -ieq $InstalledIconPath) {
+        return $true
+    }
+
+    return $resolvedLocation -imatch '[\\/]Microsoft[\\/]Installer[\\/]\{[^\\/]+\}[\\/]BoundlessIcon\.ico$'
+}
+
 function Assert-Authenticode {
     param(
         [string]$Path,
@@ -212,7 +234,7 @@ try {
         }
 
         $iconLocation = Get-ShortcutIconLocation -ShortcutPath $shortcutPath
-        if ($iconLocation -notlike "$iconPath*") {
+        if (-not (Test-ExpectedShortcutIconLocation -IconLocation $iconLocation -InstalledIconPath $iconPath)) {
             throw "Shortcut icon location was unexpected for ${shortcutPath}: $iconLocation"
         }
     }
