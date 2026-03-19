@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.1.0](https://github.com/bestlux/boundless/compare/v2.0.4...v2.1.0) (2026-03-19)
+
+
+### Features
+
+* **daemon:** reduce peer control latency ([14fa18b](https://github.com/bestlux/boundless/commit/14fa18bc7c262d69a60cd143c0af612bca657f91))
+* **release:** ship windows msi releases ([#16](https://github.com/bestlux/boundless/issues/16)) ([a91d5b7](https://github.com/bestlux/boundless/commit/a91d5b79ca0b17c16919c08bf251e5a8c79fe433))
+
+
+### Bug Fixes
+
+* **ci:** stabilize post-refactor validation ([e3ef94f](https://github.com/bestlux/boundless/commit/e3ef94f56937303deef99a2e3b9b591b8708faf3))
+* hide self and paired peers from discovery targets ([43a2669](https://github.com/bestlux/boundless/commit/43a26692819f59f8ab1261c444fbcf70da875ffd))
+* **release:** drop broken cargo-workspace plugin ([#19](https://github.com/bestlux/boundless/issues/19)) ([a9f8637](https://github.com/bestlux/boundless/commit/a9f86374d3017f810add35fa83ff8ba1aaee34d7))
+* **release:** restore literal crate versions ([fc6b821](https://github.com/bestlux/boundless/commit/fc6b8214c36890d3c6085ba6e1086ac98b33f48d))
+* **release:** restore literal crate versions ([03df7f0](https://github.com/bestlux/boundless/commit/03df7f0ea59955c267b4dd1681784eccc70768ba))
+
 ## [2.0.4](https://github.com/bestlux/boundless/compare/v2.0.3...v2.0.4) (2026-03-08)
 
 
