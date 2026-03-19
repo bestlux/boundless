@@ -138,7 +138,10 @@ function Get-UninstallEntry {
 
     foreach ($key in $keys) {
         $entry = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -eq "Boundless" } |
+            Where-Object {
+                $_.PSObject.Properties.Match("DisplayName").Count -gt 0 -and
+                $_.DisplayName -eq "Boundless"
+            } |
             Select-Object -First 1
         if ($null -ne $entry) {
             return $entry
