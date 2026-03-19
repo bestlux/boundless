@@ -83,20 +83,29 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          path: .release-tooling
+          ref: ${{ github.sha }}
+
       - name: Checkout release source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+          path: source
           ref: ${{ needs.release-context.outputs.source_ref }}
 
       - name: Setup Rust
-        uses: ./.github/actions/setup-rust
+        uses: ./.release-tooling/.github/actions/setup-rust
 
       - name: Validate release metadata
         shell: pwsh
-        run: ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-context.outputs.tag_name }}"
+        run: ./.release-tooling/scripts/release/assert-release-consistency.ps1 -RepoRoot (Resolve-Path source).Path -Tag "${{ needs.release-context.outputs.tag_name }}"
 
       - name: Build Linux binaries
+        working-directory: source
         run: cargo build --release -p boundless-daemon -p boundless-cli
 
       - name: Package Linux release
@@ -107,8 +116,8 @@ jobs:
           version="${{ needs.release-context.outputs.tag_name }}"
           version="${version#v}"
           mkdir -p dist
-          cp target/release/boundlessd dist/
-          cp target/release/boundlessctl dist/
+          cp source/target/release/boundlessd dist/
+          cp source/target/release/boundlessctl dist/
           archive_path="$(pwd)/boundless-${version}-linux-x64.tar.gz"
           tar -czf "$archive_path" -C dist .
           echo "archive_path=$archive_path" >> "$GITHUB_OUTPUT"
@@ -128,24 +137,34 @@ jobs:
       contents: read
     environment: release
     steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          path: .release-tooling
+          ref: ${{ github.sha }}
+
       - name: Checkout release source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+          path: source
           ref: ${{ needs.release-context.outputs.source_ref }}
 
       - name: Setup Rust
-        uses: ./.github/actions/setup-rust
+        uses: ./.release-tooling/.github/actions/setup-rust
 
       - name: Validate release metadata
         shell: pwsh
-        run: ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-context.outputs.tag_name }}"
+        run: ./.release-tooling/scripts/release/assert-release-consistency.ps1 -RepoRoot (Resolve-Path source).Path -Tag "${{ needs.release-context.outputs.tag_name }}"
 
       - name: Build Windows binaries
+        working-directory: source
         shell: pwsh
         run: cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray
 
       - name: Sign Windows binaries
+        working-directory: source
         shell: pwsh
         env:
           WINDOWS_SIGN_CERT_PATH: ${{ vars.WINDOWS_SIGN_CERT_PATH }}
@@ -157,7 +176,7 @@ jobs:
           WINDOWS_SIGN_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_DIGEST_ALGORITHM }}
           WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM }}
         run: |
-          ./scripts/release/sign-windows-artifacts.ps1 `
+          ../.release-tooling/scripts/release/sign-windows-artifacts.ps1 `
             -RequireSigning:${{ !contains(needs.release-context.outputs.tag_name, '-') }} `
             -Files @(
               "target/release/boundlessd.exe",
@@ -171,11 +190,12 @@ jobs:
         run: |
           $version = "${{ needs.release-context.outputs.tag_name }}".TrimStart('v')
           $outputPath = Join-Path (Resolve-Path .).Path "Boundless-$version-windows-x64.msi"
-          ./scripts/release/package-windows.ps1 `
+          ./.release-tooling/scripts/release/package-windows.ps1 `
+            -RepoRoot (Resolve-Path source).Path `
             -Version $version `
-            -DaemonPath "target/release/boundlessd.exe" `
-            -CliPath "target/release/boundlessctl.exe" `
-            -TrayPath "target/release/boundlesstray.exe" `
+            -DaemonPath "source/target/release/boundlessd.exe" `
+            -CliPath "source/target/release/boundlessctl.exe" `
+            -TrayPath "source/target/release/boundlesstray.exe" `
             -OutputPath $outputPath
           "installer_path=$outputPath" >> $env:GITHUB_OUTPUT
 
@@ -191,13 +211,13 @@ jobs:
           WINDOWS_SIGN_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_DIGEST_ALGORITHM }}
           WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM }}
         run: |
-          ./scripts/release/sign-windows-artifacts.ps1 `
+          ./.release-tooling/scripts/release/sign-windows-artifacts.ps1 `
             -RequireSigning:${{ !contains(needs.release-context.outputs.tag_name, '-') }} `
             -Files @("${{ steps.package.outputs.installer_path }}")
 
       - name: Validate Windows asset name
         shell: pwsh
-        run: ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-context.outputs.tag_name }}" -AssetPaths "${{ steps.package.outputs.installer_path }}" -CheckWindowsInstallerVersion
+        run: ./.release-tooling/scripts/release/assert-release-consistency.ps1 -RepoRoot (Resolve-Path source).Path -Tag "${{ needs.release-context.outputs.tag_name }}" -AssetPaths "${{ steps.package.outputs.installer_path }}" -CheckWindowsInstallerVersion
 
       - name: Upload Windows release artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
@@ -215,11 +235,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout release source
+      - name: Checkout release tooling
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
-          ref: ${{ needs.release-context.outputs.source_ref }}
+          path: .release-tooling
+          ref: ${{ github.sha }}
 
       - name: Download Windows installer
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -234,8 +255,9 @@ jobs:
           if (-not $installer) {
             throw "Downloaded installer artifact was not found."
           }
-          ./scripts/dev/installer-smoke.ps1 `
+          ./.release-tooling/scripts/dev/installer-smoke.ps1 `
             -InstallerPath $installer `
+            -OutputRoot (Join-Path (Resolve-Path .).Path "artifacts/installer-validation") `
             -RequireSignature:${{ !contains(needs.release-context.outputs.tag_name, '-') }}
 
   publish:
@@ -252,10 +274,18 @@ jobs:
       attestations: write
       id-token: write
     steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          path: .release-tooling
+          ref: ${{ github.sha }}
+
       - name: Checkout release source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+          path: source
           ref: ${{ needs.release-context.outputs.source_ref }}
 
       - name: Download release artifacts
@@ -283,13 +313,13 @@ jobs:
         shell: pwsh
         run: |
           $assets = Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName }
-          ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-context.outputs.tag_name }}" -AssetPaths $assets
+          ./.release-tooling/scripts/release/assert-release-consistency.ps1 -RepoRoot (Resolve-Path source).Path -Tag "${{ needs.release-context.outputs.tag_name }}" -AssetPaths $assets
 
       - name: Write release checksums
         shell: pwsh
         run: |
           $assets = Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName }
-          ./scripts/release/write-release-checksums.ps1 -AssetPaths $assets -OutputPath (Join-Path (Resolve-Path dist).Path "SHA256SUMS.txt")
+          ./.release-tooling/scripts/release/write-release-checksums.ps1 -AssetPaths $assets -OutputPath (Join-Path (Resolve-Path dist).Path "SHA256SUMS.txt")
 
       - name: Resolve release notes
         id: notes

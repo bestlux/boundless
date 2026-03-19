@@ -1,5 +1,7 @@
 [CmdletBinding()]
 param(
+    [string]$RepoRoot = "",
+
     [Parameter(Mandatory = $true)]
     [string]$Version,
 
@@ -52,7 +54,12 @@ function ConvertTo-MsiVersion {
     return "$($Matches.major).$($Matches.minor).$($Matches.patch)"
 }
 
-$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$repoRoot = if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+}
+else {
+    (Resolve-Path -LiteralPath $RepoRoot).Path
+}
 $daemonBinary = Resolve-RequiredPath -Path $DaemonPath -Label "Daemon binary"
 $cliBinary = Resolve-RequiredPath -Path $CliPath -Label "CLI binary"
 $trayBinary = Resolve-RequiredPath -Path $TrayPath -Label "Tray binary"
