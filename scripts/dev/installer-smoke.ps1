@@ -152,6 +152,10 @@ function Get-UninstallEntry {
 }
 
 function Test-InteractiveDesktopSession {
+    if ($env:GITHUB_ACTIONS -eq "true") {
+        return $false
+    }
+
     if (-not [Environment]::UserInteractive) {
         return $false
     }
@@ -273,6 +277,19 @@ try {
     $daemonSignature = Assert-Authenticode -Path (Join-Path $installRoot "boundlessd.exe") -Required:$RequireSignature.IsPresent
     $cliSignature = Assert-Authenticode -Path (Join-Path $installRoot "boundlessctl.exe") -Required:$RequireSignature.IsPresent
 
+    $trayVersionOutput = (& $trayPath --version 2>&1 | Out-String).Trim()
+    $trayVersionExitCode = $LASTEXITCODE
+    if ($trayVersionExitCode -ne 0) {
+        throw "Installed tray executable failed to report its version. Exit code: $trayVersionExitCode."
+    }
+    if (
+        -not [string]::IsNullOrWhiteSpace($expectedDisplayVersion) -and
+        -not [string]::IsNullOrWhiteSpace($trayVersionOutput) -and
+        $trayVersionOutput -notmatch [regex]::Escape($expectedDisplayVersion)
+    ) {
+        throw "Installed tray executable reported an unexpected version string: $trayVersionOutput"
+    }
+
     $interactiveDesktopSession = Test-InteractiveDesktopSession
     $trayLaunchMode = if ($interactiveDesktopSession) { "interactive_desktop" } else { "headless_session" }
     $trayExitedEarly = $false
@@ -282,9 +299,6 @@ try {
     if ($trayProcess.HasExited) {
         $trayExitedEarly = $true
         $trayExitCode = $trayProcess.ExitCode
-        if ($interactiveDesktopSession) {
-            throw "Installed tray executable exited immediately with exit code $trayExitCode."
-        }
     }
     else {
         Stop-Process -Id $trayProcess.Id -Force -ErrorAction SilentlyContinue
@@ -313,6 +327,8 @@ try {
         tray_signature = $traySignature
         daemon_signature = $daemonSignature
         cli_signature = $cliSignature
+        tray_version_output = $trayVersionOutput
+        tray_version_exit_code = $trayVersionExitCode
         tray_launch_mode = $trayLaunchMode
         tray_exited_early = $trayExitedEarly
         tray_exit_code = $trayExitCode
