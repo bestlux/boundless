@@ -151,6 +151,19 @@ function Get-UninstallEntry {
     return $null
 }
 
+function Test-InteractiveDesktopSession {
+    if (-not [Environment]::UserInteractive) {
+        return $false
+    }
+
+    $currentSessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+    $explorerProcess = Get-Process -Name "explorer" -ErrorAction SilentlyContinue |
+        Where-Object { $_.SessionId -eq $currentSessionId } |
+        Select-Object -First 1
+
+    return $null -ne $explorerProcess
+}
+
 if ((Get-Variable -Name IsWindows -ErrorAction SilentlyContinue) -and (-not $IsWindows)) {
     throw "installer-smoke.ps1 is supported on Windows only."
 }
@@ -260,12 +273,22 @@ try {
     $daemonSignature = Assert-Authenticode -Path (Join-Path $installRoot "boundlessd.exe") -Required:$RequireSignature.IsPresent
     $cliSignature = Assert-Authenticode -Path (Join-Path $installRoot "boundlessctl.exe") -Required:$RequireSignature.IsPresent
 
+    $interactiveDesktopSession = Test-InteractiveDesktopSession
+    $trayLaunchMode = if ($interactiveDesktopSession) { "interactive_desktop" } else { "headless_session" }
+    $trayExitedEarly = $false
+    $trayExitCode = $null
     $trayProcess = Start-Process -FilePath $trayPath -WorkingDirectory $installRoot -PassThru
     Start-Sleep -Seconds 3
     if ($trayProcess.HasExited) {
-        throw "Installed tray executable exited immediately."
+        $trayExitedEarly = $true
+        $trayExitCode = $trayProcess.ExitCode
+        if ($interactiveDesktopSession) {
+            throw "Installed tray executable exited immediately with exit code $trayExitCode."
+        }
     }
-    Stop-Process -Id $trayProcess.Id -Force -ErrorAction SilentlyContinue
+    else {
+        Stop-Process -Id $trayProcess.Id -Force -ErrorAction SilentlyContinue
+    }
 
     Invoke-MsiExec -ArgumentList @("/x", $InstallerPath, "/qn", "/norestart") -LogPath $uninstallLog
 
@@ -290,6 +313,9 @@ try {
         tray_signature = $traySignature
         daemon_signature = $daemonSignature
         cli_signature = $cliSignature
+        tray_launch_mode = $trayLaunchMode
+        tray_exited_early = $trayExitedEarly
+        tray_exit_code = $trayExitCode
         upgraded_from = $PreviousInstallerPath
         status = "passed"
     }
