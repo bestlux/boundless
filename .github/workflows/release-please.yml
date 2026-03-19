@@ -3,6 +3,16 @@ name: Release
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to build and publish, for example v2.1.0
+        required: true
+        type: string
+      source_ref:
+        description: Commit SHA or ref to build and tag
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -14,52 +24,77 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release-please:
+  release-context:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
+      release_created: ${{ steps.manual.outputs.release_created || steps.release.outputs.release_created }}
+      tag_name: ${{ steps.manual.outputs.tag_name || steps.release.outputs.tag_name }}
+      source_ref: ${{ steps.manual.outputs.source_ref || steps.push-context.outputs.source_ref }}
     env:
       RELEASE_PLEASE_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
     steps:
+      - name: Set manual release context
+        if: github.event_name == 'workflow_dispatch'
+        id: manual
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "release_created=true" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          echo "source_ref=${{ inputs.source_ref }}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout main
+        if: github.event_name == 'push'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
 
       - name: Validate release-please prerequisites
+        if: github.event_name == 'push'
         shell: pwsh
         run: ./scripts/release/assert-release-please-prereqs.ps1
 
       - name: Release Please
+        if: github.event_name == 'push'
         id: release
         uses: googleapis/release-please-action@16a9c90856f42705d54a6fda1823352bdc62cf38
         with:
           token: ${{ env.RELEASE_PLEASE_TOKEN != '' && env.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          skip-github-release: true
+
+      - name: Set push release source
+        if: github.event_name == 'push'
+        id: push-context
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.release.outputs.release_created }}" == "true" ]]; then
+            echo "source_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
 
   build-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    needs: release-context
+    if: needs.release-context.outputs.release_created == 'true'
     permissions:
       contents: read
     steps:
-      - name: Checkout release tag
+      - name: Checkout release source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ needs.release-context.outputs.source_ref }}
 
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
 
       - name: Validate release metadata
         shell: pwsh
-        run: ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-please.outputs.tag_name }}"
+        run: ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-context.outputs.tag_name }}"
 
       - name: Build Linux binaries
         run: cargo build --release -p boundless-daemon -p boundless-cli
@@ -69,7 +104,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ needs.release-please.outputs.tag_name }}"
+          version="${{ needs.release-context.outputs.tag_name }}"
           version="${version#v}"
           mkdir -p dist
           cp target/release/boundlessd dist/
@@ -87,24 +122,24 @@ jobs:
   build-windows:
     runs-on: windows-latest
     timeout-minutes: 45
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    needs: release-context
+    if: needs.release-context.outputs.release_created == 'true'
     permissions:
       contents: read
     environment: release
     steps:
-      - name: Checkout release tag
+      - name: Checkout release source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ needs.release-context.outputs.source_ref }}
 
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
 
       - name: Validate release metadata
         shell: pwsh
-        run: ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-please.outputs.tag_name }}"
+        run: ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-context.outputs.tag_name }}"
 
       - name: Build Windows binaries
         shell: pwsh
@@ -123,7 +158,7 @@ jobs:
           WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM }}
         run: |
           ./scripts/release/sign-windows-artifacts.ps1 `
-            -RequireSigning:${{ !contains(needs.release-please.outputs.tag_name, '-') }} `
+            -RequireSigning:${{ !contains(needs.release-context.outputs.tag_name, '-') }} `
             -Files @(
               "target/release/boundlessd.exe",
               "target/release/boundlessctl.exe",
@@ -134,7 +169,7 @@ jobs:
         id: package
         shell: pwsh
         run: |
-          $version = "${{ needs.release-please.outputs.tag_name }}".TrimStart('v')
+          $version = "${{ needs.release-context.outputs.tag_name }}".TrimStart('v')
           $outputPath = Join-Path (Resolve-Path .).Path "Boundless-$version-windows-x64.msi"
           ./scripts/release/package-windows.ps1 `
             -Version $version `
@@ -157,12 +192,12 @@ jobs:
           WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM }}
         run: |
           ./scripts/release/sign-windows-artifacts.ps1 `
-            -RequireSigning:${{ !contains(needs.release-please.outputs.tag_name, '-') }} `
+            -RequireSigning:${{ !contains(needs.release-context.outputs.tag_name, '-') }} `
             -Files @("${{ steps.package.outputs.installer_path }}")
 
       - name: Validate Windows asset name
         shell: pwsh
-        run: ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-please.outputs.tag_name }}" -AssetPaths "${{ steps.package.outputs.installer_path }}" -CheckWindowsInstallerVersion
+        run: ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-context.outputs.tag_name }}" -AssetPaths "${{ steps.package.outputs.installer_path }}" -CheckWindowsInstallerVersion
 
       - name: Upload Windows release artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
@@ -174,17 +209,17 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     needs:
-      - release-please
+      - release-context
       - build-windows
-    if: needs.release-please.outputs.release_created == 'true'
+    if: needs.release-context.outputs.release_created == 'true'
     permissions:
       contents: read
     steps:
-      - name: Checkout release tag
+      - name: Checkout release source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ needs.release-context.outputs.source_ref }}
 
       - name: Download Windows installer
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -201,27 +236,27 @@ jobs:
           }
           ./scripts/dev/installer-smoke.ps1 `
             -InstallerPath $installer `
-            -RequireSignature:${{ !contains(needs.release-please.outputs.tag_name, '-') }}
+            -RequireSignature:${{ !contains(needs.release-context.outputs.tag_name, '-') }}
 
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
-      - release-please
+      - release-context
       - build-linux
       - build-windows
       - validate-windows-installer
-    if: needs.release-please.outputs.release_created == 'true'
+    if: needs.release-context.outputs.release_created == 'true'
     permissions:
       contents: write
       attestations: write
       id-token: write
     steps:
-      - name: Checkout release tag
+      - name: Checkout release source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ needs.release-context.outputs.source_ref }}
 
       - name: Download release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -248,13 +283,50 @@ jobs:
         shell: pwsh
         run: |
           $assets = Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName }
-          ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-please.outputs.tag_name }}" -AssetPaths $assets
+          ./scripts/release/assert-release-consistency.ps1 -Tag "${{ needs.release-context.outputs.tag_name }}" -AssetPaths $assets
 
       - name: Write release checksums
         shell: pwsh
         run: |
           $assets = Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName }
           ./scripts/release/write-release-checksums.ps1 -AssetPaths $assets -OutputPath (Join-Path (Resolve-Path dist).Path "SHA256SUMS.txt")
+
+      - name: Resolve release notes
+        id: notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_ref="${{ needs.release-context.outputs.source_ref }}"
+          pr_number="$(gh api "repos/${{ github.repository }}/commits/${source_ref}/pulls" --jq 'map(select(.merged_at != null))[0].number')"
+          if [[ -z "${pr_number}" || "${pr_number}" == "null" ]]; then
+            echo "Unable to resolve the merged release pull request for ${source_ref}." >&2
+            exit 1
+          fi
+          gh pr view "${pr_number}" --json body --jq .body > release-notes.md
+          echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
+
+      - name: Recreate draft release with tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.release-context.outputs.tag_name }}"
+          source_ref="${{ needs.release-context.outputs.source_ref }}"
+          if gh release view "$tag" --json isDraft >/tmp/release.json 2>/dev/null; then
+            if [[ "$(jq -r '.isDraft' /tmp/release.json)" != "true" ]]; then
+              echo "Release $tag already exists and is published; refusing to overwrite it." >&2
+              exit 1
+            fi
+            gh release delete "$tag" --yes --cleanup-tag || gh release delete "$tag" --yes
+          fi
+          create_args=(release create "$tag" --draft --title "$tag" --target "$source_ref" --notes-file release-notes.md)
+          if [[ "$tag" == *-* ]]; then
+            create_args+=(--prerelease)
+          fi
+          gh "${create_args[@]}"
 
       - name: Attest Windows installer
         if: ${{ !github.event.repository.private }}
@@ -277,7 +349,7 @@ jobs:
       - name: Upload release assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/* --clobber
+        run: gh release upload "${{ needs.release-context.outputs.tag_name }}" dist/* --clobber
 
       - name: Publish draft release
         env:
@@ -285,9 +357,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ needs.release-please.outputs.tag_name }}"
+          tag="${{ needs.release-context.outputs.tag_name }}"
           if [[ "$tag" == *-* ]]; then
             gh release edit "$tag" --draft=false --prerelease
           else
             gh release edit "$tag" --draft=false --latest
           fi
+
+      - name: Close superseded autorelease pull requests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_pr="${{ steps.notes.outputs.pr_number }}"
+          open_prs="$(gh pr list --state open --search "label:'autorelease: pending'" --json number --jq '.[].number')"
+          if [[ -z "$open_prs" ]]; then
+            exit 0
+          fi
+          while IFS= read -r pr_number; do
+            if [[ -n "$pr_number" && "$pr_number" != "$current_pr" ]]; then
+              gh pr close "$pr_number" --comment "Superseded after successfully publishing ${{ needs.release-context.outputs.tag_name }}."
+            fi
+          done <<< "$open_prs"
