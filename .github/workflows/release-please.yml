@@ -167,6 +167,7 @@ jobs:
         working-directory: source
         shell: pwsh
         env:
+          WINDOWS_SIGN_REQUIRED: ${{ vars.WINDOWS_SIGN_REQUIRED }}
           WINDOWS_SIGN_CERT_PATH: ${{ vars.WINDOWS_SIGN_CERT_PATH }}
           WINDOWS_SIGN_CERT_BASE64: ${{ secrets.WINDOWS_SIGN_CERT_BASE64 }}
           WINDOWS_SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGN_CERT_PASSWORD }}
@@ -176,7 +177,9 @@ jobs:
           WINDOWS_SIGN_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_DIGEST_ALGORITHM }}
           WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM }}
         run: |
-          $requireSigning = [System.Convert]::ToBoolean('${{ !contains(needs.release-context.outputs.tag_name, '-') }}')
+          $stableRelease = [System.Convert]::ToBoolean('${{ !contains(needs.release-context.outputs.tag_name, '-') }}')
+          $signingRequiredByPolicy = [System.Convert]::ToBoolean('${{ vars.WINDOWS_SIGN_REQUIRED == 'true' }}')
+          $requireSigning = $stableRelease -and $signingRequiredByPolicy
           ../.release-tooling/scripts/release/sign-windows-artifacts.ps1 `
             -RequireSigning:$requireSigning `
             -Files @(
@@ -203,6 +206,7 @@ jobs:
       - name: Sign Windows installer
         shell: pwsh
         env:
+          WINDOWS_SIGN_REQUIRED: ${{ vars.WINDOWS_SIGN_REQUIRED }}
           WINDOWS_SIGN_CERT_PATH: ${{ vars.WINDOWS_SIGN_CERT_PATH }}
           WINDOWS_SIGN_CERT_BASE64: ${{ secrets.WINDOWS_SIGN_CERT_BASE64 }}
           WINDOWS_SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGN_CERT_PASSWORD }}
@@ -212,7 +216,9 @@ jobs:
           WINDOWS_SIGN_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_DIGEST_ALGORITHM }}
           WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM: ${{ vars.WINDOWS_SIGN_TIMESTAMP_DIGEST_ALGORITHM }}
         run: |
-          $requireSigning = [System.Convert]::ToBoolean('${{ !contains(needs.release-context.outputs.tag_name, '-') }}')
+          $stableRelease = [System.Convert]::ToBoolean('${{ !contains(needs.release-context.outputs.tag_name, '-') }}')
+          $signingRequiredByPolicy = [System.Convert]::ToBoolean('${{ vars.WINDOWS_SIGN_REQUIRED == 'true' }}')
+          $requireSigning = $stableRelease -and $signingRequiredByPolicy
           ./.release-tooling/scripts/release/sign-windows-artifacts.ps1 `
             -RequireSigning:$requireSigning `
             -Files @("${{ steps.package.outputs.installer_path }}")
@@ -257,7 +263,9 @@ jobs:
           if (-not $installer) {
             throw "Downloaded installer artifact was not found."
           }
-          $requireSignature = [System.Convert]::ToBoolean('${{ !contains(needs.release-context.outputs.tag_name, '-') }}')
+          $stableRelease = [System.Convert]::ToBoolean('${{ !contains(needs.release-context.outputs.tag_name, '-') }}')
+          $signingRequiredByPolicy = [System.Convert]::ToBoolean('${{ vars.WINDOWS_SIGN_REQUIRED == 'true' }}')
+          $requireSignature = $stableRelease -and $signingRequiredByPolicy
           ./.release-tooling/scripts/dev/installer-smoke.ps1 `
             -InstallerPath $installer `
             -OutputRoot (Join-Path (Resolve-Path .).Path "artifacts/installer-validation") `
