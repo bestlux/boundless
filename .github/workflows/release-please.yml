@@ -363,7 +363,7 @@ jobs:
               echo "Release $tag already exists and is published; refusing to overwrite it." >&2
               exit 1
             fi
-            gh release delete "$tag" --yes --cleanup-tag || gh release delete "$tag" --yes
+            gh release delete "$tag" --yes
           fi
           create_args=(release create "$tag" --draft --title "$tag" --target "$source_ref" --notes-file release-notes.md)
           if [[ "$tag" == *-* ]]; then
