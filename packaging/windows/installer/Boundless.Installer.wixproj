@@ -1,0 +1,16 @@
+<Project Sdk="WixToolset.Sdk/6.0.2">
+  <PropertyGroup>
+    <OutputType>Package</OutputType>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <OutputName>Boundless</OutputName>
+    <ProductVersion>0.0.0</ProductVersion>
+    <PayloadDir>$(MSBuildThisFileDirectory)..\stage</PayloadDir>
+    <DefineConstants>PayloadDir=$(PayloadDir);ProductVersion=$(ProductVersion)</DefineConstants>
+    <SuppressIces>ICE64;ICE91</SuppressIces>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.UI.wixext" Version="6.0.2" />
+    <PackageReference Include="WixToolset.Util.wixext" Version="6.0.2" />
+  </ItemGroup>
+</Project>

@@ -1,19 +1,19 @@
 Boundless for Windows
 =====================
 
-This package contains:
+This installer deploys:
 - boundlesstray.exe
 - boundlessd.exe
 - boundlessctl.exe
-- Boundless-Install.ps1
-- Boundless-Uninstall.ps1
 - Boundless-Reset.ps1
+- README.txt
+- LICENSE.txt
+- CHANGELOG.md
 
 Recommended flow
 ----------------
-1. Extract this archive to a writable folder.
-2. Run Boundless-Install.ps1 from PowerShell.
-3. Launch Boundless from the Startup shortcut or run boundlesstray.exe.
+1. Run the MSI installer.
+2. Launch Boundless from the Startup shortcut or run boundlesstray.exe.
 
 Install behavior
 ----------------
@@ -34,9 +34,9 @@ Recovery
 --------
 - Boundless-Reset.ps1 -NetworkOnly
 - Boundless-Reset.ps1 -All
-- Boundless-Uninstall.ps1 -RemoveState
 
 Notes
 -----
+- The MSI blocks over an existing legacy script-installed Boundless layout. Remove the old script-based install first, then rerun the installer.
 - The tray and CLI default to the local named-pipe API endpoint.
 - If your daemon is configured for TCP, launch the tray or CLI with an explicit endpoint.

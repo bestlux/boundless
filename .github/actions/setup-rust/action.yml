@@ -1,0 +1,19 @@
+name: Setup Rust
+description: Install the pinned Rust toolchain and restore the cargo cache.
+
+inputs:
+  toolchain:
+    description: Rust toolchain spec to install.
+    required: false
+    default: stable
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+      with:
+        toolchain: ${{ inputs.toolchain }}
+
+    - name: Restore Rust cache
+      uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
