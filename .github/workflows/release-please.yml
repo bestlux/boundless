@@ -284,6 +284,8 @@ jobs:
       contents: write
       attestations: write
       id-token: write
+      issues: write
+      pull-requests: write
     env:
       GH_REPO: ${{ github.repository }}
     steps:
