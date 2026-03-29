@@ -11,8 +11,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-eframe = "0.33.3"
-egui = "0.33.3"
+eframe = "0.34.1"
+egui = "0.34.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 ipc-api = { path = "../ipc-api" }
 raw-window-handle = "0.6.2"
