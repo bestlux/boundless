@@ -6,7 +6,12 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+core-clipboard = { path = "../core-clipboard" }
 core-input = { path = "../core-input" }
 tokio.workspace = true
 tonic.workspace = true
+tracing.workspace = true
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Shutdown", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4.1"

@@ -2,6 +2,20 @@ use anyhow::{Context, Result, bail};
 use core_input::{InputEvent, KeyState, MouseButton};
 
 #[cfg(windows)]
+mod hook_capture;
+
+#[cfg(windows)]
+pub use hook_capture::{
+    HOOK_EVENT_QUEUE_CAP, HookCaptureEvent, HookControlAction, HookSenderGuard,
+    captured_key_virtual_keys, install_keyboard_hook, install_mouse_hook, is_hook_lock_active,
+    mouse_button_from_virtual_key, mouse_button_virtual_keys, post_thread_quit,
+    raw_mouse_relative_delta, run_hook_message_loop, send_hook_event, set_hook_event_sender,
+    set_hook_lock_active, set_hook_wake_notifier, spawn_raw_input_thread,
+    take_hook_dropped_event_count, unhook_windows_hook, update_escape_state_for_key,
+    virtual_key_for_mouse_button,
+};
+
+#[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::POINT,
     UI::{

@@ -3608,9 +3608,12 @@ name = "platform-windows"
 version = "2.1.0"
 dependencies = [
  "anyhow",
+ "clipboard-win",
+ "core-clipboard",
  "core-input",
  "tokio",
  "tonic",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 

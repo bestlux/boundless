@@ -23,25 +23,7 @@ use core_input::{InputEvent, MAX_EVENTS_PER_FRAME, SwitchDirection};
 use crate::state::{AppState, PendingInjectInputFrame, TransportEventRecord};
 
 #[cfg(windows)]
-use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-    System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
-    UI::{
-        Input::{
-            GetRawInputData, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
-            RAWMOUSE, RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
-        },
-        WindowsAndMessaging::{
-            CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW,
-            HC_ACTION, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-            PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-            WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-            WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-            WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-            WM_XBUTTONDOWN, WM_XBUTTONUP,
-        },
-    },
-};
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
 #[cfg(all(windows, test))]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -49,6 +31,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
     MOUSEEVENTF_WHEEL,
 };
+#[cfg(all(windows, test))]
+use windows_sys::Win32::UI::Input::{MOUSE_MOVE_ABSOLUTE, RAWMOUSE};
 
 const INPUT_RUNTIME_SAFETY_TICK: Duration = Duration::from_millis(50);
 const INPUT_INJECT_MAX_FRAMES_PER_WAKE: usize = 64;
@@ -64,30 +48,12 @@ const EDGE_REMOTE_PRESSURE_THRESHOLD_DENOMINATOR: i32 = 5;
 const EDGE_POSITION_TOLERANCE_PX: i32 = 2;
 const EDGE_SWITCH_POST_HANDOFF_SUPPRESS_MS: u64 = 220;
 const ESCAPE_EDGE_RECAPTURE_SUPPRESS_MS: u64 = 600;
-#[cfg(windows)]
-const ESCAPE_DOUBLE_CTRL_WINDOW_MS: u64 = 400;
-#[cfg(windows)]
-const RAW_INPUT_USAGE_PAGE_GENERIC: u16 = 0x01;
-#[cfg(windows)]
-const RAW_INPUT_USAGE_MOUSE: u16 = 0x02;
-#[cfg(windows)]
-const HOOK_EVENT_QUEUE_CAP: usize = 4096;
-#[cfg(windows)]
-const STATIC_WINDOW_CLASS_NAME: [u16; 7] = [83, 84, 65, 84, 73, 67, 0];
-#[cfg(windows)]
-const EMPTY_WINDOW_NAME: [u16; 1] = [0];
 
 mod backends;
 mod edge_switch;
 mod runtime;
 #[cfg(windows)]
 mod windows_hook_backend;
-#[cfg(windows)]
-mod windows_hook_runtime;
-#[cfg(windows)]
-mod windows_hooks;
-#[cfg(windows)]
-mod windows_raw_input;
 
 #[cfg(test)]
 use edge_switch::{edge_switch_direction_from_motion, handoff_anchor_event};
@@ -100,28 +66,22 @@ use edge_switch::{
 use platform_windows::input::send_input_records_with_sender;
 #[cfg(windows)]
 use platform_windows::input::{
-    cursor_position, high_word, input_event_kind, input_records_for_event, is_virtual_key_down,
-    send_input_records, signed_high_word, vk_to_scan_code,
+    HookCaptureEvent, HookControlAction, HookSenderGuard, HOOK_EVENT_QUEUE_CAP,
+    captured_key_virtual_keys, cursor_position, input_event_kind, input_records_for_event,
+    install_keyboard_hook, install_mouse_hook, is_virtual_key_down,
+    mouse_button_from_virtual_key, mouse_button_virtual_keys, post_thread_quit,
+    run_hook_message_loop, send_input_records, set_hook_event_sender, set_hook_lock_active,
+    set_hook_wake_notifier, spawn_raw_input_thread,
+    take_hook_dropped_event_count, unhook_windows_hook, virtual_key_for_mouse_button,
+    vk_to_scan_code,
 };
+#[cfg(all(windows, test))]
+use platform_windows::input::raw_mouse_relative_delta;
 #[cfg(all(test, not(windows)))]
 use runtime::apply_frame;
 #[cfg(test)]
 use runtime::{capture_and_queue_outgoing_frames, drain_pending_inject_frames};
 use runtime::{record_local_input_runtime_event, run};
-#[cfg(windows)]
-use windows_hook_runtime::{
-    HookSenderGuard, captured_key_virtual_keys, is_hook_lock_active, mouse_button_from_virtual_key,
-    mouse_button_virtual_keys, send_hook_event, set_hook_event_sender, set_hook_lock_active,
-    set_hook_wake_state, take_hook_dropped_event_count, update_escape_state_for_key,
-    virtual_key_for_mouse_button,
-};
-#[cfg(windows)]
-use windows_hooks::{install_keyboard_hook, install_mouse_hook, run_hook_message_loop};
-#[cfg(test)]
-#[cfg(windows)]
-use windows_raw_input::raw_mouse_relative_delta;
-#[cfg(windows)]
-use windows_raw_input::spawn_raw_input_thread;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureControlAction {
@@ -231,15 +191,6 @@ struct WindowsPollingCaptureBackend {
     last_cursor: Option<(i32, i32)>,
     last_key_down: HashMap<u16, bool>,
     last_button_down: HashMap<u16, bool>,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone)]
-enum HookCaptureEvent {
-    MouseDelta { dx: i32, dy: i32 },
-    MousePosition { x: i32, y: i32 },
-    Input(InputEvent),
-    Control(CaptureControlAction),
 }
 
 #[cfg(windows)]
