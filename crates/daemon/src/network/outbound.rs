@@ -1,11 +1,14 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use core_clipboard::{ClipboardPayload, payload_hash_hex};
-use peer_transport::{FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS, OutboundTransferFlow};
+use peer_transport::{
+    CLIPBOARD_IMAGE_CHUNK_BYTES, OutboundTransferFlows, consume_outbound_chunk_credit,
+    has_available_outbound_chunk_credit, register_outbound_transfer_flow,
+    remove_outbound_transfer_flow, restore_outbound_chunk_credits_for_payloads,
+};
 
 use super::codec::input_events_to_wire;
 use super::*;
-const CLIPBOARD_IMAGE_CHUNK_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendPayloadOutcome {
@@ -15,27 +18,9 @@ enum SendPayloadOutcome {
 }
 
 struct OutboundPayloadWriter<'a, W> {
-    outbound_transfer_flow: &'a mut HashMap<String, OutboundTransferFlow>,
+    outbound_transfer_flow: &'a mut OutboundTransferFlows,
     writer: &'a mut W,
     frame_buffer: &'a mut Vec<u8>,
-}
-
-fn restore_outbound_chunk_credits_for_payloads(
-    outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
-    payloads: &[OutboundPayload],
-) {
-    for payload in payloads {
-        let OutboundPayload::FileChunk { transfer_id, .. } = payload else {
-            continue;
-        };
-        let Some(flow) = outbound_transfer_flow.get_mut(transfer_id) else {
-            continue;
-        };
-        flow.available_chunk_credits = flow
-            .available_chunk_credits
-            .saturating_add(1)
-            .min(FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS);
-    }
 }
 
 #[cfg(test)]
@@ -50,7 +35,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut frame_buffer = Vec::with_capacity(4096);
-    let mut outbound_transfer_flow = HashMap::new();
+    let mut outbound_transfer_flow = OutboundTransferFlows::new();
     flush_outgoing_input_payloads_with_buffer(
         state,
         local_machine_id,
@@ -79,7 +64,7 @@ pub(super) async fn flush_outgoing_input_payloads_with_buffer<W>(
     local_machine_id: &str,
     remote_peer_id: Option<&str>,
     remote_protocol: ProtocolVersion,
-    outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
+    outbound_transfer_flow: &mut OutboundTransferFlows,
     writer: &mut W,
     frame_buffer: &mut Vec<u8>,
 ) -> Result<()>
@@ -116,7 +101,7 @@ pub(super) async fn flush_outgoing_bulk_payloads_with_buffer<W>(
     remote_peer_id: Option<&str>,
     remote_protocol: ProtocolVersion,
     max_payloads: usize,
-    outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
+    outbound_transfer_flow: &mut OutboundTransferFlows,
     writer: &mut W,
     frame_buffer: &mut Vec<u8>,
 ) -> Result<()>
@@ -346,12 +331,7 @@ where
                 writer_ctx.frame_buffer,
             )
             .await?;
-            writer_ctx.outbound_transfer_flow.insert(
-                transfer_id.clone(),
-                OutboundTransferFlow {
-                    available_chunk_credits: 0,
-                },
-            );
+            register_outbound_transfer_flow(writer_ctx.outbound_transfer_flow, transfer_id.clone());
             Ok(SendPayloadOutcome::Sent)
         }
         OutboundPayload::FileChunk {
@@ -360,7 +340,9 @@ where
             offset_bytes,
             length_bytes,
         } => {
-            let Some(flow) = writer_ctx.outbound_transfer_flow.get(transfer_id) else {
+            let Some(has_credit) =
+                has_available_outbound_chunk_credit(writer_ctx.outbound_transfer_flow, transfer_id)
+            else {
                 warn!(
                     peer_id = %peer_id,
                     transfer_id = %transfer_id,
@@ -369,7 +351,7 @@ where
                 return Ok(SendPayloadOutcome::Dropped);
             };
 
-            if flow.available_chunk_credits == 0 {
+            if !has_credit {
                 return Ok(SendPayloadOutcome::DeferredForBackpressure);
             }
 
@@ -406,9 +388,7 @@ where
                 writer_ctx.frame_buffer,
             )
             .await?;
-            if let Some(flow) = writer_ctx.outbound_transfer_flow.get_mut(transfer_id) {
-                flow.available_chunk_credits = flow.available_chunk_credits.saturating_sub(1);
-            }
+            consume_outbound_chunk_credit(writer_ctx.outbound_transfer_flow, transfer_id);
             Ok(SendPayloadOutcome::Sent)
         }
         OutboundPayload::FileEnd {
@@ -424,7 +404,7 @@ where
                 writer_ctx.frame_buffer,
             )
             .await?;
-            writer_ctx.outbound_transfer_flow.remove(transfer_id);
+            remove_outbound_transfer_flow(writer_ctx.outbound_transfer_flow, transfer_id);
 
             state
                 .record_outgoing_file(peer_id, file_name, *total_bytes)

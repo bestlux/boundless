@@ -72,12 +72,7 @@ impl AppState {
             .await
             .map(|items| items.len())
             .unwrap_or(0);
-        let event_count = self
-            .transport
-            .transport_events
-            .lock()
-            .map(|events| events.len())
-            .unwrap_or(0);
+        let event_count = self.transport.transport_event_count();
         let input_owner = self
             .input_owner()
             .await

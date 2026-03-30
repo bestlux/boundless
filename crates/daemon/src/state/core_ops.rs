@@ -171,16 +171,11 @@ impl AppState {
     }
 
     pub fn subscribe_outgoing_flush_signal(&self) -> watch::Receiver<u64> {
-        self.transport.outgoing_flush_signal.subscribe()
+        self.transport.subscribe_outgoing_flush_signal()
     }
 
     pub(crate) fn notify_outgoing_flush_signal(&self) {
-        let next = self
-            .transport
-            .outgoing_flush_generation
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .wrapping_add(1);
-        let _ = self.transport.outgoing_flush_signal.send(next);
+        self.transport.notify_outgoing_flush_signal();
     }
 
     fn record_runtime_wake(&self, channel: &str, source: &str) {

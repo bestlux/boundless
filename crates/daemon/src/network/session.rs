@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use peer_transport::{
-    DEFAULT_TRANSPORT_TUNING, FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS, OutboundTransferFlow,
+    DEFAULT_TRANSPORT_TUNING, InboundClipboardImageTransfer, InboundTransfer,
+    OutboundTransferFlows, apply_outbound_chunk_credits, reconnect_generation_advanced,
 };
 
 use crate::state::TransportEventRecord;
@@ -12,9 +13,9 @@ use super::control::{
     HelloHandling, handle_heartbeat_message, handle_hello_ack_message, handle_hello_message,
 };
 use super::inbound::{
-    InboundClipboardImageTransfer, InboundTransfer, discard_inbound_clipboard_image_transfer,
-    discard_inbound_transfer, handle_clipboard_image_chunk, handle_clipboard_image_end,
-    handle_clipboard_image_start, handle_file_chunk, handle_file_end, handle_file_start,
+    discard_inbound_clipboard_image_transfer, discard_inbound_transfer,
+    handle_clipboard_image_chunk, handle_clipboard_image_end, handle_clipboard_image_start,
+    handle_file_chunk, handle_file_end, handle_file_start,
 };
 use super::inbound_payload::{
     handle_clipboard_image_message, handle_clipboard_text_message, handle_input_frame_message,
@@ -140,7 +141,7 @@ where
     let mut inbound_transfers: HashMap<String, InboundTransfer> = HashMap::new();
     let mut inbound_clipboard_image_transfers: HashMap<String, InboundClipboardImageTransfer> =
         HashMap::new();
-    let mut outbound_transfer_flow: HashMap<String, OutboundTransferFlow> = HashMap::new();
+    let mut outbound_transfer_flow: OutboundTransferFlows = HashMap::new();
 
     loop {
         tokio::select! {
@@ -475,7 +476,11 @@ where
                             continue;
                         }
 
-                        let Some(flow) = outbound_transfer_flow.get_mut(&transfer_id) else {
+                        let Some(_current_credits) = apply_outbound_chunk_credits(
+                            &mut outbound_transfer_flow,
+                            &transfer_id,
+                            chunk_credits,
+                        ) else {
                             warn!(
                                 transfer_id = %transfer_id,
                                 chunk_credits,
@@ -483,11 +488,6 @@ where
                             );
                             continue;
                         };
-
-                        flow.available_chunk_credits = flow
-                            .available_chunk_credits
-                            .saturating_add(chunk_credits)
-                            .min(FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS);
 
                         if let Some(remote_protocol) = remote_protocol {
                             flush_outgoing_bulk_payloads_with_buffer(
@@ -555,12 +555,7 @@ pub(super) async fn reconnect_requested_for_peer(
     observed_generation: &mut u64,
 ) -> bool {
     let current_generation = state.peer_reconnect_generation(peer_id).await;
-    if current_generation <= *observed_generation {
-        return false;
-    }
-
-    *observed_generation = current_generation;
-    true
+    reconnect_generation_advanced(observed_generation, current_generation)
 }
 
 async fn authenticated_peer_machine_id<S>(

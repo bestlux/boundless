@@ -68,8 +68,6 @@ use tls::{
 const SUPERVISOR_TICK: Duration = Duration::from_secs(1);
 const MAX_BACKOFF_SECONDS: u64 = 30;
 const MAX_WIRE_FRAME_BYTES: usize = MAX_WIRE_PAYLOAD_BYTES;
-const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
-const MAX_INBOUND_TRANSFERS_PER_PEER: usize = 4;
 const FALLBACK_BIND_HOST: &str = "0.0.0.0";
 
 pub fn start(state: AppState, listener: Option<TcpListener>) {

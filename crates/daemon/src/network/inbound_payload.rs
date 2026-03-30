@@ -1,4 +1,5 @@
 use chrono::Utc;
+use peer_transport::MAX_CLIPBOARD_TEXT_BYTES;
 use tracing::{info, warn};
 
 use crate::state::{AppState, TransportEventRecord};

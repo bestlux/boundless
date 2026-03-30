@@ -2,23 +2,13 @@ use super::*;
 
 impl AppState {
     pub async fn request_peer_reconnect(&self, peer_id: &str) -> u64 {
-        let mut generations = self.transport.reconnect_generation_by_peer.write().await;
-        let entry = generations.entry(peer_id.to_string()).or_insert(0);
-        *entry += 1;
-        let generation = *entry;
-        drop(generations);
+        let generation = self.transport.request_peer_reconnect(peer_id).await;
         self.notify_peer_reconcile_wake("peer_reconnect_requested");
         generation
     }
 
     pub async fn peer_reconnect_generation(&self, peer_id: &str) -> u64 {
-        *self
-            .transport
-            .reconnect_generation_by_peer
-            .read()
-            .await
-            .get(peer_id)
-            .unwrap_or(&0)
+        self.transport.peer_reconnect_generation(peer_id).await
     }
 
     pub async fn request_peer_reconnect_and_reset(&self, peer_id: &str) -> Result<(u64, usize)> {
@@ -72,13 +62,9 @@ impl AppState {
         &self,
         abort_handle: tokio::task::AbortHandle,
     ) -> u64 {
-        let session_id = self.transport.allocate_transport_session_id();
         self.transport
-            .pending_transport_session_abort_handles
-            .write()
+            .register_pending_transport_session(abort_handle)
             .await
-            .insert(session_id, abort_handle);
-        session_id
     }
 
     pub async fn register_transport_session_for_peer(
@@ -86,15 +72,9 @@ impl AppState {
         peer_id: &str,
         abort_handle: tokio::task::AbortHandle,
     ) -> u64 {
-        let session_id = self.transport.allocate_transport_session_id();
         self.transport
-            .transport_session_abort_handles_by_peer
-            .write()
+            .register_transport_session_for_peer(peer_id, abort_handle)
             .await
-            .entry(peer_id.to_string())
-            .or_default()
-            .insert(session_id, abort_handle);
-        session_id
     }
 
     pub async fn bind_pending_transport_session_to_peer(
@@ -102,67 +82,21 @@ impl AppState {
         session_id: u64,
         peer_id: &str,
     ) -> bool {
-        let abort_handle = self
-            .transport
-            .pending_transport_session_abort_handles
-            .write()
-            .await
-            .remove(&session_id);
-        let Some(abort_handle) = abort_handle else {
-            return false;
-        };
-
         self.transport
-            .transport_session_abort_handles_by_peer
-            .write()
+            .bind_pending_transport_session_to_peer(session_id, peer_id)
             .await
-            .entry(peer_id.to_string())
-            .or_default()
-            .insert(session_id, abort_handle);
-        true
     }
 
     pub async fn clear_transport_session_registration(&self, session_id: u64) {
-        if self
-            .transport
-            .pending_transport_session_abort_handles
-            .write()
-            .await
-            .remove(&session_id)
-            .is_some()
-        {
-            return;
-        }
-
-        let mut by_peer = self
-            .transport
-            .transport_session_abort_handles_by_peer
-            .write()
+        self.transport
+            .clear_transport_session_registration(session_id)
             .await;
-        let mut empty_peers = Vec::<String>::new();
-        for (peer_id, sessions) in by_peer.iter_mut() {
-            if sessions.remove(&session_id).is_some() && sessions.is_empty() {
-                empty_peers.push(peer_id.clone());
-            }
-        }
-        for peer_id in empty_peers {
-            by_peer.remove(&peer_id);
-        }
     }
 
     pub async fn abort_transport_sessions_for_peer(&self, peer_id: &str) -> usize {
-        let sessions = self
-            .transport
-            .transport_session_abort_handles_by_peer
-            .write()
+        self.transport
+            .abort_transport_sessions_for_peer(peer_id)
             .await
-            .remove(peer_id)
-            .unwrap_or_default();
-        let aborted = sessions.len();
-        for handle in sessions.into_values() {
-            handle.abort();
-        }
-        aborted
     }
 
     pub async fn abort_transport_sessions_for_peers(&self, peer_ids: &[String]) -> usize {

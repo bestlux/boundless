@@ -9,7 +9,8 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::Utc;
 pub use peer_transport::{
-    OutboundPayload, OutgoingPeerQueues, RuntimeWakeSignal, TransportEventRecord,
+    MAX_TRANSPORT_EVENTS, OutboundPayload, OutgoingPeerQueues, RuntimeWakeSignal,
+    TransportEventRecord,
 };
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio::sync::{RwLock, watch};
@@ -35,7 +36,6 @@ use crate::config::{
     ApiTransport, PeerConfig, RuntimeConfig, config_path, load_or_create_config_at, save_config_at,
 };
 
-const MAX_TRANSPORT_EVENTS: usize = 512;
 const MAX_PENDING_REMOTE_CLIPBOARD_ITEMS: usize = 64;
 const MAX_PENDING_INJECT_INPUT_FRAMES: usize = 128;
 const MAX_PENDING_OUTGOING_INPUT_FRAMES: usize = 128;

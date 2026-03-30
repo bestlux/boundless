@@ -904,33 +904,16 @@ impl AppState {
     }
 
     fn observe_outgoing_input_high_water(&self, peer_id: &str, depth: usize) -> Option<usize> {
-        let Ok(mut high_water) = self.transport.outgoing_input_high_water_by_peer.lock() else {
-            return None;
-        };
-        let entry = high_water.entry(peer_id.to_string()).or_insert(0);
-        if depth > *entry {
-            *entry = depth;
-            return Some(depth);
-        }
-        None
+        self.transport
+            .observe_outgoing_input_high_water(peer_id, depth)
     }
 
     pub fn record_transport_event(&self, event: TransportEventRecord) {
-        let Ok(mut events) = self.transport.transport_events.lock() else {
-            return;
-        };
-
-        events.push_back(event);
-        while events.len() > MAX_TRANSPORT_EVENTS {
-            events.pop_front();
-        }
+        self.transport.record_transport_event(event);
     }
 
     pub async fn transport_events(&self) -> Vec<TransportEventRecord> {
-        let Ok(events) = self.transport.transport_events.lock() else {
-            return Vec::new();
-        };
-        events.iter().cloned().collect()
+        self.transport.transport_events_snapshot().await
     }
 
     pub async fn record_incoming_clipboard_text(&self, peer_id: &str, text: &str) {
