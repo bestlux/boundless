@@ -726,6 +726,7 @@ name = "boundless-cli"
 version = "2.1.0"
 dependencies = [
  "anyhow",
+ "app-services",
  "clap",
  "core-clipboard",
  "core-discovery",
@@ -777,6 +778,7 @@ name = "boundless-tray"
 version = "2.1.0"
 dependencies = [
  "anyhow",
+ "app-services",
  "clap",
  "eframe",
  "egui",

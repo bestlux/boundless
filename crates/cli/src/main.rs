@@ -4,8 +4,6 @@ use core_clipboard::validate_bmp_payload as validate_bmp_bytes;
 use serde::{Deserialize, Serialize};
 use std::{
     io::{self, Write},
-    net::SocketAddr,
-    process::{Command as ProcessCommand, Stdio},
     time::Duration,
 };
 use tokio::time::Instant;
@@ -16,7 +14,6 @@ use hyper_util::rt::TokioIo;
 #[cfg(windows)]
 use std::{
     future::Future,
-    os::windows::process::CommandExt,
     pin::Pin,
     task::{Context as TaskContext, Poll},
 };
@@ -41,17 +38,18 @@ mod console;
 
 #[cfg(windows)]
 use cli_helpers::NamedPipeConnector;
-use cli_helpers::extract_port_from_network_address;
 #[cfg(all(test, windows))]
 use cli_helpers::is_pipe_busy_error;
 use cli_helpers::{
-    filter_connectable_discovery_records, format_host_port, nearby_pairing_port,
-    parse_npipe_endpoint, prompt_pairing_code, prompt_pairing_nonce, resolve_discovered_peer,
-    short_machine_id, validate_bmp_payload,
+    filter_connectable_discovery_records, format_host_port, parse_npipe_endpoint,
+    prompt_pairing_code, prompt_pairing_nonce, resolve_discovered_peer, short_machine_id,
+    validate_bmp_payload,
 };
 use commands::*;
 use console::console_run;
 use console::{ConsoleDiscoveredPeer, ConsoleSnapshot};
+#[cfg(test)]
+use app_services::desktop::nearby_pairing_port;
 
 #[derive(Debug, Parser)]
 #[command(name = "boundlessctl", version, about = "Boundless CLI")]
@@ -543,18 +541,6 @@ mod tests {
         assert_eq!(format_host_port("10.0.0.7", 15200), "10.0.0.7:15200");
         assert_eq!(format_host_port("fe80::1", 15200), "[fe80::1]:15200");
         assert_eq!(format_host_port("[fe80::1]", 15200), "[fe80::1]:15200");
-    }
-
-    #[test]
-    fn extract_port_from_network_address_accepts_hostname_with_port() {
-        assert_eq!(
-            extract_port_from_network_address("DESKTOP-ABC:15100").expect("port"),
-            15100
-        );
-        assert_eq!(
-            extract_port_from_network_address("[fe80::1%4]:17100").expect("port"),
-            17100
-        );
     }
 
     #[test]

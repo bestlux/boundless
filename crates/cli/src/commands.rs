@@ -1,7 +1,9 @@
 use super::*;
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+use app_services::desktop::{
+    build_orientation_matrix, host_and_pairing_port_from_endpoint,
+    is_local_layout_token as is_local_layout_token_shared, parse_layout_matrix,
+    resolve_boundlessd_candidates, spawn_boundlessd_process,
+};
 
 pub(super) async fn ensure_daemon_available(endpoint: &str, start_daemon: bool) -> Result<()> {
     if channel(endpoint).await.is_ok() {
@@ -32,54 +34,8 @@ pub(super) async fn ensure_daemon_available(endpoint: &str, start_daemon: bool) 
 }
 
 fn spawn_daemon_process() -> Result<String> {
-    let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("BOUNDLESS_DAEMON_PATH") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            candidates.push(trimmed.to_string());
-        }
-    }
-
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(parent) = current_exe.parent()
-    {
-        #[cfg(windows)]
-        {
-            candidates.push(parent.join("boundlessd.exe").display().to_string());
-        }
-        #[cfg(not(windows))]
-        {
-            candidates.push(parent.join("boundlessd").display().to_string());
-        }
-    }
-
-    candidates.push("boundlessd".to_string());
-    #[cfg(windows)]
-    candidates.push("boundlessd.exe".to_string());
-
-    candidates.sort();
-    candidates.dedup();
-
-    let mut errors = Vec::new();
-    for candidate in candidates {
-        let mut command = ProcessCommand::new(&candidate);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(windows)]
-        command.creation_flags(CREATE_NO_WINDOW);
-
-        match command.spawn() {
-            Ok(_) => return Ok(candidate),
-            Err(error) => errors.push(format!("{candidate}: {error}")),
-        }
-    }
-
-    bail!(
-        "failed to start boundlessd; candidates attempted: {}",
-        errors.join("; ")
-    )
+    let candidates = resolve_boundlessd_candidates(std::env::current_exe().ok());
+    spawn_boundlessd_process(&candidates)
 }
 
 pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
@@ -124,7 +80,7 @@ pub(super) async fn pair_discover(endpoint: &str) -> Result<()> {
     }
 
     for (index, peer) in discovered.iter().enumerate() {
-        let pairing_port = host_and_pairing_port_from_discovery_endpoint(&peer.endpoint)
+        let pairing_port = host_and_pairing_port_from_endpoint(&peer.endpoint)
             .map(|(_, port)| port)
             .unwrap_or(15200);
         println!(
@@ -211,9 +167,7 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
                 );
             }
             let selected = resolve_discovered_peer_record(&discovered, &selector)?;
-            let (host, pairing_port) = host_and_pairing_port_from_discovery_endpoint(
-                &selected.endpoint,
-            )
+            let (host, pairing_port) = host_and_pairing_port_from_endpoint(&selected.endpoint)
             .with_context(|| format!("invalid discovered endpoint {}", selected.endpoint))?;
             (
                 host,
@@ -334,9 +288,7 @@ pub(super) async fn setup_wizard(endpoint: &str, start_daemon: bool) -> Result<(
             (host, port, None)
         } else {
             let selected = resolve_discovered_peer_record(&discovered, &selector)?;
-            let (host, pairing_port) = host_and_pairing_port_from_discovery_endpoint(
-                &selected.endpoint,
-            )
+            let (host, pairing_port) = host_and_pairing_port_from_endpoint(&selected.endpoint)
             .with_context(|| format!("invalid discovered endpoint {}", selected.endpoint))?;
             (host, pairing_port, Some(selected.display_name.clone()))
         }
@@ -1505,7 +1457,11 @@ fn extract_orientation_slots(
     let mut local_cell: Option<(usize, usize)> = None;
     for (row_index, row) in grid.iter().enumerate() {
         for (column_index, token) in row.iter().enumerate() {
-            if is_local_layout_token(token, local_tokens) {
+            if is_local_layout_token_shared(
+                token,
+                &local_tokens.machine_id,
+                Some(local_tokens.display_name.as_str()),
+            ) {
                 if local_cell.is_some() {
                     bail!("layout has multiple local cells; cannot safely orient");
                 }
@@ -1623,25 +1579,19 @@ fn collect_matrix_peer_ids(
     Ok(ids)
 }
 
-fn is_local_layout_token(token: &str, local_tokens: &LocalLayoutTokens) -> bool {
-    let token = token.trim();
-    if token.is_empty() {
-        return false;
-    }
-    matches!(
-        token.to_ascii_lowercase().as_str(),
-        "self" | "local" | "this" | "me"
-    ) || token.eq_ignore_ascii_case(&local_tokens.machine_id)
-        || token.eq_ignore_ascii_case(&local_tokens.display_name)
-}
-
 fn resolve_matrix_peer_token(
     token: &str,
     peers: &[PeerRecord],
     local_tokens: &LocalLayoutTokens,
 ) -> Result<Option<String>> {
     let trimmed = token.trim();
-    if trimmed.is_empty() || is_local_layout_token(trimmed, local_tokens) {
+    if trimmed.is_empty()
+        || is_local_layout_token_shared(
+            trimmed,
+            &local_tokens.machine_id,
+            Some(local_tokens.display_name.as_str()),
+        )
+    {
         return Ok(None);
     }
 
@@ -1663,68 +1613,6 @@ fn resolve_matrix_peer_token(
     Ok(Some(matches[0].peer_id.clone()))
 }
 
-pub(super) fn host_and_pairing_port_from_discovery_endpoint(
-    endpoint: &str,
-) -> Result<(String, u16)> {
-    let trimmed = endpoint.trim();
-    if trimmed.is_empty() {
-        bail!("discovery endpoint is empty");
-    }
-
-    if let Ok(socket) = trimmed.parse::<SocketAddr>() {
-        return Ok((socket.ip().to_string(), nearby_pairing_port(socket.port())));
-    }
-
-    if let Some(host) = trimmed
-        .strip_prefix('[')
-        .and_then(|value| value.split_once(']'))
-        .map(|(host, _)| host.to_string())
-    {
-        let port = extract_port_from_network_address(trimmed)?;
-        return Ok((host, nearby_pairing_port(port)));
-    }
-
-    if let Some((host, _)) = trimmed.rsplit_once(':') {
-        let host = host.trim();
-        if host.is_empty() {
-            bail!("discovery endpoint is missing host");
-        }
-        let port = extract_port_from_network_address(trimmed)?;
-        return Ok((host.to_string(), nearby_pairing_port(port)));
-    }
-
-    bail!("discovery endpoint must include host and port")
-}
-
-fn build_orientation_matrix(
-    left: Option<&str>,
-    right: Option<&str>,
-    up: Option<&str>,
-    down: Option<&str>,
-) -> String {
-    let center = format!("{},{},{}", left.unwrap_or(""), "self", right.unwrap_or(""));
-    let mut rows = Vec::<String>::new();
-    if let Some(up) = up {
-        rows.push(format!(",{},", up));
-    }
-    rows.push(center);
-    if let Some(down) = down {
-        rows.push(format!(",{},", down));
-    }
-    rows.join(";")
-}
-
-fn parse_layout_matrix(matrix: &str) -> Vec<Vec<String>> {
-    matrix
-        .split(';')
-        .map(|row| {
-            row.split(',')
-                .map(|token| token.trim().to_string())
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
 fn preview_label_for_token(
     token: &str,
     peers: &[PeerRecord],
@@ -1733,7 +1621,11 @@ fn preview_label_for_token(
     if token.trim().is_empty() {
         return ".".to_string();
     }
-    if is_local_layout_token(token, local_tokens) {
+    if is_local_layout_token_shared(
+        token,
+        &local_tokens.machine_id,
+        Some(local_tokens.display_name.as_str()),
+    ) {
         return "THIS-PC".to_string();
     }
 
@@ -1748,6 +1640,12 @@ fn preview_label_for_token(
     }
 
     token.to_string()
+}
+
+pub(super) fn host_and_pairing_port_from_discovery_endpoint(
+    endpoint: &str,
+) -> Result<(String, u16)> {
+    host_and_pairing_port_from_endpoint(endpoint)
 }
 
 fn find_new_peer_record(before: &[PeerRecord], after: &[PeerRecord]) -> Option<PeerRecord> {
@@ -1913,8 +1811,8 @@ mod tests {
 
     #[test]
     fn host_and_pairing_port_parses_hostname_endpoint() {
-        let (host, port) = host_and_pairing_port_from_discovery_endpoint("DESKTOP-ABC:15100")
-            .expect("parse endpoint");
+        let (host, port) =
+            host_and_pairing_port_from_endpoint("DESKTOP-ABC:15100").expect("parse endpoint");
         assert_eq!(host, "DESKTOP-ABC");
         assert_eq!(port, 15200);
     }

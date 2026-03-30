@@ -13,6 +13,12 @@ fn main() -> anyhow::Result<()> {
 #[cfg(windows)]
 mod windows_app {
     use anyhow::{Context, Result, bail};
+    use app_services::desktop::{
+        CANONICAL_LOCAL_LAYOUT_TOKEN, host_and_pairing_port_from_endpoint,
+        is_local_layout_token as shared_is_local_layout_token, parse_pairing_port,
+        resolve_boundlessd_candidates, serialize_layout_matrix, spawn_boundlessd_process,
+        validate_layout_before_apply,
+    };
     use clap::Parser;
     use eframe::icon_data;
     use hyper_util::rt::TokioIo;
@@ -25,9 +31,7 @@ mod windows_app {
     use serde::Deserialize;
     use std::{
         future::Future,
-        os::windows::process::CommandExt,
         pin::Pin,
-        process::{Command as ProcessCommand, Stdio},
         task::{Context as TaskContext, Poll},
         time::{Duration, Instant},
     };
@@ -44,7 +48,6 @@ mod windows_app {
 
     const APP_ICON_BYTES: &[u8] = include_bytes!("../assets/app-icon.png");
     const TRAY_ICON_BYTES: &[u8] = include_bytes!("../assets/tray-icon-20.png");
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
     const ACTION_DASHBOARD: &str = "dashboard";
     const ACTION_QUIT: &str = "quit";
     #[derive(Debug, Parser)]
@@ -359,25 +362,7 @@ mod windows_app {
     }
 
     fn spawn_daemon_process(candidates: &[String]) -> Result<String> {
-        let mut errors = Vec::new();
-        for candidate in candidates {
-            let mut command = ProcessCommand::new(candidate);
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            command.creation_flags(CREATE_NO_WINDOW);
-
-            match command.spawn() {
-                Ok(_) => return Ok(candidate.clone()),
-                Err(error) => errors.push(format!("{candidate}: {error}")),
-            }
-        }
-
-        bail!(
-            "failed to start boundlessd; candidates attempted: {}",
-            errors.join("; ")
-        )
+        spawn_boundlessd_process(candidates)
     }
 
     async fn pair_nearby_request_code(
@@ -600,82 +585,9 @@ mod windows_app {
         Ok(matches[0])
     }
 
-    fn host_and_pairing_port_from_discovery_endpoint(endpoint: &str) -> Option<(String, u16)> {
-        let trimmed = endpoint.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        if let Ok(socket) = trimmed.parse::<std::net::SocketAddr>() {
-            return Some((socket.ip().to_string(), nearby_pairing_port(socket.port())));
-        }
-
-        if let Some(host) = trimmed
-            .strip_prefix('[')
-            .and_then(|value| value.split_once(']'))
-            .map(|(host, _)| host.to_string())
-        {
-            let port = extract_port_from_endpoint(trimmed)?;
-            return Some((host, nearby_pairing_port(port)));
-        }
-
-        if let Some((host, _)) = trimmed.rsplit_once(':') {
-            let host = host.trim();
-            if host.is_empty() {
-                return None;
-            }
-            let port = extract_port_from_endpoint(trimmed)?;
-            return Some((host.to_string(), nearby_pairing_port(port)));
-        }
-
-        None
-    }
-
-    fn extract_port_from_endpoint(endpoint: &str) -> Option<u16> {
-        endpoint
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.trim().parse::<u16>().ok())
-            .filter(|port| *port != 0)
-    }
-
-    fn parse_pairing_port(value: &str) -> Result<u16> {
-        let pairing_port = value
-            .parse::<u16>()
-            .context("pairing port must be a number in 1..=65535")?;
-        if pairing_port == 0 {
-            bail!("pairing port must be in 1..=65535");
-        }
-        Ok(pairing_port)
-    }
-
-    fn nearby_pairing_port(transport_port: u16) -> u16 {
-        if transport_port <= u16::MAX - 100 {
-            return transport_port + 100;
-        }
-        transport_port.saturating_sub(100).max(1)
-    }
-
-    fn resolve_boundlessd_candidates() -> Vec<String> {
-        let mut candidates = Vec::<String>::new();
-        if let Ok(path) = std::env::var("BOUNDLESS_DAEMON_PATH") {
-            let trimmed = path.trim();
-            if !trimmed.is_empty() {
-                candidates.push(trimmed.to_string());
-            }
-        }
-
-        if let Ok(current_exe) = std::env::current_exe()
-            && let Some(parent) = current_exe.parent()
-        {
-            candidates.push(parent.join("boundlessd.exe").display().to_string());
-            candidates.push(parent.join("boundlessd").display().to_string());
-        }
-
-        candidates.push("boundlessd.exe".to_string());
-        candidates.push("boundlessd".to_string());
-        candidates.sort();
-        candidates.dedup();
-        candidates
+    #[cfg(test)]
+    fn is_local_layout_token(token: &str, machine_id: &str) -> bool {
+        shared_is_local_layout_token(token, machine_id, None)
     }
 
     fn make_tray_icon() -> Result<Icon> {

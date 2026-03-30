@@ -15,7 +15,7 @@ pub(super) fn run() -> Result<()> {
     let ctx = Arc::new(AppContext {
         endpoint: cli.endpoint,
         start_daemon: cli.start_daemon,
-        daemon_candidates: resolve_boundlessd_candidates(),
+        daemon_candidates: resolve_boundlessd_candidates(std::env::current_exe().ok()),
     });
 
     let options = eframe::NativeOptions {
@@ -63,86 +63,6 @@ enum Tab {
     Settings,
 }
 
-const CANONICAL_LOCAL_LAYOUT_TOKEN: &str = "self";
-
-fn is_local_layout_token(token: &str, local_machine_id: &str) -> bool {
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    matches!(
-        trimmed.to_ascii_lowercase().as_str(),
-        "self" | "local" | "this" | "me"
-    ) || trimmed.eq_ignore_ascii_case(local_machine_id)
-}
-
-fn count_local_layout_cells(
-    layout_grid: &HashMap<(i32, i32), String>,
-    local_machine_id: &str,
-) -> usize {
-    layout_grid
-        .values()
-        .filter(|id| id.eq_ignore_ascii_case(local_machine_id))
-        .count()
-}
-
-fn validate_layout_before_apply(
-    layout_grid: &HashMap<(i32, i32), String>,
-    local_machine_id: &str,
-) -> Result<()> {
-    match count_local_layout_cells(layout_grid, local_machine_id) {
-        1 => Ok(()),
-        0 => anyhow::bail!("layout must include This PC exactly once before applying"),
-        _ => anyhow::bail!("layout must include This PC exactly once before applying"),
-    }
-}
-
-fn serialize_layout_matrix(layout_grid: &HashMap<(i32, i32), String>, local_machine_id: &str) -> String {
-    let mut positions = layout_grid.keys();
-    let Some(&(first_x, first_y)) = positions.next() else {
-        return String::new();
-    };
-
-    let mut min_x = first_x;
-    let mut max_x = first_x;
-    let mut min_y = first_y;
-    let mut max_y = first_y;
-
-    for (x, y) in positions {
-        if *x < min_x {
-            min_x = *x;
-        }
-        if *x > max_x {
-            max_x = *x;
-        }
-        if *y < min_y {
-            min_y = *y;
-        }
-        if *y > max_y {
-            max_y = *y;
-        }
-    }
-
-    let mut rows = Vec::new();
-    for y in min_y..=max_y {
-        let mut cols = Vec::new();
-        for x in min_x..=max_x {
-            if let Some(id) = layout_grid.get(&(x, y)) {
-                cols.push(if id.eq_ignore_ascii_case(local_machine_id) {
-                    CANONICAL_LOCAL_LAYOUT_TOKEN.to_string()
-                } else {
-                    id.clone()
-                });
-            } else {
-                cols.push(String::new());
-            }
-        }
-        rows.push(cols.join(","));
-    }
-
-    rows.join(";")
-}
-
 fn validate_pairing_code(code: &str) -> Result<()> {
     if code.trim().is_empty() {
         anyhow::bail!("pairing code cannot be empty");
@@ -151,10 +71,8 @@ fn validate_pairing_code(code: &str) -> Result<()> {
 }
 
 fn guided_flow_from_discovered_peer(peer: &UiDiscoveredPeer) -> Result<GuidedPairingFlow> {
-    let Some((host, pairing_port)) = host_and_pairing_port_from_discovery_endpoint(&peer.endpoint)
-    else {
-        anyhow::bail!("Failed to parse peer endpoint");
-    };
+    let (host, pairing_port) = host_and_pairing_port_from_endpoint(&peer.endpoint)
+        .context("Failed to parse peer endpoint")?;
 
     Ok(GuidedPairingFlow {
         dialog_title: format!("Pair with {}", peer.display_name),
@@ -845,7 +763,11 @@ impl eframe::App for DashboardApp {
                             for (y, row) in rows.iter().enumerate() {
                                 for (x, token) in row.iter().enumerate() {
                                     if token.is_empty() { continue; }
-                                    let peer_id = if is_local_layout_token(token, local_id) {
+                                    let peer_id = if shared_is_local_layout_token(
+                                        token,
+                                        local_id,
+                                        None,
+                                    ) {
                                         local_id.clone()
                                     } else if let Some(p) = peers.iter().find(|p| p.display_name == *token || p.peer_id == *token) {
                                         p.peer_id.clone()
