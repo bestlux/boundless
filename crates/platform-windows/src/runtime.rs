@@ -103,6 +103,17 @@ pub fn lock_workstation() -> Result<()> {
     anyhow::bail!("lock_machine is only supported on Windows");
 }
 
+pub fn validate_pipe_name(pipe_name: &str) -> Result<()> {
+    let trimmed = pipe_name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("pipe name must not be empty");
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        anyhow::bail!("pipe name must not contain path separators");
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 async fn accept_loop(
     pipe_path: String,
@@ -143,19 +154,9 @@ fn create_server(pipe_path: &str, first_instance: bool) -> io::Result<NamedPipeS
 
 #[cfg(windows)]
 fn pipe_path_for_name(pipe_name: &str) -> io::Result<String> {
+    validate_pipe_name(pipe_name)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     let trimmed = pipe_name.trim();
-    if trimmed.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "pipe name must not be empty",
-        ));
-    }
-    if trimmed.contains('/') || trimmed.contains('\\') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "pipe name must not contain path separators",
-        ));
-    }
 
     Ok(format!(r"\\.\pipe\{trimmed}"))
 }
