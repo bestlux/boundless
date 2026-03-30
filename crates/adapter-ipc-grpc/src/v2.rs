@@ -1,7 +1,7 @@
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use app_services::{
-    SharedControlPlaneApp,
+    SharedControlPlaneApp, commands as app_commands,
     queries::{
         ConsoleSnapshot, StatusSnapshot, TransportEventSnapshot, UiDiscoveredPeer, UiPairedPeer,
         UiPendingRequest, UiSnapshot,
@@ -89,20 +89,39 @@ impl ControlPlaneService for ControlPlaneApi {
 
     async fn create_pairing_code(
         &self,
-        _request: Request<PairCreateCodeRequest>,
+        request: Request<PairCreateCodeRequest>,
     ) -> Result<Response<PairCreateCodeReply>, Status> {
-        Err(Status::unimplemented(
-            "create_pairing_code is not implemented in adapter-ipc-grpc",
-        ))
+        let ttl_seconds = request.into_inner().ttl_seconds.max(1) as u64;
+        let reply = self
+            .app
+            .create_pairing_code(app_commands::PairingCodeRequest { ttl_seconds })
+            .await
+            .map_err(|error| Status::internal(format!("create pairing code: {error:#}")))?;
+        Ok(Response::new(PairCreateCodeReply {
+            code: reply.code,
+            expires_at: reply.expires_at,
+        }))
     }
 
     async fn join_with_pairing_code(
         &self,
-        _request: Request<PairJoinRequest>,
+        request: Request<PairJoinRequest>,
     ) -> Result<Response<PairJoinReply>, Status> {
-        Err(Status::unimplemented(
-            "join_with_pairing_code is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let code = parse_required_field("code", &request.code)?;
+        let host = parse_required_field("host", &request.host)?;
+        let alias = parse_optional_alias(request.alias);
+
+        let reply = self
+            .app
+            .join_with_pairing_code(app_commands::PairJoinCommand { code, host, alias })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(PairJoinReply {
+            accepted: reply.accepted,
+            peer_id: reply.peer_id,
+            message: reply.message,
+        }))
     }
 
     async fn watch_ui(
@@ -133,11 +152,18 @@ impl ControlPlaneService for ControlPlaneApi {
 
     async fn layout_set(
         &self,
-        _request: Request<LayoutSetRequest>,
+        request: Request<LayoutSetRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        Err(Status::unimplemented(
-            "layout_set is not implemented in adapter-ipc-grpc",
-        ))
+        let matrix_spec = request.into_inner().matrix_spec;
+        let reply = self
+            .app
+            .set_layout(app_commands::LayoutSetCommand { matrix_spec })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
     }
 
     async fn list_peers(
@@ -156,11 +182,18 @@ impl ControlPlaneService for ControlPlaneApi {
 
     async fn remove_peer(
         &self,
-        _request: Request<RemovePeerRequest>,
+        request: Request<RemovePeerRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        Err(Status::unimplemented(
-            "remove_peer is not implemented in adapter-ipc-grpc",
-        ))
+        let peer_id = request.into_inner().peer_id;
+        let reply = self
+            .app
+            .remove_peer(app_commands::RemovePeerCommand { peer_id })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
     }
 
     async fn layout_show(&self, _request: Request<Empty>) -> Result<Response<LayoutReply>, Status> {
@@ -190,110 +223,228 @@ impl ControlPlaneService for ControlPlaneApi {
 
     async fn set_feature(
         &self,
-        _request: Request<FeatureSetRequest>,
+        request: Request<FeatureSetRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        Err(Status::unimplemented(
-            "set_feature is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .set_feature(app_commands::FeatureSetCommand {
+                name: request.name,
+                enabled: request.enabled,
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
     }
 
     async fn set_hotkey(
         &self,
-        _request: Request<HotkeySetRequest>,
+        request: Request<HotkeySetRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        Err(Status::unimplemented(
-            "set_hotkey is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .set_hotkey(app_commands::HotkeySetCommand {
+                action: request.action,
+                combo: request.combo,
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
     }
 
     async fn trigger_hotkey_action(
         &self,
-        _request: Request<HotkeyTriggerRequest>,
+        request: Request<HotkeyTriggerRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        Err(Status::unimplemented(
-            "trigger_hotkey_action is not implemented in adapter-ipc-grpc",
-        ))
+        let action = request.into_inner().action;
+        let reply = self
+            .app
+            .trigger_hotkey_action(app_commands::HotkeyTriggerCommand { action })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
     }
 
     async fn export_trust_bundle(
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<TrustBundleReply>, Status> {
-        Err(Status::unimplemented(
-            "export_trust_bundle is not implemented in adapter-ipc-grpc",
-        ))
+        let bundle = self
+            .app
+            .export_trust_bundle()
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(TrustBundleReply {
+            machine_id: bundle.machine_id,
+            display_name: bundle.display_name,
+            network_address: bundle.network_address,
+            ca_cert_pem: bundle.ca_cert_pem,
+        }))
     }
 
     async fn import_trust_bundle(
         &self,
-        _request: Request<ImportTrustBundleRequest>,
+        request: Request<ImportTrustBundleRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        Err(Status::unimplemented(
-            "import_trust_bundle is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .import_trust_bundle(app_commands::ImportTrustBundleCommand {
+                machine_id: request.machine_id,
+                display_name: request.display_name,
+                network_address: request.network_address,
+                ca_cert_pem: request.ca_cert_pem,
+                alias: parse_optional_alias(request.alias),
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
     }
 
     async fn dump_diagnostics(
         &self,
-        _request: Request<DiagnosticsDumpRequest>,
+        request: Request<DiagnosticsDumpRequest>,
     ) -> Result<Response<DiagnosticsDumpReply>, Status> {
-        Err(Status::unimplemented(
-            "dump_diagnostics is not implemented in adapter-ipc-grpc",
-        ))
+        let output_path = parse_optional_alias(request.into_inner().output_path);
+        let reply = self
+            .app
+            .dump_diagnostics(app_commands::DiagnosticsDumpCommand { output_path })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(DiagnosticsDumpReply {
+            bundle_path: reply.bundle_path,
+        }))
     }
 
     async fn safe_reset(
         &self,
-        _request: Request<SafeResetRequest>,
+        request: Request<SafeResetRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        Err(Status::unimplemented(
-            "safe_reset is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .safe_reset(app_commands::SafeResetCommand {
+                network_only: request.network_only,
+                all: request.all,
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
     }
 
     async fn send_clipboard_text(
         &self,
-        _request: Request<SendClipboardTextRequest>,
+        request: Request<SendClipboardTextRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        Err(Status::unimplemented(
-            "send_clipboard_text is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .send_clipboard_text(app_commands::SendClipboardTextCommand {
+                peer_id: request.peer_id,
+                text: request.text,
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
     }
 
     async fn send_clipboard_image(
         &self,
-        _request: Request<SendClipboardImageRequest>,
+        request: Request<SendClipboardImageRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        Err(Status::unimplemented(
-            "send_clipboard_image is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .send_clipboard_image(app_commands::SendClipboardImageCommand {
+                peer_id: request.peer_id,
+                image_bmp: request.image_bmp,
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
     }
 
     async fn send_file(
         &self,
-        _request: Request<SendFileRequest>,
+        request: Request<SendFileRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        Err(Status::unimplemented(
-            "send_file is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .send_file(app_commands::SendFileCommand {
+                peer_id: request.peer_id,
+                file_path: PathBuf::from(request.file_path),
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
     }
 
     async fn send_input_move(
         &self,
-        _request: Request<SendInputMoveRequest>,
+        request: Request<SendInputMoveRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        Err(Status::unimplemented(
-            "send_input_move is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .send_input_move(app_commands::SendInputMoveCommand {
+                peer_id: request.peer_id,
+                dx: request.dx,
+                dy: request.dy,
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
     }
 
     async fn send_input_key(
         &self,
-        _request: Request<SendInputKeyRequest>,
+        request: Request<SendInputKeyRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        Err(Status::unimplemented(
-            "send_input_key is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let scan_code = u16::try_from(request.scan_code)
+            .map_err(|_| Status::invalid_argument("scan_code must be in 0..=65535"))?;
+        let reply = self
+            .app
+            .send_input_key(app_commands::SendInputKeyCommand {
+                peer_id: request.peer_id,
+                scan_code,
+                key_down: request.key_down,
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
     }
 
     async fn list_transport_events(
@@ -332,20 +483,42 @@ impl ControlPlaneService for ControlPlaneApi {
 
     async fn claim_input_owner(
         &self,
-        _request: Request<InputOwnerRequest>,
+        request: Request<InputOwnerRequest>,
     ) -> Result<Response<InputOwnerReply>, Status> {
-        Err(Status::unimplemented(
-            "claim_input_owner is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .claim_input_owner(app_commands::InputOwnerCommand {
+                peer_id: request.peer_id,
+                force: request.force,
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(InputOwnerReply {
+            ok: reply.ok,
+            owner_peer_id: reply.owner_peer_id,
+            message: reply.message,
+        }))
     }
 
     async fn release_input_owner(
         &self,
-        _request: Request<InputOwnerRequest>,
+        request: Request<InputOwnerRequest>,
     ) -> Result<Response<InputOwnerReply>, Status> {
-        Err(Status::unimplemented(
-            "release_input_owner is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .release_input_owner(app_commands::InputOwnerCommand {
+                peer_id: request.peer_id,
+                force: request.force,
+            })
+            .await
+            .map_err(|error| Status::internal(format!("release input owner: {error:#}")))?;
+        Ok(Response::new(InputOwnerReply {
+            ok: reply.ok,
+            owner_peer_id: reply.owner_peer_id,
+            message: reply.message,
+        }))
     }
 
     async fn get_input_capture_target(
@@ -366,75 +539,222 @@ impl ControlPlaneService for ControlPlaneApi {
 
     async fn set_input_capture_target(
         &self,
-        _request: Request<InputCaptureTargetRequest>,
+        request: Request<InputCaptureTargetRequest>,
     ) -> Result<Response<InputCaptureTargetReply>, Status> {
-        Err(Status::unimplemented(
-            "set_input_capture_target is not implemented in adapter-ipc-grpc",
-        ))
+        let peer_id = request.into_inner().peer_id;
+        let reply = self
+            .app
+            .set_input_capture_target(app_commands::InputCaptureTargetCommand { peer_id })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(InputCaptureTargetReply {
+            ok: reply.ok,
+            peer_id: reply.peer_id,
+            message: reply.message,
+        }))
     }
 
     async fn clear_input_capture_target(
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<InputCaptureTargetReply>, Status> {
-        Err(Status::unimplemented(
-            "clear_input_capture_target is not implemented in adapter-ipc-grpc",
-        ))
+        let reply = self
+            .app
+            .clear_input_capture_target()
+            .await
+            .map_err(|error| Status::internal(format!("clear input capture target: {error:#}")))?;
+        Ok(Response::new(InputCaptureTargetReply {
+            ok: reply.ok,
+            peer_id: reply.peer_id,
+            message: reply.message,
+        }))
     }
 
     async fn request_nearby_pairing_code(
         &self,
-        _request: Request<NearbyRequestCodeStartRequest>,
+        request: Request<NearbyRequestCodeStartRequest>,
     ) -> Result<Response<NearbyRequestCodeStartReply>, Status> {
-        Err(Status::unimplemented(
-            "request_nearby_pairing_code is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let host = parse_host(&request.host)?;
+        let port = parse_port(request.port)?;
+        let reply = self
+            .app
+            .request_nearby_pairing_code(app_commands::NearbyRequestCodeCommand {
+                host,
+                port,
+                alias: parse_optional_alias(request.alias),
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(NearbyRequestCodeStartReply {
+            code_required: reply.code_required,
+            request_id: reply.request_id,
+            verification_nonce: reply.verification_nonce,
+            verification_expires_at: reply.verification_expires_at,
+            unsupported: reply.unsupported,
+            message: reply.message,
+        }))
     }
 
     async fn submit_nearby_pairing_code(
         &self,
-        _request: Request<NearbySubmitCodeRequest>,
+        request: Request<NearbySubmitCodeRequest>,
     ) -> Result<Response<NearbyPairingCompletionReply>, Status> {
-        Err(Status::unimplemented(
-            "submit_nearby_pairing_code is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let host = parse_host(&request.host)?;
+        let port = parse_port(request.port)?;
+        let request_id = parse_required_field("request_id", &request.request_id)?;
+        let code = parse_required_field("code", &request.code)?;
+        let verification_nonce =
+            parse_required_field("verification_nonce", &request.verification_nonce)?;
+
+        let reply = self
+            .app
+            .submit_nearby_pairing_code(app_commands::NearbySubmitCodeCommand {
+                host,
+                port,
+                request_id,
+                code,
+                verification_nonce,
+                alias: parse_optional_alias(request.alias),
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(NearbyPairingCompletionReply {
+            ok: reply.ok,
+            message: reply.message,
+            request_id: reply.request_id,
+            peer_machine_id: reply.peer_machine_id,
+        }))
     }
 
     async fn start_nearby_pairing_join(
         &self,
-        _request: Request<NearbyJoinStartRequest>,
+        request: Request<NearbyJoinStartRequest>,
     ) -> Result<Response<NearbyJoinStatusReply>, Status> {
-        Err(Status::unimplemented(
-            "start_nearby_pairing_join is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let host = parse_host(&request.host)?;
+        let port = parse_port(request.port)?;
+        let code = parse_required_field("code", &request.code)?;
+        let reply = self
+            .app
+            .start_nearby_pairing_join(app_commands::NearbyJoinStartCommand {
+                host,
+                port,
+                code,
+                alias: parse_optional_alias(request.alias),
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(NearbyJoinStatusReply {
+            request_id: reply.request_id,
+            status: reply.status,
+            message: reply.message,
+            peer_machine_id: reply.peer_machine_id.unwrap_or_default(),
+        }))
     }
 
     async fn check_nearby_pairing_join(
         &self,
-        _request: Request<NearbyJoinStatusRequest>,
+        request: Request<NearbyJoinStatusRequest>,
     ) -> Result<Response<NearbyJoinStatusReply>, Status> {
-        Err(Status::unimplemented(
-            "check_nearby_pairing_join is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let host = parse_host(&request.host)?;
+        let port = parse_port(request.port)?;
+        let request_id = parse_required_field("request_id", &request.request_id)?;
+        let reply = self
+            .app
+            .check_nearby_pairing_join(app_commands::NearbyJoinStatusCommand {
+                host,
+                port,
+                request_id,
+                alias: parse_optional_alias(request.alias),
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(NearbyJoinStatusReply {
+            request_id: reply.request_id,
+            status: reply.status,
+            message: reply.message,
+            peer_machine_id: reply.peer_machine_id.unwrap_or_default(),
+        }))
     }
 
     async fn approve_nearby_pairing_request(
         &self,
-        _request: Request<NearbyPairingDecisionRequest>,
+        request: Request<NearbyPairingDecisionRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        Err(Status::unimplemented(
-            "approve_nearby_pairing_request is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .approve_nearby_pairing_request(app_commands::NearbyPairingDecisionCommand {
+                request_id: request.request_id,
+                alias: parse_optional_alias(request.alias),
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
     }
 
     async fn reject_nearby_pairing_request(
         &self,
-        _request: Request<NearbyPairingDecisionRequest>,
+        request: Request<NearbyPairingDecisionRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        Err(Status::unimplemented(
-            "reject_nearby_pairing_request is not implemented in adapter-ipc-grpc",
-        ))
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .reject_nearby_pairing_request(app_commands::NearbyPairingDecisionCommand {
+                request_id: request.request_id,
+                alias: parse_optional_alias(request.alias),
+            })
+            .await
+            .map_err(|error| {
+                Status::internal(format!("reject nearby pairing request: {error:#}"))
+            })?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
     }
+}
+
+fn parse_host(value: &str) -> Result<String, Status> {
+    let host = value.trim();
+    if host.is_empty() {
+        return Err(Status::invalid_argument("host must not be empty"));
+    }
+    Ok(host.to_string())
+}
+
+fn parse_port(value: u32) -> Result<u16, Status> {
+    if value == 0 || value > u16::MAX as u32 {
+        return Err(Status::invalid_argument(
+            "port must be in the range 1..=65535",
+        ));
+    }
+    Ok(value as u16)
+}
+
+fn parse_optional_alias(value: String) -> Option<String> {
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn parse_required_field(name: &str, value: &str) -> Result<String, Status> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{name} must not be empty"
+        )));
+    }
+    Ok(trimmed.to_string())
 }
 
 async fn send_snapshot(

@@ -6,7 +6,6 @@ use boundless_daemon::{
     config::ApiTransport,
     host::{HostOverrides, run_with, shutdown_signal},
     logging,
-    services::ServiceBundle,
     shared_control_plane_app,
 };
 #[cfg(windows)]
@@ -69,14 +68,6 @@ async fn main() -> Result<()> {
             network_port: args.network_port,
         },
         |runtime| async move {
-            let ServiceBundle {
-                daemon,
-                pairing,
-                topology,
-                feature,
-                diagnostics,
-                ..
-            } = ServiceBundle::new(runtime.state.clone());
             let control_plane = adapter_ipc_grpc::ControlPlaneApi::new(shared_control_plane_app(
                 runtime.state.clone(),
             ))
@@ -92,11 +83,6 @@ async fn main() -> Result<()> {
 
                     Server::builder()
                         .add_service(control_plane)
-                        .add_service(daemon)
-                        .add_service(pairing)
-                        .add_service(topology)
-                        .add_service(feature)
-                        .add_service(diagnostics)
                         .serve_with_incoming_shutdown(incoming, shutdown_signal())
                         .await
                         .context("gRPC named-pipe server failure")?;
@@ -112,11 +98,6 @@ async fn main() -> Result<()> {
 
             Server::builder()
                 .add_service(control_plane)
-                .add_service(daemon)
-                .add_service(pairing)
-                .add_service(topology)
-                .add_service(feature)
-                .add_service(diagnostics)
                 .serve_with_shutdown(addr, shutdown_signal())
                 .await
                 .context("gRPC server failure")?;

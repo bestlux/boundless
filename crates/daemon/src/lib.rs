@@ -8,7 +8,6 @@ pub mod input;
 pub mod logging;
 pub mod network;
 pub mod pairing_wire;
-pub mod services;
 pub mod state;
 
 pub use config::ApiTransport;
