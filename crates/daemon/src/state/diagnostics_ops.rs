@@ -40,49 +40,13 @@ impl AppState {
             config.peers.clear();
         }
 
-        self.outgoing_input_payloads.write().await.clear();
-        self.outgoing_bulk_payloads.write().await.clear();
-        if let Ok(mut events) = self.transport_events.lock() {
-            events.clear();
-        }
-        *self.clipboard_sync.write().await = ClipboardSyncState::default();
-        self.discovered_endpoints.write().await.clear();
-        *self.input_router.write().await =
-            InputRouter::new(config.features.get("share_input").copied().unwrap_or(true));
-        self.input_sequence_by_peer.write().await.clear();
-        self.pending_inject_input_frames.write().await.clear();
-        self.pending_inject_high_water
-            .store(0, std::sync::atomic::Ordering::Release);
-        if let Ok(mut high_water) = self.outgoing_input_high_water_by_peer.lock() {
-            high_water.clear();
-        }
-        *self.input_capture_target_peer_id.write().await = None;
-        *self.input_owner_last_changed_at.write().await = None;
-        *self.input_lock_active.write().await = false;
-        self.reconnect_generation_by_peer.write().await.clear();
-        self.pairing_codes.write().await.clear();
-        self.pending_nearby_pairing_requests.write().await.clear();
-        self.nearby_pairing_decisions.write().await.clear();
-        self.nearby_code_request_last_seen_by_ip
-            .write()
-            .await
-            .clear();
-        self.nearby_code_submission_failures_by_ip
-            .write()
-            .await
-            .clear();
-        self.nearby_code_submission_lockout_by_ip
-            .write()
-            .await
-            .clear();
-        self.pending_transport_session_abort_handles
-            .write()
-            .await
-            .clear();
-        self.transport_session_abort_handles_by_peer
-            .write()
-            .await
-            .clear();
+        self.transport.clear().await;
+        self.clipboard.clear().await;
+        self.discovery.clear().await;
+        self.input
+            .reset(config.features.get("share_input").copied().unwrap_or(true))
+            .await;
+        self.pairing.clear().await;
         self.invalidate_cached_layout_matrix().await;
 
         save_config_at(&self.config_path, &config)
@@ -109,6 +73,7 @@ impl AppState {
             .map(|items| items.len())
             .unwrap_or(0);
         let event_count = self
+            .transport
             .transport_events
             .lock()
             .map(|events| events.len())
@@ -147,7 +112,7 @@ impl AppState {
 
         let now = Utc::now();
 
-        let pending_requests = self.pending_nearby_pairing_requests.read().await;
+        let pending_requests = self.pairing.pending_requests.read().await;
         let pending_total = pending_requests.len();
         let mut pending_manual = 0_usize;
         let mut pending_code_challenge = 0_usize;
@@ -159,12 +124,12 @@ impl AppState {
         }
         drop(pending_requests);
 
-        let decisions = self.nearby_pairing_decisions.read().await;
+        let decisions = self.pairing.decisions.read().await;
         let decisions_total = decisions.len();
         let mut decisions_approved = 0_usize;
         let mut decisions_rejected = 0_usize;
         let mut rejection_counts = PairingRejectionCounts::default();
-        let mut recent_rejections = Vec::<(DateTime<Utc>, String, String)>::new();
+        let mut recent_rejections = Vec::<(chrono::DateTime<Utc>, String, String)>::new();
         for (request_id, record) in decisions.iter() {
             match &record.decision {
                 NearbyPairingDecision::Approved { .. } => decisions_approved += 1,
@@ -192,7 +157,7 @@ impl AppState {
 
         let failure_window =
             chrono::TimeDelta::seconds(NEARBY_PAIRING_CODE_SUBMISSION_FAILURE_WINDOW_SECONDS);
-        let failures_by_ip = self.nearby_code_submission_failures_by_ip.read().await;
+        let failures_by_ip = self.pairing.code_submission_failures_by_ip.read().await;
         let mut failure_window_ips = 0_usize;
         let mut failure_window_attempts = 0_usize;
         for timestamps in failures_by_ip.values() {
@@ -207,7 +172,7 @@ impl AppState {
         }
         drop(failures_by_ip);
 
-        let lockouts_by_ip = self.nearby_code_submission_lockout_by_ip.read().await;
+        let lockouts_by_ip = self.pairing.code_submission_lockout_by_ip.read().await;
         let mut active_lockouts = Vec::<(IpAddr, i64)>::new();
         for (ip, until) in lockouts_by_ip.iter() {
             if *until >= now {

@@ -10,9 +10,9 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use anyhow::Result;
 #[cfg(windows)]
-use anyhow::{Context, bail};
+use anyhow::Context;
+use anyhow::Result;
 use tokio::time;
 use tracing::warn;
 
@@ -24,31 +24,30 @@ use crate::state::{AppState, PendingInjectInputFrame, TransportEventRecord};
 
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
-        Input::KeyboardAndMouse::{
-            GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-            KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX,
-            MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-            MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-            MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-            MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput,
-        },
         Input::{
             GetRawInputData, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
             RAWMOUSE, RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetCursorPos,
-            GetMessageW, HC_ACTION, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
+            CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW,
+            HC_ACTION, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
             PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
             WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
             WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
             WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-            WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
+            WM_XBUTTONDOWN, WM_XBUTTONUP,
         },
     },
+};
+
+#[cfg(all(windows, test))]
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT_KEYBOARD, INPUT_MOUSE, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
+    MOUSEEVENTF_WHEEL,
 };
 
 const INPUT_RUNTIME_SAFETY_TICK: Duration = Duration::from_millis(50);
@@ -88,8 +87,6 @@ mod windows_hook_runtime;
 #[cfg(windows)]
 mod windows_hooks;
 #[cfg(windows)]
-mod windows_inject;
-#[cfg(windows)]
 mod windows_raw_input;
 
 #[cfg(test)]
@@ -97,6 +94,14 @@ use edge_switch::{edge_switch_direction_from_motion, handoff_anchor_event};
 use edge_switch::{
     filter_edge_start_replay_events, local_virtual_screen_bounds,
     maybe_handoff_capture_target_from_motion,
+};
+#[cfg(test)]
+#[cfg(windows)]
+use platform_windows::input::send_input_records_with_sender;
+#[cfg(windows)]
+use platform_windows::input::{
+    cursor_position, high_word, input_event_kind, input_records_for_event, is_virtual_key_down,
+    send_input_records, signed_high_word, vk_to_scan_code,
 };
 #[cfg(all(test, not(windows)))]
 use runtime::apply_frame;
@@ -112,14 +117,6 @@ use windows_hook_runtime::{
 };
 #[cfg(windows)]
 use windows_hooks::{install_keyboard_hook, install_mouse_hook, run_hook_message_loop};
-#[cfg(test)]
-#[cfg(windows)]
-use windows_inject::send_input_records_with_sender;
-#[cfg(windows)]
-use windows_inject::{
-    cursor_position, high_word, input_event_kind, input_records_for_event, is_virtual_key_down,
-    send_input_records, signed_high_word, vk_to_scan_code,
-};
 #[cfg(test)]
 #[cfg(windows)]
 use windows_raw_input::raw_mouse_relative_delta;

@@ -2,7 +2,7 @@ use super::*;
 
 impl AppState {
     pub async fn request_peer_reconnect(&self, peer_id: &str) -> u64 {
-        let mut generations = self.reconnect_generation_by_peer.write().await;
+        let mut generations = self.transport.reconnect_generation_by_peer.write().await;
         let entry = generations.entry(peer_id.to_string()).or_insert(0);
         *entry += 1;
         let generation = *entry;
@@ -13,6 +13,7 @@ impl AppState {
 
     pub async fn peer_reconnect_generation(&self, peer_id: &str) -> u64 {
         *self
+            .transport
             .reconnect_generation_by_peer
             .read()
             .await
@@ -67,14 +68,13 @@ impl AppState {
         Ok((disconnected_peers, aborted_sessions))
     }
 
-    fn next_transport_session_id(&self) -> u64 {
-        self.next_transport_session_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub async fn register_pending_transport_session(&self, abort_handle: AbortHandle) -> u64 {
-        let session_id = self.next_transport_session_id();
-        self.pending_transport_session_abort_handles
+    pub async fn register_pending_transport_session(
+        &self,
+        abort_handle: tokio::task::AbortHandle,
+    ) -> u64 {
+        let session_id = self.transport.allocate_transport_session_id();
+        self.transport
+            .pending_transport_session_abort_handles
             .write()
             .await
             .insert(session_id, abort_handle);
@@ -84,10 +84,11 @@ impl AppState {
     pub async fn register_transport_session_for_peer(
         &self,
         peer_id: &str,
-        abort_handle: AbortHandle,
+        abort_handle: tokio::task::AbortHandle,
     ) -> u64 {
-        let session_id = self.next_transport_session_id();
-        self.transport_session_abort_handles_by_peer
+        let session_id = self.transport.allocate_transport_session_id();
+        self.transport
+            .transport_session_abort_handles_by_peer
             .write()
             .await
             .entry(peer_id.to_string())
@@ -102,6 +103,7 @@ impl AppState {
         peer_id: &str,
     ) -> bool {
         let abort_handle = self
+            .transport
             .pending_transport_session_abort_handles
             .write()
             .await
@@ -110,7 +112,8 @@ impl AppState {
             return false;
         };
 
-        self.transport_session_abort_handles_by_peer
+        self.transport
+            .transport_session_abort_handles_by_peer
             .write()
             .await
             .entry(peer_id.to_string())
@@ -121,6 +124,7 @@ impl AppState {
 
     pub async fn clear_transport_session_registration(&self, session_id: u64) {
         if self
+            .transport
             .pending_transport_session_abort_handles
             .write()
             .await
@@ -130,7 +134,11 @@ impl AppState {
             return;
         }
 
-        let mut by_peer = self.transport_session_abort_handles_by_peer.write().await;
+        let mut by_peer = self
+            .transport
+            .transport_session_abort_handles_by_peer
+            .write()
+            .await;
         let mut empty_peers = Vec::<String>::new();
         for (peer_id, sessions) in by_peer.iter_mut() {
             if sessions.remove(&session_id).is_some() && sessions.is_empty() {
@@ -144,6 +152,7 @@ impl AppState {
 
     pub async fn abort_transport_sessions_for_peer(&self, peer_id: &str) -> usize {
         let sessions = self
+            .transport
             .transport_session_abort_handles_by_peer
             .write()
             .await
@@ -183,7 +192,7 @@ impl AppState {
         drop(config);
 
         if !disconnected_peer_ids.is_empty() {
-            let mut router = self.input_router.write().await;
+            let mut router = self.input.router.write().await;
             let mut released_owner = false;
             for peer_id in &disconnected_peer_ids {
                 released_owner = router.release_owner(peer_id) || released_owner;
@@ -199,7 +208,7 @@ impl AppState {
                     .await;
             }
 
-            let mut capture_target = self.input_capture_target_peer_id.write().await;
+            let mut capture_target = self.input.capture_target_peer_id.write().await;
             if capture_target
                 .as_deref()
                 .is_some_and(|peer_id| disconnected_peer_ids.iter().any(|id| id == peer_id))

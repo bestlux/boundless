@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
+use peer_transport::{
+    DEFAULT_TRANSPORT_TUNING, FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS, OutboundTransferFlow,
+};
 
 use crate::state::TransportEventRecord;
 
@@ -17,7 +20,6 @@ use super::inbound_payload::{
     handle_clipboard_image_message, handle_clipboard_text_message, handle_input_frame_message,
 };
 use super::outbound::{
-    FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS, OutboundTransferFlow,
     flush_outgoing_bulk_payloads_with_buffer, flush_outgoing_input_payloads_with_buffer,
 };
 use super::*;
@@ -109,9 +111,11 @@ where
     let mut writer = BufWriter::new(writer);
     let mut frame_payload = Vec::<u8>::with_capacity(4096);
     let mut write_frame_buffer = Vec::<u8>::with_capacity(4096);
-    let mut heartbeat_interval = time::interval(HEARTBEAT_INTERVAL);
-    let mut outgoing_input_flush_interval = time::interval(OUTGOING_INPUT_FLUSH_INTERVAL);
-    let mut outgoing_bulk_flush_interval = time::interval(OUTGOING_BULK_FLUSH_INTERVAL);
+    let mut heartbeat_interval = time::interval(DEFAULT_TRANSPORT_TUNING.heartbeat_interval);
+    let mut outgoing_input_flush_interval =
+        time::interval(DEFAULT_TRANSPORT_TUNING.outgoing_input_flush_interval);
+    let mut outgoing_bulk_flush_interval =
+        time::interval(DEFAULT_TRANSPORT_TUNING.outgoing_bulk_flush_interval);
     let mut outgoing_flush_signal = state.subscribe_outgoing_flush_signal();
     heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     outgoing_input_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -176,7 +180,7 @@ where
                         &snapshot.machine_id,
                         remote_peer_id.as_deref(),
                         remote_protocol,
-                        OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
+                        DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
                         &mut outbound_transfer_flow,
                         &mut writer,
                         &mut write_frame_buffer,
@@ -234,7 +238,7 @@ where
                         &snapshot.machine_id,
                         remote_peer_id.as_deref(),
                         remote_protocol,
-                        OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
+                        DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
                         &mut outbound_transfer_flow,
                         &mut writer,
                         &mut write_frame_buffer,
@@ -491,7 +495,7 @@ where
                                 &snapshot.machine_id,
                                 remote_peer_id.as_deref(),
                                 remote_protocol,
-                                OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
+                                DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
                                 &mut outbound_transfer_flow,
                                 &mut writer,
                                 &mut write_frame_buffer,

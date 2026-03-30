@@ -165,7 +165,7 @@ impl AppState {
     }
 
     async fn prune_stale_outgoing_clipboard_payloads(&self) {
-        let mut queue_map = self.outgoing_bulk_payloads.write().await;
+        let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
         queue_map.retain(|_, queue| {
             queue.retain(|payload| {
                 !matches!(
@@ -183,7 +183,7 @@ impl AppState {
         hash: String,
         source_peer_ids: HashSet<String>,
     ) {
-        let mut sync = self.clipboard_sync.write().await;
+        let mut sync = self.clipboard.sync.write().await;
         let previous = sync.pending_replay.clone();
         if let Some(previous) = previous.as_ref() {
             Self::capture_obsolete_inflight_replay(&mut sync, previous);
@@ -208,7 +208,7 @@ impl AppState {
         };
         let hash = payload_hash_hex(&clipboard_payload);
 
-        let mut sync = self.clipboard_sync.write().await;
+        let mut sync = self.clipboard.sync.write().await;
         let Some(obsolete_hashes) = sync
             .obsolete_inflight_replay_hashes_by_peer
             .get_mut(peer_id)
@@ -229,7 +229,7 @@ impl AppState {
         peer_id: &str,
     ) -> bool {
         let replay_state = {
-            let sync = self.clipboard_sync.read().await;
+            let sync = self.clipboard.sync.read().await;
             sync.pending_replay.clone()
         };
         let Some(replay_state) = replay_state else {
@@ -242,7 +242,7 @@ impl AppState {
             return true;
         }
 
-        let queue_map = self.outgoing_bulk_payloads.read().await;
+        let queue_map = self.transport.outgoing_bulk_payloads.read().await;
         queue_map.get(peer_id).is_some_and(|queue| {
             queue.iter().any(|payload| {
                 clipboard_payload_from_outbound_payload(payload)
@@ -252,7 +252,7 @@ impl AppState {
     }
 
     pub(crate) async fn schedule_pending_clipboard_replay_for_peer(&self, peer_id: &str) -> bool {
-        let mut sync = self.clipboard_sync.write().await;
+        let mut sync = self.clipboard.sync.write().await;
         let Some(replay) = sync.pending_replay.as_mut() else {
             return false;
         };
@@ -266,7 +266,7 @@ impl AppState {
     }
 
     pub(crate) async fn clear_pending_clipboard_replay_for_peer(&self, peer_id: &str) {
-        let mut sync = self.clipboard_sync.write().await;
+        let mut sync = self.clipboard.sync.write().await;
         let Some(replay) = sync.pending_replay.as_mut() else {
             return;
         };
@@ -275,7 +275,8 @@ impl AppState {
     }
 
     pub(crate) async fn clear_obsolete_inflight_clipboard_replays_for_peer(&self, peer_id: &str) {
-        self.clipboard_sync
+        self.clipboard
+            .sync
             .write()
             .await
             .obsolete_inflight_replay_hashes_by_peer
@@ -286,7 +287,7 @@ impl AppState {
         &self,
         peer_id: &str,
     ) -> Option<OutboundPayload> {
-        let mut sync = self.clipboard_sync.write().await;
+        let mut sync = self.clipboard.sync.write().await;
         let replay = sync.pending_replay.as_mut()?;
         if !replay.scheduled_peer_ids.remove(peer_id) {
             return None;
@@ -305,7 +306,7 @@ impl AppState {
         };
         let hash = payload_hash_hex(&clipboard_payload);
 
-        let mut sync = self.clipboard_sync.write().await;
+        let mut sync = self.clipboard.sync.write().await;
         let Some(replay) = sync.pending_replay.as_mut() else {
             return false;
         };
@@ -318,7 +319,7 @@ impl AppState {
 
     async fn queue_outgoing_bulk_payload(&self, peer_id: &str, payload: OutboundPayload) {
         {
-            let mut queue_map = self.outgoing_bulk_payloads.write().await;
+            let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
             queue_map
                 .entry(peer_id.to_string())
                 .or_default()
@@ -332,7 +333,7 @@ impl AppState {
         peer_id: &str,
         payload: OutboundPayload,
     ) -> OutgoingInputQueueReport {
-        let mut queue_map = self.outgoing_input_payloads.write().await;
+        let mut queue_map = self.transport.outgoing_input_payloads.write().await;
         let queue = queue_map.entry(peer_id.to_string()).or_default();
 
         if let Some((older_sequence, newer_sequence, merged_event_count)) =
@@ -461,7 +462,7 @@ impl AppState {
         };
 
         {
-            let mut sync = self.clipboard_sync.write().await;
+            let mut sync = self.clipboard.sync.write().await;
             if let Some(suppress_hash) = sync.suppress_echo_hash.as_deref() {
                 if suppress_hash == hash.as_str() {
                     sync.suppress_echo_hash = None;
@@ -507,7 +508,7 @@ impl AppState {
         }
 
         {
-            let mut queue_map = self.outgoing_bulk_payloads.write().await;
+            let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
             for peer_id in &initially_connected_peer_ids {
                 let outbound = match &payload {
                     ClipboardPayload::Text(text) => {
@@ -563,7 +564,7 @@ impl AppState {
             None => return Ok(()),
         };
 
-        let mut sync = self.clipboard_sync.write().await;
+        let mut sync = self.clipboard.sync.write().await;
         if sync.last_observed_hash.as_deref() == Some(hash.as_str()) {
             if let Some(replay) = sync.pending_replay.as_mut()
                 && replay.hash == hash
@@ -589,14 +590,14 @@ impl AppState {
     }
 
     pub async fn dequeue_remote_clipboard_payload(&self) -> Option<PendingRemoteClipboardPayload> {
-        self.clipboard_sync.write().await.pending_remote.pop_front()
+        self.clipboard.sync.write().await.pending_remote.pop_front()
     }
 
     pub async fn requeue_remote_clipboard_payload_front(
         &self,
         item: PendingRemoteClipboardPayload,
     ) {
-        let mut sync = self.clipboard_sync.write().await;
+        let mut sync = self.clipboard.sync.write().await;
         if sync.pending_remote.len() >= MAX_PENDING_REMOTE_CLIPBOARD_ITEMS {
             sync.pending_remote.pop_back();
         }
@@ -610,7 +611,7 @@ impl AppState {
         hash: &str,
     ) {
         self.prune_stale_outgoing_clipboard_payloads().await;
-        let mut sync = self.clipboard_sync.write().await;
+        let mut sync = self.clipboard.sync.write().await;
         let previous = sync.pending_replay.clone();
         if let Some(previous) = previous.as_ref() {
             Self::capture_obsolete_inflight_replay(&mut sync, previous);
@@ -653,7 +654,7 @@ impl AppState {
         let transfer_id = uuid::Uuid::new_v4().to_string();
         let source_path = file_path.to_path_buf();
         {
-            let mut queue_map = self.outgoing_bulk_payloads.write().await;
+            let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
             let queue = queue_map.entry(peer_id.to_string()).or_default();
             queue.push_back(OutboundPayload::FileStart {
                 transfer_id: transfer_id.clone(),
@@ -719,7 +720,7 @@ impl AppState {
         }
 
         let sequence = {
-            let mut sequences = self.input_sequence_by_peer.write().await;
+            let mut sequences = self.input.sequence_by_peer.write().await;
             let entry = sequences.entry(peer_id.to_string()).or_insert(0);
             *entry += 1;
             *entry
@@ -742,7 +743,7 @@ impl AppState {
         peer_id: &str,
         max_payloads: usize,
     ) -> Vec<OutboundPayload> {
-        let mut queue_map = self.outgoing_input_payloads.write().await;
+        let mut queue_map = self.transport.outgoing_input_payloads.write().await;
         let mut drained = {
             let Some(queue) = queue_map.get_mut(peer_id) else {
                 return Vec::new();
@@ -768,7 +769,7 @@ impl AppState {
         }
 
         let replay = self.take_scheduled_clipboard_replay_for_peer(peer_id).await;
-        let mut queue_map = self.outgoing_bulk_payloads.write().await;
+        let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
         let mut drained = Vec::new();
         if let Some(payload) = replay {
             drained.push(payload);
@@ -812,11 +813,7 @@ impl AppState {
 
         let mut split = OutgoingPeerQueues::default();
         for payload in payloads {
-            if matches!(payload, OutboundPayload::InputFrame { .. }) {
-                split.input.push_back(payload);
-            } else {
-                split.bulk.push_back(payload);
-            }
+            split.push(payload);
         }
 
         let mut restored_replay = false;
@@ -842,7 +839,7 @@ impl AppState {
         if has_input {
             let mut coalesced = Vec::<(u64, u64, usize)>::new();
             let mut dropped = Vec::<(u64, &'static str)>::new();
-            let mut queue_map = self.outgoing_input_payloads.write().await;
+            let mut queue_map = self.transport.outgoing_input_payloads.write().await;
             let queue = queue_map.entry(peer_id.to_string()).or_default();
             for payload in split.input.into_iter().rev() {
                 if let Some(result) = try_coalesce_outgoing_input_front(queue, &payload) {
@@ -894,7 +891,7 @@ impl AppState {
 
         let has_bulk = !requeued_bulk.is_empty();
         if has_bulk {
-            let mut queue_map = self.outgoing_bulk_payloads.write().await;
+            let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
             let queue = queue_map.entry(peer_id.to_string()).or_default();
             for payload in requeued_bulk.into_iter().rev() {
                 queue.push_front(payload);
@@ -907,7 +904,7 @@ impl AppState {
     }
 
     fn observe_outgoing_input_high_water(&self, peer_id: &str, depth: usize) -> Option<usize> {
-        let Ok(mut high_water) = self.outgoing_input_high_water_by_peer.lock() else {
+        let Ok(mut high_water) = self.transport.outgoing_input_high_water_by_peer.lock() else {
             return None;
         };
         let entry = high_water.entry(peer_id.to_string()).or_insert(0);
@@ -919,7 +916,7 @@ impl AppState {
     }
 
     pub fn record_transport_event(&self, event: TransportEventRecord) {
-        let Ok(mut events) = self.transport_events.lock() else {
+        let Ok(mut events) = self.transport.transport_events.lock() else {
             return;
         };
 
@@ -930,7 +927,7 @@ impl AppState {
     }
 
     pub async fn transport_events(&self) -> Vec<TransportEventRecord> {
-        let Ok(events) = self.transport_events.lock() else {
+        let Ok(events) = self.transport.transport_events.lock() else {
             return Vec::new();
         };
         events.iter().cloned().collect()

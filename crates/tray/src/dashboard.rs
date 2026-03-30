@@ -15,7 +15,6 @@ pub(super) fn run() -> Result<()> {
     let ctx = Arc::new(AppContext {
         endpoint: cli.endpoint,
         start_daemon: cli.start_daemon,
-        ctl_candidates: resolve_boundlessctl_candidates(),
         daemon_candidates: resolve_boundlessd_candidates(),
     });
 
@@ -298,13 +297,14 @@ impl DashboardApp {
             let mut next_start_attempt = Instant::now();
             let mut start_backoff = Duration::from_secs(2);
             loop {
-                match fetch_ui_snapshot_blocking(&bg_ctx.endpoint) {
-                    Ok(snapshot) => {
+                match watch_ui_snapshots_blocking(&bg_ctx.endpoint, |snapshot| {
                         next_start_attempt = Instant::now();
                         start_backoff = Duration::from_secs(2);
                         let _ = bg_tx.send(AppMsg::SnapshotUpdated(snapshot));
                         egui_ctx.request_repaint();
-                    }
+                        Ok(())
+                    }) {
+                    Ok(()) => {}
                     Err(e) => {
                         let mut message = e.to_string();
                         if bg_ctx.start_daemon && Instant::now() >= next_start_attempt {
@@ -312,39 +312,16 @@ impl DashboardApp {
                                 Ok(Some(path)) => {
                                     next_start_attempt = Instant::now() + Duration::from_secs(8);
                                     start_backoff = Duration::from_secs(2);
-                                    match fetch_ui_snapshot_blocking(&bg_ctx.endpoint) {
-                                        Ok(snapshot) => {
-                                            let _ = bg_tx.send(AppMsg::SnapshotUpdated(snapshot));
-                                            let _ = bg_tx.send(AppMsg::ActionComplete(format!(
-                                                "Started daemon via `{path}`"
-                                            )));
-                                            egui_ctx.request_repaint();
-                                            std::thread::sleep(Duration::from_secs(4));
-                                            continue;
-                                        }
-                                        Err(refetch_error) => {
-                                            message = format!(
-                                                "{message}\nstarted daemon via `{path}`\nfollow-up refresh failed: {refetch_error}"
-                                            );
-                                        }
-                                    }
+                                    let _ = bg_tx.send(AppMsg::ActionComplete(format!(
+                                        "Started daemon via `{path}`"
+                                    )));
+                                    egui_ctx.request_repaint();
+                                    continue;
                                 }
                                 Ok(None) => {
                                     next_start_attempt = Instant::now() + Duration::from_secs(8);
                                     start_backoff = Duration::from_secs(2);
-                                    match fetch_ui_snapshot_blocking(&bg_ctx.endpoint) {
-                                        Ok(snapshot) => {
-                                            let _ = bg_tx.send(AppMsg::SnapshotUpdated(snapshot));
-                                            egui_ctx.request_repaint();
-                                            std::thread::sleep(Duration::from_secs(4));
-                                            continue;
-                                        }
-                                        Err(refetch_error) => {
-                                            message = format!(
-                                                "{message}\nfollow-up refresh failed: {refetch_error}"
-                                            );
-                                        }
-                                    }
+                                    continue;
                                 }
                                 Err(start_error) => {
                                     message =
@@ -360,7 +337,7 @@ impl DashboardApp {
                         egui_ctx.request_repaint();
                     }
                 }
-                std::thread::sleep(Duration::from_secs(4));
+                std::thread::sleep(Duration::from_secs(1));
             }
         });
 
@@ -1067,12 +1044,11 @@ impl eframe::App for DashboardApp {
                             match validate_layout_before_apply(&self.layout_grid, &self.snapshot.machine_id) {
                                 Ok(()) => {
                                     let matrix_str = serialize_layout_matrix(&self.layout_grid, &self.snapshot.machine_id);
-                                    let args = vec!["layout".to_string(), "set".to_string(), matrix_str];
-                                    let ctx_clone = self.ctx.clone();
+                                    let endpoint = self.ctx.endpoint.clone();
                                     let tx = self.tx.clone();
                                     std::thread::spawn(move || {
-                                        match run_boundlessctl(&ctx_clone, &args) {
-                                            Ok(msg) => { let _ = tx.send(AppMsg::ActionComplete(format!("Layout applied: {}", msg))); }
+                                        match layout_set_blocking(&endpoint, matrix_str) {
+                                            Ok(msg) => { let _ = tx.send(AppMsg::ActionComplete(msg)); }
                                             Err(e) => { let _ = tx.send(AppMsg::ActionFailed(format!("Layout failed: {}", e))); }
                                         }
                                     });

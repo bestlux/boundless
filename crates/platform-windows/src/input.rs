@@ -1,16 +1,39 @@
-use super::*;
+use anyhow::{Context, Result, bail};
+use core_input::{InputEvent, KeyState, MouseButton};
 
-pub(super) fn high_word(value: u32) -> u16 {
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::POINT,
+    UI::{
+        Input::KeyboardAndMouse::{
+            GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+            KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX,
+            MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+            MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+            MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+            MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput,
+        },
+        WindowsAndMessaging::GetCursorPos,
+    },
+};
+
+#[cfg(windows)]
+const XBUTTON1: u32 = 0x0001;
+
+#[cfg(windows)]
+const XBUTTON2: u32 = 0x0002;
+
+pub fn high_word(value: u32) -> u16 {
     ((value >> 16) & 0xFFFF) as u16
 }
 
 #[cfg(windows)]
-pub(super) fn signed_high_word(value: u32) -> i32 {
+pub fn signed_high_word(value: u32) -> i32 {
     i16::from_ne_bytes(high_word(value).to_ne_bytes()) as i32
 }
 
 #[cfg(windows)]
-pub(super) fn cursor_position() -> Result<Option<(i32, i32)>> {
+pub fn cursor_position() -> Result<Option<(i32, i32)>> {
     let mut point = POINT { x: 0, y: 0 };
     let ok = unsafe { GetCursorPos(&mut point as *mut POINT) };
     if ok == 0 {
@@ -20,19 +43,19 @@ pub(super) fn cursor_position() -> Result<Option<(i32, i32)>> {
 }
 
 #[cfg(windows)]
-pub(super) fn is_virtual_key_down(vk: u16) -> bool {
+pub fn is_virtual_key_down(vk: u16) -> bool {
     let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
     (state as u16 & 0x8000) != 0
 }
 
 #[cfg(windows)]
-pub(super) fn vk_to_scan_code(vk: u16) -> Option<u16> {
+pub fn vk_to_scan_code(vk: u16) -> Option<u16> {
     let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) } as u16;
     if scan == 0 { None } else { Some(scan) }
 }
 
 #[cfg(windows)]
-pub(super) fn input_records_for_event(event: &InputEvent) -> Vec<INPUT> {
+pub fn input_records_for_event(event: &InputEvent) -> Vec<INPUT> {
     match event {
         InputEvent::MouseMove { dx, dy } => {
             if *dx == 0 && *dy == 0 {
@@ -51,36 +74,16 @@ pub(super) fn input_records_for_event(event: &InputEvent) -> Vec<INPUT> {
         }
         InputEvent::MouseButton { button, state } => {
             let (flags, mouse_data) = match (button, state) {
-                (core_input::MouseButton::Left, core_input::KeyState::Down) => {
-                    (MOUSEEVENTF_LEFTDOWN, 0)
-                }
-                (core_input::MouseButton::Left, core_input::KeyState::Up) => {
-                    (MOUSEEVENTF_LEFTUP, 0)
-                }
-                (core_input::MouseButton::Right, core_input::KeyState::Down) => {
-                    (MOUSEEVENTF_RIGHTDOWN, 0)
-                }
-                (core_input::MouseButton::Right, core_input::KeyState::Up) => {
-                    (MOUSEEVENTF_RIGHTUP, 0)
-                }
-                (core_input::MouseButton::Middle, core_input::KeyState::Down) => {
-                    (MOUSEEVENTF_MIDDLEDOWN, 0)
-                }
-                (core_input::MouseButton::Middle, core_input::KeyState::Up) => {
-                    (MOUSEEVENTF_MIDDLEUP, 0)
-                }
-                (core_input::MouseButton::X1, core_input::KeyState::Down) => {
-                    (MOUSEEVENTF_XDOWN, XBUTTON1 as u32)
-                }
-                (core_input::MouseButton::X1, core_input::KeyState::Up) => {
-                    (MOUSEEVENTF_XUP, XBUTTON1 as u32)
-                }
-                (core_input::MouseButton::X2, core_input::KeyState::Down) => {
-                    (MOUSEEVENTF_XDOWN, XBUTTON2 as u32)
-                }
-                (core_input::MouseButton::X2, core_input::KeyState::Up) => {
-                    (MOUSEEVENTF_XUP, XBUTTON2 as u32)
-                }
+                (MouseButton::Left, KeyState::Down) => (MOUSEEVENTF_LEFTDOWN, 0),
+                (MouseButton::Left, KeyState::Up) => (MOUSEEVENTF_LEFTUP, 0),
+                (MouseButton::Right, KeyState::Down) => (MOUSEEVENTF_RIGHTDOWN, 0),
+                (MouseButton::Right, KeyState::Up) => (MOUSEEVENTF_RIGHTUP, 0),
+                (MouseButton::Middle, KeyState::Down) => (MOUSEEVENTF_MIDDLEDOWN, 0),
+                (MouseButton::Middle, KeyState::Up) => (MOUSEEVENTF_MIDDLEUP, 0),
+                (MouseButton::X1, KeyState::Down) => (MOUSEEVENTF_XDOWN, XBUTTON1),
+                (MouseButton::X1, KeyState::Up) => (MOUSEEVENTF_XUP, XBUTTON1),
+                (MouseButton::X2, KeyState::Down) => (MOUSEEVENTF_XDOWN, XBUTTON2),
+                (MouseButton::X2, KeyState::Up) => (MOUSEEVENTF_XUP, XBUTTON2),
             };
 
             vec![mouse_input(0, 0, mouse_data, flags)]
@@ -96,16 +99,13 @@ pub(super) fn input_records_for_event(event: &InputEvent) -> Vec<INPUT> {
             records
         }
         InputEvent::Key { scan_code, state } => {
-            vec![keyboard_input(
-                *scan_code,
-                matches!(state, core_input::KeyState::Up),
-            )]
+            vec![keyboard_input(*scan_code, matches!(state, KeyState::Up))]
         }
     }
 }
 
 #[cfg(windows)]
-pub(super) fn mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> INPUT {
+fn mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -122,7 +122,7 @@ pub(super) fn mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> INPU
 }
 
 #[cfg(windows)]
-pub(super) fn keyboard_input(scan_code: u16, key_up: bool) -> INPUT {
+fn keyboard_input(scan_code: u16, key_up: bool) -> INPUT {
     let mut flags = KEYEVENTF_SCANCODE;
     let mut normalized_scan_code = scan_code;
     if is_extended_scan_code(scan_code) {
@@ -148,7 +148,7 @@ pub(super) fn keyboard_input(scan_code: u16, key_up: bool) -> INPUT {
 }
 
 #[cfg(windows)]
-pub(super) fn send_input_records(inputs: &[INPUT]) -> Result<()> {
+pub fn send_input_records(inputs: &[INPUT]) -> Result<()> {
     if inputs.is_empty() {
         return Ok(());
     }
@@ -169,7 +169,7 @@ pub(super) fn send_input_records(inputs: &[INPUT]) -> Result<()> {
 }
 
 #[cfg(windows)]
-pub(super) fn send_input_records_with_sender<F>(inputs: &[INPUT], mut sender: F) -> Result<()>
+pub fn send_input_records_with_sender<F>(inputs: &[INPUT], mut sender: F) -> Result<()>
 where
     F: FnMut(&[INPUT]) -> Result<u32>,
 {
@@ -198,12 +198,11 @@ where
 }
 
 #[cfg(windows)]
-pub(super) fn is_extended_scan_code(scan_code: u16) -> bool {
+fn is_extended_scan_code(scan_code: u16) -> bool {
     matches!(scan_code & 0xFF00, 0xE000 | 0xE100)
 }
 
-#[cfg(windows)]
-pub(super) fn input_event_kind(event: &InputEvent) -> &'static str {
+pub fn input_event_kind(event: &InputEvent) -> &'static str {
     match event {
         InputEvent::MouseMove { .. } => "mouse_move",
         InputEvent::MouseMoveAbsolute { .. } => "mouse_move_absolute",

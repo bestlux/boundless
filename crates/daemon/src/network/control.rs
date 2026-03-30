@@ -5,10 +5,10 @@ use tokio::io::AsyncWrite;
 use tracing::warn;
 
 use super::outbound::{
-    OutboundTransferFlow, flush_outgoing_bulk_payloads_with_buffer,
-    flush_outgoing_input_payloads_with_buffer,
+    flush_outgoing_bulk_payloads_with_buffer, flush_outgoing_input_payloads_with_buffer,
 };
 use super::*;
+use peer_transport::{DEFAULT_TRANSPORT_TUNING, OutboundTransferFlow};
 
 pub(super) enum HelloHandling {
     Continue,
@@ -176,7 +176,7 @@ where
             local_machine_id,
             remote_peer_id,
             remote_protocol,
-            OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
             outbound_transfer_flow,
             writer,
             frame_buffer,

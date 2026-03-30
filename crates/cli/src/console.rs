@@ -1,4 +1,5 @@
 use super::*;
+use ipc_api::boundless::v1::control_plane_service_client::ControlPlaneServiceClient;
 
 #[derive(Debug)]
 pub(super) struct ConsolePeer {
@@ -90,17 +91,17 @@ async fn ensure_daemon_available(endpoint: &str, start_daemon: bool) -> Result<(
 }
 
 async fn fetch_console_snapshot(endpoint: &str) -> Result<ConsoleSnapshot> {
-    let mut daemon_client = DaemonServiceClient::new(channel(endpoint).await?);
-    let status = daemon_client
-        .get_status(StatusRequest {})
+    let mut control_plane = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let snapshot = control_plane
+        .get_console_snapshot(Empty {})
         .await?
         .into_inner();
 
-    let mut topology_client = TopologyServiceClient::new(channel(endpoint).await?);
-    let peers = topology_client
-        .list_peers(Empty {})
-        .await?
-        .into_inner()
+    let status = snapshot
+        .status
+        .ok_or_else(|| anyhow::anyhow!("console snapshot missing status payload"))?;
+
+    let peers = snapshot
         .peers
         .into_iter()
         .map(|peer| ConsolePeer {
@@ -111,23 +112,11 @@ async fn fetch_console_snapshot(endpoint: &str) -> Result<ConsoleSnapshot> {
         })
         .collect::<Vec<_>>();
 
-    let mut feature_client = FeatureServiceClient::new(channel(endpoint).await?);
-    let mut features = feature_client
-        .list_features(Empty {})
-        .await?
-        .into_inner()
-        .features
-        .into_iter()
-        .collect::<Vec<_>>();
+    let mut features = snapshot.features.into_iter().collect::<Vec<_>>();
     features.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut diagnostics_client = DiagnosticsServiceClient::new(channel(endpoint).await?);
-    let discovery = diagnostics_client
-        .list_discovery_peers(Empty {})
-        .await?
-        .into_inner();
-    let discovered_peers = discovery
-        .peers
+    let discovered_peers = snapshot
+        .discovered_peers
         .into_iter()
         .map(|peer| ConsoleDiscoveredPeer {
             machine_id: peer.machine_id,
@@ -152,32 +141,20 @@ async fn fetch_console_snapshot(endpoint: &str) -> Result<ConsoleSnapshot> {
             .then_with(|| a.machine_id.cmp(&b.machine_id))
     });
 
-    let owner = diagnostics_client
-        .get_input_owner(Empty {})
-        .await?
-        .into_inner();
-    let input_owner = if owner.owner_peer_id.trim().is_empty() {
+    let input_owner = if snapshot.input_owner_peer_id.trim().is_empty() {
         None
     } else {
-        Some(owner.owner_peer_id)
+        Some(snapshot.input_owner_peer_id)
     };
 
-    let capture = diagnostics_client
-        .get_input_capture_target(Empty {})
-        .await?
-        .into_inner();
-    let capture_target = if capture.peer_id.trim().is_empty() {
+    let capture_target = if snapshot.input_capture_target_peer_id.trim().is_empty() {
         None
     } else {
-        Some(capture.peer_id)
+        Some(snapshot.input_capture_target_peer_id)
     };
 
-    let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
-    let pending_requests = pairing_client
-        .list_nearby_pairing_requests(Empty {})
-        .await?
-        .into_inner()
-        .requests
+    let pending_requests = snapshot
+        .pending_requests
         .into_iter()
         .map(|request| ConsolePendingRequest {
             request_id: request.request_id,
@@ -193,7 +170,7 @@ async fn fetch_console_snapshot(endpoint: &str) -> Result<ConsoleSnapshot> {
         pending_requests,
         input_owner,
         capture_target,
-        mdns_active: discovery.mdns_active,
+        mdns_active: snapshot.mdns_active,
     })
 }
 

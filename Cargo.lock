@@ -109,6 +109,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "adapter-ipc-grpc"
+version = "2.1.0"
+dependencies = [
+ "anyhow",
+ "app-services",
+ "ipc-api",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -227,6 +239,18 @@ name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+
+[[package]]
+name = "app-services"
+version = "2.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde",
+ "tokio",
+ "tokio-stream",
+]
 
 [[package]]
 name = "arboard"
@@ -699,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "boundless-cli"
-version = "2.0.4"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -715,9 +739,12 @@ dependencies = [
 
 [[package]]
 name = "boundless-daemon"
-version = "2.0.4"
+version = "2.1.0"
 dependencies = [
+ "adapter-ipc-grpc",
  "anyhow",
+ "app-services",
+ "async-trait",
  "chrono",
  "clap",
  "clipboard-win",
@@ -730,6 +757,8 @@ dependencies = [
  "dirs",
  "ipc-api",
  "mdns-sd",
+ "peer-transport",
+ "platform-windows",
  "rustls",
  "serde",
  "serde_json",
@@ -745,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "boundless-tray"
-version = "2.0.4"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1049,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "core-clipboard"
-version = "2.0.4"
+version = "2.1.0"
 dependencies = [
  "serde",
  "sha2",
@@ -1058,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "core-discovery"
-version = "2.0.4"
+version = "2.1.0"
 dependencies = [
  "serde",
 ]
@@ -1126,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "core-input"
-version = "2.0.4"
+version = "2.1.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -1134,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "core-protocol"
-version = "2.0.4"
+version = "2.1.0"
 dependencies = [
  "bincode",
  "serde",
@@ -1143,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "core-security"
-version = "2.0.4"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1159,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "core-transfer"
-version = "2.0.4"
+version = "2.1.0"
 dependencies = [
  "tempfile",
  "thiserror 2.0.18",
@@ -1228,6 +1257,13 @@ name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
+
+[[package]]
+name = "daemon-host"
+version = "2.1.0"
+dependencies = [
+ "boundless-daemon",
+]
 
 [[package]]
 name = "data-encoding"
@@ -2550,7 +2586,7 @@ dependencies = [
 
 [[package]]
 name = "ipc-api"
-version = "2.0.4"
+version = "2.1.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -3481,6 +3517,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "peer-transport"
+version = "2.1.0"
+dependencies = [
+ "chrono",
+ "core-input",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3555,6 +3602,17 @@ name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
+
+[[package]]
+name = "platform-windows"
+version = "2.1.0"
+dependencies = [
+ "anyhow",
+ "core-input",
+ "tokio",
+ "tonic",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "png"
@@ -4676,6 +4734,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

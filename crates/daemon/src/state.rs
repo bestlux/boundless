@@ -7,12 +7,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
-use rustls::pki_types::{CertificateDer, pem::PemObject};
-use tokio::{
-    sync::{Notify, RwLock, watch},
-    task::AbortHandle,
+use chrono::Utc;
+pub use peer_transport::{
+    OutboundPayload, OutgoingPeerQueues, RuntimeWakeSignal, TransportEventRecord,
 };
+use rustls::pki_types::{CertificateDer, pem::PemObject};
+use tokio::sync::{RwLock, watch};
 use tracing::info;
 
 use core_clipboard::{
@@ -51,16 +51,26 @@ const NEARBY_PAIRING_CODE_SUBMISSION_LOCKOUT_SECONDS: i64 = 600;
 pub(crate) const FILE_TRANSFER_CHUNK_BYTES: usize = 48 * 1024;
 
 mod clipboard_ops;
+mod clipboard_state;
 mod config_ops;
 mod diagnostics_ops;
+mod discovery_state;
 mod input_ops;
+mod input_state;
 mod layout_resolver;
 mod pairing_ops;
+mod pairing_state;
 mod peer_ops;
 mod routing_helpers;
 mod transport_ops;
+mod transport_state;
 mod validation;
 
+pub(crate) use clipboard_state::PendingRemoteClipboardPayload;
+use clipboard_state::{ClipboardReplayState, ClipboardState, ClipboardSyncState};
+pub(crate) use discovery_state::DiscoveredPeerEndpoint;
+use discovery_state::DiscoveryState;
+use input_state::InputState;
 #[cfg(test)]
 use layout_resolver::resolve_capture_handoff_target;
 use layout_resolver::{
@@ -71,73 +81,18 @@ use layout_resolver::{
 use layout_resolver::{
     resolve_capture_handoff_target_with_fallback, resolve_switch_all_target_order,
 };
+use pairing_state::{
+    NearbyPairingDecision, NearbyPairingDecisionRecord, PairingState, PendingNearbyPairingMode,
+    PendingNearbyPairingRequestRecord,
+};
+pub(crate) use pairing_state::{NearbyPairingStatus, PendingNearbyPairingRequest};
 use routing_helpers::{describe_input_frame_decision, elapsed_ms};
+use transport_state::TransportState;
 use validation::{
     normalize_optional_alias, normalize_peer_address, sanitize_incoming_file_name,
     validate_and_consume_pairing_code, validate_bind_address, validate_ca_cert_pem,
     validate_pipe_name,
 };
-
-#[derive(Debug, Clone)]
-pub enum OutboundPayload {
-    ClipboardText {
-        text: String,
-    },
-    ClipboardImage {
-        image_bmp: Vec<u8>,
-    },
-    FileStart {
-        transfer_id: String,
-        file_name: String,
-        total_bytes: u64,
-    },
-    FileChunk {
-        transfer_id: String,
-        source_path: PathBuf,
-        offset_bytes: u64,
-        length_bytes: usize,
-    },
-    FileEnd {
-        transfer_id: String,
-        file_name: String,
-        total_bytes: u64,
-    },
-    InputFrame {
-        sequence: u64,
-        timestamp_unix_ms: i64,
-        events: Vec<InputEvent>,
-    },
-}
-
-#[derive(Debug, Default)]
-struct OutgoingPeerQueues {
-    input: VecDeque<OutboundPayload>,
-    bulk: VecDeque<OutboundPayload>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TransportEventRecord {
-    pub timestamp: DateTime<Utc>,
-    pub direction: String,
-    pub kind: String,
-    pub peer_id: String,
-    pub detail: String,
-    pub size_bytes: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct PendingRemoteClipboardPayload {
-    pub peer_id: String,
-    pub payload: ClipboardPayload,
-    pub hash: String,
-    pub retry_count: u8,
-}
-
-#[derive(Debug, Clone)]
-pub struct DiscoveredPeerEndpoint {
-    pub display_name: String,
-    pub endpoint: SocketAddr,
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct InputFrameTiming {
@@ -168,107 +123,10 @@ impl PendingInjectInputFrame {
     }
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct RuntimeWakeSignal {
-    notify: Notify,
-    pending: std::sync::atomic::AtomicBool,
-}
-
-impl RuntimeWakeSignal {
-    fn trigger(&self) -> bool {
-        !self.pending.swap(true, std::sync::atomic::Ordering::AcqRel)
-    }
-
-    fn clear(&self) -> bool {
-        self.pending
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-    }
-
-    pub(crate) fn take_pending(&self) -> bool {
-        self.clear()
-    }
-
-    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
-        self.notify.notified()
-    }
-
-    fn notify_one(&self) {
-        self.notify.notify_one();
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PendingNearbyPairingRequest {
-    pub request_id: String,
-    pub requester_machine_id: String,
-    pub requester_display_name: String,
-    pub created_at: DateTime<Utc>,
-    pub verification_code: Option<String>,
-    pub verification_nonce: Option<String>,
-    pub verification_expires_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone)]
-pub enum NearbyPairingStatus {
-    Pending,
-    Approved { responder_bundle: TrustBundle },
-    Rejected { message: String },
-    Missing,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureHandoffTarget {
     Local,
     Peer(String),
-}
-
-#[derive(Debug, Clone)]
-struct PendingNearbyPairingRequestRecord {
-    summary: PendingNearbyPairingRequest,
-    requester_bundle: TrustBundle,
-    requester_alias: Option<String>,
-    mode: PendingNearbyPairingMode,
-}
-
-#[derive(Debug, Clone)]
-enum PendingNearbyPairingMode {
-    ManualApproval,
-    CodeChallenge {
-        code: String,
-        nonce: String,
-        expires_at: DateTime<Utc>,
-        attempts_left: u8,
-    },
-}
-
-#[derive(Debug, Clone)]
-enum NearbyPairingDecision {
-    Approved { responder_bundle: TrustBundle },
-    Rejected { message: String },
-}
-
-#[derive(Debug, Clone)]
-struct NearbyPairingDecisionRecord {
-    decision: NearbyPairingDecision,
-    decided_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone)]
-struct ClipboardReplayState {
-    payload: ClipboardPayload,
-    hash: String,
-    source_peer_ids: HashSet<String>,
-    scheduled_peer_ids: HashSet<String>,
-    inflight_peer_ids: HashSet<String>,
-}
-
-#[derive(Debug, Default)]
-struct ClipboardSyncState {
-    last_observed_hash: Option<String>,
-    suppress_echo_hash: Option<String>,
-    pending_remote: VecDeque<PendingRemoteClipboardPayload>,
-    pending_replay: Option<ClipboardReplayState>,
-    obsolete_inflight_replay_hashes_by_peer: HashMap<String, HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -281,43 +139,18 @@ struct ParsedLayoutMatrixCache {
 pub struct AppState {
     config_path: Arc<PathBuf>,
     config: Arc<RwLock<RuntimeConfig>>,
-    pairing_codes: Arc<RwLock<HashMap<String, DateTime<Utc>>>>,
+    clipboard: Arc<ClipboardState>,
+    pairing: Arc<PairingState>,
+    transport: Arc<TransportState>,
+    discovery: Arc<DiscoveryState>,
+    input: Arc<InputState>,
     security_paths: Arc<SecurityPaths>,
     identity: Arc<DeviceIdentity>,
     device_fingerprint: Arc<String>,
-    outgoing_input_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
-    outgoing_bulk_payloads: Arc<RwLock<HashMap<String, VecDeque<OutboundPayload>>>>,
-    transport_events: Arc<std::sync::Mutex<VecDeque<TransportEventRecord>>>,
-    clipboard_sync: Arc<RwLock<ClipboardSyncState>>,
-    discovered_endpoints: Arc<RwLock<HashMap<String, DiscoveredPeerEndpoint>>>,
-    mdns_active: Arc<RwLock<bool>>,
     inbox_root: Arc<PathBuf>,
     parsed_layout_matrix_cache: Arc<RwLock<Option<ParsedLayoutMatrixCache>>>,
-    input_router: Arc<RwLock<InputRouter>>,
-    input_sequence_by_peer: Arc<RwLock<HashMap<String, u64>>>,
-    pending_inject_input_frames: Arc<RwLock<VecDeque<PendingInjectInputFrame>>>,
-    input_capture_target_peer_id: Arc<RwLock<Option<String>>>,
-    input_owner_last_changed_at: Arc<RwLock<Option<Instant>>>,
-    input_lock_active: Arc<RwLock<bool>>,
-    input_lock_supported: Arc<RwLock<bool>>,
-    reconnect_generation_by_peer: Arc<RwLock<HashMap<String, u64>>>,
-    outgoing_flush_signal: watch::Sender<u64>,
-    outgoing_flush_generation: Arc<std::sync::atomic::AtomicU64>,
     input_capture_wake: Arc<RuntimeWakeSignal>,
     input_inject_wake: Arc<RuntimeWakeSignal>,
-    peer_reconcile_wake: Arc<RuntimeWakeSignal>,
-    pending_inject_high_water: Arc<std::sync::atomic::AtomicUsize>,
-    outgoing_input_high_water_by_peer: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    pending_nearby_pairing_requests:
-        Arc<RwLock<HashMap<String, PendingNearbyPairingRequestRecord>>>,
-    nearby_pairing_decisions: Arc<RwLock<HashMap<String, NearbyPairingDecisionRecord>>>,
-    nearby_code_request_last_seen_by_ip: Arc<RwLock<HashMap<IpAddr, DateTime<Utc>>>>,
-    nearby_code_submission_failures_by_ip: Arc<RwLock<HashMap<IpAddr, Vec<DateTime<Utc>>>>>,
-    nearby_code_submission_lockout_by_ip: Arc<RwLock<HashMap<IpAddr, DateTime<Utc>>>>,
-    pending_transport_session_abort_handles: Arc<RwLock<HashMap<u64, AbortHandle>>>,
-    transport_session_abort_handles_by_peer:
-        Arc<RwLock<HashMap<String, HashMap<u64, AbortHandle>>>>,
-    next_transport_session_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AppState {
@@ -372,48 +205,22 @@ impl AppState {
         );
 
         let input_enabled = config.features.get("share_input").copied().unwrap_or(true);
-        let (outgoing_flush_signal, _outgoing_flush_rx) = watch::channel(0u64);
 
         Ok(Self {
             config_path: Arc::new(config_path),
             config: Arc::new(RwLock::new(config)),
-            pairing_codes: Arc::new(RwLock::new(HashMap::new())),
+            clipboard: Arc::new(ClipboardState::default()),
+            pairing: Arc::new(PairingState::default()),
+            transport: Arc::new(TransportState::default()),
+            discovery: Arc::new(DiscoveryState::default()),
+            input: Arc::new(InputState::new(input_enabled)),
             security_paths: Arc::new(paths),
             identity: Arc::new(identity),
             device_fingerprint: Arc::new(fingerprint),
-            outgoing_input_payloads: Arc::new(RwLock::new(HashMap::new())),
-            outgoing_bulk_payloads: Arc::new(RwLock::new(HashMap::new())),
-            transport_events: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(
-                MAX_TRANSPORT_EVENTS,
-            ))),
-            clipboard_sync: Arc::new(RwLock::new(ClipboardSyncState::default())),
-            discovered_endpoints: Arc::new(RwLock::new(HashMap::new())),
-            mdns_active: Arc::new(RwLock::new(false)),
             inbox_root: Arc::new(inbox_root),
             parsed_layout_matrix_cache: Arc::new(RwLock::new(None)),
-            input_router: Arc::new(RwLock::new(InputRouter::new(input_enabled))),
-            input_sequence_by_peer: Arc::new(RwLock::new(HashMap::new())),
-            pending_inject_input_frames: Arc::new(RwLock::new(VecDeque::new())),
-            input_capture_target_peer_id: Arc::new(RwLock::new(None)),
-            input_owner_last_changed_at: Arc::new(RwLock::new(None)),
-            input_lock_active: Arc::new(RwLock::new(false)),
-            input_lock_supported: Arc::new(RwLock::new(cfg!(windows))),
-            reconnect_generation_by_peer: Arc::new(RwLock::new(HashMap::new())),
-            outgoing_flush_signal,
-            outgoing_flush_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             input_capture_wake: Arc::new(RuntimeWakeSignal::default()),
             input_inject_wake: Arc::new(RuntimeWakeSignal::default()),
-            peer_reconcile_wake: Arc::new(RuntimeWakeSignal::default()),
-            pending_inject_high_water: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            outgoing_input_high_water_by_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            pending_nearby_pairing_requests: Arc::new(RwLock::new(HashMap::new())),
-            nearby_pairing_decisions: Arc::new(RwLock::new(HashMap::new())),
-            nearby_code_request_last_seen_by_ip: Arc::new(RwLock::new(HashMap::new())),
-            nearby_code_submission_failures_by_ip: Arc::new(RwLock::new(HashMap::new())),
-            nearby_code_submission_lockout_by_ip: Arc::new(RwLock::new(HashMap::new())),
-            pending_transport_session_abort_handles: Arc::new(RwLock::new(HashMap::new())),
-            transport_session_abort_handles_by_peer: Arc::new(RwLock::new(HashMap::new())),
-            next_transport_session_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
     }
 
@@ -517,15 +324,16 @@ impl AppState {
     }
 
     pub fn subscribe_outgoing_flush_signal(&self) -> watch::Receiver<u64> {
-        self.outgoing_flush_signal.subscribe()
+        self.transport.outgoing_flush_signal.subscribe()
     }
 
     pub(crate) fn notify_outgoing_flush_signal(&self) {
         let next = self
+            .transport
             .outgoing_flush_generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .wrapping_add(1);
-        let _ = self.outgoing_flush_signal.send(next);
+        let _ = self.transport.outgoing_flush_signal.send(next);
     }
 
     fn record_runtime_wake(&self, channel: &str, source: &str) {
@@ -562,7 +370,7 @@ impl AppState {
     }
 
     pub(crate) fn notify_peer_reconcile_wake(&self, source: &str) {
-        if self.peer_reconcile_wake.trigger() {
+        if self.transport.peer_reconcile_wake.trigger() {
             self.record_transport_event(TransportEventRecord {
                 timestamp: Utc::now(),
                 direction: "local".to_string(),
@@ -571,12 +379,12 @@ impl AppState {
                 detail: format!("source={source}"),
                 size_bytes: 0,
             });
-            self.peer_reconcile_wake.notify_one();
+            self.transport.peer_reconcile_wake.notify_one();
         }
     }
 
     pub(crate) fn peer_reconcile_wake_signal(&self) -> Arc<RuntimeWakeSignal> {
-        self.peer_reconcile_wake.clone()
+        self.transport.peer_reconcile_wake.clone()
     }
 
     pub(crate) fn record_input_queue_high_water(

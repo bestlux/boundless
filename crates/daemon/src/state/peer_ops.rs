@@ -55,26 +55,27 @@ impl AppState {
             removed
         };
         if removed {
-            let mut router = self.input_router.write().await;
+            let mut router = self.input.router.write().await;
             let released_owner = router.release_owner(peer_id);
             router.clear_peer_state(peer_id);
             drop(router);
             if released_owner {
                 self.note_input_owner_transition().await;
             }
-            self.input_sequence_by_peer.write().await.remove(peer_id);
-            self.discovered_endpoints.write().await.remove(peer_id);
+            self.input.sequence_by_peer.write().await.remove(peer_id);
+            self.discovery.endpoints.write().await.remove(peer_id);
             self.clear_pending_inject_input_frames_for_peer(peer_id)
                 .await;
             self.clear_pending_clipboard_replay_for_peer(peer_id).await;
             self.clear_obsolete_inflight_clipboard_replays_for_peer(peer_id)
                 .await;
-            self.reconnect_generation_by_peer
+            self.transport
+                .reconnect_generation_by_peer
                 .write()
                 .await
                 .remove(peer_id);
             self.abort_transport_sessions_for_peer(peer_id).await;
-            let mut capture_target = self.input_capture_target_peer_id.write().await;
+            let mut capture_target = self.input.capture_target_peer_id.write().await;
             if capture_target.as_deref() == Some(peer_id) {
                 *capture_target = None;
             }
@@ -114,14 +115,14 @@ impl AppState {
         }
 
         if !connected {
-            let mut router = self.input_router.write().await;
+            let mut router = self.input.router.write().await;
             let released_owner = router.release_owner(peer_id);
             router.clear_peer_state(peer_id);
             drop(router);
             if released_owner {
                 self.note_input_owner_transition().await;
             }
-            let mut capture_target = self.input_capture_target_peer_id.write().await;
+            let mut capture_target = self.input.capture_target_peer_id.write().await;
             if capture_target.as_deref() == Some(peer_id) {
                 *capture_target = None;
             }

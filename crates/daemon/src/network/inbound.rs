@@ -7,10 +7,11 @@ use tokio::io::AsyncWrite;
 use tracing::{info, warn};
 
 use crate::state::{AppState, TransportEventRecord};
+use peer_transport::FILE_TRANSFER_INITIAL_CHUNK_CREDITS;
 
 use super::codec::now_millis;
 use super::inbound_payload::enqueue_clipboard_image_payload;
-use super::outbound::{FILE_TRANSFER_INITIAL_CHUNK_CREDITS, send_file_chunk_credit};
+use super::outbound::send_file_chunk_credit;
 use super::{MAX_INBOUND_TRANSFERS_PER_PEER, validate_transfer_size};
 
 pub(super) struct InboundTransfer {

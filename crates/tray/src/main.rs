@@ -18,28 +18,21 @@ mod windows_app {
     use hyper_util::rt::TokioIo;
     use image::ImageFormat;
     use ipc_api::boundless::v1::{
-        Empty, HotkeyTriggerRequest, ImportTrustBundleRequest, NearbyPairingDecisionRequest,
-        StatusRequest, daemon_service_client::DaemonServiceClient,
-        diagnostics_service_client::DiagnosticsServiceClient,
-        pairing_service_client::PairingServiceClient,
-        topology_service_client::TopologyServiceClient,
+        Empty, HotkeyTriggerRequest, LayoutSetRequest, NearbyPairingDecisionRequest,
+        NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
+        control_plane_service_client::ControlPlaneServiceClient,
     };
-    use serde::{Deserialize, Serialize};
+    use serde::Deserialize;
     use std::{
         future::Future,
         os::windows::process::CommandExt,
         pin::Pin,
         process::{Command as ProcessCommand, Stdio},
         task::{Context as TaskContext, Poll},
-        thread::sleep,
         time::{Duration, Instant},
     };
+    use tokio::net::windows::named_pipe::ClientOptions;
     use tokio::net::windows::named_pipe::NamedPipeClient;
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-        net::{TcpStream, windows::named_pipe::ClientOptions},
-        time::timeout,
-    };
     use tonic::{
         codegen::Service,
         transport::{Channel, Endpoint, Uri},
@@ -54,10 +47,6 @@ mod windows_app {
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     const ACTION_DASHBOARD: &str = "dashboard";
     const ACTION_QUIT: &str = "quit";
-    const NEARBY_PAIRING_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
-    const NEARBY_PAIRING_IO_TIMEOUT: Duration = Duration::from_secs(6);
-    const NEARBY_PAIRING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
-
     #[derive(Debug, Parser)]
     #[command(
         name = "boundlesstray",
@@ -79,7 +68,6 @@ mod windows_app {
     struct AppContext {
         endpoint: String,
         start_daemon: bool,
-        ctl_candidates: Vec<String>,
         daemon_candidates: Vec<String>,
     }
 
@@ -109,6 +97,7 @@ mod windows_app {
         connected: bool,
     }
 
+    #[allow(dead_code)]
     #[derive(Debug, Clone, Deserialize)]
     struct UiPendingRequest {
         request_id: String,
@@ -121,55 +110,6 @@ mod windows_app {
         verification_expires_at: String,
         #[serde(default)]
         requires_verification_code: bool,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct StoredTrustBundle {
-        machine_id: String,
-        display_name: String,
-        network_address: String,
-        ca_cert_pem: String,
-    }
-
-    #[derive(Debug, Serialize)]
-    #[serde(tag = "op", rename_all = "snake_case")]
-    enum NearbyJoinWireRequest {
-        NearbyRequestCode {
-            requester_bundle: StoredTrustBundle,
-            requester_alias: Option<String>,
-        },
-        NearbySubmitCode {
-            request_id: String,
-            code: String,
-            verification_nonce: String,
-            requester_alias: Option<String>,
-        },
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(tag = "status", rename_all = "snake_case")]
-    enum NearbyJoinWireResponse {
-        Pending {
-            #[serde(rename = "request_id")]
-            _request_id: String,
-            message: String,
-        },
-        Approved {
-            request_id: String,
-            responder_bundle: StoredTrustBundle,
-        },
-        Rejected {
-            message: String,
-        },
-        Error {
-            message: String,
-        },
-        CodeRequired {
-            request_id: String,
-            message: String,
-            verification_nonce: String,
-            expires_at: String,
-        },
     }
 
     enum NearbyRequestCodeStart {
@@ -223,6 +163,7 @@ mod windows_app {
         include!("dashboard_pairing_transition_tests.rs");
     }
 
+    #[cfg(test)]
     fn filter_connectable_discovered_peers(
         discovered_peers: Vec<UiDiscoveredPeer>,
         local_machine_id: &str,
@@ -240,101 +181,64 @@ mod windows_app {
                 machine_id != local_machine_id && !paired_peer_ids.contains(&machine_id)
             })
             .collect::<Vec<_>>();
-        discovered_peers.sort_by(|left, right| {
-            left.display_name
-                .cmp(&right.display_name)
-                .then_with(|| left.machine_id.cmp(&right.machine_id))
+        discovered_peers.sort_by(|a, b| {
+            a.display_name
+                .to_ascii_lowercase()
+                .cmp(&b.display_name.to_ascii_lowercase())
+                .then_with(|| a.machine_id.cmp(&b.machine_id))
         });
         discovered_peers
     }
 
-    fn run_boundlessctl(ctx: &AppContext, args: &[String]) -> Result<String> {
-        run_boundlessctl_with_timeout(ctx, args, Duration::from_secs(20))
-    }
-
-    fn run_boundlessctl_with_timeout(
-        ctx: &AppContext,
-        args: &[String],
-        timeout: Duration,
-    ) -> Result<String> {
-        let mut attempted = Vec::<String>::new();
-
-        for candidate in &ctx.ctl_candidates {
-            let mut command = ProcessCommand::new(candidate);
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            command.creation_flags(CREATE_NO_WINDOW);
-            command.arg("--endpoint").arg(&ctx.endpoint);
-            for arg in args {
-                command.arg(arg);
+    fn watch_ui_snapshots_blocking<F>(endpoint: &str, mut on_snapshot: F) -> Result<()>
+    where
+        F: FnMut(UiSnapshot) -> Result<()>,
+    {
+        block_on_result(async move {
+            let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+            let mut stream = client.watch_ui(Empty {}).await?.into_inner();
+            while let Some(snapshot) = stream.message().await? {
+                on_snapshot(UiSnapshot {
+                    generated_at: snapshot.generated_at,
+                    daemon_online: snapshot.daemon_online,
+                    machine_id: snapshot.machine_id,
+                    layout_matrix: snapshot.layout_matrix,
+                    discovered_peers: snapshot
+                        .discovered_peers
+                        .into_iter()
+                        .map(|peer| UiDiscoveredPeer {
+                            machine_id: peer.machine_id,
+                            display_name: peer.display_name,
+                            endpoint: peer.endpoint,
+                        })
+                        .collect(),
+                    paired_peers: snapshot
+                        .paired_peers
+                        .into_iter()
+                        .map(|peer| UiPairedPeer {
+                            peer_id: peer.peer_id,
+                            display_name: peer.display_name,
+                            address: peer.address,
+                            connected: peer.connected,
+                        })
+                        .collect(),
+                    pending_requests: snapshot
+                        .pending_requests
+                        .into_iter()
+                        .map(|request| UiPendingRequest {
+                            request_id: request.request_id,
+                            requester_machine_id: request.requester_machine_id,
+                            requester_display_name: request.requester_display_name,
+                            created_at: request.created_at,
+                            verification_code: request.verification_code,
+                            verification_expires_at: request.verification_expires_at,
+                            requires_verification_code: request.requires_verification_code,
+                        })
+                        .collect(),
+                })?;
             }
-
-            match command.spawn() {
-                Ok(mut child) => {
-                    let started_at = Instant::now();
-                    while started_at.elapsed() < timeout {
-                        match child.try_wait() {
-                            Ok(Some(_status)) => break,
-                            Ok(None) => sleep(Duration::from_millis(20)),
-                            Err(error) => {
-                                bail!(
-                                    "failed waiting for `{}` args=`{}`: {}",
-                                    candidate,
-                                    args.join(" "),
-                                    error
-                                );
-                            }
-                        }
-                    }
-
-                    let finished = matches!(child.try_wait(), Ok(Some(_)));
-                    if !finished {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        bail!(
-                            "command timed out via `{}` args=`{}` timeout={}s",
-                            candidate,
-                            args.join(" "),
-                            timeout.as_secs()
-                        );
-                    }
-
-                    let output = child.wait_with_output().with_context(|| {
-                        format!(
-                            "collect output for `{}` args=`{}`",
-                            candidate,
-                            args.join(" ")
-                        )
-                    })?;
-                    if output.status.success() {
-                        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        return Ok(stdout);
-                    }
-
-                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    bail!(
-                        "command failed via `{}` args=`{}`\nstdout: {}\nstderr: {}",
-                        candidate,
-                        args.join(" "),
-                        truncate(&stdout, 600),
-                        truncate(&stderr, 600)
-                    );
-                }
-                Err(error) => attempted.push(format!("{candidate}: {error}")),
-            }
-        }
-
-        bail!(
-            "failed to launch boundlessctl; candidates attempted: {}",
-            attempted.join("; ")
-        )
-    }
-
-    fn fetch_ui_snapshot_blocking(endpoint: &str) -> Result<UiSnapshot> {
-        block_on_result(fetch_ui_snapshot(endpoint))
+            Ok(())
+        })
     }
 
     fn pair_nearby_request_code_blocking(
@@ -383,6 +287,10 @@ mod windows_app {
         block_on_result(trigger_hotkey_action(endpoint, action.to_string()))
     }
 
+    fn layout_set_blocking(endpoint: &str, matrix_spec: String) -> Result<String> {
+        block_on_result(layout_set(endpoint, matrix_spec))
+    }
+
     fn ensure_daemon_available_blocking(ctx: &AppContext) -> Result<Option<String>> {
         block_on_result(ensure_daemon_available(
             &ctx.endpoint,
@@ -403,9 +311,18 @@ mod windows_app {
     }
 
     async fn trigger_hotkey_action(endpoint: &str, action: String) -> Result<String> {
-        let mut diagnostics_client = DiagnosticsServiceClient::new(channel(endpoint).await?);
-        let response = diagnostics_client
+        let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+        let response = client
             .trigger_hotkey_action(HotkeyTriggerRequest { action })
+            .await?
+            .into_inner();
+        Ok(response.message)
+    }
+
+    async fn layout_set(endpoint: &str, matrix_spec: String) -> Result<String> {
+        let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+        let response = client
+            .layout_set(LayoutSetRequest { matrix_spec })
             .await?
             .into_inner();
         Ok(response.message)
@@ -463,152 +380,36 @@ mod windows_app {
         )
     }
 
-    async fn fetch_ui_snapshot(endpoint: &str) -> Result<UiSnapshot> {
-        let channel = channel(endpoint).await?;
-
-        let mut daemon_client = DaemonServiceClient::new(channel.clone());
-        let status = daemon_client
-            .get_status(StatusRequest {})
-            .await?
-            .into_inner();
-
-        let mut topology_client = TopologyServiceClient::new(channel.clone());
-        let peers = topology_client
-            .list_peers(Empty {})
-            .await?
-            .into_inner()
-            .peers;
-        let layout = topology_client
-            .layout_show(Empty {})
-            .await?
-            .into_inner()
-            .matrix_spec;
-
-        let mut diagnostics_client = DiagnosticsServiceClient::new(channel.clone());
-        let discovery = diagnostics_client
-            .list_discovery_peers(Empty {})
-            .await?
-            .into_inner();
-
-        let mut pairing_client = PairingServiceClient::new(channel);
-        let pending = pairing_client
-            .list_nearby_pairing_requests(Empty {})
-            .await?
-            .into_inner()
-            .requests;
-
-        let mut paired_peers = peers
-            .into_iter()
-            .map(|peer| UiPairedPeer {
-                peer_id: peer.peer_id,
-                display_name: peer.display_name,
-                address: peer.address,
-                connected: peer.connected,
-            })
-            .collect::<Vec<_>>();
-        paired_peers.sort_by(|left, right| {
-            left.display_name
-                .cmp(&right.display_name)
-                .then_with(|| left.peer_id.cmp(&right.peer_id))
-        });
-
-        let discovered_peers = filter_connectable_discovered_peers(
-            discovery
-                .peers
-                .into_iter()
-                .map(|peer| UiDiscoveredPeer {
-                    machine_id: peer.machine_id,
-                    display_name: peer.display_name,
-                    endpoint: peer.endpoint,
-                })
-                .collect::<Vec<_>>(),
-            &status.machine_id,
-            &paired_peers,
-        );
-
-        let mut pending_requests = pending
-            .into_iter()
-            .map(|request| UiPendingRequest {
-                request_id: request.request_id,
-                requester_machine_id: request.requester_machine_id,
-                requester_display_name: request.requester_display_name,
-                created_at: request.created_at,
-                verification_code: request.verification_code,
-                verification_expires_at: request.verification_expires_at,
-                requires_verification_code: request.requires_verification_code,
-            })
-            .collect::<Vec<_>>();
-        pending_requests.sort_by(|left, right| left.created_at.cmp(&right.created_at));
-
-        Ok(UiSnapshot {
-            generated_at: String::new(),
-            daemon_online: status.running,
-            machine_id: status.machine_id,
-            layout_matrix: layout,
-            discovered_peers,
-            paired_peers,
-            pending_requests,
-        })
-    }
-
     async fn pair_nearby_request_code(
         endpoint: &str,
         host: String,
         port: u16,
     ) -> Result<NearbyRequestCodeStart> {
-        let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
-        let local_bundle = pairing_client
-            .export_trust_bundle(Empty {})
+        let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+        let response = client
+            .request_nearby_pairing_code(NearbyRequestCodeStartRequest {
+                host,
+                port: u32::from(port),
+                alias: String::new(),
+            })
             .await?
             .into_inner();
-        let requester_bundle = StoredTrustBundle {
-            machine_id: local_bundle.machine_id,
-            display_name: local_bundle.display_name,
-            network_address: local_bundle.network_address,
-            ca_cert_pem: local_bundle.ca_cert_pem,
-        };
 
-        let target = format_host_port(&host, port);
-        let response = send_nearby_pairing_request(
-            &target,
-            NearbyJoinWireRequest::NearbyRequestCode {
-                requester_bundle,
-                requester_alias: None,
-            },
-        )
-        .await?;
-
-        match response {
-            NearbyJoinWireResponse::CodeRequired {
-                request_id,
-                verification_nonce,
-                expires_at,
-                ..
-            } => Ok(NearbyRequestCodeStart::CodeRequired {
-                request_id,
-                verification_nonce,
-                expires_at,
-            }),
-            NearbyJoinWireResponse::Error { message } => {
-                let lowered = message.to_ascii_lowercase();
-                if lowered.contains("unknown variant")
-                    || lowered.contains("parse pairing request")
-                    || lowered.contains("missing field")
-                {
-                    return Ok(NearbyRequestCodeStart::Unsupported { reason: message });
-                }
-                bail!("nearby pairing request failed: {message}");
-            }
-            NearbyJoinWireResponse::Rejected { message, .. } => {
-                bail!("nearby pairing request rejected: {message}");
-            }
-            NearbyJoinWireResponse::Pending { message, .. } => {
-                bail!("unexpected nearby pairing status: {message}");
-            }
-            NearbyJoinWireResponse::Approved { .. } => {
-                bail!("unexpected nearby pairing status: approved");
-            }
+        if response.code_required {
+            return Ok(NearbyRequestCodeStart::CodeRequired {
+                request_id: response.request_id,
+                verification_nonce: response.verification_nonce,
+                expires_at: response.verification_expires_at,
+            });
         }
+
+        if response.unsupported {
+            return Ok(NearbyRequestCodeStart::Unsupported {
+                reason: response.message,
+            });
+        }
+
+        bail!("nearby pairing request failed: {}", response.message);
     }
 
     async fn pair_nearby_submit_code(
@@ -620,49 +421,32 @@ mod windows_app {
         port: u16,
         alias: Option<String>,
     ) -> Result<String> {
-        let target = format_host_port(&host, port);
-        let response = send_nearby_pairing_request(
-            &target,
-            NearbyJoinWireRequest::NearbySubmitCode {
+        let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+        let response = client
+            .submit_nearby_pairing_code(NearbySubmitCodeRequest {
+                host,
+                port: u32::from(port),
                 request_id: request_id.clone(),
                 code,
                 verification_nonce,
-                requester_alias: None,
-            },
-        )
-        .await?;
-        let responder_bundle = match response {
-            NearbyJoinWireResponse::Approved {
-                request_id: approved_request_id,
-                responder_bundle,
-                ..
-            } => {
-                if approved_request_id != request_id {
-                    bail!("nearby pairing request id mismatch");
-                }
-                responder_bundle
-            }
-            NearbyJoinWireResponse::Pending { .. } => {
-                bail!(
-                    "unexpected pending response for code submission; start a new pairing request"
-                );
-            }
-            NearbyJoinWireResponse::Rejected { message, .. } => {
-                bail!("nearby pairing rejected: {message}");
-            }
-            NearbyJoinWireResponse::Error { message } => {
-                bail!("nearby pairing failed: {message}");
-            }
-            NearbyJoinWireResponse::CodeRequired { message, .. } => {
-                bail!("nearby pairing failed: {message}");
-            }
-        };
-        import_nearby_responder_bundle(endpoint, responder_bundle, &host, alias).await
+                alias: alias.unwrap_or_default(),
+            })
+            .await?
+            .into_inner();
+
+        if !response.ok {
+            bail!("nearby pairing failed: {}", response.message);
+        }
+        if response.request_id != request_id {
+            bail!("nearby pairing request id mismatch");
+        }
+
+        Ok(response.peer_machine_id)
     }
 
     async fn approve_nearby_pairing_request(endpoint: &str, request_id: String) -> Result<String> {
-        let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
-        let response = pairing_client
+        let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+        let response = client
             .approve_nearby_pairing_request(NearbyPairingDecisionRequest {
                 request_id,
                 alias: String::new(),
@@ -673,8 +457,8 @@ mod windows_app {
     }
 
     async fn reject_nearby_pairing_request(endpoint: &str, request_id: String) -> Result<String> {
-        let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
-        let response = pairing_client
+        let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+        let response = client
             .reject_nearby_pairing_request(NearbyPairingDecisionRequest {
                 request_id,
                 alias: String::new(),
@@ -682,102 +466,6 @@ mod windows_app {
             .await?
             .into_inner();
         Ok(response.message)
-    }
-
-    async fn import_nearby_responder_bundle(
-        endpoint: &str,
-        mut responder_bundle: StoredTrustBundle,
-        host: &str,
-        alias: Option<String>,
-    ) -> Result<String> {
-        normalize_bundle_address_for_host(&mut responder_bundle, host)?;
-
-        let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
-        pairing_client
-            .import_trust_bundle(ImportTrustBundleRequest {
-                machine_id: responder_bundle.machine_id.clone(),
-                display_name: responder_bundle.display_name,
-                network_address: responder_bundle.network_address,
-                ca_cert_pem: responder_bundle.ca_cert_pem,
-                alias: alias.unwrap_or_default(),
-            })
-            .await?
-            .into_inner();
-
-        let mut diagnostics_client = DiagnosticsServiceClient::new(channel(endpoint).await?);
-        let _ = diagnostics_client
-            .trigger_hotkey_action(HotkeyTriggerRequest {
-                action: "reconnect".to_string(),
-            })
-            .await;
-
-        Ok(responder_bundle.machine_id)
-    }
-
-    async fn send_nearby_pairing_request(
-        target: &str,
-        request: NearbyJoinWireRequest,
-    ) -> Result<NearbyJoinWireResponse> {
-        let mut socket = timeout(NEARBY_PAIRING_CONNECT_TIMEOUT, TcpStream::connect(target))
-            .await
-            .with_context(|| {
-                format!(
-                    "connect nearby pairing endpoint {target} timed out after {}s",
-                    NEARBY_PAIRING_CONNECT_TIMEOUT.as_secs()
-                )
-            })?
-            .with_context(|| format!("connect nearby pairing endpoint {target}"))?;
-        let payload =
-            serde_json::to_string(&request).context("serialize nearby pairing request")?;
-        timeout(
-            NEARBY_PAIRING_IO_TIMEOUT,
-            socket.write_all(payload.as_bytes()),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "send nearby pairing request timed out after {}s",
-                NEARBY_PAIRING_IO_TIMEOUT.as_secs()
-            )
-        })?
-        .context("send nearby pairing request")?;
-        timeout(NEARBY_PAIRING_IO_TIMEOUT, socket.write_all(b"\n"))
-            .await
-            .with_context(|| {
-                format!(
-                    "terminate nearby pairing request timed out after {}s",
-                    NEARBY_PAIRING_IO_TIMEOUT.as_secs()
-                )
-            })?
-            .context("terminate nearby pairing request")?;
-        timeout(NEARBY_PAIRING_IO_TIMEOUT, socket.flush())
-            .await
-            .with_context(|| {
-                format!(
-                    "flush nearby pairing request timed out after {}s",
-                    NEARBY_PAIRING_IO_TIMEOUT.as_secs()
-                )
-            })?
-            .context("flush nearby pairing request")?;
-
-        let mut reader = BufReader::new(socket);
-        let mut response_line = String::new();
-        let read = timeout(
-            NEARBY_PAIRING_RESPONSE_TIMEOUT,
-            reader.read_line(&mut response_line),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "read nearby pairing response timed out after {}s",
-                NEARBY_PAIRING_RESPONSE_TIMEOUT.as_secs()
-            )
-        })?
-        .context("read nearby pairing response")?;
-        if read == 0 {
-            bail!("nearby pairing endpoint closed without a response");
-        }
-        serde_json::from_str(&response_line).context("parse nearby pairing response")
     }
 
     async fn channel(endpoint: &str) -> Result<Channel> {
@@ -867,47 +555,6 @@ mod windows_app {
                 Err(error) => return Err(error),
             }
         }
-    }
-
-    fn format_host_port(host: &str, port: u16) -> String {
-        let trimmed = host.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            format!("{trimmed}:{port}")
-        } else if trimmed.contains(':') {
-            format!("[{trimmed}]:{port}")
-        } else {
-            format!("{trimmed}:{port}")
-        }
-    }
-
-    fn normalize_bundle_address_for_host(bundle: &mut StoredTrustBundle, host: &str) -> Result<()> {
-        let port = extract_port_from_network_address(bundle.network_address.trim())?;
-        bundle.network_address = format_host_port(host, port);
-        Ok(())
-    }
-
-    fn extract_port_from_network_address(address: &str) -> Result<u16> {
-        let trimmed = address.trim();
-        if trimmed.is_empty() {
-            bail!("invalid responder network address: empty");
-        }
-        if let Ok(socket) = trimmed.parse::<std::net::SocketAddr>() {
-            return Ok(socket.port());
-        }
-        if let Some((host_part, port_part)) = trimmed.rsplit_once(':') {
-            if host_part.trim().is_empty() {
-                bail!("invalid responder network address: missing host");
-            }
-            let port = port_part
-                .trim()
-                .parse::<u16>()
-                .context("invalid responder network address port")?;
-            if port == 0 {
-                bail!("invalid responder network address port: 0");
-            }
-            return Ok(port);
-        }
-        bail!("invalid responder network address: missing port");
     }
 
     #[cfg(test)]
@@ -1006,29 +653,6 @@ mod windows_app {
             return transport_port + 100;
         }
         transport_port.saturating_sub(100).max(1)
-    }
-
-    fn resolve_boundlessctl_candidates() -> Vec<String> {
-        let mut candidates = Vec::<String>::new();
-        if let Ok(path) = std::env::var("BOUNDLESS_CTL_PATH") {
-            let trimmed = path.trim();
-            if !trimmed.is_empty() {
-                candidates.push(trimmed.to_string());
-            }
-        }
-
-        if let Ok(current_exe) = std::env::current_exe()
-            && let Some(parent) = current_exe.parent()
-        {
-            candidates.push(parent.join("boundlessctl.exe").display().to_string());
-            candidates.push(parent.join("boundlessctl").display().to_string());
-        }
-
-        candidates.push("boundlessctl.exe".to_string());
-        candidates.push("boundlessctl".to_string());
-        candidates.sort();
-        candidates.dedup();
-        candidates
     }
 
     fn resolve_boundlessd_candidates() -> Vec<String> {
@@ -1158,14 +782,6 @@ mod windows_app {
             return None;
         }
         digits.parse::<u8>().ok()
-    }
-
-    fn truncate(value: &str, max_chars: usize) -> String {
-        let mut out = value.chars().take(max_chars).collect::<String>();
-        if value.chars().count() > max_chars {
-            out.push_str("...");
-        }
-        out
     }
 
     fn default_endpoint() -> String {

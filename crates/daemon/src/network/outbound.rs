@@ -1,17 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 
 use core_clipboard::{ClipboardPayload, payload_hash_hex};
+use peer_transport::{FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS, OutboundTransferFlow};
 
 use super::codec::input_events_to_wire;
 use super::*;
-
-#[derive(Debug, Default)]
-pub(super) struct OutboundTransferFlow {
-    pub(super) available_chunk_credits: u32,
-}
-
-pub(super) const FILE_TRANSFER_INITIAL_CHUNK_CREDITS: u32 = 8;
-pub(super) const FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS: u32 = 256;
 const CLIPBOARD_IMAGE_CHUNK_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

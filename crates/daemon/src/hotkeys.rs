@@ -6,6 +6,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 #[cfg(windows)]
+use platform_windows::input::is_virtual_key_down;
+#[cfg(windows)]
 use tokio::time;
 use tracing::info;
 #[cfg(any(windows, test))]
@@ -30,9 +32,7 @@ const VK_LWIN: u16 = 0x5B;
 const VK_RWIN: u16 = 0x5C;
 
 #[cfg(windows)]
-use windows_sys::Win32::{
-    System::Shutdown::LockWorkStation, UI::Input::KeyboardAndMouse::GetAsyncKeyState,
-};
+use windows_sys::Win32::System::Shutdown::LockWorkStation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum HotkeyAction {
@@ -267,12 +267,6 @@ fn lock_machine() -> Result<()> {
 #[cfg(not(windows))]
 fn lock_machine() -> Result<()> {
     anyhow::bail!("lock_machine is only supported on Windows");
-}
-
-#[cfg(windows)]
-fn is_virtual_key_down(vk: u16) -> bool {
-    let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
-    (state as u16 & 0x8000) != 0
 }
 
 #[cfg(any(windows, test))]

@@ -8,11 +8,7 @@ use std::{
     process::{Command as ProcessCommand, Stdio},
     time::Duration,
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::TcpStream,
-    time::Instant,
-};
+use tokio::time::Instant;
 use tonic::transport::{Channel, Endpoint};
 
 #[cfg(windows)]
@@ -32,13 +28,11 @@ use tonic::{codegen::Service, transport::Uri};
 use ipc_api::boundless::v1::{
     DiagnosticsDumpRequest, Empty, FeatureSetRequest, HotkeySetRequest, HotkeyTriggerRequest,
     ImportTrustBundleRequest, InputCaptureTargetRequest, InputOwnerRequest, LayoutSetRequest,
-    NearbyPairingDecisionRequest, PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest,
-    SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest,
-    SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest,
-    daemon_service_client::DaemonServiceClient,
-    diagnostics_service_client::DiagnosticsServiceClient,
-    feature_service_client::FeatureServiceClient, pairing_service_client::PairingServiceClient,
-    topology_service_client::TopologyServiceClient,
+    NearbyJoinStartRequest, NearbyJoinStatusRequest, NearbyPairingDecisionRequest,
+    NearbyRequestCodeStartRequest, NearbySubmitCodeRequest, PairCreateCodeRequest, PairJoinRequest,
+    RemovePeerRequest, SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest,
+    SendFileRequest, SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest,
+    UiSnapshotReply, control_plane_service_client::ControlPlaneServiceClient,
 };
 
 mod cli_helpers;
@@ -52,9 +46,8 @@ use cli_helpers::extract_port_from_network_address;
 use cli_helpers::is_pipe_busy_error;
 use cli_helpers::{
     filter_connectable_discovery_records, format_host_port, nearby_pairing_port,
-    normalize_bundle_address_for_host, parse_npipe_endpoint, prompt_pairing_code,
-    prompt_pairing_nonce, resolve_discovered_peer, send_nearby_pairing_request, short_machine_id,
-    validate_bmp_payload,
+    parse_npipe_endpoint, prompt_pairing_code, prompt_pairing_nonce, resolve_discovered_peer,
+    short_machine_id, validate_bmp_payload,
 };
 use commands::*;
 use console::console_run;
@@ -330,56 +323,6 @@ struct StoredTrustBundle {
     display_name: String,
     network_address: String,
     ca_cert_pem: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-enum NearbyJoinWireRequest {
-    NearbyRequestCode {
-        requester_bundle: StoredTrustBundle,
-        requester_alias: Option<String>,
-    },
-    NearbySubmitCode {
-        request_id: String,
-        code: String,
-        verification_nonce: String,
-        requester_alias: Option<String>,
-    },
-    NearbyJoin {
-        code: String,
-        requester_bundle: StoredTrustBundle,
-        requester_alias: Option<String>,
-    },
-    CheckNearbyJoin {
-        request_id: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum NearbyJoinWireResponse {
-    CodeRequired {
-        request_id: String,
-        message: String,
-        verification_nonce: String,
-        expires_at: String,
-    },
-    Pending {
-        request_id: String,
-        message: String,
-    },
-    Approved {
-        request_id: String,
-        message: String,
-        responder_bundle: StoredTrustBundle,
-    },
-    Rejected {
-        request_id: String,
-        message: String,
-    },
-    Error {
-        message: String,
-    },
 }
 
 #[tokio::main]

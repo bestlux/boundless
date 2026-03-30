@@ -42,9 +42,9 @@ pub(super) fn normalize_optional_alias(alias: String) -> Option<String> {
 }
 
 pub(super) fn validate_and_consume_pairing_code(
-    pairing_codes: &mut HashMap<String, DateTime<Utc>>,
+    pairing_codes: &mut HashMap<String, chrono::DateTime<Utc>>,
     code: &str,
-    now: DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
 ) -> Result<()> {
     if code.trim().is_empty() {
         anyhow::bail!("pairing code must not be empty");
