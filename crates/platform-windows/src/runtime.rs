@@ -2,8 +2,10 @@
 use std::{
     io,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context as TaskContext, Poll},
 };
+
+use anyhow::{Context, Result};
 
 #[cfg(windows)]
 use tokio::{
@@ -13,6 +15,8 @@ use tokio::{
 };
 #[cfg(windows)]
 use tonic::{codegen::tokio_stream::Stream, transport::server::Connected};
+#[cfg(windows)]
+use windows_sys::Win32::System::Shutdown::LockWorkStation;
 
 #[cfg(windows)]
 #[derive(Debug)]
@@ -24,7 +28,7 @@ pub struct NamedPipeIncoming {
 impl Stream for NamedPipeIncoming {
     type Item = io::Result<NamedPipeIo>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.receiver).poll_recv(cx)
     }
 }
@@ -46,7 +50,7 @@ impl Connected for NamedPipeIo {
 impl AsyncRead for NamedPipeIo {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_read(cx, buf)
@@ -57,17 +61,17 @@ impl AsyncRead for NamedPipeIo {
 impl AsyncWrite for NamedPipeIo {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -83,6 +87,20 @@ pub fn named_pipe_incoming(pipe_name: &str) -> io::Result<NamedPipeIncoming> {
     });
 
     Ok(NamedPipeIncoming { receiver })
+}
+
+#[cfg(windows)]
+pub fn lock_workstation() -> Result<()> {
+    let ok = unsafe { LockWorkStation() };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error()).context("LockWorkStation");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn lock_workstation() -> Result<()> {
+    anyhow::bail!("lock_machine is only supported on Windows");
 }
 
 #[cfg(windows)]

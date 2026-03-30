@@ -9,4 +9,4 @@ anyhow.workspace = true
 core-input = { path = "../core-input" }
 tokio.workspace = true
 tonic.workspace = true
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Shutdown", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

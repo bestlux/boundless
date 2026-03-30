@@ -8,6 +8,8 @@ use anyhow::{Context, Result, bail};
 #[cfg(windows)]
 use platform_windows::input::is_virtual_key_down;
 #[cfg(windows)]
+use platform_windows::runtime::lock_workstation;
+#[cfg(windows)]
 use tokio::time;
 use tracing::info;
 #[cfg(any(windows, test))]
@@ -30,9 +32,6 @@ const VK_ALT: u16 = 0x12;
 const VK_LWIN: u16 = 0x5B;
 #[cfg(any(windows, test))]
 const VK_RWIN: u16 = 0x5C;
-
-#[cfg(windows)]
-use windows_sys::Win32::System::Shutdown::LockWorkStation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum HotkeyAction {
@@ -257,11 +256,7 @@ async fn apply_hotkey_action(state: &AppState, action: HotkeyAction) -> Result<(
 
 #[cfg(windows)]
 fn lock_machine() -> Result<()> {
-    let ok = unsafe { LockWorkStation() };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error()).context("LockWorkStation");
-    }
-    Ok(())
+    lock_workstation()
 }
 
 #[cfg(not(windows))]
