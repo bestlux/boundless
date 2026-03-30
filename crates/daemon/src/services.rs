@@ -15,7 +15,7 @@ use ipc_api::boundless::v1::{
     SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
     SendInputMoveRequest, StatusReply, StatusRequest, TransportEvent, TransportEventsReply,
     TrustBundleReply, UiSnapshotReply,
-    control_plane_service_server::{ControlPlaneService, ControlPlaneServiceServer},
+    control_plane_service_server::ControlPlaneService,
     daemon_service_server::{DaemonService, DaemonServiceServer},
     diagnostics_service_server::{DiagnosticsService, DiagnosticsServiceServer},
     feature_service_server::{FeatureService, FeatureServiceServer},
@@ -42,7 +42,6 @@ use topology_api::TopologyApi;
 #[derive(Clone)]
 pub struct ServiceBundle {
     pub daemon: DaemonServiceServer<DaemonApi>,
-    pub control_plane: ControlPlaneServiceServer<ControlPlaneApi>,
     pub pairing: PairingServiceServer<PairingApi>,
     pub topology: TopologyServiceServer<TopologyApi>,
     pub feature: FeatureServiceServer<FeatureApi>,
@@ -53,7 +52,6 @@ impl ServiceBundle {
     pub fn new(state: AppState) -> Self {
         Self {
             daemon: DaemonServiceServer::new(DaemonApi(state.clone())),
-            control_plane: ControlPlaneServiceServer::new(ControlPlaneApi(state.clone())),
             pairing: PairingServiceServer::new(PairingApi(state.clone())),
             topology: TopologyServiceServer::new(TopologyApi(state.clone())),
             feature: FeatureServiceServer::new(FeatureApi(state.clone())),
