@@ -9,6 +9,6 @@ impl DaemonService for DaemonApi {
         &self,
         request: Request<StatusRequest>,
     ) -> Result<Response<StatusReply>, Status> {
-        ControlPlaneApi(self.0.clone()).get_status(request).await
+        control_plane_api(self.0.clone()).get_status(request).await
     }
 }

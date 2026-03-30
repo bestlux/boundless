@@ -9,20 +9,22 @@ impl FeatureService for FeatureApi {
         &self,
         request: Request<FeatureSetRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        ControlPlaneApi(self.0.clone()).set_feature(request).await
+        control_plane_api(self.0.clone()).set_feature(request).await
     }
 
     async fn list_features(
         &self,
         request: Request<Empty>,
     ) -> Result<Response<FeatureListReply>, Status> {
-        ControlPlaneApi(self.0.clone()).list_features(request).await
+        control_plane_api(self.0.clone())
+            .list_features(request)
+            .await
     }
 
     async fn set_hotkey(
         &self,
         request: Request<HotkeySetRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        ControlPlaneApi(self.0.clone()).set_hotkey(request).await
+        control_plane_api(self.0.clone()).set_hotkey(request).await
     }
 }

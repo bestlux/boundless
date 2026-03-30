@@ -9,7 +9,7 @@ impl PairingService for PairingApi {
         &self,
         request: Request<PairCreateCodeRequest>,
     ) -> Result<Response<PairCreateCodeReply>, Status> {
-        ControlPlaneApi(self.0.clone())
+        control_plane_api(self.0.clone())
             .create_pairing_code(request)
             .await
     }
@@ -18,7 +18,7 @@ impl PairingService for PairingApi {
         &self,
         request: Request<PairJoinRequest>,
     ) -> Result<Response<PairJoinReply>, Status> {
-        ControlPlaneApi(self.0.clone())
+        control_plane_api(self.0.clone())
             .join_with_pairing_code(request)
             .await
     }
@@ -34,7 +34,7 @@ impl PairingService for PairingApi {
             &snapshot.api_bind,
             remote_addr,
         );
-        let snapshot = ControlPlaneApi(self.0.clone())
+        let snapshot = control_plane_api(self.0.clone())
             .get_console_snapshot(Request::new(Empty {}))
             .await?
             .into_inner();
@@ -57,7 +57,7 @@ impl PairingService for PairingApi {
         &self,
         request: Request<NearbyPairingDecisionRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        ControlPlaneApi(self.0.clone())
+        control_plane_api(self.0.clone())
             .approve_nearby_pairing_request(request)
             .await
     }
@@ -66,7 +66,7 @@ impl PairingService for PairingApi {
         &self,
         request: Request<NearbyPairingDecisionRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        ControlPlaneApi(self.0.clone())
+        control_plane_api(self.0.clone())
             .reject_nearby_pairing_request(request)
             .await
     }
@@ -75,7 +75,7 @@ impl PairingService for PairingApi {
         &self,
         request: Request<Empty>,
     ) -> Result<Response<TrustBundleReply>, Status> {
-        ControlPlaneApi(self.0.clone())
+        control_plane_api(self.0.clone())
             .export_trust_bundle(request)
             .await
     }
@@ -84,7 +84,7 @@ impl PairingService for PairingApi {
         &self,
         request: Request<ImportTrustBundleRequest>,
     ) -> Result<Response<OperationReply>, Status> {
-        ControlPlaneApi(self.0.clone())
+        control_plane_api(self.0.clone())
             .import_trust_bundle(request)
             .await
     }
