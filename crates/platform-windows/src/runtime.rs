@@ -15,9 +15,6 @@ use tokio::{
 use tonic::{codegen::tokio_stream::Stream, transport::server::Connected};
 
 #[cfg(windows)]
-pub const PLATFORM: &str = "windows";
-
-#[cfg(windows)]
 #[derive(Debug)]
 pub struct NamedPipeIncoming {
     receiver: mpsc::Receiver<io::Result<NamedPipeIo>>,

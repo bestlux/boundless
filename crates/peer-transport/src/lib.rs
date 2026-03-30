@@ -23,16 +23,6 @@ pub enum TransportLane {
     Bulk,
 }
 
-pub trait TransportPolicy {
-    fn lane_name(&self, lane: TransportLane) -> &'static str {
-        match lane {
-            TransportLane::Control => "control",
-            TransportLane::Realtime => "realtime",
-            TransportLane::Bulk => "bulk",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportTuning {
     pub heartbeat_interval: Duration,
