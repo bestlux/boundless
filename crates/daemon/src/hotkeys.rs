@@ -235,7 +235,7 @@ async fn apply_hotkey_action(state: &AppState, action: HotkeyAction) -> Result<(
             info!(enabled = next, "hotkey toggled easy_mouse");
         }
         HotkeyAction::LockMachine => {
-            lock_machine().context("lock machine action")?;
+            lock_workstation().context("lock machine action")?;
             info!("hotkey lock_machine executed");
         }
         HotkeyAction::Reconnect => {
@@ -252,16 +252,6 @@ async fn apply_hotkey_action(state: &AppState, action: HotkeyAction) -> Result<(
     }
 
     Ok(())
-}
-
-#[cfg(windows)]
-fn lock_machine() -> Result<()> {
-    lock_workstation()
-}
-
-#[cfg(not(windows))]
-fn lock_machine() -> Result<()> {
-    anyhow::bail!("lock_machine is only supported on Windows");
 }
 
 #[cfg(any(windows, test))]
