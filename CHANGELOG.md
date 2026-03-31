@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.1.1](https://github.com/bestlux/boundless/compare/v2.1.0...v2.1.1) (2026-03-31)
+
+
+### Bug Fixes
+
+* **ci:** repair tray eframe upgrade on windows ([9cb0c05](https://github.com/bestlux/boundless/commit/9cb0c055cd98cf7a415b1684c79d3e69089aadbe))
+* **ci:** repair tray eframe upgrade on windows ([e9ba389](https://github.com/bestlux/boundless/commit/e9ba389cf005a031f9e7d7c48de7689a3c72d065))
+* **release:** accept installer-managed shortcut icons ([#26](https://github.com/bestlux/boundless/issues/26)) ([98945c2](https://github.com/bestlux/boundless/commit/98945c218f664cbdf1ade70fef893daed87d206a))
+* **release:** coerce pwsh switch inputs ([#24](https://github.com/bestlux/boundless/issues/24)) ([a04b277](https://github.com/bestlux/boundless/commit/a04b277a44efa27c9436bef999042736e993f35c))
+* **release:** grant publish job pull request permissions ([#34](https://github.com/bestlux/boundless/issues/34)) ([cec0fdb](https://github.com/bestlux/boundless/commit/cec0fdb3c2b41739a2bf51be7193c4e6c3d8cf71))
+* **release:** guard uninstall registry lookup ([#27](https://github.com/bestlux/boundless/issues/27)) ([cbb93d1](https://github.com/bestlux/boundless/commit/cbb93d18393fd315e3dda77347cb7f7e428dee5a))
+* **release:** make windows signing optional ([#25](https://github.com/bestlux/boundless/issues/25)) ([4c9b465](https://github.com/bestlux/boundless/commit/4c9b46513c4a94202ed1150c48e249cf5461aa0b))
+* **release:** recover tagged publish flow ([#22](https://github.com/bestlux/boundless/issues/22)) ([09c3879](https://github.com/bestlux/boundless/commit/09c3879b52159b1d6328c570ab84933db3c1f7bc))
+* **release:** recreate draft releases without tag cleanup ([#32](https://github.com/bestlux/boundless/issues/32)) ([112d127](https://github.com/bestlux/boundless/commit/112d1277f9098a4866774a77b759f59edc1ad850))
+* **release:** set gh repo context for publish ([#31](https://github.com/bestlux/boundless/issues/31)) ([6f64412](https://github.com/bestlux/boundless/commit/6f64412cbe579df1073f6c1c2fa807ae6f71ccb5))
+* **release:** skip tray persistence on github runners ([#30](https://github.com/bestlux/boundless/issues/30)) ([873ceb1](https://github.com/bestlux/boundless/commit/873ceb1670dc35853756e6f40b3577d8bbf46498))
+* **release:** split tooling from source checkout ([#23](https://github.com/bestlux/boundless/issues/23)) ([7ecbbb7](https://github.com/bestlux/boundless/commit/7ecbbb705eedbd5d23db777916c2ec3ef7aad8aa))
+* **release:** tolerate headless tray validation ([#29](https://github.com/bestlux/boundless/issues/29)) ([976f59b](https://github.com/bestlux/boundless/commit/976f59b837966a55ae74d3cae575fdaeeedf6b40))
+* **release:** tolerate missing arp install path ([#28](https://github.com/bestlux/boundless/issues/28)) ([9958db2](https://github.com/bestlux/boundless/commit/9958db296558070946714aa769ebff58eee26743))
+* **release:** update existing draft releases in place ([#33](https://github.com/bestlux/boundless/issues/33)) ([bd5b674](https://github.com/bestlux/boundless/commit/bd5b674d753056931e5f32234cbd638159d0fa00))
+* restore ci and release workflows after merge ([#41](https://github.com/bestlux/boundless/issues/41)) ([0d6d7fa](https://github.com/bestlux/boundless/commit/0d6d7fa7118ad35d59008caabf24014a28444822))
+
 ## [2.1.0](https://github.com/bestlux/boundless/compare/v2.0.4...v2.1.0) (2026-03-19)
 
 
