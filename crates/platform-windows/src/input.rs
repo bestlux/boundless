@@ -1,5 +1,9 @@
+use core_input::InputEvent;
+
+#[cfg(windows)]
 use anyhow::{Context, Result, bail};
-use core_input::{InputEvent, KeyState, MouseButton};
+#[cfg(windows)]
+use core_input::{KeyState, MouseButton};
 
 #[cfg(windows)]
 mod hook_capture;
