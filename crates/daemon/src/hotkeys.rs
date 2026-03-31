@@ -7,7 +7,6 @@ use std::{
 use anyhow::{Context, Result, bail};
 #[cfg(windows)]
 use platform_windows::input::is_virtual_key_down;
-#[cfg(windows)]
 use platform_windows::runtime::lock_workstation;
 #[cfg(windows)]
 use tokio::time;
