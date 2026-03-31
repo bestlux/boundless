@@ -24,7 +24,7 @@ jobs:
           - language: actions
             build_mode: none
           - language: rust
-            build_mode: none
+            build_mode: manual
 
     steps:
       - name: Checkout
@@ -32,11 +32,21 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Setup Rust
+        if: matrix.language == 'rust'
+        uses: ./.github/actions/setup-rust
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@a60c4df7a135c7317c1e9ddf9b5a9b07a910dda9
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build_mode }}
+
+      - name: Build Rust workspace for CodeQL
+        if: matrix.language == 'rust'
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: cargo build --workspace --all-targets
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@a60c4df7a135c7317c1e9ddf9b5a9b07a910dda9
