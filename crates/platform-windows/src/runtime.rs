@@ -5,7 +5,9 @@ use std::{
     task::{Context as TaskContext, Poll},
 };
 
-use anyhow::{Context, Result};
+#[cfg(windows)]
+use anyhow::Context;
+use anyhow::Result;
 
 #[cfg(windows)]
 use tokio::{
