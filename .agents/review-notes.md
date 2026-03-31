@@ -4,11 +4,7 @@
 
 - `AppState` still exists as the dominant facade even after the decomposition work.
 - `pairing_wire.rs` still owns a large daemon-side nearby-pairing workflow surface.
-- Trace-budget and recovery gates still need real execution evidence.
-- Installer validation exposed a concrete packaging defect:
-  - uninstall `InstallLocation` resolves to literal `[INSTALLDIR]`
-  - WiX warns on `ARPINSTALLLOCATION` in `packaging/windows/installer/Package.wxs`
-- `.agents/` remains gitignored in this repo, so these artifacts are local program records unless repo policy changes.
+- `.agents/` remains ignored by repo defaults, so new planning artifacts still need explicit staging discipline when they change.
 - Rust incremental compilation on this machine continues to emit Windows finalization warnings (`Access is denied. (os error 5)`), though they did not block validation.
 
 ## Architectural review verdict
@@ -25,4 +21,9 @@
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `scripts/dev/two-node-smoke.ps1 -TimeoutSeconds 60`
 - `scripts/dev/three-node-smoke.ps1 -TimeoutSeconds 90`
-- `scripts/dev/installer-smoke.ps1 -Version 2.1.0` (failed on installer metadata)
+- `scripts/dev/installer-smoke.ps1 -Version 2.1.0`
+- `scripts/dev/edge-handoff-trace.ps1 -EndpointA http://127.0.0.1:56052 -LabelA node2 -DurationSeconds 20 -EnforceBudgets`
+- `scripts/dev/edge-handoff-trace.ps1 -EndpointA http://127.0.0.1:56051 -LabelA node1 -DurationSeconds 20 -EnforceBudgets`
+- `scripts/dev/input-trace-matrix.ps1 -TracePaths @(...edge-handoff-trace-node1.log, ...edge-handoff-trace-node2.log) -Scenario edge_handoff -Topology 2-node-loopback`
+- `scripts/dev/s4-recovery-automation.ps1 -EndpointA http://127.0.0.1:56051 -EndpointB http://127.0.0.1:56052 -ResponderHost 127.0.0.1 -ResponderPairingPort 56201 -Mode full`
+- `scripts/dev/s4-recovery-automation.ps1 -EndpointA http://127.0.0.1:56051 -EndpointB http://127.0.0.1:56052 -ResponderHost 127.0.0.1 -ResponderPairingPort 56201 -Mode lockout-only`

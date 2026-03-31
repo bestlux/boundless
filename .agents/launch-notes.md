@@ -26,17 +26,30 @@
   - `cargo clippy --workspace --all-targets -- -D warnings`
   - `scripts/dev/two-node-smoke.ps1 -TimeoutSeconds 60`
   - `scripts/dev/three-node-smoke.ps1 -TimeoutSeconds 90`
-- Failed:
   - `scripts/dev/installer-smoke.ps1 -Version 2.1.0`
-    - Packaging succeeded and produced an MSI.
-    - Validation failed on uninstall metadata with `Unexpected uninstall InstallLocation: [INSTALLDIR]`.
-    - WiX also emitted `WIX1077` on `ARPINSTALLLOCATION` in `packaging/windows/installer/Package.wxs`.
-- Not executed here:
-  - Trace-budget enforcement
-  - Recovery automation
-  - Those scripts require live endpoint setups that they do not self-provision in the same way as the smoke scripts.
+  - `scripts/dev/edge-handoff-trace.ps1 -EndpointA http://127.0.0.1:56052 -LabelA node2 -DurationSeconds 20 -EnforceBudgets`
+  - `scripts/dev/edge-handoff-trace.ps1 -EndpointA http://127.0.0.1:56051 -LabelA node1 -DurationSeconds 20 -EnforceBudgets`
+  - `scripts/dev/input-trace-matrix.ps1 -TracePaths @(...edge-handoff-trace-node1.log, ...edge-handoff-trace-node2.log) -Scenario edge_handoff -Topology 2-node-loopback`
+  - `scripts/dev/s4-recovery-automation.ps1 -EndpointA http://127.0.0.1:56051 -EndpointB http://127.0.0.1:56052 -ResponderHost 127.0.0.1 -ResponderPairingPort 56201 -Mode full`
+  - `scripts/dev/s4-recovery-automation.ps1 -EndpointA http://127.0.0.1:56051 -EndpointB http://127.0.0.1:56052 -ResponderHost 127.0.0.1 -ResponderPairingPort 56201 -Mode lockout-only`
+
+## Validation artifacts
+
+- Installer smoke artifacts: `artifacts/installer-validation/20260330-185433`
+- Trace logs:
+  - `artifacts/input-trace/edge-handoff-trace-node1.log`
+  - `artifacts/input-trace/edge-handoff-trace-node2.log`
+- Trace matrix:
+  - `artifacts/input-trace/input-latency-matrix-20260330-185919.csv`
+  - `artifacts/input-trace/input-latency-matrix-20260330-185919.json`
+- Recovery diagnostics:
+  - `artifacts/pairing-recovery/s4_recovery_a/dump-20260331-000225.txt`
+  - `artifacts/pairing-recovery/s4_recovery_b/dump-20260331-000225.txt`
+  - `artifacts/pairing-recovery/s4_recovery_a/dump-20260331-000307.txt`
+  - `artifacts/pairing-recovery/s4_recovery_b/dump-20260331-000307.txt`
 
 ## Readiness verdict
 
 - Architectural refactor scope: complete for this branch.
-- Release readiness: not ready until the installer metadata issue is fixed and trace/recovery gates are executed with valid endpoint setups.
+- Release readiness: ready on this machine for the current alpha branch validation scope.
+- Residual local issue: Rust incremental compilation still emits Windows finalization warnings (`Access is denied. (os error 5)`), but those warnings did not block any validation or release-gate run.
