@@ -61,22 +61,21 @@ use edge_switch::{
     filter_edge_start_replay_events, local_virtual_screen_bounds,
     maybe_handoff_capture_target_from_motion,
 };
+#[cfg(all(windows, test))]
+use platform_windows::input::raw_mouse_relative_delta;
 #[cfg(test)]
 #[cfg(windows)]
 use platform_windows::input::send_input_records_with_sender;
 #[cfg(windows)]
 use platform_windows::input::{
-    HookCaptureEvent, HookControlAction, HookSenderGuard, HOOK_EVENT_QUEUE_CAP,
+    HOOK_EVENT_QUEUE_CAP, HookCaptureEvent, HookControlAction, HookSenderGuard,
     captured_key_virtual_keys, cursor_position, input_event_kind, input_records_for_event,
-    install_keyboard_hook, install_mouse_hook, is_virtual_key_down,
-    mouse_button_from_virtual_key, mouse_button_virtual_keys, post_thread_quit,
-    run_hook_message_loop, send_input_records, set_hook_event_sender, set_hook_lock_active,
-    set_hook_wake_notifier, spawn_raw_input_thread,
+    install_keyboard_hook, install_mouse_hook, is_virtual_key_down, mouse_button_from_virtual_key,
+    mouse_button_virtual_keys, post_thread_quit, run_hook_message_loop, send_input_records,
+    set_hook_event_sender, set_hook_lock_active, set_hook_wake_notifier, spawn_raw_input_thread,
     take_hook_dropped_event_count, unhook_windows_hook, virtual_key_for_mouse_button,
     vk_to_scan_code,
 };
-#[cfg(all(windows, test))]
-use platform_windows::input::raw_mouse_relative_delta;
 #[cfg(all(test, not(windows)))]
 use runtime::apply_frame;
 #[cfg(test)]

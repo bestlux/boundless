@@ -36,6 +36,8 @@ mod cli_helpers;
 mod commands;
 mod console;
 
+#[cfg(test)]
+use app_services::desktop::nearby_pairing_port;
 #[cfg(windows)]
 use cli_helpers::NamedPipeConnector;
 #[cfg(all(test, windows))]
@@ -48,8 +50,6 @@ use cli_helpers::{
 use commands::*;
 use console::console_run;
 use console::{ConsoleDiscoveredPeer, ConsoleSnapshot};
-#[cfg(test)]
-use app_services::desktop::nearby_pairing_port;
 
 #[derive(Debug, Parser)]
 #[command(name = "boundlessctl", version, about = "Boundless CLI")]

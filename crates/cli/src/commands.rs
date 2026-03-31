@@ -168,7 +168,7 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
             }
             let selected = resolve_discovered_peer_record(&discovered, &selector)?;
             let (host, pairing_port) = host_and_pairing_port_from_endpoint(&selected.endpoint)
-            .with_context(|| format!("invalid discovered endpoint {}", selected.endpoint))?;
+                .with_context(|| format!("invalid discovered endpoint {}", selected.endpoint))?;
             (
                 host,
                 pairing_port,
@@ -289,7 +289,7 @@ pub(super) async fn setup_wizard(endpoint: &str, start_daemon: bool) -> Result<(
         } else {
             let selected = resolve_discovered_peer_record(&discovered, &selector)?;
             let (host, pairing_port) = host_and_pairing_port_from_endpoint(&selected.endpoint)
-            .with_context(|| format!("invalid discovered endpoint {}", selected.endpoint))?;
+                .with_context(|| format!("invalid discovered endpoint {}", selected.endpoint))?;
             (host, pairing_port, Some(selected.display_name.clone()))
         }
     };

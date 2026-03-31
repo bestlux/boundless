@@ -5,8 +5,7 @@ use tonic::transport::Server;
 use boundless_daemon::{
     config::ApiTransport,
     host::{HostOverrides, run_with, shutdown_signal},
-    logging,
-    shared_control_plane_app,
+    logging, shared_control_plane_app,
 };
 #[cfg(windows)]
 use platform_windows::runtime::named_pipe_incoming;
