@@ -15,8 +15,7 @@ pub(super) fn run() -> Result<()> {
     let ctx = Arc::new(AppContext {
         endpoint: cli.endpoint,
         start_daemon: cli.start_daemon,
-        ctl_candidates: resolve_boundlessctl_candidates(),
-        daemon_candidates: resolve_boundlessd_candidates(),
+        daemon_candidates: resolve_boundlessd_candidates(std::env::current_exe().ok()),
     });
 
     let options = eframe::NativeOptions {
@@ -64,86 +63,6 @@ enum Tab {
     Settings,
 }
 
-const CANONICAL_LOCAL_LAYOUT_TOKEN: &str = "self";
-
-fn is_local_layout_token(token: &str, local_machine_id: &str) -> bool {
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    matches!(
-        trimmed.to_ascii_lowercase().as_str(),
-        "self" | "local" | "this" | "me"
-    ) || trimmed.eq_ignore_ascii_case(local_machine_id)
-}
-
-fn count_local_layout_cells(
-    layout_grid: &HashMap<(i32, i32), String>,
-    local_machine_id: &str,
-) -> usize {
-    layout_grid
-        .values()
-        .filter(|id| id.eq_ignore_ascii_case(local_machine_id))
-        .count()
-}
-
-fn validate_layout_before_apply(
-    layout_grid: &HashMap<(i32, i32), String>,
-    local_machine_id: &str,
-) -> Result<()> {
-    match count_local_layout_cells(layout_grid, local_machine_id) {
-        1 => Ok(()),
-        0 => anyhow::bail!("layout must include This PC exactly once before applying"),
-        _ => anyhow::bail!("layout must include This PC exactly once before applying"),
-    }
-}
-
-fn serialize_layout_matrix(layout_grid: &HashMap<(i32, i32), String>, local_machine_id: &str) -> String {
-    let mut positions = layout_grid.keys();
-    let Some(&(first_x, first_y)) = positions.next() else {
-        return String::new();
-    };
-
-    let mut min_x = first_x;
-    let mut max_x = first_x;
-    let mut min_y = first_y;
-    let mut max_y = first_y;
-
-    for (x, y) in positions {
-        if *x < min_x {
-            min_x = *x;
-        }
-        if *x > max_x {
-            max_x = *x;
-        }
-        if *y < min_y {
-            min_y = *y;
-        }
-        if *y > max_y {
-            max_y = *y;
-        }
-    }
-
-    let mut rows = Vec::new();
-    for y in min_y..=max_y {
-        let mut cols = Vec::new();
-        for x in min_x..=max_x {
-            if let Some(id) = layout_grid.get(&(x, y)) {
-                cols.push(if id.eq_ignore_ascii_case(local_machine_id) {
-                    CANONICAL_LOCAL_LAYOUT_TOKEN.to_string()
-                } else {
-                    id.clone()
-                });
-            } else {
-                cols.push(String::new());
-            }
-        }
-        rows.push(cols.join(","));
-    }
-
-    rows.join(";")
-}
-
 fn validate_pairing_code(code: &str) -> Result<()> {
     if code.trim().is_empty() {
         anyhow::bail!("pairing code cannot be empty");
@@ -152,10 +71,8 @@ fn validate_pairing_code(code: &str) -> Result<()> {
 }
 
 fn guided_flow_from_discovered_peer(peer: &UiDiscoveredPeer) -> Result<GuidedPairingFlow> {
-    let Some((host, pairing_port)) = host_and_pairing_port_from_discovery_endpoint(&peer.endpoint)
-    else {
-        anyhow::bail!("Failed to parse peer endpoint");
-    };
+    let (host, pairing_port) = host_and_pairing_port_from_endpoint(&peer.endpoint)
+        .context("Failed to parse peer endpoint")?;
 
     Ok(GuidedPairingFlow {
         dialog_title: format!("Pair with {}", peer.display_name),
@@ -298,13 +215,14 @@ impl DashboardApp {
             let mut next_start_attempt = Instant::now();
             let mut start_backoff = Duration::from_secs(2);
             loop {
-                match fetch_ui_snapshot_blocking(&bg_ctx.endpoint) {
-                    Ok(snapshot) => {
+                match watch_ui_snapshots_blocking(&bg_ctx.endpoint, |snapshot| {
                         next_start_attempt = Instant::now();
                         start_backoff = Duration::from_secs(2);
                         let _ = bg_tx.send(AppMsg::SnapshotUpdated(snapshot));
                         egui_ctx.request_repaint();
-                    }
+                        Ok(())
+                    }) {
+                    Ok(()) => {}
                     Err(e) => {
                         let mut message = e.to_string();
                         if bg_ctx.start_daemon && Instant::now() >= next_start_attempt {
@@ -312,39 +230,16 @@ impl DashboardApp {
                                 Ok(Some(path)) => {
                                     next_start_attempt = Instant::now() + Duration::from_secs(8);
                                     start_backoff = Duration::from_secs(2);
-                                    match fetch_ui_snapshot_blocking(&bg_ctx.endpoint) {
-                                        Ok(snapshot) => {
-                                            let _ = bg_tx.send(AppMsg::SnapshotUpdated(snapshot));
-                                            let _ = bg_tx.send(AppMsg::ActionComplete(format!(
-                                                "Started daemon via `{path}`"
-                                            )));
-                                            egui_ctx.request_repaint();
-                                            std::thread::sleep(Duration::from_secs(4));
-                                            continue;
-                                        }
-                                        Err(refetch_error) => {
-                                            message = format!(
-                                                "{message}\nstarted daemon via `{path}`\nfollow-up refresh failed: {refetch_error}"
-                                            );
-                                        }
-                                    }
+                                    let _ = bg_tx.send(AppMsg::ActionComplete(format!(
+                                        "Started daemon via `{path}`"
+                                    )));
+                                    egui_ctx.request_repaint();
+                                    continue;
                                 }
                                 Ok(None) => {
                                     next_start_attempt = Instant::now() + Duration::from_secs(8);
                                     start_backoff = Duration::from_secs(2);
-                                    match fetch_ui_snapshot_blocking(&bg_ctx.endpoint) {
-                                        Ok(snapshot) => {
-                                            let _ = bg_tx.send(AppMsg::SnapshotUpdated(snapshot));
-                                            egui_ctx.request_repaint();
-                                            std::thread::sleep(Duration::from_secs(4));
-                                            continue;
-                                        }
-                                        Err(refetch_error) => {
-                                            message = format!(
-                                                "{message}\nfollow-up refresh failed: {refetch_error}"
-                                            );
-                                        }
-                                    }
+                                    continue;
                                 }
                                 Err(start_error) => {
                                     message =
@@ -360,7 +255,7 @@ impl DashboardApp {
                         egui_ctx.request_repaint();
                     }
                 }
-                std::thread::sleep(Duration::from_secs(4));
+                std::thread::sleep(Duration::from_secs(1));
             }
         });
 
@@ -868,7 +763,11 @@ impl eframe::App for DashboardApp {
                             for (y, row) in rows.iter().enumerate() {
                                 for (x, token) in row.iter().enumerate() {
                                     if token.is_empty() { continue; }
-                                    let peer_id = if is_local_layout_token(token, local_id) {
+                                    let peer_id = if shared_is_local_layout_token(
+                                        token,
+                                        local_id,
+                                        None,
+                                    ) {
                                         local_id.clone()
                                     } else if let Some(p) = peers.iter().find(|p| p.display_name == *token || p.peer_id == *token) {
                                         p.peer_id.clone()
@@ -1067,12 +966,11 @@ impl eframe::App for DashboardApp {
                             match validate_layout_before_apply(&self.layout_grid, &self.snapshot.machine_id) {
                                 Ok(()) => {
                                     let matrix_str = serialize_layout_matrix(&self.layout_grid, &self.snapshot.machine_id);
-                                    let args = vec!["layout".to_string(), "set".to_string(), matrix_str];
-                                    let ctx_clone = self.ctx.clone();
+                                    let endpoint = self.ctx.endpoint.clone();
                                     let tx = self.tx.clone();
                                     std::thread::spawn(move || {
-                                        match run_boundlessctl(&ctx_clone, &args) {
-                                            Ok(msg) => { let _ = tx.send(AppMsg::ActionComplete(format!("Layout applied: {}", msg))); }
+                                        match layout_set_blocking(&endpoint, matrix_str) {
+                                            Ok(msg) => { let _ = tx.send(AppMsg::ActionComplete(msg)); }
                                             Err(e) => { let _ = tx.send(AppMsg::ActionFailed(format!("Layout failed: {}", e))); }
                                         }
                                     });

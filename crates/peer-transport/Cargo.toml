@@ -1,0 +1,12 @@
+[package]
+name = "peer-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+core-input = { path = "../core-input" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

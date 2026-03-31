@@ -199,8 +199,121 @@ message InputCaptureTargetReply {
   string message = 3;
 }
 
+message UiSnapshotReply {
+  string generated_at = 1;
+  bool daemon_online = 2;
+  string machine_id = 3;
+  string layout_matrix = 4;
+  repeated DiscoveredPeerInfo discovered_peers = 5;
+  repeated PeerInfo paired_peers = 6;
+  repeated NearbyPairingRequestInfo pending_requests = 7;
+}
+
+message ConsoleSnapshotReply {
+  StatusReply status = 1;
+  repeated PeerInfo peers = 2;
+  map<string, bool> features = 3;
+  repeated DiscoveredPeerInfo discovered_peers = 4;
+  repeated NearbyPairingRequestInfo pending_requests = 5;
+  string input_owner_peer_id = 6;
+  string input_capture_target_peer_id = 7;
+  bool mdns_active = 8;
+  string local_display_name = 9;
+}
+
+message NearbyRequestCodeStartRequest {
+  string host = 1;
+  uint32 port = 2;
+  string alias = 3;
+}
+
+message NearbyRequestCodeStartReply {
+  bool code_required = 1;
+  string request_id = 2;
+  string verification_nonce = 3;
+  string verification_expires_at = 4;
+  bool unsupported = 5;
+  string message = 6;
+}
+
+message NearbySubmitCodeRequest {
+  string host = 1;
+  uint32 port = 2;
+  string request_id = 3;
+  string code = 4;
+  string verification_nonce = 5;
+  string alias = 6;
+}
+
+message NearbyJoinStartRequest {
+  string host = 1;
+  uint32 port = 2;
+  string code = 3;
+  string alias = 4;
+}
+
+message NearbyJoinStatusRequest {
+  string host = 1;
+  uint32 port = 2;
+  string request_id = 3;
+  string alias = 4;
+}
+
+message NearbyJoinStatusReply {
+  string request_id = 1;
+  string status = 2;
+  string message = 3;
+  string peer_machine_id = 4;
+}
+
+message NearbyPairingCompletionReply {
+  bool ok = 1;
+  string message = 2;
+  string request_id = 3;
+  string peer_machine_id = 4;
+}
+
 service DaemonService {
   rpc GetStatus(StatusRequest) returns (StatusReply);
+}
+
+service ControlPlaneService {
+  rpc GetUiSnapshot(Empty) returns (UiSnapshotReply);
+  rpc GetConsoleSnapshot(Empty) returns (ConsoleSnapshotReply);
+  rpc GetStatus(StatusRequest) returns (StatusReply);
+  rpc CreatePairingCode(PairCreateCodeRequest) returns (PairCreateCodeReply);
+  rpc JoinWithPairingCode(PairJoinRequest) returns (PairJoinReply);
+  rpc WatchUi(Empty) returns (stream UiSnapshotReply);
+  rpc ListPeers(Empty) returns (PeerListReply);
+  rpc RemovePeer(RemovePeerRequest) returns (OperationReply);
+  rpc LayoutShow(Empty) returns (LayoutReply);
+  rpc LayoutSet(LayoutSetRequest) returns (OperationReply);
+  rpc ListFeatures(Empty) returns (FeatureListReply);
+  rpc SetFeature(FeatureSetRequest) returns (OperationReply);
+  rpc SetHotkey(HotkeySetRequest) returns (OperationReply);
+  rpc TriggerHotkeyAction(HotkeyTriggerRequest) returns (OperationReply);
+  rpc ExportTrustBundle(Empty) returns (TrustBundleReply);
+  rpc ImportTrustBundle(ImportTrustBundleRequest) returns (OperationReply);
+  rpc DumpDiagnostics(DiagnosticsDumpRequest) returns (DiagnosticsDumpReply);
+  rpc SafeReset(SafeResetRequest) returns (OperationReply);
+  rpc SendClipboardText(SendClipboardTextRequest) returns (OperationReply);
+  rpc SendClipboardImage(SendClipboardImageRequest) returns (OperationReply);
+  rpc SendFile(SendFileRequest) returns (OperationReply);
+  rpc SendInputMove(SendInputMoveRequest) returns (OperationReply);
+  rpc SendInputKey(SendInputKeyRequest) returns (OperationReply);
+  rpc ListTransportEvents(Empty) returns (TransportEventsReply);
+  rpc GetInputOwner(Empty) returns (InputOwnerReply);
+  rpc ClaimInputOwner(InputOwnerRequest) returns (InputOwnerReply);
+  rpc ReleaseInputOwner(InputOwnerRequest) returns (InputOwnerReply);
+  rpc GetInputCaptureTarget(Empty) returns (InputCaptureTargetReply);
+  rpc SetInputCaptureTarget(InputCaptureTargetRequest) returns (InputCaptureTargetReply);
+  rpc ClearInputCaptureTarget(Empty) returns (InputCaptureTargetReply);
+  rpc RequestNearbyPairingCode(NearbyRequestCodeStartRequest) returns (NearbyRequestCodeStartReply);
+  rpc SubmitNearbyPairingCode(NearbySubmitCodeRequest) returns (NearbyPairingCompletionReply);
+  rpc StartNearbyPairingJoin(NearbyJoinStartRequest) returns (NearbyJoinStatusReply);
+  rpc CheckNearbyPairingJoin(NearbyJoinStatusRequest) returns (NearbyJoinStatusReply);
+  rpc ApproveNearbyPairingRequest(NearbyPairingDecisionRequest) returns (OperationReply);
+  rpc RejectNearbyPairingRequest(NearbyPairingDecisionRequest) returns (OperationReply);
 }
 
 service PairingService {

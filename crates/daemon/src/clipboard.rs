@@ -5,6 +5,8 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 use core_clipboard::ClipboardPayload;
+#[cfg(windows)]
+use platform_windows::clipboard_backend::WindowsClipboardBackend;
 
 use crate::state::{AppState, PendingRemoteClipboardPayload};
 
@@ -192,7 +194,7 @@ trait ClipboardBackend: Send {
 fn clipboard_backend() -> Box<dyn ClipboardBackend> {
     #[cfg(windows)]
     {
-        Box::new(WindowsClipboardBackend)
+        Box::new(WindowsClipboardBackendAdapter(WindowsClipboardBackend))
     }
 
     #[cfg(not(windows))]
@@ -201,45 +203,26 @@ fn clipboard_backend() -> Box<dyn ClipboardBackend> {
     }
 }
 
-#[cfg(windows)]
-struct WindowsClipboardBackend;
+#[cfg(not(windows))]
+struct NoopClipboardBackend;
 
 #[cfg(windows)]
-impl ClipboardBackend for WindowsClipboardBackend {
+struct WindowsClipboardBackendAdapter(WindowsClipboardBackend);
+
+#[cfg(windows)]
+impl ClipboardBackend for WindowsClipboardBackendAdapter {
     fn sequence_number(&mut self) -> Option<u64> {
-        clipboard_win::seq_num().map(|num| num.get() as u64)
+        self.0.sequence_number()
     }
 
     fn read_payload(&mut self) -> Result<Option<ClipboardPayload>> {
-        use clipboard_win::{Format, formats};
-
-        if formats::Bitmap.is_format_avail() {
-            let image_bmp: Vec<u8> = clipboard_win::get_clipboard(formats::Bitmap)
-                .map_err(|error| anyhow::anyhow!("clipboard image read failed: {error}"))?;
-            return Ok(Some(ClipboardPayload::Image(image_bmp)));
-        }
-
-        Ok(clipboard_win::get_clipboard_string()
-            .ok()
-            .map(ClipboardPayload::Text))
+        self.0.read_payload()
     }
 
     fn write_payload(&mut self, payload: &ClipboardPayload) -> Result<()> {
-        use clipboard_win::formats;
-
-        match payload {
-            ClipboardPayload::Text(text) => clipboard_win::set_clipboard_string(text)
-                .map_err(|error| anyhow::anyhow!("clipboard text write failed: {error}")),
-            ClipboardPayload::Image(image_bmp) => {
-                clipboard_win::set_clipboard(formats::Bitmap, image_bmp.as_slice())
-                    .map_err(|error| anyhow::anyhow!("clipboard image write failed: {error}"))
-            }
-        }
+        self.0.write_payload(payload)
     }
 }
-
-#[cfg(not(windows))]
-struct NoopClipboardBackend;
 
 #[cfg(not(windows))]
 impl ClipboardBackend for NoopClipboardBackend {

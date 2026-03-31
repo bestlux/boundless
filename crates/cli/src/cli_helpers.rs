@@ -64,15 +64,6 @@ pub(super) fn prompt_pairing_nonce() -> Result<String> {
     Ok(line.trim().to_string())
 }
 
-pub(super) fn nearby_pairing_port(transport_port: u16) -> u16 {
-    if transport_port <= u16::MAX - 100 {
-        return transport_port + 100;
-    }
-
-    let fallback = transport_port.saturating_sub(100);
-    if fallback == 0 { 1 } else { fallback }
-}
-
 pub(super) fn short_machine_id(machine_id: &str) -> &str {
     machine_id.get(..8).unwrap_or(machine_id)
 }
@@ -165,9 +156,6 @@ const ERROR_PIPE_BUSY_CODE: i32 = 231;
 const PIPE_BUSY_MAX_RETRIES: u32 = 20;
 #[cfg(windows)]
 const PIPE_BUSY_BACKOFF_MS: u64 = 25;
-const NEARBY_PAIRING_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
-const NEARBY_PAIRING_IO_TIMEOUT: Duration = Duration::from_secs(6);
-const NEARBY_PAIRING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[cfg(windows)]
 async fn open_named_pipe_with_retry(pipe_path: String) -> io::Result<NamedPipeClient> {
@@ -192,110 +180,6 @@ pub(super) fn is_pipe_busy_error(error: &io::Error) -> bool {
 
 pub(super) fn validate_bmp_payload(bytes: &[u8]) -> Result<()> {
     validate_bmp_bytes(bytes).map_err(anyhow::Error::from)
-}
-
-pub(super) async fn send_nearby_pairing_request(
-    target: &str,
-    request: NearbyJoinWireRequest,
-) -> Result<NearbyJoinWireResponse> {
-    let mut socket =
-        tokio::time::timeout(NEARBY_PAIRING_CONNECT_TIMEOUT, TcpStream::connect(target))
-            .await
-            .with_context(|| {
-                format!(
-                    "connect nearby pairing endpoint {target} timed out after {}s",
-                    NEARBY_PAIRING_CONNECT_TIMEOUT.as_secs()
-                )
-            })?
-            .with_context(|| format!("connect nearby pairing endpoint {target}"))?;
-    let payload = serde_json::to_string(&request).context("serialize nearby pairing request")?;
-    tokio::time::timeout(
-        NEARBY_PAIRING_IO_TIMEOUT,
-        socket.write_all(payload.as_bytes()),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "send nearby pairing request timed out after {}s",
-            NEARBY_PAIRING_IO_TIMEOUT.as_secs()
-        )
-    })?
-    .context("send nearby pairing request")?;
-    tokio::time::timeout(NEARBY_PAIRING_IO_TIMEOUT, socket.write_all(b"\n"))
-        .await
-        .with_context(|| {
-            format!(
-                "terminate nearby pairing request timed out after {}s",
-                NEARBY_PAIRING_IO_TIMEOUT.as_secs()
-            )
-        })?
-        .context("terminate nearby pairing request")?;
-    tokio::time::timeout(NEARBY_PAIRING_IO_TIMEOUT, socket.flush())
-        .await
-        .with_context(|| {
-            format!(
-                "flush nearby pairing request timed out after {}s",
-                NEARBY_PAIRING_IO_TIMEOUT.as_secs()
-            )
-        })?
-        .context("flush nearby pairing request")?;
-
-    let mut reader = BufReader::new(socket);
-    let mut response_line = String::new();
-    let read = tokio::time::timeout(
-        NEARBY_PAIRING_RESPONSE_TIMEOUT,
-        reader.read_line(&mut response_line),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "read nearby pairing response timed out after {}s",
-            NEARBY_PAIRING_RESPONSE_TIMEOUT.as_secs()
-        )
-    })?
-    .context("read nearby pairing response")?;
-    if read == 0 {
-        bail!("nearby pairing endpoint closed without a response");
-    }
-
-    serde_json::from_str(&response_line).context("parse nearby pairing response")
-}
-
-pub(super) fn normalize_bundle_address_for_host(
-    bundle: &mut StoredTrustBundle,
-    host: &str,
-) -> Result<()> {
-    let port = extract_port_from_network_address(bundle.network_address.trim())?;
-    bundle.network_address = format_host_port(host, port);
-    Ok(())
-}
-
-pub(super) fn extract_port_from_network_address(address: &str) -> Result<u16> {
-    let trimmed = address.trim();
-    if trimmed.is_empty() {
-        bail!("invalid responder network address: empty");
-    }
-
-    if let Ok(socket) = trimmed.parse::<std::net::SocketAddr>() {
-        return Ok(socket.port());
-    }
-
-    if let Some((host_part, port_part)) = trimmed.rsplit_once(':') {
-        if host_part.trim().is_empty() {
-            bail!("invalid responder network address: missing host");
-        }
-
-        let port = port_part
-            .trim()
-            .parse::<u16>()
-            .context("invalid responder network address port")?;
-        if port == 0 {
-            bail!("invalid responder network address port: 0");
-        }
-        return Ok(port);
-    }
-
-    bail!("invalid responder network address: missing port");
 }
 
 pub(super) fn format_host_port(host: &str, port: u16) -> String {

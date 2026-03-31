@@ -1,5 +1,10 @@
 use std::collections::HashMap;
 
+use peer_transport::{
+    outbound_target_candidates as transport_outbound_target_candidates,
+    wait_for_runtime_wake_or_backoff,
+};
+
 use super::*;
 
 pub(super) async fn listener_loop(state: AppState, listener: TcpListener) {
@@ -162,34 +167,12 @@ pub(super) async fn wait_for_reconcile_or_backoff(
     reconcile_wake: &std::sync::Arc<crate::state::RuntimeWakeSignal>,
     backoff: Duration,
 ) {
-    let wake_notified = reconcile_wake.notified();
-    tokio::pin!(wake_notified);
-    if reconcile_wake.take_pending() {
-        return;
-    }
-
-    tokio::select! {
-        _ = &mut wake_notified => {
-            let _ = reconcile_wake.take_pending();
-        }
-        _ = time::sleep(backoff) => {}
-    }
+    wait_for_runtime_wake_or_backoff(reconcile_wake, backoff).await;
 }
 
 pub(super) fn outbound_target_candidates(
     configured_address: &str,
     discovered_endpoint: Option<SocketAddr>,
 ) -> Vec<String> {
-    let mut targets = Vec::new();
-
-    if let Some(endpoint) = discovered_endpoint {
-        targets.push(endpoint.to_string());
-    }
-
-    let manual = configured_address.trim();
-    if !manual.is_empty() && !targets.iter().any(|target| target == manual) {
-        targets.push(manual.to_string());
-    }
-
-    targets
+    transport_outbound_target_candidates(configured_address, discovered_endpoint)
 }

@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+async-trait = "0.1"
 clap.workspace = true
 dirs.workspace = true
 serde.workspace = true
@@ -31,7 +32,11 @@ core-input = { path = "../core-input" }
 core-protocol = { path = "../core-protocol" }
 core-security = { path = "../core-security" }
 core-transfer = { path = "../core-transfer" }
+app-services = { path = "../app-services" }
+adapter-ipc-grpc = { path = "../adapter-ipc-grpc" }
 ipc-api = { path = "../ipc-api" }
+peer-transport = { path = "../peer-transport" }
+platform-windows = { path = "../platform-windows" }
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4.1"

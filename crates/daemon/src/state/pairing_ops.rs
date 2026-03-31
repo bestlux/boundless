@@ -26,9 +26,10 @@ impl VerificationMismatchKind {
 }
 
 impl AppState {
-    pub async fn create_pairing_code(&self, ttl_secs: u64) -> (String, DateTime<Utc>) {
+    pub async fn create_pairing_code(&self, ttl_secs: u64) -> (String, chrono::DateTime<Utc>) {
         let code = generate_pairing_code(Duration::from_secs(ttl_secs));
-        self.pairing_codes
+        self.pairing
+            .pairing_codes
             .write()
             .await
             .insert(code.value.clone(), code.expires_at);
@@ -37,7 +38,7 @@ impl AppState {
 
     pub async fn consume_pairing_code(&self, code: &str) -> Result<()> {
         let now = Utc::now();
-        let mut pairing_codes = self.pairing_codes.write().await;
+        let mut pairing_codes = self.pairing.pairing_codes.write().await;
         validate_and_consume_pairing_code(&mut pairing_codes, code, now)?;
         pairing_codes.retain(|_, expires_at| *expires_at >= now);
         Ok(())
@@ -48,7 +49,7 @@ impl AppState {
         requester_bundle: TrustBundle,
         requester_alias: Option<String>,
     ) -> Result<PendingNearbyPairingRequest> {
-        let mut pending_requests = self.pending_nearby_pairing_requests.write().await;
+        let mut pending_requests = self.pairing.pending_requests.write().await;
         if pending_requests.len() >= MAX_PENDING_NEARBY_PAIRING_REQUESTS {
             anyhow::bail!("too many pending pairing requests; try again later");
         }
@@ -82,7 +83,7 @@ impl AppState {
         requester_alias: Option<String>,
         ttl_secs: u64,
     ) -> Result<PendingNearbyPairingRequest> {
-        let mut pending_requests = self.pending_nearby_pairing_requests.write().await;
+        let mut pending_requests = self.pairing.pending_requests.write().await;
         let requester_machine_id = requester_bundle.machine_id.clone();
         pending_requests.retain(|_, record| {
             !(record.summary.requester_machine_id == requester_machine_id
@@ -132,7 +133,7 @@ impl AppState {
 
     pub async fn validate_nearby_code_request_rate_limit(&self, remote_ip: IpAddr) -> Result<()> {
         let now = Utc::now();
-        let mut last_seen = self.nearby_code_request_last_seen_by_ip.write().await;
+        let mut last_seen = self.pairing.code_request_last_seen_by_ip.write().await;
         last_seen.retain(|_, seen_at| *seen_at + chrono::TimeDelta::seconds(60) >= now);
 
         if let Some(previous) = last_seen.get(&remote_ip)
@@ -148,7 +149,7 @@ impl AppState {
 
     pub async fn validate_nearby_code_submission_allowed(&self, remote_ip: IpAddr) -> Result<()> {
         let now = Utc::now();
-        let mut lockouts = self.nearby_code_submission_lockout_by_ip.write().await;
+        let mut lockouts = self.pairing.code_submission_lockout_by_ip.write().await;
         lockouts.retain(|_, lockout_until| *lockout_until >= now);
 
         if let Some(lockout_until) = lockouts.get(&remote_ip)
@@ -163,11 +164,13 @@ impl AppState {
 
     pub async fn record_nearby_code_submission_result(&self, remote_ip: IpAddr, success: bool) {
         if success {
-            self.nearby_code_submission_failures_by_ip
+            self.pairing
+                .code_submission_failures_by_ip
                 .write()
                 .await
                 .remove(&remote_ip);
-            self.nearby_code_submission_lockout_by_ip
+            self.pairing
+                .code_submission_lockout_by_ip
                 .write()
                 .await
                 .remove(&remote_ip);
@@ -175,7 +178,7 @@ impl AppState {
         }
 
         let now = Utc::now();
-        let mut failures_map = self.nearby_code_submission_failures_by_ip.write().await;
+        let mut failures_map = self.pairing.code_submission_failures_by_ip.write().await;
         let window =
             chrono::TimeDelta::seconds(NEARBY_PAIRING_CODE_SUBMISSION_FAILURE_WINDOW_SECONDS);
         let failures = failures_map.entry(remote_ip).or_default();
@@ -184,7 +187,8 @@ impl AppState {
 
         if failures.len() >= NEARBY_PAIRING_CODE_SUBMISSION_MAX_FAILURES {
             failures.clear();
-            self.nearby_code_submission_lockout_by_ip
+            self.pairing
+                .code_submission_lockout_by_ip
                 .write()
                 .await
                 .insert(
@@ -200,7 +204,8 @@ impl AppState {
         self.expire_nearby_pairing_challenges().await;
 
         let mut requests = self
-            .pending_nearby_pairing_requests
+            .pairing
+            .pending_requests
             .read()
             .await
             .values()
@@ -214,7 +219,8 @@ impl AppState {
         self.expire_nearby_pairing_challenges().await;
 
         if self
-            .pending_nearby_pairing_requests
+            .pairing
+            .pending_requests
             .read()
             .await
             .contains_key(request_id)
@@ -223,7 +229,7 @@ impl AppState {
         }
 
         let now = Utc::now();
-        let mut decisions = self.nearby_pairing_decisions.write().await;
+        let mut decisions = self.pairing.decisions.write().await;
         decisions.retain(|_, record| {
             record.decided_at
                 + chrono::TimeDelta::minutes(NEARBY_PAIRING_DECISION_RETENTION_MINUTES)
@@ -253,14 +259,16 @@ impl AppState {
         self.expire_nearby_pairing_challenges().await;
 
         let pending = {
-            self.pending_nearby_pairing_requests
+            self.pairing
+                .pending_requests
                 .write()
                 .await
                 .remove(request_id)
         }
         .ok_or_else(|| anyhow::anyhow!("nearby pairing request not found"))?;
         if matches!(pending.mode, PendingNearbyPairingMode::CodeChallenge { .. }) {
-            self.pending_nearby_pairing_requests
+            self.pairing
+                .pending_requests
                 .write()
                 .await
                 .insert(request_id.to_string(), pending);
@@ -275,7 +283,8 @@ impl AppState {
             .import_trust_bundle(pending.requester_bundle.clone(), effective_alias)
             .await
         {
-            self.pending_nearby_pairing_requests
+            self.pairing
+                .pending_requests
                 .write()
                 .await
                 .insert(request_id.to_string(), pending);
@@ -283,7 +292,7 @@ impl AppState {
         }
 
         let responder_bundle = self.export_trust_bundle().await?;
-        self.nearby_pairing_decisions.write().await.insert(
+        self.pairing.decisions.write().await.insert(
             request_id.to_string(),
             NearbyPairingDecisionRecord {
                 decision: NearbyPairingDecision::Approved {
@@ -318,7 +327,8 @@ impl AppState {
         }
 
         let mut pending = {
-            self.pending_nearby_pairing_requests
+            self.pairing
+                .pending_requests
                 .write()
                 .await
                 .remove(request_id)
@@ -329,7 +339,8 @@ impl AppState {
         let mut invalid_attempt: Option<(u8, VerificationMismatchKind)> = None;
         match &mut pending.mode {
             PendingNearbyPairingMode::ManualApproval => {
-                self.pending_nearby_pairing_requests
+                self.pairing
+                    .pending_requests
                     .write()
                     .await
                     .insert(request_id.to_string(), pending);
@@ -342,7 +353,7 @@ impl AppState {
                 attempts_left,
             } => {
                 if *expires_at < now {
-                    self.nearby_pairing_decisions.write().await.insert(
+                    self.pairing.decisions.write().await.insert(
                         request_id.to_string(),
                         NearbyPairingDecisionRecord {
                             decision: NearbyPairingDecision::Rejected {
@@ -375,7 +386,8 @@ impl AppState {
 
         if let Some((attempts_remaining, mismatch_kind)) = invalid_attempt {
             if attempts_remaining > 0 {
-                self.pending_nearby_pairing_requests
+                self.pairing
+                    .pending_requests
                     .write()
                     .await
                     .insert(request_id.to_string(), pending);
@@ -385,7 +397,7 @@ impl AppState {
                 );
             }
 
-            self.nearby_pairing_decisions.write().await.insert(
+            self.pairing.decisions.write().await.insert(
                 request_id.to_string(),
                 NearbyPairingDecisionRecord {
                     decision: NearbyPairingDecision::Rejected {
@@ -412,7 +424,8 @@ impl AppState {
             .import_trust_bundle(pending.requester_bundle.clone(), effective_alias)
             .await
         {
-            self.pending_nearby_pairing_requests
+            self.pairing
+                .pending_requests
                 .write()
                 .await
                 .insert(request_id.to_string(), pending);
@@ -420,7 +433,7 @@ impl AppState {
         }
 
         let responder_bundle = self.export_trust_bundle().await?;
-        self.nearby_pairing_decisions.write().await.insert(
+        self.pairing.decisions.write().await.insert(
             request_id.to_string(),
             NearbyPairingDecisionRecord {
                 decision: NearbyPairingDecision::Approved {
@@ -440,7 +453,8 @@ impl AppState {
         self.expire_nearby_pairing_challenges().await;
 
         let removed = self
-            .pending_nearby_pairing_requests
+            .pairing
+            .pending_requests
             .write()
             .await
             .remove(request_id);
@@ -448,7 +462,7 @@ impl AppState {
             return false;
         }
 
-        self.nearby_pairing_decisions.write().await.insert(
+        self.pairing.decisions.write().await.insert(
             request_id.to_string(),
             NearbyPairingDecisionRecord {
                 decision: NearbyPairingDecision::Rejected {
@@ -465,7 +479,7 @@ impl AppState {
         let mut expired_ids = Vec::<String>::new();
 
         {
-            let mut pending = self.pending_nearby_pairing_requests.write().await;
+            let mut pending = self.pairing.pending_requests.write().await;
             pending.retain(|request_id, record| match &record.mode {
                 PendingNearbyPairingMode::ManualApproval => true,
                 PendingNearbyPairingMode::CodeChallenge { expires_at, .. } => {
@@ -482,7 +496,7 @@ impl AppState {
             return;
         }
 
-        let mut decisions = self.nearby_pairing_decisions.write().await;
+        let mut decisions = self.pairing.decisions.write().await;
         for request_id in expired_ids {
             decisions.insert(
                 request_id,

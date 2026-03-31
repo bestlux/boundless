@@ -7,7 +7,6 @@ pub(super) fn test_app() -> DashboardApp {
         ctx: Arc::new(AppContext {
             endpoint: "npipe://./pipe/boundlessd-api".to_string(),
             start_daemon: false,
-            ctl_candidates: Vec::new(),
             daemon_candidates: Vec::new(),
         }),
         _tray_icon: None,

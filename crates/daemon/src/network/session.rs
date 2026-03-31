@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
+use peer_transport::{
+    DEFAULT_TRANSPORT_TUNING, InboundClipboardImageTransfer, InboundTransfer,
+    OutboundTransferFlows, apply_outbound_chunk_credits, reconnect_generation_advanced,
+};
 
 use crate::state::TransportEventRecord;
 
@@ -9,15 +13,14 @@ use super::control::{
     HelloHandling, handle_heartbeat_message, handle_hello_ack_message, handle_hello_message,
 };
 use super::inbound::{
-    InboundClipboardImageTransfer, InboundTransfer, discard_inbound_clipboard_image_transfer,
-    discard_inbound_transfer, handle_clipboard_image_chunk, handle_clipboard_image_end,
-    handle_clipboard_image_start, handle_file_chunk, handle_file_end, handle_file_start,
+    discard_inbound_clipboard_image_transfer, discard_inbound_transfer,
+    handle_clipboard_image_chunk, handle_clipboard_image_end, handle_clipboard_image_start,
+    handle_file_chunk, handle_file_end, handle_file_start,
 };
 use super::inbound_payload::{
     handle_clipboard_image_message, handle_clipboard_text_message, handle_input_frame_message,
 };
 use super::outbound::{
-    FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS, OutboundTransferFlow,
     flush_outgoing_bulk_payloads_with_buffer, flush_outgoing_input_payloads_with_buffer,
 };
 use super::*;
@@ -109,9 +112,11 @@ where
     let mut writer = BufWriter::new(writer);
     let mut frame_payload = Vec::<u8>::with_capacity(4096);
     let mut write_frame_buffer = Vec::<u8>::with_capacity(4096);
-    let mut heartbeat_interval = time::interval(HEARTBEAT_INTERVAL);
-    let mut outgoing_input_flush_interval = time::interval(OUTGOING_INPUT_FLUSH_INTERVAL);
-    let mut outgoing_bulk_flush_interval = time::interval(OUTGOING_BULK_FLUSH_INTERVAL);
+    let mut heartbeat_interval = time::interval(DEFAULT_TRANSPORT_TUNING.heartbeat_interval);
+    let mut outgoing_input_flush_interval =
+        time::interval(DEFAULT_TRANSPORT_TUNING.outgoing_input_flush_interval);
+    let mut outgoing_bulk_flush_interval =
+        time::interval(DEFAULT_TRANSPORT_TUNING.outgoing_bulk_flush_interval);
     let mut outgoing_flush_signal = state.subscribe_outgoing_flush_signal();
     heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     outgoing_input_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -136,7 +141,7 @@ where
     let mut inbound_transfers: HashMap<String, InboundTransfer> = HashMap::new();
     let mut inbound_clipboard_image_transfers: HashMap<String, InboundClipboardImageTransfer> =
         HashMap::new();
-    let mut outbound_transfer_flow: HashMap<String, OutboundTransferFlow> = HashMap::new();
+    let mut outbound_transfer_flow: OutboundTransferFlows = HashMap::new();
 
     loop {
         tokio::select! {
@@ -176,7 +181,7 @@ where
                         &snapshot.machine_id,
                         remote_peer_id.as_deref(),
                         remote_protocol,
-                        OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
+                        DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
                         &mut outbound_transfer_flow,
                         &mut writer,
                         &mut write_frame_buffer,
@@ -234,7 +239,7 @@ where
                         &snapshot.machine_id,
                         remote_peer_id.as_deref(),
                         remote_protocol,
-                        OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
+                        DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
                         &mut outbound_transfer_flow,
                         &mut writer,
                         &mut write_frame_buffer,
@@ -471,7 +476,11 @@ where
                             continue;
                         }
 
-                        let Some(flow) = outbound_transfer_flow.get_mut(&transfer_id) else {
+                        let Some(_current_credits) = apply_outbound_chunk_credits(
+                            &mut outbound_transfer_flow,
+                            &transfer_id,
+                            chunk_credits,
+                        ) else {
                             warn!(
                                 transfer_id = %transfer_id,
                                 chunk_credits,
@@ -480,18 +489,13 @@ where
                             continue;
                         };
 
-                        flow.available_chunk_credits = flow
-                            .available_chunk_credits
-                            .saturating_add(chunk_credits)
-                            .min(FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS);
-
                         if let Some(remote_protocol) = remote_protocol {
                             flush_outgoing_bulk_payloads_with_buffer(
                                 &state,
                                 &snapshot.machine_id,
                                 remote_peer_id.as_deref(),
                                 remote_protocol,
-                                OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
+                                DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
                                 &mut outbound_transfer_flow,
                                 &mut writer,
                                 &mut write_frame_buffer,
@@ -551,12 +555,7 @@ pub(super) async fn reconnect_requested_for_peer(
     observed_generation: &mut u64,
 ) -> bool {
     let current_generation = state.peer_reconnect_generation(peer_id).await;
-    if current_generation <= *observed_generation {
-        return false;
-    }
-
-    *observed_generation = current_generation;
-    true
+    reconnect_generation_advanced(observed_generation, current_generation)
 }
 
 async fn authenticated_peer_machine_id<S>(

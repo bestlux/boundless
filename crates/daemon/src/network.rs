@@ -22,6 +22,7 @@ use tokio_rustls::{
 };
 use tracing::{error, info, warn};
 
+use crate::state::{AppState, OutboundPayload};
 use core_input::{InputEvent, InputFrame, KeyState, MouseButton};
 use core_protocol::{
     MAX_WIRE_PAYLOAD_BYTES, PROTOCOL_CURRENT, ProtocolVersion, WIRE_FRAME_LENGTH_PREFIX_BYTES,
@@ -29,8 +30,8 @@ use core_protocol::{
     decode_frame_payload, encode_frame_to_vec,
 };
 use core_transfer::validate_transfer_size;
-
-use crate::state::{AppState, OutboundPayload};
+#[cfg(test)]
+use peer_transport::DEFAULT_TRANSPORT_TUNING;
 
 mod codec;
 mod control;
@@ -64,15 +65,9 @@ use tls::{
     parse_server_name_for_peer,
 };
 
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
-const OUTGOING_INPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(4);
-const OUTGOING_BULK_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
-const OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH: usize = 4;
 const SUPERVISOR_TICK: Duration = Duration::from_secs(1);
 const MAX_BACKOFF_SECONDS: u64 = 30;
 const MAX_WIRE_FRAME_BYTES: usize = MAX_WIRE_PAYLOAD_BYTES;
-const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
-const MAX_INBOUND_TRANSFERS_PER_PEER: usize = 4;
 const FALLBACK_BIND_HOST: &str = "0.0.0.0";
 
 pub fn start(state: AppState, listener: Option<TcpListener>) {
@@ -451,8 +446,12 @@ mod tests {
 
     #[test]
     fn perf_probe_outgoing_flush_tick_rate() {
-        let input_flush_ms = OUTGOING_INPUT_FLUSH_INTERVAL.as_millis() as f64;
-        let bulk_flush_ms = OUTGOING_BULK_FLUSH_INTERVAL.as_millis() as f64;
+        let input_flush_ms = DEFAULT_TRANSPORT_TUNING
+            .outgoing_input_flush_interval
+            .as_millis() as f64;
+        let bulk_flush_ms = DEFAULT_TRANSPORT_TUNING
+            .outgoing_bulk_flush_interval
+            .as_millis() as f64;
         let input_theoretical_max_hz = if input_flush_ms > 0.0 {
             1000.0 / input_flush_ms
         } else {
@@ -469,7 +468,7 @@ mod tests {
             input_theoretical_max_hz,
             bulk_flush_ms,
             bulk_theoretical_max_hz,
-            OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush
         );
         assert!(
             input_flush_ms > 0.0 && bulk_flush_ms > 0.0,

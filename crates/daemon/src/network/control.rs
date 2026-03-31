@@ -1,14 +1,12 @@
-use std::collections::HashMap;
-
 use anyhow::{Context, Result};
 use tokio::io::AsyncWrite;
 use tracing::warn;
 
 use super::outbound::{
-    OutboundTransferFlow, flush_outgoing_bulk_payloads_with_buffer,
-    flush_outgoing_input_payloads_with_buffer,
+    flush_outgoing_bulk_payloads_with_buffer, flush_outgoing_input_payloads_with_buffer,
 };
 use super::*;
+use peer_transport::{DEFAULT_TRANSPORT_TUNING, OutboundTransferFlows};
 
 pub(super) enum HelloHandling {
     Continue,
@@ -28,7 +26,7 @@ pub(super) async fn handle_hello_message<W>(
     machine_id: String,
     protocol: ProtocolVersion,
     remote_protocol: &mut Option<ProtocolVersion>,
-    outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
+    outbound_transfer_flow: &mut OutboundTransferFlows,
     writer: &mut W,
     frame_buffer: &mut Vec<u8>,
 ) -> Result<HelloHandling>
@@ -114,7 +112,7 @@ pub(super) async fn handle_hello_ack_message<W>(
     remote_peer_id: Option<&str>,
     local_machine_id: &str,
     remote_protocol: Option<ProtocolVersion>,
-    outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
+    outbound_transfer_flow: &mut OutboundTransferFlows,
     accepted: bool,
     writer: &mut W,
     frame_buffer: &mut Vec<u8>,
@@ -153,7 +151,7 @@ async fn flush_pending_after_control_frame<W>(
     local_machine_id: &str,
     remote_peer_id: Option<&str>,
     remote_protocol: Option<ProtocolVersion>,
-    outbound_transfer_flow: &mut HashMap<String, OutboundTransferFlow>,
+    outbound_transfer_flow: &mut OutboundTransferFlows,
     writer: &mut W,
     frame_buffer: &mut Vec<u8>,
 ) -> Result<()>
@@ -176,7 +174,7 @@ where
             local_machine_id,
             remote_peer_id,
             remote_protocol,
-            OUTGOING_BULK_MAX_PAYLOADS_PER_FLUSH,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
             outbound_transfer_flow,
             writer,
             frame_buffer,

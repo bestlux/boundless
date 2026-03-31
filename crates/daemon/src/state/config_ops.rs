@@ -35,7 +35,7 @@ impl AppState {
         display_name: &str,
         endpoint: SocketAddr,
     ) -> Option<DiscoveredPeerEndpoint> {
-        let previous = self.discovered_endpoints.write().await.insert(
+        let previous = self.discovery.endpoints.write().await.insert(
             machine_id.to_string(),
             DiscoveredPeerEndpoint {
                 display_name: display_name.to_string(),
@@ -50,7 +50,7 @@ impl AppState {
         &self,
         machine_id: &str,
     ) -> Option<DiscoveredPeerEndpoint> {
-        let removed = self.discovered_endpoints.write().await.remove(machine_id);
+        let removed = self.discovery.endpoints.write().await.remove(machine_id);
         if removed.is_some() {
             self.notify_peer_reconcile_wake("discovered_endpoint_removed");
         }
@@ -59,7 +59,8 @@ impl AppState {
 
     pub async fn discovered_endpoints(&self) -> Vec<(String, DiscoveredPeerEndpoint)> {
         let mut entries = self
-            .discovered_endpoints
+            .discovery
+            .endpoints
             .read()
             .await
             .iter()
@@ -70,7 +71,8 @@ impl AppState {
     }
 
     pub async fn discovered_endpoint(&self, machine_id: &str) -> Option<SocketAddr> {
-        self.discovered_endpoints
+        self.discovery
+            .endpoints
             .read()
             .await
             .get(machine_id)
@@ -78,11 +80,11 @@ impl AppState {
     }
 
     pub async fn set_mdns_active(&self, active: bool) {
-        *self.mdns_active.write().await = active;
+        *self.discovery.mdns_active.write().await = active;
     }
 
     pub async fn mdns_active(&self) -> bool {
-        *self.mdns_active.read().await
+        *self.discovery.mdns_active.read().await
     }
 
     pub async fn layout(&self) -> String {
@@ -152,7 +154,7 @@ impl AppState {
                 .await;
             resolve_switch_all_target_order_from_matrix(&config, matrix.as_ref())
         };
-        let current_target = self.input_capture_target_peer_id.read().await.clone();
+        let current_target = self.input.capture_target_peer_id.read().await.clone();
         if order.is_empty() {
             return None;
         }
@@ -172,11 +174,11 @@ impl AppState {
         save_config_at(&self.config_path, &config)?;
 
         if name == "share_input" {
-            self.input_router.write().await.set_enabled(enabled);
+            self.input.router.write().await.set_enabled(enabled);
             self.notify_input_inject_wake("share_input_toggled");
             self.notify_input_capture_wake("share_input_toggled");
         } else if name == "share_clipboard" && !enabled {
-            *self.clipboard_sync.write().await = ClipboardSyncState::default();
+            self.clipboard.clear().await;
         } else if name == "easy_mouse" || name == "wrap_mouse" {
             self.notify_input_capture_wake("input_policy_toggled");
         }

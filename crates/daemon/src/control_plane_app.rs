@@ -1,0 +1,622 @@
+use std::{path::Path, sync::Arc};
+
+use anyhow::Result;
+use app_services::{
+    ControlPlaneApp, SharedControlPlaneApp,
+    commands::{
+        DiagnosticsDumpCommand, DiagnosticsDumpReply, FeatureSetCommand, HotkeySetCommand,
+        HotkeyTriggerCommand, ImportTrustBundleCommand, InputCaptureTargetCommand,
+        InputCaptureTargetReply, InputOwnerCommand, InputOwnerReply, LayoutReply, LayoutSetCommand,
+        NearbyJoinStartCommand, NearbyJoinStatusCommand, NearbyPairingDecisionCommand,
+        NearbyRequestCodeCommand, NearbySubmitCodeCommand, OperationReply, PairJoinCommand,
+        PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, SafeResetCommand,
+        SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand,
+        SendInputMoveCommand,
+    },
+    queries::{
+        ConsoleSnapshot, NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot,
+        NearbyRequestCodeStartSnapshot, StatusSnapshot, TransportEventSnapshot,
+        TrustBundleSnapshot, UiDiscoveredPeer, UiPairedPeer, UiPendingRequest, UiSnapshot,
+    },
+};
+use async_trait::async_trait;
+use core_security::TrustBundle;
+
+use crate::{config::ApiTransport, pairing_wire, state::AppState};
+
+#[derive(Clone)]
+pub struct DaemonControlPlaneApp {
+    state: AppState,
+}
+
+impl DaemonControlPlaneApp {
+    pub fn new(state: AppState) -> Self {
+        Self { state }
+    }
+}
+
+pub fn shared_control_plane_app(state: AppState) -> SharedControlPlaneApp {
+    Arc::new(DaemonControlPlaneApp::new(state))
+}
+
+#[async_trait]
+impl ControlPlaneApp for DaemonControlPlaneApp {
+    async fn status_snapshot(&self) -> Result<StatusSnapshot> {
+        build_status_snapshot(&self.state).await
+    }
+
+    async fn ui_snapshot(&self) -> Result<UiSnapshot> {
+        build_ui_snapshot(&self.state).await
+    }
+
+    async fn console_snapshot(&self) -> Result<ConsoleSnapshot> {
+        build_console_snapshot(&self.state).await
+    }
+
+    async fn create_pairing_code(&self, request: PairingCodeRequest) -> Result<PairingCodeReply> {
+        let (code, expires_at) = self
+            .state
+            .create_pairing_code(request.ttl_seconds.max(1))
+            .await;
+        Ok(PairingCodeReply {
+            code,
+            expires_at: expires_at.to_rfc3339(),
+        })
+    }
+
+    async fn join_with_pairing_code(&self, command: PairJoinCommand) -> Result<PairJoinReply> {
+        let peer_id = self
+            .state
+            .join_peer(command.code, command.host, command.alias)
+            .await?;
+
+        Ok(PairJoinReply {
+            accepted: true,
+            peer_id,
+            message: "paired".to_string(),
+        })
+    }
+
+    async fn set_layout(&self, command: LayoutSetCommand) -> Result<OperationReply> {
+        self.state.set_layout(command.matrix_spec).await?;
+        Ok(OperationReply {
+            ok: true,
+            message: "Layout updated".to_string(),
+        })
+    }
+
+    async fn list_peers(&self) -> Result<Vec<UiPairedPeer>> {
+        Ok(build_paired_peers(&self.state).await)
+    }
+
+    async fn remove_peer(&self, command: RemovePeerCommand) -> Result<OperationReply> {
+        let removed = self.state.remove_peer(&command.peer_id).await?;
+        Ok(OperationReply {
+            ok: removed,
+            message: if removed {
+                format!("Removed peer {}", command.peer_id)
+            } else {
+                format!("Peer {} not found", command.peer_id)
+            },
+        })
+    }
+
+    async fn layout(&self) -> Result<LayoutReply> {
+        Ok(LayoutReply {
+            matrix_spec: self.state.layout().await,
+        })
+    }
+
+    async fn features(&self) -> Result<std::collections::BTreeMap<String, bool>> {
+        Ok(self.state.feature_map().await)
+    }
+
+    async fn set_feature(&self, command: FeatureSetCommand) -> Result<OperationReply> {
+        self.state
+            .set_feature(command.name.clone(), command.enabled)
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: format!("{}={}", command.name, command.enabled),
+        })
+    }
+
+    async fn set_hotkey(&self, command: HotkeySetCommand) -> Result<OperationReply> {
+        self.state
+            .set_hotkey(command.action.clone(), command.combo.clone())
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: format!("hotkey {}={}", command.action, command.combo),
+        })
+    }
+
+    async fn trigger_hotkey_action(&self, command: HotkeyTriggerCommand) -> Result<OperationReply> {
+        let action_name =
+            crate::hotkeys::trigger_action_for_diagnostics(&self.state, &command.action).await?;
+        Ok(OperationReply {
+            ok: true,
+            message: format!("hotkey action {action_name} triggered"),
+        })
+    }
+
+    async fn export_trust_bundle(&self) -> Result<TrustBundleSnapshot> {
+        let bundle = self.state.export_trust_bundle().await?;
+        Ok(TrustBundleSnapshot {
+            machine_id: bundle.machine_id,
+            display_name: bundle.display_name,
+            network_address: bundle.network_address,
+            ca_cert_pem: bundle.ca_cert_pem,
+        })
+    }
+
+    async fn import_trust_bundle(
+        &self,
+        command: ImportTrustBundleCommand,
+    ) -> Result<OperationReply> {
+        self.state
+            .import_trust_bundle(
+                TrustBundle {
+                    machine_id: command.machine_id,
+                    display_name: command.display_name,
+                    network_address: command.network_address,
+                    ca_cert_pem: command.ca_cert_pem,
+                },
+                command.alias,
+            )
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: "trust bundle imported".to_string(),
+        })
+    }
+
+    async fn dump_diagnostics(
+        &self,
+        command: DiagnosticsDumpCommand,
+    ) -> Result<DiagnosticsDumpReply> {
+        let bundle_path = self.state.diagnostics_dump(command.output_path).await?;
+        Ok(DiagnosticsDumpReply { bundle_path })
+    }
+
+    async fn safe_reset(&self, command: SafeResetCommand) -> Result<OperationReply> {
+        self.state
+            .safe_reset(command.network_only, command.all)
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: "reset complete".to_string(),
+        })
+    }
+
+    async fn send_clipboard_text(
+        &self,
+        command: SendClipboardTextCommand,
+    ) -> Result<OperationReply> {
+        self.state
+            .queue_clipboard_text(&command.peer_id, command.text)
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: "clipboard payload queued".to_string(),
+        })
+    }
+
+    async fn send_clipboard_image(
+        &self,
+        command: SendClipboardImageCommand,
+    ) -> Result<OperationReply> {
+        self.state
+            .queue_clipboard_image(&command.peer_id, command.image_bmp)
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: "clipboard image payload queued".to_string(),
+        })
+    }
+
+    async fn send_file(&self, command: SendFileCommand) -> Result<OperationReply> {
+        self.state
+            .queue_file_from_path(&command.peer_id, Path::new(&command.file_path))
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: "file payload queued".to_string(),
+        })
+    }
+
+    async fn send_input_move(&self, command: SendInputMoveCommand) -> Result<OperationReply> {
+        self.state
+            .queue_input_move(&command.peer_id, command.dx, command.dy)
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: "input move frame queued".to_string(),
+        })
+    }
+
+    async fn send_input_key(&self, command: SendInputKeyCommand) -> Result<OperationReply> {
+        let key_state = if command.key_down {
+            core_input::KeyState::Down
+        } else {
+            core_input::KeyState::Up
+        };
+        self.state
+            .queue_input_key(&command.peer_id, command.scan_code, key_state)
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: "input key frame queued".to_string(),
+        })
+    }
+
+    async fn transport_events(&self) -> Result<Vec<TransportEventSnapshot>> {
+        Ok(self
+            .state
+            .transport_events()
+            .await
+            .into_iter()
+            .map(|event| TransportEventSnapshot {
+                timestamp: event.timestamp.to_rfc3339(),
+                direction: event.direction,
+                kind: event.kind,
+                peer_id: event.peer_id,
+                detail: event.detail,
+                size_bytes: event.size_bytes,
+            })
+            .collect())
+    }
+
+    async fn input_owner(&self) -> Result<InputOwnerReply> {
+        Ok(InputOwnerReply {
+            ok: true,
+            owner_peer_id: self.state.input_owner().await.unwrap_or_default(),
+            message: "input owner fetched".to_string(),
+        })
+    }
+
+    async fn claim_input_owner(&self, command: InputOwnerCommand) -> Result<InputOwnerReply> {
+        let acquired = self
+            .state
+            .claim_input_owner(&command.peer_id, command.force)
+            .await?;
+        let owner = self.state.input_owner().await.unwrap_or_default();
+        Ok(InputOwnerReply {
+            ok: acquired,
+            owner_peer_id: owner.clone(),
+            message: if acquired {
+                format!("input owner set to {owner}")
+            } else {
+                format!("input owner remains {owner}")
+            },
+        })
+    }
+
+    async fn release_input_owner(&self, command: InputOwnerCommand) -> Result<InputOwnerReply> {
+        let released = self.state.release_input_owner(&command.peer_id).await;
+        Ok(InputOwnerReply {
+            ok: released,
+            owner_peer_id: self.state.input_owner().await.unwrap_or_default(),
+            message: if released {
+                "input owner released".to_string()
+            } else {
+                "peer did not hold input owner".to_string()
+            },
+        })
+    }
+
+    async fn input_capture_target(&self) -> Result<InputCaptureTargetReply> {
+        Ok(InputCaptureTargetReply {
+            ok: true,
+            peer_id: self.state.input_capture_target().await.unwrap_or_default(),
+            message: "input capture target fetched".to_string(),
+        })
+    }
+
+    async fn set_input_capture_target(
+        &self,
+        command: InputCaptureTargetCommand,
+    ) -> Result<InputCaptureTargetReply> {
+        let target = self
+            .state
+            .set_input_capture_target(Some(&command.peer_id))
+            .await?;
+        let peer_id = target.unwrap_or_default();
+        Ok(InputCaptureTargetReply {
+            ok: true,
+            peer_id: peer_id.clone(),
+            message: if peer_id.is_empty() {
+                "input capture target cleared".to_string()
+            } else {
+                format!("input capture target set to {peer_id}")
+            },
+        })
+    }
+
+    async fn clear_input_capture_target(&self) -> Result<InputCaptureTargetReply> {
+        self.state.clear_input_capture_target().await;
+        Ok(InputCaptureTargetReply {
+            ok: true,
+            peer_id: String::new(),
+            message: "input capture target cleared".to_string(),
+        })
+    }
+
+    async fn request_nearby_pairing_code(
+        &self,
+        command: NearbyRequestCodeCommand,
+    ) -> Result<NearbyRequestCodeStartSnapshot> {
+        let result = pairing_wire::request_nearby_pairing_code(
+            &self.state,
+            &command.host,
+            command.port,
+            command.alias,
+        )
+        .await?;
+
+        Ok(match result {
+            pairing_wire::NearbyRequestCodeStart::CodeRequired {
+                request_id,
+                verification_nonce,
+                expires_at,
+            } => NearbyRequestCodeStartSnapshot {
+                code_required: true,
+                request_id,
+                verification_nonce,
+                verification_expires_at: expires_at,
+                unsupported: false,
+                message: "enter code shown on target machine".to_string(),
+            },
+            pairing_wire::NearbyRequestCodeStart::Unsupported { reason } => {
+                NearbyRequestCodeStartSnapshot {
+                    code_required: false,
+                    request_id: String::new(),
+                    verification_nonce: String::new(),
+                    verification_expires_at: String::new(),
+                    unsupported: true,
+                    message: reason,
+                }
+            }
+        })
+    }
+
+    async fn submit_nearby_pairing_code(
+        &self,
+        command: NearbySubmitCodeCommand,
+    ) -> Result<NearbyPairingCompletionSnapshot> {
+        let request_id = command.request_id.clone();
+        let peer_machine_id = pairing_wire::submit_nearby_pairing_code(
+            &self.state,
+            &command.host,
+            command.port,
+            command.request_id,
+            command.code,
+            command.verification_nonce,
+            command.alias,
+        )
+        .await?;
+
+        Ok(NearbyPairingCompletionSnapshot {
+            ok: true,
+            message: "nearby pairing complete".to_string(),
+            request_id,
+            peer_machine_id,
+        })
+    }
+
+    async fn start_nearby_pairing_join(
+        &self,
+        command: NearbyJoinStartCommand,
+    ) -> Result<NearbyJoinStatusSnapshot> {
+        let result = pairing_wire::start_nearby_pairing_join(
+            &self.state,
+            &command.host,
+            command.port,
+            command.code,
+            command.alias,
+        )
+        .await?;
+        Ok(map_nearby_join_status(result))
+    }
+
+    async fn check_nearby_pairing_join(
+        &self,
+        command: NearbyJoinStatusCommand,
+    ) -> Result<NearbyJoinStatusSnapshot> {
+        let result = pairing_wire::check_nearby_pairing_join(
+            &self.state,
+            &command.host,
+            command.port,
+            command.request_id,
+            command.alias,
+        )
+        .await?;
+        Ok(map_nearby_join_status(result))
+    }
+
+    async fn approve_nearby_pairing_request(
+        &self,
+        command: NearbyPairingDecisionCommand,
+    ) -> Result<OperationReply> {
+        self.state
+            .approve_nearby_pairing_request(&command.request_id, command.alias)
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: "nearby pairing request approved".to_string(),
+        })
+    }
+
+    async fn reject_nearby_pairing_request(
+        &self,
+        command: NearbyPairingDecisionCommand,
+    ) -> Result<OperationReply> {
+        let rejected = self
+            .state
+            .reject_nearby_pairing_request(&command.request_id)
+            .await;
+        Ok(OperationReply {
+            ok: rejected,
+            message: if rejected {
+                "nearby pairing request rejected".to_string()
+            } else {
+                "nearby pairing request not found".to_string()
+            },
+        })
+    }
+}
+
+async fn build_status_snapshot(state: &AppState) -> Result<StatusSnapshot> {
+    let snapshot = state.snapshot().await;
+    let (input_locked, input_lock_supported) = state.input_lock_runtime().await;
+    let capture_target_peer_id = state.active_input_capture_target().await;
+    let effective_api_transport = snapshot.api_transport.effective();
+    let api_pipe_name = if matches!(effective_api_transport, ApiTransport::NamedPipe) {
+        snapshot.api_pipe_name
+    } else {
+        String::new()
+    };
+
+    Ok(StatusSnapshot {
+        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        machine_id: snapshot.machine_id,
+        peer_count: snapshot.peers.len() as u32,
+        protocol_version: snapshot.protocol_version,
+        api_bind: snapshot.api_bind,
+        api_transport: effective_api_transport.as_str().to_string(),
+        api_pipe_name,
+        input_locked,
+        input_lock_supported,
+        capture_target_peer_id,
+    })
+}
+
+async fn build_ui_snapshot(state: &AppState) -> Result<UiSnapshot> {
+    let paired_peers = build_paired_peers(state).await;
+    let discovered_peers = build_discovered_peers(state, &paired_peers).await;
+    let pending_requests = build_pending_requests(state).await;
+    let machine_id = state.snapshot().await.machine_id;
+
+    Ok(UiSnapshot {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        daemon_online: true,
+        machine_id,
+        layout_matrix: state.layout().await,
+        discovered_peers,
+        paired_peers,
+        pending_requests,
+    })
+}
+
+async fn build_console_snapshot(state: &AppState) -> Result<ConsoleSnapshot> {
+    let snapshot = state.snapshot().await;
+    let paired_peers = build_paired_peers(state).await;
+
+    Ok(ConsoleSnapshot {
+        status: build_status_snapshot(state).await?,
+        layout_matrix: state.layout().await,
+        peers: paired_peers.clone(),
+        features: state.feature_map().await,
+        discovered_peers: build_discovered_peers(state, &paired_peers).await,
+        pending_requests: build_pending_requests(state).await,
+        transport_events: state
+            .transport_events()
+            .await
+            .into_iter()
+            .map(|event| TransportEventSnapshot {
+                timestamp: event.timestamp.to_rfc3339(),
+                direction: event.direction,
+                kind: event.kind,
+                peer_id: event.peer_id,
+                detail: event.detail,
+                size_bytes: event.size_bytes,
+            })
+            .collect(),
+        input_owner_peer_id: state.input_owner().await,
+        input_capture_target_peer_id: state.input_capture_target().await,
+        mdns_active: state.mdns_active().await,
+        local_display_name: snapshot.device_name,
+    })
+}
+
+async fn build_paired_peers(state: &AppState) -> Vec<UiPairedPeer> {
+    state
+        .list_peers()
+        .await
+        .into_iter()
+        .map(|peer| UiPairedPeer {
+            peer_id: peer.peer_id,
+            display_name: peer.display_name,
+            address: peer.address,
+            connected: peer.connected,
+        })
+        .collect()
+}
+
+async fn build_discovered_peers(
+    state: &AppState,
+    paired_peers: &[UiPairedPeer],
+) -> Vec<UiDiscoveredPeer> {
+    let local_machine_id = state.snapshot().await.machine_id;
+    let paired_peer_ids = paired_peers
+        .iter()
+        .map(|peer| peer.peer_id.clone())
+        .collect::<Vec<_>>();
+
+    let mut discovered_peers = state
+        .discovered_endpoints()
+        .await
+        .into_iter()
+        .filter(|(machine_id, _)| {
+            machine_id != &local_machine_id
+                && !paired_peer_ids.iter().any(|peer_id| peer_id == machine_id)
+        })
+        .map(|(machine_id, peer)| UiDiscoveredPeer {
+            machine_id,
+            display_name: peer.display_name,
+            endpoint: peer.endpoint.to_string(),
+        })
+        .collect::<Vec<_>>();
+
+    discovered_peers.sort_by(|a, b| {
+        a.display_name
+            .to_ascii_lowercase()
+            .cmp(&b.display_name.to_ascii_lowercase())
+            .then_with(|| a.machine_id.cmp(&b.machine_id))
+    });
+    discovered_peers
+}
+
+async fn build_pending_requests(state: &AppState) -> Vec<UiPendingRequest> {
+    let mut pending_requests = state
+        .list_pending_nearby_pairing_requests()
+        .await
+        .into_iter()
+        .map(|request| {
+            let requires_verification_code = request.verification_code.is_some();
+            UiPendingRequest {
+                request_id: request.request_id,
+                requester_machine_id: request.requester_machine_id,
+                requester_display_name: request.requester_display_name,
+                created_at: request.created_at.to_rfc3339(),
+                verification_code: request.verification_code.unwrap_or_default(),
+                verification_expires_at: request
+                    .verification_expires_at
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_default(),
+                requires_verification_code,
+            }
+        })
+        .collect::<Vec<_>>();
+    pending_requests.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    pending_requests
+}
+
+fn map_nearby_join_status(result: pairing_wire::NearbyJoinStatus) -> NearbyJoinStatusSnapshot {
+    NearbyJoinStatusSnapshot {
+        request_id: result.request_id,
+        status: result.status.as_str().to_string(),
+        message: result.message,
+        peer_machine_id: result.peer_machine_id,
+    }
+}

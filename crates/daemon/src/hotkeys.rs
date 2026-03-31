@@ -6,6 +6,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 #[cfg(windows)]
+use platform_windows::input::is_virtual_key_down;
+#[cfg(windows)]
+use platform_windows::runtime::lock_workstation;
+#[cfg(windows)]
 use tokio::time;
 use tracing::info;
 #[cfg(any(windows, test))]
@@ -28,11 +32,6 @@ const VK_ALT: u16 = 0x12;
 const VK_LWIN: u16 = 0x5B;
 #[cfg(any(windows, test))]
 const VK_RWIN: u16 = 0x5C;
-
-#[cfg(windows)]
-use windows_sys::Win32::{
-    System::Shutdown::LockWorkStation, UI::Input::KeyboardAndMouse::GetAsyncKeyState,
-};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum HotkeyAction {
@@ -236,7 +235,7 @@ async fn apply_hotkey_action(state: &AppState, action: HotkeyAction) -> Result<(
             info!(enabled = next, "hotkey toggled easy_mouse");
         }
         HotkeyAction::LockMachine => {
-            lock_machine().context("lock machine action")?;
+            lock_workstation().context("lock machine action")?;
             info!("hotkey lock_machine executed");
         }
         HotkeyAction::Reconnect => {
@@ -253,26 +252,6 @@ async fn apply_hotkey_action(state: &AppState, action: HotkeyAction) -> Result<(
     }
 
     Ok(())
-}
-
-#[cfg(windows)]
-fn lock_machine() -> Result<()> {
-    let ok = unsafe { LockWorkStation() };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error()).context("LockWorkStation");
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn lock_machine() -> Result<()> {
-    anyhow::bail!("lock_machine is only supported on Windows");
-}
-
-#[cfg(windows)]
-fn is_virtual_key_down(vk: u16) -> bool {
-    let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
-    (state as u16 & 0x8000) != 0
 }
 
 #[cfg(any(windows, test))]

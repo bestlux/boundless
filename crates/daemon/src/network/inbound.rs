@@ -7,28 +7,15 @@ use tokio::io::AsyncWrite;
 use tracing::{info, warn};
 
 use crate::state::{AppState, TransportEventRecord};
+use peer_transport::{
+    FILE_TRANSFER_INITIAL_CHUNK_CREDITS, InboundClipboardImageTransfer, InboundTransfer,
+    MAX_INBOUND_TRANSFERS_PER_PEER,
+};
 
 use super::codec::now_millis;
 use super::inbound_payload::enqueue_clipboard_image_payload;
-use super::outbound::{FILE_TRANSFER_INITIAL_CHUNK_CREDITS, send_file_chunk_credit};
-use super::{MAX_INBOUND_TRANSFERS_PER_PEER, validate_transfer_size};
-
-pub(super) struct InboundTransfer {
-    pub(super) peer_id: String,
-    pub(super) file_name: String,
-    pub(super) total_bytes: u64,
-    pub(super) bytes_received: u64,
-    pub(super) temp_path: std::path::PathBuf,
-    pub(super) temp_file: tokio::fs::File,
-}
-
-pub(super) struct InboundClipboardImageTransfer {
-    pub(super) peer_id: String,
-    pub(super) total_bytes: u64,
-    pub(super) bytes_received: u64,
-    pub(super) hash_hex: String,
-    pub(super) data: Vec<u8>,
-}
+use super::outbound::send_file_chunk_credit;
+use super::validate_transfer_size;
 
 #[expect(
     clippy::too_many_arguments,

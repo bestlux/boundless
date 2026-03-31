@@ -21,21 +21,15 @@ impl WindowsHookCaptureBackend {
                     if let Err(error) = unsafe { run_hook_message_loop() } {
                         warn!(error = ?error, "hook message loop exited with error");
                     }
-                    unsafe {
-                        let _ = UnhookWindowsHookEx(keyboard_hook);
-                        let _ = UnhookWindowsHookEx(mouse_hook);
-                    }
+                    unhook_windows_hook(keyboard_hook);
+                    unhook_windows_hook(mouse_hook);
                 }
                 (keyboard, mouse) => {
                     if let Ok(hook) = keyboard.as_ref() {
-                        unsafe {
-                            let _ = UnhookWindowsHookEx(*hook);
-                        }
+                        unhook_windows_hook(*hook);
                     }
                     if let Ok(hook) = mouse.as_ref() {
-                        unsafe {
-                            let _ = UnhookWindowsHookEx(*hook);
-                        }
+                        unhook_windows_hook(*hook);
                     }
                     let error = keyboard
                         .err()
@@ -47,7 +41,11 @@ impl WindowsHookCaptureBackend {
         });
 
         let hook_thread_id = startup_rx.recv().context("hook startup channel closed")??;
-        set_hook_wake_state(Some(state.clone())).context("set hook wake state")?;
+        set_hook_wake_notifier(Some(std::sync::Arc::new({
+            let state = state.clone();
+            move |source| state.notify_input_capture_wake(source)
+        })))
+        .context("set hook wake notifier")?;
         let (raw_input_thread_id, raw_input_thread, raw_input_enabled) =
             match spawn_raw_input_thread() {
                 Ok((thread_id, thread)) => (Some(thread_id), Some(thread), true),
@@ -159,18 +157,14 @@ impl Drop for WindowsHookCaptureBackend {
             self.lock_active = false;
         }
         if let Some(thread_id) = self.raw_input_thread_id {
-            unsafe {
-                let _ = PostThreadMessageW(thread_id, WM_QUIT, 0, 0);
-            }
+            post_thread_quit(thread_id);
         }
         if let Some(thread) = self.raw_input_thread.take() {
             let _ = thread.join();
         }
         self.raw_input_thread_id = None;
         self.raw_input_enabled = false;
-        unsafe {
-            let _ = PostThreadMessageW(self.hook_thread_id, WM_QUIT, 0, 0);
-        }
+        post_thread_quit(self.hook_thread_id);
         if let Some(thread) = self.hook_thread.take() {
             let _ = thread.join();
         }
@@ -248,6 +242,9 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
                     self.update_pressed_state_and_filter(input_event, &mut output);
                 }
                 HookCaptureEvent::Control(action) => {
+                    let action = match action {
+                        HookControlAction::EscapeUnlock => CaptureControlAction::EscapeUnlock,
+                    };
                     self.control_actions.push_back(action);
                 }
             }

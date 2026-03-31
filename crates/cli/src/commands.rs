@@ -1,7 +1,9 @@
 use super::*;
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+use app_services::desktop::{
+    build_orientation_matrix, host_and_pairing_port_from_endpoint,
+    is_local_layout_token as is_local_layout_token_shared, parse_layout_matrix,
+    resolve_boundlessd_candidates, spawn_boundlessd_process,
+};
 
 pub(super) async fn ensure_daemon_available(endpoint: &str, start_daemon: bool) -> Result<()> {
     if channel(endpoint).await.is_ok() {
@@ -32,58 +34,12 @@ pub(super) async fn ensure_daemon_available(endpoint: &str, start_daemon: bool) 
 }
 
 fn spawn_daemon_process() -> Result<String> {
-    let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("BOUNDLESS_DAEMON_PATH") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            candidates.push(trimmed.to_string());
-        }
-    }
-
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(parent) = current_exe.parent()
-    {
-        #[cfg(windows)]
-        {
-            candidates.push(parent.join("boundlessd.exe").display().to_string());
-        }
-        #[cfg(not(windows))]
-        {
-            candidates.push(parent.join("boundlessd").display().to_string());
-        }
-    }
-
-    candidates.push("boundlessd".to_string());
-    #[cfg(windows)]
-    candidates.push("boundlessd.exe".to_string());
-
-    candidates.sort();
-    candidates.dedup();
-
-    let mut errors = Vec::new();
-    for candidate in candidates {
-        let mut command = ProcessCommand::new(&candidate);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(windows)]
-        command.creation_flags(CREATE_NO_WINDOW);
-
-        match command.spawn() {
-            Ok(_) => return Ok(candidate),
-            Err(error) => errors.push(format!("{candidate}: {error}")),
-        }
-    }
-
-    bail!(
-        "failed to start boundlessd; candidates attempted: {}",
-        errors.join("; ")
-    )
+    let candidates = resolve_boundlessd_candidates(std::env::current_exe().ok());
+    spawn_boundlessd_process(&candidates)
 }
 
 pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
-    let mut client = DaemonServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let status = client.get_status(StatusRequest {}).await?.into_inner();
     println!(
         "running={} machine_id={} peers={} protocol={} api_transport={} api_bind={} api_pipe_name={} input_locked={} input_lock_supported={} active_capture_target={}",
@@ -106,9 +62,9 @@ pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
 }
 
 pub(super) async fn pair_create_code(endpoint: &str, ttl: u32) -> Result<()> {
-    let mut client = PairingServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
-        .create_code(PairCreateCodeRequest { ttl_seconds: ttl })
+        .create_pairing_code(PairCreateCodeRequest { ttl_seconds: ttl })
         .await?
         .into_inner();
 
@@ -124,7 +80,7 @@ pub(super) async fn pair_discover(endpoint: &str) -> Result<()> {
     }
 
     for (index, peer) in discovered.iter().enumerate() {
-        let pairing_port = host_and_pairing_port_from_discovery_endpoint(&peer.endpoint)
+        let pairing_port = host_and_pairing_port_from_endpoint(&peer.endpoint)
             .map(|(_, port)| port)
             .unwrap_or(15200);
         println!(
@@ -211,10 +167,8 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
                 );
             }
             let selected = resolve_discovered_peer_record(&discovered, &selector)?;
-            let (host, pairing_port) = host_and_pairing_port_from_discovery_endpoint(
-                &selected.endpoint,
-            )
-            .with_context(|| format!("invalid discovered endpoint {}", selected.endpoint))?;
+            let (host, pairing_port) = host_and_pairing_port_from_endpoint(&selected.endpoint)
+                .with_context(|| format!("invalid discovered endpoint {}", selected.endpoint))?;
             (
                 host,
                 pairing_port,
@@ -254,13 +208,12 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
         return pair_nearby_submit_code(
             endpoint,
             NearbySubmitCodeRequest {
+                host,
+                port: u32::from(pairing_port),
                 request_id,
                 code,
                 verification_nonce,
-                host,
-                port: pairing_port,
-                timeout_seconds,
-                alias,
+                alias: alias.unwrap_or_default(),
             },
         )
         .await;
@@ -273,7 +226,7 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
         return pair_nearby_join(endpoint, code, host, pairing_port, timeout_seconds, alias).await;
     }
 
-    match pair_nearby_request_code(endpoint, host.clone(), pairing_port).await? {
+    match pair_nearby_request_code(endpoint, host.clone(), pairing_port, alias).await? {
         NearbyRequestCodeStart::CodeRequired {
             request_id,
             verification_nonce,
@@ -335,10 +288,8 @@ pub(super) async fn setup_wizard(endpoint: &str, start_daemon: bool) -> Result<(
             (host, port, None)
         } else {
             let selected = resolve_discovered_peer_record(&discovered, &selector)?;
-            let (host, pairing_port) = host_and_pairing_port_from_discovery_endpoint(
-                &selected.endpoint,
-            )
-            .with_context(|| format!("invalid discovered endpoint {}", selected.endpoint))?;
+            let (host, pairing_port) = host_and_pairing_port_from_endpoint(&selected.endpoint)
+                .with_context(|| format!("invalid discovered endpoint {}", selected.endpoint))?;
             (host, pairing_port, Some(selected.display_name.clone()))
         }
     };
@@ -415,9 +366,9 @@ pub(super) async fn pair_join(
     host: String,
     alias: Option<String>,
 ) -> Result<()> {
-    let mut client = PairingServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
-        .join(PairJoinRequest {
+        .join_with_pairing_code(PairJoinRequest {
             code,
             host,
             alias: alias.unwrap_or_default(),
@@ -439,8 +390,27 @@ pub(super) async fn pair_nearby_join(
     timeout_seconds: u64,
     alias: Option<String>,
 ) -> Result<()> {
-    let peer_machine_id =
-        pair_nearby_join_inner(endpoint, code, host, port, timeout_seconds, alias).await?;
+    let alias_value = alias.unwrap_or_default();
+    let mut control_plane = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let initial_response = control_plane
+        .start_nearby_pairing_join(NearbyJoinStartRequest {
+            host: host.clone(),
+            port: u32::from(port),
+            code,
+            alias: alias_value.clone(),
+        })
+        .await?
+        .into_inner();
+    let peer_machine_id = wait_for_nearby_pairing_approval(
+        endpoint,
+        &host,
+        u32::from(port),
+        initial_response,
+        timeout_seconds,
+        "",
+        alias_value,
+    )
+    .await?;
     println!("accepted=true peer_machine_id={peer_machine_id} message=nearby pairing complete");
     Ok(())
 }
@@ -456,264 +426,155 @@ enum NearbyRequestCodeStart {
     },
 }
 
-struct NearbySubmitCodeRequest {
-    request_id: String,
-    code: String,
-    verification_nonce: String,
-    host: String,
-    port: u16,
-    timeout_seconds: u64,
-    alias: Option<String>,
-}
-
 async fn pair_nearby_request_code(
     endpoint: &str,
     host: String,
     port: u16,
+    alias: Option<String>,
 ) -> Result<NearbyRequestCodeStart> {
-    let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
-    let local_bundle = pairing_client
-        .export_trust_bundle(Empty {})
-        .await?
-        .into_inner();
-    let requester_bundle = StoredTrustBundle {
-        machine_id: local_bundle.machine_id,
-        display_name: local_bundle.display_name,
-        network_address: local_bundle.network_address,
-        ca_cert_pem: local_bundle.ca_cert_pem,
-    };
-
-    let target = format_host_port(&host, port);
-    let response = send_nearby_pairing_request(
-        &target,
-        NearbyJoinWireRequest::NearbyRequestCode {
-            requester_bundle,
-            requester_alias: None,
-        },
-    )
-    .await?;
-
-    match response {
-        NearbyJoinWireResponse::CodeRequired {
-            request_id,
-            verification_nonce,
-            expires_at,
-            ..
-        } => Ok(NearbyRequestCodeStart::CodeRequired {
-            request_id,
-            verification_nonce,
-            expires_at,
-        }),
-        NearbyJoinWireResponse::Error { message } => {
-            let lowered = message.to_ascii_lowercase();
-            if lowered.contains("unknown variant")
-                || lowered.contains("parse pairing request")
-                || lowered.contains("missing field")
-            {
-                return Ok(NearbyRequestCodeStart::Unsupported { reason: message });
-            }
-            bail!("nearby pairing request failed: {message}");
-        }
-        NearbyJoinWireResponse::Rejected { message, .. } => {
-            bail!("nearby pairing request rejected: {message}");
-        }
-        NearbyJoinWireResponse::Pending { message, .. } => {
-            bail!("unexpected nearby pairing status: {message}");
-        }
-        NearbyJoinWireResponse::Approved { .. } => {
-            bail!("unexpected nearby pairing status: approved");
-        }
-    }
-}
-
-async fn pair_nearby_submit_code(endpoint: &str, request: NearbySubmitCodeRequest) -> Result<()> {
-    let target = format_host_port(&request.host, request.port);
-    let response = send_nearby_pairing_request(
-        &target,
-        NearbyJoinWireRequest::NearbySubmitCode {
-            request_id: request.request_id.clone(),
-            code: request.code,
-            verification_nonce: request.verification_nonce,
-            requester_alias: None,
-        },
-    )
-    .await?;
-    let responder_bundle = wait_for_nearby_pairing_approval(
-        &target,
-        response,
-        request.timeout_seconds,
-        &request.request_id,
-    )
-    .await?;
-    let peer_machine_id =
-        import_nearby_responder_bundle(endpoint, responder_bundle, &request.host, request.alias)
-            .await?;
-    println!("accepted=true peer_machine_id={peer_machine_id} message=nearby pairing complete");
-    Ok(())
-}
-
-async fn pair_nearby_join_inner(
-    endpoint: &str,
-    code: String,
-    host: String,
-    port: u16,
-    timeout_seconds: u64,
-    alias: Option<String>,
-) -> Result<String> {
-    let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
-    let local_bundle = pairing_client
-        .export_trust_bundle(Empty {})
-        .await?
-        .into_inner();
-    let requester_bundle = StoredTrustBundle {
-        machine_id: local_bundle.machine_id,
-        display_name: local_bundle.display_name,
-        network_address: local_bundle.network_address,
-        ca_cert_pem: local_bundle.ca_cert_pem,
-    };
-
-    let target = format_host_port(&host, port);
-    let initial_response = send_nearby_pairing_request(
-        &target,
-        NearbyJoinWireRequest::NearbyJoin {
-            code,
-            requester_bundle,
-            requester_alias: None,
-        },
-    )
-    .await?;
-    let responder_bundle =
-        wait_for_nearby_pairing_approval(&target, initial_response, timeout_seconds, "").await?;
-    import_nearby_responder_bundle(endpoint, responder_bundle, &host, alias).await
-}
-
-async fn wait_for_nearby_pairing_approval(
-    target: &str,
-    initial_response: NearbyJoinWireResponse,
-    timeout_seconds: u64,
-    expected_request_id: &str,
-) -> Result<StoredTrustBundle> {
-    match initial_response {
-        NearbyJoinWireResponse::Approved {
-            request_id,
-            responder_bundle,
-            ..
-        } => {
-            if !expected_request_id.is_empty() && !request_id.eq(expected_request_id) {
-                bail!("nearby pairing request id mismatch");
-            }
-            Ok(responder_bundle)
-        }
-        NearbyJoinWireResponse::Pending {
-            request_id,
-            message,
-        } => {
-            println!("pending=true request_id={} message={}", request_id, message);
-            if !expected_request_id.is_empty() && !request_id.eq(expected_request_id) {
-                bail!("nearby pairing request id mismatch");
-            }
-
-            let deadline = std::time::Instant::now() + Duration::from_secs(timeout_seconds.max(5));
-            let mut poll_count = 0_u64;
-            loop {
-                if std::time::Instant::now() >= deadline {
-                    bail!("timed out waiting for nearby pairing approval request_id={request_id}");
-                }
-
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                poll_count += 1;
-                if poll_count.is_multiple_of(5) {
-                    println!(
-                        "pending=true request_id={} waited={}s",
-                        request_id, poll_count
-                    );
-                }
-                let status_response = send_nearby_pairing_request(
-                    target,
-                    NearbyJoinWireRequest::CheckNearbyJoin {
-                        request_id: request_id.clone(),
-                    },
-                )
-                .await?;
-                match status_response {
-                    NearbyJoinWireResponse::Pending { .. } => continue,
-                    NearbyJoinWireResponse::Approved {
-                        request_id: approved_request_id,
-                        responder_bundle,
-                        ..
-                    } => {
-                        if !request_id.eq(&approved_request_id) {
-                            bail!("nearby pairing request id mismatch");
-                        }
-                        return Ok(responder_bundle);
-                    }
-                    NearbyJoinWireResponse::Rejected { message, .. } => {
-                        bail!("nearby pairing rejected: {message}");
-                    }
-                    NearbyJoinWireResponse::Error { message } => {
-                        bail!("nearby pairing failed: {message}");
-                    }
-                    NearbyJoinWireResponse::CodeRequired { message, .. } => {
-                        bail!("nearby pairing failed: {message}");
-                    }
-                }
-            }
-        }
-        NearbyJoinWireResponse::Rejected { message, .. } => {
-            bail!("nearby pairing rejected: {message}");
-        }
-        NearbyJoinWireResponse::Error { message } => {
-            bail!("nearby pairing failed: {message}");
-        }
-        NearbyJoinWireResponse::CodeRequired { message, .. } => {
-            bail!("nearby pairing failed: {message}");
-        }
-    }
-}
-
-async fn import_nearby_responder_bundle(
-    endpoint: &str,
-    mut responder_bundle: StoredTrustBundle,
-    host: &str,
-    alias: Option<String>,
-) -> Result<String> {
-    normalize_bundle_address_for_host(&mut responder_bundle, host)?;
-
-    let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
-    pairing_client
-        .import_trust_bundle(ImportTrustBundleRequest {
-            machine_id: responder_bundle.machine_id.clone(),
-            display_name: responder_bundle.display_name,
-            network_address: responder_bundle.network_address,
-            ca_cert_pem: responder_bundle.ca_cert_pem,
+    let mut control_plane = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let response = control_plane
+        .request_nearby_pairing_code(NearbyRequestCodeStartRequest {
+            host,
+            port: u32::from(port),
             alias: alias.unwrap_or_default(),
         })
         .await?
         .into_inner();
 
-    let mut diagnostics_client = DiagnosticsServiceClient::new(channel(endpoint).await?);
-    let _ = diagnostics_client
-        .trigger_hotkey_action(HotkeyTriggerRequest {
-            action: "reconnect".to_string(),
-        })
-        .await;
+    if response.code_required {
+        return Ok(NearbyRequestCodeStart::CodeRequired {
+            request_id: response.request_id,
+            verification_nonce: response.verification_nonce,
+            expires_at: response.verification_expires_at,
+        });
+    }
 
-    Ok(responder_bundle.machine_id)
+    if response.unsupported {
+        return Ok(NearbyRequestCodeStart::Unsupported {
+            reason: response.message,
+        });
+    }
+
+    let message = response.message.trim();
+    if message.is_empty() {
+        bail!("nearby pairing request failed");
+    }
+    bail!("nearby pairing request failed: {message}");
+}
+
+async fn wait_for_nearby_pairing_approval(
+    endpoint: &str,
+    host: &str,
+    port: u32,
+    initial_response: ipc_api::boundless::v1::NearbyJoinStatusReply,
+    timeout_seconds: u64,
+    expected_request_id: &str,
+    alias: String,
+) -> Result<String> {
+    let mut response = initial_response;
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_seconds.max(5));
+    let mut poll_count = 0_u64;
+
+    loop {
+        let status = response.status.trim().to_ascii_lowercase();
+        match status.as_str() {
+            "approved" => {
+                if !expected_request_id.is_empty() && response.request_id != expected_request_id {
+                    bail!("nearby pairing request id mismatch");
+                }
+                if response.peer_machine_id.trim().is_empty() {
+                    bail!("nearby pairing failed: approved status missing peer machine id");
+                }
+                return Ok(response.peer_machine_id);
+            }
+            "pending" => {
+                let request_id = response.request_id;
+                println!(
+                    "pending=true request_id={} message={}",
+                    request_id, response.message
+                );
+                if !expected_request_id.is_empty() && request_id != expected_request_id {
+                    bail!("nearby pairing request id mismatch");
+                }
+
+                loop {
+                    if std::time::Instant::now() >= deadline {
+                        bail!(
+                            "timed out waiting for nearby pairing approval request_id={request_id}"
+                        );
+                    }
+
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    poll_count += 1;
+                    if poll_count.is_multiple_of(5) {
+                        println!(
+                            "pending=true request_id={} waited={}s",
+                            request_id, poll_count
+                        );
+                    }
+
+                    let mut control_plane =
+                        ControlPlaneServiceClient::new(channel(endpoint).await?);
+                    response = control_plane
+                        .check_nearby_pairing_join(NearbyJoinStatusRequest {
+                            host: host.to_string(),
+                            port,
+                            request_id: request_id.clone(),
+                            alias: alias.clone(),
+                        })
+                        .await?
+                        .into_inner();
+                    let next_status = response.status.trim().to_ascii_lowercase();
+                    if next_status == "pending" {
+                        continue;
+                    }
+                    break;
+                }
+            }
+            "rejected" => bail!("nearby pairing rejected: {}", response.message),
+            "error" | "code_required" => bail!("nearby pairing failed: {}", response.message),
+            _ => {
+                let message = response.message.trim();
+                if message.is_empty() {
+                    bail!(
+                        "nearby pairing failed: unknown status `{}`",
+                        response.status
+                    );
+                }
+                bail!("nearby pairing failed: {message}");
+            }
+        }
+    }
+}
+
+async fn pair_nearby_submit_code(endpoint: &str, request: NearbySubmitCodeRequest) -> Result<()> {
+    let expected_request_id = request.request_id.clone();
+    let mut control_plane = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let response = control_plane
+        .submit_nearby_pairing_code(request)
+        .await?
+        .into_inner();
+    if !response.ok {
+        bail!("nearby pairing failed: {}", response.message);
+    }
+    if response.request_id != expected_request_id {
+        bail!("nearby pairing request id mismatch");
+    }
+    let peer_machine_id = response.peer_machine_id;
+    println!("accepted=true peer_machine_id={peer_machine_id} message=nearby pairing complete");
+    Ok(())
 }
 
 pub(super) async fn pair_pending(endpoint: &str) -> Result<()> {
-    let mut client = PairingServiceClient::new(channel(endpoint).await?);
-    let response = client
-        .list_nearby_pairing_requests(Empty {})
-        .await?
-        .into_inner();
+    let snapshot = fetch_ui_snapshot(endpoint).await?;
 
-    if response.requests.is_empty() {
+    if snapshot.pending_requests.is_empty() {
         println!("no pending nearby pairing requests");
         return Ok(());
     }
 
-    for request in response.requests {
+    for request in snapshot.pending_requests {
         let requires_code = request.requires_verification_code;
         let has_visible_code = requires_code && !request.verification_code.trim().is_empty();
         println!(
@@ -751,7 +612,7 @@ pub(super) async fn pair_approve(
     request_id: String,
     alias: Option<String>,
 ) -> Result<()> {
-    let mut client = PairingServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .approve_nearby_pairing_request(NearbyPairingDecisionRequest {
             request_id,
@@ -765,7 +626,7 @@ pub(super) async fn pair_approve(
 }
 
 pub(super) async fn pair_reject(endpoint: &str, request_id: String) -> Result<()> {
-    let mut client = PairingServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .reject_nearby_pairing_request(NearbyPairingDecisionRequest {
             request_id,
@@ -779,7 +640,7 @@ pub(super) async fn pair_reject(endpoint: &str, request_id: String) -> Result<()
 }
 
 pub(super) async fn pair_export_trust(endpoint: &str, output: Option<String>) -> Result<()> {
-    let mut client = PairingServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client.export_trust_bundle(Empty {}).await?.into_inner();
 
     let bundle = StoredTrustBundle {
@@ -809,7 +670,7 @@ pub(super) async fn pair_import_trust(
     let raw = std::fs::read_to_string(&input).with_context(|| format!("read {input}"))?;
     let bundle: StoredTrustBundle = serde_json::from_str(&raw).context("parse trust bundle")?;
 
-    let mut client = PairingServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .import_trust_bundle(ImportTrustBundleRequest {
             machine_id: bundle.machine_id,
@@ -826,7 +687,7 @@ pub(super) async fn pair_import_trust(
 }
 
 pub(super) async fn peer_list(endpoint: &str) -> Result<()> {
-    let mut client = TopologyServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client.list_peers(Empty {}).await?.into_inner();
 
     if response.peers.is_empty() {
@@ -845,7 +706,7 @@ pub(super) async fn peer_list(endpoint: &str) -> Result<()> {
 }
 
 pub(super) async fn peer_remove(endpoint: &str, peer_id: String) -> Result<()> {
-    let mut client = TopologyServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .remove_peer(RemovePeerRequest { peer_id })
         .await?
@@ -856,14 +717,14 @@ pub(super) async fn peer_remove(endpoint: &str, peer_id: String) -> Result<()> {
 }
 
 pub(super) async fn layout_show(endpoint: &str) -> Result<()> {
-    let mut client = TopologyServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client.layout_show(Empty {}).await?.into_inner();
     println!("{}", response.matrix_spec);
     Ok(())
 }
 
 pub(super) async fn layout_set(endpoint: &str, matrix: String) -> Result<()> {
-    let mut client = TopologyServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .layout_set(LayoutSetRequest {
             matrix_spec: matrix,
@@ -991,7 +852,7 @@ pub(super) async fn layout_wizard(endpoint: &str) -> Result<()> {
 }
 
 pub(super) async fn feature_list(endpoint: &str) -> Result<()> {
-    let mut client = FeatureServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client.list_features(Empty {}).await?.into_inner();
 
     let mut features = response.features.into_iter().collect::<Vec<_>>();
@@ -1005,7 +866,7 @@ pub(super) async fn feature_list(endpoint: &str) -> Result<()> {
 }
 
 pub(super) async fn feature_set(endpoint: &str, name: String, value: ToggleValue) -> Result<()> {
-    let mut client = FeatureServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .set_feature(FeatureSetRequest {
             name,
@@ -1019,7 +880,7 @@ pub(super) async fn feature_set(endpoint: &str, name: String, value: ToggleValue
 }
 
 pub(super) async fn hotkey_set(endpoint: &str, action: String, combo: String) -> Result<()> {
-    let mut client = FeatureServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .set_hotkey(HotkeySetRequest { action, combo })
         .await?
@@ -1033,7 +894,7 @@ pub(super) async fn transport_send_text(
     peer_id: String,
     text: String,
 ) -> Result<()> {
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .send_clipboard_text(SendClipboardTextRequest { peer_id, text })
         .await?
@@ -1051,7 +912,7 @@ pub(super) async fn transport_send_image(
     let image_bmp = std::fs::read(&path).with_context(|| format!("read {path}"))?;
     validate_bmp_payload(&image_bmp).with_context(|| format!("invalid BMP payload at {path}"))?;
 
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .send_clipboard_image(SendClipboardImageRequest { peer_id, image_bmp })
         .await?
@@ -1066,7 +927,7 @@ pub(super) async fn transport_send_file(
     peer_id: String,
     path: String,
 ) -> Result<()> {
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .send_file(SendFileRequest {
             peer_id,
@@ -1080,7 +941,7 @@ pub(super) async fn transport_send_file(
 }
 
 pub(super) async fn transport_events(endpoint: &str, limit: usize) -> Result<()> {
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let mut events = client
         .list_transport_events(Empty {})
         .await?
@@ -1112,7 +973,7 @@ pub(super) async fn transport_events(endpoint: &str, limit: usize) -> Result<()>
 }
 
 pub(super) async fn input_owner(endpoint: &str) -> Result<()> {
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client.get_input_owner(Empty {}).await?.into_inner();
     let owner = if response.owner_peer_id.is_empty() {
         "none".to_string()
@@ -1128,7 +989,7 @@ pub(super) async fn input_owner(endpoint: &str) -> Result<()> {
 }
 
 pub(super) async fn input_capture_target(endpoint: &str) -> Result<()> {
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .get_input_capture_target(Empty {})
         .await?
@@ -1147,7 +1008,7 @@ pub(super) async fn input_capture_target(endpoint: &str) -> Result<()> {
 }
 
 pub(super) async fn input_capture_start(endpoint: &str, peer_id: String) -> Result<()> {
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .set_input_capture_target(InputCaptureTargetRequest { peer_id })
         .await?
@@ -1166,7 +1027,7 @@ pub(super) async fn input_capture_start(endpoint: &str, peer_id: String) -> Resu
 }
 
 pub(super) async fn input_capture_stop(endpoint: &str) -> Result<()> {
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .clear_input_capture_target(Empty {})
         .await?
@@ -1190,7 +1051,7 @@ pub(super) async fn input_send_move(
     dx: i32,
     dy: i32,
 ) -> Result<()> {
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .send_input_move(SendInputMoveRequest { peer_id, dx, dy })
         .await?
@@ -1206,7 +1067,7 @@ pub(super) async fn input_send_key(
     scan_code: u16,
     state: InputKeyState,
 ) -> Result<()> {
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .send_input_key(SendInputKeyRequest {
             peer_id,
@@ -1221,7 +1082,7 @@ pub(super) async fn input_send_key(
 }
 
 pub(super) async fn input_claim(endpoint: &str, peer_id: String, force: bool) -> Result<()> {
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .claim_input_owner(InputOwnerRequest { peer_id, force })
         .await?
@@ -1241,7 +1102,7 @@ pub(super) async fn input_claim(endpoint: &str, peer_id: String, force: bool) ->
 }
 
 pub(super) async fn input_release(endpoint: &str, peer_id: String) -> Result<()> {
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .release_input_owner(InputOwnerRequest {
             peer_id,
@@ -1264,9 +1125,9 @@ pub(super) async fn input_release(endpoint: &str, peer_id: String) -> Result<()>
 }
 
 pub(super) async fn diagnostics_dump(endpoint: &str, output: Option<String>) -> Result<()> {
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
-        .dump(DiagnosticsDumpRequest {
+        .dump_diagnostics(DiagnosticsDumpRequest {
             output_path: output.unwrap_or_default(),
         })
         .await?
@@ -1277,7 +1138,7 @@ pub(super) async fn diagnostics_dump(endpoint: &str, output: Option<String>) -> 
 }
 
 pub(super) async fn diagnostics_run_action(endpoint: &str, action: String) -> Result<()> {
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .trigger_hotkey_action(HotkeyTriggerRequest { action })
         .await?
@@ -1288,7 +1149,7 @@ pub(super) async fn diagnostics_run_action(endpoint: &str, action: String) -> Re
 }
 
 pub(super) async fn safe_reset(endpoint: &str, network_only: bool, all: bool) -> Result<()> {
-    let mut client = DiagnosticsServiceClient::new(channel(endpoint).await?);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
         .safe_reset(SafeResetRequest { network_only, all })
         .await?
@@ -1340,89 +1201,45 @@ pub(super) async fn ui_snapshot(endpoint: &str, start_daemon: bool) -> Result<()
         ensure_daemon_available(endpoint, true).await?;
     }
 
-    let mut daemon_client = DaemonServiceClient::new(channel(endpoint).await?);
-    let status = daemon_client
-        .get_status(StatusRequest {})
-        .await?
-        .into_inner();
-
-    let mut topology_client = TopologyServiceClient::new(channel(endpoint).await?);
-    let paired_peers = topology_client
-        .list_peers(Empty {})
-        .await?
-        .into_inner()
-        .peers
-        .into_iter()
-        .map(|peer| UiPairedPeer {
-            peer_id: peer.peer_id,
-            display_name: peer.display_name,
-            address: peer.address,
-            connected: peer.connected,
-        })
-        .collect::<Vec<_>>();
-
-    let mut diagnostics_client = DiagnosticsServiceClient::new(channel(endpoint).await?);
-    let discovery = diagnostics_client
-        .list_discovery_peers(Empty {})
-        .await?
-        .into_inner();
-    let discovered_peers = discovery
-        .peers
-        .into_iter()
-        .map(|peer| UiDiscoveredPeer {
-            machine_id: peer.machine_id,
-            display_name: peer.display_name,
-            endpoint: peer.endpoint,
-        })
-        .collect::<Vec<_>>();
-    let paired_peer_ids = paired_peers
-        .iter()
-        .map(|peer| peer.peer_id.clone())
-        .collect::<Vec<_>>();
-    let mut discovered_peers = filter_connectable_discovery_records(
-        discovered_peers,
-        &status.machine_id,
-        &paired_peer_ids,
-        |peer| peer.machine_id.clone(),
-    );
-    discovered_peers.sort_by(|a, b| {
-        a.display_name
-            .to_ascii_lowercase()
-            .cmp(&b.display_name.to_ascii_lowercase())
-            .then_with(|| a.machine_id.cmp(&b.machine_id))
-    });
-
-    let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
-    let pending_requests = pairing_client
-        .list_nearby_pairing_requests(Empty {})
-        .await?
-        .into_inner()
-        .requests
-        .into_iter()
-        .map(|request| UiPendingRequest {
-            request_id: request.request_id,
-            requester_machine_id: request.requester_machine_id,
-            requester_display_name: request.requester_display_name,
-            created_at: request.created_at,
-            verification_code: request.verification_code,
-            verification_expires_at: request.verification_expires_at,
-            requires_verification_code: request.requires_verification_code,
-        })
-        .collect::<Vec<_>>();
-
-    let layout_matrix = fetch_layout_spec(endpoint).await?;
-    let generated_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string());
+    let mut control_plane = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let snapshot = control_plane.get_ui_snapshot(Empty {}).await?.into_inner();
     let snapshot = UiSnapshot {
-        generated_at,
-        daemon_online: status.running,
-        machine_id: status.machine_id,
-        layout_matrix,
-        discovered_peers,
-        paired_peers,
-        pending_requests,
+        generated_at: snapshot.generated_at,
+        daemon_online: snapshot.daemon_online,
+        machine_id: snapshot.machine_id,
+        layout_matrix: snapshot.layout_matrix,
+        discovered_peers: snapshot
+            .discovered_peers
+            .into_iter()
+            .map(|peer| UiDiscoveredPeer {
+                machine_id: peer.machine_id,
+                display_name: peer.display_name,
+                endpoint: peer.endpoint,
+            })
+            .collect(),
+        paired_peers: snapshot
+            .paired_peers
+            .into_iter()
+            .map(|peer| UiPairedPeer {
+                peer_id: peer.peer_id,
+                display_name: peer.display_name,
+                address: peer.address,
+                connected: peer.connected,
+            })
+            .collect(),
+        pending_requests: snapshot
+            .pending_requests
+            .into_iter()
+            .map(|request| UiPendingRequest {
+                request_id: request.request_id,
+                requester_machine_id: request.requester_machine_id,
+                requester_display_name: request.requester_display_name,
+                created_at: request.created_at,
+                verification_code: request.verification_code,
+                verification_expires_at: request.verification_expires_at,
+                requires_verification_code: request.requires_verification_code,
+            })
+            .collect(),
     };
 
     println!(
@@ -1453,19 +1270,10 @@ struct LocalLayoutTokens {
 }
 
 async fn list_discovered_peer_records(endpoint: &str) -> Result<Vec<DiscoveredPeerRecord>> {
-    let mut daemon_client = DaemonServiceClient::new(channel(endpoint).await?);
-    let status = daemon_client
-        .get_status(StatusRequest {})
-        .await?
-        .into_inner();
-    let paired_peers = list_peer_records(endpoint).await?;
-
-    let mut diagnostics_client = DiagnosticsServiceClient::new(channel(endpoint).await?);
-    let peers = diagnostics_client
-        .list_discovery_peers(Empty {})
-        .await?
-        .into_inner()
-        .peers
+    let snapshot = fetch_ui_snapshot(endpoint).await?;
+    let paired_peers = map_peer_records(&snapshot.paired_peers);
+    let peers = snapshot
+        .discovered_peers
         .into_iter()
         .map(|peer| DiscoveredPeerRecord {
             machine_id: peer.machine_id,
@@ -1475,22 +1283,49 @@ async fn list_discovered_peer_records(endpoint: &str) -> Result<Vec<DiscoveredPe
         .collect::<Vec<_>>();
     Ok(filter_connectable_discovered_peer_records(
         peers,
-        &status.machine_id,
+        &snapshot.machine_id,
         &paired_peers,
     ))
 }
 
 async fn list_peer_records(endpoint: &str) -> Result<Vec<PeerRecord>> {
-    let mut topology_client = TopologyServiceClient::new(channel(endpoint).await?);
-    let mut peers = topology_client
-        .list_peers(Empty {})
+    let snapshot = fetch_ui_snapshot(endpoint).await?;
+    Ok(map_peer_records(&snapshot.paired_peers))
+}
+
+async fn fetch_layout_spec(endpoint: &str) -> Result<String> {
+    let snapshot = fetch_ui_snapshot(endpoint).await?;
+    Ok(snapshot.layout_matrix)
+}
+
+async fn fetch_local_layout_tokens(endpoint: &str) -> Result<LocalLayoutTokens> {
+    let mut control_plane = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let snapshot = control_plane
+        .get_console_snapshot(Empty {})
         .await?
-        .into_inner()
-        .peers
-        .into_iter()
+        .into_inner();
+    let status = snapshot
+        .status
+        .ok_or_else(|| anyhow::anyhow!("console snapshot missing status payload"))?;
+
+    Ok(LocalLayoutTokens {
+        machine_id: status.machine_id,
+        display_name: snapshot.local_display_name,
+    })
+}
+
+async fn fetch_ui_snapshot(endpoint: &str) -> Result<UiSnapshotReply> {
+    let mut control_plane = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let snapshot = control_plane.get_ui_snapshot(Empty {}).await?.into_inner();
+    Ok(snapshot)
+}
+
+fn map_peer_records(peers: &[ipc_api::boundless::v1::PeerInfo]) -> Vec<PeerRecord> {
+    let mut peers = peers
+        .iter()
         .map(|peer| PeerRecord {
-            peer_id: peer.peer_id,
-            display_name: peer.display_name,
+            peer_id: peer.peer_id.clone(),
+            display_name: peer.display_name.clone(),
             connected: peer.connected,
         })
         .collect::<Vec<_>>();
@@ -1504,32 +1339,7 @@ async fn list_peer_records(endpoint: &str) -> Result<Vec<PeerRecord>> {
             })
             .then_with(|| a.peer_id.cmp(&b.peer_id))
     });
-    Ok(peers)
-}
-
-async fn fetch_layout_spec(endpoint: &str) -> Result<String> {
-    let mut topology_client = TopologyServiceClient::new(channel(endpoint).await?);
-    let layout = topology_client.layout_show(Empty {}).await?.into_inner();
-    Ok(layout.matrix_spec)
-}
-
-async fn fetch_local_layout_tokens(endpoint: &str) -> Result<LocalLayoutTokens> {
-    let mut daemon_client = DaemonServiceClient::new(channel(endpoint).await?);
-    let status = daemon_client
-        .get_status(StatusRequest {})
-        .await?
-        .into_inner();
-
-    let mut pairing_client = PairingServiceClient::new(channel(endpoint).await?);
-    let bundle = pairing_client
-        .export_trust_bundle(Empty {})
-        .await?
-        .into_inner();
-
-    Ok(LocalLayoutTokens {
-        machine_id: status.machine_id,
-        display_name: bundle.display_name,
-    })
+    peers
 }
 
 fn resolve_discovered_peer_record<'a>(
@@ -1647,7 +1457,11 @@ fn extract_orientation_slots(
     let mut local_cell: Option<(usize, usize)> = None;
     for (row_index, row) in grid.iter().enumerate() {
         for (column_index, token) in row.iter().enumerate() {
-            if is_local_layout_token(token, local_tokens) {
+            if is_local_layout_token_shared(
+                token,
+                &local_tokens.machine_id,
+                Some(local_tokens.display_name.as_str()),
+            ) {
                 if local_cell.is_some() {
                     bail!("layout has multiple local cells; cannot safely orient");
                 }
@@ -1765,25 +1579,19 @@ fn collect_matrix_peer_ids(
     Ok(ids)
 }
 
-fn is_local_layout_token(token: &str, local_tokens: &LocalLayoutTokens) -> bool {
-    let token = token.trim();
-    if token.is_empty() {
-        return false;
-    }
-    matches!(
-        token.to_ascii_lowercase().as_str(),
-        "self" | "local" | "this" | "me"
-    ) || token.eq_ignore_ascii_case(&local_tokens.machine_id)
-        || token.eq_ignore_ascii_case(&local_tokens.display_name)
-}
-
 fn resolve_matrix_peer_token(
     token: &str,
     peers: &[PeerRecord],
     local_tokens: &LocalLayoutTokens,
 ) -> Result<Option<String>> {
     let trimmed = token.trim();
-    if trimmed.is_empty() || is_local_layout_token(trimmed, local_tokens) {
+    if trimmed.is_empty()
+        || is_local_layout_token_shared(
+            trimmed,
+            &local_tokens.machine_id,
+            Some(local_tokens.display_name.as_str()),
+        )
+    {
         return Ok(None);
     }
 
@@ -1805,68 +1613,6 @@ fn resolve_matrix_peer_token(
     Ok(Some(matches[0].peer_id.clone()))
 }
 
-pub(super) fn host_and_pairing_port_from_discovery_endpoint(
-    endpoint: &str,
-) -> Result<(String, u16)> {
-    let trimmed = endpoint.trim();
-    if trimmed.is_empty() {
-        bail!("discovery endpoint is empty");
-    }
-
-    if let Ok(socket) = trimmed.parse::<SocketAddr>() {
-        return Ok((socket.ip().to_string(), nearby_pairing_port(socket.port())));
-    }
-
-    if let Some(host) = trimmed
-        .strip_prefix('[')
-        .and_then(|value| value.split_once(']'))
-        .map(|(host, _)| host.to_string())
-    {
-        let port = extract_port_from_network_address(trimmed)?;
-        return Ok((host, nearby_pairing_port(port)));
-    }
-
-    if let Some((host, _)) = trimmed.rsplit_once(':') {
-        let host = host.trim();
-        if host.is_empty() {
-            bail!("discovery endpoint is missing host");
-        }
-        let port = extract_port_from_network_address(trimmed)?;
-        return Ok((host.to_string(), nearby_pairing_port(port)));
-    }
-
-    bail!("discovery endpoint must include host and port")
-}
-
-fn build_orientation_matrix(
-    left: Option<&str>,
-    right: Option<&str>,
-    up: Option<&str>,
-    down: Option<&str>,
-) -> String {
-    let center = format!("{},{},{}", left.unwrap_or(""), "self", right.unwrap_or(""));
-    let mut rows = Vec::<String>::new();
-    if let Some(up) = up {
-        rows.push(format!(",{},", up));
-    }
-    rows.push(center);
-    if let Some(down) = down {
-        rows.push(format!(",{},", down));
-    }
-    rows.join(";")
-}
-
-fn parse_layout_matrix(matrix: &str) -> Vec<Vec<String>> {
-    matrix
-        .split(';')
-        .map(|row| {
-            row.split(',')
-                .map(|token| token.trim().to_string())
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
 fn preview_label_for_token(
     token: &str,
     peers: &[PeerRecord],
@@ -1875,7 +1621,11 @@ fn preview_label_for_token(
     if token.trim().is_empty() {
         return ".".to_string();
     }
-    if is_local_layout_token(token, local_tokens) {
+    if is_local_layout_token_shared(
+        token,
+        &local_tokens.machine_id,
+        Some(local_tokens.display_name.as_str()),
+    ) {
         return "THIS-PC".to_string();
     }
 
@@ -1890,6 +1640,12 @@ fn preview_label_for_token(
     }
 
     token.to_string()
+}
+
+pub(super) fn host_and_pairing_port_from_discovery_endpoint(
+    endpoint: &str,
+) -> Result<(String, u16)> {
+    host_and_pairing_port_from_endpoint(endpoint)
 }
 
 fn find_new_peer_record(before: &[PeerRecord], after: &[PeerRecord]) -> Option<PeerRecord> {
@@ -2055,8 +1811,8 @@ mod tests {
 
     #[test]
     fn host_and_pairing_port_parses_hostname_endpoint() {
-        let (host, port) = host_and_pairing_port_from_discovery_endpoint("DESKTOP-ABC:15100")
-            .expect("parse endpoint");
+        let (host, port) =
+            host_and_pairing_port_from_endpoint("DESKTOP-ABC:15100").expect("parse endpoint");
         assert_eq!(host, "DESKTOP-ABC");
         assert_eq!(port, 15200);
     }

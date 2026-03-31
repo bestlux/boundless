@@ -20,16 +20,7 @@ pub(super) fn normalize_peer_address(address: &str, default_port: u16) -> Result
 }
 
 pub(super) fn validate_pipe_name(pipe_name: &str) -> Result<()> {
-    let trimmed = pipe_name.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("pipe name must not be empty");
-    }
-
-    if trimmed.contains('/') || trimmed.contains('\\') {
-        anyhow::bail!("pipe name must not contain path separators");
-    }
-
-    Ok(())
+    platform_windows::runtime::validate_pipe_name(pipe_name)
 }
 
 pub(super) fn normalize_optional_alias(alias: String) -> Option<String> {
@@ -42,9 +33,9 @@ pub(super) fn normalize_optional_alias(alias: String) -> Option<String> {
 }
 
 pub(super) fn validate_and_consume_pairing_code(
-    pairing_codes: &mut HashMap<String, DateTime<Utc>>,
+    pairing_codes: &mut HashMap<String, chrono::DateTime<Utc>>,
     code: &str,
-    now: DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
 ) -> Result<()> {
     if code.trim().is_empty() {
         anyhow::bail!("pairing code must not be empty");

@@ -19,8 +19,11 @@ const PAIRING_BIND_HOST: &str = "0.0.0.0";
 const PAIRING_PORT_OFFSET: u16 = 100;
 const PAIRING_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const NEARBY_CHALLENGE_TTL_SECONDS: u64 = 120;
+const NEARBY_PAIRING_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const NEARBY_PAIRING_IO_TIMEOUT: Duration = Duration::from_secs(6);
+const NEARBY_PAIRING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum PairingWireRequest {
     NearbyRequestCode {
@@ -43,7 +46,7 @@ enum PairingWireRequest {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum PairingWireResponse {
     CodeRequired {
@@ -70,12 +73,404 @@ enum PairingWireResponse {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NearbyJoinStatusKind {
+    Pending,
+    Approved,
+    Rejected,
+    Error,
+    CodeRequired,
+}
+
+impl NearbyJoinStatusKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            NearbyJoinStatusKind::Pending => "pending",
+            NearbyJoinStatusKind::Approved => "approved",
+            NearbyJoinStatusKind::Rejected => "rejected",
+            NearbyJoinStatusKind::Error => "error",
+            NearbyJoinStatusKind::CodeRequired => "code_required",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum NearbyRequestCodeStart {
+    CodeRequired {
+        request_id: String,
+        verification_nonce: String,
+        expires_at: String,
+    },
+    Unsupported {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NearbyJoinStatus {
+    pub(crate) request_id: String,
+    pub(crate) status: NearbyJoinStatusKind,
+    pub(crate) message: String,
+    pub(crate) peer_machine_id: Option<String>,
+}
+
+pub(crate) async fn request_nearby_pairing_code(
+    state: &AppState,
+    host: &str,
+    port: u16,
+    alias: Option<String>,
+) -> Result<NearbyRequestCodeStart> {
+    let target = format_host_port(host, port);
+    let requester_bundle = state.export_trust_bundle().await?;
+    let response = send_nearby_pairing_request(
+        &target,
+        PairingWireRequest::NearbyRequestCode {
+            requester_bundle,
+            requester_alias: normalize_alias(alias),
+        },
+    )
+    .await?;
+
+    match response {
+        PairingWireResponse::CodeRequired {
+            request_id,
+            verification_nonce,
+            expires_at,
+            ..
+        } => Ok(NearbyRequestCodeStart::CodeRequired {
+            request_id,
+            verification_nonce,
+            expires_at,
+        }),
+        PairingWireResponse::Error { message } => {
+            let lowered = message.to_ascii_lowercase();
+            if lowered.contains("unknown variant")
+                || lowered.contains("parse pairing request")
+                || lowered.contains("missing field")
+            {
+                return Ok(NearbyRequestCodeStart::Unsupported { reason: message });
+            }
+            anyhow::bail!("nearby pairing request failed: {message}");
+        }
+        PairingWireResponse::Rejected { message, .. } => {
+            anyhow::bail!("nearby pairing request rejected: {message}");
+        }
+        PairingWireResponse::Pending { message, .. } => {
+            anyhow::bail!("unexpected nearby pairing status: {message}");
+        }
+        PairingWireResponse::Approved { .. } => {
+            anyhow::bail!("unexpected nearby pairing status: approved");
+        }
+    }
+}
+
+pub(crate) async fn submit_nearby_pairing_code(
+    state: &AppState,
+    host: &str,
+    port: u16,
+    request_id: String,
+    code: String,
+    verification_nonce: String,
+    alias: Option<String>,
+) -> Result<String> {
+    let target = format_host_port(host, port);
+    let response = send_nearby_pairing_request(
+        &target,
+        PairingWireRequest::NearbySubmitCode {
+            request_id: request_id.clone(),
+            code,
+            verification_nonce,
+            requester_alias: normalize_alias(alias.clone()),
+        },
+    )
+    .await?;
+
+    let responder_bundle = match response {
+        PairingWireResponse::Approved {
+            request_id: approved_request_id,
+            responder_bundle,
+            ..
+        } => {
+            if approved_request_id != request_id {
+                anyhow::bail!("nearby pairing request id mismatch");
+            }
+            responder_bundle
+        }
+        PairingWireResponse::Pending { .. } => {
+            anyhow::bail!(
+                "unexpected pending response for code submission; start a new pairing request"
+            );
+        }
+        PairingWireResponse::Rejected { message, .. } => {
+            anyhow::bail!("nearby pairing rejected: {message}");
+        }
+        PairingWireResponse::Error { message } => {
+            anyhow::bail!("nearby pairing failed: {message}");
+        }
+        PairingWireResponse::CodeRequired { message, .. } => {
+            anyhow::bail!("nearby pairing failed: {message}");
+        }
+    };
+
+    import_nearby_responder_bundle(state, responder_bundle, host, alias).await
+}
+
+pub(crate) async fn start_nearby_pairing_join(
+    state: &AppState,
+    host: &str,
+    port: u16,
+    code: String,
+    alias: Option<String>,
+) -> Result<NearbyJoinStatus> {
+    let normalized_code = code.trim().to_string();
+    if normalized_code.is_empty() {
+        anyhow::bail!("pairing code must not be empty");
+    }
+
+    let target = format_host_port(host, port);
+    let requester_bundle = state.export_trust_bundle().await?;
+    let response = send_nearby_pairing_request(
+        &target,
+        PairingWireRequest::NearbyJoin {
+            code: normalized_code,
+            requester_bundle,
+            requester_alias: normalize_alias(alias.clone()),
+        },
+    )
+    .await?;
+
+    map_join_status_response(state, host, response, alias).await
+}
+
+pub(crate) async fn check_nearby_pairing_join(
+    state: &AppState,
+    host: &str,
+    port: u16,
+    request_id: String,
+    alias: Option<String>,
+) -> Result<NearbyJoinStatus> {
+    let trimmed_request_id = request_id.trim().to_string();
+    if trimmed_request_id.is_empty() {
+        anyhow::bail!("request_id must not be empty");
+    }
+
+    let target = format_host_port(host, port);
+    let response = send_nearby_pairing_request(
+        &target,
+        PairingWireRequest::CheckNearbyJoin {
+            request_id: trimmed_request_id,
+        },
+    )
+    .await?;
+
+    map_join_status_response(state, host, response, alias).await
+}
+
 pub fn start(state: AppState) {
     tokio::spawn(async move {
         if let Err(error) = run(state).await {
             warn!(error = ?error, "pairing listener stopped");
         }
     });
+}
+
+async fn map_join_status_response(
+    state: &AppState,
+    host: &str,
+    response: PairingWireResponse,
+    alias: Option<String>,
+) -> Result<NearbyJoinStatus> {
+    match response {
+        PairingWireResponse::Pending {
+            request_id,
+            message,
+        } => Ok(NearbyJoinStatus {
+            request_id,
+            status: NearbyJoinStatusKind::Pending,
+            message,
+            peer_machine_id: None,
+        }),
+        PairingWireResponse::Approved {
+            request_id,
+            message,
+            responder_bundle,
+        } => {
+            let peer_machine_id =
+                import_nearby_responder_bundle(state, responder_bundle, host, alias).await?;
+            Ok(NearbyJoinStatus {
+                request_id,
+                status: NearbyJoinStatusKind::Approved,
+                message,
+                peer_machine_id: Some(peer_machine_id),
+            })
+        }
+        PairingWireResponse::Rejected {
+            request_id,
+            message,
+        } => Ok(NearbyJoinStatus {
+            request_id,
+            status: NearbyJoinStatusKind::Rejected,
+            message,
+            peer_machine_id: None,
+        }),
+        PairingWireResponse::Error { message } => Ok(NearbyJoinStatus {
+            request_id: String::new(),
+            status: NearbyJoinStatusKind::Error,
+            message,
+            peer_machine_id: None,
+        }),
+        PairingWireResponse::CodeRequired {
+            request_id,
+            message,
+            ..
+        } => Ok(NearbyJoinStatus {
+            request_id,
+            status: NearbyJoinStatusKind::CodeRequired,
+            message,
+            peer_machine_id: None,
+        }),
+    }
+}
+
+async fn import_nearby_responder_bundle(
+    state: &AppState,
+    mut responder_bundle: TrustBundle,
+    host: &str,
+    alias: Option<String>,
+) -> Result<String> {
+    normalize_bundle_address_for_host(&mut responder_bundle, host)?;
+    let machine_id = responder_bundle.machine_id.clone();
+
+    state
+        .import_trust_bundle(responder_bundle, normalize_alias(alias))
+        .await?;
+    let _ = state
+        .request_peer_reconnect_and_reset(&machine_id)
+        .await
+        .context("request reconnect after nearby pairing import")?;
+
+    Ok(machine_id)
+}
+
+async fn send_nearby_pairing_request(
+    target: &str,
+    request: PairingWireRequest,
+) -> Result<PairingWireResponse> {
+    let mut socket = time::timeout(NEARBY_PAIRING_CONNECT_TIMEOUT, TcpStream::connect(target))
+        .await
+        .with_context(|| {
+            format!(
+                "connect nearby pairing endpoint {target} timed out after {}s",
+                NEARBY_PAIRING_CONNECT_TIMEOUT.as_secs()
+            )
+        })?
+        .with_context(|| format!("connect nearby pairing endpoint {target}"))?;
+    let payload = serde_json::to_string(&request).context("serialize nearby pairing request")?;
+    time::timeout(
+        NEARBY_PAIRING_IO_TIMEOUT,
+        socket.write_all(payload.as_bytes()),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "send nearby pairing request timed out after {}s",
+            NEARBY_PAIRING_IO_TIMEOUT.as_secs()
+        )
+    })?
+    .context("send nearby pairing request")?;
+    time::timeout(NEARBY_PAIRING_IO_TIMEOUT, socket.write_all(b"\n"))
+        .await
+        .with_context(|| {
+            format!(
+                "terminate nearby pairing request timed out after {}s",
+                NEARBY_PAIRING_IO_TIMEOUT.as_secs()
+            )
+        })?
+        .context("terminate nearby pairing request")?;
+    time::timeout(NEARBY_PAIRING_IO_TIMEOUT, socket.flush())
+        .await
+        .with_context(|| {
+            format!(
+                "flush nearby pairing request timed out after {}s",
+                NEARBY_PAIRING_IO_TIMEOUT.as_secs()
+            )
+        })?
+        .context("flush nearby pairing request")?;
+
+    let mut reader = BufReader::new(socket);
+    let mut response_line = String::new();
+    let read = time::timeout(
+        NEARBY_PAIRING_RESPONSE_TIMEOUT,
+        reader.read_line(&mut response_line),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "read nearby pairing response timed out after {}s",
+            NEARBY_PAIRING_RESPONSE_TIMEOUT.as_secs()
+        )
+    })?
+    .context("read nearby pairing response")?;
+    if read == 0 {
+        anyhow::bail!("nearby pairing endpoint closed without a response");
+    }
+
+    serde_json::from_str(&response_line).context("parse nearby pairing response")
+}
+
+fn normalize_bundle_address_for_host(bundle: &mut TrustBundle, host: &str) -> Result<()> {
+    let port = extract_port_from_network_address(bundle.network_address.trim())?;
+    bundle.network_address = format_host_port(host, port);
+    Ok(())
+}
+
+fn extract_port_from_network_address(address: &str) -> Result<u16> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("invalid responder network address: empty");
+    }
+
+    if let Ok(socket) = trimmed.parse::<SocketAddr>() {
+        return Ok(socket.port());
+    }
+
+    if let Some((host_part, port_part)) = trimmed.rsplit_once(':') {
+        if host_part.trim().is_empty() {
+            anyhow::bail!("invalid responder network address: missing host");
+        }
+        let port = port_part
+            .trim()
+            .parse::<u16>()
+            .context("invalid responder network address port")?;
+        if port == 0 {
+            anyhow::bail!("invalid responder network address port: 0");
+        }
+        return Ok(port);
+    }
+
+    anyhow::bail!("invalid responder network address: missing port");
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    let trimmed = host.trim();
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        format!("{trimmed}:{port}")
+    } else if trimmed.contains(':') {
+        format!("[{trimmed}]:{port}")
+    } else {
+        format!("{trimmed}:{port}")
+    }
+}
+
+fn normalize_alias(alias: Option<String>) -> Option<String> {
+    alias.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
 }
 
 async fn run(state: AppState) -> Result<()> {
