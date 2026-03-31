@@ -540,7 +540,7 @@ impl DashboardApp {
 }
 
 impl eframe::App for DashboardApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.exit_requested |= self.exit_requested_signal.load(Ordering::SeqCst);
 
         if ctx.input(|input| input.viewport().close_requested()) {
@@ -566,10 +566,13 @@ impl eframe::App for DashboardApp {
         if self.exit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+    }
 
-        self.render_pairing_dialog(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.render_pairing_dialog(&ctx);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Boundless");
                 ui.separator();
