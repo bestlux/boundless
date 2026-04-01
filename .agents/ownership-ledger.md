@@ -2,10 +2,14 @@
 
 | Owner | Scope | Files / Surfaces | Status | Notes |
 | --- | --- | --- | --- | --- |
-| orchestrator | Integration, validation, commits, `.agents` | shared crate graph, validation, final branch synthesis | completed | kept shared seams single-owned |
-| contracts-owner | Control-plane v2 | `crates/app-services`, `crates/adapter-ipc-grpc`, daemon app adapter | completed | unary daemon services removed |
-| state-owner | daemon state decomposition | `crates/daemon/src/state*` | completed | facade remains, monolith file no longer exists |
-| platform-owner | Windows extraction | `crates/platform-windows`, daemon input/clipboard integration points | completed | low-level helper/runtime ownership moved |
-| transport-owner | transport runtime extraction | `crates/peer-transport`, daemon network integration points | completed | TLS/session orchestration intentionally remained daemon-owned |
-| adapter-owner | CLI and tray thinning | `crates/cli`, `crates/tray` | completed | shared desktop helper layer now consumed by both shells |
-| release-owner | release evidence and launch verdict | `.agents`, smoke/install validation | completed | installer bug and unrun trace/recovery gates remain explicit blockers |
+| orchestrator | Branch orchestration, `.agents`, checkpoints, final synthesis | `.agents/*`, merge order, final reporting | active | does not author implementation code unless integration requires it |
+| input-seam-owner | Capture runtime seam | `crates/daemon/src/input.rs`, `crates/platform-windows/src/input.rs`, `crates/platform-windows/src/input/hook_capture.rs`, `crates/daemon/src/input/windows_hook_backend.rs`, `crates/platform-windows/Cargo.toml` | completed | frozen seam is `platform_windows::input::CaptureRuntime`; daemon backend now depends on it instead of direct hook globals |
+| tray-seam-owner | Dashboard shell seam | `crates/tray/src/dashboard.rs` | pending | extracts module boundaries and shared model/task runner only |
+| platform-capture-owner | Windows capture runtime ownership | `crates/platform-windows/src/input*`, stale daemon hook file cleanup | pending | depends on `input-seam-owner` handoff |
+| daemon-input-owner | Daemon input decomposition | `crates/daemon/src/state/*input*`, `crates/daemon/src/input/runtime.rs`, input-related helpers moved from other state modules | pending | depends on `input-seam-owner` handoff |
+| snapshot-owner | Coherent control-plane snapshot bundle | `crates/daemon/src/control_plane_app.rs`, new daemon snapshot helpers | pending | depends on `daemon-input-owner` handoff |
+| tray-workflow-owner | Dashboard workflow extraction | `crates/tray/src/dashboard/*` except layout module | pending | depends on `tray-seam-owner` handoff |
+| tray-layout-owner | Dashboard layout extraction | layout-specific `crates/tray/src/dashboard/*`, layout tests | pending | depends on `tray-seam-owner` handoff |
+| integration-owner | Shared-file stitch-up and dead-code cleanup | `crates/daemon/src/input.rs`, `crates/daemon/src/control_plane_app.rs`, `crates/tray/src/dashboard.rs`, shared exports | pending | accepts worker handoffs in merge order |
+| qa-owner | Validation and smoke evidence | tests, scripts, validation notes | pending | returns failures to owning worker |
+| reviewer | Independent review | integrated branch only | pending | no self-review, no delegation |

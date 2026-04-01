@@ -126,7 +126,7 @@ impl AppState {
         drop(config);
 
         if !disconnected_peer_ids.is_empty() {
-            let mut router = self.input.router.write().await;
+            let mut router = self.input.control.router.write().await;
             let mut released_owner = false;
             for peer_id in &disconnected_peer_ids {
                 released_owner = router.release_owner(peer_id) || released_owner;
@@ -142,7 +142,7 @@ impl AppState {
                     .await;
             }
 
-            let mut capture_target = self.input.capture_target_peer_id.write().await;
+            let mut capture_target = self.input.control.capture_target_peer_id.write().await;
             if capture_target
                 .as_deref()
                 .is_some_and(|peer_id| disconnected_peer_ids.iter().any(|id| id == peer_id))

@@ -2,7 +2,7 @@ use super::*;
 
 #[derive(Debug)]
 #[allow(dead_code)]
-struct OutgoingInputQueueReport {
+pub(crate) struct OutgoingInputQueueReport {
     enqueued: bool,
     depth: usize,
     dropped: Option<(u64, &'static str)>,
@@ -328,7 +328,7 @@ impl AppState {
         self.notify_outgoing_flush_signal();
     }
 
-    async fn queue_outgoing_input_payload(
+    pub(crate) async fn queue_outgoing_input_payload(
         &self,
         peer_id: &str,
         payload: OutboundPayload,
@@ -680,61 +680,6 @@ impl AppState {
             });
         }
         self.notify_outgoing_flush_signal();
-        Ok(())
-    }
-
-    pub async fn queue_input_move(&self, peer_id: &str, dx: i32, dy: i32) -> Result<()> {
-        self.queue_input_events(peer_id, vec![InputEvent::MouseMove { dx, dy }])
-            .await
-    }
-
-    pub async fn queue_input_key(
-        &self,
-        peer_id: &str,
-        scan_code: u16,
-        key_state: KeyState,
-    ) -> Result<()> {
-        self.queue_input_events(
-            peer_id,
-            vec![InputEvent::Key {
-                scan_code,
-                state: key_state,
-            }],
-        )
-        .await
-    }
-
-    pub async fn queue_input_events(&self, peer_id: &str, events: Vec<InputEvent>) -> Result<()> {
-        if self.get_peer(peer_id).await.is_none() {
-            anyhow::bail!("unknown peer {peer_id}");
-        }
-        if events.is_empty() {
-            anyhow::bail!("input frame must include at least one event");
-        }
-        if events.len() > MAX_EVENTS_PER_FRAME {
-            anyhow::bail!(
-                "input frame event count exceeds limit: {} > {}",
-                events.len(),
-                MAX_EVENTS_PER_FRAME
-            );
-        }
-
-        let sequence = {
-            let mut sequences = self.input.sequence_by_peer.write().await;
-            let entry = sequences.entry(peer_id.to_string()).or_insert(0);
-            *entry += 1;
-            *entry
-        };
-
-        self.queue_outgoing_input_payload(
-            peer_id,
-            OutboundPayload::InputFrame {
-                sequence,
-                timestamp_unix_ms: Utc::now().timestamp_millis(),
-                events,
-            },
-        )
-        .await;
         Ok(())
     }
 

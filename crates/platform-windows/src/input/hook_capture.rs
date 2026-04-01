@@ -1,7 +1,7 @@
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Mutex, OnceLock, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc::{self, TrySendError},
+    mpsc::{self, SyncSender, TrySendError},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -63,6 +63,24 @@ pub enum HookCaptureEvent {
     Control(HookControlAction),
 }
 
+pub struct CaptureRuntime {
+    core: Arc<CaptureRuntimeCore>,
+    event_rx: mpsc::Receiver<HookCaptureEvent>,
+    hook_thread_id: u32,
+    hook_thread: Option<JoinHandle<()>>,
+    raw_input_thread_id: Option<u32>,
+    raw_input_thread: Option<JoinHandle<()>>,
+    raw_input_enabled: bool,
+}
+
+struct CaptureRuntimeCore {
+    event_tx: Mutex<Option<SyncSender<HookCaptureEvent>>>,
+    wake_notifier: Mutex<Option<HookWakeNotifier>>,
+    runtime_state: Mutex<HookRuntimeState>,
+    lock_active: AtomicBool,
+    dropped_event_count: AtomicU64,
+}
+
 #[derive(Debug, Default)]
 struct HookRuntimeState {
     left_ctrl_down: bool,
@@ -82,92 +100,253 @@ const CAPTURE_KEY_VIRTUAL_KEYS: &[u16] = &[
     0xDB, 0xDC, 0xDD, 0xDE,
 ];
 
-static HOOK_EVENT_SENDER: OnceLock<Mutex<Option<mpsc::SyncSender<HookCaptureEvent>>>> =
-    OnceLock::new();
-static HOOK_WAKE_NOTIFIER: OnceLock<Mutex<Option<HookWakeNotifier>>> = OnceLock::new();
-static HOOK_RUNTIME_STATE: OnceLock<Mutex<HookRuntimeState>> = OnceLock::new();
-static HOOK_LOCK_ACTIVE: AtomicBool = AtomicBool::new(false);
-static HOOK_DROPPED_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_CAPTURE_RUNTIME: OnceLock<Mutex<Option<Weak<CaptureRuntimeCore>>>> = OnceLock::new();
 
-pub struct HookSenderGuard;
+impl CaptureRuntime {
+    pub fn start<F>(wake_notifier: F) -> Result<Self>
+    where
+        F: Fn(&'static str) + Send + Sync + 'static,
+    {
+        let (event_tx, event_rx) = mpsc::sync_channel::<HookCaptureEvent>(HOOK_EVENT_QUEUE_CAP);
+        let (startup_tx, startup_rx) = mpsc::channel::<Result<u32>>();
+        let core = Arc::new(CaptureRuntimeCore {
+            event_tx: Mutex::new(Some(event_tx)),
+            wake_notifier: Mutex::new(Some(Arc::new(wake_notifier))),
+            runtime_state: Mutex::new(HookRuntimeState::default()),
+            lock_active: AtomicBool::new(false),
+            dropped_event_count: AtomicU64::new(0),
+        });
 
-impl Drop for HookSenderGuard {
-    fn drop(&mut self) {
-        let _ = set_hook_event_sender(None);
-        let _ = set_hook_wake_notifier(None);
+        activate_capture_runtime(&core)?;
+
+        let hook_thread = thread::spawn(move || {
+            let thread_id = unsafe { GetCurrentThreadId() };
+            let keyboard_hook = unsafe { install_keyboard_hook() };
+            let mouse_hook = unsafe { install_mouse_hook() };
+            match (keyboard_hook, mouse_hook) {
+                (Ok(keyboard_hook), Ok(mouse_hook)) => {
+                    let _ = startup_tx.send(Ok(thread_id));
+                    if let Err(error) = unsafe { run_hook_message_loop() } {
+                        warn!(error = ?error, "hook message loop exited with error");
+                    }
+                    unhook_windows_hook(keyboard_hook);
+                    unhook_windows_hook(mouse_hook);
+                }
+                (keyboard, mouse) => {
+                    if let Ok(hook) = keyboard.as_ref() {
+                        unhook_windows_hook(*hook);
+                    }
+                    if let Ok(hook) = mouse.as_ref() {
+                        unhook_windows_hook(*hook);
+                    }
+                    let error = keyboard
+                        .err()
+                        .or_else(|| mouse.err())
+                        .unwrap_or_else(|| anyhow::anyhow!("failed to install capture hooks"));
+                    let _ = startup_tx.send(Err(error));
+                }
+            }
+        });
+
+        let hook_thread_id = match startup_rx.recv().context("hook startup channel closed")? {
+            Ok(thread_id) => thread_id,
+            Err(error) => {
+                let _ = clear_active_capture_runtime(&core);
+                let _ = hook_thread.join();
+                return Err(error);
+            }
+        };
+        let (raw_input_thread_id, raw_input_thread, raw_input_enabled) =
+            match spawn_raw_input_thread() {
+                Ok((thread_id, thread)) => (Some(thread_id), Some(thread), true),
+                Err(error) => {
+                    warn!(
+                        error = ?error,
+                        "raw input mouse capture unavailable; falling back to mouse hook position deltas"
+                    );
+                    (None, None, false)
+                }
+            };
+
+        Ok(Self {
+            core,
+            event_rx,
+            hook_thread_id,
+            hook_thread: Some(hook_thread),
+            raw_input_thread_id,
+            raw_input_thread,
+            raw_input_enabled,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn from_test_parts(
+        event_rx: mpsc::Receiver<HookCaptureEvent>,
+        raw_input_enabled: bool,
+    ) -> Self {
+        Self {
+            core: Arc::new(CaptureRuntimeCore {
+                event_tx: Mutex::new(None),
+                wake_notifier: Mutex::new(None),
+                runtime_state: Mutex::new(HookRuntimeState::default()),
+                lock_active: AtomicBool::new(false),
+                dropped_event_count: AtomicU64::new(0),
+            }),
+            event_rx,
+            hook_thread_id: 0,
+            hook_thread: None,
+            raw_input_thread_id: None,
+            raw_input_thread: None,
+            raw_input_enabled,
+        }
+    }
+
+    pub fn drain_events(&mut self) -> Vec<HookCaptureEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.event_rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    pub fn refresh(&mut self) -> bool {
+        if !self.raw_input_enabled {
+            return false;
+        }
+
+        let finished = self
+            .raw_input_thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished());
+        if !finished {
+            return true;
+        }
+
+        if let Some(thread) = self.raw_input_thread.take() {
+            let _ = thread.join();
+        }
+        self.raw_input_thread_id = None;
+        self.raw_input_enabled = false;
+        warn!("raw input capture thread exited; using mouse hook position delta fallback");
+        false
+    }
+
+    pub fn raw_input_enabled(&self) -> bool {
+        self.raw_input_enabled
+    }
+
+    pub fn set_lock_active(&mut self, active: bool) -> Result<bool> {
+        set_hook_lock_active_for(&self.core, active)
+    }
+
+    pub fn lock_active(&self) -> bool {
+        self.core.lock_active.load(Ordering::Relaxed)
+    }
+
+    pub fn take_dropped_event_count(&mut self) -> u64 {
+        self.core.dropped_event_count.swap(0, Ordering::Relaxed)
     }
 }
 
-fn hook_sender_cell() -> &'static Mutex<Option<mpsc::SyncSender<HookCaptureEvent>>> {
-    HOOK_EVENT_SENDER.get_or_init(|| Mutex::new(None))
+impl Drop for CaptureRuntime {
+    fn drop(&mut self) {
+        if self.lock_active() {
+            let _ = set_hook_lock_active_for(&self.core, false);
+        }
+        if let Some(thread_id) = self.raw_input_thread_id {
+            post_thread_quit(thread_id);
+        }
+        if let Some(thread) = self.raw_input_thread.take() {
+            let _ = thread.join();
+        }
+        self.raw_input_thread_id = None;
+        self.raw_input_enabled = false;
+        post_thread_quit(self.hook_thread_id);
+        if let Some(thread) = self.hook_thread.take() {
+            let _ = thread.join();
+        }
+
+        let _ = clear_active_capture_runtime(&self.core);
+    }
 }
 
-fn hook_wake_notifier_cell() -> &'static Mutex<Option<HookWakeNotifier>> {
-    HOOK_WAKE_NOTIFIER.get_or_init(|| Mutex::new(None))
+fn active_capture_runtime_cell() -> &'static Mutex<Option<Weak<CaptureRuntimeCore>>> {
+    ACTIVE_CAPTURE_RUNTIME.get_or_init(|| Mutex::new(None))
 }
 
-fn hook_runtime_state_cell() -> &'static Mutex<HookRuntimeState> {
-    HOOK_RUNTIME_STATE.get_or_init(|| Mutex::new(HookRuntimeState::default()))
-}
-
-pub fn set_hook_event_sender(sender: Option<mpsc::SyncSender<HookCaptureEvent>>) -> Result<()> {
-    let mut guard = hook_sender_cell()
+fn activate_capture_runtime(core: &Arc<CaptureRuntimeCore>) -> Result<()> {
+    let mut guard = active_capture_runtime_cell()
         .lock()
-        .map_err(|_| anyhow::anyhow!("hook sender mutex poisoned"))?;
-    *guard = sender;
+        .map_err(|_| anyhow::anyhow!("capture runtime registry mutex poisoned"))?;
+    if guard
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .is_some_and(|current| !Arc::ptr_eq(&current, core))
+    {
+        anyhow::bail!("capture runtime already active");
+    }
+    *guard = Some(Arc::downgrade(core));
     Ok(())
 }
 
-pub fn set_hook_wake_notifier(notifier: Option<HookWakeNotifier>) -> Result<()> {
-    let mut guard = hook_wake_notifier_cell()
+fn clear_active_capture_runtime(core: &Arc<CaptureRuntimeCore>) -> Result<()> {
+    let mut guard = active_capture_runtime_cell()
         .lock()
-        .map_err(|_| anyhow::anyhow!("hook wake notifier mutex poisoned"))?;
-    *guard = notifier;
+        .map_err(|_| anyhow::anyhow!("capture runtime registry mutex poisoned"))?;
+    if guard
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .is_some_and(|current| Arc::ptr_eq(&current, core))
+    {
+        *guard = None;
+    }
     Ok(())
+}
+
+fn active_capture_runtime() -> Option<Arc<CaptureRuntimeCore>> {
+    active_capture_runtime_cell()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().and_then(Weak::upgrade))
+}
+
+fn with_active_capture_runtime<T>(f: impl FnOnce(&CaptureRuntimeCore) -> T) -> Option<T> {
+    active_capture_runtime().as_deref().map(f)
 }
 
 pub fn send_hook_event(event: HookCaptureEvent, source: &'static str) {
-    let sender = hook_sender_cell()
-        .lock()
-        .ok()
-        .and_then(|guard| guard.as_ref().cloned());
+    let sender = with_active_capture_runtime(|core| {
+        core.event_tx
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    })
+    .flatten();
     if let Some(sender) = sender {
         match sender.try_send(event) {
             Ok(()) => {
-                if let Some(notifier) = hook_wake_notifier_cell()
-                    .lock()
-                    .ok()
-                    .and_then(|guard| guard.as_ref().cloned())
+                if let Some(notifier) = with_active_capture_runtime(|core| {
+                    core.wake_notifier
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.as_ref().cloned())
+                })
+                .flatten()
                 {
                     notifier(source);
                 }
             }
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                HOOK_DROPPED_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
+                let _ = with_active_capture_runtime(|core| {
+                    core.dropped_event_count.fetch_add(1, Ordering::Relaxed)
+                });
             }
         }
     }
 }
 
-pub fn take_hook_dropped_event_count() -> u64 {
-    HOOK_DROPPED_EVENT_COUNT.swap(0, Ordering::Relaxed)
-}
-
-pub fn set_hook_lock_active(active: bool) -> Result<()> {
-    HOOK_LOCK_ACTIVE.store(active, Ordering::Relaxed);
-    let mut state = hook_runtime_state_cell()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("hook runtime state mutex poisoned"))?;
-    if !active {
-        state.left_ctrl_down = false;
-        state.right_ctrl_down = false;
-        state.last_ctrl_tap_at = None;
-    }
-    Ok(())
-}
-
 pub fn is_hook_lock_active() -> bool {
-    HOOK_LOCK_ACTIVE.load(Ordering::Relaxed)
+    with_active_capture_runtime(|core| core.lock_active.load(Ordering::Relaxed)).unwrap_or(false)
 }
 
 pub fn update_escape_state_for_key(vk_code: u16, key_state: KeyState) -> bool {
@@ -176,13 +355,16 @@ pub fn update_escape_state_for_key(vk_code: u16, key_state: KeyState) -> bool {
     }
 
     let now = Instant::now();
-    let mut state = match hook_runtime_state_cell().lock() {
+    let Some(runtime) = active_capture_runtime() else {
+        return false;
+    };
+    if !runtime.lock_active.load(Ordering::Relaxed) {
+        return false;
+    }
+    let mut state = match runtime.runtime_state.lock() {
         Ok(state) => state,
         Err(_) => return false,
     };
-    if !HOOK_LOCK_ACTIVE.load(Ordering::Relaxed) {
-        return false;
-    }
 
     let is_down = matches!(key_state, KeyState::Down);
     let was_down = match vk_code {
@@ -220,6 +402,24 @@ pub fn update_escape_state_for_key(vk_code: u16, key_state: KeyState) -> bool {
     }
 
     false
+}
+
+fn set_hook_lock_active_for(core: &Arc<CaptureRuntimeCore>, active: bool) -> Result<bool> {
+    set_hook_lock_active_for_arc(core.as_ref(), active)
+}
+
+fn set_hook_lock_active_for_arc(core: &CaptureRuntimeCore, active: bool) -> Result<bool> {
+    core.lock_active.store(active, Ordering::Relaxed);
+    let mut state = core
+        .runtime_state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("hook runtime state mutex poisoned"))?;
+    if !active {
+        state.left_ctrl_down = false;
+        state.right_ctrl_down = false;
+        state.last_ctrl_tap_at = None;
+    }
+    Ok(active)
 }
 
 pub fn mouse_button_virtual_keys() -> [(u16, MouseButton); 5] {
@@ -644,4 +844,61 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     }
 
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    static REGISTRY_TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn registry_test_guard() -> &'static Mutex<()> {
+        REGISTRY_TEST_GUARD.get_or_init(|| Mutex::new(()))
+    }
+
+    fn test_runtime_core() -> Arc<CaptureRuntimeCore> {
+        Arc::new(CaptureRuntimeCore {
+            event_tx: Mutex::new(None),
+            wake_notifier: Mutex::new(None),
+            runtime_state: Mutex::new(HookRuntimeState::default()),
+            lock_active: AtomicBool::new(false),
+            dropped_event_count: AtomicU64::new(0),
+        })
+    }
+
+    fn reset_active_runtime_for_test() {
+        if let Ok(mut guard) = active_capture_runtime_cell().lock() {
+            *guard = None;
+        }
+    }
+
+    #[test]
+    fn active_runtime_registry_rejects_second_live_runtime() {
+        let _guard = registry_test_guard().lock().expect("test guard");
+        reset_active_runtime_for_test();
+
+        let first = test_runtime_core();
+        activate_capture_runtime(&first).expect("first runtime should activate");
+
+        let second = test_runtime_core();
+        let err = activate_capture_runtime(&second).expect_err("second runtime must be rejected");
+        assert!(err.to_string().contains("already active"));
+
+        clear_active_capture_runtime(&first).expect("cleanup");
+    }
+
+    #[test]
+    fn active_runtime_registry_allows_reactivation_after_clear() {
+        let _guard = registry_test_guard().lock().expect("test guard");
+        reset_active_runtime_for_test();
+
+        let first = test_runtime_core();
+        activate_capture_runtime(&first).expect("first runtime should activate");
+        clear_active_capture_runtime(&first).expect("clear first runtime");
+
+        let second = test_runtime_core();
+        activate_capture_runtime(&second).expect("second runtime should activate");
+        clear_active_capture_runtime(&second).expect("clear second runtime");
+    }
 }

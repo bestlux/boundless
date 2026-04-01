@@ -2,83 +2,18 @@ use super::*;
 
 impl WindowsHookCaptureBackend {
     pub(super) fn new(state: &AppState) -> Result<Self> {
-        let (event_tx, event_rx) = mpsc::sync_channel::<HookCaptureEvent>(HOOK_EVENT_QUEUE_CAP);
-        let (startup_tx, startup_rx) = mpsc::channel::<Result<u32>>();
-
-        let hook_thread = thread::spawn(move || {
-            let thread_id = unsafe { GetCurrentThreadId() };
-            if let Err(error) = set_hook_event_sender(Some(event_tx)) {
-                let _ = startup_tx.send(Err(error));
-                return;
-            }
-
-            let _guard = HookSenderGuard;
-            let keyboard_hook = unsafe { install_keyboard_hook() };
-            let mouse_hook = unsafe { install_mouse_hook() };
-            match (keyboard_hook, mouse_hook) {
-                (Ok(keyboard_hook), Ok(mouse_hook)) => {
-                    let _ = startup_tx.send(Ok(thread_id));
-                    if let Err(error) = unsafe { run_hook_message_loop() } {
-                        warn!(error = ?error, "hook message loop exited with error");
-                    }
-                    unhook_windows_hook(keyboard_hook);
-                    unhook_windows_hook(mouse_hook);
-                }
-                (keyboard, mouse) => {
-                    if let Ok(hook) = keyboard.as_ref() {
-                        unhook_windows_hook(*hook);
-                    }
-                    if let Ok(hook) = mouse.as_ref() {
-                        unhook_windows_hook(*hook);
-                    }
-                    let error = keyboard
-                        .err()
-                        .or_else(|| mouse.err())
-                        .unwrap_or_else(|| anyhow::anyhow!("failed to install capture hooks"));
-                    let _ = startup_tx.send(Err(error));
-                }
-            }
-        });
-
-        let hook_thread_id = startup_rx.recv().context("hook startup channel closed")??;
-        set_hook_wake_notifier(Some(std::sync::Arc::new({
+        let capture_runtime = CaptureRuntime::start({
             let state = state.clone();
             move |source| state.notify_input_capture_wake(source)
-        })))
-        .context("set hook wake notifier")?;
-        let (raw_input_thread_id, raw_input_thread, raw_input_enabled) =
-            match spawn_raw_input_thread() {
-                Ok((thread_id, thread)) => (Some(thread_id), Some(thread), true),
-                Err(error) => {
-                    warn!(
-                        error = ?error,
-                        "raw input mouse capture unavailable; falling back to mouse hook position deltas"
-                    );
-                    (None, None, false)
-                }
-            };
+        })?;
 
         Ok(Self {
-            event_rx,
-            hook_thread_id,
-            hook_thread: Some(hook_thread),
-            raw_input_thread_id,
-            raw_input_thread,
-            raw_input_enabled,
-            lock_active: false,
+            capture_runtime,
             control_actions: VecDeque::new(),
             last_cursor: None,
             last_key_down: HashMap::new(),
             last_button_down: HashMap::new(),
         })
-    }
-
-    fn drain_pending_events(&mut self) -> Vec<HookCaptureEvent> {
-        let mut events = Vec::new();
-        while let Ok(event) = self.event_rx.try_recv() {
-            events.push(event);
-        }
-        events
     }
 
     fn update_pressed_state_and_filter(&mut self, event: InputEvent, output: &mut Vec<InputEvent>) {
@@ -128,45 +63,9 @@ impl WindowsHookCaptureBackend {
     }
 
     fn update_raw_input_runtime_state(&mut self) {
-        if !self.raw_input_enabled {
-            return;
-        }
-
-        let finished = self
-            .raw_input_thread
-            .as_ref()
-            .is_some_and(|thread| thread.is_finished());
-        if !finished {
-            return;
-        }
-
-        if let Some(thread) = self.raw_input_thread.take() {
-            let _ = thread.join();
-        }
-        self.raw_input_thread_id = None;
-        self.raw_input_enabled = false;
-        self.last_cursor = None;
-        warn!("raw input capture thread exited; using mouse hook position delta fallback");
-    }
-}
-
-impl Drop for WindowsHookCaptureBackend {
-    fn drop(&mut self) {
-        if self.lock_active {
-            let _ = set_hook_lock_active(false);
-            self.lock_active = false;
-        }
-        if let Some(thread_id) = self.raw_input_thread_id {
-            post_thread_quit(thread_id);
-        }
-        if let Some(thread) = self.raw_input_thread.take() {
-            let _ = thread.join();
-        }
-        self.raw_input_thread_id = None;
-        self.raw_input_enabled = false;
-        post_thread_quit(self.hook_thread_id);
-        if let Some(thread) = self.hook_thread.take() {
-            let _ = thread.join();
+        let was_enabled = self.capture_runtime.raw_input_enabled();
+        if !self.capture_runtime.refresh() && was_enabled {
+            self.last_cursor = None;
         }
     }
 }
@@ -211,7 +110,7 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
         self.last_key_down.clear();
         self.last_button_down.clear();
         self.control_actions.clear();
-        let _ = self.drain_pending_events();
+        let _ = self.capture_runtime.drain_events();
     }
 
     fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
@@ -220,10 +119,10 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
         let mut output = Vec::new();
         let mut pending_move: Option<(i32, i32)> = None;
 
-        for event in self.drain_pending_events() {
+        for event in self.capture_runtime.drain_events() {
             match event {
                 HookCaptureEvent::MouseDelta { dx, dy } => {
-                    if self.raw_input_enabled {
+                    if self.capture_runtime.raw_input_enabled() {
                         Self::accumulate_pending_move(&mut pending_move, dx, dy);
                     }
                 }
@@ -231,7 +130,9 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
                     if let Some((last_x, last_y)) = self.last_cursor {
                         let dx = x - last_x;
                         let dy = y - last_y;
-                        if !self.raw_input_enabled || !self.lock_active {
+                        if !self.capture_runtime.raw_input_enabled()
+                            || !self.capture_runtime.lock_active()
+                        {
                             Self::accumulate_pending_move(&mut pending_move, dx, dy);
                         }
                     }
@@ -260,11 +161,7 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
     }
 
     fn set_lock_active(&mut self, active: bool) -> Result<bool> {
-        if self.lock_active != active {
-            set_hook_lock_active(active)?;
-            self.lock_active = active;
-        }
-        Ok(self.lock_active)
+        self.capture_runtime.set_lock_active(active)
     }
 
     fn lock_supported(&self) -> bool {
@@ -272,7 +169,7 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
     }
 
     fn backend_mode(&self) -> &'static str {
-        if self.raw_input_enabled {
+        if self.capture_runtime.raw_input_enabled() {
             "hook_raw"
         } else {
             "hook"
@@ -284,6 +181,6 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
     }
 
     fn take_dropped_event_count(&mut self) -> u64 {
-        take_hook_dropped_event_count()
+        self.capture_runtime.take_dropped_event_count()
     }
 }

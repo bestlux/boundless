@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
@@ -53,6 +54,7 @@ pub(crate) const FILE_TRANSFER_CHUNK_BYTES: usize = 48 * 1024;
 mod clipboard_ops;
 mod clipboard_state;
 mod config_ops;
+mod control_plane_snapshot_ops;
 mod core_ops;
 mod diagnostics_ops;
 mod discovery_state;
@@ -112,6 +114,23 @@ pub struct PendingInjectInputFrame {
     pub retry_count: u8,
     pub next_retry_at: Option<Instant>,
     pub events: Vec<InputEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ControlPlaneSnapshotBundle {
+    pub(crate) config: RuntimeConfig,
+    pub(crate) peers: Vec<PeerConfig>,
+    pub(crate) layout_matrix: String,
+    pub(crate) features: BTreeMap<String, bool>,
+    pub(crate) discovered_endpoints: Vec<(String, DiscoveredPeerEndpoint)>,
+    pub(crate) pending_requests: Vec<PendingNearbyPairingRequest>,
+    pub(crate) transport_events: Vec<TransportEventRecord>,
+    pub(crate) input_owner_peer_id: Option<String>,
+    pub(crate) input_capture_target_peer_id: Option<String>,
+    pub(crate) active_input_capture_target_peer_id: Option<String>,
+    pub(crate) input_locked: bool,
+    pub(crate) input_lock_supported: bool,
+    pub(crate) mdns_active: bool,
 }
 
 impl PendingInjectInputFrame {

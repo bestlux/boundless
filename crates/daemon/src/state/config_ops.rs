@@ -154,7 +154,13 @@ impl AppState {
                 .await;
             resolve_switch_all_target_order_from_matrix(&config, matrix.as_ref())
         };
-        let current_target = self.input.capture_target_peer_id.read().await.clone();
+        let current_target = self
+            .input
+            .control
+            .capture_target_peer_id
+            .read()
+            .await
+            .clone();
         if order.is_empty() {
             return None;
         }
@@ -174,7 +180,7 @@ impl AppState {
         save_config_at(&self.config_path, &config)?;
 
         if name == "share_input" {
-            self.input.router.write().await.set_enabled(enabled);
+            self.input.control.router.write().await.set_enabled(enabled);
             self.notify_input_inject_wake("share_input_toggled");
             self.notify_input_capture_wake("share_input_toggled");
         } else if name == "share_clipboard" && !enabled {

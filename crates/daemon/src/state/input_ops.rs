@@ -76,11 +76,66 @@ fn remove_oldest_coalescible_pending_inject_frame(
 }
 
 impl AppState {
+    pub async fn queue_input_move(&self, peer_id: &str, dx: i32, dy: i32) -> Result<()> {
+        self.queue_input_events(peer_id, vec![InputEvent::MouseMove { dx, dy }])
+            .await
+    }
+
+    pub async fn queue_input_key(
+        &self,
+        peer_id: &str,
+        scan_code: u16,
+        key_state: KeyState,
+    ) -> Result<()> {
+        self.queue_input_events(
+            peer_id,
+            vec![InputEvent::Key {
+                scan_code,
+                state: key_state,
+            }],
+        )
+        .await
+    }
+
+    pub async fn queue_input_events(&self, peer_id: &str, events: Vec<InputEvent>) -> Result<()> {
+        if self.get_peer(peer_id).await.is_none() {
+            anyhow::bail!("unknown peer {peer_id}");
+        }
+        if events.is_empty() {
+            anyhow::bail!("input frame must include at least one event");
+        }
+        if events.len() > MAX_EVENTS_PER_FRAME {
+            anyhow::bail!(
+                "input frame event count exceeds limit: {} > {}",
+                events.len(),
+                MAX_EVENTS_PER_FRAME
+            );
+        }
+
+        let sequence = {
+            let mut sequences = self.input.control.sequence_by_peer.write().await;
+            let entry = sequences.entry(peer_id.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+
+        self.queue_outgoing_input_payload(
+            peer_id,
+            OutboundPayload::InputFrame {
+                sequence,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events,
+            },
+        )
+        .await;
+        Ok(())
+    }
+
     async fn enqueue_pending_inject_input_frame(
         &self,
         frame: PendingInjectInputFrame,
     ) -> PendingInjectEnqueueReport {
-        let mut queue = self.input.pending_inject_frames.write().await;
+        let mut queue = self.input.inject.pending_inject_frames.write().await;
         let incoming_is_move_only = move_only_delta(&frame.events).is_some();
         if let Some((older_sequence, newer_sequence, merged_event_count)) =
             try_coalesce_pending_inject_back(&mut queue, &frame)
@@ -130,7 +185,7 @@ impl AppState {
     }
 
     pub(crate) async fn clear_pending_inject_input_frames_for_peer(&self, peer_id: &str) {
-        let mut queue = self.input.pending_inject_frames.write().await;
+        let mut queue = self.input.inject.pending_inject_frames.write().await;
         queue.retain(|frame| frame.peer_id != peer_id);
     }
 
@@ -227,7 +282,7 @@ impl AppState {
         };
         let received_timestamp_unix_ms = Utc::now().timestamp_millis();
         let mut decision = {
-            let mut router = self.input.router.write().await;
+            let mut router = self.input.control.router.write().await;
             router
                 .route_frame(&frame, &mut sink)
                 .map_err(anyhow::Error::from)?
@@ -243,7 +298,7 @@ impl AppState {
             };
             let mut blocked_reason: Option<&'static str> = None;
             decision = {
-                let mut router = self.input.router.write().await;
+                let mut router = self.input.control.router.write().await;
                 let mut retried_decision = router
                     .route_frame(&frame, &mut retry_sink)
                     .map_err(anyhow::Error::from)?;
@@ -357,7 +412,7 @@ impl AppState {
 
     #[cfg(test)]
     pub async fn pending_inject_input_frame_count(&self) -> usize {
-        self.input.pending_inject_frames.read().await.len()
+        self.input.inject.pending_inject_frames.read().await.len()
     }
 
     pub async fn dequeue_pending_inject_input_frames_up_to(
@@ -368,7 +423,7 @@ impl AppState {
             return Vec::new();
         }
 
-        let mut queue = self.input.pending_inject_frames.write().await;
+        let mut queue = self.input.inject.pending_inject_frames.write().await;
         let drain_count = queue.len().min(max_frames);
         queue.drain(..drain_count).collect()
     }
@@ -381,7 +436,7 @@ impl AppState {
             return;
         }
 
-        let mut queue = self.input.pending_inject_frames.write().await;
+        let mut queue = self.input.inject.pending_inject_frames.write().await;
         for frame in frames {
             if let Some((older_sequence, newer_sequence, merged_event_count)) =
                 try_coalesce_pending_inject_back(&mut queue, &frame)
@@ -424,11 +479,18 @@ impl AppState {
     }
 
     pub async fn has_pending_inject_input_frames(&self) -> bool {
-        !self.input.pending_inject_frames.read().await.is_empty()
+        !self
+            .input
+            .inject
+            .pending_inject_frames
+            .read()
+            .await
+            .is_empty()
     }
 
     pub async fn next_pending_inject_retry_at(&self) -> Option<Instant> {
         self.input
+            .inject
             .pending_inject_frames
             .read()
             .await
@@ -440,15 +502,20 @@ impl AppState {
     fn observe_pending_inject_high_water(&self, depth: usize) -> Option<usize> {
         let mut current = self
             .input
+            .inject
             .pending_inject_high_water
             .load(std::sync::atomic::Ordering::Relaxed);
         while depth > current {
-            match self.input.pending_inject_high_water.compare_exchange(
-                current,
-                depth,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            ) {
+            match self
+                .input
+                .inject
+                .pending_inject_high_water
+                .compare_exchange(
+                    current,
+                    depth,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                ) {
                 Ok(_) => return Some(depth),
                 Err(observed) => current = observed,
             }
@@ -558,7 +625,13 @@ impl AppState {
             anyhow::bail!("unknown peer {peer_id}");
         }
 
-        let claimed = self.input.router.write().await.claim_owner(peer_id, force);
+        let claimed = self
+            .input
+            .control
+            .router
+            .write()
+            .await
+            .claim_owner(peer_id, force);
         if claimed {
             self.note_input_owner_transition().await;
         }
@@ -566,12 +639,18 @@ impl AppState {
     }
 
     pub async fn input_injection_allowed_for_peer(&self, peer_id: &str) -> bool {
-        let router = self.input.router.read().await;
+        let router = self.input.control.router.read().await;
         router.is_enabled() && router.owner() == Some(peer_id)
     }
 
     pub async fn release_input_owner(&self, peer_id: &str) -> bool {
-        let released = self.input.router.write().await.release_owner(peer_id);
+        let released = self
+            .input
+            .control
+            .router
+            .write()
+            .await
+            .release_owner(peer_id);
         if released {
             self.note_input_owner_transition().await;
         }
@@ -579,12 +658,13 @@ impl AppState {
     }
 
     pub async fn note_input_owner_transition(&self) {
-        *self.input.owner_last_changed_at.write().await = Some(std::time::Instant::now());
+        *self.input.control.owner_last_changed_at.write().await = Some(std::time::Instant::now());
         self.notify_input_inject_wake("input_owner_changed");
     }
 
     pub async fn input_owner(&self) -> Option<String> {
         self.input
+            .control
             .router
             .read()
             .await
@@ -603,7 +683,7 @@ impl AppState {
             }
         };
 
-        let mut target = self.input.capture_target_peer_id.write().await;
+        let mut target = self.input.control.capture_target_peer_id.write().await;
         *target = next.clone();
         drop(target);
         self.notify_input_capture_wake("capture_target_changed");
@@ -611,40 +691,33 @@ impl AppState {
     }
 
     pub async fn clear_input_capture_target(&self) {
-        *self.input.capture_target_peer_id.write().await = None;
+        *self.input.control.capture_target_peer_id.write().await = None;
         self.notify_input_capture_wake("capture_target_cleared");
     }
 
     pub async fn input_capture_target(&self) -> Option<String> {
-        self.input.capture_target_peer_id.read().await.clone()
+        self.input
+            .control
+            .capture_target_peer_id
+            .read()
+            .await
+            .clone()
     }
 
     pub async fn active_input_capture_target(&self) -> Option<String> {
         let target = self.input_capture_target().await?;
         let config = self.config.read().await;
-        let share_input_enabled = config.features.get("share_input").copied().unwrap_or(true);
-        if !share_input_enabled {
-            return None;
-        }
-        if config
-            .peers
-            .iter()
-            .any(|peer| peer.peer_id == target && peer.connected)
-        {
-            Some(target)
-        } else {
-            None
-        }
+        active_input_capture_target_from_config(&config, &target)
     }
 
     pub async fn set_input_lock_runtime(&self, active: bool, supported: bool) {
-        *self.input.lock_active.write().await = active;
-        *self.input.lock_supported.write().await = supported;
+        *self.input.control.lock_active.write().await = active;
+        *self.input.control.lock_supported.write().await = supported;
     }
 
     pub async fn input_lock_runtime(&self) -> (bool, bool) {
-        let active = *self.input.lock_active.read().await;
-        let supported = *self.input.lock_supported.read().await;
+        let active = *self.input.control.lock_active.read().await;
+        let supported = *self.input.control.lock_supported.read().await;
         (active, supported)
     }
 
@@ -670,6 +743,7 @@ impl AppState {
                 let cooldown = Duration::from_millis(INPUT_OWNER_AUTO_STEAL_COOLDOWN_MS);
                 let cooldown_ready = self
                     .input
+                    .control
                     .owner_last_changed_at
                     .try_read()
                     .ok()
@@ -706,4 +780,20 @@ impl AppState {
             size_bytes: 0,
         });
     }
+}
+
+pub(crate) fn active_input_capture_target_from_config(
+    config: &RuntimeConfig,
+    target: &str,
+) -> Option<String> {
+    let share_input_enabled = config.features.get("share_input").copied().unwrap_or(true);
+    if !share_input_enabled {
+        return None;
+    }
+
+    config
+        .peers
+        .iter()
+        .any(|peer| peer.peer_id == target && peer.connected)
+        .then(|| target.to_string())
 }
