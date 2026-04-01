@@ -4,14 +4,13 @@ use std::time::{Duration, Instant};
 use std::collections::VecDeque;
 
 #[cfg(windows)]
-use std::{
-    collections::HashMap,
-    sync::mpsc,
-    thread::{self, JoinHandle},
-};
+use std::collections::HashMap;
+#[cfg(all(windows, test))]
+use std::sync::mpsc;
 
 #[cfg(windows)]
 use anyhow::Context;
+#[cfg(windows)]
 use anyhow::Result;
 use tokio::time;
 use tracing::warn;
@@ -21,9 +20,6 @@ use chrono::Utc;
 use core_input::{InputEvent, MAX_EVENTS_PER_FRAME, SwitchDirection};
 
 use crate::state::{AppState, PendingInjectInputFrame, TransportEventRecord};
-
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
 #[cfg(all(windows, test))]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -68,13 +64,10 @@ use platform_windows::input::raw_mouse_relative_delta;
 use platform_windows::input::send_input_records_with_sender;
 #[cfg(windows)]
 use platform_windows::input::{
-    HOOK_EVENT_QUEUE_CAP, HookCaptureEvent, HookControlAction, HookSenderGuard,
-    captured_key_virtual_keys, cursor_position, input_event_kind, input_records_for_event,
-    install_keyboard_hook, install_mouse_hook, is_virtual_key_down, mouse_button_from_virtual_key,
-    mouse_button_virtual_keys, post_thread_quit, run_hook_message_loop, send_input_records,
-    set_hook_event_sender, set_hook_lock_active, set_hook_wake_notifier, spawn_raw_input_thread,
-    take_hook_dropped_event_count, unhook_windows_hook, virtual_key_for_mouse_button,
-    vk_to_scan_code,
+    CaptureRuntime, HookCaptureEvent, HookControlAction, captured_key_virtual_keys,
+    cursor_position, input_event_kind, input_records_for_event, is_virtual_key_down,
+    mouse_button_from_virtual_key, mouse_button_virtual_keys, send_input_records,
+    virtual_key_for_mouse_button, vk_to_scan_code,
 };
 #[cfg(all(test, not(windows)))]
 use runtime::apply_frame;
@@ -194,13 +187,7 @@ struct WindowsPollingCaptureBackend {
 
 #[cfg(windows)]
 struct WindowsHookCaptureBackend {
-    event_rx: mpsc::Receiver<HookCaptureEvent>,
-    hook_thread_id: u32,
-    hook_thread: Option<JoinHandle<()>>,
-    raw_input_thread_id: Option<u32>,
-    raw_input_thread: Option<JoinHandle<()>>,
-    raw_input_enabled: bool,
-    lock_active: bool,
+    capture_runtime: CaptureRuntime,
     control_actions: VecDeque<CaptureControlAction>,
     last_cursor: Option<(i32, i32)>,
     last_key_down: HashMap<u16, bool>,
@@ -1383,13 +1370,7 @@ mod tests {
     fn hook_backend_flushes_mouse_move_before_button_event() {
         let (tx, rx) = mpsc::channel();
         let mut backend = WindowsHookCaptureBackend {
-            event_rx: rx,
-            hook_thread_id: 0,
-            hook_thread: None,
-            raw_input_thread_id: None,
-            raw_input_thread: None,
-            raw_input_enabled: true,
-            lock_active: false,
+            capture_runtime: CaptureRuntime::from_test_parts(rx, true),
             control_actions: VecDeque::new(),
             last_cursor: None,
             last_key_down: HashMap::new(),
@@ -1442,13 +1423,7 @@ mod tests {
     fn hook_backend_uses_mouse_position_when_unlocked_with_raw_mode() {
         let (tx, rx) = mpsc::channel();
         let mut backend = WindowsHookCaptureBackend {
-            event_rx: rx,
-            hook_thread_id: 0,
-            hook_thread: None,
-            raw_input_thread_id: None,
-            raw_input_thread: None,
-            raw_input_enabled: true,
-            lock_active: false,
+            capture_runtime: CaptureRuntime::from_test_parts(rx, true),
             control_actions: VecDeque::new(),
             last_cursor: None,
             last_key_down: HashMap::new(),
@@ -1472,13 +1447,7 @@ mod tests {
     fn hook_backend_preserves_repeated_key_down_events() {
         let (tx, rx) = mpsc::channel();
         let mut backend = WindowsHookCaptureBackend {
-            event_rx: rx,
-            hook_thread_id: 0,
-            hook_thread: None,
-            raw_input_thread_id: None,
-            raw_input_thread: None,
-            raw_input_enabled: false,
-            lock_active: false,
+            capture_runtime: CaptureRuntime::from_test_parts(rx, false),
             control_actions: VecDeque::new(),
             last_cursor: None,
             last_key_down: HashMap::new(),

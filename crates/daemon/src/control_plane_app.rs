@@ -86,7 +86,8 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
     }
 
     async fn list_peers(&self) -> Result<Vec<UiPairedPeer>> {
-        Ok(build_paired_peers(&self.state).await)
+        let bundle = self.state.control_plane_snapshot_bundle().await;
+        Ok(build_paired_peers(&bundle))
     }
 
     async fn remove_peer(&self, command: RemovePeerCommand) -> Result<OperationReply> {
@@ -467,41 +468,45 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
 }
 
 async fn build_status_snapshot(state: &AppState) -> Result<StatusSnapshot> {
-    let snapshot = state.snapshot().await;
-    let (input_locked, input_lock_supported) = state.input_lock_runtime().await;
-    let capture_target_peer_id = state.active_input_capture_target().await;
-    let effective_api_transport = snapshot.api_transport.effective();
+    let bundle = state.control_plane_snapshot_bundle().await;
+    Ok(build_status_snapshot_from_bundle(bundle))
+}
+
+fn build_status_snapshot_from_bundle(
+    bundle: crate::state::ControlPlaneSnapshotBundle,
+) -> StatusSnapshot {
+    let effective_api_transport = bundle.config.api_transport.effective();
     let api_pipe_name = if matches!(effective_api_transport, ApiTransport::NamedPipe) {
-        snapshot.api_pipe_name
+        bundle.config.api_pipe_name
     } else {
         String::new()
     };
 
-    Ok(StatusSnapshot {
+    StatusSnapshot {
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-        machine_id: snapshot.machine_id,
-        peer_count: snapshot.peers.len() as u32,
-        protocol_version: snapshot.protocol_version,
-        api_bind: snapshot.api_bind,
+        machine_id: bundle.config.machine_id,
+        peer_count: bundle.peers.len() as u32,
+        protocol_version: bundle.config.protocol_version,
+        api_bind: bundle.config.api_bind,
         api_transport: effective_api_transport.as_str().to_string(),
         api_pipe_name,
-        input_locked,
-        input_lock_supported,
-        capture_target_peer_id,
-    })
+        input_locked: bundle.input_locked,
+        input_lock_supported: bundle.input_lock_supported,
+        capture_target_peer_id: bundle.active_input_capture_target_peer_id,
+    }
 }
 
 async fn build_ui_snapshot(state: &AppState) -> Result<UiSnapshot> {
-    let paired_peers = build_paired_peers(state).await;
-    let discovered_peers = build_discovered_peers(state, &paired_peers).await;
-    let pending_requests = build_pending_requests(state).await;
-    let machine_id = state.snapshot().await.machine_id;
+    let bundle = state.control_plane_snapshot_bundle().await;
+    let paired_peers = build_paired_peers(&bundle);
+    let discovered_peers = build_discovered_peers(&bundle, &paired_peers);
+    let pending_requests = build_pending_requests(&bundle);
 
     Ok(UiSnapshot {
         generated_at: chrono::Utc::now().to_rfc3339(),
         daemon_online: true,
-        machine_id,
-        layout_matrix: state.layout().await,
+        machine_id: bundle.config.machine_id,
+        layout_matrix: bundle.layout_matrix,
         discovered_peers,
         paired_peers,
         pending_requests,
@@ -509,19 +514,28 @@ async fn build_ui_snapshot(state: &AppState) -> Result<UiSnapshot> {
 }
 
 async fn build_console_snapshot(state: &AppState) -> Result<ConsoleSnapshot> {
-    let snapshot = state.snapshot().await;
-    let paired_peers = build_paired_peers(state).await;
+    let bundle = state.control_plane_snapshot_bundle().await;
+    Ok(build_console_snapshot_from_bundle(bundle))
+}
 
-    Ok(ConsoleSnapshot {
-        status: build_status_snapshot(state).await?,
-        layout_matrix: state.layout().await,
+fn build_console_snapshot_from_bundle(
+    bundle: crate::state::ControlPlaneSnapshotBundle,
+) -> ConsoleSnapshot {
+    let status = build_status_snapshot_from_bundle(bundle.clone());
+    let paired_peers = build_paired_peers(&bundle);
+    let discovered_peers = build_discovered_peers(&bundle, &paired_peers);
+    let pending_requests = build_pending_requests(&bundle);
+    let features = bundle.features.clone();
+
+    ConsoleSnapshot {
+        status,
+        layout_matrix: bundle.layout_matrix,
         peers: paired_peers.clone(),
-        features: state.feature_map().await,
-        discovered_peers: build_discovered_peers(state, &paired_peers).await,
-        pending_requests: build_pending_requests(state).await,
-        transport_events: state
-            .transport_events()
-            .await
+        features,
+        discovered_peers,
+        pending_requests,
+        transport_events: bundle
+            .transport_events
             .into_iter()
             .map(|event| TransportEventSnapshot {
                 timestamp: event.timestamp.to_rfc3339(),
@@ -532,17 +546,17 @@ async fn build_console_snapshot(state: &AppState) -> Result<ConsoleSnapshot> {
                 size_bytes: event.size_bytes,
             })
             .collect(),
-        input_owner_peer_id: state.input_owner().await,
-        input_capture_target_peer_id: state.input_capture_target().await,
-        mdns_active: state.mdns_active().await,
-        local_display_name: snapshot.device_name,
-    })
+        input_owner_peer_id: bundle.input_owner_peer_id,
+        input_capture_target_peer_id: bundle.input_capture_target_peer_id,
+        mdns_active: bundle.mdns_active,
+        local_display_name: bundle.config.device_name,
+    }
 }
 
-async fn build_paired_peers(state: &AppState) -> Vec<UiPairedPeer> {
-    state
-        .list_peers()
-        .await
+fn build_paired_peers(bundle: &crate::state::ControlPlaneSnapshotBundle) -> Vec<UiPairedPeer> {
+    bundle
+        .peers
+        .clone()
         .into_iter()
         .map(|peer| UiPairedPeer {
             peer_id: peer.peer_id,
@@ -553,19 +567,19 @@ async fn build_paired_peers(state: &AppState) -> Vec<UiPairedPeer> {
         .collect()
 }
 
-async fn build_discovered_peers(
-    state: &AppState,
+fn build_discovered_peers(
+    bundle: &crate::state::ControlPlaneSnapshotBundle,
     paired_peers: &[UiPairedPeer],
 ) -> Vec<UiDiscoveredPeer> {
-    let local_machine_id = state.snapshot().await.machine_id;
+    let local_machine_id = bundle.config.machine_id.clone();
     let paired_peer_ids = paired_peers
         .iter()
         .map(|peer| peer.peer_id.clone())
         .collect::<Vec<_>>();
 
-    let mut discovered_peers = state
-        .discovered_endpoints()
-        .await
+    let mut discovered_peers = bundle
+        .discovered_endpoints
+        .clone()
         .into_iter()
         .filter(|(machine_id, _)| {
             machine_id != &local_machine_id
@@ -587,10 +601,12 @@ async fn build_discovered_peers(
     discovered_peers
 }
 
-async fn build_pending_requests(state: &AppState) -> Vec<UiPendingRequest> {
-    let mut pending_requests = state
-        .list_pending_nearby_pairing_requests()
-        .await
+fn build_pending_requests(
+    bundle: &crate::state::ControlPlaneSnapshotBundle,
+) -> Vec<UiPendingRequest> {
+    let mut pending_requests = bundle
+        .pending_requests
+        .clone()
         .into_iter()
         .map(|request| {
             let requires_verification_code = request.verification_code.is_some();
