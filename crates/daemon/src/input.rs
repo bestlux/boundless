@@ -10,7 +10,6 @@ use std::sync::mpsc;
 
 #[cfg(windows)]
 use anyhow::Context;
-#[cfg(windows)]
 use anyhow::Result;
 use tokio::time;
 use tracing::warn;
