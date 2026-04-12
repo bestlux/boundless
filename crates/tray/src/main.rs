@@ -702,6 +702,7 @@ mod windows_app {
 
     #[cfg(test)]
     mod tests {
+        use super::dashboard_layout::compute_visible_bounds;
         use super::*;
 
         #[test]
@@ -864,6 +865,33 @@ mod windows_app {
             assert!(
                 validate_layout_before_apply(&grid, "local-machine-id").is_err(),
                 "layout with multiple local cells must fail apply validation"
+            );
+        }
+
+        #[test]
+        fn layout_visible_bounds_include_drag_origin_for_edge_drags() {
+            let mut grid = std::collections::HashMap::<(i32, i32), String>::new();
+            grid.insert((3, 3), "local-machine-id".to_string());
+
+            let bounds = compute_visible_bounds(&grid, Some((4, 3)));
+
+            assert_eq!(
+                bounds,
+                (2, 2, 5, 4),
+                "dragging an edge device should keep its original edge cell visible"
+            );
+        }
+
+        #[test]
+        fn layout_visible_bounds_center_on_drag_origin_when_grid_is_temporarily_empty() {
+            let grid = std::collections::HashMap::<(i32, i32), String>::new();
+
+            let bounds = compute_visible_bounds(&grid, Some((6, 0)));
+
+            assert_eq!(
+                bounds,
+                (4, 0, 6, 2),
+                "dragging the only visible device should still leave a drop target near its origin"
             );
         }
 

@@ -28,7 +28,7 @@ mod dashboard_workflow {
     include!("dashboard/workflow.rs");
 }
 
-use dashboard_model::{AppMsg, DashboardApp, Tab};
+use dashboard_model::{AppMsg, DashboardApp, Tab, TOAST_ERROR_SECS, TOAST_SUCCESS_SECS};
 use dashboard_task_runner::{DashboardTaskRunner, SubmitPairingCodeTask};
 use dashboard_window::{
     hide_dashboard_window, native_window_handle_from_creation_context, request_dashboard_exit,
@@ -46,7 +46,8 @@ pub(super) fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_visible(false)
-            .with_inner_size([760.0, 560.0])
+            .with_inner_size([800.0, 600.0])
+            .with_resizable(false)
             .with_icon(make_window_icon()?)
             .with_title("Boundless Dashboard"),
         ..Default::default()
@@ -137,6 +138,14 @@ impl eframe::App for DashboardApp {
         let ctx = ui.ctx().clone();
         self.render_pairing_dialog(&ctx);
 
+        // ── Tick + render toast notifications as floating overlay ───────
+        self.tick_toasts();
+        if self.has_active_toasts() {
+            // Keep repainting so success toasts auto-dismiss on time
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        self.render_toast_overlay(&ctx);
+
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Boundless");
@@ -147,20 +156,10 @@ impl eframe::App for DashboardApp {
             });
             ui.separator();
 
-            if let Some(err) = &self.last_error {
-                let color = if self.last_message_is_error {
-                    egui::Color32::LIGHT_RED
-                } else {
-                    egui::Color32::LIGHT_GREEN
-                };
-                ui.add(egui::Label::new(egui::RichText::new(err).color(color)));
-                if self.pairing_retry_available
-                    && !self.pairing_in_progress
-                    && let Some(flow) = self.pairing_flow.clone()
-                    && ui.button("Retry Pairing Request").clicked()
-                {
-                    self.start_pairing(flow, ctx.clone());
-                }
+            let pairing_modal_visible =
+                self.pairing_in_progress || self.pairing_challenge.is_some();
+            if !pairing_modal_visible && self.pairing_last_error.is_some() {
+                self.render_pairing_error(ui, &ctx);
                 ui.separator();
             }
 
@@ -170,6 +169,105 @@ impl eframe::App for DashboardApp {
                 Tab::Settings => self.render_settings_tab(ui),
             }
         });
+    }
+}
+
+impl DashboardApp {
+    fn render_toast_overlay(&mut self, ctx: &egui::Context) {
+        if self.toasts.is_empty() {
+            return;
+        }
+
+        // Collect toast data so we can render without borrowing self
+        let toast_data: Vec<(u64, String, bool, f32)> = self
+            .toasts
+            .iter()
+            .map(|t| {
+                let age = Instant::now().duration_since(t.created_at).as_secs_f32();
+                let max_age = if t.is_error {
+                    TOAST_ERROR_SECS as f32
+                } else {
+                    TOAST_SUCCESS_SECS as f32
+                };
+                // Fade out in the last 0.5s
+                let alpha = ((max_age - age) / 0.5).clamp(0.0, 1.0);
+                (t.id, t.message.clone(), t.is_error, alpha)
+            })
+            .collect();
+
+        let mut dismissed_id = None;
+
+        egui::Area::new(egui::Id::new("toast_overlay"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 8.0))
+            .order(egui::Order::Foreground)
+            .interactable(true)
+            .show(ctx, |ui| {
+                ui.set_max_width(340.0);
+                for (id, message, is_error, alpha) in &toast_data {
+                    let (bg, border, text_color) = if *is_error {
+                        (
+                            egui::Color32::from_rgba_unmultiplied(100, 30, 30, (220.0 * alpha) as u8),
+                            egui::Color32::from_rgba_unmultiplied(180, 60, 60, (200.0 * alpha) as u8),
+                            egui::Color32::from_rgba_unmultiplied(255, 180, 180, (255.0 * alpha) as u8),
+                        )
+                    } else {
+                        (
+                            egui::Color32::from_rgba_unmultiplied(25, 80, 50, (220.0 * alpha) as u8),
+                            egui::Color32::from_rgba_unmultiplied(50, 160, 90, (200.0 * alpha) as u8),
+                            egui::Color32::from_rgba_unmultiplied(180, 255, 200, (255.0 * alpha) as u8),
+                        )
+                    };
+                    egui::Frame::new()
+                        .fill(bg)
+                        .corner_radius(8.0)
+                        .inner_margin(10.0)
+                        .stroke(egui::Stroke::new(1.0, border))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(message)
+                                            .color(text_color)
+                                            .size(12.5),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add(egui::Button::new(
+                                                egui::RichText::new("x")
+                                                    .color(text_color)
+                                                    .size(11.0),
+                                            ).frame(false))
+                                            .clicked()
+                                        {
+                                            dismissed_id = Some(*id);
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
+            });
+
+        if let Some(id) = dismissed_id {
+            self.dismiss_toast(id);
+        }
+    }
+}
+
+/// Trim an ISO 8601 timestamp to a human-friendly `YYYY-MM-DD HH:MM:SS`.
+/// Falls back to the original string if the format is unexpected.
+fn format_timestamp(iso: &str) -> &str {
+    // ISO 8601: "2026-04-12T22:57:03.840916700+00:00"
+    //           ↑ 19 chars to get "2026-04-12T22:57:03"
+    if iso.len() >= 19 && iso.as_bytes().get(10) == Some(&b'T') {
+        &iso[..19]
+    } else {
+        iso
     }
 }
 

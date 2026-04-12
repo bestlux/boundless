@@ -26,14 +26,31 @@ pub(super) enum Tab {
     Settings,
 }
 
+// ── Toast notification system ──────────────────────────────────────────
+pub(super) struct Toast {
+    pub(super) id: u64,
+    pub(super) message: String,
+    pub(super) is_error: bool,
+    pub(super) created_at: Instant,
+}
+
+pub(super) const TOAST_SUCCESS_SECS: u64 = 4;
+pub(super) const TOAST_ERROR_SECS: u64 = 12;
+
 pub(super) struct DashboardApp {
     pub(super) ctx: Arc<AppContext>,
     pub(super) _tray_icon: Option<TrayIcon>,
     pub(super) snapshot: UiSnapshot,
-    pub(super) last_error: Option<String>,
-    pub(super) last_message_is_error: bool,
     pub(super) tx: Sender<AppMsg>,
     pub(super) rx: Receiver<AppMsg>,
+
+    // Toast notifications (replaces old inline last_error banner)
+    pub(super) toasts: Vec<Toast>,
+    pub(super) toast_seq: u64,
+
+    // Pairing-specific error state (shown in pairing dialog context)
+    pub(super) pairing_last_error: Option<String>,
+    pub(super) pairing_retry_available: bool,
 
     pub(super) selected_tab: Tab,
     pub(super) manual_host: String,
@@ -44,7 +61,6 @@ pub(super) struct DashboardApp {
     pub(super) pairing_code: String,
     pub(super) pairing_alias: String,
     pub(super) pairing_in_progress: bool,
-    pub(super) pairing_retry_available: bool,
     pub(super) pairing_attempt_seq: u64,
     pub(super) active_pairing_attempt_id: Option<u64>,
     pub(super) pending_onboarding_focus: bool,
@@ -58,6 +74,13 @@ pub(super) struct DashboardApp {
     pub(super) layout_initialized: bool,
     pub(super) dragging_peer: Option<(String, (i32, i32))>,
     pub(super) last_layout_matrix: String,
+
+    // Undo: stash previous layout state before each drag/action
+    pub(super) prev_layout_grid: Option<HashMap<(i32, i32), String>>,
+    pub(super) prev_layout_unassigned: Option<Vec<String>>,
+
+    // Apply confirmation dialog
+    pub(super) confirm_apply_pending: bool,
 }
 
 impl DashboardApp {
@@ -94,14 +117,28 @@ impl DashboardApp {
                 .send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
 
+        let mut toasts = Vec::new();
+        let mut toast_seq = 0u64;
+        if let Some(err) = tray_init_error {
+            toast_seq += 1;
+            toasts.push(Toast {
+                id: toast_seq,
+                message: err,
+                is_error: true,
+                created_at: Instant::now(),
+            });
+        }
+
         Self {
             ctx: app_ctx,
             _tray_icon: tray_icon,
             snapshot: UiSnapshot::default(),
-            last_error: tray_init_error,
-            last_message_is_error: true,
             tx,
             rx,
+            toasts,
+            toast_seq,
+            pairing_last_error: None,
+            pairing_retry_available: false,
             selected_tab: Tab::Status,
             manual_host: String::new(),
             manual_port: "15200".to_string(),
@@ -110,7 +147,6 @@ impl DashboardApp {
             pairing_code: String::new(),
             pairing_alias: String::new(),
             pairing_in_progress: false,
-            pairing_retry_available: false,
             pairing_attempt_seq: 0,
             active_pairing_attempt_id: None,
             pending_onboarding_focus: false,
@@ -123,6 +159,9 @@ impl DashboardApp {
             layout_initialized: false,
             dragging_peer: None,
             last_layout_matrix: String::new(),
+            prev_layout_grid: None,
+            prev_layout_unassigned: None,
+            confirm_apply_pending: false,
         }
     }
 
@@ -134,7 +173,7 @@ impl DashboardApp {
         self.pairing_challenge = None;
         self.pairing_code.clear();
         self.pairing_alias = flow.default_alias;
-        self.last_error = None;
+        self.pairing_last_error = None;
         self.pairing_retry_available = false;
         self.active_pairing_attempt_id = Some(attempt_id);
         attempt_id
@@ -148,20 +187,75 @@ impl DashboardApp {
         self.active_pairing_attempt_id = None;
     }
 
+    // ── Toast helpers ──────────────────────────────────────────────────
+    pub(super) fn push_toast(&mut self, message: String, is_error: bool) {
+        self.toast_seq += 1;
+        self.toasts.push(Toast {
+            id: self.toast_seq,
+            message,
+            is_error,
+            created_at: Instant::now(),
+        });
+    }
+
+    pub(super) fn tick_toasts(&mut self) {
+        let now = Instant::now();
+        self.toasts.retain(|t| {
+            let max_age = if t.is_error {
+                Duration::from_secs(TOAST_ERROR_SECS)
+            } else {
+                Duration::from_secs(TOAST_SUCCESS_SECS)
+            };
+            now.duration_since(t.created_at) < max_age
+        });
+    }
+
+    pub(super) fn dismiss_toast(&mut self, id: u64) {
+        self.toasts.retain(|t| t.id != id);
+    }
+
+    pub(super) fn has_active_toasts(&self) -> bool {
+        !self.toasts.is_empty()
+    }
+
+    // ── Layout undo helpers ────────────────────────────────────────────
+    pub(super) fn stash_layout_for_undo(&mut self) {
+        self.prev_layout_grid = Some(self.layout_grid.clone());
+        self.prev_layout_unassigned = Some(self.layout_unassigned.clone());
+    }
+
+    pub(super) fn undo_layout(&mut self) {
+        if let Some(grid) = self.prev_layout_grid.take() {
+            let unassigned = self.prev_layout_unassigned.take().unwrap_or_default();
+            // Stash current as new undo target (allows redo-like toggle)
+            self.prev_layout_grid = Some(self.layout_grid.clone());
+            self.prev_layout_unassigned = Some(self.layout_unassigned.clone());
+            self.layout_grid = grid;
+            self.layout_unassigned = unassigned;
+        }
+    }
+
     pub(super) fn apply_app_msg(&mut self, msg: AppMsg) {
         match msg {
             AppMsg::SnapshotUpdated(snap) => {
                 self.snapshot = snap;
-                self.last_error = None;
-                self.last_message_is_error = false;
                 if should_offer_first_run_onboarding(&self.snapshot) && !self.onboarding_focus_shown
                 {
                     self.pending_onboarding_focus = true;
                 }
             }
             AppMsg::SnapshotError(err) => {
-                self.last_error = Some(err);
-                self.last_message_is_error = true;
+                // Deduplicate: if the most recent toast is also a snapshot
+                // error, replace it instead of stacking (the snapshot watcher
+                // retries every ~1s, so without this we'd flood the overlay).
+                if let Some(last) = self.toasts.last_mut()
+                    && last.is_error
+                {
+                    last.message = err;
+                    last.created_at = Instant::now();
+                    return;
+                }
+                self.push_toast(err, true);
             }
             AppMsg::PairingChallenge {
                 attempt_id,
@@ -182,13 +276,16 @@ impl DashboardApp {
                 self.pairing_flow = None;
                 self.active_pairing_attempt_id = None;
                 self.selected_tab = Tab::Layout;
-                self.last_error = Some(format!(
-                    "Pairing successful with {} (selector: {})",
-                    short_token(&result.peer_machine_id),
-                    result.orientation_selector
-                ));
-                self.last_message_is_error = false;
+                self.push_toast(
+                    format!(
+                        "Pairing successful with {} (selector: {})",
+                        short_token(&result.peer_machine_id),
+                        result.orientation_selector
+                    ),
+                    false,
+                );
                 self.pairing_retry_available = false;
+                self.pairing_last_error = None;
             }
             AppMsg::PairingFailed { attempt_id, error } => {
                 if Some(attempt_id) != self.active_pairing_attempt_id {
@@ -196,17 +293,14 @@ impl DashboardApp {
                 }
                 self.pairing_in_progress = false;
                 let error = anyhow::anyhow!(error);
-                self.last_error = Some(format_error_for_dialog(&error));
-                self.last_message_is_error = true;
+                self.pairing_last_error = Some(format_error_for_dialog(&error));
                 self.pairing_retry_available = should_offer_new_request_retry(&error);
             }
             AppMsg::ActionComplete(msg) => {
-                self.last_error = Some(msg);
-                self.last_message_is_error = false;
+                self.push_toast(msg, false);
             }
             AppMsg::ActionFailed(err) => {
-                self.last_error = Some(err);
-                self.last_message_is_error = true;
+                self.push_toast(err, true);
             }
         }
     }

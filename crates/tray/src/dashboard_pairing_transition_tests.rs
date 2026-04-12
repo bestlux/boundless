@@ -75,18 +75,13 @@ fn empty_code_validation_sets_error_and_keeps_current_flow_active() {
     let expected_challenge = sample_pairing_challenge();
     let mut app = app_with_code_entry_flow();
     app.pairing_code = "   ".to_string();
-    app.last_error = None;
-    app.last_message_is_error = false;
+    app.pairing_last_error = None;
 
     app.confirm_pairing_code(egui::Context::default());
 
     assert_eq!(
-        app.last_error.as_deref(),
+        app.pairing_last_error.as_deref(),
         Some("pairing code cannot be empty")
-    );
-    assert!(
-        app.last_message_is_error,
-        "empty code validation should mark the banner as an error"
     );
     assert!(
         !app.pairing_in_progress,
@@ -141,13 +136,15 @@ fn apply_pairing_complete_clears_pairing_state_and_shows_success_banner() {
         "completion should close the pairing flow"
     );
     assert_eq!(app.selected_tab, Tab::Layout);
-    assert_eq!(
-        app.last_error.as_deref(),
-        Some("Pairing successful with peer-mac (selector: Office Desktop)")
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.message.contains("Pairing successful") && !t.is_error),
+        "completion should push a success toast"
     );
     assert!(
-        !app.last_message_is_error,
-        "completion should show a success banner"
+        app.pairing_last_error.is_none(),
+        "completion should clear pairing error state"
     );
     assert!(
         !app.pairing_retry_available,
@@ -177,10 +174,9 @@ fn apply_pairing_failed_preserves_flow_and_formats_error_for_retry_state() {
         "failure should stop the in-progress state"
     );
     assert_flow_matches(&app, &flow);
-    assert_eq!(app.last_error.as_deref(), Some(expected_banner.as_str()));
-    assert!(
-        app.last_message_is_error,
-        "failure should show an error banner"
+    assert_eq!(
+        app.pairing_last_error.as_deref(),
+        Some(expected_banner.as_str())
     );
     assert_eq!(
         app.pairing_retry_available,
@@ -234,8 +230,8 @@ fn stale_pairing_messages_are_ignored_after_cancel() {
     let canceled_attempt_id = app
         .active_pairing_attempt_id
         .expect("active flow should have an attempt id");
-    app.last_error = Some("keep existing banner".to_string());
-    app.last_message_is_error = false;
+    app.pairing_last_error = Some("keep existing error".to_string());
+    let toast_count_before = app.toasts.len();
     app.cancel_pairing_flow();
 
     app.apply_app_msg(AppMsg::PairingChallenge {
@@ -264,10 +260,14 @@ fn stale_pairing_messages_are_ignored_after_cancel() {
         "late messages must not mark pairing as active"
     );
     assert_eq!(app.selected_tab, Tab::Status);
-    assert_eq!(app.last_error.as_deref(), Some("keep existing banner"));
-    assert!(
-        !app.last_message_is_error,
-        "ignored late messages must leave the existing banner type unchanged"
+    assert_eq!(
+        app.pairing_last_error.as_deref(),
+        Some("keep existing error")
+    );
+    assert_eq!(
+        app.toasts.len(),
+        toast_count_before,
+        "ignored late messages must not push new toasts"
     );
     assert!(
         !app.pairing_retry_available,
