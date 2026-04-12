@@ -1,5 +1,21 @@
 # Changelog
 
+## [4.0.0](https://github.com/bestlux/boundless/compare/v3.0.0...v4.0.0) (2026-04-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* **tray:** tray dashboard interaction flow, layout management behavior, and pairing feedback semantics are reset for the 4.0.0 UX baseline.
+
+### Features
+
+* **tray:** redesign dashboard pairing and layout flows ([d7e1143](https://github.com/bestlux/boundless/commit/d7e1143a561472d7f7a193b5e9c469a1804bfcb4))
+
+
+### Bug Fixes
+
+* restore cross-platform daemon input result import ([1021927](https://github.com/bestlux/boundless/commit/102192774b135a6b1f0b7482c7f05a6cf610377a))
+
 ## [3.0.0](https://github.com/bestlux/boundless/compare/v2.1.0...v3.0.0) (2026-03-31)
 
 
