@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-ipc-grpc"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "anyhow",
  "app-services",
@@ -161,7 +161,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app-services"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "boundless-cli"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "anyhow",
  "app-services",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "boundless-daemon"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "adapter-ipc-grpc",
  "anyhow",
@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "boundless-tray"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "anyhow",
  "app-services",
@@ -790,7 +790,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "core-clipboard"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "serde",
  "sha2",
@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "core-discovery"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "serde",
 ]
@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "core-input"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "core-protocol"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "bincode",
  "serde",
@@ -873,7 +873,7 @@ dependencies = [
 
 [[package]]
 name = "core-security"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "core-transfer"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "tempfile",
  "thiserror 2.0.18",
@@ -951,7 +951,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "daemon-host"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "boundless-daemon",
 ]
@@ -1050,7 +1050,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330c60081dcc4c72131f8eb70510f1ac07223e5d4163db481a04a0befcffa412"
 dependencies = [
- "libloading 0.7.4",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "ipc-api"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -2401,9 +2401,9 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mdns-sd"
-version = "0.18.2"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d797ab3274a16f4940f9650a29838e940223aeff31773df5c2827ad82150182f"
+checksum = "451927183d65d600e52b4e877a1251e051576f84fa01e5b4a50b450dfaaa537c"
 dependencies = [
  "fastrand",
  "flume",
@@ -2614,7 +2614,7 @@ version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff32365de1b6743cb203b710788263c44a03de03802daf96092f2da4fe6ba4d7"
 dependencies = [
- "proc-macro-crate 1.3.1",
+ "proc-macro-crate 2.0.2",
  "proc-macro2",
  "quote",
  "syn 2.0.115",
@@ -3000,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "peer-transport"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "chrono",
  "core-input",
@@ -3089,7 +3089,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "platform-windows"
-version = "3.0.0"
+version = "4.0.2"
 dependencies = [
  "anyhow",
  "clipboard-win",
@@ -3241,7 +3241,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools",
  "log",
  "multimap",
@@ -3403,9 +3403,9 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
 name = "rand"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc266eb313df6c5c09c1c7b1fbe2510961e5bcd3add930c1e31f7ed9da0feff8"
+checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
 dependencies = [
  "chacha20",
  "getrandom 0.4.1",
@@ -3575,9 +3575,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.37"
+version = "0.23.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
+checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -3982,7 +3982,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.1",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -4421,9 +4421,9 @@ dependencies = [
 
 [[package]]
 name = "tray-icon"
-version = "0.21.3"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5e85aa143ceb072062fc4d6356c1b520a51d636e7bc8e77ec94be3608e5e80c"
+checksum = "93e1484378c343c5a9b291188fa58917c7184967683f8cfe4a05461986970553"
 dependencies = [
  "crossbeam-channel",
  "dirs",
@@ -4435,7 +4435,7 @@ dependencies = [
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
  "once_cell",
- "png 0.17.16",
+ "png 0.18.1",
  "thiserror 2.0.18",
  "windows-sys 0.60.2",
 ]
