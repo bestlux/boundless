@@ -44,10 +44,24 @@ function Wait-ForPathRemoval {
             return
         }
 
+        $remainingEntry = Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -eq $remainingEntry) {
+            return
+        }
+
         Start-Sleep -Milliseconds 250
     }
 
-    throw "Timed out waiting for path removal: $Path"
+    $remainingEntries = @(
+        Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name
+    ) -join ", "
+    if ([string]::IsNullOrWhiteSpace($remainingEntries)) {
+        $remainingEntries = "<empty directory>"
+    }
+
+    throw "Timed out waiting for path removal or empty state: $Path (remaining: $remainingEntries)"
 }
 
 function Invoke-MsiExec {
