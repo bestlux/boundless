@@ -1,5 +1,12 @@
 # Changelog
 
+## [4.0.1](https://github.com/bestlux/boundless/compare/v4.0.0...v4.0.1) (2026-04-13)
+
+
+### Bug Fixes
+
+* **windows:** harden installer upgrade recovery ([43540c1](https://github.com/bestlux/boundless/commit/43540c1e972679dd6a46aa950989a4eef68786d4))
+
 ## [4.0.0](https://github.com/bestlux/boundless/compare/v3.0.0...v4.0.0) (2026-04-12)
 
 
