@@ -1,5 +1,12 @@
 # Changelog
 
+## [4.0.2](https://github.com/bestlux/boundless/compare/v4.0.1...v4.0.2) (2026-04-13)
+
+
+### Bug Fixes
+
+* **release:** accept empty install roots after uninstall ([99095e6](https://github.com/bestlux/boundless/commit/99095e6f3ad06ef89cfdb920ea79c1495b84651c))
+
 ## [4.0.1](https://github.com/bestlux/boundless/compare/v4.0.0...v4.0.1) (2026-04-13)
 
 
