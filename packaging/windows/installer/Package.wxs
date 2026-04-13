@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package
     Name="Boundless"
     Manufacturer="Boundless"
@@ -18,6 +19,18 @@
     <Property Id="ARPPRODUCTICON" Value="BoundlessIcon.ico" />
     <Property Id="ARPNOMODIFY" Value="1" />
     <Property Id="ARPNOREPAIR" Value="1" />
+    <util:CloseApplication
+      Id="CloseBoundlessTray"
+      Target="TrayBinaryFile"
+      Description="Boundless tray"
+      RebootPrompt="no"
+      TerminateProcess="1" />
+    <util:CloseApplication
+      Id="CloseBoundlessDaemon"
+      Target="DaemonBinaryFile"
+      Description="Boundless daemon"
+      RebootPrompt="no"
+      TerminateProcess="1" />
 
     <Property Id="BOUNDLESSLEGACYSCRIPTINSTALL">
       <DirectorySearch Id="LegacyScriptInstallDirSearch" Path="[LocalAppDataFolder]Programs\Boundless">

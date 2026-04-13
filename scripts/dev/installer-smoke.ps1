@@ -62,9 +62,11 @@ function Invoke-MsiExec {
     }
 
     $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
-    if ($process.ExitCode -ne 0) {
+    if ($process.ExitCode -notin @(0, 3010)) {
         throw "msiexec.exe failed with exit code $($process.ExitCode). Log: $LogPath"
     }
+
+    return $process.ExitCode
 }
 
 function Get-ShortcutTarget {
@@ -168,6 +170,71 @@ function Test-InteractiveDesktopSession {
     return $null -ne $explorerProcess
 }
 
+function Stop-BoundlessProcesses {
+    Get-Process -Name "boundlesstray", "boundlessd" -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 800
+}
+
+function Wait-ForDaemonReady {
+    param(
+        [string]$CliPath,
+        [int]$TimeoutSeconds = 20
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $output = (& $CliPath daemon status 2>&1 | Out-String).Trim()
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -eq 0) {
+            return $output
+        }
+
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Timed out waiting for daemon readiness via $CliPath"
+}
+
+function Get-BoundlessProcessCount {
+    param([string]$Name)
+
+    $procs = Get-Process -Name $Name -ErrorAction SilentlyContinue
+    if ($null -eq $procs) {
+        return 0
+    }
+
+    return @($procs).Count
+}
+
+function Test-BoundlessPipePresent {
+    return $null -ne (Get-ChildItem \\.\pipe\ -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq "boundlessd-api" } |
+        Select-Object -First 1)
+}
+
+function Wait-ForRuntimePresence {
+    param([int]$TimeoutSeconds = 20)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $trayCount = Get-BoundlessProcessCount -Name "boundlesstray"
+        $daemonCount = Get-BoundlessProcessCount -Name "boundlessd"
+        $pipePresent = Test-BoundlessPipePresent
+        if ($trayCount -ge 1 -and $daemonCount -ge 1 -and $pipePresent) {
+            return [pscustomobject]@{
+                TrayCount = $trayCount
+                DaemonCount = $daemonCount
+                PipePresent = $pipePresent
+            }
+        }
+
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Timed out waiting for Boundless runtime to become present."
+}
+
 if ((Get-Variable -Name IsWindows -ErrorAction SilentlyContinue) -and (-not $IsWindows)) {
     throw "installer-smoke.ps1 is supported on Windows only."
 }
@@ -225,18 +292,48 @@ $installRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolde
 $resetScriptPath = Join-Path $installRoot "Boundless-Reset.ps1"
 $iconPath = Join-Path $installRoot "Boundless.ico"
 $legacyInstallScriptPath = Join-Path $installRoot "Boundless-Install.ps1"
+$interactiveDesktopSession = Test-InteractiveDesktopSession
 
 if ([string]::IsNullOrWhiteSpace($PreviousInstallerPath) -and (Test-Path -LiteralPath $legacyInstallScriptPath)) {
     throw "Legacy script-installed Boundless files were detected at $installRoot. Remove that installation before running installer-smoke.ps1."
 }
 
 try {
+    Stop-BoundlessProcesses
+
+    $upgradeWhileRunningTested = $false
+    $upgradeWhileRunningSkippedReason = $null
+    $upgradeDaemonStatus = $null
+    $postUpgradeTrayCount = $null
+    $postUpgradeDaemonCount = $null
+    $upgradeInstallExitCode = $null
+    $installExitCode = $null
+    $uninstallExitCode = $null
+
     if (-not [string]::IsNullOrWhiteSpace($PreviousInstallerPath)) {
         $PreviousInstallerPath = (Resolve-Path -LiteralPath $PreviousInstallerPath).Path
-        Invoke-MsiExec -ArgumentList @("/i", $PreviousInstallerPath, "/qn", "/norestart") -LogPath $upgradeLog
+        $upgradeInstallExitCode = Invoke-MsiExec -ArgumentList @("/i", $PreviousInstallerPath, "/qn", "/norestart") -LogPath $upgradeLog
+
+        if ($interactiveDesktopSession) {
+            $previousTrayPath = Join-Path $installRoot "boundlesstray.exe"
+            $previousCliPath = Join-Path $installRoot "boundlessctl.exe"
+            Assert-PathExists -Path $previousTrayPath -Message "Previous installer did not lay down tray executable."
+            Assert-PathExists -Path $previousCliPath -Message "Previous installer did not lay down CLI executable."
+
+            $previousTrayProcess = Start-Process -FilePath $previousTrayPath -WorkingDirectory $installRoot -PassThru
+            Start-Sleep -Seconds 3
+            if ($previousTrayProcess.HasExited) {
+                throw "Previous installer tray exited before upgrade-running smoke could begin. Exit code: $($previousTrayProcess.ExitCode)"
+            }
+
+            $null = Wait-ForDaemonReady -CliPath $previousCliPath
+        }
+        else {
+            $upgradeWhileRunningSkippedReason = "interactive desktop session not available"
+        }
     }
 
-    Invoke-MsiExec -ArgumentList @("/i", $InstallerPath, "/qn", "/norestart") -LogPath $installLog
+    $installExitCode = Invoke-MsiExec -ArgumentList @("/i", $InstallerPath, "/qn", "/norestart") -LogPath $installLog
 
     Assert-PathExists -Path (Join-Path $installRoot "boundlessd.exe") -Message "Installed daemon binary is missing."
     Assert-PathExists -Path (Join-Path $installRoot "boundlessctl.exe") -Message "Installed CLI binary is missing."
@@ -290,22 +387,40 @@ try {
         throw "Installed tray executable reported an unexpected version string: $trayVersionOutput"
     }
 
-    $interactiveDesktopSession = Test-InteractiveDesktopSession
     $trayLaunchMode = if ($interactiveDesktopSession) { "interactive_desktop" } else { "headless_session" }
     $trayExitedEarly = $false
     $trayExitCode = $null
-    $trayProcess = Start-Process -FilePath $trayPath -WorkingDirectory $installRoot -PassThru
-    Start-Sleep -Seconds 3
-    if ($trayProcess.HasExited) {
-        $trayExitedEarly = $true
-        $trayExitCode = $trayProcess.ExitCode
+    $daemonReadyOutput = $null
+    if (-not [string]::IsNullOrWhiteSpace($PreviousInstallerPath) -and $interactiveDesktopSession) {
+        $upgradeWhileRunningTested = $true
+        $runtimePresence = Wait-ForRuntimePresence
+        $upgradeDaemonStatus = "tray_count=$($runtimePresence.TrayCount) daemon_count=$($runtimePresence.DaemonCount) pipe_present=$($runtimePresence.PipePresent)"
+        Start-Sleep -Seconds 3
+        $postUpgradeTrayCount = Get-BoundlessProcessCount -Name "boundlesstray"
+        $postUpgradeDaemonCount = Get-BoundlessProcessCount -Name "boundlessd"
+        if ($postUpgradeTrayCount -ne 1) {
+            throw "Expected exactly one boundlesstray.exe after upgrade-while-running smoke, found $postUpgradeTrayCount."
+        }
+        if ($postUpgradeDaemonCount -ne 1) {
+            throw "Expected exactly one boundlessd.exe after upgrade-while-running smoke, found $postUpgradeDaemonCount."
+        }
     }
     else {
-        Stop-Process -Id $trayProcess.Id -Force -ErrorAction SilentlyContinue
+        $trayProcess = Start-Process -FilePath $trayPath -WorkingDirectory $installRoot -PassThru
+        Start-Sleep -Seconds 3
+        if ($trayProcess.HasExited) {
+            $trayExitedEarly = $true
+            $trayExitCode = $trayProcess.ExitCode
+        }
+        else {
+            $daemonReadyOutput = Wait-ForDaemonReady -CliPath (Join-Path $installRoot "boundlessctl.exe")
+            Stop-Process -Id $trayProcess.Id -Force -ErrorAction SilentlyContinue
+        }
     }
 
-    Invoke-MsiExec -ArgumentList @("/x", $InstallerPath, "/qn", "/norestart") -LogPath $uninstallLog
+    $uninstallExitCode = Invoke-MsiExec -ArgumentList @("/x", $InstallerPath, "/qn", "/norestart") -LogPath $uninstallLog
 
+    Stop-BoundlessProcesses
     Wait-ForPathRemoval -Path $installRoot
     if (Test-Path -LiteralPath $startupShortcutPath) {
         throw "Uninstall did not remove startup shortcut."
@@ -332,7 +447,16 @@ try {
         tray_launch_mode = $trayLaunchMode
         tray_exited_early = $trayExitedEarly
         tray_exit_code = $trayExitCode
+        daemon_ready_output = $daemonReadyOutput
         upgraded_from = $PreviousInstallerPath
+        previous_install_exit_code = $upgradeInstallExitCode
+        install_exit_code = $installExitCode
+        uninstall_exit_code = $uninstallExitCode
+        upgrade_while_running_tested = $upgradeWhileRunningTested
+        upgrade_while_running_skipped_reason = $upgradeWhileRunningSkippedReason
+        upgrade_daemon_status = $upgradeDaemonStatus
+        post_upgrade_tray_count = $postUpgradeTrayCount
+        post_upgrade_daemon_count = $postUpgradeDaemonCount
         status = "passed"
     }
     $summary | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutputRoot "installer-smoke.json") -Encoding utf8

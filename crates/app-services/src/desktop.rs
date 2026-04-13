@@ -116,6 +116,47 @@ pub fn spawn_boundlessd_process(candidates: &[String]) -> Result<String> {
     )
 }
 
+pub fn terminate_boundlessd_processes() -> Result<bool> {
+    #[cfg(windows)]
+    {
+        let mut command = ProcessCommand::new("taskkill");
+        command
+            .args(["/IM", "boundlessd.exe", "/F", "/T"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW);
+
+        let output = command
+            .output()
+            .context("run taskkill for boundlessd.exe")?;
+        if output.status.success() {
+            return Ok(true);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}\n{stderr}");
+        if combined.contains("No tasks are running")
+            || combined.contains("not found")
+            || combined.contains("ERROR: The process")
+        {
+            return Ok(false);
+        }
+
+        bail!(
+            "taskkill boundlessd.exe failed with exit code {:?}: {}",
+            output.status.code(),
+            combined.trim()
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
+}
+
 pub fn is_local_layout_token(token: &str, machine_id: &str, display_name: Option<&str>) -> bool {
     let trimmed = token.trim();
     if trimmed.is_empty() {
