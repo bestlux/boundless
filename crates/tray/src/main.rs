@@ -17,7 +17,7 @@ mod windows_app {
         CANONICAL_LOCAL_LAYOUT_TOKEN, host_and_pairing_port_from_endpoint,
         is_local_layout_token as shared_is_local_layout_token, parse_pairing_port,
         resolve_boundlessd_candidates, serialize_layout_matrix, spawn_boundlessd_process,
-        validate_layout_before_apply,
+        terminate_boundlessd_processes, validate_layout_before_apply,
     };
     use clap::Parser;
     use eframe::icon_data;
@@ -336,15 +336,54 @@ mod windows_app {
         start_daemon: bool,
         daemon_candidates: &[String],
     ) -> Result<Option<String>> {
-        if channel(endpoint).await.is_ok() {
-            return Ok(None);
-        }
+        let initial_error = match channel(endpoint).await {
+            Ok(_) => return Ok(None),
+            Err(error) => error,
+        };
 
         if !start_daemon {
             bail!("daemon is not reachable at {endpoint}; run boundlessd or pass --start-daemon");
         }
 
+        if is_named_pipe_endpoint(endpoint) && has_access_denied_io_error(&initial_error) {
+            let launched = recover_stale_named_pipe_owner(endpoint, daemon_candidates).await?;
+            return Ok(Some(format!(
+                "{launched} (after clearing stale boundlessd.exe named-pipe owner)"
+            )));
+        }
+
         let launched = spawn_daemon_process(daemon_candidates)?;
+        wait_for_daemon_ready(endpoint, launched, "start attempt").await
+    }
+
+    async fn recover_stale_named_pipe_owner(
+        endpoint: &str,
+        daemon_candidates: &[String],
+    ) -> Result<String> {
+        let terminated = terminate_boundlessd_processes()?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        if channel(endpoint).await.is_ok() {
+            return Ok("existing daemon became reachable after stale-process cleanup".to_string());
+        }
+
+        let launched = spawn_daemon_process(daemon_candidates)?;
+        let context = if terminated {
+            "stale-daemon recovery"
+        } else {
+            "named-pipe recovery"
+        };
+        match wait_for_daemon_ready(endpoint, launched.clone(), context).await? {
+            Some(path) => Ok(path),
+            None => Ok("existing daemon became reachable during named-pipe recovery".to_string()),
+        }
+    }
+
+    async fn wait_for_daemon_ready(
+        endpoint: &str,
+        launched: String,
+        context: &str,
+    ) -> Result<Option<String>> {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             match channel(endpoint).await {
@@ -352,7 +391,7 @@ mod windows_app {
                 Err(error) => {
                     if Instant::now() >= deadline {
                         bail!(
-                            "daemon did not become reachable at {endpoint} after start attempt: {error}"
+                            "daemon did not become reachable at {endpoint} after {context}: {error}"
                         );
                     }
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -363,6 +402,18 @@ mod windows_app {
 
     fn spawn_daemon_process(candidates: &[String]) -> Result<String> {
         spawn_boundlessd_process(candidates)
+    }
+
+    fn is_named_pipe_endpoint(endpoint: &str) -> bool {
+        endpoint.trim().starts_with("npipe://")
+    }
+
+    fn has_access_denied_io_error(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_error| io_error.raw_os_error() == Some(5))
+        })
     }
 
     async fn pair_nearby_request_code(
@@ -702,6 +753,7 @@ mod windows_app {
 
     #[cfg(test)]
     mod tests {
+        use super::dashboard_layout::compute_visible_bounds;
         use super::*;
 
         #[test]
@@ -864,6 +916,33 @@ mod windows_app {
             assert!(
                 validate_layout_before_apply(&grid, "local-machine-id").is_err(),
                 "layout with multiple local cells must fail apply validation"
+            );
+        }
+
+        #[test]
+        fn layout_visible_bounds_include_drag_origin_for_edge_drags() {
+            let mut grid = std::collections::HashMap::<(i32, i32), String>::new();
+            grid.insert((3, 3), "local-machine-id".to_string());
+
+            let bounds = compute_visible_bounds(&grid, Some((4, 3)));
+
+            assert_eq!(
+                bounds,
+                (2, 2, 5, 4),
+                "dragging an edge device should keep its original edge cell visible"
+            );
+        }
+
+        #[test]
+        fn layout_visible_bounds_center_on_drag_origin_when_grid_is_temporarily_empty() {
+            let grid = std::collections::HashMap::<(i32, i32), String>::new();
+
+            let bounds = compute_visible_bounds(&grid, Some((6, 0)));
+
+            assert_eq!(
+                bounds,
+                (4, 0, 6, 2),
+                "dragging the only visible device should still leave a drop target near its origin"
             );
         }
 

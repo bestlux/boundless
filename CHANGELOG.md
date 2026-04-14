@@ -1,5 +1,35 @@
 # Changelog
 
+## [4.0.2](https://github.com/bestlux/boundless/compare/v4.0.1...v4.0.2) (2026-04-13)
+
+
+### Bug Fixes
+
+* **release:** accept empty install roots after uninstall ([99095e6](https://github.com/bestlux/boundless/commit/99095e6f3ad06ef89cfdb920ea79c1495b84651c))
+
+## [4.0.1](https://github.com/bestlux/boundless/compare/v4.0.0...v4.0.1) (2026-04-13)
+
+
+### Bug Fixes
+
+* **windows:** harden installer upgrade recovery ([43540c1](https://github.com/bestlux/boundless/commit/43540c1e972679dd6a46aa950989a4eef68786d4))
+
+## [4.0.0](https://github.com/bestlux/boundless/compare/v3.0.0...v4.0.0) (2026-04-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* **tray:** tray dashboard interaction flow, layout management behavior, and pairing feedback semantics are reset for the 4.0.0 UX baseline.
+
+### Features
+
+* **tray:** redesign dashboard pairing and layout flows ([d7e1143](https://github.com/bestlux/boundless/commit/d7e1143a561472d7f7a193b5e9c469a1804bfcb4))
+
+
+### Bug Fixes
+
+* restore cross-platform daemon input result import ([1021927](https://github.com/bestlux/boundless/commit/102192774b135a6b1f0b7482c7f05a6cf610377a))
+
 ## [3.0.0](https://github.com/bestlux/boundless/compare/v2.1.0...v3.0.0) (2026-03-31)
 
 

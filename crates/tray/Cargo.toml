@@ -1,6 +1,6 @@
 [package]
 name = "boundless-tray"
-version = "3.0.0"
+version = "4.0.2"
 edition.workspace = true
 license.workspace = true
 
@@ -24,7 +24,7 @@ egui = "0.34.1"
 hyper-util.workspace = true
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 raw-window-handle = "0.6.2"
-tray-icon = "0.21.3"
+tray-icon = "0.22.0"
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 winit = "0.30"
 

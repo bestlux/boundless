@@ -1,14 +1,44 @@
 use super::*;
 
+fn layout_peer_ids(peers: &[UiPairedPeer]) -> Vec<String> {
+    let mut ids = peers
+        .iter()
+        .map(|peer| peer.peer_id.clone())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}
+
+fn should_rebuild_layout_model(
+    layout_initialized: bool,
+    machine_id: &str,
+    layout_matrix: &str,
+    last_layout_matrix: &str,
+    current_peer_ids: &[String],
+    last_layout_peer_ids: &[String],
+    dragging_peer: bool,
+) -> bool {
+    (!layout_initialized && !machine_id.is_empty())
+        || (layout_initialized
+            && !dragging_peer
+            && (layout_matrix != last_layout_matrix || current_peer_ids != last_layout_peer_ids))
+}
+
 impl DashboardApp {
     pub(super) fn render_layout_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if (!self.layout_initialized && !self.snapshot.machine_id.is_empty())
-            || (self.layout_initialized
-                && self.snapshot.layout_matrix != self.last_layout_matrix
-                && self.dragging_peer.is_none())
-        {
+        let current_peer_ids = layout_peer_ids(&self.snapshot.paired_peers);
+        if should_rebuild_layout_model(
+            self.layout_initialized,
+            &self.snapshot.machine_id,
+            &self.snapshot.layout_matrix,
+            &self.last_layout_matrix,
+            &current_peer_ids,
+            &self.last_layout_peer_ids,
+            self.dragging_peer.is_some(),
+        ) {
             self.layout_initialized = true;
             self.last_layout_matrix = self.snapshot.layout_matrix.clone();
+            self.last_layout_peer_ids = current_peer_ids;
             self.layout_grid.clear();
             self.layout_unassigned.clear();
 
@@ -84,174 +114,333 @@ impl DashboardApp {
             }
         }
 
+        let local_id = self.snapshot.machine_id.clone();
+        let paired_peers = self.snapshot.paired_peers.clone();
+
         let get_display_name = |id: &str| -> String {
-            if id == self.snapshot.machine_id {
+            if id == local_id {
                 return "This PC".to_string();
             }
-            if let Some(p) = self.snapshot.paired_peers.iter().find(|p| p.peer_id == id) {
+            if let Some(p) = paired_peers.iter().find(|p| p.peer_id == id) {
                 return p.display_name.clone();
             }
             short_token(id).to_string()
         };
 
-        ui.heading("Visual Layout Manager");
-        ui.label("Drag and drop devices onto the grid to configure your layout.");
+        let is_peer_connected = |id: &str| -> bool {
+            if id == local_id {
+                return true; // local is always "connected"
+            }
+            paired_peers
+                .iter()
+                .find(|p| p.peer_id == id)
+                .is_some_and(|p| p.connected)
+        };
+
+        ui.heading("Layout Manager");
+        ui.label("Drag devices onto the grid to arrange your multi-machine layout.");
         ui.add_space(8.0);
 
         let mut drag_stopped = false;
         let mut pointer_pos_at_drop = None;
         let mut cell_rects = Vec::new();
+        let mut context_action: Option<LayoutContextAction> = None;
 
-        let cell_size = egui::vec2(90.0, 60.0);
+        let cell_size = egui::vec2(120.0, 80.0);
         let mut new_grid = self.layout_grid.clone();
         let mut new_unassigned = self.layout_unassigned.clone();
 
-        ui.group(|ui| {
-            ui.label("Unassigned Devices");
-            ui.horizontal_wrapped(|ui| {
-                if self.layout_unassigned.is_empty() {
-                    ui.label(egui::RichText::new("None").italics());
-                }
-                for (i, peer_id) in self.layout_unassigned.iter().enumerate() {
-                    let (rect, response) =
-                        ui.allocate_exact_size(cell_size, egui::Sense::click_and_drag());
+        // ── Unassigned devices (only shown when non-empty) ──────────────
+        if !self.layout_unassigned.is_empty() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Unassigned Devices").strong());
+                    ui.label(
+                        egui::RichText::new("  Drag onto the grid to position")
+                            .weak()
+                            .italics(),
+                    );
+                });
+                ui.add_space(4.0);
+                let unassigned_snapshot: Vec<String> = self.layout_unassigned.clone();
+                ui.horizontal_wrapped(|ui| {
+                    for (i, peer_id) in unassigned_snapshot.iter().enumerate() {
+                        let (rect, response) =
+                            ui.allocate_exact_size(cell_size, egui::Sense::click_and_drag());
 
-                    let is_being_dragged = self.dragging_peer.is_some() && response.dragged();
+                        let is_being_dragged = self.dragging_peer.is_some() && response.dragged();
 
-                    if response.drag_started() {
-                        self.dragging_peer = Some((peer_id.clone(), (-1, i as i32)));
-                        new_unassigned.remove(i);
+                        if response.drag_started() {
+                            self.stash_layout_for_undo();
+                            self.dragging_peer = Some((peer_id.clone(), (-1, i as i32)));
+                            new_unassigned.remove(i);
+                        }
+
+                        if response.drag_stopped() {
+                            drag_stopped = true;
+                            pointer_pos_at_drop = ctx.pointer_interact_pos();
+                        }
+
+                        if !is_being_dragged {
+                            let painter = ui.painter();
+                            let connected = is_peer_connected(peer_id);
+                            let bg = if connected {
+                                egui::Color32::from_rgb(50, 60, 70)
+                            } else {
+                                egui::Color32::from_rgb(40, 42, 48)
+                            };
+                            painter.rect_filled(rect.shrink(4.0), 8.0, bg);
+                            painter.rect_stroke(
+                                rect.shrink(4.0),
+                                8.0,
+                                egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 90, 100)),
+                                egui::StrokeKind::Inside,
+                            );
+                            let text = get_display_name(peer_id);
+                            let color = if peer_id == &local_id {
+                                egui::Color32::LIGHT_BLUE
+                            } else {
+                                egui::Color32::WHITE
+                            };
+                            painter.text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                text,
+                                egui::FontId::proportional(14.0),
+                                color,
+                            );
+                            // Connection status dot
+                            paint_status_dot(painter, rect, connected);
+                        }
+
+                        response.on_hover_text("Drag onto the grid to position this device");
                     }
+                });
+            });
+            ui.add_space(12.0);
+        }
 
-                    if response.drag_stopped() {
-                        drag_stopped = true;
-                        pointer_pos_at_drop = ctx.pointer_interact_pos();
-                    }
+        // ── Compute dynamic grid bounds ─────────────────────────────────
+        let drag_origin = self.dragging_peer.as_ref().and_then(|(_, pos)| {
+            if pos.0 >= 0 && pos.1 >= 0 {
+                Some(*pos)
+            } else {
+                None
+            }
+        });
+        let (view_x0, view_y0, view_x1, view_y1) =
+            compute_visible_bounds(&self.layout_grid, drag_origin);
 
-                    let painter = ui.painter();
-                    if !is_being_dragged {
-                        painter.rect_filled(
-                            rect.shrink(4.0),
-                            6.0,
-                            egui::Color32::from_rgb(50, 60, 70),
-                        );
-                        painter.rect_stroke(
-                            rect.shrink(4.0),
-                            6.0,
-                            egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
-                            egui::StrokeKind::Inside,
-                        );
-                        let text = get_display_name(peer_id);
-                        let color = if peer_id == &self.snapshot.machine_id {
-                            egui::Color32::LIGHT_BLUE
-                        } else {
-                            egui::Color32::WHITE
-                        };
-                        let mut job = egui::text::LayoutJob::simple(
-                            text,
-                            egui::FontId::proportional(12.0),
-                            color,
-                            rect.width() - 8.0,
-                        );
-                        job.halign = egui::Align::Center;
-                        let galley = painter.layout_job(job);
-                        painter.galley(rect.center() - galley.size() / 2.0, galley, color);
-                    }
-                }
+        let is_dragging_any = self.dragging_peer.is_some();
+
+        // ── Render grid (scrollable for large layouts) ───────────────────
+        egui::ScrollArea::both().show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                egui::Frame::canvas(ui.style())
+                    .fill(egui::Color32::from_rgb(20, 24, 28))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        ui.add_space(8.0);
+                        for y in view_y0..=view_y1 {
+                            ui.horizontal(|ui| {
+                                ui.add_space(8.0);
+                                for x in view_x0..=view_x1 {
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        cell_size,
+                                        egui::Sense::click_and_drag(),
+                                    );
+                                    cell_rects.push((rect, x, y));
+
+                                    let has_device = self.layout_grid.contains_key(&(x, y));
+                                    let is_hovered = response.hovered() && is_dragging_any;
+                                    let is_being_dragged = is_dragging_any && response.dragged();
+
+                                    if response.drag_started()
+                                        && let Some(peer_id) =
+                                            self.layout_grid.get(&(x, y)).cloned()
+                                    {
+                                        self.stash_layout_for_undo();
+                                        self.dragging_peer = Some((peer_id, (x, y)));
+                                        new_grid.remove(&(x, y));
+                                    }
+
+                                    if response.drag_stopped() {
+                                        drag_stopped = true;
+                                        pointer_pos_at_drop = ctx.pointer_interact_pos();
+                                    }
+
+                                    // ── Right-click context menu ──
+                                    if has_device && !is_dragging_any {
+                                        let cell_x = x;
+                                        let cell_y = y;
+                                        response.context_menu(|ui| {
+                                            if let Some(peer_id) =
+                                                self.layout_grid.get(&(cell_x, cell_y))
+                                            {
+                                                let name = get_display_name(peer_id);
+                                                ui.label(
+                                                    egui::RichText::new(&name)
+                                                        .strong()
+                                                        .size(13.0),
+                                                );
+                                                ui.separator();
+                                                if peer_id != &local_id
+                                                    && ui.button("Remove from grid").clicked()
+                                                {
+                                                    context_action =
+                                                        Some(LayoutContextAction::RemoveFromGrid(
+                                                            cell_x, cell_y,
+                                                        ));
+                                                    ui.close();
+                                                }
+                                                if peer_id == &local_id {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "This PC must stay on the grid",
+                                                        )
+                                                        .weak()
+                                                        .italics()
+                                                        .size(11.0),
+                                                    );
+                                                }
+                                            }
+                                        });
+                                    }
+
+                                    let painter = ui.painter();
+
+                                    if is_hovered {
+                                        // ── Prominent drop-target highlight ──
+                                        painter.rect_filled(
+                                            rect.shrink(2.0),
+                                            6.0,
+                                            egui::Color32::from_rgb(40, 90, 155),
+                                        );
+                                        painter.rect_stroke(
+                                            rect.shrink(2.0),
+                                            6.0,
+                                            egui::Stroke::new(
+                                                2.0,
+                                                egui::Color32::from_rgb(80, 160, 240),
+                                            ),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    } else if has_device && !is_being_dragged {
+                                        // ── Occupied device card ──
+                                        if let Some(peer_id) = self.layout_grid.get(&(x, y)) {
+                                            let is_local = peer_id == &local_id;
+                                            let connected = is_peer_connected(peer_id);
+                                            let bg = if is_local {
+                                                egui::Color32::from_rgb(25, 65, 110)
+                                            } else if connected {
+                                                egui::Color32::from_rgb(48, 56, 66)
+                                            } else {
+                                                egui::Color32::from_rgb(38, 40, 46)
+                                            };
+                                            painter.rect_filled(rect.shrink(4.0), 8.0, bg);
+
+                                            let border = if is_local {
+                                                egui::Color32::from_rgb(70, 150, 220)
+                                            } else if connected {
+                                                egui::Color32::from_rgb(90, 100, 115)
+                                            } else {
+                                                egui::Color32::from_rgb(65, 65, 72)
+                                            };
+                                            painter.rect_stroke(
+                                                rect.shrink(4.0),
+                                                8.0,
+                                                egui::Stroke::new(1.5, border),
+                                                egui::StrokeKind::Inside,
+                                            );
+
+                                            let text = get_display_name(peer_id);
+                                            let text_color = if is_local {
+                                                egui::Color32::from_rgb(150, 210, 255)
+                                            } else if connected {
+                                                egui::Color32::WHITE
+                                            } else {
+                                                egui::Color32::from_rgb(140, 140, 150)
+                                            };
+                                            painter.text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                &text,
+                                                egui::FontId::proportional(14.0),
+                                                text_color,
+                                            );
+
+                                            // Connection status dot
+                                            paint_status_dot(painter, rect, connected);
+
+                                            // Tooltip
+                                            let status_str = if is_local {
+                                                "This PC"
+                                            } else if connected {
+                                                "Connected"
+                                            } else {
+                                                "Offline"
+                                            };
+                                            response.on_hover_text(format!(
+                                                "{text} - {status_str}\nDrag to reposition | Right-click for options"
+                                            ));
+                                        }
+                                    } else {
+                                        // ── Empty cell ──
+                                        painter.rect_stroke(
+                                            rect.shrink(3.0),
+                                            6.0,
+                                            egui::Stroke::new(
+                                                1.0,
+                                                egui::Color32::from_rgb(50, 58, 66),
+                                            ),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        // Show "+" hint in empty cells while user is dragging
+                                        if is_dragging_any {
+                                            painter.text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                "+",
+                                                egui::FontId::proportional(18.0),
+                                                egui::Color32::from_rgb(75, 85, 95),
+                                            );
+                                        }
+                                    }
+                                }
+                                ui.add_space(8.0);
+                            });
+                        }
+                        ui.add_space(8.0);
+                    });
             });
         });
 
-        ui.add_space(16.0);
+        // ── Fallback drag release detection ────────────────────────────
+        // If the user releases the mouse outside any allocated cell rect,
+        // egui never fires `drag_stopped` on those responses. Detect the
+        // primary-button release globally and treat it as a drop so the
+        // ghost doesn't stick to the cursor forever.
+        if !drag_stopped
+            && self.dragging_peer.is_some()
+            && ctx.input(|i| i.pointer.any_released())
+        {
+            drag_stopped = true;
+            pointer_pos_at_drop = ctx.pointer_interact_pos();
+        }
 
-        ui.vertical_centered(|ui| {
-            egui::Frame::canvas(ui.style())
-                .fill(egui::Color32::from_rgb(25, 30, 35))
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                    for y in 0..7 {
-                        ui.horizontal(|ui| {
-                            for x in 0..7 {
-                                let (rect, response) =
-                                    ui.allocate_exact_size(cell_size, egui::Sense::click_and_drag());
-                                cell_rects.push((rect, x, y));
-
-                                let is_hovered =
-                                    response.hovered() && self.dragging_peer.is_some();
-                                let is_being_dragged =
-                                    self.dragging_peer.is_some() && response.dragged();
-
-                                if response.drag_started()
-                                    && let Some(peer_id) = self.layout_grid.get(&(x, y))
-                                {
-                                    self.dragging_peer = Some((peer_id.clone(), (x, y)));
-                                    new_grid.remove(&(x, y));
-                                }
-
-                                if response.drag_stopped() {
-                                    drag_stopped = true;
-                                    pointer_pos_at_drop = ctx.pointer_interact_pos();
-                                }
-
-                                let painter = ui.painter();
-                                if is_hovered {
-                                    painter.rect_filled(
-                                        rect.shrink(2.0),
-                                        4.0,
-                                        egui::Color32::from_rgb(40, 50, 60),
-                                    );
-                                }
-                                painter.rect_stroke(
-                                    rect.shrink(2.0),
-                                    4.0,
-                                    egui::Stroke::new(
-                                        1.0,
-                                        egui::Color32::from_rgb(45, 50, 55),
-                                    ),
-                                    egui::StrokeKind::Inside,
-                                );
-
-                                if let Some(peer_id) = self.layout_grid.get(&(x, y))
-                                    && !is_being_dragged
-                                {
-                                    let is_local = peer_id == &self.snapshot.machine_id;
-                                    let bg_color = if is_local {
-                                        egui::Color32::from_rgb(30, 70, 110)
-                                    } else {
-                                        egui::Color32::from_rgb(50, 60, 70)
-                                    };
-                                    painter.rect_filled(rect.shrink(4.0), 6.0, bg_color);
-                                    let border_color = if is_local {
-                                        egui::Color32::LIGHT_BLUE
-                                    } else {
-                                        egui::Color32::DARK_GRAY
-                                    };
-                                    painter.rect_stroke(
-                                        rect.shrink(4.0),
-                                        6.0,
-                                        egui::Stroke::new(1.5, border_color),
-                                        egui::StrokeKind::Inside,
-                                    );
-                                    let text = get_display_name(peer_id);
-                                    let mut job = egui::text::LayoutJob::simple(
-                                        text,
-                                        egui::FontId::proportional(12.0),
-                                        egui::Color32::WHITE,
-                                        rect.width() - 8.0,
-                                    );
-                                    job.halign = egui::Align::Center;
-                                    let galley = painter.layout_job(job);
-                                    painter.galley(
-                                        rect.center() - galley.size() / 2.0,
-                                        galley,
-                                        egui::Color32::WHITE,
-                                    );
-                                }
-                            }
-                        });
+        // ── Context menu actions ───────────────────────────────────────
+        if let Some(action) = context_action {
+            match action {
+                LayoutContextAction::RemoveFromGrid(cx, cy) => {
+                    self.stash_layout_for_undo();
+                    if let Some(peer_id) = new_grid.remove(&(cx, cy)) {
+                        new_unassigned.push(peer_id);
                     }
-                });
-        });
+                }
+            }
+        }
 
+        // ── Drag-drop resolution ────────────────────────────────────────
         if drag_stopped && let Some((peer_id, old_pos)) = self.dragging_peer.take() {
             if let Some(pos) = pointer_pos_at_drop {
                 let mut dropped_in_cell = None;
@@ -286,6 +475,7 @@ impl DashboardApp {
         self.layout_grid = new_grid;
         self.layout_unassigned = new_unassigned;
 
+        // ── Drag ghost overlay ──────────────────────────────────────────
         if let Some((peer_id, _)) = &self.dragging_peer && let Some(pos) = ctx.pointer_hover_pos()
         {
             let painter = ctx.layer_painter(egui::LayerId::new(
@@ -293,36 +483,106 @@ impl DashboardApp {
                 egui::Id::new("drag_layer"),
             ));
             let rect = egui::Rect::from_center_size(pos, cell_size);
-            let is_local = peer_id == &self.snapshot.machine_id;
+            let is_local = peer_id == &local_id;
             let bg_color = if is_local {
-                egui::Color32::from_rgb(40, 90, 140)
+                egui::Color32::from_rgb(35, 80, 140)
             } else {
-                egui::Color32::from_rgb(70, 80, 90)
+                egui::Color32::from_rgb(65, 75, 90)
             };
-            painter.rect_filled(rect.shrink(4.0), 6.0, bg_color);
+            painter.rect_filled(rect.shrink(4.0), 8.0, bg_color);
             painter.rect_stroke(
                 rect.shrink(4.0),
-                6.0,
+                8.0,
                 egui::Stroke::new(2.0, egui::Color32::WHITE),
                 egui::StrokeKind::Inside,
             );
             let text = get_display_name(peer_id);
-            let mut job = egui::text::LayoutJob::simple(
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
                 text,
-                egui::FontId::proportional(12.0),
+                egui::FontId::proportional(14.0),
                 egui::Color32::WHITE,
-                rect.width() - 8.0,
             );
-            job.halign = egui::Align::Center;
-            let galley = painter.layout_job(job);
-            painter.galley(rect.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
         }
 
-        ui.add_space(16.0);
+        // ── Apply confirmation dialog ──────────────────────────────────
+        if self.confirm_apply_pending {
+            self.render_apply_confirmation(ctx);
+        }
+
+        // ── Action buttons ──────────────────────────────────────────────
+        ui.add_space(12.0);
         ui.horizontal(|ui| {
-            if ui.button("Apply Layout").clicked() {
+            let apply_btn = ui.add(
+                egui::Button::new("Apply Layout")
+            );
+            if apply_btn.clicked() {
                 match validate_layout_before_apply(&self.layout_grid, &self.snapshot.machine_id) {
                     Ok(()) => {
+                        self.confirm_apply_pending = true;
+                    }
+                    Err(error) => {
+                        self.push_toast(error.to_string(), true);
+                    }
+                }
+            }
+            apply_btn.on_hover_text("Send this layout to the daemon for immediate use");
+
+            let reset_btn = ui.button("Reset Layout");
+            if reset_btn.clicked() {
+                self.stash_layout_for_undo();
+                self.layout_initialized = false;
+                self.snapshot.layout_matrix = String::new();
+            }
+            reset_btn.on_hover_text("Discard changes and reload from daemon");
+
+            // Undo button
+            if self.prev_layout_grid.is_some() {
+                let undo_btn = ui.button("Undo");
+                if undo_btn.clicked() {
+                    self.undo_layout();
+                }
+                undo_btn.on_hover_text("Revert the last layout change");
+            }
+        });
+
+        // ── Human-readable layout summary (replaces raw matrix debug) ──
+        ui.add_space(8.0);
+        if !self.layout_grid.is_empty() {
+            let summary = build_layout_summary(
+                &self.layout_grid,
+                &self.snapshot.machine_id,
+                &self.snapshot.paired_peers,
+            );
+            ui.label(egui::RichText::new(summary).weak().size(12.0));
+        }
+    }
+
+    fn render_apply_confirmation(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        egui::Window::new("Confirm Layout")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .min_width(380.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label("Apply this layout to the daemon? Active connections will be reconfigured.");
+                ui.add_space(8.0);
+
+                // Show preview summary
+                let summary = build_layout_summary(
+                    &self.layout_grid,
+                    &self.snapshot.machine_id,
+                    &self.snapshot.paired_peers,
+                );
+                ui.label(egui::RichText::new(&summary).strong().size(13.0));
+                ui.add_space(12.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
                         let matrix_str =
                             serialize_layout_matrix(&self.layout_grid, &self.snapshot.machine_id);
                         self.task_runner().apply_layout(
@@ -330,21 +590,174 @@ impl DashboardApp {
                             self.ctx.endpoint.clone(),
                             matrix_str,
                         );
+                        self.confirm_apply_pending = false;
                     }
-                    Err(error) => {
-                        self.last_error = Some(error.to_string());
-                        self.last_message_is_error = true;
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_apply_pending = false;
                     }
-                }
-            }
+                });
+            });
+        if !open {
+            self.confirm_apply_pending = false;
+        }
+    }
+}
 
-            if ui.button("Reset Layout").clicked() {
-                self.layout_initialized = false;
-                self.snapshot.layout_matrix = String::new();
-            }
-        });
+// ── Layout context menu actions ────────────────────────────────────────
+enum LayoutContextAction {
+    RemoveFromGrid(i32, i32),
+}
 
-        ui.add_space(8.0);
-        ui.label(format!("Current Matrix: {}", self.snapshot.layout_matrix));
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+/// Paint a small colored status dot in the top-right corner of a cell.
+fn paint_status_dot(painter: &egui::Painter, rect: egui::Rect, connected: bool) {
+    let dot_center = egui::pos2(rect.right() - 12.0, rect.top() + 12.0);
+    let dot_color = if connected {
+        egui::Color32::from_rgb(60, 200, 90)
+    } else {
+        egui::Color32::from_rgb(100, 100, 110)
+    };
+    painter.circle_filled(dot_center, 4.0, dot_color);
+}
+
+/// Compute the visible grid region: bounding box of placed devices plus
+/// one cell of padding on each side, clamped to [0, 6] and at least 3x3.
+pub(super) fn compute_visible_bounds(
+    grid: &HashMap<(i32, i32), String>,
+    drag_origin: Option<(i32, i32)>,
+) -> (i32, i32, i32, i32) {
+    if grid.is_empty() && drag_origin.is_none() {
+        return (2, 2, 4, 4);
+    }
+
+    let (mut min_x, mut max_x, mut min_y, mut max_y) = if let Some((x, y)) = drag_origin {
+        (x, x, y, y)
+    } else {
+        (i32::MAX, i32::MIN, i32::MAX, i32::MIN)
+    };
+    for &(x, y) in grid.keys() {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+
+    // Pad by one cell for expansion drop targets
+    let mut x0 = (min_x - 1).max(0);
+    let mut y0 = (min_y - 1).max(0);
+    let mut x1 = (max_x + 1).min(6);
+    let mut y1 = (max_y + 1).min(6);
+
+    // Enforce minimum 3 cells in each dimension
+    while x1 - x0 < 2 {
+        if x0 > 0 {
+            x0 -= 1;
+        }
+        if x1 - x0 < 2 && x1 < 6 {
+            x1 += 1;
+        }
+    }
+    while y1 - y0 < 2 {
+        if y0 > 0 {
+            y0 -= 1;
+        }
+        if y1 - y0 < 2 && y1 < 6 {
+            y1 += 1;
+        }
+    }
+
+    (x0, y0, x1, y1)
+}
+
+/// Build a human-readable summary like:
+///   Layout: Office Desktop (left) -- This PC -- Living Room (right)
+fn build_layout_summary(
+    grid: &HashMap<(i32, i32), String>,
+    local_id: &str,
+    peers: &[UiPairedPeer],
+) -> String {
+    if grid.is_empty() {
+        return "No devices placed.".to_string();
+    }
+
+    let name_of = |id: &str| -> String {
+        if id == local_id {
+            return "This PC".to_string();
+        }
+        if let Some(p) = peers.iter().find(|p| p.peer_id == id) {
+            return p.display_name.clone();
+        }
+        short_token(id).to_string()
+    };
+
+    let local_pos = grid
+        .iter()
+        .find(|(_, id)| id.as_str() == local_id)
+        .map(|(pos, _)| *pos);
+
+    let Some((lx, ly)) = local_pos else {
+        return format!("{} device(s) placed", grid.len());
+    };
+
+    let mut parts = Vec::new();
+    if let Some(id) = grid.get(&(lx - 1, ly)) {
+        parts.push(format!("{} (left)", name_of(id)));
+    }
+    parts.push(name_of(local_id));
+    if let Some(id) = grid.get(&(lx + 1, ly)) {
+        parts.push(format!("{} (right)", name_of(id)));
+    }
+
+    let mut extras = Vec::new();
+    if let Some(id) = grid.get(&(lx, ly - 1)) {
+        extras.push(format!("{} (above)", name_of(id)));
+    }
+    if let Some(id) = grid.get(&(lx, ly + 1)) {
+        extras.push(format!("{} (below)", name_of(id)));
+    }
+
+    let line = parts.join("  --  ");
+    if extras.is_empty() {
+        format!("Layout: {line}")
+    } else {
+        format!("Layout: {line}  |  {}", extras.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_rebuild_layout_model;
+
+    #[test]
+    fn rebuilds_when_paired_peer_ids_change_without_layout_matrix_change() {
+        let current_peer_ids = vec!["peer-a".to_string(), "peer-b".to_string()];
+        let last_peer_ids = vec!["peer-a".to_string()];
+
+        assert!(should_rebuild_layout_model(
+            true,
+            "local-machine",
+            "self",
+            "self",
+            &current_peer_ids,
+            &last_peer_ids,
+            false,
+        ));
+    }
+
+    #[test]
+    fn defers_rebuild_while_dragging_even_if_peer_ids_change() {
+        let current_peer_ids = vec!["peer-a".to_string(), "peer-b".to_string()];
+        let last_peer_ids = vec!["peer-a".to_string()];
+
+        assert!(!should_rebuild_layout_model(
+            true,
+            "local-machine",
+            "self",
+            "self",
+            &current_peer_ids,
+            &last_peer_ids,
+            true,
+        ));
     }
 }

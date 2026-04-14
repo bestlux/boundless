@@ -45,8 +45,7 @@ impl DashboardApp {
 
     pub(super) fn confirm_pairing_code(&mut self, egui_ctx: egui::Context) {
         if let Err(error) = validate_pairing_code(&self.pairing_code) {
-            self.last_error = Some(error.to_string());
-            self.last_message_is_error = true;
+            self.pairing_last_error = Some(error.to_string());
             return;
         }
 
@@ -60,52 +59,96 @@ impl DashboardApp {
                 .as_ref()
                 .map(|flow| flow.dialog_title.as_str())
                 .unwrap_or("Pairing...");
-            egui::Window::new(title).collapsible(false).show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Requesting pairing challenge from target...");
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .min_width(360.0)
+                .show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Requesting pairing challenge from target...");
+                    });
+                    ui.add_space(8.0);
+                    if ui.button("Cancel").clicked() {
+                        self.cancel_pairing_flow();
+                    }
                 });
-                if ui.button("Cancel").clicked() {
-                    self.cancel_pairing_flow();
-                }
-            });
         } else if let Some(challenge) = self.pairing_challenge.clone() {
             let title = self
                 .pairing_flow
                 .as_ref()
                 .map(|flow| flow.dialog_title.as_str())
                 .unwrap_or("Enter Pairing Code");
-            egui::Window::new(title).collapsible(false).show(ctx, |ui| {
-                ui.label(format!("Request ID: {}", short_token(&challenge.request_id)));
-                ui.label(format!("Expires at: {}", challenge.expires_at));
-                ui.add_space(8.0);
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .min_width(360.0)
+                .show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    ui.label(format!("Request ID: {}", short_token(&challenge.request_id)));
+                    ui.label(format!("Expires at: {}", format_timestamp(&challenge.expires_at)));
+                    ui.add_space(8.0);
 
-                ui.horizontal(|ui| {
-                    ui.label("Code:");
-                    ui.text_edit_singleline(&mut self.pairing_code);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Alias (optional):");
-                    ui.text_edit_singleline(&mut self.pairing_alias);
-                });
+                    self.render_pairing_error(ui, ctx);
 
-                if self.pairing_in_progress {
                     ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Verifying code...");
+                        ui.label("Code:");
+                        ui.text_edit_singleline(&mut self.pairing_code);
                     });
-                } else {
                     ui.horizontal(|ui| {
-                        if ui.button("Confirm").clicked() {
-                            self.confirm_pairing_code(ctx.clone());
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.cancel_pairing_flow();
-                        }
+                        ui.label("Alias (optional):");
+                        ui.text_edit_singleline(&mut self.pairing_alias);
                     });
+
+                    ui.add_space(8.0);
+                    if self.pairing_in_progress {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Verifying code...");
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            if ui.button("Confirm").clicked() {
+                                self.confirm_pairing_code(ctx.clone());
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.cancel_pairing_flow();
+                            }
+                        });
+                    }
+                });
+        }
+    }
+
+    pub(super) fn render_pairing_error(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(err) = self.pairing_last_error.clone() else {
+            return;
+        };
+
+        ui.group(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(err)
+                        .color(egui::Color32::LIGHT_RED)
+                        .size(12.0),
+                ));
+                if self.pairing_retry_available
+                    && !self.pairing_in_progress
+                    && let Some(flow) = self.pairing_flow.clone()
+                    && ui.button("Retry Pairing Request").clicked()
+                {
+                    self.start_pairing(flow, ctx.clone());
+                }
+                if ui.small_button("Dismiss").clicked() {
+                    self.pairing_last_error = None;
+                    self.pairing_retry_available = false;
                 }
             });
-        }
+        });
+        ui.add_space(8.0);
     }
 
     pub(super) fn render_status_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -131,18 +174,25 @@ impl DashboardApp {
                 egui::Grid::new("discovered_peers")
                     .striped(true)
                     .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Name").strong());
+                        ui.label(egui::RichText::new("ID").strong());
+                        ui.label(egui::RichText::new("Address").strong());
+                        ui.label("");
+                        ui.end_row();
                         for peer in self.snapshot.discovered_peers.clone() {
                             ui.label(&peer.display_name);
                             ui.label(short_token(&peer.machine_id));
                             ui.label(&peer.endpoint);
-                            if ui.button("Connect").clicked() {
+                            let btn = ui.button("Connect");
+                            if btn.clicked() {
                                 match guided_flow_from_discovered_peer(&peer) {
                                     Ok(flow) => self.start_pairing(flow, ctx.clone()),
                                     Err(error) => {
-                                        self.last_error = Some(error.to_string());
+                                        self.push_toast(error.to_string(), true);
                                     }
                                 }
                             }
+                            btn.on_hover_text("Start guided pairing with this peer");
                             ui.end_row();
                         }
                     });
@@ -152,15 +202,41 @@ impl DashboardApp {
             ui.heading("Manual Setup");
             ui.horizontal(|ui| {
                 ui.label("Host/IP:");
-                ui.text_edit_singleline(&mut self.manual_host);
+                let host_response = ui.text_edit_singleline(&mut self.manual_host);
+                // Inline validation: red border on empty host when focused
+                if self.manual_host.trim().is_empty() && host_response.lost_focus() {
+                    ui.label(
+                        egui::RichText::new("Required")
+                            .color(egui::Color32::from_rgb(255, 120, 100))
+                            .size(11.0),
+                    );
+                }
+
                 ui.label("Port:");
-                ui.text_edit_singleline(&mut self.manual_port);
-                if ui.button("Connect").clicked()
+                let port_response = ui.text_edit_singleline(&mut self.manual_port);
+                // Inline validation: show error for non-numeric port
+                let port_valid = self.manual_port.trim().parse::<u16>().is_ok_and(|p| p > 0);
+                if !port_valid
+                    && !self.manual_port.is_empty()
+                    && port_response.lost_focus()
+                {
+                    ui.label(
+                        egui::RichText::new("Invalid port")
+                            .color(egui::Color32::from_rgb(255, 120, 100))
+                            .size(11.0),
+                    );
+                }
+
+                let connect_enabled =
+                    !self.manual_host.trim().is_empty() && port_valid;
+                let btn = ui.add_enabled(connect_enabled, egui::Button::new("Connect"));
+                if btn.clicked()
                     && let Ok(flow) =
                         guided_flow_from_manual_input(&self.manual_host, &self.manual_port)
                 {
                     self.start_pairing(flow, ctx.clone());
                 }
+                btn.on_hover_text("Start pairing with this host and port");
             });
 
             ui.add_space(16.0);
@@ -169,6 +245,11 @@ impl DashboardApp {
                 ui.label(egui::RichText::new("No paired peers.").italics());
             } else {
                 egui::Grid::new("paired_peers").striped(true).show(ui, |ui| {
+                    ui.label(egui::RichText::new("Name").strong());
+                    ui.label(egui::RichText::new("ID").strong());
+                    ui.label(egui::RichText::new("Address").strong());
+                    ui.label(egui::RichText::new("Status").strong());
+                    ui.end_row();
                     for peer in &self.snapshot.paired_peers {
                         let color = if peer.connected {
                             egui::Color32::LIGHT_GREEN
@@ -236,23 +317,131 @@ impl DashboardApp {
     }
 
     pub(super) fn render_settings_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings & Diagnostics");
-        ui.label(format!("Machine ID: {}", self.snapshot.machine_id));
-        ui.label(format!(
-            "Daemon Status: {}",
-            if self.snapshot.daemon_online {
-                "Online"
-            } else {
-                "Offline"
-            }
-        ));
-        ui.label(format!("API Endpoint: {}", self.ctx.endpoint));
-        ui.label(format!("Snapshot Timestamp: {}", self.snapshot.generated_at));
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // ── Identity ───────────────────────────────────────────────
+            ui.heading("Identity");
+            ui.add_space(4.0);
+            egui::Grid::new("settings_identity")
+                .num_columns(3)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("Machine ID:").strong());
+                    let id_short = short_token(&self.snapshot.machine_id);
+                    ui.label(id_short)
+                        .on_hover_text(&self.snapshot.machine_id);
+                    if ui
+                        .small_button("Copy")
+                        .on_hover_text("Copy full machine ID to clipboard")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(self.snapshot.machine_id.clone());
+                        self.push_toast("Machine ID copied to clipboard".to_string(), false);
+                    }
+                    ui.end_row();
 
-        ui.add_space(16.0);
-        if ui.button("Reconnect All Peers").clicked() {
-            self.task_runner()
-                .reconnect_all_peers(self.tx.clone(), self.ctx.endpoint.clone());
-        }
+                    ui.label(egui::RichText::new("PC Name:").strong());
+                    let hostname = std::env::var("COMPUTERNAME")
+                        .unwrap_or_else(|_| "Unknown".to_string());
+                    ui.label(&hostname);
+                    ui.label(""); // empty column
+                    ui.end_row();
+                });
+
+            ui.add_space(16.0);
+            ui.separator();
+
+            // ── Daemon ─────────────────────────────────────────────────
+            ui.add_space(8.0);
+            ui.heading("Daemon");
+            ui.add_space(4.0);
+            egui::Grid::new("settings_daemon")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("Status:").strong());
+                    if self.snapshot.daemon_online {
+                        ui.label(
+                            egui::RichText::new("Online")
+                                .color(egui::Color32::LIGHT_GREEN),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Offline")
+                                .color(egui::Color32::LIGHT_RED),
+                        );
+                    }
+                    ui.end_row();
+
+                    ui.label(egui::RichText::new("API Endpoint:").strong());
+                    ui.label(&self.ctx.endpoint);
+                    ui.end_row();
+
+                    ui.label(egui::RichText::new("Last Snapshot:").strong());
+                    if self.snapshot.generated_at.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No data yet").weak().italics(),
+                        );
+                    } else {
+                        ui.label(format_timestamp(&self.snapshot.generated_at));
+                    }
+                    ui.end_row();
+                });
+
+            ui.add_space(16.0);
+            ui.separator();
+
+            // ── Actions ────────────────────────────────────────────────
+            ui.add_space(8.0);
+            ui.heading("Actions");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Reconnect All Peers")
+                    .on_hover_text(
+                        "Trigger the daemon to reconnect all paired peers",
+                    )
+                    .clicked()
+                {
+                    self.task_runner()
+                        .reconnect_all_peers(self.tx.clone(), self.ctx.endpoint.clone());
+                }
+            });
+
+            ui.add_space(16.0);
+            ui.separator();
+
+            // ── Diagnostics ────────────────────────────────────────────
+            ui.add_space(8.0);
+            ui.heading("Diagnostics");
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "Paired: {}  |  Discovered: {}  |  Pending: {}",
+                    self.snapshot.paired_peers.len(),
+                    self.snapshot.discovered_peers.len(),
+                    self.snapshot.pending_requests.len(),
+                ))
+                .weak()
+                .size(12.0),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "Layout matrix: {}",
+                    if self.snapshot.layout_matrix.is_empty() {
+                        "(none)"
+                    } else {
+                        &self.snapshot.layout_matrix
+                    }
+                ))
+                .weak()
+                .size(12.0),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(format!("Boundless v{}", env!("CARGO_PKG_VERSION")))
+                    .weak()
+                    .size(11.0),
+            );
+        });
     }
 }

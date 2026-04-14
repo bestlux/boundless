@@ -57,7 +57,7 @@ fn begin_pairing_flow_sets_pairing_request_state() {
     app.pairing_code = "123456".to_string();
     app.pairing_alias = "Old Alias".to_string();
     app.pairing_retry_available = true;
-    app.last_error = Some("previous failure".to_string());
+    app.pairing_last_error = Some("previous failure".to_string());
 
     app.begin_pairing_flow(flow.clone());
 
@@ -78,7 +78,7 @@ fn begin_pairing_flow_sets_pairing_request_state() {
     assert!(app.pairing_code.is_empty());
     assert_eq!(app.pairing_alias, "Office Desktop");
     assert!(!app.pairing_retry_available);
-    assert!(app.last_error.is_none());
+    assert!(app.pairing_last_error.is_none());
 }
 
 #[test]
@@ -113,15 +113,18 @@ fn cancel_pairing_flow_does_not_emit_success_state() {
     let mut app = test_app();
 
     app.begin_pairing_flow(sample_guided_flow());
-    app.last_error = Some("still waiting for pairing".to_string());
-    app.last_message_is_error = true;
+    app.pairing_last_error = Some("still waiting for pairing".to_string());
+    app.push_toast("existing toast".to_string(), true);
 
     app.cancel_pairing_flow();
 
-    assert_eq!(app.last_error.as_deref(), Some("still waiting for pairing"));
+    assert_eq!(
+        app.pairing_last_error.as_deref(),
+        Some("still waiting for pairing")
+    );
     assert!(
-        app.last_message_is_error,
-        "cancel should not synthesize a success message"
+        !app.toasts.is_empty(),
+        "cancel should not clear existing toasts"
     );
 }
 

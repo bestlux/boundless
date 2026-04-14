@@ -60,7 +60,7 @@ impl DashboardTaskRunner {
                                     next_start_attempt = Instant::now() + Duration::from_secs(8);
                                     start_backoff = Duration::from_secs(2);
                                     let _ = tx.send(AppMsg::ActionComplete(format!(
-                                        "Started daemon via `{path}`"
+                                        "Boundless daemon is available via `{path}`"
                                     )));
                                     egui_ctx.request_repaint();
                                     continue;

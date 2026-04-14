@@ -2,7 +2,7 @@
   "app_id": "boundless",
   "display_name": "Boundless",
   "publisher": "Boundless",
-  "version": "3.0.0",
+  "version": "4.0.2",
   "generated_at_utc": "",
   "package_name": "",
   "default_install_root": "%LocalAppData%\\Programs\\Boundless",
