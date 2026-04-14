@@ -74,6 +74,7 @@ pub(super) struct DashboardApp {
     pub(super) layout_initialized: bool,
     pub(super) dragging_peer: Option<(String, (i32, i32))>,
     pub(super) last_layout_matrix: String,
+    pub(super) last_layout_peer_ids: Vec<String>,
 
     // Undo: stash previous layout state before each drag/action
     pub(super) prev_layout_grid: Option<HashMap<(i32, i32), String>>,
@@ -159,6 +160,7 @@ impl DashboardApp {
             layout_initialized: false,
             dragging_peer: None,
             last_layout_matrix: String::new(),
+            last_layout_peer_ids: Vec::new(),
             prev_layout_grid: None,
             prev_layout_unassigned: None,
             confirm_apply_pending: false,
