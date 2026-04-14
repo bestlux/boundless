@@ -1,14 +1,44 @@
 use super::*;
 
+fn layout_peer_ids(peers: &[UiPairedPeer]) -> Vec<String> {
+    let mut ids = peers
+        .iter()
+        .map(|peer| peer.peer_id.clone())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}
+
+fn should_rebuild_layout_model(
+    layout_initialized: bool,
+    machine_id: &str,
+    layout_matrix: &str,
+    last_layout_matrix: &str,
+    current_peer_ids: &[String],
+    last_layout_peer_ids: &[String],
+    dragging_peer: bool,
+) -> bool {
+    (!layout_initialized && !machine_id.is_empty())
+        || (layout_initialized
+            && !dragging_peer
+            && (layout_matrix != last_layout_matrix || current_peer_ids != last_layout_peer_ids))
+}
+
 impl DashboardApp {
     pub(super) fn render_layout_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if (!self.layout_initialized && !self.snapshot.machine_id.is_empty())
-            || (self.layout_initialized
-                && self.snapshot.layout_matrix != self.last_layout_matrix
-                && self.dragging_peer.is_none())
-        {
+        let current_peer_ids = layout_peer_ids(&self.snapshot.paired_peers);
+        if should_rebuild_layout_model(
+            self.layout_initialized,
+            &self.snapshot.machine_id,
+            &self.snapshot.layout_matrix,
+            &self.last_layout_matrix,
+            &current_peer_ids,
+            &self.last_layout_peer_ids,
+            self.dragging_peer.is_some(),
+        ) {
             self.layout_initialized = true;
             self.last_layout_matrix = self.snapshot.layout_matrix.clone();
+            self.last_layout_peer_ids = current_peer_ids;
             self.layout_grid.clear();
             self.layout_unassigned.clear();
 
@@ -692,5 +722,42 @@ fn build_layout_summary(
         format!("Layout: {line}")
     } else {
         format!("Layout: {line}  |  {}", extras.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_rebuild_layout_model;
+
+    #[test]
+    fn rebuilds_when_paired_peer_ids_change_without_layout_matrix_change() {
+        let current_peer_ids = vec!["peer-a".to_string(), "peer-b".to_string()];
+        let last_peer_ids = vec!["peer-a".to_string()];
+
+        assert!(should_rebuild_layout_model(
+            true,
+            "local-machine",
+            "self",
+            "self",
+            &current_peer_ids,
+            &last_peer_ids,
+            false,
+        ));
+    }
+
+    #[test]
+    fn defers_rebuild_while_dragging_even_if_peer_ids_change() {
+        let current_peer_ids = vec!["peer-a".to_string(), "peer-b".to_string()];
+        let last_peer_ids = vec!["peer-a".to_string()];
+
+        assert!(!should_rebuild_layout_model(
+            true,
+            "local-machine",
+            "self",
+            "self",
+            &current_peer_ids,
+            &last_peer_ids,
+            true,
+        ));
     }
 }

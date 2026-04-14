@@ -37,6 +37,7 @@ pub(super) fn test_app() -> DashboardApp {
         layout_initialized: false,
         dragging_peer: None,
         last_layout_matrix: String::new(),
+        last_layout_peer_ids: Vec::new(),
         prev_layout_grid: None,
         prev_layout_unassigned: None,
         confirm_apply_pending: false,
