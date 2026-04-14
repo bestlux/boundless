@@ -74,6 +74,7 @@ impl AppState {
             self.clear_pending_clipboard_replay_for_peer(peer_id).await;
             self.clear_obsolete_inflight_clipboard_replays_for_peer(peer_id)
                 .await;
+            self.clear_remote_anti_idle_peer(peer_id).await;
             self.transport
                 .reconnect_generation_by_peer
                 .write()
@@ -136,6 +137,7 @@ impl AppState {
             self.clear_pending_clipboard_replay_for_peer(peer_id).await;
             self.clear_obsolete_inflight_clipboard_replays_for_peer(peer_id)
                 .await;
+            self.clear_remote_anti_idle_peer(peer_id).await;
             self.notify_input_capture_wake("peer_disconnected");
         } else if transitioned_to_connected
             && !self

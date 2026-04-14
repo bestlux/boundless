@@ -61,6 +61,7 @@ impl AppState {
             transport: Arc::new(TransportState::default()),
             discovery: Arc::new(DiscoveryState::default()),
             input: Arc::new(InputState::new(input_enabled)),
+            anti_idle: Arc::new(AntiIdleState::default()),
             security_paths: Arc::new(paths),
             identity: Arc::new(identity),
             device_fingerprint: Arc::new(fingerprint),
@@ -68,6 +69,7 @@ impl AppState {
             parsed_layout_matrix_cache: Arc::new(RwLock::new(None)),
             input_capture_wake: Arc::new(RuntimeWakeSignal::default()),
             input_inject_wake: Arc::new(RuntimeWakeSignal::default()),
+            anti_idle_wake: Arc::new(RuntimeWakeSignal::default()),
         })
     }
 
@@ -178,7 +180,7 @@ impl AppState {
         self.transport.notify_outgoing_flush_signal();
     }
 
-    fn record_runtime_wake(&self, channel: &str, source: &str) {
+    pub(crate) fn record_runtime_wake(&self, channel: &str, source: &str) {
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
             direction: "local".to_string(),

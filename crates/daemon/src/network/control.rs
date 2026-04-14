@@ -146,6 +146,18 @@ pub(super) async fn handle_heartbeat_message(state: &AppState, remote_peer_id: O
     }
 }
 
+pub(super) async fn handle_anti_idle_pulse_message(
+    state: &AppState,
+    remote_peer_id: Option<&str>,
+    keep_display_on: bool,
+) {
+    if let Some(peer_id) = remote_peer_id {
+        state
+            .note_remote_anti_idle_pulse(peer_id, keep_display_on)
+            .await;
+    }
+}
+
 async fn flush_pending_after_control_frame<W>(
     state: &AppState,
     local_machine_id: &str,

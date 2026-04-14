@@ -7,6 +7,7 @@ impl AppState {
         let peers = config.peers.clone();
         let layout_matrix = config.layout_matrix.clone();
         let features = config.features.clone();
+        let anti_idle_config = config.anti_idle.clone();
 
         let (
             discovered_endpoints,
@@ -16,6 +17,7 @@ impl AppState {
             input_capture_target_peer_id,
             input_lock_runtime,
             mdns_active,
+            anti_idle_runtime,
         ) = tokio::join!(
             self.discovered_endpoints(),
             self.list_pending_nearby_pairing_requests(),
@@ -24,6 +26,7 @@ impl AppState {
             self.input_capture_target(),
             self.input_lock_runtime(),
             self.mdns_active(),
+            self.async_anti_idle_runtime_state(),
         );
 
         let (input_locked, input_lock_supported) = input_lock_runtime;
@@ -45,7 +48,13 @@ impl AppState {
             input_locked,
             input_lock_supported,
             mdns_active,
+            anti_idle_config,
+            anti_idle_runtime,
         }
+    }
+
+    async fn async_anti_idle_runtime_state(&self) -> AntiIdleRuntimeState {
+        self.anti_idle_runtime_state().await
     }
 }
 

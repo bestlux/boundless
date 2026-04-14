@@ -5,7 +5,7 @@ use thiserror::Error;
 
 pub const PROTOCOL_NAME: &str = "boundless";
 pub const PROTOCOL_CURRENT: ProtocolVersion = ProtocolVersion {
-    major: 3,
+    major: 4,
     minor: 0,
     patch: 0,
 };
@@ -65,6 +65,9 @@ pub enum WireMessage {
     Heartbeat {
         machine_id: String,
         timestamp_unix_ms: i64,
+    },
+    AntiIdlePulse {
+        keep_display_on: bool,
     },
     ClipboardText {
         machine_id: String,

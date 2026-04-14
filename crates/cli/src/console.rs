@@ -32,6 +32,7 @@ pub(super) struct ConsoleSnapshot {
     pub(super) input_owner: Option<String>,
     pub(super) capture_target: Option<String>,
     pub(super) mdns_active: bool,
+    pub(super) anti_idle_reason: String,
 }
 
 impl ConsoleSnapshot {
@@ -171,6 +172,11 @@ async fn fetch_console_snapshot(endpoint: &str) -> Result<ConsoleSnapshot> {
         input_owner,
         capture_target,
         mdns_active: snapshot.mdns_active,
+        anti_idle_reason: snapshot
+            .anti_idle_status
+            .as_ref()
+            .map(|status| status.reason.clone())
+            .unwrap_or_else(|| "none".to_string()),
     })
 }
 
@@ -178,7 +184,7 @@ fn print_console_snapshot(endpoint: &str, snapshot: &ConsoleSnapshot) {
     println!();
     println!("=== Boundless Status ===");
     println!(
-        "daemon=running endpoint={} machine_id={} protocol={} input_locked={} input_lock_supported={} active_capture_target={}",
+        "daemon=running endpoint={} machine_id={} protocol={} input_locked={} input_lock_supported={} active_capture_target={} anti_idle_supported={} anti_idle_enabled={} anti_idle_active={} anti_idle_display_required={} anti_idle_reason={}",
         endpoint,
         snapshot.status.machine_id,
         snapshot.status.protocol_version,
@@ -188,7 +194,12 @@ fn print_console_snapshot(endpoint: &str, snapshot: &ConsoleSnapshot) {
             "none"
         } else {
             snapshot.status.capture_target_peer_id.as_str()
-        }
+        },
+        snapshot.status.anti_idle_supported,
+        snapshot.status.anti_idle_enabled,
+        snapshot.status.anti_idle_active,
+        snapshot.status.anti_idle_display_required,
+        snapshot.anti_idle_reason
     );
     println!(
         "api_transport={} api_bind={} api_pipe_name={}",

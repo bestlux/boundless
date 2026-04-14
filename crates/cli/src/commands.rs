@@ -42,7 +42,7 @@ pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
     let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let status = client.get_status(StatusRequest {}).await?.into_inner();
     println!(
-        "running={} machine_id={} peers={} protocol={} api_transport={} api_bind={} api_pipe_name={} input_locked={} input_lock_supported={} active_capture_target={}",
+        "running={} machine_id={} peers={} protocol={} api_transport={} api_bind={} api_pipe_name={} input_locked={} input_lock_supported={} active_capture_target={} anti_idle_supported={} anti_idle_enabled={} anti_idle_active={} anti_idle_display_required={}",
         status.running,
         status.machine_id,
         status.peer_count,
@@ -56,7 +56,11 @@ pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
             "none"
         } else {
             status.capture_target_peer_id.as_str()
-        }
+        },
+        status.anti_idle_supported,
+        status.anti_idle_enabled,
+        status.anti_idle_active,
+        status.anti_idle_display_required
     );
     Ok(())
 }
@@ -879,6 +883,48 @@ pub(super) async fn feature_set(endpoint: &str, name: String, value: ToggleValue
     Ok(())
 }
 
+pub(super) async fn anti_idle_show(endpoint: &str) -> Result<()> {
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let config = client.get_anti_idle_config(Empty {}).await?.into_inner();
+    let status = client.get_anti_idle_status(Empty {}).await?.into_inner();
+
+    println!(
+        "enabled={} recent_activity_window_secs={} allow_on_battery={} keep_display_on={} supported={} active={} display_required={} reason={}",
+        config.enabled,
+        config.recent_activity_window_secs,
+        config.allow_on_battery,
+        config.keep_display_on,
+        status.supported,
+        status.active,
+        status.display_required,
+        status.reason
+    );
+    Ok(())
+}
+
+pub(super) async fn anti_idle_set(
+    endpoint: &str,
+    enabled: bool,
+    window_minutes: u32,
+    allow_on_battery: bool,
+    keep_display_on: bool,
+) -> Result<()> {
+    let recent_activity_window_secs = window_minutes.saturating_mul(60);
+    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let response = client
+        .set_anti_idle_config(AntiIdleSetRequest {
+            enabled,
+            recent_activity_window_secs,
+            allow_on_battery,
+            keep_display_on,
+        })
+        .await?
+        .into_inner();
+
+    println!("ok={} message={}", response.ok, response.message);
+    Ok(())
+}
+
 pub(super) async fn hotkey_set(endpoint: &str, action: String, combo: String) -> Result<()> {
     let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
     let response = client
@@ -1168,6 +1214,8 @@ struct UiSnapshot {
     discovered_peers: Vec<UiDiscoveredPeer>,
     paired_peers: Vec<UiPairedPeer>,
     pending_requests: Vec<UiPendingRequest>,
+    anti_idle_config: UiAntiIdleConfig,
+    anti_idle_status: UiAntiIdleStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1194,6 +1242,23 @@ struct UiPendingRequest {
     verification_code: String,
     verification_expires_at: String,
     requires_verification_code: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UiAntiIdleConfig {
+    enabled: bool,
+    recent_activity_window_secs: u32,
+    allow_on_battery: bool,
+    keep_display_on: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UiAntiIdleStatus {
+    supported: bool,
+    enabled: bool,
+    active: bool,
+    display_required: bool,
+    reason: String,
 }
 
 pub(super) async fn ui_snapshot(endpoint: &str, start_daemon: bool) -> Result<()> {
@@ -1240,6 +1305,36 @@ pub(super) async fn ui_snapshot(endpoint: &str, start_daemon: bool) -> Result<()
                 requires_verification_code: request.requires_verification_code,
             })
             .collect(),
+        anti_idle_config: snapshot
+            .anti_idle_config
+            .map(|config| UiAntiIdleConfig {
+                enabled: config.enabled,
+                recent_activity_window_secs: config.recent_activity_window_secs,
+                allow_on_battery: config.allow_on_battery,
+                keep_display_on: config.keep_display_on,
+            })
+            .unwrap_or(UiAntiIdleConfig {
+                enabled: false,
+                recent_activity_window_secs: 0,
+                allow_on_battery: false,
+                keep_display_on: false,
+            }),
+        anti_idle_status: snapshot
+            .anti_idle_status
+            .map(|status| UiAntiIdleStatus {
+                supported: status.supported,
+                enabled: status.enabled,
+                active: status.active,
+                display_required: status.display_required,
+                reason: status.reason,
+            })
+            .unwrap_or(UiAntiIdleStatus {
+                supported: false,
+                enabled: false,
+                active: false,
+                display_required: false,
+                reason: "none".to_string(),
+            }),
     };
 
     println!(

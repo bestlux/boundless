@@ -86,6 +86,19 @@ pub(super) fn sample_first_run_snapshot() -> UiSnapshot {
         discovered_peers: Vec::new(),
         paired_peers: Vec::new(),
         pending_requests: Vec::new(),
+        anti_idle_config: UiAntiIdleConfig {
+            enabled: true,
+            recent_activity_window_secs: 300,
+            allow_on_battery: false,
+            keep_display_on: false,
+        },
+        anti_idle_status: UiAntiIdleStatus {
+            supported: true,
+            enabled: true,
+            active: false,
+            display_required: false,
+            reason: "none".to_string(),
+        },
     }
 }
 

@@ -317,6 +317,9 @@ pub(super) async fn capture_and_queue_outgoing_frames(
         )
         .await;
     }
+    if !events.is_empty() {
+        state.note_real_local_input_activity().await;
+    }
     let cursor_position = backend.cursor_position();
     let screen_bounds = local_virtual_screen_bounds();
 

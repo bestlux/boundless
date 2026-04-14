@@ -34,7 +34,8 @@ use core_security::{
 use core_transfer::{resolve_conflict_path, validate_transfer_size};
 
 use crate::config::{
-    ApiTransport, PeerConfig, RuntimeConfig, config_path, load_or_create_config_at, save_config_at,
+    AntiIdleConfig, ApiTransport, PeerConfig, RuntimeConfig, config_path, load_or_create_config_at,
+    save_config_at,
 };
 
 const MAX_PENDING_REMOTE_CLIPBOARD_ITEMS: usize = 64;
@@ -51,6 +52,8 @@ const NEARBY_PAIRING_CODE_SUBMISSION_MAX_FAILURES: usize = 8;
 const NEARBY_PAIRING_CODE_SUBMISSION_LOCKOUT_SECONDS: i64 = 600;
 pub(crate) const FILE_TRANSFER_CHUNK_BYTES: usize = 48 * 1024;
 
+mod anti_idle_ops;
+mod anti_idle_state;
 mod clipboard_ops;
 mod clipboard_state;
 mod config_ops;
@@ -69,6 +72,8 @@ mod transport_ops;
 mod transport_state;
 mod validation;
 
+pub(crate) use anti_idle_state::AntiIdleRuntimeState;
+use anti_idle_state::AntiIdleState;
 pub(crate) use clipboard_state::PendingRemoteClipboardPayload;
 use clipboard_state::{ClipboardReplayState, ClipboardState, ClipboardSyncState};
 pub(crate) use discovery_state::DiscoveredPeerEndpoint;
@@ -131,6 +136,8 @@ pub(crate) struct ControlPlaneSnapshotBundle {
     pub(crate) input_locked: bool,
     pub(crate) input_lock_supported: bool,
     pub(crate) mdns_active: bool,
+    pub(crate) anti_idle_config: AntiIdleConfig,
+    pub(crate) anti_idle_runtime: AntiIdleRuntimeState,
 }
 
 impl PendingInjectInputFrame {
@@ -149,6 +156,29 @@ pub enum CaptureHandoffTarget {
     Peer(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntiIdleAssertionReason {
+    None,
+    LocalRecentInput,
+    RemoteRecentInput,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AntiIdleOutboundPulse {
+    pub keep_display_on: bool,
+    pub interval: Duration,
+}
+
+impl AntiIdleAssertionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::LocalRecentInput => "local_recent_input",
+            Self::RemoteRecentInput => "remote_recent_input",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ParsedLayoutMatrixCache {
     spec: String,
@@ -164,6 +194,7 @@ pub struct AppState {
     transport: Arc<TransportState>,
     discovery: Arc<DiscoveryState>,
     input: Arc<InputState>,
+    anti_idle: Arc<AntiIdleState>,
     security_paths: Arc<SecurityPaths>,
     identity: Arc<DeviceIdentity>,
     device_fingerprint: Arc<String>,
@@ -171,6 +202,7 @@ pub struct AppState {
     parsed_layout_matrix_cache: Arc<RwLock<Option<ParsedLayoutMatrixCache>>>,
     input_capture_wake: Arc<RuntimeWakeSignal>,
     input_inject_wake: Arc<RuntimeWakeSignal>,
+    anti_idle_wake: Arc<RuntimeWakeSignal>,
 }
 
 #[cfg(test)]

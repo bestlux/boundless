@@ -10,7 +10,8 @@ use crate::state::TransportEventRecord;
 
 use super::codec::now_millis;
 use super::control::{
-    HelloHandling, handle_heartbeat_message, handle_hello_ack_message, handle_hello_message,
+    HelloHandling, handle_anti_idle_pulse_message, handle_heartbeat_message,
+    handle_hello_ack_message, handle_hello_message,
 };
 use super::inbound::{
     discard_inbound_clipboard_image_transfer, discard_inbound_transfer,
@@ -142,6 +143,7 @@ where
     let mut inbound_clipboard_image_transfers: HashMap<String, InboundClipboardImageTransfer> =
         HashMap::new();
     let mut outbound_transfer_flow: OutboundTransferFlows = HashMap::new();
+    let mut last_anti_idle_pulse_sent_at: Option<std::time::Instant> = None;
 
     loop {
         tokio::select! {
@@ -165,6 +167,28 @@ where
                     timestamp_unix_ms: now_millis(),
                 };
                 send_message(&mut writer, &heartbeat, &mut write_frame_buffer).await?;
+                if let Some(pulse) = state.anti_idle_outbound_pulse().await
+                    && last_anti_idle_pulse_sent_at
+                        .is_none_or(|last| last.elapsed() >= pulse.interval)
+                {
+                    send_message(
+                        &mut writer,
+                        &WireMessage::AntiIdlePulse {
+                            keep_display_on: pulse.keep_display_on,
+                        },
+                        &mut write_frame_buffer,
+                    )
+                    .await?;
+                    state.record_transport_event(TransportEventRecord {
+                        timestamp: Utc::now(),
+                        direction: "outgoing".to_string(),
+                        kind: "anti_idle_pulse_sent".to_string(),
+                        peer_id: authenticated_peer_id.clone(),
+                        detail: format!("keep_display_on={}", pulse.keep_display_on),
+                        size_bytes: 0,
+                    });
+                    last_anti_idle_pulse_sent_at = Some(std::time::Instant::now());
+                }
                 if let Some(remote_protocol) = remote_protocol {
                     flush_outgoing_input_payloads_with_buffer(
                         &state,
@@ -374,6 +398,14 @@ where
                     }
                     WireMessage::Heartbeat { .. } => {
                         handle_heartbeat_message(&state, remote_peer_id.as_deref()).await;
+                    }
+                    WireMessage::AntiIdlePulse { keep_display_on } => {
+                        handle_anti_idle_pulse_message(
+                            &state,
+                            remote_peer_id.as_deref(),
+                            keep_display_on,
+                        )
+                        .await;
                     }
                     WireMessage::ClipboardText { machine_id, text } => {
                         handle_clipboard_text_message(

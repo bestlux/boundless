@@ -3,8 +3,8 @@ use std::{path::PathBuf, time::Duration};
 use app_services::{
     SharedControlPlaneApp, commands as app_commands,
     queries::{
-        ConsoleSnapshot, StatusSnapshot, TransportEventSnapshot, UiDiscoveredPeer, UiPairedPeer,
-        UiPendingRequest, UiSnapshot,
+        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot, StatusSnapshot,
+        TransportEventSnapshot, UiDiscoveredPeer, UiPairedPeer, UiPendingRequest, UiSnapshot,
     },
 };
 use tokio::{sync::mpsc, time};
@@ -12,17 +12,18 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use ipc_api::boundless::v1::{
-    ConsoleSnapshotReply, DiagnosticsDumpReply, DiagnosticsDumpRequest, DiscoveredPeerInfo, Empty,
-    FeatureListReply, FeatureSetRequest, HotkeySetRequest, HotkeyTriggerRequest,
-    ImportTrustBundleRequest, InputCaptureTargetReply, InputCaptureTargetRequest, InputOwnerReply,
-    InputOwnerRequest, LayoutReply, LayoutSetRequest, NearbyJoinStartRequest,
-    NearbyJoinStatusReply, NearbyJoinStatusRequest, NearbyPairingCompletionReply,
-    NearbyPairingDecisionRequest, NearbyPairingRequestInfo, NearbyRequestCodeStartReply,
-    NearbyRequestCodeStartRequest, NearbySubmitCodeRequest, OperationReply, PairCreateCodeReply,
-    PairCreateCodeRequest, PairJoinReply, PairJoinRequest, PeerInfo, PeerListReply,
-    RemovePeerRequest, SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest,
-    SendFileRequest, SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest,
-    TransportEvent, TransportEventsReply, TrustBundleReply, UiSnapshotReply,
+    AntiIdleConfigReply, AntiIdleSetRequest, AntiIdleStatusReply, ConsoleSnapshotReply,
+    DiagnosticsDumpReply, DiagnosticsDumpRequest, DiscoveredPeerInfo, Empty, FeatureListReply,
+    FeatureSetRequest, HotkeySetRequest, HotkeyTriggerRequest, ImportTrustBundleRequest,
+    InputCaptureTargetReply, InputCaptureTargetRequest, InputOwnerReply, InputOwnerRequest,
+    LayoutReply, LayoutSetRequest, NearbyJoinStartRequest, NearbyJoinStatusReply,
+    NearbyJoinStatusRequest, NearbyPairingCompletionReply, NearbyPairingDecisionRequest,
+    NearbyPairingRequestInfo, NearbyRequestCodeStartReply, NearbyRequestCodeStartRequest,
+    NearbySubmitCodeRequest, OperationReply, PairCreateCodeReply, PairCreateCodeRequest,
+    PairJoinReply, PairJoinRequest, PeerInfo, PeerListReply, RemovePeerRequest, SafeResetRequest,
+    SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
+    SendInputMoveRequest, StatusReply, StatusRequest, TransportEvent, TransportEventsReply,
+    TrustBundleReply, UiSnapshotReply,
     control_plane_service_server::{ControlPlaneService, ControlPlaneServiceServer},
 };
 
@@ -234,6 +235,51 @@ impl ControlPlaneService for ControlPlaneApi {
             })
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
+    }
+
+    async fn get_anti_idle_config(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<AntiIdleConfigReply>, Status> {
+        let snapshot = self
+            .app
+            .anti_idle_config()
+            .await
+            .map_err(|error| Status::internal(format!("build anti-idle config: {error:#}")))?;
+        Ok(Response::new(map_anti_idle_config(snapshot)))
+    }
+
+    async fn get_anti_idle_status(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<AntiIdleStatusReply>, Status> {
+        let snapshot = self
+            .app
+            .anti_idle_status()
+            .await
+            .map_err(|error| Status::internal(format!("build anti-idle status: {error:#}")))?;
+        Ok(Response::new(map_anti_idle_status(snapshot)))
+    }
+
+    async fn set_anti_idle_config(
+        &self,
+        request: Request<AntiIdleSetRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .set_anti_idle_config(app_commands::SetAntiIdleConfigCommand {
+                enabled: request.enabled,
+                recent_activity_window_secs: request.recent_activity_window_secs,
+                allow_on_battery: request.allow_on_battery,
+                keep_display_on: request.keep_display_on,
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         Ok(Response::new(OperationReply {
             ok: reply.ok,
             message: reply.message,
@@ -790,6 +836,8 @@ fn map_ui_snapshot(snapshot: UiSnapshot) -> UiSnapshotReply {
             .into_iter()
             .map(map_pending_request)
             .collect(),
+        anti_idle_config: Some(map_anti_idle_config(snapshot.anti_idle_config)),
+        anti_idle_status: Some(map_anti_idle_status(snapshot.anti_idle_status)),
     }
 }
 
@@ -812,6 +860,8 @@ fn map_console_snapshot(snapshot: ConsoleSnapshot) -> ConsoleSnapshotReply {
         input_capture_target_peer_id: snapshot.input_capture_target_peer_id.unwrap_or_default(),
         mdns_active: snapshot.mdns_active,
         local_display_name: snapshot.local_display_name,
+        anti_idle_config: Some(map_anti_idle_config(snapshot.anti_idle_config)),
+        anti_idle_status: Some(map_anti_idle_status(snapshot.anti_idle_status)),
     }
 }
 
@@ -828,6 +878,29 @@ fn map_status_snapshot(snapshot: StatusSnapshot) -> StatusReply {
         input_locked: snapshot.input_locked,
         input_lock_supported: snapshot.input_lock_supported,
         capture_target_peer_id: snapshot.capture_target_peer_id.unwrap_or_default(),
+        anti_idle_supported: snapshot.anti_idle_supported,
+        anti_idle_enabled: snapshot.anti_idle_enabled,
+        anti_idle_active: snapshot.anti_idle_active,
+        anti_idle_display_required: snapshot.anti_idle_display_required,
+    }
+}
+
+fn map_anti_idle_config(snapshot: AntiIdleConfigSnapshot) -> AntiIdleConfigReply {
+    AntiIdleConfigReply {
+        enabled: snapshot.enabled,
+        recent_activity_window_secs: snapshot.recent_activity_window_secs,
+        allow_on_battery: snapshot.allow_on_battery,
+        keep_display_on: snapshot.keep_display_on,
+    }
+}
+
+fn map_anti_idle_status(snapshot: AntiIdleStatusSnapshot) -> AntiIdleStatusReply {
+    AntiIdleStatusReply {
+        supported: snapshot.supported,
+        enabled: snapshot.enabled,
+        active: snapshot.active,
+        display_required: snapshot.display_required,
+        reason: snapshot.reason,
     }
 }
 

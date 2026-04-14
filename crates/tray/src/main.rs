@@ -24,8 +24,8 @@ mod windows_app {
     use hyper_util::rt::TokioIo;
     use image::ImageFormat;
     use ipc_api::boundless::v1::{
-        Empty, HotkeyTriggerRequest, LayoutSetRequest, NearbyPairingDecisionRequest,
-        NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
+        AntiIdleSetRequest, Empty, HotkeyTriggerRequest, LayoutSetRequest,
+        NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
         control_plane_service_client::ControlPlaneServiceClient,
     };
     use serde::Deserialize;
@@ -83,6 +83,25 @@ mod windows_app {
         discovered_peers: Vec<UiDiscoveredPeer>,
         paired_peers: Vec<UiPairedPeer>,
         pending_requests: Vec<UiPendingRequest>,
+        anti_idle_config: UiAntiIdleConfig,
+        anti_idle_status: UiAntiIdleStatus,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Default)]
+    struct UiAntiIdleConfig {
+        enabled: bool,
+        recent_activity_window_secs: u32,
+        allow_on_battery: bool,
+        keep_display_on: bool,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Default)]
+    struct UiAntiIdleStatus {
+        supported: bool,
+        enabled: bool,
+        active: bool,
+        display_required: bool,
+        reason: String,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -238,6 +257,25 @@ mod windows_app {
                             requires_verification_code: request.requires_verification_code,
                         })
                         .collect(),
+                    anti_idle_config: snapshot
+                        .anti_idle_config
+                        .map(|config| UiAntiIdleConfig {
+                            enabled: config.enabled,
+                            recent_activity_window_secs: config.recent_activity_window_secs,
+                            allow_on_battery: config.allow_on_battery,
+                            keep_display_on: config.keep_display_on,
+                        })
+                        .unwrap_or_default(),
+                    anti_idle_status: snapshot
+                        .anti_idle_status
+                        .map(|status| UiAntiIdleStatus {
+                            supported: status.supported,
+                            enabled: status.enabled,
+                            active: status.active,
+                            display_required: status.display_required,
+                            reason: status.reason,
+                        })
+                        .unwrap_or_default(),
                 })?;
             }
             Ok(())
@@ -294,6 +332,22 @@ mod windows_app {
         block_on_result(layout_set(endpoint, matrix_spec))
     }
 
+    fn set_anti_idle_config_blocking(
+        endpoint: &str,
+        enabled: bool,
+        recent_activity_window_secs: u32,
+        allow_on_battery: bool,
+        keep_display_on: bool,
+    ) -> Result<String> {
+        block_on_result(set_anti_idle_config(
+            endpoint,
+            enabled,
+            recent_activity_window_secs,
+            allow_on_battery,
+            keep_display_on,
+        ))
+    }
+
     fn ensure_daemon_available_blocking(ctx: &AppContext) -> Result<Option<String>> {
         block_on_result(ensure_daemon_available(
             &ctx.endpoint,
@@ -328,6 +382,29 @@ mod windows_app {
             .layout_set(LayoutSetRequest { matrix_spec })
             .await?
             .into_inner();
+        Ok(response.message)
+    }
+
+    async fn set_anti_idle_config(
+        endpoint: &str,
+        enabled: bool,
+        recent_activity_window_secs: u32,
+        allow_on_battery: bool,
+        keep_display_on: bool,
+    ) -> Result<String> {
+        let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+        let response = client
+            .set_anti_idle_config(AntiIdleSetRequest {
+                enabled,
+                recent_activity_window_secs,
+                allow_on_battery,
+                keep_display_on,
+            })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
         Ok(response.message)
     }
 
