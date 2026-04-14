@@ -603,43 +603,6 @@ impl DashboardApp {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::should_rebuild_layout_model;
-
-    #[test]
-    fn rebuilds_when_paired_peer_ids_change_without_layout_matrix_change() {
-        let current_peer_ids = vec!["peer-a".to_string(), "peer-b".to_string()];
-        let last_peer_ids = vec!["peer-a".to_string()];
-
-        assert!(should_rebuild_layout_model(
-            true,
-            "local-machine",
-            "self",
-            "self",
-            &current_peer_ids,
-            &last_peer_ids,
-            false,
-        ));
-    }
-
-    #[test]
-    fn defers_rebuild_while_dragging_even_if_peer_ids_change() {
-        let current_peer_ids = vec!["peer-a".to_string(), "peer-b".to_string()];
-        let last_peer_ids = vec!["peer-a".to_string()];
-
-        assert!(!should_rebuild_layout_model(
-            true,
-            "local-machine",
-            "self",
-            "self",
-            &current_peer_ids,
-            &last_peer_ids,
-            true,
-        ));
-    }
-}
-
 // ── Layout context menu actions ────────────────────────────────────────
 enum LayoutContextAction {
     RemoveFromGrid(i32, i32),
@@ -759,5 +722,42 @@ fn build_layout_summary(
         format!("Layout: {line}")
     } else {
         format!("Layout: {line}  |  {}", extras.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_rebuild_layout_model;
+
+    #[test]
+    fn rebuilds_when_paired_peer_ids_change_without_layout_matrix_change() {
+        let current_peer_ids = vec!["peer-a".to_string(), "peer-b".to_string()];
+        let last_peer_ids = vec!["peer-a".to_string()];
+
+        assert!(should_rebuild_layout_model(
+            true,
+            "local-machine",
+            "self",
+            "self",
+            &current_peer_ids,
+            &last_peer_ids,
+            false,
+        ));
+    }
+
+    #[test]
+    fn defers_rebuild_while_dragging_even_if_peer_ids_change() {
+        let current_peer_ids = vec!["peer-a".to_string(), "peer-b".to_string()];
+        let last_peer_ids = vec!["peer-a".to_string()];
+
+        assert!(!should_rebuild_layout_model(
+            true,
+            "local-machine",
+            "self",
+            "self",
+            &current_peer_ids,
+            &last_peer_ids,
+            true,
+        ));
     }
 }
