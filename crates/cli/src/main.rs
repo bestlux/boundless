@@ -23,13 +23,14 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tonic::{codegen::Service, transport::Uri};
 
 use ipc_api::boundless::v1::{
-    DiagnosticsDumpRequest, Empty, FeatureSetRequest, HotkeySetRequest, HotkeyTriggerRequest,
-    ImportTrustBundleRequest, InputCaptureTargetRequest, InputOwnerRequest, LayoutSetRequest,
-    NearbyJoinStartRequest, NearbyJoinStatusRequest, NearbyPairingDecisionRequest,
-    NearbyRequestCodeStartRequest, NearbySubmitCodeRequest, PairCreateCodeRequest, PairJoinRequest,
-    RemovePeerRequest, SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest,
-    SendFileRequest, SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest,
-    UiSnapshotReply, control_plane_service_client::ControlPlaneServiceClient,
+    AntiIdleSetRequest, DiagnosticsDumpRequest, Empty, FeatureSetRequest, HotkeySetRequest,
+    HotkeyTriggerRequest, ImportTrustBundleRequest, InputCaptureTargetRequest, InputOwnerRequest,
+    LayoutSetRequest, NearbyJoinStartRequest, NearbyJoinStatusRequest,
+    NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
+    PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest, SafeResetRequest,
+    SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
+    SendInputMoveRequest, StatusReply, StatusRequest, UiSnapshotReply,
+    control_plane_service_client::ControlPlaneServiceClient,
 };
 
 mod cli_helpers;
@@ -95,6 +96,10 @@ enum Command {
     Feature {
         #[command(subcommand)]
         command: FeatureCommand,
+    },
+    AntiIdle {
+        #[command(subcommand)]
+        command: AntiIdleCommand,
     },
     Transport {
         #[command(subcommand)]
@@ -222,6 +227,21 @@ enum LayoutCommand {
 enum FeatureCommand {
     List,
     Set { name: String, value: ToggleValue },
+}
+
+#[derive(Debug, Subcommand)]
+enum AntiIdleCommand {
+    Show,
+    Set {
+        #[arg(long)]
+        enabled: bool,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=30))]
+        window_minutes: u32,
+        #[arg(long)]
+        allow_on_battery: bool,
+        #[arg(long)]
+        keep_display_on: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -401,6 +421,24 @@ async fn main() -> Result<()> {
             FeatureCommand::List => feature_list(&cli.endpoint).await,
             FeatureCommand::Set { name, value } => feature_set(&cli.endpoint, name, value).await,
         },
+        Command::AntiIdle { command } => match command {
+            AntiIdleCommand::Show => anti_idle_show(&cli.endpoint).await,
+            AntiIdleCommand::Set {
+                enabled,
+                window_minutes,
+                allow_on_battery,
+                keep_display_on,
+            } => {
+                anti_idle_set(
+                    &cli.endpoint,
+                    enabled,
+                    window_minutes,
+                    allow_on_battery,
+                    keep_display_on,
+                )
+                .await
+            }
+        },
         Command::Transport { command } => match command {
             TransportCommand::SendText { peer_id, text } => {
                 transport_send_text(&cli.endpoint, peer_id, text).await
@@ -571,6 +609,7 @@ mod tests {
             input_owner: None,
             capture_target: None,
             mdns_active: true,
+            anti_idle_reason: "none".to_string(),
         };
 
         let by_index = resolve_discovered_peer(&snapshot, "2").expect("index");

@@ -390,6 +390,119 @@ impl DashboardApp {
             ui.add_space(16.0);
             ui.separator();
 
+            // ── Peer Availability ─────────────────────────────────────
+            ui.add_space(8.0);
+            ui.heading("Peer Availability");
+            ui.add_space(4.0);
+            let anti_idle_config = self.snapshot.anti_idle_config.clone();
+            let anti_idle_status = self.snapshot.anti_idle_status.clone();
+            let anti_idle_status_text = if !anti_idle_status.supported {
+                "Unsupported on this platform"
+            } else if anti_idle_status.active {
+                "Active now"
+            } else {
+                "Inactive"
+            };
+            ui.label(
+                egui::RichText::new(format!(
+                    "Status: {}{}",
+                    anti_idle_status_text,
+                    if anti_idle_status.reason == "none" {
+                        if anti_idle_status.supported {
+                            format!(
+                                " (enabled={} display_required={})",
+                                anti_idle_status.enabled, anti_idle_status.display_required
+                            )
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        format!(
+                            " ({}; enabled={} display_required={})",
+                            anti_idle_status.reason.replace('_', " "),
+                            anti_idle_status.enabled,
+                            anti_idle_status.display_required
+                        )
+                    }
+                ))
+                .weak(),
+            );
+            if anti_idle_status.supported {
+                let mut anti_idle_enabled = anti_idle_config.enabled;
+                if ui
+                    .checkbox(
+                        &mut anti_idle_enabled,
+                        "Keep connected peers awake",
+                    )
+                    .clicked()
+                {
+                    self.task_runner().set_anti_idle_config(
+                        self.tx.clone(),
+                        self.ctx.endpoint.clone(),
+                        !anti_idle_config.enabled,
+                        anti_idle_config.recent_activity_window_secs,
+                        anti_idle_config.allow_on_battery,
+                        anti_idle_config.keep_display_on,
+                    );
+                }
+
+                ui.add_space(8.0);
+                ui.label("Recent activity window");
+                ui.horizontal_wrapped(|ui| {
+                    for minutes in [1_u32, 5, 10, 15, 30] {
+                        let selected = anti_idle_config.recent_activity_window_secs == minutes * 60;
+                        if ui.selectable_label(selected, format!("{minutes} min")).clicked() {
+                            self.task_runner().set_anti_idle_config(
+                                self.tx.clone(),
+                                self.ctx.endpoint.clone(),
+                                anti_idle_config.enabled,
+                                minutes * 60,
+                                anti_idle_config.allow_on_battery,
+                                anti_idle_config.keep_display_on,
+                            );
+                        }
+                    }
+                });
+
+                let mut allow_on_battery = anti_idle_config.allow_on_battery;
+                if ui
+                    .checkbox(
+                        &mut allow_on_battery,
+                        "Allow on battery",
+                    )
+                    .clicked()
+                {
+                    self.task_runner().set_anti_idle_config(
+                        self.tx.clone(),
+                        self.ctx.endpoint.clone(),
+                        anti_idle_config.enabled,
+                        anti_idle_config.recent_activity_window_secs,
+                        !anti_idle_config.allow_on_battery,
+                        anti_idle_config.keep_display_on,
+                    );
+                }
+                let mut keep_display_on = anti_idle_config.keep_display_on;
+                if ui
+                    .checkbox(
+                        &mut keep_display_on,
+                        "Keep display on",
+                    )
+                    .clicked()
+                {
+                    self.task_runner().set_anti_idle_config(
+                        self.tx.clone(),
+                        self.ctx.endpoint.clone(),
+                        anti_idle_config.enabled,
+                        anti_idle_config.recent_activity_window_secs,
+                        anti_idle_config.allow_on_battery,
+                        !anti_idle_config.keep_display_on,
+                    );
+                }
+            }
+
+            ui.add_space(16.0);
+            ui.separator();
+
             // ── Actions ────────────────────────────────────────────────
             ui.add_space(8.0);
             ui.heading("Actions");

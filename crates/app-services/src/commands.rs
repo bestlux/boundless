@@ -31,6 +31,14 @@ pub struct FeatureSetCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetAntiIdleConfigCommand {
+    pub enabled: bool,
+    pub recent_activity_window_secs: u32,
+    pub allow_on_battery: bool,
+    pub keep_display_on: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotkeySetCommand {
     pub action: String,
     pub combo: String,

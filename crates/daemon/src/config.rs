@@ -12,7 +12,9 @@ use uuid::Uuid;
 use core_protocol::PROTOCOL_CURRENT;
 
 const DEFAULT_LAYOUT_MATRIX: &str = "self";
-const RUNTIME_CONFIG_VERSION: &str = "2";
+const RUNTIME_CONFIG_VERSION: &str = "4";
+const DEFAULT_ANTI_IDLE_RECENT_ACTIVITY_WINDOW_SECS: u32 = 300;
+const DEFAULT_ANTI_IDLE_PULSE_INTERVAL_SECS: u32 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerConfig {
@@ -69,9 +71,37 @@ pub struct RuntimeConfig {
     pub auto_start: bool,
     pub network_port: u16,
     pub features: BTreeMap<String, bool>,
+    #[serde(default)]
+    pub anti_idle: AntiIdleConfig,
     pub hotkeys: BTreeMap<String, String>,
     pub peers: Vec<PeerConfig>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AntiIdleConfig {
+    #[serde(default = "default_anti_idle_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_recent_activity_window_secs")]
+    pub recent_activity_window_secs: u32,
+    #[serde(default = "default_allow_on_battery")]
+    pub allow_on_battery: bool,
+    #[serde(default = "default_keep_display_on")]
+    pub keep_display_on: bool,
+    #[serde(default = "default_pulse_interval_secs")]
+    pub pulse_interval_secs: u32,
+}
+
+impl Default for AntiIdleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_anti_idle_enabled(),
+            recent_activity_window_secs: default_recent_activity_window_secs(),
+            allow_on_battery: default_allow_on_battery(),
+            keep_display_on: default_keep_display_on(),
+            pulse_interval_secs: default_pulse_interval_secs(),
+        }
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -112,6 +142,7 @@ impl Default for RuntimeConfig {
             auto_start: true,
             network_port: 15100,
             features,
+            anti_idle: AntiIdleConfig::default(),
             hotkeys,
             peers: Vec::new(),
             updated_at: now,
@@ -133,6 +164,26 @@ fn default_api_transport() -> ApiTransport {
 
 fn default_api_pipe_name() -> String {
     "boundlessd-api".to_string()
+}
+
+fn default_anti_idle_enabled() -> bool {
+    true
+}
+
+fn default_recent_activity_window_secs() -> u32 {
+    DEFAULT_ANTI_IDLE_RECENT_ACTIVITY_WINDOW_SECS
+}
+
+fn default_allow_on_battery() -> bool {
+    false
+}
+
+fn default_keep_display_on() -> bool {
+    false
+}
+
+fn default_pulse_interval_secs() -> u32 {
+    DEFAULT_ANTI_IDLE_PULSE_INTERVAL_SECS
 }
 
 pub fn config_path() -> PathBuf {
@@ -158,8 +209,13 @@ pub fn load_or_create_config_at(path: &Path) -> Result<RuntimeConfig> {
     }
 
     let data = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let config: RuntimeConfig =
+    let mut value: serde_json::Value =
         serde_json::from_str(&data).with_context(|| format!("parse {}", path.display()))?;
+
+    migrate_config_value(path, &mut value)?;
+
+    let config: RuntimeConfig =
+        serde_json::from_value(value).with_context(|| format!("parse {}", path.display()))?;
 
     if config.config_version != RUNTIME_CONFIG_VERSION {
         bail!(
@@ -186,6 +242,20 @@ pub fn load_or_create_config_at(path: &Path) -> Result<RuntimeConfig> {
         );
     }
 
+    if config.anti_idle.recent_activity_window_secs == 0 {
+        bail!(
+            "invalid config: anti_idle.recent_activity_window_secs must be greater than zero in `{}`",
+            path.display()
+        );
+    }
+
+    if config.anti_idle.pulse_interval_secs == 0 {
+        bail!(
+            "invalid config: anti_idle.pulse_interval_secs must be greater than zero in `{}`",
+            path.display()
+        );
+    }
+
     Ok(config)
 }
 
@@ -208,9 +278,71 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "boundless-host".to_string())
 }
 
+fn migrate_config_value(path: &Path, value: &mut serde_json::Value) -> Result<()> {
+    let Some(object) = value.as_object_mut() else {
+        bail!(
+            "invalid config: root must be an object in `{}`",
+            path.display()
+        );
+    };
+
+    let Some(config_version) = object
+        .get("config_version")
+        .and_then(|entry| entry.as_str())
+    else {
+        bail!(
+            "invalid config: config_version is required in `{}`",
+            path.display()
+        );
+    };
+
+    match config_version {
+        RUNTIME_CONFIG_VERSION => {
+            if !object.contains_key("anti_idle") {
+                object.insert(
+                    "anti_idle".to_string(),
+                    serde_json::to_value(AntiIdleConfig::default())
+                        .context("serialize anti_idle default")?,
+                );
+            }
+            Ok(())
+        }
+        "2" | "3" => {
+            object.insert(
+                "config_version".to_string(),
+                serde_json::Value::String(RUNTIME_CONFIG_VERSION.to_string()),
+            );
+            object.insert(
+                "protocol_version".to_string(),
+                serde_json::Value::String(PROTOCOL_CURRENT.to_string()),
+            );
+            object.insert(
+                "anti_idle".to_string(),
+                serde_json::to_value(AntiIdleConfig::default())
+                    .context("serialize anti_idle default")?,
+            );
+
+            let migrated: RuntimeConfig =
+                serde_json::from_value(serde_json::Value::Object(object.clone()))
+                    .with_context(|| format!("parse migrated {}", path.display()))?;
+            save_config_at(path, &migrated)?;
+            Ok(())
+        }
+        other => bail!(
+            "unsupported config version `{}`; expected `{}`. remove `{}` to regenerate config for this build",
+            other,
+            RUNTIME_CONFIG_VERSION,
+            path.display()
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ApiTransport, RuntimeConfig, load_or_create_config_at, save_config_at};
+    use super::{
+        AntiIdleConfig, ApiTransport, RuntimeConfig, default_pulse_interval_secs,
+        default_recent_activity_window_secs, load_or_create_config_at, save_config_at,
+    };
     use core_protocol::PROTOCOL_CURRENT;
 
     #[test]
@@ -330,6 +462,74 @@ mod tests {
                 .contains("layout_matrix must not be empty"),
             "unexpected error: {error:#}"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn anti_idle_defaults_match_balanced_policy() {
+        let config = RuntimeConfig::default();
+
+        assert!(config.anti_idle.enabled);
+        assert_eq!(
+            config.anti_idle.recent_activity_window_secs,
+            default_recent_activity_window_secs()
+        );
+        assert!(!config.anti_idle.allow_on_battery);
+        assert!(!config.anti_idle.keep_display_on);
+        assert_eq!(
+            config.anti_idle.pulse_interval_secs,
+            default_pulse_interval_secs()
+        );
+    }
+
+    #[test]
+    fn load_or_create_migrates_v2_config_with_default_anti_idle() {
+        let root =
+            std::env::temp_dir().join(format!("boundless-config-migrate-{}", uuid::Uuid::new_v4()));
+        let path = root.join("config.json");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{
+  "config_version": "2",
+  "machine_id": "m1",
+  "device_name": "node",
+  "api_bind": "127.0.0.1:50051",
+  "api_transport": "tcp",
+  "api_pipe_name": "boundlessd-api",
+  "protocol_version": "{}",
+  "layout_matrix": "self",
+  "auto_start": true,
+  "network_port": 15100,
+  "features": {{
+    "share_clipboard": true,
+    "transfer_file": true,
+    "share_input": true,
+    "easy_mouse": true,
+    "wrap_mouse": true
+  }},
+  "hotkeys": {{
+    "toggle_easy_mouse": "Ctrl+Alt+Shift+E",
+    "lock_machine": "Ctrl+Alt+Shift+L",
+    "switch_all": "Disabled",
+    "reconnect": "Ctrl+Alt+Shift+R"
+  }},
+  "peers": [],
+  "updated_at": "2026-04-13T00:00:00Z"
+}}"#,
+                PROTOCOL_CURRENT
+            ),
+        )
+        .expect("seed config");
+
+        let config = load_or_create_config_at(&path).expect("migrate config");
+        assert_eq!(config.config_version, "4");
+        assert_eq!(config.anti_idle, AntiIdleConfig::default());
+
+        let saved = std::fs::read_to_string(&path).expect("read migrated");
+        assert!(saved.contains("\"anti_idle\""));
 
         let _ = std::fs::remove_dir_all(root);
     }

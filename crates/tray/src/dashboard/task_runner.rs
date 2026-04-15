@@ -205,6 +205,33 @@ impl DashboardTaskRunner {
         });
     }
 
+    pub(super) fn set_anti_idle_config(
+        &self,
+        tx: Sender<AppMsg>,
+        endpoint: String,
+        enabled: bool,
+        recent_activity_window_secs: u32,
+        allow_on_battery: bool,
+        keep_display_on: bool,
+    ) {
+        Self::spawn(move || {
+            match set_anti_idle_config_blocking(
+                &endpoint,
+                enabled,
+                recent_activity_window_secs,
+                allow_on_battery,
+                keep_display_on,
+            ) {
+                Ok(msg) => {
+                    let _ = tx.send(AppMsg::ActionComplete(msg));
+                }
+                Err(error) => {
+                    let _ = tx.send(AppMsg::ActionFailed(error.to_string()));
+                }
+            }
+        });
+    }
+
     pub(super) fn reconnect_all_peers(&self, tx: Sender<AppMsg>, endpoint: String) {
         Self::spawn(move || match trigger_hotkey_action_blocking(&endpoint, "reconnect") {
             Ok(msg) => {

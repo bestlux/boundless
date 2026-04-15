@@ -140,6 +140,7 @@ impl AppState {
             for peer_id in &disconnected_peer_ids {
                 self.clear_pending_inject_input_frames_for_peer(peer_id)
                     .await;
+                self.clear_remote_anti_idle_peer(peer_id).await;
             }
 
             let mut capture_target = self.input.control.capture_target_peer_id.write().await;

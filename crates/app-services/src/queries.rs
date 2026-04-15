@@ -2,6 +2,23 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AntiIdleConfigSnapshot {
+    pub enabled: bool,
+    pub recent_activity_window_secs: u32,
+    pub allow_on_battery: bool,
+    pub keep_display_on: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AntiIdleStatusSnapshot {
+    pub supported: bool,
+    pub enabled: bool,
+    pub active: bool,
+    pub display_required: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     pub daemon_version: String,
     pub machine_id: String,
@@ -13,6 +30,10 @@ pub struct StatusSnapshot {
     pub input_locked: bool,
     pub input_lock_supported: bool,
     pub capture_target_peer_id: Option<String>,
+    pub anti_idle_supported: bool,
+    pub anti_idle_enabled: bool,
+    pub anti_idle_active: bool,
+    pub anti_idle_display_required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +71,8 @@ pub struct UiSnapshot {
     pub discovered_peers: Vec<UiDiscoveredPeer>,
     pub paired_peers: Vec<UiPairedPeer>,
     pub pending_requests: Vec<UiPendingRequest>,
+    pub anti_idle_config: AntiIdleConfigSnapshot,
+    pub anti_idle_status: AntiIdleStatusSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +88,8 @@ pub struct ConsoleSnapshot {
     pub input_capture_target_peer_id: Option<String>,
     pub mdns_active: bool,
     pub local_display_name: String,
+    pub anti_idle_config: AntiIdleConfigSnapshot,
+    pub anti_idle_status: AntiIdleStatusSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

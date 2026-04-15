@@ -12,12 +12,12 @@ use crate::{
         NearbyRequestCodeCommand, NearbySubmitCodeCommand, OperationReply, PairJoinCommand,
         PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, SafeResetCommand,
         SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand,
-        SendInputMoveCommand,
+        SendInputMoveCommand, SetAntiIdleConfigCommand,
     },
     queries::{
-        ConsoleSnapshot, NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot,
-        NearbyRequestCodeStartSnapshot, StatusSnapshot, TransportEventSnapshot,
-        TrustBundleSnapshot, UiSnapshot,
+        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot, NearbyJoinStatusSnapshot,
+        NearbyPairingCompletionSnapshot, NearbyRequestCodeStartSnapshot, StatusSnapshot,
+        TransportEventSnapshot, TrustBundleSnapshot, UiSnapshot,
     },
 };
 
@@ -34,6 +34,12 @@ pub trait ControlPlaneApp: Send + Sync {
     async fn layout(&self) -> Result<LayoutReply>;
     async fn features(&self) -> Result<std::collections::BTreeMap<String, bool>>;
     async fn set_feature(&self, command: FeatureSetCommand) -> Result<OperationReply>;
+    async fn anti_idle_config(&self) -> Result<AntiIdleConfigSnapshot>;
+    async fn anti_idle_status(&self) -> Result<AntiIdleStatusSnapshot>;
+    async fn set_anti_idle_config(
+        &self,
+        command: SetAntiIdleConfigCommand,
+    ) -> Result<OperationReply>;
     async fn set_hotkey(&self, command: HotkeySetCommand) -> Result<OperationReply>;
     async fn trigger_hotkey_action(&self, command: HotkeyTriggerCommand) -> Result<OperationReply>;
     async fn export_trust_bundle(&self) -> Result<TrustBundleSnapshot>;

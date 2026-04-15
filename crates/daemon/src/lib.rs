@@ -1,3 +1,4 @@
+pub mod anti_idle;
 pub mod clipboard;
 pub mod config;
 pub mod control_plane_app;

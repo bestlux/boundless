@@ -17,6 +17,10 @@ message StatusReply {
   bool input_locked = 9;
   bool input_lock_supported = 10;
   string capture_target_peer_id = 11;
+  bool anti_idle_supported = 12;
+  bool anti_idle_enabled = 13;
+  bool anti_idle_active = 14;
+  bool anti_idle_display_required = 15;
 }
 
 message PairCreateCodeRequest {
@@ -104,6 +108,28 @@ message FeatureSetRequest {
 }
 message FeatureListReply {
   map<string, bool> features = 1;
+}
+
+message AntiIdleConfigReply {
+  bool enabled = 1;
+  uint32 recent_activity_window_secs = 2;
+  bool allow_on_battery = 3;
+  bool keep_display_on = 4;
+}
+
+message AntiIdleStatusReply {
+  bool supported = 1;
+  bool enabled = 2;
+  bool active = 3;
+  bool display_required = 4;
+  string reason = 5;
+}
+
+message AntiIdleSetRequest {
+  bool enabled = 1;
+  uint32 recent_activity_window_secs = 2;
+  bool allow_on_battery = 3;
+  bool keep_display_on = 4;
 }
 
 message HotkeySetRequest {
@@ -207,6 +233,8 @@ message UiSnapshotReply {
   repeated DiscoveredPeerInfo discovered_peers = 5;
   repeated PeerInfo paired_peers = 6;
   repeated NearbyPairingRequestInfo pending_requests = 7;
+  AntiIdleConfigReply anti_idle_config = 8;
+  AntiIdleStatusReply anti_idle_status = 9;
 }
 
 message ConsoleSnapshotReply {
@@ -219,6 +247,8 @@ message ConsoleSnapshotReply {
   string input_capture_target_peer_id = 7;
   bool mdns_active = 8;
   string local_display_name = 9;
+  AntiIdleConfigReply anti_idle_config = 10;
+  AntiIdleStatusReply anti_idle_status = 11;
 }
 
 message NearbyRequestCodeStartRequest {
@@ -290,6 +320,9 @@ service ControlPlaneService {
   rpc LayoutSet(LayoutSetRequest) returns (OperationReply);
   rpc ListFeatures(Empty) returns (FeatureListReply);
   rpc SetFeature(FeatureSetRequest) returns (OperationReply);
+  rpc GetAntiIdleConfig(Empty) returns (AntiIdleConfigReply);
+  rpc GetAntiIdleStatus(Empty) returns (AntiIdleStatusReply);
+  rpc SetAntiIdleConfig(AntiIdleSetRequest) returns (OperationReply);
   rpc SetHotkey(HotkeySetRequest) returns (OperationReply);
   rpc TriggerHotkeyAction(HotkeyTriggerRequest) returns (OperationReply);
   rpc ExportTrustBundle(Empty) returns (TrustBundleReply);

@@ -11,12 +11,13 @@ use app_services::{
         NearbyRequestCodeCommand, NearbySubmitCodeCommand, OperationReply, PairJoinCommand,
         PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, SafeResetCommand,
         SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand,
-        SendInputMoveCommand,
+        SendInputMoveCommand, SetAntiIdleConfigCommand,
     },
     queries::{
-        ConsoleSnapshot, NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot,
-        NearbyRequestCodeStartSnapshot, StatusSnapshot, TransportEventSnapshot,
-        TrustBundleSnapshot, UiDiscoveredPeer, UiPairedPeer, UiPendingRequest, UiSnapshot,
+        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot, NearbyJoinStatusSnapshot,
+        NearbyPairingCompletionSnapshot, NearbyRequestCodeStartSnapshot, StatusSnapshot,
+        TransportEventSnapshot, TrustBundleSnapshot, UiDiscoveredPeer, UiPairedPeer,
+        UiPendingRequest, UiSnapshot,
     },
 };
 use async_trait::async_trait;
@@ -119,6 +120,42 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         Ok(OperationReply {
             ok: true,
             message: format!("{}={}", command.name, command.enabled),
+        })
+    }
+
+    async fn anti_idle_config(&self) -> Result<AntiIdleConfigSnapshot> {
+        Ok(build_anti_idle_config_snapshot(
+            self.state.anti_idle_config().await,
+        ))
+    }
+
+    async fn anti_idle_status(&self) -> Result<AntiIdleStatusSnapshot> {
+        Ok(build_anti_idle_status_snapshot(
+            self.state.anti_idle_runtime_state().await,
+        ))
+    }
+
+    async fn set_anti_idle_config(
+        &self,
+        command: SetAntiIdleConfigCommand,
+    ) -> Result<OperationReply> {
+        self.state
+            .set_anti_idle_config_values(
+                command.enabled,
+                command.recent_activity_window_secs,
+                command.allow_on_battery,
+                command.keep_display_on,
+            )
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: format!(
+                "anti_idle enabled={} recent_activity_window_secs={} allow_on_battery={} keep_display_on={}",
+                command.enabled,
+                command.recent_activity_window_secs,
+                command.allow_on_battery,
+                command.keep_display_on
+            ),
         })
     }
 
@@ -493,6 +530,10 @@ fn build_status_snapshot_from_bundle(
         input_locked: bundle.input_locked,
         input_lock_supported: bundle.input_lock_supported,
         capture_target_peer_id: bundle.active_input_capture_target_peer_id,
+        anti_idle_supported: bundle.anti_idle_runtime.supported,
+        anti_idle_enabled: bundle.anti_idle_runtime.enabled,
+        anti_idle_active: bundle.anti_idle_runtime.active,
+        anti_idle_display_required: bundle.anti_idle_runtime.display_required,
     }
 }
 
@@ -510,6 +551,8 @@ async fn build_ui_snapshot(state: &AppState) -> Result<UiSnapshot> {
         discovered_peers,
         paired_peers,
         pending_requests,
+        anti_idle_config: build_anti_idle_config_snapshot(bundle.anti_idle_config),
+        anti_idle_status: build_anti_idle_status_snapshot(bundle.anti_idle_runtime),
     })
 }
 
@@ -550,6 +593,31 @@ fn build_console_snapshot_from_bundle(
         input_capture_target_peer_id: bundle.input_capture_target_peer_id,
         mdns_active: bundle.mdns_active,
         local_display_name: bundle.config.device_name,
+        anti_idle_config: build_anti_idle_config_snapshot(bundle.anti_idle_config),
+        anti_idle_status: build_anti_idle_status_snapshot(bundle.anti_idle_runtime),
+    }
+}
+
+fn build_anti_idle_config_snapshot(
+    config: crate::config::AntiIdleConfig,
+) -> AntiIdleConfigSnapshot {
+    AntiIdleConfigSnapshot {
+        enabled: config.enabled,
+        recent_activity_window_secs: config.recent_activity_window_secs,
+        allow_on_battery: config.allow_on_battery,
+        keep_display_on: config.keep_display_on,
+    }
+}
+
+fn build_anti_idle_status_snapshot(
+    runtime: crate::state::AntiIdleRuntimeState,
+) -> AntiIdleStatusSnapshot {
+    AntiIdleStatusSnapshot {
+        supported: runtime.supported,
+        enabled: runtime.enabled,
+        active: runtime.active,
+        display_required: runtime.display_required,
+        reason: runtime.reason.as_str().to_string(),
     }
 }
 

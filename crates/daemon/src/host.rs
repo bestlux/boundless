@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::{
-    clipboard, config::ApiTransport, discovery, hotkeys, input, network, pairing_wire,
+    anti_idle, clipboard, config::ApiTransport, discovery, hotkeys, input, network, pairing_wire,
     state::AppState,
 };
 
@@ -28,6 +28,7 @@ where
 {
     let state = AppState::load_or_create().context("load app state")?;
     apply_overrides(&state, overrides).await?;
+    let _ = state.reconcile_anti_idle_runtime().await;
 
     let transport_listener = network::prepare_listener(&state).await;
     let snapshot = state.snapshot().await;
@@ -35,6 +36,7 @@ where
     clipboard::start(state.clone());
     discovery::start(state.clone());
     input::start(state.clone());
+    anti_idle::start(state.clone());
     hotkeys::start(state.clone());
     pairing_wire::start(state.clone());
     network::start(state.clone(), transport_listener);
