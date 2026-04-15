@@ -301,12 +301,14 @@ mod tests {
         assert!(state.anti_idle_outbound_pulse().await.is_none());
         state.note_real_local_input_activity().await;
 
-        let pulse = state
-            .anti_idle_outbound_pulse()
-            .await
-            .expect("recent local input should produce pulse");
-        assert_eq!(pulse.interval, Duration::from_secs(30));
-        assert!(!pulse.keep_display_on);
+        let pulse = state.anti_idle_outbound_pulse().await;
+        if platform_windows::runtime::anti_idle_power_supported() {
+            let pulse = pulse.expect("recent local input should produce pulse");
+            assert_eq!(pulse.interval, Duration::from_secs(30));
+            assert!(!pulse.keep_display_on);
+        } else {
+            assert!(pulse.is_none());
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -321,9 +323,16 @@ mod tests {
 
         state.note_remote_anti_idle_pulse(&peer_id, true).await;
         let runtime = state.reconcile_anti_idle_runtime().await;
-        assert_eq!(runtime.reason, AntiIdleAssertionReason::RemoteRecentInput);
-        assert!(runtime.active || runtime.battery_suppressed || !runtime.supported);
-        assert_eq!(runtime.display_required, runtime.active);
+        if runtime.supported {
+            assert_eq!(runtime.reason, AntiIdleAssertionReason::RemoteRecentInput);
+            assert!(runtime.active || runtime.battery_suppressed);
+            assert_eq!(runtime.display_required, runtime.active);
+        } else {
+            assert_eq!(runtime.reason, AntiIdleAssertionReason::None);
+            assert!(!runtime.active);
+            assert!(!runtime.display_required);
+            assert!(!runtime.battery_suppressed);
+        }
 
         state
             .set_peer_connected(&peer_id, false)
