@@ -45,9 +45,7 @@ impl AppState {
         }
 
         let now = Instant::now();
-        let Some(last_activity) = *self.anti_idle.last_real_local_input_at.read().await else {
-            return None;
-        };
+        let last_activity = (*self.anti_idle.last_real_local_input_at.read().await)?;
         if now.duration_since(last_activity)
             > Duration::from_secs(u64::from(config.recent_activity_window_secs))
         {
