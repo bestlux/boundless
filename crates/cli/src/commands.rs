@@ -39,7 +39,7 @@ fn spawn_daemon_process() -> Result<String> {
 }
 
 pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let status = client.get_status(StatusRequest {}).await?.into_inner();
     println!(
         "running={} machine_id={} peers={} protocol={} api_transport={} api_bind={} api_pipe_name={} input_locked={} input_lock_supported={} active_capture_target={} anti_idle_supported={} anti_idle_enabled={} anti_idle_active={} anti_idle_display_required={}",
@@ -66,7 +66,7 @@ pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
 }
 
 pub(super) async fn pair_create_code(endpoint: &str, ttl: u32) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .create_pairing_code(PairCreateCodeRequest { ttl_seconds: ttl })
         .await?
@@ -370,7 +370,7 @@ pub(super) async fn pair_join(
     host: String,
     alias: Option<String>,
 ) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .join_with_pairing_code(PairJoinRequest {
             code,
@@ -395,7 +395,7 @@ pub(super) async fn pair_nearby_join(
     alias: Option<String>,
 ) -> Result<()> {
     let alias_value = alias.unwrap_or_default();
-    let mut control_plane = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut control_plane = connect_control_plane(endpoint).await?;
     let initial_response = control_plane
         .start_nearby_pairing_join(NearbyJoinStartRequest {
             host: host.clone(),
@@ -436,7 +436,7 @@ async fn pair_nearby_request_code(
     port: u16,
     alias: Option<String>,
 ) -> Result<NearbyRequestCodeStart> {
-    let mut control_plane = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut control_plane = connect_control_plane(endpoint).await?;
     let response = control_plane
         .request_nearby_pairing_code(NearbyRequestCodeStartRequest {
             host,
@@ -518,8 +518,7 @@ async fn wait_for_nearby_pairing_approval(
                         );
                     }
 
-                    let mut control_plane =
-                        ControlPlaneServiceClient::new(channel(endpoint).await?);
+                    let mut control_plane = connect_control_plane(endpoint).await?;
                     response = control_plane
                         .check_nearby_pairing_join(NearbyJoinStatusRequest {
                             host: host.to_string(),
@@ -554,7 +553,7 @@ async fn wait_for_nearby_pairing_approval(
 
 async fn pair_nearby_submit_code(endpoint: &str, request: NearbySubmitCodeRequest) -> Result<()> {
     let expected_request_id = request.request_id.clone();
-    let mut control_plane = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut control_plane = connect_control_plane(endpoint).await?;
     let response = control_plane
         .submit_nearby_pairing_code(request)
         .await?
@@ -616,7 +615,7 @@ pub(super) async fn pair_approve(
     request_id: String,
     alias: Option<String>,
 ) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .approve_nearby_pairing_request(NearbyPairingDecisionRequest {
             request_id,
@@ -630,7 +629,7 @@ pub(super) async fn pair_approve(
 }
 
 pub(super) async fn pair_reject(endpoint: &str, request_id: String) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .reject_nearby_pairing_request(NearbyPairingDecisionRequest {
             request_id,
@@ -644,7 +643,7 @@ pub(super) async fn pair_reject(endpoint: &str, request_id: String) -> Result<()
 }
 
 pub(super) async fn pair_export_trust(endpoint: &str, output: Option<String>) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client.export_trust_bundle(Empty {}).await?.into_inner();
 
     let bundle = StoredTrustBundle {
@@ -674,7 +673,7 @@ pub(super) async fn pair_import_trust(
     let raw = std::fs::read_to_string(&input).with_context(|| format!("read {input}"))?;
     let bundle: StoredTrustBundle = serde_json::from_str(&raw).context("parse trust bundle")?;
 
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .import_trust_bundle(ImportTrustBundleRequest {
             machine_id: bundle.machine_id,
@@ -691,7 +690,7 @@ pub(super) async fn pair_import_trust(
 }
 
 pub(super) async fn peer_list(endpoint: &str) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client.list_peers(Empty {}).await?.into_inner();
 
     if response.peers.is_empty() {
@@ -710,7 +709,7 @@ pub(super) async fn peer_list(endpoint: &str) -> Result<()> {
 }
 
 pub(super) async fn peer_remove(endpoint: &str, peer_id: String) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .remove_peer(RemovePeerRequest { peer_id })
         .await?
@@ -721,14 +720,14 @@ pub(super) async fn peer_remove(endpoint: &str, peer_id: String) -> Result<()> {
 }
 
 pub(super) async fn layout_show(endpoint: &str) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client.layout_show(Empty {}).await?.into_inner();
     println!("{}", response.matrix_spec);
     Ok(())
 }
 
 pub(super) async fn layout_set(endpoint: &str, matrix: String) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .layout_set(LayoutSetRequest {
             matrix_spec: matrix,
@@ -856,7 +855,7 @@ pub(super) async fn layout_wizard(endpoint: &str) -> Result<()> {
 }
 
 pub(super) async fn feature_list(endpoint: &str) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client.list_features(Empty {}).await?.into_inner();
 
     let mut features = response.features.into_iter().collect::<Vec<_>>();
@@ -870,7 +869,7 @@ pub(super) async fn feature_list(endpoint: &str) -> Result<()> {
 }
 
 pub(super) async fn feature_set(endpoint: &str, name: String, value: ToggleValue) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .set_feature(FeatureSetRequest {
             name,
@@ -884,7 +883,7 @@ pub(super) async fn feature_set(endpoint: &str, name: String, value: ToggleValue
 }
 
 pub(super) async fn anti_idle_show(endpoint: &str) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let config = client.get_anti_idle_config(Empty {}).await?.into_inner();
     let status = client.get_anti_idle_status(Empty {}).await?.into_inner();
 
@@ -910,7 +909,7 @@ pub(super) async fn anti_idle_set(
     keep_display_on: bool,
 ) -> Result<()> {
     let recent_activity_window_secs = window_minutes.saturating_mul(60);
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .set_anti_idle_config(AntiIdleSetRequest {
             enabled,
@@ -926,7 +925,7 @@ pub(super) async fn anti_idle_set(
 }
 
 pub(super) async fn hotkey_set(endpoint: &str, action: String, combo: String) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .set_hotkey(HotkeySetRequest { action, combo })
         .await?
@@ -940,7 +939,7 @@ pub(super) async fn transport_send_text(
     peer_id: String,
     text: String,
 ) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .send_clipboard_text(SendClipboardTextRequest { peer_id, text })
         .await?
@@ -958,7 +957,7 @@ pub(super) async fn transport_send_image(
     let image_bmp = std::fs::read(&path).with_context(|| format!("read {path}"))?;
     validate_bmp_payload(&image_bmp).with_context(|| format!("invalid BMP payload at {path}"))?;
 
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .send_clipboard_image(SendClipboardImageRequest { peer_id, image_bmp })
         .await?
@@ -973,7 +972,7 @@ pub(super) async fn transport_send_file(
     peer_id: String,
     path: String,
 ) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .send_file(SendFileRequest {
             peer_id,
@@ -987,7 +986,7 @@ pub(super) async fn transport_send_file(
 }
 
 pub(super) async fn transport_events(endpoint: &str, limit: usize) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let mut events = client
         .list_transport_events(Empty {})
         .await?
@@ -1019,7 +1018,7 @@ pub(super) async fn transport_events(endpoint: &str, limit: usize) -> Result<()>
 }
 
 pub(super) async fn input_owner(endpoint: &str) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client.get_input_owner(Empty {}).await?.into_inner();
     let owner = if response.owner_peer_id.is_empty() {
         "none".to_string()
@@ -1035,7 +1034,7 @@ pub(super) async fn input_owner(endpoint: &str) -> Result<()> {
 }
 
 pub(super) async fn input_capture_target(endpoint: &str) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .get_input_capture_target(Empty {})
         .await?
@@ -1054,7 +1053,7 @@ pub(super) async fn input_capture_target(endpoint: &str) -> Result<()> {
 }
 
 pub(super) async fn input_capture_start(endpoint: &str, peer_id: String) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .set_input_capture_target(InputCaptureTargetRequest { peer_id })
         .await?
@@ -1073,7 +1072,7 @@ pub(super) async fn input_capture_start(endpoint: &str, peer_id: String) -> Resu
 }
 
 pub(super) async fn input_capture_stop(endpoint: &str) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .clear_input_capture_target(Empty {})
         .await?
@@ -1097,7 +1096,7 @@ pub(super) async fn input_send_move(
     dx: i32,
     dy: i32,
 ) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .send_input_move(SendInputMoveRequest { peer_id, dx, dy })
         .await?
@@ -1113,7 +1112,7 @@ pub(super) async fn input_send_key(
     scan_code: u16,
     state: InputKeyState,
 ) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .send_input_key(SendInputKeyRequest {
             peer_id,
@@ -1128,7 +1127,7 @@ pub(super) async fn input_send_key(
 }
 
 pub(super) async fn input_claim(endpoint: &str, peer_id: String, force: bool) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .claim_input_owner(InputOwnerRequest { peer_id, force })
         .await?
@@ -1148,7 +1147,7 @@ pub(super) async fn input_claim(endpoint: &str, peer_id: String, force: bool) ->
 }
 
 pub(super) async fn input_release(endpoint: &str, peer_id: String) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .release_input_owner(InputOwnerRequest {
             peer_id,
@@ -1171,7 +1170,7 @@ pub(super) async fn input_release(endpoint: &str, peer_id: String) -> Result<()>
 }
 
 pub(super) async fn diagnostics_dump(endpoint: &str, output: Option<String>) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .dump_diagnostics(DiagnosticsDumpRequest {
             output_path: output.unwrap_or_default(),
@@ -1184,7 +1183,7 @@ pub(super) async fn diagnostics_dump(endpoint: &str, output: Option<String>) -> 
 }
 
 pub(super) async fn diagnostics_run_action(endpoint: &str, action: String) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .trigger_hotkey_action(HotkeyTriggerRequest { action })
         .await?
@@ -1195,7 +1194,7 @@ pub(super) async fn diagnostics_run_action(endpoint: &str, action: String) -> Re
 }
 
 pub(super) async fn safe_reset(endpoint: &str, network_only: bool, all: bool) -> Result<()> {
-    let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .safe_reset(SafeResetRequest { network_only, all })
         .await?
@@ -1266,7 +1265,7 @@ pub(super) async fn ui_snapshot(endpoint: &str, start_daemon: bool) -> Result<()
         ensure_daemon_available(endpoint, true).await?;
     }
 
-    let mut control_plane = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut control_plane = connect_control_plane(endpoint).await?;
     let snapshot = control_plane.get_ui_snapshot(Empty {}).await?.into_inner();
     let snapshot = UiSnapshot {
         generated_at: snapshot.generated_at,
@@ -1394,7 +1393,7 @@ async fn fetch_layout_spec(endpoint: &str) -> Result<String> {
 }
 
 async fn fetch_local_layout_tokens(endpoint: &str) -> Result<LocalLayoutTokens> {
-    let mut control_plane = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut control_plane = connect_control_plane(endpoint).await?;
     let snapshot = control_plane
         .get_console_snapshot(Empty {})
         .await?
@@ -1410,7 +1409,7 @@ async fn fetch_local_layout_tokens(endpoint: &str) -> Result<LocalLayoutTokens> 
 }
 
 async fn fetch_ui_snapshot(endpoint: &str) -> Result<UiSnapshotReply> {
-    let mut control_plane = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut control_plane = connect_control_plane(endpoint).await?;
     let snapshot = control_plane.get_ui_snapshot(Empty {}).await?.into_inner();
     Ok(snapshot)
 }

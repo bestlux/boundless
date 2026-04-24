@@ -1,5 +1,4 @@
 use super::*;
-use ipc_api::boundless::v1::control_plane_service_client::ControlPlaneServiceClient;
 
 #[derive(Debug)]
 pub(super) struct ConsolePeer {
@@ -92,7 +91,7 @@ async fn ensure_daemon_available(endpoint: &str, start_daemon: bool) -> Result<(
 }
 
 async fn fetch_console_snapshot(endpoint: &str) -> Result<ConsoleSnapshot> {
-    let mut control_plane = ControlPlaneServiceClient::new(channel(endpoint).await?);
+    let mut control_plane = connect_control_plane(endpoint).await?;
     let snapshot = control_plane
         .get_console_snapshot(Empty {})
         .await?

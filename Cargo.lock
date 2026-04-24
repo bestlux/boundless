@@ -434,9 +434,9 @@ dependencies = [
  "anyhow",
  "app-services",
  "clap",
+ "control-plane-client",
  "core-clipboard",
  "core-discovery",
- "hyper-util",
  "ipc-api",
  "serde",
  "serde_json",
@@ -486,9 +486,9 @@ dependencies = [
  "anyhow",
  "app-services",
  "clap",
+ "control-plane-client",
  "eframe",
  "egui",
- "hyper-util",
  "image",
  "ipc-api",
  "raw-window-handle",
@@ -787,6 +787,17 @@ name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
+name = "control-plane-client"
+version = "4.0.2"
+dependencies = [
+ "anyhow",
+ "hyper-util",
+ "ipc-api",
+ "tokio",
+ "tonic",
+]
 
 [[package]]
 name = "core-clipboard"
