@@ -54,6 +54,18 @@ pub fn parse_npipe_endpoint(endpoint: &str) -> Result<Option<String>> {
     bail!("invalid named-pipe endpoint {endpoint}; expected npipe://./pipe/<name>")
 }
 
+pub fn is_named_pipe_endpoint(endpoint: &str) -> bool {
+    endpoint.trim().starts_with("npipe://")
+}
+
+pub fn has_access_denied_io_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.raw_os_error() == Some(5))
+    })
+}
+
 fn pipe_path_from_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -162,6 +174,21 @@ mod tests {
     fn parse_npipe_endpoint_ignores_http_endpoint() {
         let parsed = parse_npipe_endpoint("http://127.0.0.1:50051").expect("parse");
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn is_named_pipe_endpoint_detects_scheme_only() {
+        assert!(is_named_pipe_endpoint(" npipe://./pipe/boundlessd-api"));
+        assert!(!is_named_pipe_endpoint("http://127.0.0.1:50051"));
+    }
+
+    #[test]
+    fn has_access_denied_io_error_matches_raw_os_code() {
+        let error = anyhow::Error::new(std::io::Error::from_raw_os_error(5));
+        assert!(has_access_denied_io_error(&error));
+
+        let error = anyhow::Error::new(std::io::Error::from_raw_os_error(2));
+        assert!(!has_access_denied_io_error(&error));
     }
 
     #[test]

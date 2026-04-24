@@ -20,7 +20,10 @@ mod windows_app {
         terminate_boundlessd_processes, validate_layout_before_apply,
     };
     use clap::Parser;
-    use control_plane_client::{channel, connect_control_plane, default_endpoint};
+    use control_plane_client::{
+        channel, connect_control_plane, default_endpoint, has_access_denied_io_error,
+        is_named_pipe_endpoint,
+    };
     use eframe::icon_data;
     use image::ImageFormat;
     use ipc_api::boundless::v1::{
@@ -470,18 +473,6 @@ mod windows_app {
 
     fn spawn_daemon_process(candidates: &[String]) -> Result<String> {
         spawn_boundlessd_process(candidates)
-    }
-
-    fn is_named_pipe_endpoint(endpoint: &str) -> bool {
-        endpoint.trim().starts_with("npipe://")
-    }
-
-    fn has_access_denied_io_error(error: &anyhow::Error) -> bool {
-        error.chain().any(|cause| {
-            cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io_error| io_error.raw_os_error() == Some(5))
-        })
     }
 
     async fn pair_nearby_request_code(

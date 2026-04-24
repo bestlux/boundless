@@ -2,30 +2,59 @@ use super::*;
 use app_services::desktop::{
     build_orientation_matrix, host_and_pairing_port_from_endpoint,
     is_local_layout_token as is_local_layout_token_shared, parse_layout_matrix,
-    resolve_boundlessd_candidates, spawn_boundlessd_process,
+    resolve_boundlessd_candidates, spawn_boundlessd_process, terminate_boundlessd_processes,
 };
 
 pub(super) async fn ensure_daemon_available(endpoint: &str, start_daemon: bool) -> Result<()> {
-    if channel(endpoint).await.is_ok() {
-        return Ok(());
-    }
+    let initial_error = match channel(endpoint).await {
+        Ok(_) => return Ok(()),
+        Err(error) => error,
+    };
 
     if !start_daemon {
         bail!("daemon is not reachable at {endpoint}; run boundlessd or pass --start-daemon");
     }
 
+    if is_named_pipe_endpoint(endpoint) && has_access_denied_io_error(&initial_error) {
+        let launched = recover_stale_named_pipe_owner(endpoint).await?;
+        println!("daemon_start=spawned path={launched}");
+        return Ok(());
+    }
+
     let launched = spawn_daemon_process()?;
     println!("daemon_start=spawned path={launched}");
 
+    wait_for_daemon_ready(endpoint, "start attempt").await
+}
+
+async fn recover_stale_named_pipe_owner(endpoint: &str) -> Result<String> {
+    let terminated = terminate_boundlessd_processes()?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    if channel(endpoint).await.is_ok() {
+        return Ok("existing daemon became reachable after stale-process cleanup".to_string());
+    }
+
+    let launched = spawn_daemon_process()?;
+    let context = if terminated {
+        "stale-daemon recovery"
+    } else {
+        "named-pipe recovery"
+    };
+    wait_for_daemon_ready(endpoint, context).await?;
+    Ok(format!(
+        "{launched} (after clearing stale boundlessd.exe named-pipe owner)"
+    ))
+}
+
+async fn wait_for_daemon_ready(endpoint: &str, context: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         match channel(endpoint).await {
             Ok(_) => return Ok(()),
             Err(error) => {
                 if Instant::now() >= deadline {
-                    bail!(
-                        "daemon did not become reachable at {endpoint} after start attempt: {error}"
-                    );
+                    bail!("daemon did not become reachable at {endpoint} after {context}: {error}");
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
