@@ -20,26 +20,17 @@ mod windows_app {
         terminate_boundlessd_processes, validate_layout_before_apply,
     };
     use clap::Parser;
+    use control_plane_client::{channel, connect_control_plane, default_endpoint};
     use eframe::icon_data;
-    use hyper_util::rt::TokioIo;
     use image::ImageFormat;
     use ipc_api::boundless::v1::{
         AntiIdleSetRequest, Empty, HotkeyTriggerRequest, LayoutSetRequest,
         NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
-        control_plane_service_client::ControlPlaneServiceClient,
     };
     use serde::Deserialize;
     use std::{
         future::Future,
-        pin::Pin,
-        task::{Context as TaskContext, Poll},
         time::{Duration, Instant},
-    };
-    use tokio::net::windows::named_pipe::ClientOptions;
-    use tokio::net::windows::named_pipe::NamedPipeClient;
-    use tonic::{
-        codegen::Service,
-        transport::{Channel, Endpoint, Uri},
     };
     use tray_icon::{
         Icon, TrayIcon, TrayIconBuilder,
@@ -217,7 +208,7 @@ mod windows_app {
         F: FnMut(UiSnapshot) -> Result<()>,
     {
         block_on_result(async move {
-            let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+            let mut client = connect_control_plane(endpoint).await?;
             let mut stream = client.watch_ui(Empty {}).await?.into_inner();
             while let Some(snapshot) = stream.message().await? {
                 on_snapshot(UiSnapshot {
@@ -368,7 +359,7 @@ mod windows_app {
     }
 
     async fn trigger_hotkey_action(endpoint: &str, action: String) -> Result<String> {
-        let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+        let mut client = connect_control_plane(endpoint).await?;
         let response = client
             .trigger_hotkey_action(HotkeyTriggerRequest { action })
             .await?
@@ -377,7 +368,7 @@ mod windows_app {
     }
 
     async fn layout_set(endpoint: &str, matrix_spec: String) -> Result<String> {
-        let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+        let mut client = connect_control_plane(endpoint).await?;
         let response = client
             .layout_set(LayoutSetRequest { matrix_spec })
             .await?
@@ -392,7 +383,7 @@ mod windows_app {
         allow_on_battery: bool,
         keep_display_on: bool,
     ) -> Result<String> {
-        let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+        let mut client = connect_control_plane(endpoint).await?;
         let response = client
             .set_anti_idle_config(AntiIdleSetRequest {
                 enabled,
@@ -498,7 +489,7 @@ mod windows_app {
         host: String,
         port: u16,
     ) -> Result<NearbyRequestCodeStart> {
-        let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+        let mut client = connect_control_plane(endpoint).await?;
         let response = client
             .request_nearby_pairing_code(NearbyRequestCodeStartRequest {
                 host,
@@ -534,7 +525,7 @@ mod windows_app {
         port: u16,
         alias: Option<String>,
     ) -> Result<String> {
-        let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+        let mut client = connect_control_plane(endpoint).await?;
         let response = client
             .submit_nearby_pairing_code(NearbySubmitCodeRequest {
                 host,
@@ -558,7 +549,7 @@ mod windows_app {
     }
 
     async fn approve_nearby_pairing_request(endpoint: &str, request_id: String) -> Result<String> {
-        let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+        let mut client = connect_control_plane(endpoint).await?;
         let response = client
             .approve_nearby_pairing_request(NearbyPairingDecisionRequest {
                 request_id,
@@ -570,7 +561,7 @@ mod windows_app {
     }
 
     async fn reject_nearby_pairing_request(endpoint: &str, request_id: String) -> Result<String> {
-        let mut client = ControlPlaneServiceClient::new(channel(endpoint).await?);
+        let mut client = connect_control_plane(endpoint).await?;
         let response = client
             .reject_nearby_pairing_request(NearbyPairingDecisionRequest {
                 request_id,
@@ -579,95 +570,6 @@ mod windows_app {
             .await?
             .into_inner();
         Ok(response.message)
-    }
-
-    async fn channel(endpoint: &str) -> Result<Channel> {
-        if let Some(pipe_path) = parse_npipe_endpoint(endpoint)? {
-            return Endpoint::from_static("http://[::]:50051")
-                .connect_with_connector(NamedPipeConnector::new(pipe_path))
-                .await
-                .with_context(|| format!("failed to connect to named pipe endpoint {endpoint}"));
-        }
-
-        Endpoint::from_shared(endpoint.to_string())
-            .with_context(|| format!("invalid endpoint {endpoint}"))?
-            .connect()
-            .await
-            .with_context(|| format!("failed to connect to {endpoint}"))
-    }
-
-    fn parse_npipe_endpoint(endpoint: &str) -> Result<Option<String>> {
-        let Some(rest) = endpoint.strip_prefix("npipe://") else {
-            return Ok(None);
-        };
-        if let Some(name) = rest.strip_prefix("./pipe/") {
-            return pipe_path_from_name(name).map(Some);
-        }
-        if let Some(name) = rest.strip_prefix(r"\\.\pipe\") {
-            return pipe_path_from_name(name).map(Some);
-        }
-        bail!("invalid named-pipe endpoint {endpoint}; expected npipe://./pipe/<name>");
-    }
-
-    fn pipe_path_from_name(name: &str) -> Result<String> {
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            bail!("named-pipe endpoint is missing pipe name");
-        }
-        if trimmed.contains('/') || trimmed.contains('\\') {
-            bail!("named-pipe endpoint pipe name must not contain path separators");
-        }
-        Ok(format!(r"\\.\pipe\{trimmed}"))
-    }
-
-    #[derive(Clone)]
-    struct NamedPipeConnector {
-        pipe_path: String,
-    }
-
-    impl NamedPipeConnector {
-        fn new(pipe_path: String) -> Self {
-            Self { pipe_path }
-        }
-    }
-
-    impl Service<Uri> for NamedPipeConnector {
-        type Response = TokioIo<NamedPipeClient>;
-        type Error = std::io::Error;
-        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-        fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, _req: Uri) -> Self::Future {
-            let pipe_path = self.pipe_path.clone();
-            Box::pin(async move {
-                let client = open_named_pipe_with_retry(pipe_path).await?;
-                Ok(TokioIo::new(client))
-            })
-        }
-    }
-
-    const ERROR_PIPE_BUSY_CODE: i32 = 231;
-    const PIPE_BUSY_MAX_RETRIES: u32 = 20;
-    const PIPE_BUSY_BACKOFF_MS: u64 = 25;
-
-    async fn open_named_pipe_with_retry(pipe_path: String) -> std::io::Result<NamedPipeClient> {
-        let mut attempt = 0_u32;
-        loop {
-            match ClientOptions::new().open(pipe_path.as_str()) {
-                Ok(client) => return Ok(client),
-                Err(error)
-                    if error.raw_os_error() == Some(ERROR_PIPE_BUSY_CODE)
-                        && attempt < PIPE_BUSY_MAX_RETRIES =>
-                {
-                    attempt += 1;
-                    tokio::time::sleep(Duration::from_millis(PIPE_BUSY_BACKOFF_MS)).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
     }
 
     #[cfg(test)]
@@ -822,10 +724,6 @@ mod windows_app {
             return None;
         }
         digits.parse::<u8>().ok()
-    }
-
-    fn default_endpoint() -> String {
-        "npipe://./pipe/boundlessd-api".to_string()
     }
 
     #[cfg(test)]

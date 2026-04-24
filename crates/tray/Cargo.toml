@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 app-services = { path = "../app-services" }
 clap.workspace = true
+control-plane-client = { path = "../control-plane-client" }
 ipc-api = { path = "../ipc-api" }
 serde.workspace = true
 serde_json.workspace = true
@@ -21,7 +22,6 @@ tonic.workspace = true
 [target.'cfg(windows)'.dependencies]
 eframe = { version = "0.34.1", default-features = false, features = ["default_fonts", "glow"] }
 egui = "0.34.1"
-hyper-util.workspace = true
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 raw-window-handle = "0.6.2"
 tray-icon = "0.22.0"
