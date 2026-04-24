@@ -73,6 +73,8 @@ pub struct RuntimeConfig {
     pub features: BTreeMap<String, bool>,
     #[serde(default)]
     pub anti_idle: AntiIdleConfig,
+    #[serde(default)]
+    pub file_transfer: FileTransferConfig,
     pub hotkeys: BTreeMap<String, String>,
     pub peers: Vec<PeerConfig>,
     pub updated_at: DateTime<Utc>,
@@ -92,6 +94,16 @@ pub struct AntiIdleConfig {
     pub pulse_interval_secs: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileTransferConfig {
+    #[serde(default = "default_file_receive_dir")]
+    pub receive_dir: String,
+    #[serde(default)]
+    pub organize_by_peer: bool,
+    #[serde(default = "default_file_auto_accept_trusted_peers")]
+    pub auto_accept_trusted_peers: bool,
+}
+
 impl Default for AntiIdleConfig {
     fn default() -> Self {
         Self {
@@ -100,6 +112,16 @@ impl Default for AntiIdleConfig {
             allow_on_battery: default_allow_on_battery(),
             keep_display_on: default_keep_display_on(),
             pulse_interval_secs: default_pulse_interval_secs(),
+        }
+    }
+}
+
+impl Default for FileTransferConfig {
+    fn default() -> Self {
+        Self {
+            receive_dir: default_file_receive_dir(),
+            organize_by_peer: false,
+            auto_accept_trusted_peers: default_file_auto_accept_trusted_peers(),
         }
     }
 }
@@ -145,6 +167,7 @@ impl Default for RuntimeConfig {
             anti_idle: AntiIdleConfig::default(),
             hotkeys,
             peers: Vec::new(),
+            file_transfer: FileTransferConfig::default(),
             updated_at: now,
         }
     }
@@ -184,6 +207,19 @@ fn default_keep_display_on() -> bool {
 
 fn default_pulse_interval_secs() -> u32 {
     DEFAULT_ANTI_IDLE_PULSE_INTERVAL_SECS
+}
+
+fn default_file_auto_accept_trusted_peers() -> bool {
+    true
+}
+
+fn default_file_receive_dir() -> String {
+    dirs::download_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Boundless")
+        .display()
+        .to_string()
 }
 
 pub fn config_path() -> PathBuf {
@@ -256,6 +292,13 @@ pub fn load_or_create_config_at(path: &Path) -> Result<RuntimeConfig> {
         );
     }
 
+    if config.file_transfer.receive_dir.trim().is_empty() {
+        bail!(
+            "invalid config: file_transfer.receive_dir must not be empty in `{}`",
+            path.display()
+        );
+    }
+
     Ok(config)
 }
 
@@ -305,6 +348,13 @@ fn migrate_config_value(path: &Path, value: &mut serde_json::Value) -> Result<()
                         .context("serialize anti_idle default")?,
                 );
             }
+            if !object.contains_key("file_transfer") {
+                object.insert(
+                    "file_transfer".to_string(),
+                    serde_json::to_value(FileTransferConfig::default())
+                        .context("serialize file_transfer default")?,
+                );
+            }
             Ok(())
         }
         "2" | "3" => {
@@ -320,6 +370,11 @@ fn migrate_config_value(path: &Path, value: &mut serde_json::Value) -> Result<()
                 "anti_idle".to_string(),
                 serde_json::to_value(AntiIdleConfig::default())
                     .context("serialize anti_idle default")?,
+            );
+            object.insert(
+                "file_transfer".to_string(),
+                serde_json::to_value(FileTransferConfig::default())
+                    .context("serialize file_transfer default")?,
             );
 
             let migrated: RuntimeConfig =
@@ -481,6 +536,45 @@ mod tests {
             config.anti_idle.pulse_interval_secs,
             default_pulse_interval_secs()
         );
+    }
+
+    #[test]
+    fn default_config_uses_visible_boundless_receive_folder() {
+        let config = RuntimeConfig::default();
+
+        assert!(config.file_transfer.receive_dir.ends_with("Boundless"));
+        assert!(!config.file_transfer.receive_dir.trim().is_empty());
+        assert!(!config.file_transfer.organize_by_peer);
+        assert!(config.file_transfer.auto_accept_trusted_peers);
+    }
+
+    #[test]
+    fn current_config_without_file_transfer_gets_default_receive_folder() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-config-file-transfer-default-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("config.json");
+        std::fs::create_dir_all(&root).expect("create temp root");
+
+        let mut value =
+            serde_json::to_value(RuntimeConfig::default()).expect("serialize default config");
+        value
+            .as_object_mut()
+            .expect("config must be object")
+            .remove("file_transfer");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&value).expect("serialize"),
+        )
+        .expect("write seeded config");
+
+        let config = load_or_create_config_at(&path).expect("load config with defaulted transfer");
+        assert!(config.file_transfer.receive_dir.ends_with("Boundless"));
+        assert!(!config.file_transfer.organize_by_peer);
+        assert!(config.file_transfer.auto_accept_trusted_peers);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

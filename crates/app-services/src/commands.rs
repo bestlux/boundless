@@ -39,6 +39,13 @@ pub struct SetAntiIdleConfigCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetFileTransferConfigCommand {
+    pub receive_dir: String,
+    pub organize_by_peer: bool,
+    pub auto_accept_trusted_peers: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotkeySetCommand {
     pub action: String,
     pub combo: String,

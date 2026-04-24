@@ -12,12 +12,13 @@ use crate::{
         NearbyRequestCodeCommand, NearbySubmitCodeCommand, OperationReply, PairJoinCommand,
         PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, SafeResetCommand,
         SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand,
-        SendInputMoveCommand, SetAntiIdleConfigCommand,
+        SendInputMoveCommand, SetAntiIdleConfigCommand, SetFileTransferConfigCommand,
     },
     queries::{
-        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot, NearbyJoinStatusSnapshot,
-        NearbyPairingCompletionSnapshot, NearbyRequestCodeStartSnapshot, StatusSnapshot,
-        TransportEventSnapshot, TrustBundleSnapshot, UiSnapshot,
+        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
+        FileTransferConfigSnapshot, NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot,
+        NearbyRequestCodeStartSnapshot, StatusSnapshot, TransportEventSnapshot,
+        TrustBundleSnapshot, UiSnapshot,
     },
 };
 
@@ -39,6 +40,11 @@ pub trait ControlPlaneApp: Send + Sync {
     async fn set_anti_idle_config(
         &self,
         command: SetAntiIdleConfigCommand,
+    ) -> Result<OperationReply>;
+    async fn file_transfer_config(&self) -> Result<FileTransferConfigSnapshot>;
+    async fn set_file_transfer_config(
+        &self,
+        command: SetFileTransferConfigCommand,
     ) -> Result<OperationReply>;
     async fn set_hotkey(&self, command: HotkeySetCommand) -> Result<OperationReply>;
     async fn trigger_hotkey_action(&self, command: HotkeyTriggerCommand) -> Result<OperationReply>;

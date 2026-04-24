@@ -19,6 +19,13 @@ pub struct AntiIdleStatusSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTransferConfigSnapshot {
+    pub receive_dir: String,
+    pub organize_by_peer: bool,
+    pub auto_accept_trusted_peers: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     pub daemon_version: String,
     pub machine_id: String,
@@ -73,6 +80,7 @@ pub struct UiSnapshot {
     pub pending_requests: Vec<UiPendingRequest>,
     pub anti_idle_config: AntiIdleConfigSnapshot,
     pub anti_idle_status: AntiIdleStatusSnapshot,
+    pub file_transfer_config: FileTransferConfigSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +98,7 @@ pub struct ConsoleSnapshot {
     pub local_display_name: String,
     pub anti_idle_config: AntiIdleConfigSnapshot,
     pub anti_idle_status: AntiIdleStatusSnapshot,
+    pub file_transfer_config: FileTransferConfigSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

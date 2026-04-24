@@ -440,6 +440,54 @@ impl DashboardApp {
             }
         }
 
+        let dropped_file_paths = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.as_ref())
+                .filter(|path| path.is_file())
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+        });
+        if !dropped_file_paths.is_empty() && let Some(pos) = ctx.pointer_hover_pos() {
+            let mut target_peer_id = None;
+            for (rect, x, y) in &cell_rects {
+                if rect.contains(pos)
+                    && let Some(peer_id) = self.layout_grid.get(&(*x, *y)).cloned()
+                {
+                    target_peer_id = Some(peer_id);
+                    break;
+                }
+            }
+
+            match target_peer_id {
+                Some(peer_id) if peer_id == local_id => {
+                    self.push_toast("Drop files on a connected peer to send them".to_string(), true);
+                }
+                Some(peer_id) if is_peer_connected(&peer_id) => {
+                    self.task_runner().send_files_to_peer(
+                        self.tx.clone(),
+                        self.ctx.endpoint.clone(),
+                        peer_id,
+                        dropped_file_paths,
+                    );
+                }
+                Some(peer_id) => {
+                    self.push_toast(
+                        format!("{} is offline; connect it before sending files", get_display_name(&peer_id)),
+                        true,
+                    );
+                }
+                None => {
+                    self.push_toast(
+                        "Drop files directly on a connected peer tile to send them".to_string(),
+                        true,
+                    );
+                }
+            }
+        }
+
         // ── Drag-drop resolution ────────────────────────────────────────
         if drag_stopped && let Some((peer_id, old_pos)) = self.dragging_peer.take() {
             if let Some(pos) = pointer_pos_at_drop {

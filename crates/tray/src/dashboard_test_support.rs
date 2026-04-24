@@ -38,6 +38,8 @@ pub(super) fn test_app() -> DashboardApp {
         dragging_peer: None,
         last_layout_matrix: String::new(),
         last_layout_peer_ids: Vec::new(),
+        file_receive_dir_edit: String::new(),
+        file_receive_dir_last_snapshot: String::new(),
         prev_layout_grid: None,
         prev_layout_unassigned: None,
         confirm_apply_pending: false,
@@ -98,6 +100,11 @@ pub(super) fn sample_first_run_snapshot() -> UiSnapshot {
             active: false,
             display_required: false,
             reason: "none".to_string(),
+        },
+        file_transfer_config: UiFileTransferConfig {
+            receive_dir: r"C:\Users\Test\Downloads\Boundless".to_string(),
+            organize_by_peer: false,
+            auto_accept_trusted_peers: true,
         },
     }
 }

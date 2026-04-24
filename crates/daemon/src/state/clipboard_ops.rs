@@ -917,7 +917,7 @@ impl AppState {
         validate_transfer_size(bytes.len() as u64)?;
         let sanitized_name = sanitize_incoming_file_name(file_name)?;
 
-        let peer_dir = self.inbox_root.join(peer_id);
+        let peer_dir = self.receive_dir_for_peer(peer_id).await;
         tokio::fs::create_dir_all(&peer_dir).await?;
 
         let final_path = resolve_conflict_path(&peer_dir, &sanitized_name);
@@ -948,7 +948,7 @@ impl AppState {
         validate_transfer_size(size_bytes)?;
         let sanitized_name = sanitize_incoming_file_name(file_name)?;
 
-        let peer_dir = self.inbox_root.join(peer_id);
+        let peer_dir = self.receive_dir_for_peer(peer_id).await;
         tokio::fs::create_dir_all(&peer_dir).await?;
 
         let final_path = resolve_conflict_path(&peer_dir, &sanitized_name);
@@ -974,6 +974,16 @@ impl AppState {
         });
 
         Ok(final_path)
+    }
+
+    async fn receive_dir_for_peer(&self, peer_id: &str) -> PathBuf {
+        let file_transfer = self.config.read().await.file_transfer.clone();
+        let receive_dir = PathBuf::from(file_transfer.receive_dir);
+        if file_transfer.organize_by_peer {
+            receive_dir.join(peer_id)
+        } else {
+            receive_dir
+        }
     }
 
     pub async fn record_outgoing_file(&self, peer_id: &str, file_name: &str, size_bytes: u64) {

@@ -75,6 +75,8 @@ pub(super) struct DashboardApp {
     pub(super) dragging_peer: Option<(String, (i32, i32))>,
     pub(super) last_layout_matrix: String,
     pub(super) last_layout_peer_ids: Vec<String>,
+    pub(super) file_receive_dir_edit: String,
+    pub(super) file_receive_dir_last_snapshot: String,
 
     // Undo: stash previous layout state before each drag/action
     pub(super) prev_layout_grid: Option<HashMap<(i32, i32), String>>,
@@ -161,6 +163,8 @@ impl DashboardApp {
             dragging_peer: None,
             last_layout_matrix: String::new(),
             last_layout_peer_ids: Vec::new(),
+            file_receive_dir_edit: String::new(),
+            file_receive_dir_last_snapshot: String::new(),
             prev_layout_grid: None,
             prev_layout_unassigned: None,
             confirm_apply_pending: false,
@@ -240,6 +244,13 @@ impl DashboardApp {
     pub(super) fn apply_app_msg(&mut self, msg: AppMsg) {
         match msg {
             AppMsg::SnapshotUpdated(snap) => {
+                let receive_dir = snap.file_transfer_config.receive_dir.clone();
+                if self.file_receive_dir_edit.trim().is_empty()
+                    || self.file_receive_dir_edit == self.file_receive_dir_last_snapshot
+                {
+                    self.file_receive_dir_edit = receive_dir.clone();
+                }
+                self.file_receive_dir_last_snapshot = receive_dir;
                 self.snapshot = snap;
                 if should_offer_first_run_onboarding(&self.snapshot) && !self.onboarding_focus_shown
                 {
