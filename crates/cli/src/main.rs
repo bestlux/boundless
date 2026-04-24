@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use control_plane_client::{channel, connect_control_plane, default_endpoint};
+use control_plane_client::{
+    channel, connect_control_plane, default_endpoint, has_access_denied_io_error,
+    is_named_pipe_endpoint,
+};
 use core_clipboard::validate_bmp_payload as validate_bmp_bytes;
 use serde::{Deserialize, Serialize};
 use std::{
