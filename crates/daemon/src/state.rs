@@ -34,8 +34,8 @@ use core_security::{
 use core_transfer::{resolve_conflict_path, validate_transfer_size};
 
 use crate::config::{
-    AntiIdleConfig, ApiTransport, PeerConfig, RuntimeConfig, config_path, load_or_create_config_at,
-    save_config_at,
+    AntiIdleConfig, ApiTransport, FileTransferConfig, PeerConfig, RuntimeConfig, config_path,
+    load_or_create_config_at, save_config_at,
 };
 
 const MAX_PENDING_REMOTE_CLIPBOARD_ITEMS: usize = 64;
@@ -198,7 +198,6 @@ pub struct AppState {
     security_paths: Arc<SecurityPaths>,
     identity: Arc<DeviceIdentity>,
     device_fingerprint: Arc<String>,
-    inbox_root: Arc<PathBuf>,
     parsed_layout_matrix_cache: Arc<RwLock<Option<ParsedLayoutMatrixCache>>>,
     input_capture_wake: Arc<RuntimeWakeSignal>,
     input_inject_wake: Arc<RuntimeWakeSignal>,

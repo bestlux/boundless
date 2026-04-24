@@ -232,6 +232,62 @@ impl DashboardTaskRunner {
         });
     }
 
+    pub(super) fn set_file_transfer_config(
+        &self,
+        tx: Sender<AppMsg>,
+        endpoint: String,
+        receive_dir: String,
+        organize_by_peer: bool,
+        auto_accept_trusted_peers: bool,
+    ) {
+        Self::spawn(move || {
+            match set_file_transfer_config_blocking(
+                &endpoint,
+                receive_dir,
+                organize_by_peer,
+                auto_accept_trusted_peers,
+            ) {
+                Ok(msg) => {
+                    let _ = tx.send(AppMsg::ActionComplete(msg));
+                }
+                Err(error) => {
+                    let _ = tx.send(AppMsg::ActionFailed(error.to_string()));
+                }
+            }
+        });
+    }
+
+    pub(super) fn open_receive_folder(&self, tx: Sender<AppMsg>, receive_dir: String) {
+        Self::spawn(move || {
+            let result = ProcessCommand::new("explorer")
+                .arg(&receive_dir)
+                .spawn()
+                .map(|_| format!("Opened receive folder: {receive_dir}"))
+                .map_err(|error| format!("Failed to open receive folder: {error}"));
+            let _ = tx.send(match result {
+                Ok(message) => AppMsg::ActionComplete(message),
+                Err(error) => AppMsg::ActionFailed(error),
+            });
+        });
+    }
+
+    pub(super) fn send_files_to_peer(
+        &self,
+        tx: Sender<AppMsg>,
+        endpoint: String,
+        peer_id: String,
+        paths: Vec<String>,
+    ) {
+        Self::spawn(move || match send_files_to_peer_blocking(&endpoint, peer_id, paths) {
+            Ok(msg) => {
+                let _ = tx.send(AppMsg::ActionComplete(msg));
+            }
+            Err(error) => {
+                let _ = tx.send(AppMsg::ActionFailed(error.to_string()));
+            }
+        });
+    }
+
     pub(super) fn reconnect_all_peers(&self, tx: Sender<AppMsg>, endpoint: String) {
         Self::spawn(move || match trigger_hotkey_action_blocking(&endpoint, "reconnect") {
             Ok(msg) => {

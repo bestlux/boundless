@@ -31,14 +31,7 @@ impl AppState {
             },
         )?;
 
-        let inbox_root = if let Ok(path) = std::env::var("BOUNDLESS_INBOX_ROOT") {
-            PathBuf::from(path)
-        } else {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("Boundless")
-                .join("inbox")
-        };
+        let inbox_root = PathBuf::from(&config.file_transfer.receive_dir);
         std::fs::create_dir_all(&inbox_root)?;
 
         let fingerprint = fingerprint(&secret);
@@ -65,7 +58,6 @@ impl AppState {
             security_paths: Arc::new(paths),
             identity: Arc::new(identity),
             device_fingerprint: Arc::new(fingerprint),
-            inbox_root: Arc::new(inbox_root),
             parsed_layout_matrix_cache: Arc::new(RwLock::new(None)),
             input_capture_wake: Arc::new(RuntimeWakeSignal::default()),
             input_inject_wake: Arc::new(RuntimeWakeSignal::default()),

@@ -27,12 +27,14 @@ mod windows_app {
     use eframe::icon_data;
     use image::ImageFormat;
     use ipc_api::boundless::v1::{
-        AntiIdleSetRequest, Empty, HotkeyTriggerRequest, LayoutSetRequest,
+        AntiIdleSetRequest, Empty, FileTransferSetRequest, HotkeyTriggerRequest, LayoutSetRequest,
         NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
+        SendFileRequest,
     };
     use serde::Deserialize;
     use std::{
         future::Future,
+        process::Command as ProcessCommand,
         time::{Duration, Instant},
     };
     use tray_icon::{
@@ -79,6 +81,7 @@ mod windows_app {
         pending_requests: Vec<UiPendingRequest>,
         anti_idle_config: UiAntiIdleConfig,
         anti_idle_status: UiAntiIdleStatus,
+        file_transfer_config: UiFileTransferConfig,
     }
 
     #[derive(Debug, Clone, Deserialize, Default)]
@@ -96,6 +99,13 @@ mod windows_app {
         active: bool,
         display_required: bool,
         reason: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Default)]
+    struct UiFileTransferConfig {
+        receive_dir: String,
+        organize_by_peer: bool,
+        auto_accept_trusted_peers: bool,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -270,6 +280,14 @@ mod windows_app {
                             reason: status.reason,
                         })
                         .unwrap_or_default(),
+                    file_transfer_config: snapshot
+                        .file_transfer_config
+                        .map(|config| UiFileTransferConfig {
+                            receive_dir: config.receive_dir,
+                            organize_by_peer: config.organize_by_peer,
+                            auto_accept_trusted_peers: config.auto_accept_trusted_peers,
+                        })
+                        .unwrap_or_default(),
                 })?;
             }
             Ok(())
@@ -342,6 +360,20 @@ mod windows_app {
         ))
     }
 
+    fn set_file_transfer_config_blocking(
+        endpoint: &str,
+        receive_dir: String,
+        organize_by_peer: bool,
+        auto_accept_trusted_peers: bool,
+    ) -> Result<String> {
+        block_on_result(set_file_transfer_config(
+            endpoint,
+            receive_dir,
+            organize_by_peer,
+            auto_accept_trusted_peers,
+        ))
+    }
+
     fn ensure_daemon_available_blocking(ctx: &AppContext) -> Result<Option<String>> {
         block_on_result(ensure_daemon_available(
             &ctx.endpoint,
@@ -400,6 +432,60 @@ mod windows_app {
             bail!(response.message);
         }
         Ok(response.message)
+    }
+
+    async fn set_file_transfer_config(
+        endpoint: &str,
+        receive_dir: String,
+        organize_by_peer: bool,
+        auto_accept_trusted_peers: bool,
+    ) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let response = client
+            .set_file_transfer_config(FileTransferSetRequest {
+                receive_dir,
+                organize_by_peer,
+                auto_accept_trusted_peers,
+            })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
+        Ok(response.message)
+    }
+
+    fn send_files_to_peer_blocking(
+        endpoint: &str,
+        peer_id: String,
+        paths: Vec<String>,
+    ) -> Result<String> {
+        block_on_result(send_files_to_peer(endpoint, peer_id, paths))
+    }
+
+    async fn send_files_to_peer(
+        endpoint: &str,
+        peer_id: String,
+        paths: Vec<String>,
+    ) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let total = paths.len();
+        for path in paths {
+            let response = client
+                .send_file(SendFileRequest {
+                    peer_id: peer_id.clone(),
+                    file_path: path,
+                })
+                .await?
+                .into_inner();
+            if !response.ok {
+                bail!(response.message);
+            }
+        }
+        Ok(format!(
+            "Queued {total} file{} for transfer",
+            if total == 1 { "" } else { "s" }
+        ))
     }
 
     async fn ensure_daemon_available(

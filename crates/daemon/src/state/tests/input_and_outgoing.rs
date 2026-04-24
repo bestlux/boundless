@@ -25,6 +25,76 @@ async fn store_incoming_file_rejects_unsafe_name() {
 }
 
 #[tokio::test]
+async fn store_incoming_file_uses_configured_receive_dir() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-incoming-file-receive-dir-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let receive_dir = root.join("received");
+
+    let mut config = RuntimeConfig::default();
+    config.file_transfer.receive_dir = receive_dir.display().to_string();
+    save_config_at(&config_path, &config).expect("seed config");
+
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+    let final_path = state
+        .store_incoming_file("peer-a", "report.txt", b"payload".to_vec())
+        .await
+        .expect("store incoming file");
+
+    assert_eq!(final_path.parent(), Some(receive_dir.as_path()));
+    assert_eq!(
+        final_path.file_name().and_then(|name| name.to_str()),
+        Some("report.txt")
+    );
+    assert_eq!(
+        std::fs::read(&final_path).expect("read stored file"),
+        b"payload"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn update_file_transfer_config_persists_receive_dir() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-file-transfer-config-update-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let receive_dir = root.join("custom-receive");
+
+    let state = AppState::load_or_create_with_paths(config_path.clone(), security_root)
+        .expect("load state");
+
+    let mut config = state.file_transfer_config().await;
+    config.receive_dir = receive_dir.display().to_string();
+    state
+        .update_file_transfer_config(config)
+        .await
+        .expect("update file transfer config");
+
+    let final_path = state
+        .store_incoming_file("peer-a", "report.txt", b"payload".to_vec())
+        .await
+        .expect("store incoming file");
+    assert_eq!(final_path.parent(), Some(receive_dir.as_path()));
+
+    let reloaded = load_or_create_config_at(&config_path).expect("reload config");
+    assert_eq!(
+        reloaded.file_transfer.receive_dir,
+        receive_dir.display().to_string()
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn disconnect_clears_inbound_sequence_state_for_reconnect() {
     let root = std::env::temp_dir().join(format!(
         "boundless-reconnect-seq-test-{}",

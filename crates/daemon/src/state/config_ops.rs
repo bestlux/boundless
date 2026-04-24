@@ -29,6 +29,26 @@ impl AppState {
         save_config_at(&self.config_path, &config)
     }
 
+    pub async fn file_transfer_config(&self) -> FileTransferConfig {
+        self.config.read().await.file_transfer.clone()
+    }
+
+    pub async fn update_file_transfer_config(
+        &self,
+        file_transfer: FileTransferConfig,
+    ) -> Result<()> {
+        if file_transfer.receive_dir.trim().is_empty() {
+            anyhow::bail!("file transfer receive directory must not be empty");
+        }
+
+        let receive_dir = PathBuf::from(&file_transfer.receive_dir);
+        tokio::fs::create_dir_all(&receive_dir).await?;
+
+        let mut config = self.config.write().await;
+        config.file_transfer = file_transfer;
+        save_config_at(&self.config_path, &config)
+    }
+
     pub async fn set_discovered_endpoint(
         &self,
         machine_id: &str,

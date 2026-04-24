@@ -953,6 +953,40 @@ pub(super) async fn anti_idle_set(
     Ok(())
 }
 
+pub(super) async fn file_transfer_config(endpoint: &str) -> Result<()> {
+    let mut client = connect_control_plane(endpoint).await?;
+    let config = client
+        .get_file_transfer_config(Empty {})
+        .await?
+        .into_inner();
+
+    println!(
+        "receive_dir={} organize_by_peer={} auto_accept_trusted_peers={}",
+        config.receive_dir, config.organize_by_peer, config.auto_accept_trusted_peers
+    );
+    Ok(())
+}
+
+pub(super) async fn file_transfer_set_receive_dir(
+    endpoint: &str,
+    path: String,
+    organize_by_peer: bool,
+    auto_accept_trusted_peers: bool,
+) -> Result<()> {
+    let mut client = connect_control_plane(endpoint).await?;
+    let response = client
+        .set_file_transfer_config(FileTransferSetRequest {
+            receive_dir: path,
+            organize_by_peer,
+            auto_accept_trusted_peers,
+        })
+        .await?
+        .into_inner();
+
+    println!("ok={} message={}", response.ok, response.message);
+    Ok(())
+}
+
 pub(super) async fn hotkey_set(endpoint: &str, action: String, combo: String) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let response = client
@@ -996,21 +1030,30 @@ pub(super) async fn transport_send_image(
     Ok(())
 }
 
-pub(super) async fn transport_send_file(
+pub(super) async fn transport_send_files(
     endpoint: &str,
     peer_id: String,
-    path: String,
+    paths: Vec<String>,
 ) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
-    let response = client
-        .send_file(SendFileRequest {
-            peer_id,
-            file_path: path,
-        })
-        .await?
-        .into_inner();
+    let total = paths.len();
+    for path in paths {
+        let response = client
+            .send_file(SendFileRequest {
+                peer_id: peer_id.clone(),
+                file_path: path.clone(),
+            })
+            .await?
+            .into_inner();
 
-    println!("ok={} message={}", response.ok, response.message);
+        println!(
+            "path={} ok={} message={}",
+            path, response.ok, response.message
+        );
+    }
+    if total > 1 {
+        println!("queued_files={total}");
+    }
     Ok(())
 }
 

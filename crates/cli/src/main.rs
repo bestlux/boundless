@@ -13,9 +13,9 @@ use std::{
 use tokio::time::Instant;
 
 use ipc_api::boundless::v1::{
-    AntiIdleSetRequest, DiagnosticsDumpRequest, Empty, FeatureSetRequest, HotkeySetRequest,
-    HotkeyTriggerRequest, ImportTrustBundleRequest, InputCaptureTargetRequest, InputOwnerRequest,
-    LayoutSetRequest, NearbyJoinStartRequest, NearbyJoinStatusRequest,
+    AntiIdleSetRequest, DiagnosticsDumpRequest, Empty, FeatureSetRequest, FileTransferSetRequest,
+    HotkeySetRequest, HotkeyTriggerRequest, ImportTrustBundleRequest, InputCaptureTargetRequest,
+    InputOwnerRequest, LayoutSetRequest, NearbyJoinStartRequest, NearbyJoinStatusRequest,
     NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
     PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest, SafeResetRequest,
     SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
@@ -84,6 +84,10 @@ enum Command {
     AntiIdle {
         #[command(subcommand)]
         command: AntiIdleCommand,
+    },
+    FileTransfer {
+        #[command(subcommand)]
+        command: FileTransferCommand,
     },
     Transport {
         #[command(subcommand)]
@@ -229,6 +233,18 @@ enum AntiIdleCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum FileTransferCommand {
+    Config,
+    SetReceiveDir {
+        path: String,
+        #[arg(long)]
+        organize_by_peer: bool,
+        #[arg(long, default_value_t = true)]
+        auto_accept_trusted_peers: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum TransportCommand {
     SendText {
         peer_id: String,
@@ -240,7 +256,8 @@ enum TransportCommand {
     },
     SendFile {
         peer_id: String,
-        path: String,
+        #[arg(required = true)]
+        paths: Vec<String>,
     },
     Events {
         #[arg(long, default_value_t = 50)]
@@ -423,6 +440,22 @@ async fn main() -> Result<()> {
                 .await
             }
         },
+        Command::FileTransfer { command } => match command {
+            FileTransferCommand::Config => file_transfer_config(&cli.endpoint).await,
+            FileTransferCommand::SetReceiveDir {
+                path,
+                organize_by_peer,
+                auto_accept_trusted_peers,
+            } => {
+                file_transfer_set_receive_dir(
+                    &cli.endpoint,
+                    path,
+                    organize_by_peer,
+                    auto_accept_trusted_peers,
+                )
+                .await
+            }
+        },
         Command::Transport { command } => match command {
             TransportCommand::SendText { peer_id, text } => {
                 transport_send_text(&cli.endpoint, peer_id, text).await
@@ -430,8 +463,8 @@ async fn main() -> Result<()> {
             TransportCommand::SendImage { peer_id, path } => {
                 transport_send_image(&cli.endpoint, peer_id, path).await
             }
-            TransportCommand::SendFile { peer_id, path } => {
-                transport_send_file(&cli.endpoint, peer_id, path).await
+            TransportCommand::SendFile { peer_id, paths } => {
+                transport_send_files(&cli.endpoint, peer_id, paths).await
             }
             TransportCommand::Events { limit } => transport_events(&cli.endpoint, limit).await,
         },

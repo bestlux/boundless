@@ -11,19 +11,23 @@ use app_services::{
         NearbyRequestCodeCommand, NearbySubmitCodeCommand, OperationReply, PairJoinCommand,
         PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, SafeResetCommand,
         SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand,
-        SendInputMoveCommand, SetAntiIdleConfigCommand,
+        SendInputMoveCommand, SetAntiIdleConfigCommand, SetFileTransferConfigCommand,
     },
     queries::{
-        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot, NearbyJoinStatusSnapshot,
-        NearbyPairingCompletionSnapshot, NearbyRequestCodeStartSnapshot, StatusSnapshot,
-        TransportEventSnapshot, TrustBundleSnapshot, UiDiscoveredPeer, UiPairedPeer,
-        UiPendingRequest, UiSnapshot,
+        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
+        FileTransferConfigSnapshot, NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot,
+        NearbyRequestCodeStartSnapshot, StatusSnapshot, TransportEventSnapshot,
+        TrustBundleSnapshot, UiDiscoveredPeer, UiPairedPeer, UiPendingRequest, UiSnapshot,
     },
 };
 use async_trait::async_trait;
 use core_security::TrustBundle;
 
-use crate::{config::ApiTransport, pairing_wire, state::AppState};
+use crate::{
+    config::{ApiTransport, FileTransferConfig},
+    pairing_wire,
+    state::AppState,
+};
 
 #[derive(Clone)]
 pub struct DaemonControlPlaneApp {
@@ -155,6 +159,32 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
                 command.recent_activity_window_secs,
                 command.allow_on_battery,
                 command.keep_display_on
+            ),
+        })
+    }
+
+    async fn file_transfer_config(&self) -> Result<FileTransferConfigSnapshot> {
+        Ok(build_file_transfer_config_snapshot(
+            self.state.file_transfer_config().await,
+        ))
+    }
+
+    async fn set_file_transfer_config(
+        &self,
+        command: SetFileTransferConfigCommand,
+    ) -> Result<OperationReply> {
+        self.state
+            .update_file_transfer_config(FileTransferConfig {
+                receive_dir: command.receive_dir.clone(),
+                organize_by_peer: command.organize_by_peer,
+                auto_accept_trusted_peers: command.auto_accept_trusted_peers,
+            })
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: format!(
+                "file_transfer receive_dir={} organize_by_peer={} auto_accept_trusted_peers={}",
+                command.receive_dir, command.organize_by_peer, command.auto_accept_trusted_peers
             ),
         })
     }
@@ -553,6 +583,7 @@ async fn build_ui_snapshot(state: &AppState) -> Result<UiSnapshot> {
         pending_requests,
         anti_idle_config: build_anti_idle_config_snapshot(bundle.anti_idle_config),
         anti_idle_status: build_anti_idle_status_snapshot(bundle.anti_idle_runtime),
+        file_transfer_config: build_file_transfer_config_snapshot(bundle.config.file_transfer),
     })
 }
 
@@ -595,6 +626,7 @@ fn build_console_snapshot_from_bundle(
         local_display_name: bundle.config.device_name,
         anti_idle_config: build_anti_idle_config_snapshot(bundle.anti_idle_config),
         anti_idle_status: build_anti_idle_status_snapshot(bundle.anti_idle_runtime),
+        file_transfer_config: build_file_transfer_config_snapshot(bundle.config.file_transfer),
     }
 }
 
@@ -618,6 +650,16 @@ fn build_anti_idle_status_snapshot(
         active: runtime.active,
         display_required: runtime.display_required,
         reason: runtime.reason.as_str().to_string(),
+    }
+}
+
+fn build_file_transfer_config_snapshot(
+    config: crate::config::FileTransferConfig,
+) -> FileTransferConfigSnapshot {
+    FileTransferConfigSnapshot {
+        receive_dir: config.receive_dir,
+        organize_by_peer: config.organize_by_peer,
+        auto_accept_trusted_peers: config.auto_accept_trusted_peers,
     }
 }
 

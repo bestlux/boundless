@@ -132,6 +132,18 @@ message AntiIdleSetRequest {
   bool keep_display_on = 4;
 }
 
+message FileTransferConfigReply {
+  string receive_dir = 1;
+  bool organize_by_peer = 2;
+  bool auto_accept_trusted_peers = 3;
+}
+
+message FileTransferSetRequest {
+  string receive_dir = 1;
+  bool organize_by_peer = 2;
+  bool auto_accept_trusted_peers = 3;
+}
+
 message HotkeySetRequest {
   string action = 1;
   string combo = 2;
@@ -235,6 +247,7 @@ message UiSnapshotReply {
   repeated NearbyPairingRequestInfo pending_requests = 7;
   AntiIdleConfigReply anti_idle_config = 8;
   AntiIdleStatusReply anti_idle_status = 9;
+  FileTransferConfigReply file_transfer_config = 10;
 }
 
 message ConsoleSnapshotReply {
@@ -249,6 +262,7 @@ message ConsoleSnapshotReply {
   string local_display_name = 9;
   AntiIdleConfigReply anti_idle_config = 10;
   AntiIdleStatusReply anti_idle_status = 11;
+  FileTransferConfigReply file_transfer_config = 12;
 }
 
 message NearbyRequestCodeStartRequest {
@@ -323,6 +337,8 @@ service ControlPlaneService {
   rpc GetAntiIdleConfig(Empty) returns (AntiIdleConfigReply);
   rpc GetAntiIdleStatus(Empty) returns (AntiIdleStatusReply);
   rpc SetAntiIdleConfig(AntiIdleSetRequest) returns (OperationReply);
+  rpc GetFileTransferConfig(Empty) returns (FileTransferConfigReply);
+  rpc SetFileTransferConfig(FileTransferSetRequest) returns (OperationReply);
   rpc SetHotkey(HotkeySetRequest) returns (OperationReply);
   rpc TriggerHotkeyAction(HotkeyTriggerRequest) returns (OperationReply);
   rpc ExportTrustBundle(Empty) returns (TrustBundleReply);
@@ -369,6 +385,8 @@ service TopologyService {
 service FeatureService {
   rpc SetFeature(FeatureSetRequest) returns (OperationReply);
   rpc ListFeatures(Empty) returns (FeatureListReply);
+  rpc GetFileTransferConfig(Empty) returns (FileTransferConfigReply);
+  rpc SetFileTransferConfig(FileTransferSetRequest) returns (OperationReply);
   rpc SetHotkey(HotkeySetRequest) returns (OperationReply);
 }
 

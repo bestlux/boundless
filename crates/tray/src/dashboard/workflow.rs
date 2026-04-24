@@ -390,6 +390,73 @@ impl DashboardApp {
             ui.add_space(16.0);
             ui.separator();
 
+            // ── File Transfer ──────────────────────────────────────────
+            ui.add_space(8.0);
+            ui.heading("File Transfer");
+            ui.add_space(4.0);
+            let file_transfer_config = self.snapshot.file_transfer_config.clone();
+            ui.label(egui::RichText::new("Received files are saved to this folder.").weak());
+            ui.horizontal(|ui| {
+                ui.label("Receive folder:");
+                ui.text_edit_singleline(&mut self.file_receive_dir_edit);
+            });
+            let mut organize_by_peer = file_transfer_config.organize_by_peer;
+            if ui
+                .checkbox(&mut organize_by_peer, "Organize received files by sender")
+                .clicked()
+            {
+                self.task_runner().set_file_transfer_config(
+                    self.tx.clone(),
+                    self.ctx.endpoint.clone(),
+                    self.file_receive_dir_edit.clone(),
+                    !file_transfer_config.organize_by_peer,
+                    file_transfer_config.auto_accept_trusted_peers,
+                );
+            }
+            let mut auto_accept_trusted = file_transfer_config.auto_accept_trusted_peers;
+            if ui
+                .checkbox(&mut auto_accept_trusted, "Auto-accept files from trusted peers")
+                .clicked()
+            {
+                self.task_runner().set_file_transfer_config(
+                    self.tx.clone(),
+                    self.ctx.endpoint.clone(),
+                    self.file_receive_dir_edit.clone(),
+                    file_transfer_config.organize_by_peer,
+                    !file_transfer_config.auto_accept_trusted_peers,
+                );
+            }
+            ui.horizontal(|ui| {
+                let receive_dir_changed =
+                    self.file_receive_dir_edit != file_transfer_config.receive_dir;
+                if ui
+                    .add_enabled(receive_dir_changed, egui::Button::new("Save Folder"))
+                    .on_hover_text("Persist this receive folder for future incoming files")
+                    .clicked()
+                {
+                    self.task_runner().set_file_transfer_config(
+                        self.tx.clone(),
+                        self.ctx.endpoint.clone(),
+                        self.file_receive_dir_edit.clone(),
+                        file_transfer_config.organize_by_peer,
+                        file_transfer_config.auto_accept_trusted_peers,
+                    );
+                }
+                if ui
+                    .button("Open Folder")
+                    .on_hover_text("Open the current receive folder in Explorer")
+                    .clicked()
+                {
+                    self.task_runner().open_receive_folder(
+                        self.tx.clone(),
+                        file_transfer_config.receive_dir.clone(),
+                    );
+                }
+            });
+
+            ui.add_space(16.0);
+            ui.separator();
+
             // ── Peer Availability ─────────────────────────────────────
             ui.add_space(8.0);
             ui.heading("Peer Availability");
