@@ -17,9 +17,7 @@ tokio.workspace = true
 tonic.workspace = true
 
 app-services = { path = "../app-services" }
+control-plane-client = { path = "../control-plane-client" }
 ipc-api = { path = "../ipc-api" }
 core-clipboard = { path = "../core-clipboard" }
 core-discovery = { path = "../core-discovery" }
-
-[target.'cfg(windows)'.dependencies]
-hyper-util.workspace = true

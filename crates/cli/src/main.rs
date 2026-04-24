@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use control_plane_client::{channel, connect_control_plane, default_endpoint};
 use core_clipboard::validate_bmp_payload as validate_bmp_bytes;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -7,20 +8,6 @@ use std::{
     time::Duration,
 };
 use tokio::time::Instant;
-use tonic::transport::{Channel, Endpoint};
-
-#[cfg(windows)]
-use hyper_util::rt::TokioIo;
-#[cfg(windows)]
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context as TaskContext, Poll},
-};
-#[cfg(windows)]
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
-#[cfg(windows)]
-use tonic::{codegen::Service, transport::Uri};
 
 use ipc_api::boundless::v1::{
     AntiIdleSetRequest, DiagnosticsDumpRequest, Empty, FeatureSetRequest, HotkeySetRequest,
@@ -30,7 +17,6 @@ use ipc_api::boundless::v1::{
     PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest, SafeResetRequest,
     SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
     SendInputMoveRequest, StatusReply, StatusRequest, UiSnapshotReply,
-    control_plane_service_client::ControlPlaneServiceClient,
 };
 
 mod cli_helpers;
@@ -39,14 +25,9 @@ mod console;
 
 #[cfg(test)]
 use app_services::desktop::nearby_pairing_port;
-#[cfg(windows)]
-use cli_helpers::NamedPipeConnector;
-#[cfg(all(test, windows))]
-use cli_helpers::is_pipe_busy_error;
 use cli_helpers::{
-    filter_connectable_discovery_records, format_host_port, parse_npipe_endpoint,
-    prompt_pairing_code, prompt_pairing_nonce, resolve_discovered_peer, short_machine_id,
-    validate_bmp_payload,
+    filter_connectable_discovery_records, format_host_port, prompt_pairing_code,
+    prompt_pairing_nonce, resolve_discovered_peer, short_machine_id, validate_bmp_payload,
 };
 use commands::*;
 use console::console_run;
@@ -485,61 +466,9 @@ async fn main() -> Result<()> {
     }
 }
 
-fn default_endpoint() -> String {
-    if cfg!(windows) {
-        "npipe://./pipe/boundlessd-api".to_string()
-    } else {
-        "http://127.0.0.1:50051".to_string()
-    }
-}
-
-async fn channel(endpoint: &str) -> Result<Channel> {
-    if let Some(pipe_path) = parse_npipe_endpoint(endpoint)? {
-        #[cfg(windows)]
-        {
-            return Endpoint::from_static("http://[::]:50051")
-                .connect_with_connector(NamedPipeConnector::new(pipe_path))
-                .await
-                .with_context(|| format!("failed to connect to named pipe endpoint {endpoint}"));
-        }
-
-        #[cfg(not(windows))]
-        {
-            let _ = pipe_path;
-            bail!("named-pipe endpoint is only supported on Windows: {endpoint}");
-        }
-    }
-
-    Endpoint::from_shared(endpoint.to_string())
-        .with_context(|| format!("invalid endpoint {endpoint}"))?
-        .connect()
-        .await
-        .with_context(|| format!("failed to connect to {endpoint}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_npipe_endpoint_accepts_pipe_name() {
-        let path = parse_npipe_endpoint("npipe://./pipe/boundlessd-api")
-            .expect("parse")
-            .expect("npipe");
-        assert_eq!(path, r"\\.\pipe\boundlessd-api");
-    }
-
-    #[test]
-    fn parse_npipe_endpoint_rejects_invalid_shape() {
-        let err = parse_npipe_endpoint("npipe://boundlessd-api").expect_err("must fail");
-        assert!(err.to_string().contains("expected npipe://./pipe/<name>"));
-    }
-
-    #[test]
-    fn parse_npipe_endpoint_ignores_http_endpoint() {
-        let parsed = parse_npipe_endpoint("http://127.0.0.1:50051").expect("parse");
-        assert!(parsed.is_none());
-    }
 
     #[test]
     fn validate_bmp_payload_rejects_non_bmp() {
@@ -616,14 +545,5 @@ mod tests {
         assert_eq!(by_index.display_name, "MACHINE-B");
         let by_prefix = resolve_discovered_peer(&snapshot, "aaaaaaaa").expect("prefix");
         assert_eq!(by_prefix.display_name, "MACHINE-A");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn detects_pipe_busy_error_code() {
-        let busy = std::io::Error::from_raw_os_error(231);
-        let other = std::io::Error::from_raw_os_error(5);
-        assert!(is_pipe_busy_error(&busy));
-        assert!(!is_pipe_busy_error(&other));
     }
 }
