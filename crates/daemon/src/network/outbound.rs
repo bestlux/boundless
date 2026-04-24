@@ -168,14 +168,14 @@ where
             Ok(SendPayloadOutcome::DeferredForBackpressure) => {
                 let mut unsent = Vec::with_capacity(pending.len() + 1);
                 unsent.push(payload);
-                unsent.extend(pending.into_iter());
+                unsent.extend(pending);
                 state.requeue_outgoing_front(peer_id, unsent).await;
                 break;
             }
             Err(error) => {
                 let mut unsent = Vec::with_capacity(pending.len() + 1);
                 unsent.push(payload);
-                unsent.extend(pending.into_iter());
+                unsent.extend(pending);
                 state.requeue_outgoing_front(peer_id, unsent).await;
                 if !sent_for_flush.is_empty() {
                     restore_outbound_chunk_credits_for_payloads(
