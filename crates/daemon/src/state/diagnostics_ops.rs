@@ -147,7 +147,7 @@ impl AppState {
             }
         }
         drop(decisions);
-        recent_rejections.sort_by(|left, right| right.0.cmp(&left.0));
+        recent_rejections.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         recent_rejections.truncate(5);
 
         let failure_window =
@@ -175,7 +175,7 @@ impl AppState {
             }
         }
         drop(lockouts_by_ip);
-        active_lockouts.sort_by(|left, right| right.1.cmp(&left.1));
+        active_lockouts.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
         let mut report = String::new();
         let _ = writeln!(report, "Pairing Diagnostics");
