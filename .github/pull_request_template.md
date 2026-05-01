@@ -8,10 +8,10 @@ Link the issue this PR addresses, if any.
 
 ## Validation
 
-- [ ] `cargo fmt`
+- [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --workspace`
-- [ ] `./scripts/dev/test-suite.ps1 -Profile quick` (when feasible)
+- [ ] Targeted runtime smoke/installer validation, when the change touches those paths
 - [ ] Not run, with reason explained below
 
 ## Notes for review

@@ -1,6 +1,6 @@
 param(
     [ValidateSet("quick", "smoke", "full", "trace", "recovery", "clipboard")]
-    [string]$Profile = "smoke",
+    [string]$Profile = "quick",
     [int]$TimeoutSeconds = 60,
     [switch]$KeepArtifacts,
     [int]$TraceDurationSeconds = 45,

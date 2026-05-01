@@ -1,5 +1,6 @@
 param(
     [switch]$SkipSmoke,
+    [switch]$IncludeSmoke,
     [switch]$IncludeThreeNodeSmoke,
     [switch]$KeepArtifacts,
     [int]$TimeoutSeconds = 60
@@ -11,12 +12,17 @@ $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 Set-Location $repoRoot
 
-$profile = "smoke"
-if ($SkipSmoke) {
-    $profile = "quick"
+$explicitSmokeProfiles = @($IncludeSmoke.IsPresent, $IncludeThreeNodeSmoke.IsPresent) | Where-Object { $_ }
+if ($SkipSmoke -and $explicitSmokeProfiles.Count -gt 0) {
+    throw "-SkipSmoke cannot be combined with -IncludeSmoke or -IncludeThreeNodeSmoke"
 }
-elseif ($IncludeThreeNodeSmoke) {
+
+$profile = "quick"
+if ($IncludeThreeNodeSmoke) {
     $profile = "full"
+}
+elseif ($IncludeSmoke) {
+    $profile = "smoke"
 }
 
 $suiteParams = @{

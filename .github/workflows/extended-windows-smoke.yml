@@ -1,11 +1,9 @@
 name: Extended Windows Smoke
 
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
   schedule:
-    - cron: "0 9 * * *"
+    - cron: "0 9 * * 1"
 
 permissions:
   contents: read
