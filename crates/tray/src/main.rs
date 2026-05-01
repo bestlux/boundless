@@ -149,6 +149,8 @@ mod windows_app {
         display_name: String,
         address: String,
         connected: bool,
+        health_state: String,
+        health_reason: String,
     }
 
     #[allow(dead_code)]
@@ -276,6 +278,8 @@ mod windows_app {
                             display_name: peer.display_name,
                             address: peer.address,
                             connected: peer.connected,
+                            health_state: peer.health_state,
+                            health_reason: peer.health_reason,
                         })
                         .collect(),
                     pending_requests: snapshot

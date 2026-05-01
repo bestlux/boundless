@@ -78,6 +78,8 @@ pub struct UiPairedPeer {
     pub display_name: String,
     pub address: String,
     pub connected: bool,
+    pub health_state: String,
+    pub health_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

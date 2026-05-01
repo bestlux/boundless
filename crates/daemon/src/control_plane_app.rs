@@ -768,12 +768,76 @@ fn build_paired_peers(bundle: &crate::state::ControlPlaneSnapshotBundle) -> Vec<
         .clone()
         .into_iter()
         .map(|peer| UiPairedPeer {
+            health_state: peer_health_state(bundle, &peer),
+            health_reason: peer_health_reason(bundle, &peer),
             peer_id: peer.peer_id,
             display_name: peer.display_name,
             address: peer.address,
             connected: peer.connected,
         })
         .collect()
+}
+
+fn peer_health_state(
+    bundle: &crate::state::ControlPlaneSnapshotBundle,
+    peer: &crate::config::PeerConfig,
+) -> String {
+    if peer.connected {
+        return "connected".to_string();
+    }
+    peer_health_event(bundle, peer)
+        .map(|event| match event.kind.as_str() {
+            "peer_reconnect_requested" | "peers_reconnect_requested" => "reconnecting",
+            "transport_trust_error" => "trust_error",
+            "transport_protocol_mismatch" => "protocol_mismatch",
+            "transport_firewall_suspect" => "firewall_suspect",
+            "transport_service_issue" => "service_issue",
+            _ => "disconnected",
+        })
+        .unwrap_or("disconnected")
+        .to_string()
+}
+
+fn peer_health_reason(
+    bundle: &crate::state::ControlPlaneSnapshotBundle,
+    peer: &crate::config::PeerConfig,
+) -> String {
+    if peer.connected {
+        return "peer is connected".to_string();
+    }
+    peer_health_event(bundle, peer)
+        .map(|event| match event.kind.as_str() {
+            "peer_reconnect_requested" | "peers_reconnect_requested" => {
+                "manual or automatic reconnect requested".to_string()
+            }
+            "transport_trust_error" => "transport reported a trust failure".to_string(),
+            "transport_protocol_mismatch" => "transport reported a protocol mismatch".to_string(),
+            "transport_firewall_suspect" => {
+                "transport reported a firewall or reachability suspect".to_string()
+            }
+            "transport_service_issue" => "service mode issue reported".to_string(),
+            _ => "peer is disconnected; no classified transport failure is available".to_string(),
+        })
+        .unwrap_or_else(|| "no recent peer health event".to_string())
+}
+
+fn peer_health_event<'a>(
+    bundle: &'a crate::state::ControlPlaneSnapshotBundle,
+    peer: &crate::config::PeerConfig,
+) -> Option<&'a crate::state::TransportEventRecord> {
+    bundle.transport_events.iter().rev().find(|event| {
+        (event.peer_id == peer.peer_id
+            || (event.peer_id == "all" && event.kind == "peers_reconnect_requested"))
+            && matches!(
+                event.kind.as_str(),
+                "peer_reconnect_requested"
+                    | "peers_reconnect_requested"
+                    | "transport_trust_error"
+                    | "transport_protocol_mismatch"
+                    | "transport_firewall_suspect"
+                    | "transport_service_issue"
+            )
+    })
 }
 
 fn build_discovered_peers(
@@ -923,6 +987,40 @@ mod tests {
             .await
             .expect("matching confirmation should reset network");
         assert!(reply.ok);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn all_peer_reconnect_surfaces_reconnecting_health_per_peer() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-control-plane-peer-health-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        for (port, alias) in [(15100, "left"), (15101, "right")] {
+            let (code, _) = state.create_pairing_code(120).await;
+            state
+                .join_peer(code, format!("127.0.0.1:{port}"), Some(alias.to_string()))
+                .await
+                .expect("join peer");
+        }
+        state
+            .request_all_peers_reconnect_and_reset()
+            .await
+            .expect("reconnect all peers");
+
+        let app = DaemonControlPlaneApp::new(state);
+        let peers = app.list_peers().await.expect("list peers");
+        assert_eq!(peers.len(), 2);
+        assert!(
+            peers.iter().all(|peer| peer.health_state == "reconnecting"),
+            "all-peer reconnect event should apply to every paired peer"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

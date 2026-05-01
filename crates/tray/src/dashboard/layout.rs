@@ -856,12 +856,16 @@ mod tests {
                 display_name: "Office".to_string(),
                 address: "127.0.0.1:15100".to_string(),
                 connected: true,
+                health_state: "connected".to_string(),
+                health_reason: "connected".to_string(),
             },
             UiPairedPeer {
                 peer_id: "11111111-2222-3333-4444-555555555555".to_string(),
                 display_name: "Laptop".to_string(),
                 address: "127.0.0.1:15101".to_string(),
                 connected: false,
+                health_state: "disconnected".to_string(),
+                health_reason: "no recent peer event".to_string(),
             },
         ];
 

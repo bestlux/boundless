@@ -1029,6 +1029,8 @@ fn map_peer_info(peer: UiPairedPeer) -> PeerInfo {
         display_name: peer.display_name,
         address: peer.address,
         connected: peer.connected,
+        health_state: peer.health_state,
+        health_reason: peer.health_reason,
     }
 }
 

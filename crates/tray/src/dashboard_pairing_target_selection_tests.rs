@@ -152,6 +152,8 @@ fn filter_connectable_discovered_peers_hides_self_and_existing_pairings() {
         display_name: "Stored Alias".to_string(),
         address: "10.0.0.25:15100".to_string(),
         connected: true,
+        health_state: "connected".to_string(),
+        health_reason: "connected".to_string(),
     }];
 
     let filtered = filter_connectable_discovered_peers(discovered, "LOCAL-MACHINE-1234", &paired);

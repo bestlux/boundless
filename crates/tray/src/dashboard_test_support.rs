@@ -154,6 +154,8 @@ pub(super) fn sample_paired_snapshot() -> UiSnapshot {
             display_name: "Office Desktop".to_string(),
             address: "10.0.0.25:15100".to_string(),
             connected: false,
+            health_state: "disconnected".to_string(),
+            health_reason: "no recent peer event".to_string(),
         }],
         ..sample_first_run_snapshot()
     }

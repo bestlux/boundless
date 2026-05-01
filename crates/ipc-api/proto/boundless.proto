@@ -85,6 +85,8 @@ message PeerInfo {
   string display_name = 2;
   string address = 3;
   bool connected = 4;
+  string health_state = 5;
+  string health_reason = 6;
 }
 message PeerListReply {
   repeated PeerInfo peers = 1;

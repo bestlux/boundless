@@ -299,6 +299,16 @@ async fn diagnostics_dump_reports_nonce_challenge_rejections() {
         dump_content.contains("pairing_rejections_nonce_attempts=1"),
         "diagnostics should classify nonce challenge rejections"
     );
+    assert!(dump_content.contains("[redacted-machine-id]"));
+    assert!(!dump_content.contains(&state.snapshot().await.machine_id));
+    assert!(!dump_content.contains(&request_id));
+    assert!(
+        !dump_content.contains(output_dir.to_string_lossy().as_ref()),
+        "diagnostics dump must not include local output paths"
+    );
+    let manifest_path = std::path::PathBuf::from(&dump_path).with_extension("redaction.txt");
+    let manifest = std::fs::read_to_string(manifest_path).expect("read redaction manifest");
+    assert!(manifest.contains("default_redaction=true"));
 
     let _ = std::fs::remove_dir_all(&root);
 }

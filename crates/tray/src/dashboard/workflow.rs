@@ -259,7 +259,8 @@ impl DashboardApp {
                         ui.label(egui::RichText::new(&peer.display_name).color(color));
                         ui.label(short_token(&peer.peer_id));
                         ui.label(&peer.address);
-                        ui.label(if peer.connected { "Connected" } else { "Offline" });
+                        ui.label(peer.health_state.replace('_', " "))
+                            .on_hover_text(&peer.health_reason);
                         ui.end_row();
                     }
                 });
