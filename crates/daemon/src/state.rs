@@ -34,8 +34,8 @@ use core_security::{
 use core_transfer::{resolve_conflict_path, validate_transfer_size};
 
 use crate::config::{
-    AntiIdleConfig, ApiTransport, FileTransferConfig, PeerConfig, RuntimeConfig, config_path,
-    load_or_create_config_at, save_config_at,
+    AntiIdleConfig, ApiTransport, FileTransferConfig, InputHandoffConfig, PeerConfig,
+    RuntimeConfig, config_path, load_or_create_config_at, save_config_at,
 };
 
 const MAX_PENDING_REMOTE_CLIPBOARD_ITEMS: usize = 64;
@@ -138,6 +138,10 @@ pub(crate) struct ControlPlaneSnapshotBundle {
     pub(crate) mdns_active: bool,
     pub(crate) anti_idle_config: AntiIdleConfig,
     pub(crate) anti_idle_runtime: AntiIdleRuntimeState,
+    pub(crate) input_handoff_config: InputHandoffConfig,
+    pub(crate) input_capture_backend_mode: String,
+    pub(crate) pending_inject_frames: usize,
+    pub(crate) pending_inject_high_water: usize,
 }
 
 impl PendingInjectInputFrame {

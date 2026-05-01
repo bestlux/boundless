@@ -13,6 +13,7 @@ use crate::{
         PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, SafeResetCommand,
         SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand,
         SendInputMoveCommand, SetAntiIdleConfigCommand, SetFileTransferConfigCommand,
+        SetInputHandoffConfigCommand,
     },
     queries::{
         AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
@@ -45,6 +46,10 @@ pub trait ControlPlaneApp: Send + Sync {
     async fn set_file_transfer_config(
         &self,
         command: SetFileTransferConfigCommand,
+    ) -> Result<OperationReply>;
+    async fn set_input_handoff_config(
+        &self,
+        command: SetInputHandoffConfigCommand,
     ) -> Result<OperationReply>;
     async fn set_hotkey(&self, command: HotkeySetCommand) -> Result<OperationReply>;
     async fn trigger_hotkey_action(&self, command: HotkeyTriggerCommand) -> Result<OperationReply>;

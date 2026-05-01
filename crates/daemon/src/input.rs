@@ -932,7 +932,7 @@ mod tests {
             .await
             .expect("connect right");
         state
-            .set_layout("left,self,right".to_string())
+            .set_layout("peer,self,right".to_string())
             .await
             .expect("set layout");
         state.clear_input_capture_target().await;
@@ -1037,6 +1037,7 @@ mod tests {
             }],
             &mut edge_switch_state,
             false,
+            &crate::config::InputHandoffConfig::default(),
             Some("peer-a"),
             None,
             Some(bounds),
@@ -1050,6 +1051,7 @@ mod tests {
             &[InputEvent::MouseMove { dx: 2000, dy: 0 }],
             &mut edge_switch_state,
             false,
+            &crate::config::InputHandoffConfig::default(),
             Some("peer-a"),
             None,
             Some(bounds),
@@ -1079,6 +1081,7 @@ mod tests {
             &events,
             &mut edge_switch_state,
             false,
+            &crate::config::InputHandoffConfig::default(),
             None,
             Some((960, 540)),
             Some(bounds),
@@ -1107,6 +1110,7 @@ mod tests {
             &events,
             &mut edge_switch_state,
             false,
+            &crate::config::InputHandoffConfig::default(),
             None,
             Some((1919, 540)),
             Some(bounds),
@@ -1133,6 +1137,7 @@ mod tests {
             &events,
             &mut edge_switch_state,
             false,
+            &crate::config::InputHandoffConfig::default(),
             None,
             Some((1919, 540)),
             Some(bounds),
@@ -1142,6 +1147,59 @@ mod tests {
             Some(SwitchDirection::Right),
             "local capture start should work with a small push once cursor is at the edge"
         );
+    }
+
+    #[test]
+    fn local_edge_handoff_blocks_configured_corners() {
+        let mut edge_switch_state = EdgeSwitchState::default();
+        let events = vec![InputEvent::MouseMove { dx: 5, dy: 0 }];
+        let bounds = VirtualScreenBounds {
+            left: 0,
+            top: 0,
+            right: 1919,
+            bottom: 1079,
+        };
+
+        let direction = edge_switch_direction_from_motion(
+            &events,
+            &mut edge_switch_state,
+            false,
+            &crate::config::InputHandoffConfig::default(),
+            None,
+            Some((1919, 8)),
+            Some(bounds),
+        );
+        assert_eq!(
+            direction, None,
+            "corner blocking should prevent accidental edge handoff near the top-right corner"
+        );
+    }
+
+    #[test]
+    fn local_edge_handoff_allows_corners_when_corner_blocking_disabled() {
+        let mut edge_switch_state = EdgeSwitchState::default();
+        let events = vec![InputEvent::MouseMove { dx: 5, dy: 0 }];
+        let bounds = VirtualScreenBounds {
+            left: 0,
+            top: 0,
+            right: 1919,
+            bottom: 1079,
+        };
+        let policy = crate::config::InputHandoffConfig {
+            block_screen_corners: false,
+            ..crate::config::InputHandoffConfig::default()
+        };
+
+        let direction = edge_switch_direction_from_motion(
+            &events,
+            &mut edge_switch_state,
+            false,
+            &policy,
+            None,
+            Some((1919, 8)),
+            Some(bounds),
+        );
+        assert_eq!(direction, Some(SwitchDirection::Right));
     }
 
     #[test]

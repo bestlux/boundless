@@ -26,6 +26,27 @@ pub struct FileTransferConfigSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputHandoffConfigSnapshot {
+    pub block_screen_corners: bool,
+    pub corner_block_px: u32,
+    pub relative_mouse: bool,
+    pub hide_cursor_at_edge: bool,
+    pub draw_cursor_marker: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputRuntimeSnapshot {
+    pub owner_peer_id: Option<String>,
+    pub configured_capture_target_peer_id: Option<String>,
+    pub active_capture_target_peer_id: Option<String>,
+    pub lock_active: bool,
+    pub lock_supported: bool,
+    pub capture_backend_mode: String,
+    pub pending_inject_frames: usize,
+    pub pending_inject_high_water: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     pub daemon_version: String,
     pub machine_id: String,
@@ -81,6 +102,8 @@ pub struct UiSnapshot {
     pub anti_idle_config: AntiIdleConfigSnapshot,
     pub anti_idle_status: AntiIdleStatusSnapshot,
     pub file_transfer_config: FileTransferConfigSnapshot,
+    pub input_handoff_config: InputHandoffConfigSnapshot,
+    pub input_runtime: InputRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +122,8 @@ pub struct ConsoleSnapshot {
     pub anti_idle_config: AntiIdleConfigSnapshot,
     pub anti_idle_status: AntiIdleStatusSnapshot,
     pub file_transfer_config: FileTransferConfigSnapshot,
+    pub input_handoff_config: InputHandoffConfigSnapshot,
+    pub input_runtime: InputRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -12,19 +12,21 @@ use app_services::{
         PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, SafeResetCommand,
         SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand,
         SendInputMoveCommand, SetAntiIdleConfigCommand, SetFileTransferConfigCommand,
+        SetInputHandoffConfigCommand,
     },
     queries::{
         AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
-        FileTransferConfigSnapshot, NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot,
-        NearbyRequestCodeStartSnapshot, StatusSnapshot, TransportEventSnapshot,
-        TrustBundleSnapshot, UiDiscoveredPeer, UiPairedPeer, UiPendingRequest, UiSnapshot,
+        FileTransferConfigSnapshot, InputHandoffConfigSnapshot, InputRuntimeSnapshot,
+        NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot, NearbyRequestCodeStartSnapshot,
+        StatusSnapshot, TransportEventSnapshot, TrustBundleSnapshot, UiDiscoveredPeer,
+        UiPairedPeer, UiPendingRequest, UiSnapshot,
     },
 };
 use async_trait::async_trait;
 use core_security::TrustBundle;
 
 use crate::{
-    config::{ApiTransport, FileTransferConfig},
+    config::{ApiTransport, FileTransferConfig, InputHandoffConfig},
     pairing_wire,
     state::AppState,
 };
@@ -185,6 +187,32 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             message: format!(
                 "file_transfer receive_dir={} organize_by_peer={} auto_accept_trusted_peers={}",
                 command.receive_dir, command.organize_by_peer, command.auto_accept_trusted_peers
+            ),
+        })
+    }
+
+    async fn set_input_handoff_config(
+        &self,
+        command: SetInputHandoffConfigCommand,
+    ) -> Result<OperationReply> {
+        self.state
+            .update_input_handoff_config(InputHandoffConfig {
+                block_screen_corners: command.block_screen_corners,
+                corner_block_px: command.corner_block_px,
+                relative_mouse: command.relative_mouse,
+                hide_cursor_at_edge: command.hide_cursor_at_edge,
+                draw_cursor_marker: command.draw_cursor_marker,
+            })
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: format!(
+                "input_handoff block_screen_corners={} corner_block_px={} relative_mouse={} hide_cursor_at_edge={} draw_cursor_marker={}",
+                command.block_screen_corners,
+                command.corner_block_px,
+                command.relative_mouse,
+                command.hide_cursor_at_edge,
+                command.draw_cursor_marker
             ),
         })
     }
@@ -572,6 +600,7 @@ async fn build_ui_snapshot(state: &AppState) -> Result<UiSnapshot> {
     let paired_peers = build_paired_peers(&bundle);
     let discovered_peers = build_discovered_peers(&bundle, &paired_peers);
     let pending_requests = build_pending_requests(&bundle);
+    let input_runtime = build_input_runtime_snapshot(&bundle);
 
     Ok(UiSnapshot {
         generated_at: chrono::Utc::now().to_rfc3339(),
@@ -581,8 +610,12 @@ async fn build_ui_snapshot(state: &AppState) -> Result<UiSnapshot> {
         discovered_peers,
         paired_peers,
         pending_requests,
-        anti_idle_config: build_anti_idle_config_snapshot(bundle.anti_idle_config),
+        anti_idle_config: build_anti_idle_config_snapshot(bundle.anti_idle_config.clone()),
         anti_idle_status: build_anti_idle_status_snapshot(bundle.anti_idle_runtime),
+        input_handoff_config: build_input_handoff_config_snapshot(
+            bundle.input_handoff_config.clone(),
+        ),
+        input_runtime,
         file_transfer_config: build_file_transfer_config_snapshot(bundle.config.file_transfer),
     })
 }
@@ -600,6 +633,7 @@ fn build_console_snapshot_from_bundle(
     let discovered_peers = build_discovered_peers(&bundle, &paired_peers);
     let pending_requests = build_pending_requests(&bundle);
     let features = bundle.features.clone();
+    let input_runtime = build_input_runtime_snapshot(&bundle);
 
     ConsoleSnapshot {
         status,
@@ -624,8 +658,12 @@ fn build_console_snapshot_from_bundle(
         input_capture_target_peer_id: bundle.input_capture_target_peer_id,
         mdns_active: bundle.mdns_active,
         local_display_name: bundle.config.device_name,
-        anti_idle_config: build_anti_idle_config_snapshot(bundle.anti_idle_config),
+        anti_idle_config: build_anti_idle_config_snapshot(bundle.anti_idle_config.clone()),
         anti_idle_status: build_anti_idle_status_snapshot(bundle.anti_idle_runtime),
+        input_handoff_config: build_input_handoff_config_snapshot(
+            bundle.input_handoff_config.clone(),
+        ),
+        input_runtime,
         file_transfer_config: build_file_transfer_config_snapshot(bundle.config.file_transfer),
     }
 }
@@ -660,6 +698,33 @@ fn build_file_transfer_config_snapshot(
         receive_dir: config.receive_dir,
         organize_by_peer: config.organize_by_peer,
         auto_accept_trusted_peers: config.auto_accept_trusted_peers,
+    }
+}
+
+fn build_input_handoff_config_snapshot(
+    config: crate::config::InputHandoffConfig,
+) -> InputHandoffConfigSnapshot {
+    InputHandoffConfigSnapshot {
+        block_screen_corners: config.block_screen_corners,
+        corner_block_px: config.corner_block_px,
+        relative_mouse: config.relative_mouse,
+        hide_cursor_at_edge: config.hide_cursor_at_edge,
+        draw_cursor_marker: config.draw_cursor_marker,
+    }
+}
+
+fn build_input_runtime_snapshot(
+    bundle: &crate::state::ControlPlaneSnapshotBundle,
+) -> InputRuntimeSnapshot {
+    InputRuntimeSnapshot {
+        owner_peer_id: bundle.input_owner_peer_id.clone(),
+        configured_capture_target_peer_id: bundle.input_capture_target_peer_id.clone(),
+        active_capture_target_peer_id: bundle.active_input_capture_target_peer_id.clone(),
+        lock_active: bundle.input_locked,
+        lock_supported: bundle.input_lock_supported,
+        capture_backend_mode: bundle.input_capture_backend_mode.clone(),
+        pending_inject_frames: bundle.pending_inject_frames,
+        pending_inject_high_water: bundle.pending_inject_high_water,
     }
 }
 

@@ -144,6 +144,33 @@ message FileTransferSetRequest {
   bool auto_accept_trusted_peers = 3;
 }
 
+message InputHandoffConfigReply {
+  bool block_screen_corners = 1;
+  uint32 corner_block_px = 2;
+  bool relative_mouse = 3;
+  bool hide_cursor_at_edge = 4;
+  bool draw_cursor_marker = 5;
+}
+
+message InputHandoffSetRequest {
+  bool block_screen_corners = 1;
+  uint32 corner_block_px = 2;
+  bool relative_mouse = 3;
+  bool hide_cursor_at_edge = 4;
+  bool draw_cursor_marker = 5;
+}
+
+message InputRuntimeStatusReply {
+  string owner_peer_id = 1;
+  string configured_capture_target_peer_id = 2;
+  string active_capture_target_peer_id = 3;
+  bool lock_active = 4;
+  bool lock_supported = 5;
+  string capture_backend_mode = 6;
+  uint32 pending_inject_frames = 7;
+  uint32 pending_inject_high_water = 8;
+}
+
 message HotkeySetRequest {
   string action = 1;
   string combo = 2;
@@ -248,6 +275,8 @@ message UiSnapshotReply {
   AntiIdleConfigReply anti_idle_config = 8;
   AntiIdleStatusReply anti_idle_status = 9;
   FileTransferConfigReply file_transfer_config = 10;
+  InputHandoffConfigReply input_handoff_config = 11;
+  InputRuntimeStatusReply input_runtime = 12;
 }
 
 message ConsoleSnapshotReply {
@@ -263,6 +292,8 @@ message ConsoleSnapshotReply {
   AntiIdleConfigReply anti_idle_config = 10;
   AntiIdleStatusReply anti_idle_status = 11;
   FileTransferConfigReply file_transfer_config = 12;
+  InputHandoffConfigReply input_handoff_config = 13;
+  InputRuntimeStatusReply input_runtime = 14;
 }
 
 message NearbyRequestCodeStartRequest {
@@ -339,6 +370,7 @@ service ControlPlaneService {
   rpc SetAntiIdleConfig(AntiIdleSetRequest) returns (OperationReply);
   rpc GetFileTransferConfig(Empty) returns (FileTransferConfigReply);
   rpc SetFileTransferConfig(FileTransferSetRequest) returns (OperationReply);
+  rpc SetInputHandoffConfig(InputHandoffSetRequest) returns (OperationReply);
   rpc SetHotkey(HotkeySetRequest) returns (OperationReply);
   rpc TriggerHotkeyAction(HotkeyTriggerRequest) returns (OperationReply);
   rpc ExportTrustBundle(Empty) returns (TrustBundleReply);

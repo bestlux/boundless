@@ -50,6 +50,26 @@ impl AppState {
         save_config_at(&self.config_path, &config)
     }
 
+    pub async fn input_handoff_config(&self) -> InputHandoffConfig {
+        self.config.read().await.input_handoff.clone()
+    }
+
+    pub async fn update_input_handoff_config(
+        &self,
+        input_handoff: InputHandoffConfig,
+    ) -> Result<()> {
+        if input_handoff.corner_block_px > 256 {
+            anyhow::bail!("input_handoff.corner_block_px must be <= 256");
+        }
+
+        let mut config = self.config.write().await;
+        config.input_handoff = input_handoff;
+        save_config_at(&self.config_path, &config)?;
+        drop(config);
+        self.notify_input_capture_wake("input_handoff_config_changed");
+        Ok(())
+    }
+
     pub async fn set_discovered_endpoint(
         &self,
         machine_id: &str,
@@ -136,11 +156,12 @@ impl AppState {
         Ok(())
     }
 
-    pub async fn edge_switch_policy(&self) -> (EasyMouseMode, bool) {
+    pub async fn edge_switch_policy(&self) -> (EasyMouseMode, bool, InputHandoffConfig) {
         let config = self.config.read().await;
         let share_input_enabled = config.features.get("share_input").copied().unwrap_or(true);
         let easy_mouse_enabled = config.features.get("easy_mouse").copied().unwrap_or(true);
         let wrap_mouse = config.features.get("wrap_mouse").copied().unwrap_or(true);
+        let input_handoff = config.input_handoff.clone();
 
         let mode = if share_input_enabled && easy_mouse_enabled {
             EasyMouseMode::Enable
@@ -148,7 +169,7 @@ impl AppState {
             EasyMouseMode::Disable
         };
 
-        (mode, wrap_mouse)
+        (mode, wrap_mouse, input_handoff)
     }
 
     pub async fn capture_handoff_target_for_direction(

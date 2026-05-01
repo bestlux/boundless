@@ -15,11 +15,11 @@ use tokio::time::Instant;
 use ipc_api::boundless::v1::{
     AntiIdleSetRequest, DiagnosticsDumpRequest, Empty, FeatureSetRequest, FileTransferSetRequest,
     HotkeySetRequest, HotkeyTriggerRequest, ImportTrustBundleRequest, InputCaptureTargetRequest,
-    InputOwnerRequest, LayoutSetRequest, NearbyJoinStartRequest, NearbyJoinStatusRequest,
-    NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
-    PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest, SafeResetRequest,
-    SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
-    SendInputMoveRequest, StatusReply, StatusRequest, UiSnapshotReply,
+    InputHandoffSetRequest, InputOwnerRequest, LayoutSetRequest, NearbyJoinStartRequest,
+    NearbyJoinStatusRequest, NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest,
+    NearbySubmitCodeRequest, PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest,
+    SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest,
+    SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest, UiSnapshotReply,
 };
 
 mod cli_helpers;
@@ -287,6 +287,7 @@ enum TransportCommand {
 
 #[derive(Debug, Subcommand)]
 enum InputCommand {
+    Status,
     Owner,
     CaptureTarget,
     CaptureStart {
@@ -310,6 +311,19 @@ enum InputCommand {
     },
     Release {
         peer_id: String,
+    },
+    Config,
+    SetConfig {
+        #[arg(long)]
+        block_screen_corners: Option<bool>,
+        #[arg(long)]
+        corner_block_px: Option<u32>,
+        #[arg(long)]
+        relative_mouse: Option<bool>,
+        #[arg(long)]
+        hide_cursor_at_edge: Option<bool>,
+        #[arg(long)]
+        draw_cursor_marker: Option<bool>,
     },
 }
 
@@ -500,6 +514,7 @@ async fn main() -> Result<()> {
             TransportCommand::Events { limit } => transport_events(&cli.endpoint, limit).await,
         },
         Command::Input { command } => match command {
+            InputCommand::Status => input_status(&cli.endpoint).await,
             InputCommand::Owner => input_owner(&cli.endpoint).await,
             InputCommand::CaptureTarget => input_capture_target(&cli.endpoint).await,
             InputCommand::CaptureStart { peer_id } => {
@@ -518,6 +533,24 @@ async fn main() -> Result<()> {
                 input_claim(&cli.endpoint, peer_id, force).await
             }
             InputCommand::Release { peer_id } => input_release(&cli.endpoint, peer_id).await,
+            InputCommand::Config => input_config(&cli.endpoint).await,
+            InputCommand::SetConfig {
+                block_screen_corners,
+                corner_block_px,
+                relative_mouse,
+                hide_cursor_at_edge,
+                draw_cursor_marker,
+            } => {
+                input_set_config(
+                    &cli.endpoint,
+                    block_screen_corners,
+                    corner_block_px,
+                    relative_mouse,
+                    hide_cursor_at_edge,
+                    draw_cursor_marker,
+                )
+                .await
+            }
         },
         Command::Hotkey { action, combo } => hotkey_set(&cli.endpoint, action, combo).await,
         Command::Diagnostics { command } => match command {

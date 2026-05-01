@@ -46,6 +46,15 @@ pub struct SetFileTransferConfigCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetInputHandoffConfigCommand {
+    pub block_screen_corners: bool,
+    pub corner_block_px: u32,
+    pub relative_mouse: bool,
+    pub hide_cursor_at_edge: bool,
+    pub draw_cursor_marker: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotkeySetCommand {
     pub action: String,
     pub combo: String,

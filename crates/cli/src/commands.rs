@@ -1334,6 +1334,84 @@ pub(super) async fn input_owner(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
+fn none_if_empty(value: String) -> String {
+    if value.is_empty() {
+        "none".to_string()
+    } else {
+        value
+    }
+}
+
+pub(super) async fn input_status(endpoint: &str) -> Result<()> {
+    let mut client = connect_control_plane(endpoint).await?;
+    let snapshot = client.get_console_snapshot(Empty {}).await?.into_inner();
+    let runtime = snapshot.input_runtime.unwrap_or_default();
+    let handoff = snapshot.input_handoff_config.unwrap_or_default();
+    let owner = none_if_empty(runtime.owner_peer_id);
+    let configured_target = none_if_empty(runtime.configured_capture_target_peer_id);
+    let active_target = none_if_empty(runtime.active_capture_target_peer_id);
+
+    println!(
+        "owner={} configured_capture_target={} active_capture_target={} lock_active={} lock_supported={} capture_backend_mode={} pending_inject_frames={} pending_inject_high_water={} block_screen_corners={} corner_block_px={} relative_mouse={} hide_cursor_at_edge={} draw_cursor_marker={}",
+        owner,
+        configured_target,
+        active_target,
+        runtime.lock_active,
+        runtime.lock_supported,
+        none_if_empty(runtime.capture_backend_mode),
+        runtime.pending_inject_frames,
+        runtime.pending_inject_high_water,
+        handoff.block_screen_corners,
+        handoff.corner_block_px,
+        handoff.relative_mouse,
+        handoff.hide_cursor_at_edge,
+        handoff.draw_cursor_marker,
+    );
+    Ok(())
+}
+
+pub(super) async fn input_config(endpoint: &str) -> Result<()> {
+    let mut client = connect_control_plane(endpoint).await?;
+    let snapshot = client.get_console_snapshot(Empty {}).await?.into_inner();
+    let handoff = snapshot.input_handoff_config.unwrap_or_default();
+
+    println!(
+        "block_screen_corners={} corner_block_px={} relative_mouse={} hide_cursor_at_edge={} draw_cursor_marker={}",
+        handoff.block_screen_corners,
+        handoff.corner_block_px,
+        handoff.relative_mouse,
+        handoff.hide_cursor_at_edge,
+        handoff.draw_cursor_marker,
+    );
+    Ok(())
+}
+
+pub(super) async fn input_set_config(
+    endpoint: &str,
+    block_screen_corners: Option<bool>,
+    corner_block_px: Option<u32>,
+    relative_mouse: Option<bool>,
+    hide_cursor_at_edge: Option<bool>,
+    draw_cursor_marker: Option<bool>,
+) -> Result<()> {
+    let mut client = connect_control_plane(endpoint).await?;
+    let snapshot = client.get_console_snapshot(Empty {}).await?.into_inner();
+    let current = snapshot.input_handoff_config.unwrap_or_default();
+    let response = client
+        .set_input_handoff_config(InputHandoffSetRequest {
+            block_screen_corners: block_screen_corners.unwrap_or(current.block_screen_corners),
+            corner_block_px: corner_block_px.unwrap_or(current.corner_block_px),
+            relative_mouse: relative_mouse.unwrap_or(current.relative_mouse),
+            hide_cursor_at_edge: hide_cursor_at_edge.unwrap_or(current.hide_cursor_at_edge),
+            draw_cursor_marker: draw_cursor_marker.unwrap_or(current.draw_cursor_marker),
+        })
+        .await?
+        .into_inner();
+
+    println!("ok={} message={}", response.ok, response.message);
+    Ok(())
+}
+
 pub(super) async fn input_capture_target(endpoint: &str) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let response = client

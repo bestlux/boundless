@@ -400,6 +400,87 @@ async fn route_incoming_input_frame_records_latency_detail_fields() {
 }
 
 #[tokio::test]
+async fn update_input_handoff_config_persists_policy_and_notifies_capture_runtime() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-input-handoff-config-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let state = AppState::load_or_create_with_paths(config_path.clone(), security_root)
+        .expect("load state");
+
+    let signal = state.input_capture_wake_signal();
+    let notified = signal.notified();
+    tokio::pin!(notified);
+    let next = InputHandoffConfig {
+        block_screen_corners: false,
+        corner_block_px: 12,
+        relative_mouse: false,
+        hide_cursor_at_edge: true,
+        draw_cursor_marker: true,
+    };
+    state
+        .update_input_handoff_config(next.clone())
+        .await
+        .expect("update handoff config");
+
+    tokio::time::timeout(std::time::Duration::from_millis(200), &mut notified)
+        .await
+        .expect("capture signal should fire after input policy update");
+    assert!(signal.take_pending());
+
+    let reloaded = load_or_create_config_at(&config_path).expect("reload config");
+    assert_eq!(reloaded.input_handoff, next);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn input_runtime_stats_expose_capture_backend_mode_and_queue_depth() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-input-runtime-stats-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+    let (code, _) = state.create_pairing_code(120).await;
+    let peer_id = state
+        .join_peer(
+            code,
+            "127.0.0.1:15100".to_string(),
+            Some("peer".to_string()),
+        )
+        .await
+        .expect("join peer");
+    state
+        .claim_input_owner(&peer_id, false)
+        .await
+        .expect("claim owner");
+
+    state.set_input_capture_backend_mode("scripted").await;
+    state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id.clone(),
+                sequence: 1,
+                timestamp_unix_ms: 1,
+                events: vec![InputEvent::MouseMove { dx: 1, dy: 1 }],
+            },
+        )
+        .await
+        .expect("route");
+
+    assert_eq!(state.input_capture_backend_mode().await, "scripted");
+    assert_eq!(state.pending_inject_frame_stats().await, (1, 1));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn transport_events_ring_buffer_keeps_most_recent_records() {
     let root = std::env::temp_dir().join(format!(
         "boundless-transport-event-ring-test-{}",

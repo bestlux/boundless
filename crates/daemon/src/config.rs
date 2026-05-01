@@ -12,9 +12,10 @@ use uuid::Uuid;
 use core_protocol::PROTOCOL_CURRENT;
 
 const DEFAULT_LAYOUT_MATRIX: &str = "self";
-const RUNTIME_CONFIG_VERSION: &str = "4";
+const RUNTIME_CONFIG_VERSION: &str = "5";
 const DEFAULT_ANTI_IDLE_RECENT_ACTIVITY_WINDOW_SECS: u32 = 300;
 const DEFAULT_ANTI_IDLE_PULSE_INTERVAL_SECS: u32 = 30;
+const DEFAULT_INPUT_CORNER_BLOCK_PX: u32 = 24;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerConfig {
@@ -75,6 +76,8 @@ pub struct RuntimeConfig {
     pub anti_idle: AntiIdleConfig,
     #[serde(default)]
     pub file_transfer: FileTransferConfig,
+    #[serde(default)]
+    pub input_handoff: InputHandoffConfig,
     pub hotkeys: BTreeMap<String, String>,
     pub peers: Vec<PeerConfig>,
     pub updated_at: DateTime<Utc>,
@@ -104,6 +107,20 @@ pub struct FileTransferConfig {
     pub auto_accept_trusted_peers: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputHandoffConfig {
+    #[serde(default = "default_input_block_screen_corners")]
+    pub block_screen_corners: bool,
+    #[serde(default = "default_input_corner_block_px")]
+    pub corner_block_px: u32,
+    #[serde(default = "default_input_relative_mouse")]
+    pub relative_mouse: bool,
+    #[serde(default = "default_input_hide_cursor_at_edge")]
+    pub hide_cursor_at_edge: bool,
+    #[serde(default = "default_input_draw_cursor_marker")]
+    pub draw_cursor_marker: bool,
+}
+
 impl Default for AntiIdleConfig {
     fn default() -> Self {
         Self {
@@ -122,6 +139,18 @@ impl Default for FileTransferConfig {
             receive_dir: default_file_receive_dir(),
             organize_by_peer: false,
             auto_accept_trusted_peers: default_file_auto_accept_trusted_peers(),
+        }
+    }
+}
+
+impl Default for InputHandoffConfig {
+    fn default() -> Self {
+        Self {
+            block_screen_corners: default_input_block_screen_corners(),
+            corner_block_px: default_input_corner_block_px(),
+            relative_mouse: default_input_relative_mouse(),
+            hide_cursor_at_edge: default_input_hide_cursor_at_edge(),
+            draw_cursor_marker: default_input_draw_cursor_marker(),
         }
     }
 }
@@ -168,6 +197,7 @@ impl Default for RuntimeConfig {
             hotkeys,
             peers: Vec::new(),
             file_transfer: FileTransferConfig::default(),
+            input_handoff: InputHandoffConfig::default(),
             updated_at: now,
         }
     }
@@ -220,6 +250,26 @@ fn default_file_receive_dir() -> String {
         .join("Boundless")
         .display()
         .to_string()
+}
+
+fn default_input_block_screen_corners() -> bool {
+    true
+}
+
+fn default_input_corner_block_px() -> u32 {
+    DEFAULT_INPUT_CORNER_BLOCK_PX
+}
+
+fn default_input_relative_mouse() -> bool {
+    true
+}
+
+fn default_input_hide_cursor_at_edge() -> bool {
+    false
+}
+
+fn default_input_draw_cursor_marker() -> bool {
+    false
 }
 
 pub fn config_path() -> PathBuf {
@@ -299,6 +349,13 @@ pub fn load_or_create_config_at(path: &Path) -> Result<RuntimeConfig> {
         );
     }
 
+    if config.input_handoff.corner_block_px > 256 {
+        bail!(
+            "invalid config: input_handoff.corner_block_px must be <= 256 in `{}`",
+            path.display()
+        );
+    }
+
     Ok(config)
 }
 
@@ -355,6 +412,50 @@ fn migrate_config_value(path: &Path, value: &mut serde_json::Value) -> Result<()
                         .context("serialize file_transfer default")?,
                 );
             }
+            if !object.contains_key("input_handoff") {
+                object.insert(
+                    "input_handoff".to_string(),
+                    serde_json::to_value(InputHandoffConfig::default())
+                        .context("serialize input_handoff default")?,
+                );
+            }
+            Ok(())
+        }
+        "4" => {
+            object.insert(
+                "config_version".to_string(),
+                serde_json::Value::String(RUNTIME_CONFIG_VERSION.to_string()),
+            );
+            object.insert(
+                "protocol_version".to_string(),
+                serde_json::Value::String(PROTOCOL_CURRENT.to_string()),
+            );
+            if !object.contains_key("anti_idle") {
+                object.insert(
+                    "anti_idle".to_string(),
+                    serde_json::to_value(AntiIdleConfig::default())
+                        .context("serialize anti_idle default")?,
+                );
+            }
+            if !object.contains_key("file_transfer") {
+                object.insert(
+                    "file_transfer".to_string(),
+                    serde_json::to_value(FileTransferConfig::default())
+                        .context("serialize file_transfer default")?,
+                );
+            }
+            if !object.contains_key("input_handoff") {
+                object.insert(
+                    "input_handoff".to_string(),
+                    serde_json::to_value(InputHandoffConfig::default())
+                        .context("serialize input_handoff default")?,
+                );
+            }
+
+            let migrated: RuntimeConfig =
+                serde_json::from_value(serde_json::Value::Object(object.clone()))
+                    .with_context(|| format!("parse migrated {}", path.display()))?;
+            save_config_at(path, &migrated)?;
             Ok(())
         }
         "2" | "3" => {
@@ -376,6 +477,11 @@ fn migrate_config_value(path: &Path, value: &mut serde_json::Value) -> Result<()
                 serde_json::to_value(FileTransferConfig::default())
                     .context("serialize file_transfer default")?,
             );
+            object.insert(
+                "input_handoff".to_string(),
+                serde_json::to_value(InputHandoffConfig::default())
+                    .context("serialize input_handoff default")?,
+            );
 
             let migrated: RuntimeConfig =
                 serde_json::from_value(serde_json::Value::Object(object.clone()))
@@ -395,7 +501,8 @@ fn migrate_config_value(path: &Path, value: &mut serde_json::Value) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        AntiIdleConfig, ApiTransport, RuntimeConfig, default_pulse_interval_secs,
+        AntiIdleConfig, ApiTransport, FileTransferConfig, InputHandoffConfig, RuntimeConfig,
+        default_input_corner_block_px, default_pulse_interval_secs,
         default_recent_activity_window_secs, load_or_create_config_at, save_config_at,
     };
     use core_protocol::PROTOCOL_CURRENT;
@@ -549,6 +656,20 @@ mod tests {
     }
 
     #[test]
+    fn input_handoff_defaults_match_predictable_edge_policy() {
+        let config = RuntimeConfig::default();
+
+        assert!(config.input_handoff.block_screen_corners);
+        assert_eq!(
+            config.input_handoff.corner_block_px,
+            default_input_corner_block_px()
+        );
+        assert!(config.input_handoff.relative_mouse);
+        assert!(!config.input_handoff.hide_cursor_at_edge);
+        assert!(!config.input_handoff.draw_cursor_marker);
+    }
+
+    #[test]
     fn current_config_without_file_transfer_gets_default_receive_folder() {
         let root = std::env::temp_dir().join(format!(
             "boundless-config-file-transfer-default-test-{}",
@@ -573,6 +694,7 @@ mod tests {
         assert!(config.file_transfer.receive_dir.ends_with("Boundless"));
         assert!(!config.file_transfer.organize_by_peer);
         assert!(config.file_transfer.auto_accept_trusted_peers);
+        assert_eq!(config.input_handoff, InputHandoffConfig::default());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -619,11 +741,96 @@ mod tests {
         .expect("seed config");
 
         let config = load_or_create_config_at(&path).expect("migrate config");
-        assert_eq!(config.config_version, "4");
+        assert_eq!(config.config_version, "5");
         assert_eq!(config.anti_idle, AntiIdleConfig::default());
+        assert_eq!(config.input_handoff, InputHandoffConfig::default());
 
         let saved = std::fs::read_to_string(&path).expect("read migrated");
         assert!(saved.contains("\"anti_idle\""));
+        assert!(saved.contains("\"input_handoff\""));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_or_create_migrates_v4_config_without_resetting_existing_sections() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-config-migrate-v4-preserve-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("config.json");
+        std::fs::create_dir_all(&root).expect("create root");
+        let receive_dir = root.join("custom-receive");
+        let seed = RuntimeConfig {
+            config_version: "4".to_string(),
+            anti_idle: AntiIdleConfig {
+                enabled: false,
+                recent_activity_window_secs: 900,
+                allow_on_battery: true,
+                keep_display_on: true,
+                pulse_interval_secs: 45,
+            },
+            file_transfer: FileTransferConfig {
+                receive_dir: receive_dir.display().to_string(),
+                organize_by_peer: true,
+                auto_accept_trusted_peers: false,
+            },
+            ..RuntimeConfig::default()
+        };
+        let mut value = serde_json::to_value(seed).expect("serialize v4 seed");
+        value
+            .as_object_mut()
+            .expect("config must be object")
+            .remove("input_handoff");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&value).expect("serialize"),
+        )
+        .expect("write seeded config");
+
+        let config = load_or_create_config_at(&path).expect("migrate v4 config");
+        assert_eq!(config.config_version, "5");
+        assert!(!config.anti_idle.enabled);
+        assert_eq!(config.anti_idle.recent_activity_window_secs, 900);
+        assert!(config.anti_idle.allow_on_battery);
+        assert!(config.anti_idle.keep_display_on);
+        assert_eq!(config.anti_idle.pulse_interval_secs, 45);
+        assert_eq!(
+            config.file_transfer.receive_dir,
+            receive_dir.display().to_string()
+        );
+        assert!(config.file_transfer.organize_by_peer);
+        assert!(!config.file_transfer.auto_accept_trusted_peers);
+        assert_eq!(config.input_handoff, InputHandoffConfig::default());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_or_create_rejects_unbounded_corner_block_size() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-config-input-handoff-invalid-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("config.json");
+        std::fs::create_dir_all(&root).expect("create temp root");
+
+        let seed = RuntimeConfig {
+            input_handoff: InputHandoffConfig {
+                corner_block_px: 257,
+                ..InputHandoffConfig::default()
+            },
+            ..RuntimeConfig::default()
+        };
+        save_config_at(&path, &seed).expect("seed invalid config");
+
+        let error = load_or_create_config_at(&path).expect_err("must reject invalid corner block");
+        assert!(
+            error
+                .to_string()
+                .contains("input_handoff.corner_block_px must be <= 256"),
+            "unexpected error: {error:#}"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

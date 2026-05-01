@@ -81,10 +81,14 @@ impl AppState {
             .input_capture_target()
             .await
             .unwrap_or_else(|| "none".to_string());
+        let input_handoff = self.input_handoff_config().await;
+        let input_capture_backend_mode = self.input_capture_backend_mode().await;
+        let (pending_inject_frames, pending_inject_high_water) =
+            self.pending_inject_frame_stats().await;
         let pairing_diagnostics = self.pairing_diagnostics_report().await;
 
         let report = format!(
-            "Boundless Diagnostics\nMachine: {}\nFingerprint: {}\nPeers: {}\nTrusted CAs: {}\nTransport Events: {}\nInput Owner: {}\nInput Capture Target: {}\nAPI: {}\nTransport Port: {}\nProtocol: {}\n{}\n",
+            "Boundless Diagnostics\nMachine: {}\nFingerprint: {}\nPeers: {}\nTrusted CAs: {}\nTransport Events: {}\nInput Owner: {}\nInput Capture Target: {}\nInput Capture Backend Mode: {}\nInput Pending Inject Frames: {}\nInput Pending Inject High Water: {}\nInput Handoff: block_screen_corners={} corner_block_px={} relative_mouse={} hide_cursor_at_edge={} draw_cursor_marker={}\nAPI: {}\nTransport Port: {}\nProtocol: {}\n{}\n",
             snapshot.machine_id,
             self.fingerprint(),
             snapshot.peers.len(),
@@ -92,6 +96,14 @@ impl AppState {
             event_count,
             input_owner,
             input_capture_target,
+            input_capture_backend_mode,
+            pending_inject_frames,
+            pending_inject_high_water,
+            input_handoff.block_screen_corners,
+            input_handoff.corner_block_px,
+            input_handoff.relative_mouse,
+            input_handoff.hide_cursor_at_edge,
+            input_handoff.draw_cursor_marker,
             snapshot.api_bind,
             snapshot.network_port,
             snapshot.protocol_version,

@@ -212,6 +212,11 @@ foreach ($target in $targets) {
         Write-TraceLine "snapshot label=$($target.Label) feature_list=$(($feature.Output -replace '\r?\n',' | ').Trim())"
     }
 
+    $inputStatus = Invoke-CliUnchecked -Endpoint $target.Endpoint -CommandArgs @("input", "status")
+    if ($inputStatus.ExitCode -eq 0) {
+        Write-TraceLine "snapshot label=$($target.Label) input_status=$(($inputStatus.Output -replace '\r?\n',' | ').Trim())"
+    }
+
     $layout = Invoke-CliUnchecked -Endpoint $target.Endpoint -CommandArgs @("layout", "show")
     if ($layout.ExitCode -eq 0) {
         Write-TraceLine "snapshot label=$($target.Label) layout_show=$(($layout.Output -replace '\r?\n',' | ').Trim())"
