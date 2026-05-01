@@ -156,6 +156,83 @@ async fn remove_peer_revokes_trust_and_reimport_resets_reconnect_generation() {
 }
 
 #[tokio::test]
+async fn rotate_trust_clears_peers_trust_and_requires_restart() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-trust-rotation-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let state = AppState::load_or_create_with_paths(config_path.clone(), security_root.clone())
+        .expect("load state");
+    let original_ca = state.identity().ca_cert_pem.clone();
+
+    let remote_paths = core_security::SecurityPaths::for_root(root.join("remote-security"));
+    let remote_identity = core_security::ensure_device_identity(
+        &remote_paths,
+        "remote-machine",
+        "remote",
+        Some("127.0.0.1"),
+    )
+    .expect("remote identity");
+    state
+        .import_trust_bundle(
+            core_security::TrustBundle {
+                machine_id: "remote-machine".to_string(),
+                display_name: "remote".to_string(),
+                network_address: "127.0.0.1:15100".to_string(),
+                ca_cert_pem: remote_identity.ca_cert_pem,
+            },
+            None,
+        )
+        .await
+        .expect("import trust");
+    state.request_peer_reconnect("remote-machine").await;
+    let session = tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+    state
+        .register_transport_session_for_peer("remote-machine", session.abort_handle())
+        .await;
+
+    let message = state.rotate_trust().await.expect("rotate trust");
+    assert!(message.contains("restart_required=true"));
+    assert!(message.contains("aborted_sessions=1"));
+    let err = state
+        .export_trust_bundle()
+        .await
+        .expect_err("export must wait for restart after rotation");
+    assert!(err.to_string().contains("pending daemon restart"));
+    let import_err = state
+        .import_trust_bundle(
+            core_security::TrustBundle {
+                machine_id: "post-rotate-peer".to_string(),
+                display_name: "post rotate".to_string(),
+                network_address: "127.0.0.1:15101".to_string(),
+                ca_cert_pem: "not used while restart is pending".to_string(),
+            },
+            None,
+        )
+        .await
+        .expect_err("import must wait for restart after rotation");
+    assert!(import_err.to_string().contains("pending daemon restart"));
+    assert!(state.list_peers().await.is_empty());
+    assert_eq!(state.peer_reconnect_generation("remote-machine").await, 0);
+
+    let rotated_state = AppState::load_or_create_with_paths(config_path, security_root)
+        .expect("reload rotated state");
+    assert_ne!(rotated_state.identity().ca_cert_pem, original_ca);
+    assert!(rotated_state.list_peers().await.is_empty());
+    let trusted = rotated_state.trusted_records().await.expect("read trust");
+    assert_eq!(trusted.len(), 1, "only self trust should remain");
+    assert_eq!(trusted[0].machine_id, rotated_state.identity().machine_id);
+    let join_error = session.await.expect_err("session should be aborted");
+    assert!(join_error.is_cancelled());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn diagnostics_dump_reports_nonce_challenge_rejections() {
     let root = std::env::temp_dir().join(format!(
         "boundless-pairing-diagnostics-dump-test-{}",

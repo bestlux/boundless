@@ -49,7 +49,9 @@ impl AppState {
         requester_bundle: TrustBundle,
         requester_alias: Option<String>,
     ) -> Result<PendingNearbyPairingRequest> {
+        self.ensure_trust_rotation_not_pending()?;
         let mut pending_requests = self.pairing.pending_requests.write().await;
+        self.ensure_trust_rotation_not_pending()?;
         if pending_requests.len() >= MAX_PENDING_NEARBY_PAIRING_REQUESTS {
             anyhow::bail!("too many pending pairing requests; try again later");
         }
@@ -83,7 +85,9 @@ impl AppState {
         requester_alias: Option<String>,
         ttl_secs: u64,
     ) -> Result<PendingNearbyPairingRequest> {
+        self.ensure_trust_rotation_not_pending()?;
         let mut pending_requests = self.pairing.pending_requests.write().await;
+        self.ensure_trust_rotation_not_pending()?;
         let requester_machine_id = requester_bundle.machine_id.clone();
         pending_requests.retain(|_, record| {
             !(record.summary.requester_machine_id == requester_machine_id
@@ -256,6 +260,7 @@ impl AppState {
         request_id: &str,
         alias_override: Option<String>,
     ) -> Result<TrustBundle> {
+        self.ensure_trust_rotation_not_pending()?;
         self.expire_nearby_pairing_challenges().await;
 
         let pending = {
@@ -315,6 +320,7 @@ impl AppState {
         verification_nonce: &str,
         alias_override: Option<String>,
     ) -> Result<TrustBundle> {
+        self.ensure_trust_rotation_not_pending()?;
         self.expire_nearby_pairing_challenges().await;
 
         let normalized_code = code.trim();

@@ -8,9 +8,11 @@ impl AppState {
         alias: Option<String>,
     ) -> Result<String> {
         let now = Utc::now();
+        self.ensure_trust_rotation_not_pending()?;
         self.consume_pairing_code(&code).await?;
 
         let mut config = self.config.write().await;
+        self.ensure_trust_rotation_not_pending()?;
         let normalized_address = normalize_peer_address(&host, config.network_port)?;
         let peer_id = uuid::Uuid::new_v4().to_string();
 
@@ -90,6 +92,58 @@ impl AppState {
             self.notify_peer_reconcile_wake("peer_removed");
         }
         Ok(removed)
+    }
+
+    pub async fn rotate_trust(&self) -> Result<String> {
+        self.trust_rotation_pending_restart
+            .store(true, Ordering::Release);
+        {
+            let mut config = self.config.write().await;
+            let machine_id = config.machine_id.clone();
+            let device_name = config.device_name.clone();
+            let advertised_host = std::env::var("BOUNDLESS_ADVERTISE_HOST").ok();
+            let identity = rotate_device_identity(
+                &self.security_paths,
+                &machine_id,
+                &device_name,
+                advertised_host.as_deref(),
+            )?;
+            upsert_trust_record(
+                &self.security_paths,
+                TrustRecord {
+                    machine_id: machine_id.clone(),
+                    ca_cert_pem: identity.ca_cert_pem,
+                    added_at: Utc::now(),
+                },
+            )?;
+            config.peers.clear();
+            config.layout_matrix = "self".to_string();
+            config.updated_at = Utc::now();
+            save_config_at(&self.config_path, &config)?;
+        }
+
+        let aborted_sessions = self.transport.clear().await;
+        self.clipboard.clear().await;
+        self.discovery.clear().await;
+        self.pairing.clear().await;
+        self.input
+            .reset(
+                self.config
+                    .read()
+                    .await
+                    .features
+                    .get("share_input")
+                    .copied()
+                    .unwrap_or(true),
+            )
+            .await;
+        self.invalidate_cached_layout_matrix().await;
+        self.notify_input_capture_wake("trust_rotated");
+        self.notify_peer_reconcile_wake("trust_rotated");
+
+        Ok(format!(
+            "trust_rotated=true peers_cleared=true aborted_sessions={aborted_sessions} restart_required=true"
+        ))
     }
 
     pub async fn set_peer_connected(&self, peer_id: &str, connected: bool) -> Result<()> {

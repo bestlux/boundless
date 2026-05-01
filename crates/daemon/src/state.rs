@@ -3,7 +3,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -29,7 +32,8 @@ use core_input::{
 use core_security::{
     DeviceIdentity, SecurityPaths, TrustBundle, TrustRecord, default_security_root,
     ensure_device_identity, ensure_trust_store, fingerprint, generate_pairing_code,
-    load_or_create_device_secret, load_trust_records, remove_trust_record, upsert_trust_record,
+    load_or_create_device_secret, load_trust_records, remove_trust_record, rotate_device_identity,
+    upsert_trust_record,
 };
 use core_transfer::{resolve_conflict_path, validate_transfer_size_with_limit};
 
@@ -202,6 +206,7 @@ pub struct AppState {
     security_paths: Arc<SecurityPaths>,
     identity: Arc<DeviceIdentity>,
     device_fingerprint: Arc<String>,
+    trust_rotation_pending_restart: Arc<AtomicBool>,
     parsed_layout_matrix_cache: Arc<RwLock<Option<ParsedLayoutMatrixCache>>>,
     input_capture_wake: Arc<RuntimeWakeSignal>,
     input_inject_wake: Arc<RuntimeWakeSignal>,

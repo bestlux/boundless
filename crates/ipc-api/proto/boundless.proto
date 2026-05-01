@@ -76,6 +76,10 @@ message ImportTrustBundleRequest {
   string alias = 5;
 }
 
+message RotateTrustRequest {
+  string confirm = 1;
+}
+
 message PeerInfo {
   string peer_id = 1;
   string display_name = 2;
@@ -377,6 +381,7 @@ service ControlPlaneService {
   rpc TriggerHotkeyAction(HotkeyTriggerRequest) returns (OperationReply);
   rpc ExportTrustBundle(Empty) returns (TrustBundleReply);
   rpc ImportTrustBundle(ImportTrustBundleRequest) returns (OperationReply);
+  rpc RotateTrust(RotateTrustRequest) returns (OperationReply);
   rpc DumpDiagnostics(DiagnosticsDumpRequest) returns (DiagnosticsDumpReply);
   rpc SafeReset(SafeResetRequest) returns (OperationReply);
   rpc SendClipboardText(SendClipboardTextRequest) returns (OperationReply);
@@ -407,6 +412,7 @@ service PairingService {
   rpc RejectNearbyPairingRequest(NearbyPairingDecisionRequest) returns (OperationReply);
   rpc ExportTrustBundle(Empty) returns (TrustBundleReply);
   rpc ImportTrustBundle(ImportTrustBundleRequest) returns (OperationReply);
+  rpc RotateTrust(RotateTrustRequest) returns (OperationReply);
 }
 
 service TopologyService {

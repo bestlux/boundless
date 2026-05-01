@@ -734,6 +734,16 @@ pub(super) async fn pair_import_trust(
     Ok(())
 }
 
+pub(super) async fn pair_rotate_trust(endpoint: &str, confirm: String) -> Result<()> {
+    let mut client = connect_control_plane(endpoint).await?;
+    let response = client
+        .rotate_trust(RotateTrustRequest { confirm })
+        .await?
+        .into_inner();
+    println!("ok={} message={}", response.ok, response.message);
+    Ok(())
+}
+
 pub(super) async fn peer_list(endpoint: &str) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let response = client.list_peers(Empty {}).await?.into_inner();

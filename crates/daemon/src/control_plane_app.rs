@@ -9,10 +9,10 @@ use app_services::{
         InputCaptureTargetReply, InputOwnerCommand, InputOwnerReply, LayoutReply, LayoutSetCommand,
         NearbyJoinStartCommand, NearbyJoinStatusCommand, NearbyPairingDecisionCommand,
         NearbyRequestCodeCommand, NearbySubmitCodeCommand, OperationReply, PairJoinCommand,
-        PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, SafeResetCommand,
-        SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand,
-        SendInputMoveCommand, SetAntiIdleConfigCommand, SetFileTransferConfigCommand,
-        SetInputHandoffConfigCommand,
+        PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, RotateTrustCommand,
+        SafeResetCommand, SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand,
+        SendInputKeyCommand, SendInputMoveCommand, SetAntiIdleConfigCommand,
+        SetFileTransferConfigCommand, SetInputHandoffConfigCommand,
     },
     queries::{
         AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
@@ -275,6 +275,16 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             ok: true,
             message: "trust bundle imported".to_string(),
         })
+    }
+
+    async fn rotate_trust(&self, command: RotateTrustCommand) -> Result<OperationReply> {
+        let machine_id = self.state.snapshot().await.machine_id;
+        let expected = format!("rotate-trust:{machine_id}");
+        if command.confirm != expected {
+            anyhow::bail!("typed confirmation required: --confirm {expected}");
+        }
+        let message = self.state.rotate_trust().await?;
+        Ok(OperationReply { ok: true, message })
     }
 
     async fn dump_diagnostics(
@@ -820,5 +830,47 @@ fn map_nearby_join_status(result: pairing_wire::NearbyJoinStatus) -> NearbyJoinS
         status: result.status.as_str().to_string(),
         message: result.message,
         peer_machine_id: result.peer_machine_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rotate_trust_requires_machine_typed_confirmation() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-control-plane-rotate-trust-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+        let machine_id = state.snapshot().await.machine_id;
+        let app = DaemonControlPlaneApp::new(state);
+
+        let err = app
+            .rotate_trust(RotateTrustCommand {
+                confirm: "rotate-trust:wrong-machine".to_string(),
+            })
+            .await
+            .expect_err("wrong confirmation should fail");
+        assert!(
+            err.to_string()
+                .contains(&format!("--confirm rotate-trust:{machine_id}")),
+            "error should include exact confirmation token"
+        );
+
+        let reply = app
+            .rotate_trust(RotateTrustCommand {
+                confirm: format!("rotate-trust:{machine_id}"),
+            })
+            .await
+            .expect("matching confirmation should rotate trust");
+        assert!(reply.ok);
+        assert!(reply.message.contains("restart_required=true"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

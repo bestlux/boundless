@@ -76,6 +76,11 @@ pub struct ImportTrustBundleCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotateTrustCommand {
+    pub confirm: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticsDumpCommand {
     pub output_path: Option<String>,
 }

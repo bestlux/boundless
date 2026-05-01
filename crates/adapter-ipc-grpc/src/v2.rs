@@ -24,10 +24,10 @@ use ipc_api::boundless::v1::{
     NearbyPairingCompletionReply, NearbyPairingDecisionRequest, NearbyPairingRequestInfo,
     NearbyRequestCodeStartReply, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
     OperationReply, PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply, PairJoinRequest,
-    PeerInfo, PeerListReply, RemovePeerRequest, SafeResetRequest, SendClipboardImageRequest,
-    SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest, SendInputMoveRequest,
-    StatusReply, StatusRequest, TransportEvent, TransportEventsReply, TrustBundleReply,
-    UiSnapshotReply,
+    PeerInfo, PeerListReply, RemovePeerRequest, RotateTrustRequest, SafeResetRequest,
+    SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
+    SendInputMoveRequest, StatusReply, StatusRequest, TransportEvent, TransportEventsReply,
+    TrustBundleReply, UiSnapshotReply,
     control_plane_service_server::{ControlPlaneService, ControlPlaneServiceServer},
 };
 
@@ -409,6 +409,24 @@ impl ControlPlaneService for ControlPlaneApi {
                 network_address: request.network_address,
                 ca_cert_pem: request.ca_cert_pem,
                 alias: parse_optional_alias(request.alias),
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
+    }
+
+    async fn rotate_trust(
+        &self,
+        request: Request<RotateTrustRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .rotate_trust(app_commands::RotateTrustCommand {
+                confirm: request.confirm,
             })
             .await
             .map_err(|error| Status::invalid_argument(error.to_string()))?;

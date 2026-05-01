@@ -18,8 +18,9 @@ use ipc_api::boundless::v1::{
     InputHandoffSetRequest, InputOwnerRequest, LayoutSetRequest, NearbyJoinStartRequest,
     NearbyJoinStatusRequest, NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest,
     NearbySubmitCodeRequest, PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest,
-    SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest,
-    SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest, UiSnapshotReply,
+    RotateTrustRequest, SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest,
+    SendFileRequest, SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest,
+    UiSnapshotReply,
 };
 
 mod cli_helpers;
@@ -202,6 +203,10 @@ enum PairCommand {
         input: String,
         #[arg(long)]
         alias: Option<String>,
+    },
+    RotateTrust {
+        #[arg(long)]
+        confirm: String,
     },
 }
 
@@ -450,6 +455,7 @@ async fn main() -> Result<()> {
             PairCommand::ImportTrust { input, alias } => {
                 pair_import_trust(&cli.endpoint, input, alias).await
             }
+            PairCommand::RotateTrust { confirm } => pair_rotate_trust(&cli.endpoint, confirm).await,
         },
         Command::Peer { command } => match command {
             PeerCommand::List => peer_list(&cli.endpoint).await,
