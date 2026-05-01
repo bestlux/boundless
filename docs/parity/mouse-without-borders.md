@@ -1,0 +1,101 @@
+# Mouse Without Borders Parity Matrix
+
+This matrix is the v5 release contract for matching and exceeding Microsoft PowerToys Mouse Without Borders. The source parity target is the current Microsoft Learn page for [PowerToys Mouse Without Borders](https://learn.microsoft.com/en-us/windows/powertoys/mouse-without-borders).
+
+The matrix is intentionally stricter than a feature inventory. A row is not `validated` until the user-facing tray path, CLI/diagnostic fallback, and release validation evidence all exist where that row requires them.
+
+## Status Values
+
+- `not-started`: No meaningful Boundless implementation exists.
+- `plumbing`: Protocol, config, state, or tests exist, but the feature is not user-ready.
+- `cli-ready`: CLI or script workflow exists and is usable by a power user.
+- `tray-ready`: Tray workflow exists and matches the user-facing promise.
+- `validated`: Release-blocking validation proves the required behavior.
+- `deferred`: Explicitly postponed beyond v5.
+- `out-of-scope`: Intentionally excluded from Boundless.
+
+## Release Blocking Rule
+
+Rows marked `yes` in the release blocker column must be `validated`, `deferred`, or `out-of-scope` with a concrete rationale before v5 can ship. Required rows cannot remain `not-started`, `plumbing`, `cli-ready`, or `tray-ready` in the v5 readiness packet.
+
+## Matrix
+
+| Feature or Setting | Mouse Without Borders Behavior | Boundless v5 Target | Current Boundless Status | Owner Surface | CLI Surface | Tray Surface | Validation Evidence | Release Blocker |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Control up to four computers | Control up to four computers from one machine. | Validate two-, three-, and four-machine Windows topologies with predictable layout and reconnect behavior. | plumbing | `daemon` layout/input state, `core-input`, `tray` layout UI | `layout show`, `layout set`, `layout orient`, `input capture-start` | Layout Manager | four-node topology validation or deterministic equivalent; two-/three-node smokes | yes |
+| Shared keyboard and mouse | Use one keyboard/mouse across connected machines. | Low-latency edge handoff, explicit capture target, release/unlock path, diagnostics for hook/polling mode. | plumbing | `platform-windows`, `daemon::input`, `core-input` | `input owner`, `input capture-target`, `input capture-start`, `input capture-stop` | Status and Settings controls | edge handoff trace matrix; input queue/drop tests; two-node runtime smoke | yes |
+| Device layout | Drag machines in layout. | Tray visual layout editor with one-row/grid/freeform cardinal layout for up to four peers plus local machine. | tray-ready | `app-services::desktop`, `daemon` layout validation, `tray` layout | `layout set`, `layout preview`, `layout wizard` | Layout Manager | layout unit tests; tray layout tests; topology smoke | yes |
+| Refresh connections | Refresh/reconnect connected machines. | Manual reconnect, automatic reconnect with reason classification, per-peer health states. | cli-ready | `daemon` transport runtime/state, `tray` Settings | `diagnostics run-action reconnect`, hotkey `reconnect` | Settings reconnect action | reconnect generation tests; reconnect smoke | yes |
+| Security key / new key | Generate new key and reset current connections. | Trust rotation command that revokes existing peer trust, clears stale sessions, and forces explicit re-pairing. | plumbing | `core-security`, `daemon` trust/peer state | `pair export-trust`, `pair import-trust`, `peer remove` | not complete | trust rotation tests; pairing recovery matrix | yes |
+| Connect by name/key | Connect with remote machine name and shared key. | Safer nearby challenge-confirm pairing plus manual host fallback and clear trust identity. | tray-ready | `daemon::pairing_wire`, `core-security`, `tray` pairing | `pair request`, `pair nearby-join`, `pair create-code`, `pair approve` | Status & Pairing guided dialog | pairing recovery matrix; lockout/replay tests | yes |
+| Local host name | Show current host name. | Show local display name, machine ID, endpoint, and service/control health. | cli-ready | `app-services::queries`, `ipc-api`, `daemon` status | `daemon status`, `ui snapshot`, `console` | Settings | status snapshot tests; manual tray check | yes |
+| Devices in a single row | Arrange devices as one row or 2x2 matrix. | Provide one-row, grid, and explicit cardinal arrangement with validation. | plumbing | layout parser/resolver, tray layout | `layout orient`, `layout set` | Layout Manager | layout validation tests; tray layout tests | yes |
+| Use service | Install service to control elevated apps/lock screen. | Optional Windows service mode with explicit status, IPC ACLs, install/uninstall, elevated-app validation, and lock-screen claim classification. | not-started | `platform-windows`, `daemon-host` or service crate, installer | future `service` commands | Settings service panel | service smoke; elevated-app validation; installer smoke | yes |
+| Uninstall service | Remove service from computer. | Service uninstall path removes service, stops daemon, and preserves or migrates user config safely. | not-started | installer/service host | future `service uninstall` | Settings service panel | service uninstall validation | yes |
+| Wrap mouse | Wrap across first/last machine edges. | Configurable wrap behavior with tray setting and layout-aware validation. | plumbing | `daemon` config/input handoff | `feature set wrap_mouse on/off` | future Settings toggle | input handoff tests; topology smoke | yes |
+| Share clipboard | Share clipboard between machines. | Tray-visible text/image clipboard sharing with enable/disable, status, echo suppression, and failure reporting. | plumbing | `daemon::clipboard`, `core-clipboard`, transport | `feature set share_clipboard`, `transport send-text`, `transport send-image` | future Settings/status | clipboard matrix; runtime smoke | yes |
+| Clipboard file transfer | Copy files via clipboard, 100 MB limit in MWB. | Clipboard-file workflow plus explicit send-file action, progress, receive-folder policy, interruption recovery, safe receive directory enforcement, explicit consent or per-peer auto-accept opt-in, and configurable size policy. | plumbing | `core-transfer`, `daemon` network/file state, transport | `transport send-file`, `file-transfer config`, `file-transfer set-receive-dir` | future receive/progress UI | file transfer matrix; interrupted/reconnect tests; unsafe path/hash/size tests | yes |
+| Drag/drop file transfer | Drag/drop can transfer one file in MWB, with known limitations around folders, multiple files, and network files. | Classify as a first-class tray workflow if Windows exposes a reliable source path; otherwise defer with the exact limitation and keep clipboard-file plus explicit send-file as the v5 path. | not-started | `tray`, `core-transfer`, `daemon` network/file state | future `transport send-file` integration | future drag/drop target or explicit unsupported state | drag/drop validation or deferral evidence in readiness packet | yes |
+| Hide mouse at screen edge | Position cursor at edge when switching to another machine. | Setting that avoids focus traps and fullscreen/RDP issues; explicit unsupported states. | not-started | `platform-windows` input/cursor helpers, `daemon::input` | future feature setting | future Settings toggle | input handoff trace; fullscreen scenario validation | yes |
+| Draw mouse cursor | Draw cursor on machines without physical peripheral. | Cursor marker or remote cursor aid when Windows reports invisible/no hardware cursor state. | not-started | `platform-windows`, tray/status overlay if needed | future feature setting | future Settings toggle | cursor visibility validation | no |
+| Validate remote machine IP | Reverse DNS validation of remote machine IPs. | Optional peer endpoint validation with warnings when reverse DNS is unreliable; v5 must prove warning/enforcement behavior and avoid implying DNS is a trust boundary. | not-started | `daemon` discovery/network validation | future feature setting | future Settings toggle | endpoint validation tests; unreliable-DNS warning tests | yes |
+| Same subnet only | Only connect on same intranet/subnet. | Optional subnet policy enforced before outbound connection and inbound trust acceptance, with clear diagnostics when disabled or bypassed by manual endpoint policy. | not-started | `daemon` network runtime/config | future feature setting | future Settings toggle | subnet policy tests; inbound/outbound enforcement tests | yes |
+| Local control endpoint security | Not an MWB user setting; MWB service/control behavior is local to Windows. | Current-user named-pipe ACLs, service-to-user privilege separation, localhost TCP fallback warnings, and tests that unauthorized local users cannot invoke privileged actions. | plumbing | `platform-windows`, `adapter-ipc-grpc`, `daemon` control plane | `daemon status`, future diagnostics checks | Settings service/control health | IPC ACL tests; service privilege-boundary tests; localhost fallback warning tests | yes |
+| Block screen saver on other machines | Prevent screen saver on other machines. | Anti-idle/block-screen-saver policy with local and remote pulse behavior, display-required option, and battery safeguards. | plumbing | `daemon::anti_idle`, `platform-windows::runtime` | `anti-idle show`, `anti-idle set` | future Settings toggle | anti-idle tests; Windows runtime validation | no |
+| Move mouse relatively | Help across different resolutions or multi-display scenarios. | Absolute/relative movement modes with mixed-DPI and multi-display validation. | plumbing | `core-input`, `platform-windows`, `daemon::input` | future feature setting | future Settings toggle | mixed-DPI/multi-display trace | yes |
+| Block mouse at screen corners | Avoid accidental switching at corners. | Configurable corner blocking with tests for every edge and corner. | not-started | `daemon::input`, `core-input` | future feature setting | future Settings toggle | edge/corner handoff tests | yes |
+| Clipboard/network status messages | Show clipboard and network status in tray notifications. | Local bounded event stream, tray toasts/history, and CLI support bundle with default redaction for trust material, pairing artifacts, peer IDs, machine IDs, fingerprints, endpoints, local paths, request IDs, and lockout IPs. | plumbing | `daemon` events, `app-services`, `tray` toasts | `transport events`, future diagnostics export | toast/history panel | diagnostics redaction tests; UI smoke | yes |
+| Easy Mouse | Switch by moving pointer past screen edge; optional modifier requirement. | Edge switching with optional modifier policy and fullscreen suppression. | plumbing | `daemon::input`, `platform-windows` hooks | `feature set easy_mouse`, hotkey toggle | future Settings toggle | edge handoff tests; fullscreen validation | yes |
+| Disable Easy Mouse in fullscreen | Prevent switching when fullscreen app is focused. | Fullscreen detection with allowlist/ignore list and visible fallback when unavailable. | not-started | `platform-windows`, `daemon::input` | future feature setting | future Settings toggle/list | fullscreen app validation | no |
+| Ignored fullscreen applications | Allow Easy Mouse for listed fullscreen executables. | Executable allowlist for fullscreen suppression exceptions. | not-started | config, `platform-windows` foreground app detection | future config command | future Settings list | allowlist tests | no |
+| Shortcut to toggle Easy Mouse | Configurable `Ctrl`+`Alt`+letter shortcut. | Existing hotkey action remains configurable in CLI and tray. | cli-ready | `daemon::hotkeys`, `platform-windows` | `hotkey toggle_easy_mouse <combo>` | future Settings hotkey editor | hotkey unit/runtime tests | yes |
+| Shortcut to lock all machines | Shortcut pressed twice locks all machines with same setting. | Lock local/paired machines where supported, with service-mode and trust constraints visible. | plumbing | `daemon::hotkeys`, transport anti-idle/input control, `platform-windows` | `hotkey lock_machine <combo>` | future Settings hotkey editor | lock behavior tests; Windows validation | no |
+| Shortcut to reconnect | Configurable reconnect shortcut. | Existing reconnect hotkey remains configurable and reports reconnect reason. | cli-ready | `daemon::hotkeys`, transport runtime | `hotkey reconnect <combo>` | future Settings hotkey editor | reconnect hotkey tests | yes |
+| Shortcut for multi-machine mode | Send same input to all machines. | Explicit multi-cast input mode with strong visual state, easy escape, and off-by-default policy. | not-started | `daemon::input`, `core-input`, tray state | future command | future status/control | multi-cast input tests | no |
+| Shortcut to switch to specific machine | `Ctrl`+`Alt`+number or `F1`-`F4` switch. | Direct capture-target shortcuts for up to four peers with layout-aware labels. | not-started | `daemon::hotkeys`, layout resolver | future hotkey command | future Settings hotkey editor | hotkey target tests | no |
+| Add firewall rule | Install firewall rule for MWB. | Optional firewall rule install/check/remove with admin prompts and diagnostics, not silent mutation. | not-started | Windows installer/scripts/platform glue | future firewall command | future Settings action | firewall rule validation | yes |
+| Status colors | Color-coded connection states. | Tray peer health states with accessible labels and exact reason text. | plumbing | `app-services::queries`, `tray` status UI | `console`, `daemon status` | Status & Pairing | UI/state tests | yes |
+| Troubleshooting guidance | Same network, key/host, firewall, refresh connections. | Built-in diagnostics and docs distinguish discovery, firewall, stale daemon, named pipe, TLS trust, protocol mismatch, and service issues. | plumbing | diagnostics ops, docs, tray health | `diagnostics dump`, `console` | future diagnostics panel | support bundle validation | yes |
+| Original MWB UI | Show legacy original UI. | Not applicable; Boundless has its own tray UX. | out-of-scope | none | none | none | rationale in docs | no |
+
+## V5 Readiness Snapshot Requirements
+
+The v5 readiness packet must include a copy of this matrix with each release-blocking row set to `validated`, `deferred`, or `out-of-scope`. For each `validated` row, the packet must include:
+
+- the commit SHA,
+- validation command,
+- validation result,
+- artifact path when applicable,
+- remaining risk,
+- and any manual environment prerequisite.
+
+For each `deferred` row, the packet must include:
+
+- reason for deferral,
+- user-facing claim removed or softened,
+- target follow-up release,
+- and known workaround if one exists.
+
+## Workstream Completion Checklist
+
+Each milestone commit must update this checklist when it moves a matrix row closer to `validated`.
+
+| Workstream | Matrix Rows It Must Complete Or Explicitly Defer |
+| --- | --- |
+| V5-1 Parity contract | All rows classified with status, owner surface, CLI/tray surface, validation evidence, and release-blocker status. |
+| V5-2 Four-machine topology and layout UX | Control up to four computers; Device layout; Devices in a single row; Status colors. |
+| V5-3 Windows service mode | Use service; Uninstall service; Local control endpoint security; Add firewall rule; Troubleshooting guidance. |
+| V5-4 Input handoff excellence | Shared keyboard and mouse; Wrap mouse; Hide mouse at screen edge; Draw mouse cursor; Move mouse relatively; Block mouse at screen corners; Easy Mouse; Disable Easy Mouse in fullscreen; Ignored fullscreen applications; Shortcut to toggle Easy Mouse; Shortcut to lock all machines; Shortcut to reconnect; Shortcut for multi-machine mode; Shortcut to switch to specific machine. |
+| V5-5 Clipboard and file workflows | Share clipboard; Clipboard file transfer; Drag/drop file transfer; Clipboard/network status messages. |
+| V5-6 Pairing, trust rotation, and network safety | Security key / new key; Connect by name/key; Validate remote machine IP; Same subnet only; Add firewall rule; Troubleshooting guidance. |
+| V5-7 Complete tray settings surface | Every row with a future or incomplete tray surface, including settings, hotkeys, receive folder, network policy, service status, and diagnostics controls. |
+| V5-8 Reliability and observability | Refresh connections; Clipboard/network status messages; Status colors; Troubleshooting guidance; Local control endpoint security. |
+| V5-9 Installer and release hardening | Use service; Uninstall service; Add firewall rule; Local host name; Troubleshooting guidance. |
+| V5-10 Validation harness and readiness packet | Every release-blocking row must have command output, artifact evidence, skip rationale, or deferral rationale in the readiness packet. |
+| V5-11 Documentation, support, and migration | Every deferred/out-of-scope row must have user-facing rationale; all validated rows must link to user docs and troubleshooting guidance. |
+
+## Current Required Follow-Ups
+
+- Build a `docs/parity/v5-readiness-template.md` packet template before release hardening begins.
+- Add one issue or work item per release-blocking row that is not yet `validated`.
+- Update this matrix after every v5 milestone commit.

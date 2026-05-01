@@ -43,6 +43,8 @@ This repository now contains an alpha-oriented workspace scaffold with:
 - Shared core crates for protocol, security, transfer policy, input switching logic, discovery helpers, and clipboard policy
 - Versioned local config + structured rotating logs + diagnostics dump baseline
 
+V5 planning tracks Mouse Without Borders parity and beyond in [docs/v5-roadmap.md](docs/v5-roadmap.md). The release contract for parity status lives in [docs/parity/mouse-without-borders.md](docs/parity/mouse-without-borders.md).
+
 ## Workspace layout
 
 - `crates/core-protocol`
