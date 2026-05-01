@@ -21,14 +21,20 @@
     <Property Id="ARPNOREPAIR" Value="1" />
     <util:CloseApplication
       Id="CloseBoundlessTray"
-      Target="TrayBinaryFile"
+      Target="boundlesstray.exe"
       Description="Boundless tray"
       RebootPrompt="no"
       TerminateProcess="1" />
     <util:CloseApplication
       Id="CloseBoundlessDaemon"
-      Target="DaemonBinaryFile"
+      Target="boundlessd.exe"
       Description="Boundless daemon"
+      RebootPrompt="no"
+      TerminateProcess="1" />
+    <util:CloseApplication
+      Id="CloseBoundlessService"
+      Target="boundless-service.exe"
+      Description="Boundless service"
       RebootPrompt="no"
       TerminateProcess="1" />
 
