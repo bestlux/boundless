@@ -64,6 +64,61 @@ async fn touch_peer_does_not_persist_config_on_heartbeat() {
 }
 
 #[tokio::test]
+async fn set_feature_rejects_unsupported_network_policy_names() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-feature-policy-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+    let err = state
+        .set_feature("same_subnet_only".to_string(), true)
+        .await
+        .expect_err("unsupported network policy must fail");
+    assert!(err.to_string().contains("unsupported"));
+    assert!(
+        !state.feature_map().await.contains_key("same_subnet_only"),
+        "unsupported feature must not persist"
+    );
+
+    let unknown_err = state
+        .set_feature("not_a_real_feature".to_string(), true)
+        .await
+        .expect_err("unknown feature must fail");
+    assert!(unknown_err.to_string().contains("unknown feature"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn set_hotkey_rejects_semantic_duplicate_bindings() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-hotkey-duplicate-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+    state
+        .set_hotkey("toggle_easy_mouse".to_string(), "Ctrl+Alt+R".to_string())
+        .await
+        .expect("set first hotkey");
+    let err = state
+        .set_hotkey("switch_all".to_string(), "Alt+Ctrl+R".to_string())
+        .await
+        .expect_err("semantic duplicate must fail");
+    assert!(err.to_string().contains("already assigned"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn remove_peer_clears_input_owner_and_allows_new_claim() {
     let root = std::env::temp_dir().join(format!(
         "boundless-remove-owner-test-{}",

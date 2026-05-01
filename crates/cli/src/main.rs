@@ -119,6 +119,8 @@ enum Command {
         network: bool,
         #[arg(long, default_value_t = false)]
         all: bool,
+        #[arg(long)]
+        confirm: String,
     },
 }
 
@@ -576,7 +578,11 @@ async fn main() -> Result<()> {
         Command::Ui { command } => match command {
             UiCommand::Snapshot { start_daemon } => ui_snapshot(&cli.endpoint, start_daemon).await,
         },
-        Command::SafeReset { network, all } => safe_reset(&cli.endpoint, network, all).await,
+        Command::SafeReset {
+            network,
+            all,
+            confirm,
+        } => safe_reset(&cli.endpoint, network, all, confirm).await,
     }
 }
 

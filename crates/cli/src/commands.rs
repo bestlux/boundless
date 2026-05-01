@@ -1607,10 +1607,19 @@ pub(super) async fn diagnostics_run_action(endpoint: &str, action: String) -> Re
     Ok(())
 }
 
-pub(super) async fn safe_reset(endpoint: &str, network_only: bool, all: bool) -> Result<()> {
+pub(super) async fn safe_reset(
+    endpoint: &str,
+    network_only: bool,
+    all: bool,
+    confirm: String,
+) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let response = client
-        .safe_reset(SafeResetRequest { network_only, all })
+        .safe_reset(SafeResetRequest {
+            network_only,
+            all,
+            confirm,
+        })
         .await?
         .into_inner();
 

@@ -196,6 +196,7 @@ message DiagnosticsDumpReply {
 message SafeResetRequest {
   bool network_only = 1;
   bool all = 2;
+  string confirm = 3;
 }
 
 message SendClipboardTextRequest {
@@ -283,6 +284,8 @@ message UiSnapshotReply {
   FileTransferConfigReply file_transfer_config = 10;
   InputHandoffConfigReply input_handoff_config = 11;
   InputRuntimeStatusReply input_runtime = 12;
+  map<string, bool> features = 13;
+  map<string, string> hotkeys = 14;
 }
 
 message ConsoleSnapshotReply {

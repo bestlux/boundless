@@ -89,6 +89,7 @@ pub struct DiagnosticsDumpCommand {
 pub struct SafeResetCommand {
     pub network_only: bool,
     pub all: bool,
+    pub confirm: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

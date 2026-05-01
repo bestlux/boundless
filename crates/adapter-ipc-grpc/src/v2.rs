@@ -461,6 +461,7 @@ impl ControlPlaneService for ControlPlaneApi {
             .safe_reset(app_commands::SafeResetCommand {
                 network_only: request.network_only,
                 all: request.all,
+                confirm: request.confirm,
             })
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -917,6 +918,8 @@ fn map_ui_snapshot(snapshot: UiSnapshot) -> UiSnapshotReply {
         file_transfer_config: Some(map_file_transfer_config(snapshot.file_transfer_config)),
         input_handoff_config: Some(map_input_handoff_config(snapshot.input_handoff_config)),
         input_runtime: Some(map_input_runtime(snapshot.input_runtime)),
+        features: snapshot.features.into_iter().collect(),
+        hotkeys: snapshot.hotkeys.into_iter().collect(),
     }
 }
 

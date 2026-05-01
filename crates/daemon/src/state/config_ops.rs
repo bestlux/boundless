@@ -246,6 +246,15 @@ impl AppState {
     }
 
     pub async fn set_feature(&self, name: String, enabled: bool) -> Result<()> {
+        match name.as_str() {
+            "share_clipboard" | "transfer_file" | "share_input" | "easy_mouse" | "wrap_mouse" => {}
+            "same_subnet_only" | "validate_remote_ip" => {
+                anyhow::bail!(
+                    "{name} is visible in the tray but unsupported until network policy enforcement lands"
+                );
+            }
+            _ => anyhow::bail!("unknown feature '{name}'"),
+        }
         let mut config = self.config.write().await;
         config.features.insert(name.clone(), enabled);
         save_config_at(&self.config_path, &config)?;
@@ -273,7 +282,19 @@ impl AppState {
     }
 
     pub async fn set_hotkey(&self, action: String, combo: String) -> Result<()> {
+        crate::hotkeys::validate_hotkey_binding(&action, &combo)?;
+        let new_combo = crate::hotkeys::canonical_hotkey_combo(&combo)?;
         let mut config = self.config.write().await;
+        for (existing_action, existing_combo) in &config.hotkeys {
+            if existing_action != &action
+                && new_combo.is_some()
+                && crate::hotkeys::canonical_hotkey_combo(existing_combo)? == new_combo
+            {
+                anyhow::bail!(
+                    "hotkey combo already assigned to {existing_action}; choose a unique combo"
+                );
+            }
+        }
         config.hotkeys.insert(action, combo);
         save_config_at(&self.config_path, &config)
     }

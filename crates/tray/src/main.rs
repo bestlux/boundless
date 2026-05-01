@@ -27,12 +27,14 @@ mod windows_app {
     use eframe::icon_data;
     use image::ImageFormat;
     use ipc_api::boundless::v1::{
-        AntiIdleSetRequest, Empty, FileTransferSetRequest, HotkeyTriggerRequest, LayoutSetRequest,
+        AntiIdleSetRequest, Empty, FeatureSetRequest, FileTransferSetRequest, HotkeySetRequest,
+        HotkeyTriggerRequest, InputHandoffSetRequest, LayoutSetRequest,
         NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
-        SendFileRequest,
+        SafeResetRequest, SendFileRequest,
     };
     use serde::Deserialize;
     use std::{
+        collections::BTreeMap,
         future::Future,
         process::Command as ProcessCommand,
         time::{Duration, Instant},
@@ -76,12 +78,16 @@ mod windows_app {
         daemon_online: bool,
         machine_id: String,
         layout_matrix: String,
+        features: BTreeMap<String, bool>,
+        hotkeys: BTreeMap<String, String>,
         discovered_peers: Vec<UiDiscoveredPeer>,
         paired_peers: Vec<UiPairedPeer>,
         pending_requests: Vec<UiPendingRequest>,
         anti_idle_config: UiAntiIdleConfig,
         anti_idle_status: UiAntiIdleStatus,
         file_transfer_config: UiFileTransferConfig,
+        input_handoff_config: UiInputHandoffConfig,
+        input_runtime: UiInputRuntime,
     }
 
     #[derive(Debug, Clone, Deserialize, Default)]
@@ -107,6 +113,27 @@ mod windows_app {
         organize_by_peer: bool,
         auto_accept_trusted_peers: bool,
         max_file_bytes: u64,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Default)]
+    struct UiInputHandoffConfig {
+        block_screen_corners: bool,
+        corner_block_px: u32,
+        relative_mouse: bool,
+        hide_cursor_at_edge: bool,
+        draw_cursor_marker: bool,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Default)]
+    struct UiInputRuntime {
+        owner_peer_id: String,
+        configured_capture_target_peer_id: String,
+        active_capture_target_peer_id: String,
+        lock_active: bool,
+        lock_supported: bool,
+        capture_backend_mode: String,
+        pending_inject_frames: u32,
+        pending_inject_high_water: u32,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -230,6 +257,8 @@ mod windows_app {
                     daemon_online: snapshot.daemon_online,
                     machine_id: snapshot.machine_id,
                     layout_matrix: snapshot.layout_matrix,
+                    features: snapshot.features.into_iter().collect(),
+                    hotkeys: snapshot.hotkeys.into_iter().collect(),
                     discovered_peers: snapshot
                         .discovered_peers
                         .into_iter()
@@ -288,6 +317,30 @@ mod windows_app {
                             organize_by_peer: config.organize_by_peer,
                             auto_accept_trusted_peers: config.auto_accept_trusted_peers,
                             max_file_bytes: config.max_file_bytes,
+                        })
+                        .unwrap_or_default(),
+                    input_handoff_config: snapshot
+                        .input_handoff_config
+                        .map(|config| UiInputHandoffConfig {
+                            block_screen_corners: config.block_screen_corners,
+                            corner_block_px: config.corner_block_px,
+                            relative_mouse: config.relative_mouse,
+                            hide_cursor_at_edge: config.hide_cursor_at_edge,
+                            draw_cursor_marker: config.draw_cursor_marker,
+                        })
+                        .unwrap_or_default(),
+                    input_runtime: snapshot
+                        .input_runtime
+                        .map(|runtime| UiInputRuntime {
+                            owner_peer_id: runtime.owner_peer_id,
+                            configured_capture_target_peer_id: runtime
+                                .configured_capture_target_peer_id,
+                            active_capture_target_peer_id: runtime.active_capture_target_peer_id,
+                            lock_active: runtime.lock_active,
+                            lock_supported: runtime.lock_supported,
+                            capture_backend_mode: runtime.capture_backend_mode,
+                            pending_inject_frames: runtime.pending_inject_frames,
+                            pending_inject_high_water: runtime.pending_inject_high_water,
                         })
                         .unwrap_or_default(),
                 })?;
@@ -378,6 +431,41 @@ mod windows_app {
         ))
     }
 
+    fn set_feature_blocking(endpoint: &str, name: String, enabled: bool) -> Result<String> {
+        block_on_result(set_feature(endpoint, name, enabled))
+    }
+
+    fn set_input_handoff_config_blocking(
+        endpoint: &str,
+        block_screen_corners: bool,
+        corner_block_px: u32,
+        relative_mouse: bool,
+        hide_cursor_at_edge: bool,
+        draw_cursor_marker: bool,
+    ) -> Result<String> {
+        block_on_result(set_input_handoff_config(
+            endpoint,
+            block_screen_corners,
+            corner_block_px,
+            relative_mouse,
+            hide_cursor_at_edge,
+            draw_cursor_marker,
+        ))
+    }
+
+    fn set_hotkey_blocking(endpoint: &str, action: String, combo: String) -> Result<String> {
+        block_on_result(set_hotkey(endpoint, action, combo))
+    }
+
+    fn safe_reset_blocking(
+        endpoint: &str,
+        network_only: bool,
+        all: bool,
+        confirm: String,
+    ) -> Result<String> {
+        block_on_result(safe_reset(endpoint, network_only, all, confirm))
+    }
+
     fn ensure_daemon_available_blocking(ctx: &AppContext) -> Result<Option<String>> {
         block_on_result(ensure_daemon_available(
             &ctx.endpoint,
@@ -452,6 +540,76 @@ mod windows_app {
                 organize_by_peer,
                 auto_accept_trusted_peers,
                 max_file_bytes,
+            })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
+        Ok(response.message)
+    }
+
+    async fn set_feature(endpoint: &str, name: String, enabled: bool) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let response = client
+            .set_feature(FeatureSetRequest { name, enabled })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
+        Ok(response.message)
+    }
+
+    async fn set_input_handoff_config(
+        endpoint: &str,
+        block_screen_corners: bool,
+        corner_block_px: u32,
+        relative_mouse: bool,
+        hide_cursor_at_edge: bool,
+        draw_cursor_marker: bool,
+    ) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let response = client
+            .set_input_handoff_config(InputHandoffSetRequest {
+                block_screen_corners,
+                corner_block_px,
+                relative_mouse,
+                hide_cursor_at_edge,
+                draw_cursor_marker,
+            })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
+        Ok(response.message)
+    }
+
+    async fn set_hotkey(endpoint: &str, action: String, combo: String) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let response = client
+            .set_hotkey(HotkeySetRequest { action, combo })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
+        Ok(response.message)
+    }
+
+    async fn safe_reset(
+        endpoint: &str,
+        network_only: bool,
+        all: bool,
+        confirm: String,
+    ) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let response = client
+            .safe_reset(SafeResetRequest {
+                network_only,
+                all,
+                confirm,
             })
             .await?
             .into_inner();
@@ -717,6 +875,10 @@ mod windows_app {
 
     fn short_token(value: &str) -> &str {
         value.get(..8).unwrap_or(value)
+    }
+
+    fn empty_as_none(value: &str) -> &str {
+        if value.is_empty() { "none" } else { value }
     }
 
     fn format_error_for_dialog(error: &anyhow::Error) -> String {

@@ -97,6 +97,8 @@ pub struct UiSnapshot {
     pub daemon_online: bool,
     pub machine_id: String,
     pub layout_matrix: String,
+    pub features: BTreeMap<String, bool>,
+    pub hotkeys: BTreeMap<String, String>,
     pub discovered_peers: Vec<UiDiscoveredPeer>,
     pub paired_peers: Vec<UiPairedPeer>,
     pub pending_requests: Vec<UiPendingRequest>,

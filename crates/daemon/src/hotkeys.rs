@@ -33,7 +33,7 @@ const VK_LWIN: u16 = 0x5B;
 const VK_RWIN: u16 = 0x5C;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum HotkeyAction {
+pub(crate) enum HotkeyAction {
     ToggleEasyMouse,
     LockMachine,
     SwitchAll,
@@ -41,7 +41,7 @@ enum HotkeyAction {
 }
 
 impl HotkeyAction {
-    fn from_config_name(value: &str) -> Option<Self> {
+    pub(crate) fn from_config_name(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "toggle_easy_mouse" => Some(Self::ToggleEasyMouse),
             "lock_machine" => Some(Self::LockMachine),
@@ -51,7 +51,7 @@ impl HotkeyAction {
         }
     }
 
-    fn config_name(self) -> &'static str {
+    pub(crate) fn config_name(self) -> &'static str {
         match self {
             Self::ToggleEasyMouse => "toggle_easy_mouse",
             Self::LockMachine => "lock_machine",
@@ -61,9 +61,8 @@ impl HotkeyAction {
     }
 }
 
-#[cfg(any(windows, test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct KeyCombo {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct KeyCombo {
     key: u16,
     require_ctrl: bool,
     require_alt: bool,
@@ -307,6 +306,37 @@ fn parse_key_combo(spec: &str) -> Result<Option<KeyCombo>> {
     }))
 }
 
+pub(crate) fn validate_hotkey_binding(action: &str, combo: &str) -> Result<()> {
+    let raw_action = action.trim();
+    let Some(action) = HotkeyAction::from_config_name(raw_action) else {
+        bail!(
+            "unknown hotkey action '{raw_action}' (expected toggle_easy_mouse, lock_machine, switch_all, reconnect)"
+        );
+    };
+
+    let Some(parsed) = parse_key_combo(combo)? else {
+        return Ok(());
+    };
+
+    if matches!(action, HotkeyAction::LockMachine | HotkeyAction::Reconnect)
+        && !(parsed.require_ctrl
+            || parsed.require_alt
+            || parsed.require_shift
+            || parsed.require_win)
+    {
+        bail!(
+            "{} hotkey must include at least one modifier or be Disabled",
+            action.config_name()
+        );
+    }
+
+    Ok(())
+}
+
+pub(crate) fn canonical_hotkey_combo(combo: &str) -> Result<Option<KeyCombo>> {
+    parse_key_combo(combo)
+}
+
 #[cfg(any(windows, test))]
 fn parse_primary_key_token(token: &str) -> Result<u16> {
     let upper = token.trim().to_ascii_uppercase();
@@ -375,6 +405,19 @@ mod tests {
         assert!(parsed.require_alt);
         assert!(parsed.require_shift);
         assert!(!parsed.require_win);
+    }
+
+    #[test]
+    fn validate_hotkey_binding_rejects_unknown_or_risky_bindings() {
+        assert!(validate_hotkey_binding("not_real", "Ctrl+Alt+R").is_err());
+        assert!(validate_hotkey_binding("lock_machine", "L").is_err());
+        assert!(validate_hotkey_binding("reconnect", "R").is_err());
+        assert!(validate_hotkey_binding("lock_machine", "Disabled").is_ok());
+        assert!(validate_hotkey_binding("lock_machine", "Ctrl+Alt+L").is_ok());
+        assert_eq!(
+            canonical_hotkey_combo("Ctrl+Alt+R").expect("canonical"),
+            canonical_hotkey_combo("Alt+Ctrl+R").expect("canonical")
+        );
     }
 
     #[test]

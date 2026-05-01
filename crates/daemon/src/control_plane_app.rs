@@ -296,6 +296,17 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
     }
 
     async fn safe_reset(&self, command: SafeResetCommand) -> Result<OperationReply> {
+        let machine_id = self.state.snapshot().await.machine_id;
+        let expected = if command.all {
+            format!("safe-reset-all:{machine_id}")
+        } else if command.network_only {
+            format!("safe-reset-network:{machine_id}")
+        } else {
+            format!("safe-reset-runtime:{machine_id}")
+        };
+        if command.confirm != expected {
+            anyhow::bail!("typed confirmation required: --confirm {expected}");
+        }
         self.state
             .safe_reset(command.network_only, command.all)
             .await?;
@@ -625,8 +636,10 @@ async fn build_ui_snapshot(state: &AppState) -> Result<UiSnapshot> {
     Ok(UiSnapshot {
         generated_at: chrono::Utc::now().to_rfc3339(),
         daemon_online: true,
-        machine_id: bundle.config.machine_id,
+        machine_id: bundle.config.machine_id.clone(),
         layout_matrix: bundle.layout_matrix,
+        features: bundle.features.clone(),
+        hotkeys: bundle.config.hotkeys.clone(),
         discovered_peers,
         paired_peers,
         pending_requests,
@@ -870,6 +883,46 @@ mod tests {
             .expect("matching confirmation should rotate trust");
         assert!(reply.ok);
         assert!(reply.message.contains("restart_required=true"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn safe_reset_requires_typed_confirmation() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-control-plane-safe-reset-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+        let machine_id = state.snapshot().await.machine_id;
+        let app = DaemonControlPlaneApp::new(state);
+
+        let err = app
+            .safe_reset(SafeResetCommand {
+                network_only: true,
+                all: false,
+                confirm: "safe-reset-network:wrong-machine".to_string(),
+            })
+            .await
+            .expect_err("wrong confirmation should fail");
+        assert!(
+            err.to_string()
+                .contains(&format!("--confirm safe-reset-network:{machine_id}")),
+            "error should include exact confirmation token"
+        );
+
+        let reply = app
+            .safe_reset(SafeResetCommand {
+                network_only: true,
+                all: false,
+                confirm: format!("safe-reset-network:{machine_id}"),
+            })
+            .await
+            .expect("matching confirmation should reset network");
+        assert!(reply.ok);
 
         let _ = std::fs::remove_dir_all(&root);
     }
