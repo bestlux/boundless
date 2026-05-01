@@ -411,6 +411,7 @@ impl DashboardApp {
                     self.file_receive_dir_edit.clone(),
                     !file_transfer_config.organize_by_peer,
                     file_transfer_config.auto_accept_trusted_peers,
+                    file_transfer_config.max_file_bytes,
                 );
             }
             let mut auto_accept_trusted = file_transfer_config.auto_accept_trusted_peers;
@@ -424,8 +425,13 @@ impl DashboardApp {
                     self.file_receive_dir_edit.clone(),
                     file_transfer_config.organize_by_peer,
                     !file_transfer_config.auto_accept_trusted_peers,
+                    file_transfer_config.max_file_bytes,
                 );
             }
+            ui.label(egui::RichText::new(format!(
+                "Limit: {} MB",
+                file_transfer_config.max_file_bytes / (1024 * 1024)
+            )).weak());
             ui.horizontal(|ui| {
                 let receive_dir_changed =
                     self.file_receive_dir_edit != file_transfer_config.receive_dir;
@@ -440,6 +446,7 @@ impl DashboardApp {
                         self.file_receive_dir_edit.clone(),
                         file_transfer_config.organize_by_peer,
                         file_transfer_config.auto_accept_trusted_peers,
+                        file_transfer_config.max_file_bytes,
                     );
                 }
                 if ui

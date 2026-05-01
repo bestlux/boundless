@@ -259,8 +259,12 @@ enum FileTransferCommand {
         path: String,
         #[arg(long)]
         organize_by_peer: bool,
-        #[arg(long, default_value_t = true)]
-        auto_accept_trusted_peers: bool,
+        #[arg(long)]
+        no_organize_by_peer: bool,
+        #[arg(long)]
+        auto_accept_trusted_peers: Option<bool>,
+        #[arg(long)]
+        max_file_bytes: Option<u64>,
     },
 }
 
@@ -490,13 +494,17 @@ async fn main() -> Result<()> {
             FileTransferCommand::SetReceiveDir {
                 path,
                 organize_by_peer,
+                no_organize_by_peer,
                 auto_accept_trusted_peers,
+                max_file_bytes,
             } => {
                 file_transfer_set_receive_dir(
                     &cli.endpoint,
                     path,
                     organize_by_peer,
+                    no_organize_by_peer,
                     auto_accept_trusted_peers,
+                    max_file_bytes,
                 )
                 .await
             }

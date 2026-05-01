@@ -104,7 +104,8 @@ pub(super) fn sample_first_run_snapshot() -> UiSnapshot {
         file_transfer_config: UiFileTransferConfig {
             receive_dir: r"C:\Users\Test\Downloads\Boundless".to_string(),
             organize_by_peer: false,
-            auto_accept_trusted_peers: true,
+            auto_accept_trusted_peers: false,
+            max_file_bytes: 100 * 1024 * 1024,
         },
     }
 }

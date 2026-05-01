@@ -239,6 +239,7 @@ impl DashboardTaskRunner {
         receive_dir: String,
         organize_by_peer: bool,
         auto_accept_trusted_peers: bool,
+        max_file_bytes: u64,
     ) {
         Self::spawn(move || {
             match set_file_transfer_config_blocking(
@@ -246,6 +247,7 @@ impl DashboardTaskRunner {
                 receive_dir,
                 organize_by_peer,
                 auto_accept_trusted_peers,
+                max_file_bytes,
             ) {
                 Ok(msg) => {
                     let _ = tx.send(AppMsg::ActionComplete(msg));

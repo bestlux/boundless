@@ -312,6 +312,7 @@ impl ControlPlaneService for ControlPlaneApi {
                 receive_dir: request.receive_dir,
                 organize_by_peer: request.organize_by_peer,
                 auto_accept_trusted_peers: request.auto_accept_trusted_peers,
+                max_file_bytes: request.max_file_bytes,
             })
             .await
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -972,6 +973,7 @@ fn map_file_transfer_config(snapshot: FileTransferConfigSnapshot) -> FileTransfe
         receive_dir: snapshot.receive_dir,
         organize_by_peer: snapshot.organize_by_peer,
         auto_accept_trusted_peers: snapshot.auto_accept_trusted_peers,
+        max_file_bytes: snapshot.max_file_bytes,
     }
 }
 

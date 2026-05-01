@@ -175,18 +175,28 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         &self,
         command: SetFileTransferConfigCommand,
     ) -> Result<OperationReply> {
+        let current = self.state.file_transfer_config().await;
+        let max_file_bytes = if command.max_file_bytes == 0 {
+            current.max_file_bytes
+        } else {
+            command.max_file_bytes
+        };
         self.state
             .update_file_transfer_config(FileTransferConfig {
                 receive_dir: command.receive_dir.clone(),
                 organize_by_peer: command.organize_by_peer,
                 auto_accept_trusted_peers: command.auto_accept_trusted_peers,
+                max_file_bytes,
             })
             .await?;
         Ok(OperationReply {
             ok: true,
             message: format!(
-                "file_transfer receive_dir={} organize_by_peer={} auto_accept_trusted_peers={}",
-                command.receive_dir, command.organize_by_peer, command.auto_accept_trusted_peers
+                "file_transfer receive_dir={} organize_by_peer={} auto_accept_trusted_peers={} max_file_bytes={}",
+                command.receive_dir,
+                command.organize_by_peer,
+                command.auto_accept_trusted_peers,
+                max_file_bytes
             ),
         })
     }
@@ -698,6 +708,7 @@ fn build_file_transfer_config_snapshot(
         receive_dir: config.receive_dir,
         organize_by_peer: config.organize_by_peer,
         auto_accept_trusted_peers: config.auto_accept_trusted_peers,
+        max_file_bytes: config.max_file_bytes,
     }
 }
 

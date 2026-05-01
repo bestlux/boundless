@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use core_clipboard::{ClipboardPayload, ClipboardPolicy, payload_hash_hex};
+use core_protocol::WireMessage;
 use tokio::io::AsyncWrite;
 use tracing::{info, warn};
 
@@ -14,8 +15,7 @@ use peer_transport::{
 
 use super::codec::now_millis;
 use super::inbound_payload::enqueue_clipboard_image_payload;
-use super::outbound::send_file_chunk_credit;
-use super::validate_transfer_size;
+use super::outbound::{send_file_chunk_credit, send_message};
 
 #[expect(
     clippy::too_many_arguments,
@@ -58,6 +58,8 @@ where
             0,
         )
         .await;
+        send_file_transfer_rejected(writer, frame_buffer, &transfer_id, "too_many_transfers")
+            .await?;
         return Ok(());
     }
 
@@ -69,10 +71,28 @@ where
             0,
         )
         .await;
+        send_file_transfer_rejected(writer, frame_buffer, &transfer_id, "duplicate_transfer_id")
+            .await?;
         return Ok(());
     }
 
-    if let Err(error) = validate_transfer_size(total_bytes) {
+    if !state.file_transfer_auto_accept_trusted_peers().await {
+        record_transport_transfer_rejected(
+            state,
+            authenticated_peer_id,
+            format!("reason=receive_policy_denied transfer_id={transfer_id}"),
+            total_bytes,
+        )
+        .await;
+        send_file_transfer_rejected(writer, frame_buffer, &transfer_id, "receive_policy_denied")
+            .await?;
+        return Ok(());
+    }
+
+    if let Err(error) = core_transfer::validate_transfer_size_with_limit(
+        total_bytes,
+        state.file_transfer_max_bytes().await,
+    ) {
         record_transport_transfer_rejected(
             state,
             authenticated_peer_id,
@@ -80,14 +100,15 @@ where
             total_bytes,
         )
         .await;
+        send_file_transfer_rejected(writer, frame_buffer, &transfer_id, "invalid_total_size")
+            .await?;
         return Ok(());
     }
 
     let temp_path = std::env::temp_dir().join(format!(
-        "boundless-inbound-{}-{}-{}.part",
-        authenticated_peer_id,
+        "boundless-inbound-{}-{}.part",
         now_millis(),
-        transfer_id
+        uuid::Uuid::new_v4()
     ));
     let temp_file = match tokio::fs::File::create(&temp_path).await {
         Ok(file) => file,
@@ -99,6 +120,8 @@ where
                 total_bytes,
             )
             .await;
+            send_file_transfer_rejected(writer, frame_buffer, &transfer_id, "temp_create_failed")
+                .await?;
             return Ok(());
         }
     };
@@ -122,6 +145,16 @@ where
             total_bytes,
             "started inbound file transfer"
         );
+        state.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "incoming".to_string(),
+            kind: "file_transfer_started".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!(
+                "transfer_id={transfer_id} file_name={file_name} total_bytes={total_bytes}"
+            ),
+            size_bytes: total_bytes,
+        });
         send_file_chunk_credit(
             writer,
             &transfer_id,
@@ -253,7 +286,10 @@ where
     let chunk = data;
 
     let next_size = transfer.bytes_received.saturating_add(chunk.len() as u64);
-    if let Err(error) = validate_transfer_size(next_size) {
+    if let Err(error) = core_transfer::validate_transfer_size_with_limit(
+        next_size,
+        state.file_transfer_max_bytes().await,
+    ) {
         record_transport_transfer_rejected(
             state,
             &transfer.peer_id,
@@ -299,7 +335,19 @@ where
     }
 
     transfer.bytes_received = next_size;
+    let peer_id = transfer.peer_id.clone();
+    let total_bytes = transfer.total_bytes;
     inbound_transfers.insert(transfer_id.clone(), transfer);
+    state.record_transport_event(TransportEventRecord {
+        timestamp: Utc::now(),
+        direction: "incoming".to_string(),
+        kind: "file_transfer_progress".to_string(),
+        peer_id,
+        detail: format!(
+            "transfer_id={transfer_id} bytes_received={next_size} total_bytes={total_bytes}"
+        ),
+        size_bytes: next_size,
+    });
     send_file_chunk_credit(writer, &transfer_id, 1, frame_buffer).await?;
     tokio::io::AsyncWriteExt::flush(writer)
         .await
@@ -419,6 +467,14 @@ pub(super) async fn handle_file_end(
                 path = %path.display(),
                 "stored inbound file payload"
             );
+            state.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: "incoming".to_string(),
+                kind: "file_transfer_completed".to_string(),
+                peer_id: transfer.peer_id.clone(),
+                detail: format!("transfer_id={transfer_id} file_name={}", transfer.file_name),
+                size_bytes: transfer.bytes_received,
+            });
         }
         Err(error) => {
             warn!(
@@ -507,6 +563,29 @@ pub(super) async fn discard_inbound_transfer(transfer: InboundTransfer) {
     } = transfer;
     drop(temp_file);
     let _ = tokio::fs::remove_file(temp_path).await;
+}
+
+async fn send_file_transfer_rejected<W>(
+    writer: &mut W,
+    frame_buffer: &mut Vec<u8>,
+    transfer_id: &str,
+    reason: &str,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    send_message(
+        writer,
+        &WireMessage::FileTransferRejected {
+            transfer_id: transfer_id.to_string(),
+            reason: reason.to_string(),
+        },
+        frame_buffer,
+    )
+    .await?;
+    tokio::io::AsyncWriteExt::flush(writer)
+        .await
+        .context("flush inbound file transfer rejection")
 }
 
 pub(super) async fn discard_inbound_clipboard_image_transfer(

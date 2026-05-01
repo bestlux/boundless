@@ -43,6 +43,7 @@ pub struct SetFileTransferConfigCommand {
     pub receive_dir: String,
     pub organize_by_peer: bool,
     pub auto_accept_trusted_peers: bool,
+    pub max_file_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

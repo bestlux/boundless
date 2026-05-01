@@ -106,6 +106,7 @@ mod windows_app {
         receive_dir: String,
         organize_by_peer: bool,
         auto_accept_trusted_peers: bool,
+        max_file_bytes: u64,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -286,6 +287,7 @@ mod windows_app {
                             receive_dir: config.receive_dir,
                             organize_by_peer: config.organize_by_peer,
                             auto_accept_trusted_peers: config.auto_accept_trusted_peers,
+                            max_file_bytes: config.max_file_bytes,
                         })
                         .unwrap_or_default(),
                 })?;
@@ -365,12 +367,14 @@ mod windows_app {
         receive_dir: String,
         organize_by_peer: bool,
         auto_accept_trusted_peers: bool,
+        max_file_bytes: u64,
     ) -> Result<String> {
         block_on_result(set_file_transfer_config(
             endpoint,
             receive_dir,
             organize_by_peer,
             auto_accept_trusted_peers,
+            max_file_bytes,
         ))
     }
 
@@ -439,6 +443,7 @@ mod windows_app {
         receive_dir: String,
         organize_by_peer: bool,
         auto_accept_trusted_peers: bool,
+        max_file_bytes: u64,
     ) -> Result<String> {
         let mut client = connect_control_plane(endpoint).await?;
         let response = client
@@ -446,6 +451,7 @@ mod windows_app {
                 receive_dir,
                 organize_by_peer,
                 auto_accept_trusted_peers,
+                max_file_bytes,
             })
             .await?
             .into_inner();

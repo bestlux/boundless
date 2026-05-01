@@ -34,12 +34,27 @@ impl AppState {
         self.config.read().await.file_transfer.clone()
     }
 
+    pub async fn file_transfer_max_bytes(&self) -> u64 {
+        self.config.read().await.file_transfer.max_file_bytes
+    }
+
+    pub async fn file_transfer_auto_accept_trusted_peers(&self) -> bool {
+        self.config
+            .read()
+            .await
+            .file_transfer
+            .auto_accept_trusted_peers
+    }
+
     pub async fn update_file_transfer_config(
         &self,
         file_transfer: FileTransferConfig,
     ) -> Result<()> {
         if file_transfer.receive_dir.trim().is_empty() {
             anyhow::bail!("file transfer receive directory must not be empty");
+        }
+        if file_transfer.max_file_bytes == 0 {
+            anyhow::bail!("file transfer max_file_bytes must be greater than zero");
         }
 
         let receive_dir = PathBuf::from(&file_transfer.receive_dir);

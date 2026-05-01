@@ -60,6 +60,43 @@ async fn store_incoming_file_uses_configured_receive_dir() {
 }
 
 #[tokio::test]
+async fn store_incoming_file_uses_safe_peer_directory_name() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-incoming-file-peer-dir-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let receive_dir = root.join("received");
+
+    let mut config = RuntimeConfig::default();
+    config.file_transfer.receive_dir = receive_dir.display().to_string();
+    config.file_transfer.organize_by_peer = true;
+    save_config_at(&config_path, &config).expect("seed config");
+
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+    let final_path = state
+        .store_incoming_file(r"..\escaped-peer", "report.txt", b"payload".to_vec())
+        .await
+        .expect("store incoming file");
+
+    assert!(final_path.starts_with(&receive_dir));
+    assert_ne!(final_path.parent(), Some(receive_dir.as_path()));
+    assert!(
+        final_path
+            .parent()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("peer-"))
+    );
+    assert!(!root.join("escaped-peer").exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn update_file_transfer_config_persists_receive_dir() {
     let root = std::env::temp_dir().join(format!(
         "boundless-file-transfer-config-update-test-{}",
@@ -92,6 +129,86 @@ async fn update_file_transfer_config_persists_receive_dir() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn file_transfer_uses_configured_size_limit() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-file-transfer-configured-limit-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+    let mut config = state.file_transfer_config().await;
+    config.max_file_bytes = 2;
+    state
+        .update_file_transfer_config(config)
+        .await
+        .expect("update file transfer config");
+
+    let err = state
+        .store_incoming_file("peer-a", "too-large.txt", b"abc".to_vec())
+        .await
+        .expect_err("configured limit must reject oversized file");
+    assert!(err.to_string().contains("exceeds transfer limit"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn remove_queued_file_transfer_drops_deferred_chunks() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-file-transfer-remove-queued-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+    let (code, _) = state.create_pairing_code(120).await;
+    let peer_id = state
+        .join_peer(
+            code,
+            "127.0.0.1:15100".to_string(),
+            Some("peer".to_string()),
+        )
+        .await
+        .expect("join peer");
+    let file_path = root.join("flow.bin");
+    tokio::fs::write(
+        &file_path,
+        vec![9u8; crate::state::FILE_TRANSFER_CHUNK_BYTES + 7],
+    )
+    .await
+    .expect("write payload");
+
+    state
+        .queue_file_from_path(&peer_id, &file_path)
+        .await
+        .expect("queue file");
+    let mut queued = state.drain_outgoing_bulk(&peer_id, usize::MAX).await;
+    let transfer_id = match queued.first() {
+        Some(OutboundPayload::FileStart { transfer_id, .. }) => transfer_id.clone(),
+        other => panic!("expected first payload to be file start, got {other:?}"),
+    };
+    queued.remove(0);
+    state.requeue_outgoing_front(&peer_id, queued).await;
+
+    state
+        .remove_queued_file_transfer(&peer_id, &transfer_id)
+        .await;
+
+    assert!(
+        state
+            .drain_outgoing_bulk(&peer_id, usize::MAX)
+            .await
+            .is_empty()
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]

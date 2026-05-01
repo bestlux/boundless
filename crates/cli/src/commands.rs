@@ -1190,8 +1190,11 @@ pub(super) async fn file_transfer_config(endpoint: &str) -> Result<()> {
         .into_inner();
 
     println!(
-        "receive_dir={} organize_by_peer={} auto_accept_trusted_peers={}",
-        config.receive_dir, config.organize_by_peer, config.auto_accept_trusted_peers
+        "receive_dir={} organize_by_peer={} auto_accept_trusted_peers={} max_file_bytes={}",
+        config.receive_dir,
+        config.organize_by_peer,
+        config.auto_accept_trusted_peers,
+        config.max_file_bytes
     );
     Ok(())
 }
@@ -1200,14 +1203,32 @@ pub(super) async fn file_transfer_set_receive_dir(
     endpoint: &str,
     path: String,
     organize_by_peer: bool,
-    auto_accept_trusted_peers: bool,
+    no_organize_by_peer: bool,
+    auto_accept_trusted_peers: Option<bool>,
+    max_file_bytes: Option<u64>,
 ) -> Result<()> {
+    if organize_by_peer && no_organize_by_peer {
+        bail!("--organize-by-peer and --no-organize-by-peer cannot both be set");
+    }
+
     let mut client = connect_control_plane(endpoint).await?;
+    let current = client
+        .get_file_transfer_config(Empty {})
+        .await?
+        .into_inner();
     let response = client
         .set_file_transfer_config(FileTransferSetRequest {
             receive_dir: path,
-            organize_by_peer,
-            auto_accept_trusted_peers,
+            organize_by_peer: if organize_by_peer {
+                true
+            } else if no_organize_by_peer {
+                false
+            } else {
+                current.organize_by_peer
+            },
+            auto_accept_trusted_peers: auto_accept_trusted_peers
+                .unwrap_or(current.auto_accept_trusted_peers),
+            max_file_bytes: max_file_bytes.unwrap_or(current.max_file_bytes),
         })
         .await?
         .into_inner();
@@ -1307,15 +1328,19 @@ pub(super) async fn transport_events(endpoint: &str, limit: usize) -> Result<()>
         println!(
             "{} direction={} kind={} peer_id={} size_bytes={} detail={}",
             event.timestamp,
-            event.direction,
-            event.kind,
-            event.peer_id,
+            escape_event_field(&event.direction),
+            escape_event_field(&event.kind),
+            escape_event_field(&event.peer_id),
             event.size_bytes,
-            event.detail
+            escape_event_field(&event.detail)
         );
     }
 
     Ok(())
+}
+
+fn escape_event_field(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
 }
 
 pub(super) async fn input_owner(endpoint: &str) -> Result<()> {

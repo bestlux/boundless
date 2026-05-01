@@ -497,6 +497,21 @@ fn sanitize_incoming_file_name_rejects_paths() {
 }
 
 #[test]
+fn sanitize_incoming_file_name_rejects_windows_unsafe_names() {
+    for name in [
+        "report.txt:ads",
+        "CON",
+        "nul.txt",
+        "report.txt.",
+        " report.txt",
+        "report.txt ",
+        "report\u{0007}.txt",
+    ] {
+        sanitize_incoming_file_name(name).expect_err("must reject unsafe Windows name");
+    }
+}
+
+#[test]
 fn sanitize_incoming_file_name_accepts_plain_name() {
     let name = sanitize_incoming_file_name("report.txt").expect("must accept");
     assert_eq!(name, "report.txt");

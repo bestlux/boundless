@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use core_protocol::PROTOCOL_CURRENT;
+use core_transfer::MAX_TRANSFER_BYTES;
 
 const DEFAULT_LAYOUT_MATRIX: &str = "self";
 const RUNTIME_CONFIG_VERSION: &str = "5";
@@ -105,6 +106,8 @@ pub struct FileTransferConfig {
     pub organize_by_peer: bool,
     #[serde(default = "default_file_auto_accept_trusted_peers")]
     pub auto_accept_trusted_peers: bool,
+    #[serde(default = "default_file_max_bytes")]
+    pub max_file_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -139,6 +142,7 @@ impl Default for FileTransferConfig {
             receive_dir: default_file_receive_dir(),
             organize_by_peer: false,
             auto_accept_trusted_peers: default_file_auto_accept_trusted_peers(),
+            max_file_bytes: default_file_max_bytes(),
         }
     }
 }
@@ -240,7 +244,11 @@ fn default_pulse_interval_secs() -> u32 {
 }
 
 fn default_file_auto_accept_trusted_peers() -> bool {
-    true
+    false
+}
+
+fn default_file_max_bytes() -> u64 {
+    MAX_TRANSFER_BYTES
 }
 
 fn default_file_receive_dir() -> String {
@@ -345,6 +353,13 @@ pub fn load_or_create_config_at(path: &Path) -> Result<RuntimeConfig> {
     if config.file_transfer.receive_dir.trim().is_empty() {
         bail!(
             "invalid config: file_transfer.receive_dir must not be empty in `{}`",
+            path.display()
+        );
+    }
+
+    if config.file_transfer.max_file_bytes == 0 {
+        bail!(
+            "invalid config: file_transfer.max_file_bytes must be greater than zero in `{}`",
             path.display()
         );
     }
@@ -506,6 +521,7 @@ mod tests {
         default_recent_activity_window_secs, load_or_create_config_at, save_config_at,
     };
     use core_protocol::PROTOCOL_CURRENT;
+    use core_transfer::MAX_TRANSFER_BYTES;
 
     #[test]
     fn tcp_effective_transport_is_tcp() {
@@ -652,7 +668,8 @@ mod tests {
         assert!(config.file_transfer.receive_dir.ends_with("Boundless"));
         assert!(!config.file_transfer.receive_dir.trim().is_empty());
         assert!(!config.file_transfer.organize_by_peer);
-        assert!(config.file_transfer.auto_accept_trusted_peers);
+        assert!(!config.file_transfer.auto_accept_trusted_peers);
+        assert_eq!(config.file_transfer.max_file_bytes, MAX_TRANSFER_BYTES);
     }
 
     #[test]
@@ -693,7 +710,8 @@ mod tests {
         let config = load_or_create_config_at(&path).expect("load config with defaulted transfer");
         assert!(config.file_transfer.receive_dir.ends_with("Boundless"));
         assert!(!config.file_transfer.organize_by_peer);
-        assert!(config.file_transfer.auto_accept_trusted_peers);
+        assert!(!config.file_transfer.auto_accept_trusted_peers);
+        assert_eq!(config.file_transfer.max_file_bytes, MAX_TRANSFER_BYTES);
         assert_eq!(config.input_handoff, InputHandoffConfig::default());
 
         let _ = std::fs::remove_dir_all(root);
@@ -774,6 +792,7 @@ mod tests {
                 receive_dir: receive_dir.display().to_string(),
                 organize_by_peer: true,
                 auto_accept_trusted_peers: false,
+                max_file_bytes: 123_456,
             },
             ..RuntimeConfig::default()
         };
@@ -801,6 +820,7 @@ mod tests {
         );
         assert!(config.file_transfer.organize_by_peer);
         assert!(!config.file_transfer.auto_accept_trusted_peers);
+        assert_eq!(config.file_transfer.max_file_bytes, 123_456);
         assert_eq!(config.input_handoff, InputHandoffConfig::default());
 
         let _ = std::fs::remove_dir_all(root);
@@ -829,6 +849,35 @@ mod tests {
             error
                 .to_string()
                 .contains("input_handoff.corner_block_px must be <= 256"),
+            "unexpected error: {error:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_or_create_rejects_zero_file_transfer_limit() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-config-file-transfer-limit-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("config.json");
+        std::fs::create_dir_all(&root).expect("create temp root");
+
+        let seed = RuntimeConfig {
+            file_transfer: FileTransferConfig {
+                max_file_bytes: 0,
+                ..FileTransferConfig::default()
+            },
+            ..RuntimeConfig::default()
+        };
+        save_config_at(&path, &seed).expect("seed invalid config");
+
+        let error = load_or_create_config_at(&path).expect_err("must reject invalid max size");
+        assert!(
+            error
+                .to_string()
+                .contains("file_transfer.max_file_bytes must be greater than zero"),
             "unexpected error: {error:#}"
         );
 

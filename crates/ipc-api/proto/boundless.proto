@@ -136,12 +136,14 @@ message FileTransferConfigReply {
   string receive_dir = 1;
   bool organize_by_peer = 2;
   bool auto_accept_trusted_peers = 3;
+  uint64 max_file_bytes = 4;
 }
 
 message FileTransferSetRequest {
   string receive_dir = 1;
   bool organize_by_peer = 2;
   bool auto_accept_trusted_peers = 3;
+  uint64 max_file_bytes = 4;
 }
 
 message InputHandoffConfigReply {

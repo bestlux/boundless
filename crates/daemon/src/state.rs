@@ -31,7 +31,7 @@ use core_security::{
     ensure_device_identity, ensure_trust_store, fingerprint, generate_pairing_code,
     load_or_create_device_secret, load_trust_records, remove_trust_record, upsert_trust_record,
 };
-use core_transfer::{resolve_conflict_path, validate_transfer_size};
+use core_transfer::{resolve_conflict_path, validate_transfer_size_with_limit};
 
 use crate::config::{
     AntiIdleConfig, ApiTransport, FileTransferConfig, InputHandoffConfig, PeerConfig,
