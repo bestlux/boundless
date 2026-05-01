@@ -1,19 +1,28 @@
-# boundless
+# Boundless
 
-Boundless is a Rust-first, performance-oriented alternative to Mouse Without Borders.
+Boundless is a Windows-first, Rust-based alternative to Mouse Without Borders. V5 focuses on reliable multi-machine input sharing, explicit pairing trust, validated layouts, clipboard/file workflows, and supportable diagnostics.
 
-Boundless is currently an alpha-stage project. Windows is the primary target today; cross-platform runtime coverage is still in progress.
+Boundless is still pre-release software. Windows is the primary product target; cross-platform runtime coverage is not yet parity-grade.
 
-## Quick start
+## Start Here
 
-For local development:
+- Install and pair two machines: [V5 Quickstart](docs/user/quickstart.md)
+- Arrange up to four peers: [Four-Machine Layouts](docs/user/four-machine-layouts.md)
+- Clipboard and file behavior: [Clipboard And File Workflows](docs/user/clipboard-file-workflows.md)
+- Service mode limits and recovery: [Service Mode](docs/user/service-mode.md)
+- Troubleshoot runtime issues: [Troubleshooting](docs/user/troubleshooting.md)
+- Migrate from v4 or Mouse Without Borders: [Migration Guide](docs/user/migration.md)
+- Understand trust boundaries: [Security And Trust Model](docs/security-trust-model.md)
+- Track parity and release blockers: [Mouse Without Borders Parity](docs/parity/mouse-without-borders.md)
+
+## Developer Quick Start
 
 ```bash
 cargo fmt
 cargo test
 ```
 
-For the Windows desktop flow:
+Run the Windows desktop flow from source:
 
 ```bash
 cargo run -p boundless-daemon
@@ -24,7 +33,7 @@ cargo run -p boundless-tray
 
 - Primary target: Windows
 - First-run UX: tray dashboard + local daemon
-- Public status: alpha, APIs and runtime behavior may still change
+- Public status: pre-release, APIs and runtime behavior may still change
 - License: MIT; see [LICENSE](LICENSE)
 
 ## Community
@@ -210,12 +219,14 @@ Start-Process msiexec.exe -Wait -ArgumentList @(
 The Windows release artifact is an MSI that installs:
 - `boundlesstray.exe`
 - `boundlessd.exe`
+- `boundless-service.exe`
 - `boundlessctl.exe`
 - `Boundless.ico`
 - `Boundless-Reset.ps1`
 - `README.txt`
 - `LICENSE.txt`
 - `CHANGELOG.md`
+- `package-manifest.json`
 
 Release signing policy:
 - Windows signing is optional during the current alpha phase.
@@ -263,6 +274,8 @@ Use `--request-id` and `--code` to submit and complete pairing.
 The daemon nearby pairing listener defaults to `network_port + 100` (for example `15200` when transport network port is `15100`).
 
 Export/import trust bundles (fallback or offline workflow):
+
+Prefer guided challenge-confirmation pairing. Import trust bundles only from an authenticated out-of-band channel after verifying the peer identity and fingerprint. Never import trust bundles received from untrusted chat, email, download links, or issue comments.
 
 ```bash
 cargo run -p boundless-cli -- pair export-trust --output node-a.json

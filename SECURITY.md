@@ -2,6 +2,8 @@
 
 Boundless is alpha software. Please report suspected vulnerabilities responsibly.
 
+For the product trust boundaries, see [docs/security-trust-model.md](docs/security-trust-model.md).
+
 ## Supported versions
 
 Security fixes are best-effort and are most likely to land on:
