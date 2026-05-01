@@ -64,6 +64,7 @@
       <Component Id="BoundlessPayloadComponent" Guid="70B4D0ED-BE16-4B0A-A5F0-C1987B909E6B">
         <File Id="TrayBinaryFile" Source="$(var.PayloadDir)\boundlesstray.exe" />
         <File Id="DaemonBinaryFile" Source="$(var.PayloadDir)\boundlessd.exe" />
+        <File Id="ServiceBinaryFile" Source="$(var.PayloadDir)\boundless-service.exe" />
         <File Id="CliBinaryFile" Source="$(var.PayloadDir)\boundlessctl.exe" />
         <File Id="IconFile" Source="$(var.PayloadDir)\Boundless.ico" />
         <File Id="ResetScriptFile" Source="$(var.PayloadDir)\Boundless-Reset.ps1" />

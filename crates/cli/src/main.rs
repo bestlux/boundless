@@ -65,6 +65,10 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     Pair {
         #[command(subcommand)]
         command: PairCommand,
@@ -120,6 +124,22 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    Status,
+    Install {
+        #[arg(long)]
+        binary: Option<String>,
+        #[arg(long, default_value_t = false)]
+        auto_start: bool,
+        #[arg(long, default_value_t = false)]
+        unsafe_allow_unreviewed_control_pipe: bool,
+    },
+    Start,
+    Stop,
+    Uninstall,
 }
 
 #[derive(Debug, Subcommand)]
@@ -353,6 +373,17 @@ async fn main() -> Result<()> {
         Command::Console { start_daemon } => console_run(&cli.endpoint, start_daemon).await,
         Command::Daemon { command } => match command {
             DaemonCommand::Status => daemon_status(&cli.endpoint).await,
+        },
+        Command::Service { command } => match command {
+            ServiceCommand::Status => service_status().await,
+            ServiceCommand::Install {
+                binary,
+                auto_start,
+                unsafe_allow_unreviewed_control_pipe,
+            } => service_install(binary, auto_start, unsafe_allow_unreviewed_control_pipe).await,
+            ServiceCommand::Start => service_start().await,
+            ServiceCommand::Stop => service_stop().await,
+            ServiceCommand::Uninstall => service_uninstall().await,
         },
         Command::Pair { command } => match command {
             PairCommand::Discover => pair_discover(&cli.endpoint).await,

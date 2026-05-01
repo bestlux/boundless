@@ -5,6 +5,12 @@ use app_services::desktop::{
     resolve_boundlessd_candidates, spawn_boundlessd_process, terminate_boundlessd_processes,
     validate_layout_matrix_spec,
 };
+use std::path::PathBuf;
+
+const BOUNDLESS_SERVICE_NAME: &str = "BoundlessService";
+const BOUNDLESS_SERVICE_DISPLAY_NAME: &str = "Boundless Service";
+#[cfg(windows)]
+const USER_WRITABLE_SERVICE_SOURCE_DIRS: [&str; 3] = ["LOCALAPPDATA", "APPDATA", "TEMP"];
 
 pub(super) async fn ensure_daemon_available(endpoint: &str, start_daemon: bool) -> Result<()> {
     let initial_error = match channel(endpoint).await {
@@ -66,6 +72,15 @@ async fn wait_for_daemon_ready(endpoint: &str, context: &str) -> Result<()> {
 fn spawn_daemon_process() -> Result<String> {
     let candidates = resolve_boundlessd_candidates(std::env::current_exe().ok());
     spawn_boundlessd_process(&candidates)
+}
+
+#[cfg(windows)]
+fn resolve_boundless_service_binary() -> Result<PathBuf> {
+    let current_exe = std::env::current_exe().context("resolve current executable")?;
+    let Some(parent) = current_exe.parent() else {
+        bail!("current executable has no parent directory");
+    };
+    Ok(parent.join("boundless-service.exe"))
 }
 
 pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
@@ -768,6 +783,218 @@ pub(super) async fn layout_set(endpoint: &str, matrix: String) -> Result<()> {
 
     println!("ok={} message={}", response.ok, response.message);
     Ok(())
+}
+
+#[cfg(windows)]
+pub(super) async fn service_status() -> Result<()> {
+    use windows_service::{
+        service::ServiceAccess,
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    match manager.open_service(BOUNDLESS_SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        Ok(service) => {
+            let status = service.query_status()?;
+            println!(
+                "installed=true service={} state={:?} process_id={}",
+                BOUNDLESS_SERVICE_NAME,
+                status.current_state,
+                status.process_id.unwrap_or_default()
+            );
+        }
+        Err(error) => {
+            println!(
+                "installed=false service={} state=not_installed error={}",
+                BOUNDLESS_SERVICE_NAME, error
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(super) async fn service_status() -> Result<()> {
+    println!(
+        "installed=false service={BOUNDLESS_SERVICE_NAME} state=unsupported platform=non-windows"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(super) async fn service_install(
+    binary: Option<String>,
+    auto_start: bool,
+    unsafe_allow_unreviewed_control_pipe: bool,
+) -> Result<()> {
+    use std::ffi::OsString;
+    use windows_service::{
+        service::{ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType},
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let service_binary_path = binary
+        .map(PathBuf::from)
+        .unwrap_or(resolve_boundless_service_binary()?);
+    if !service_binary_path.is_file() {
+        bail!(
+            "service binary was not found: {}",
+            service_binary_path.display()
+        );
+    }
+    reject_user_writable_service_source(&service_binary_path)?;
+    if !unsafe_allow_unreviewed_control_pipe {
+        bail!(
+            "service install is blocked until Boundless implements an explicit service named-pipe ACL; rerun with --unsafe-allow-unreviewed-control-pipe only for local development on a trusted machine"
+        );
+    }
+
+    let manager = ServiceManager::local_computer(
+        None::<&str>,
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    )?;
+    let service_info = ServiceInfo {
+        name: OsString::from(BOUNDLESS_SERVICE_NAME),
+        display_name: OsString::from(BOUNDLESS_SERVICE_DISPLAY_NAME),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: if auto_start {
+            ServiceStartType::AutoStart
+        } else {
+            ServiceStartType::OnDemand
+        },
+        error_control: ServiceErrorControl::Normal,
+        executable_path: service_binary_path.clone(),
+        launch_arguments: vec![],
+        dependencies: vec![],
+        account_name: None,
+        account_password: None,
+    };
+    let service = manager.create_service(
+        &service_info,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::START | ServiceAccess::CHANGE_CONFIG,
+    )?;
+    service.set_description("Boundless service-mode daemon host")?;
+    println!(
+        "installed=true service={} binary={} start_type={}",
+        BOUNDLESS_SERVICE_NAME,
+        service_binary_path.display(),
+        if auto_start { "auto" } else { "demand" }
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(super) async fn service_install(
+    _binary: Option<String>,
+    _auto_start: bool,
+    _unsafe_allow_unreviewed_control_pipe: bool,
+) -> Result<()> {
+    bail!("service install is only supported on Windows")
+}
+
+#[cfg(windows)]
+fn reject_user_writable_service_source(path: &std::path::Path) -> Result<()> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize service binary {}", path.display()))?;
+    for var in USER_WRITABLE_SERVICE_SOURCE_DIRS {
+        let Ok(root) = std::env::var(var) else {
+            continue;
+        };
+        if root.trim().is_empty() {
+            continue;
+        }
+        let root = PathBuf::from(root);
+        let Ok(root) = root.canonicalize() else {
+            continue;
+        };
+        if canonical.starts_with(&root) {
+            bail!(
+                "refusing to install LocalSystem service from user-writable path `{}`; copy boundless-service.exe to an admin-protected directory such as %ProgramFiles%\\Boundless and rerun with --binary",
+                canonical.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(super) async fn service_start() -> Result<()> {
+    use windows_service::{
+        service::ServiceAccess,
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(
+        BOUNDLESS_SERVICE_NAME,
+        ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+    )?;
+    service.start::<&str>(&[])?;
+    let status = service.query_status()?;
+    println!(
+        "start_requested=true service={} state={:?}",
+        BOUNDLESS_SERVICE_NAME, status.current_state
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(super) async fn service_start() -> Result<()> {
+    bail!("service start is only supported on Windows")
+}
+
+#[cfg(windows)]
+pub(super) async fn service_stop() -> Result<()> {
+    use windows_service::{
+        service::ServiceAccess,
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(
+        BOUNDLESS_SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+    )?;
+    let status = service.stop()?;
+    println!(
+        "stop_requested=true service={} state={:?}",
+        BOUNDLESS_SERVICE_NAME, status.current_state
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(super) async fn service_stop() -> Result<()> {
+    bail!("service stop is only supported on Windows")
+}
+
+#[cfg(windows)]
+pub(super) async fn service_uninstall() -> Result<()> {
+    use windows_service::{
+        service::{ServiceAccess, ServiceState},
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(
+        BOUNDLESS_SERVICE_NAME,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+    )?;
+    if service.query_status()?.current_state != ServiceState::Stopped {
+        let _ = service.stop();
+    }
+    service.delete()?;
+    println!(
+        "uninstall_requested=true service={} state=delete_pending",
+        BOUNDLESS_SERVICE_NAME
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(super) async fn service_uninstall() -> Result<()> {
+    bail!("service uninstall is only supported on Windows")
 }
 
 pub(super) async fn layout_preview(endpoint: &str) -> Result<()> {

@@ -10,6 +10,7 @@
   "executables": {
     "tray": "boundlesstray.exe",
     "daemon": "boundlessd.exe",
+    "service": "boundless-service.exe",
     "cli": "boundlessctl.exe"
   },
   "scripts": {
