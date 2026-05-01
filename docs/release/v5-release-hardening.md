@@ -32,6 +32,7 @@ This document records the release-hardening contract for the Boundless v5 Window
 The v5 readiness packet must include:
 
 - `scripts/release/assert-release-consistency.ps1` output,
+- `scripts/dev/v5-readiness.ps1` JSON and Markdown summaries,
 - Windows release workflow artifact names,
 - installer smoke summary JSON path,
 - signing status for each `.exe` and `.msi`,
