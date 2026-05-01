@@ -14,10 +14,10 @@ fn main() -> anyhow::Result<()> {
 mod windows_app {
     use anyhow::{Context, Result, bail};
     use app_services::desktop::{
-        CANONICAL_LOCAL_LAYOUT_TOKEN, host_and_pairing_port_from_endpoint,
+        CANONICAL_LOCAL_LAYOUT_TOKEN, LayoutPeerToken, host_and_pairing_port_from_endpoint,
         is_local_layout_token as shared_is_local_layout_token, parse_pairing_port,
         resolve_boundlessd_candidates, serialize_layout_matrix, spawn_boundlessd_process,
-        terminate_boundlessd_processes, validate_layout_before_apply,
+        terminate_boundlessd_processes, validate_layout_matrix_spec,
     };
     use clap::Parser;
     use control_plane_client::{
@@ -954,19 +954,22 @@ mod windows_app {
             let mut grid = std::collections::HashMap::<(i32, i32), String>::new();
             grid.insert((0, 0), "peer-a".to_string());
             assert!(
-                validate_layout_before_apply(&grid, "local-machine-id").is_err(),
+                app_services::desktop::validate_layout_before_apply(&grid, "local-machine-id")
+                    .is_err(),
                 "layout with zero local cells must fail apply validation"
             );
 
             grid.insert((1, 0), "local-machine-id".to_string());
             assert!(
-                validate_layout_before_apply(&grid, "local-machine-id").is_ok(),
+                app_services::desktop::validate_layout_before_apply(&grid, "local-machine-id")
+                    .is_ok(),
                 "layout with one local cell should pass apply validation"
             );
 
             grid.insert((2, 0), "LOCAL-MACHINE-ID".to_string());
             assert!(
-                validate_layout_before_apply(&grid, "local-machine-id").is_err(),
+                app_services::desktop::validate_layout_before_apply(&grid, "local-machine-id")
+                    .is_err(),
                 "layout with multiple local cells must fail apply validation"
             );
         }

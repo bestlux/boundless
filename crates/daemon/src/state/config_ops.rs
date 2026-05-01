@@ -1,4 +1,5 @@
 use super::*;
+use app_services::desktop::{LayoutPeerToken, canonicalize_layout_matrix_spec};
 
 impl AppState {
     pub async fn update_bind(&self, bind: String) -> Result<()> {
@@ -113,7 +114,21 @@ impl AppState {
 
     pub async fn set_layout(&self, matrix: String) -> Result<()> {
         let mut config = self.config.write().await;
-        config.layout_matrix = matrix;
+        let peers = config
+            .peers
+            .iter()
+            .map(|peer| LayoutPeerToken {
+                peer_id: peer.peer_id.clone(),
+                display_name: peer.display_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let canonical_matrix = canonicalize_layout_matrix_spec(
+            &matrix,
+            &config.machine_id,
+            Some(config.device_name.as_str()),
+            &peers,
+        )?;
+        config.layout_matrix = canonical_matrix;
         save_config_at(&self.config_path, &config)?;
         drop(config);
         self.invalidate_cached_layout_matrix().await;

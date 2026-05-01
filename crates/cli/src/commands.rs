@@ -1,8 +1,9 @@
 use super::*;
 use app_services::desktop::{
-    build_orientation_matrix, host_and_pairing_port_from_endpoint,
+    LayoutPeerToken, build_orientation_matrix, host_and_pairing_port_from_endpoint,
     is_local_layout_token as is_local_layout_token_shared, parse_layout_matrix,
     resolve_boundlessd_candidates, spawn_boundlessd_process, terminate_boundlessd_processes,
+    validate_layout_matrix_spec,
 };
 
 pub(super) async fn ensure_daemon_available(endpoint: &str, start_daemon: bool) -> Result<()> {
@@ -756,6 +757,7 @@ pub(super) async fn layout_show(endpoint: &str) -> Result<()> {
 }
 
 pub(super) async fn layout_set(endpoint: &str, matrix: String) -> Result<()> {
+    validate_layout_for_endpoint(endpoint, &matrix).await?;
     let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .layout_set(LayoutSetRequest {
@@ -1478,6 +1480,25 @@ async fn fetch_local_layout_tokens(endpoint: &str) -> Result<LocalLayoutTokens> 
         machine_id: status.machine_id,
         display_name: snapshot.local_display_name,
     })
+}
+
+async fn validate_layout_for_endpoint(endpoint: &str, matrix: &str) -> Result<()> {
+    let peers = list_peer_records(endpoint).await?;
+    let local_tokens = fetch_local_layout_tokens(endpoint).await?;
+    let peer_tokens = peers
+        .iter()
+        .map(|peer| LayoutPeerToken {
+            peer_id: peer.peer_id.clone(),
+            display_name: peer.display_name.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    validate_layout_matrix_spec(
+        matrix,
+        &local_tokens.machine_id,
+        Some(local_tokens.display_name.as_str()),
+        &peer_tokens,
+    )
 }
 
 async fn fetch_ui_snapshot(endpoint: &str) -> Result<UiSnapshotReply> {
