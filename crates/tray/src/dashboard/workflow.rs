@@ -859,7 +859,7 @@ impl DashboardApp {
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(
-                    "Service mode actions remain guarded until Windows IPC ACL validation is complete.",
+                    "Service mode actions are admin-owned and available through boundlessctl.",
                 )
                 .weak()
                 .size(12.0),

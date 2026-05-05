@@ -47,6 +47,6 @@ Migration steps:
 
 ## Capability Differences
 
-Boundless v5 aims to exceed Mouse Without Borders in trust visibility, layout validation, diagnostics, and explicit receive policy.
+Boundless v5 aims to exceed Mouse Without Borders in trust visibility, layout validation, diagnostics, explicit receive policy, and auditable service lifecycle controls.
 
 Still-deferred or preview areas are tracked in [Mouse Without Borders Parity](../parity/mouse-without-borders.md). Do not treat service lock-screen/elevated-app behavior, silent firewall mutation, or public drag/drop transfer as release-grade until the parity matrix and readiness packet say they are validated.

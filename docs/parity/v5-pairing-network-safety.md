@@ -14,7 +14,7 @@ Boundless v5 should be safer than shared-key pairing without pretending DNS, loc
 
 `boundlessctl pair rotate-trust --confirm rotate-trust:<machine-id>` is the CLI trust-rotation path. It requires typed confirmation, clears peer config, clears peer trust, rebuilds the trust store with only the rotated local self-trust record, regenerates local device trust material on disk, aborts registered transport sessions, clears runtime transport/pairing/discovery/input state, and reports `restart_required=true` because the current daemon process still holds the pre-rotation TLS identity in memory. Until restart, trust export is blocked so peers cannot receive a stale in-memory trust bundle.
 
-The typed confirmation is an operator accident-prevention guard, not an authorization boundary. Any caller that can reach the local control plane can read the machine ID from status, so V5 still needs current-user named-pipe ACL and localhost fallback validation before treating destructive local operations as protected from other local users.
+The typed confirmation is an operator accident-prevention guard, not an authorization boundary. Any caller that can reach the local control plane can read the machine ID from status. V5 now creates current-user and service named pipes with explicit ACLs, but still needs unauthorized-user denial evidence and localhost fallback warning validation before treating destructive local operations as protected from other local users.
 
 While restart is pending after trust rotation, Boundless rejects trust export, trust import, manual join, and nearby pairing mutations so the running daemon cannot mix a rotated on-disk trust epoch with its stale in-memory TLS identity.
 
@@ -31,7 +31,7 @@ The following remain release-blocking V5 work:
 - reverse-DNS warning behavior that does not imply DNS is a trust boundary,
 - firewall rule check/install/remove diagnostics,
 - protocol mismatch UX beyond transport rejection,
-- local control-plane ACL validation for current-user named pipes and service mode.
+- unauthorized-user local control-plane denial evidence and localhost fallback warning validation.
 
 Until those land, the parity matrix must keep `Validate remote machine IP`, `Same subnet only`, `Add firewall rule`, and `Local control endpoint security` below `validated`.
 

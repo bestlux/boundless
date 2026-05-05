@@ -10,7 +10,7 @@ fn main() {
 
 #[cfg(windows)]
 mod service_entry {
-    use std::{ffi::OsString, io, time::Duration};
+    use std::{env, ffi::OsString, io, time::Duration};
 
     use anyhow::{Context, Result};
     use tokio::sync::watch;
@@ -30,7 +30,7 @@ mod service_entry {
         host::{HostOverrides, run_with},
         logging, shared_control_plane_app,
     };
-    use platform_windows::runtime::named_pipe_incoming;
+    use platform_windows::runtime::named_pipe_incoming_for_allowed_user;
 
     const SERVICE_NAME: &str = "BoundlessService";
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
@@ -41,13 +41,13 @@ mod service_entry {
         service_dispatcher::start(SERVICE_NAME, ffi_service_main)
     }
 
-    fn service_main(_arguments: Vec<OsString>) {
-        if let Err(error) = run_service() {
+    fn service_main(arguments: Vec<OsString>) {
+        if let Err(error) = run_service(startup_arguments(arguments)) {
             tracing::error!(%error, "boundless service failed");
         }
     }
 
-    fn run_service() -> windows_service::Result<()> {
+    fn run_service(arguments: Vec<OsString>) -> windows_service::Result<()> {
         let _logging = logging::init_logging().ok();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -64,11 +64,22 @@ mod service_entry {
 
         let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
         status_handle.set_service_status(service_status(ServiceState::StartPending))?;
+        let allowed_user_sid = match parse_allowed_user_sid(arguments) {
+            Ok(sid) => sid,
+            Err(error) => {
+                let _ = status_handle
+                    .set_service_status(service_status_with_exit(ServiceState::Stopped, 1));
+                return Err(windows_service::Error::Winapi(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    error.to_string(),
+                )));
+            }
+        };
 
         let runtime = tokio::runtime::Runtime::new().map_err(windows_service::Error::Winapi)?;
         let result = runtime.block_on(async move {
             status_handle.set_service_status(service_status(ServiceState::Running))?;
-            let result = run_daemon(shutdown_rx).await;
+            let result = run_daemon(shutdown_rx, allowed_user_sid).await;
             status_handle.set_service_status(service_status(ServiceState::StopPending))?;
             result
         });
@@ -88,7 +99,10 @@ mod service_entry {
         Ok(())
     }
 
-    async fn run_daemon(mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
+    async fn run_daemon(
+        mut shutdown_rx: watch::Receiver<bool>,
+        allowed_user_sid: String,
+    ) -> Result<()> {
         run_with(
             HostOverrides {
                 bind: None,
@@ -102,10 +116,13 @@ mod service_entry {
                 )
                 .into_server();
 
-                let incoming =
-                    named_pipe_incoming(&runtime.snapshot.api_pipe_name).with_context(|| {
-                        format!("initialize named pipe {}", runtime.snapshot.api_pipe_name)
-                    })?;
+                let incoming = named_pipe_incoming_for_allowed_user(
+                    &runtime.snapshot.api_pipe_name,
+                    &allowed_user_sid,
+                )
+                .with_context(|| {
+                    format!("initialize named pipe {}", runtime.snapshot.api_pipe_name)
+                })?;
 
                 Server::builder()
                     .add_service(control_plane)
@@ -123,6 +140,36 @@ mod service_entry {
             },
         )
         .await
+    }
+
+    fn startup_arguments(service_arguments: Vec<OsString>) -> Vec<OsString> {
+        service_arguments
+            .into_iter()
+            .chain(env::args_os().skip(1))
+            .collect()
+    }
+
+    fn parse_allowed_user_sid(arguments: Vec<OsString>) -> Result<String> {
+        for argument in arguments {
+            let Some(value) = argument.to_str() else {
+                continue;
+            };
+            if let Some(sid) = value.strip_prefix("--allowed-user-sid=") {
+                let sid = sid.trim();
+                if sid.starts_with("S-1-")
+                    && !sid.contains(';')
+                    && !sid.contains(')')
+                    && !sid.contains('(')
+                {
+                    return Ok(sid.to_string());
+                }
+                anyhow::bail!("service allowed user SID argument was invalid");
+            }
+        }
+
+        anyhow::bail!(
+            "service missing --allowed-user-sid argument; reinstall the service with current boundlessctl"
+        )
     }
 
     fn service_status(current_state: ServiceState) -> ServiceStatus {
@@ -151,6 +198,35 @@ mod service_entry {
             checkpoint: 0,
             wait_hint: Duration::from_secs(10),
             process_id: None,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parse_allowed_user_sid_accepts_expected_argument() {
+            let sid = parse_allowed_user_sid(vec![
+                OsString::from("ignored"),
+                OsString::from("--allowed-user-sid=S-1-5-21-1-2-3-1001"),
+            ])
+            .expect("sid");
+
+            assert_eq!(sid, "S-1-5-21-1-2-3-1001");
+        }
+
+        #[test]
+        fn parse_allowed_user_sid_rejects_sddl_injection() {
+            let err = parse_allowed_user_sid(vec![OsString::from(
+                "--allowed-user-sid=S-1-5-21-1);(A;;GA;;;WD",
+            )])
+            .expect_err("must reject");
+
+            assert!(
+                err.to_string()
+                    .contains("service allowed user SID argument was invalid")
+            );
         }
     }
 }

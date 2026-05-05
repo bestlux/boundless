@@ -137,8 +137,6 @@ enum ServiceCommand {
         binary: Option<String>,
         #[arg(long, default_value_t = false)]
         auto_start: bool,
-        #[arg(long, default_value_t = false)]
-        unsafe_allow_unreviewed_control_pipe: bool,
     },
     Start,
     Stop,
@@ -401,11 +399,9 @@ async fn main() -> Result<()> {
         },
         Command::Service { command } => match command {
             ServiceCommand::Status => service_status().await,
-            ServiceCommand::Install {
-                binary,
-                auto_start,
-                unsafe_allow_unreviewed_control_pipe,
-            } => service_install(binary, auto_start, unsafe_allow_unreviewed_control_pipe).await,
+            ServiceCommand::Install { binary, auto_start } => {
+                service_install(binary, auto_start).await
+            }
             ServiceCommand::Start => service_start().await,
             ServiceCommand::Stop => service_stop().await,
             ServiceCommand::Uninstall => service_uninstall().await,

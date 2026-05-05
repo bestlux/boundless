@@ -19,10 +19,11 @@ This document records the release-hardening contract for the Boundless v5 Window
   - stable releases require signing only when `WINDOWS_SIGN_REQUIRED=true`,
   - unsigned artifacts are explicit when signing variables are not configured,
   - signing scripts never silently convert missing signing credentials into success when policy requires signing.
+- Service mode has an elevated runtime smoke harness at `scripts/dev/service-smoke.ps1`, and `scripts/dev/v5-readiness.ps1 -IncludeServiceSmoke` runs it as a release gate.
 
 ## Honest Limits
 
-- MSI service-mode installation is not enabled by default; service commands remain CLI/admin-owned until IPC ACL and service privilege-boundary validation are complete.
+- MSI service-mode installation is not enabled by default; service commands remain CLI/admin-owned and require an admin-protected service binary path.
 - Upgrade from the last supported v4 build requires a previous MSI path passed to `installer-smoke.ps1 -PreviousInstallerPath`.
 - Lock-screen and elevated-app service behavior still require Windows runtime evidence before V5 can mark those claims validated.
 - Signing validation depends on release environment variables and Windows SDK `signtool.exe` availability.
@@ -37,4 +38,4 @@ The v5 readiness packet must include:
 - installer smoke summary JSON path,
 - signing status for each `.exe` and `.msi`,
 - previous installer version used for upgrade validation or explicit skip rationale,
-- service-mode validation status or deferral rationale.
+- service-mode smoke summary JSON path or deferral rationale.

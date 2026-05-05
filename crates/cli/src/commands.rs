@@ -832,11 +832,8 @@ pub(super) async fn service_status() -> Result<()> {
 }
 
 #[cfg(windows)]
-pub(super) async fn service_install(
-    binary: Option<String>,
-    auto_start: bool,
-    unsafe_allow_unreviewed_control_pipe: bool,
-) -> Result<()> {
+pub(super) async fn service_install(binary: Option<String>, auto_start: bool) -> Result<()> {
+    use platform_windows::runtime::current_user_sid_string;
     use std::ffi::OsString;
     use windows_service::{
         service::{ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType},
@@ -853,11 +850,8 @@ pub(super) async fn service_install(
         );
     }
     reject_user_writable_service_source(&service_binary_path)?;
-    if !unsafe_allow_unreviewed_control_pipe {
-        bail!(
-            "service install is blocked until Boundless implements an explicit service named-pipe ACL; rerun with --unsafe-allow-unreviewed-control-pipe only for local development on a trusted machine"
-        );
-    }
+    let allowed_user_sid = current_user_sid_string()
+        .context("resolve installing user SID for service control pipe ACL")?;
 
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -874,7 +868,9 @@ pub(super) async fn service_install(
         },
         error_control: ServiceErrorControl::Normal,
         executable_path: service_binary_path.clone(),
-        launch_arguments: vec![],
+        launch_arguments: vec![OsString::from(format!(
+            "--allowed-user-sid={allowed_user_sid}"
+        ))],
         dependencies: vec![],
         account_name: None,
         account_password: None,
@@ -885,7 +881,7 @@ pub(super) async fn service_install(
     )?;
     service.set_description("Boundless service-mode daemon host")?;
     println!(
-        "installed=true service={} binary={} start_type={}",
+        "installed=true service={} binary={} start_type={} control_pipe_acl=system,administrators,installing_user",
         BOUNDLESS_SERVICE_NAME,
         service_binary_path.display(),
         if auto_start { "auto" } else { "demand" }
@@ -894,11 +890,7 @@ pub(super) async fn service_install(
 }
 
 #[cfg(not(windows))]
-pub(super) async fn service_install(
-    _binary: Option<String>,
-    _auto_start: bool,
-    _unsafe_allow_unreviewed_control_pipe: bool,
-) -> Result<()> {
+pub(super) async fn service_install(_binary: Option<String>, _auto_start: bool) -> Result<()> {
     bail!("service install is only supported on Windows")
 }
 

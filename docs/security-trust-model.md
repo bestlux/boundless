@@ -20,11 +20,13 @@ The default Windows control endpoint is a local named pipe:
 npipe://./pipe/boundlessd-api
 ```
 
-Tray and CLI default to the same endpoint. Local same-user mutability remains in scope; do not describe the tray dashboard or diagnostics as a security boundary.
+Tray and CLI default to the same endpoint. Boundless creates Windows named pipes with an explicit DACL for `SYSTEM`, local Administrators, and the current Windows user SID. Local same-user mutability remains in scope; do not describe the tray dashboard or diagnostics as a security boundary.
 
 ## Service Mode
 
-The service binary exists, but the per-user MSI does not silently install a service. Service install remains an explicit admin action and is blocked by default until named-pipe ACL and privilege-boundary review is complete.
+The service binary exists, but the per-user MSI does not silently install a service. Service install remains an explicit admin action from an admin-protected service binary path.
+
+When installed through current `boundlessctl`, the service receives the installing user's SID and hosts the control pipe with an ACL for `SYSTEM`, local Administrators, and that installing user. The service should not be installed from `%LocalAppData%`, `%AppData%`, `%TEMP%`, Downloads, or another user-writable path.
 
 Lock-screen and elevated-app control are not release-grade claims until validated on Windows with service smoke evidence.
 
@@ -43,5 +45,5 @@ Diagnostics are support evidence, not proof that no sensitive data exists elsewh
 - Same-user local processes can often observe or interfere with desktop utilities.
 - Network discovery can be filtered, spoofed, or unavailable depending on local network policy.
 - Firewall rules are not silently managed by v5.
-- Service mode needs more privilege-boundary validation before elevated-app or lock-screen claims are complete.
+- Service mode lifecycle and control-pipe ACLs exist, but elevated-app and lock-screen behavior still need runtime validation before those claims are complete.
 - Runtime input behavior depends on Windows hook availability, focus state, display topology, DPI, and fallback mode.

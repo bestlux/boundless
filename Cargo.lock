@@ -438,6 +438,7 @@ dependencies = [
  "core-clipboard",
  "core-discovery",
  "ipc-api",
+ "platform-windows",
  "serde",
  "serde_json",
  "tokio",

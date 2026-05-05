@@ -22,12 +22,12 @@ Boundless v5 should make the important Mouse Without Borders parity controls ava
   - the shipped hotkey actions.
 - The tray exposes safe reset and network reset actions through the shared control plane.
 - Same-subnet-only and validate-remote-IP controls are visible but disabled with explicit unsupported reasons.
-- Service-mode guidance remains visible until Windows IPC ACL validation is complete.
+- Service-mode guidance remains visible because install/start/stop/uninstall remain CLI/admin-owned.
 
 ## Honest Limitations
 
 - Disabled same-subnet and remote-IP controls are not enforcement. V5-8/V5-9 must add daemon policy and validation before those rows can be marked validated.
-- The tray shows service-mode guidance, but install/start/stop/uninstall actions remain CLI/installer owned until the service privilege boundary is validated.
+- The tray shows service-mode guidance, but install/start/stop/uninstall actions remain CLI/installer owned.
 - Cursor hiding, cursor marker, relative movement, clipboard-file, and drag/drop claims still depend on their feature-specific runtime validation.
 - The tray hotkey editor persists daemon hotkey strings; it does not capture key chords interactively yet.
 - Reset actions use a two-click tray confirmation before invoking the control plane. Future UX can replace this with typed confirmations if release testing shows the two-click guard is too weak for broader factory-reset flows.
@@ -39,5 +39,5 @@ Before V5 can mark the tray settings workstream validated, the readiness packet 
 - tray unit or interaction coverage for settings snapshot hydration,
 - IPC compatibility evidence for the new snapshot fields,
 - restart persistence evidence for every setting changed through the tray,
-- unsupported-state evidence for same-subnet, remote-IP, and service controls,
+- unsupported-state evidence for same-subnet and remote-IP controls, plus service guidance evidence,
 - and a manual Windows tray smoke showing no clipped settings text at the supported window size.

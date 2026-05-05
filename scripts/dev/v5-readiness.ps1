@@ -288,10 +288,12 @@ else {
 }
 
 if ($IncludeServiceSmoke) {
-    Add-SkippedGate -Id "service_smoke" -Category "release" -Command "future service smoke" -Reason "dedicated service smoke is not implemented" -Impact "service mode remains explicitly deferred for elevated-app and lock-screen claims"
+    Invoke-Gate -Id "service_smoke" -Category "release" -Command "scripts/dev/service-smoke.ps1" -Action {
+        & (Join-Path $repoRoot "scripts/dev/service-smoke.ps1") -OutputRoot (Join-Path $OutputRoot "service-smoke")
+    }
 }
 else {
-    Add-SkippedGate -Id "service_smoke" -Category "release" -Command "future service smoke" -Reason "IncludeServiceSmoke was not set" -Impact "service mode remains explicitly deferred for elevated-app and lock-screen claims"
+    Add-SkippedGate -Id "service_smoke" -Category "release" -Command "scripts/dev/service-smoke.ps1" -Reason "IncludeServiceSmoke was not set" -Impact "service install/start/status/stop/uninstall evidence must be supplied before service mode release signoff"
 }
 
 $failed = @($results | Where-Object { $_.status -eq "failed" })

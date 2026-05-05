@@ -69,15 +69,19 @@ Checks:
 Symptoms:
 
 - `boundlessctl service status` reports not installed,
+- `service start` succeeds but `daemon status` cannot reach `npipe://./pipe/boundlessd-api`,
 - elevated-app or lock-screen behavior is expected but not working.
 
 Checks:
 
 ```powershell
 & $BoundlessCtl service status
+& $BoundlessCtl daemon status
 ```
 
-Service mode is not silently installed by the per-user MSI. Elevated-app and lock-screen claims remain deferred until IPC ACL and service privilege-boundary validation are complete.
+Service mode is not silently installed by the per-user MSI. Install it only from an elevated shell and an admin-protected `boundless-service.exe` path. The service control pipe is ACL'd to `SYSTEM`, Administrators, and the installing user.
+
+If the service is running but the CLI cannot connect, stop the normal tray and per-user daemon first so only one process owns the named pipe. Elevated-app and lock-screen claims remain deferred until Windows runtime evidence proves them.
 
 ## Input Capture
 

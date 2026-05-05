@@ -23,4 +23,5 @@ core-clipboard = { path = "../core-clipboard" }
 core-discovery = { path = "../core-discovery" }
 
 [target.'cfg(windows)'.dependencies]
+platform-windows = { path = "../platform-windows" }
 windows-service = "0.8.0"
