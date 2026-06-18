@@ -185,9 +185,38 @@ function Test-InteractiveDesktopSession {
 }
 
 function Stop-BoundlessProcesses {
-    Get-Process -Name "boundlesstray", "boundlessd" -ErrorAction SilentlyContinue |
+    Get-Process -Name "boundlesstray", "boundlessd", "boundless-service" -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 800
+}
+
+function Assert-NoBoundlessProcesses {
+    $remaining = Get-Process -Name "boundlesstray", "boundlessd", "boundless-service" -ErrorAction SilentlyContinue
+    if ($null -ne $remaining) {
+        $names = @($remaining | ForEach-Object { "$($_.ProcessName):$($_.Id)" }) -join ", "
+        throw "Boundless processes still running after uninstall: $names"
+    }
+}
+
+function Wait-ForNoBoundlessProcesses {
+    param([int]$TimeoutSeconds = 10)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $remaining = Get-Process -Name "boundlesstray", "boundlessd", "boundless-service" -ErrorAction SilentlyContinue
+        if ($null -eq $remaining) {
+            return
+        }
+
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+
+    Assert-NoBoundlessProcesses
+}
+
+function Get-BoundlessService {
+    Get-Service -Name "BoundlessService" -ErrorAction SilentlyContinue |
+        Select-Object -First 1
 }
 
 function Wait-ForDaemonReady {
@@ -349,16 +378,21 @@ try {
 
     $installExitCode = Invoke-MsiExec -ArgumentList @("/i", $InstallerPath, "/qn", "/norestart") -LogPath $installLog
 
-    Assert-PathExists -Path (Join-Path $installRoot "boundlessd.exe") -Message "Installed daemon binary is missing."
-    Assert-PathExists -Path (Join-Path $installRoot "boundlessctl.exe") -Message "Installed CLI binary is missing."
-    Assert-PathExists -Path (Join-Path $installRoot "boundlesstray.exe") -Message "Installed tray binary is missing."
+    $daemonPath = Join-Path $installRoot "boundlessd.exe"
+    $servicePath = Join-Path $installRoot "boundless-service.exe"
+    $cliPath = Join-Path $installRoot "boundlessctl.exe"
+    $trayPath = Join-Path $installRoot "boundlesstray.exe"
+
+    Assert-PathExists -Path $daemonPath -Message "Installed daemon binary is missing."
+    Assert-PathExists -Path $servicePath -Message "Installed service binary is missing."
+    Assert-PathExists -Path $cliPath -Message "Installed CLI binary is missing."
+    Assert-PathExists -Path $trayPath -Message "Installed tray binary is missing."
     Assert-PathExists -Path $resetScriptPath -Message "Installed reset helper is missing."
     Assert-PathExists -Path $iconPath -Message "Installed icon asset is missing."
     Assert-PathExists -Path $startupShortcutPath -Message "Startup shortcut is missing."
     Assert-PathExists -Path $startMenuShortcutPath -Message "Start menu shortcut is missing."
     Assert-PathExists -Path $desktopShortcutPath -Message "Desktop shortcut is missing."
 
-    $trayPath = Join-Path $installRoot "boundlesstray.exe"
     foreach ($shortcutPath in @($startupShortcutPath, $startMenuShortcutPath, $desktopShortcutPath)) {
         if ((Get-ShortcutTarget -ShortcutPath $shortcutPath) -ne $trayPath) {
             throw "Shortcut target was unexpected: $shortcutPath"
@@ -385,8 +419,9 @@ try {
     }
 
     $traySignature = Assert-Authenticode -Path $trayPath -Required:$RequireSignature.IsPresent
-    $daemonSignature = Assert-Authenticode -Path (Join-Path $installRoot "boundlessd.exe") -Required:$RequireSignature.IsPresent
-    $cliSignature = Assert-Authenticode -Path (Join-Path $installRoot "boundlessctl.exe") -Required:$RequireSignature.IsPresent
+    $daemonSignature = Assert-Authenticode -Path $daemonPath -Required:$RequireSignature.IsPresent
+    $serviceSignature = Assert-Authenticode -Path $servicePath -Required:$RequireSignature.IsPresent
+    $cliSignature = Assert-Authenticode -Path $cliPath -Required:$RequireSignature.IsPresent
 
     $trayVersionOutput = (& $trayPath --version 2>&1 | Out-String).Trim()
     $trayVersionExitCode = $LASTEXITCODE
@@ -427,14 +462,13 @@ try {
             $trayExitCode = $trayProcess.ExitCode
         }
         else {
-            $daemonReadyOutput = Wait-ForDaemonReady -CliPath (Join-Path $installRoot "boundlessctl.exe")
-            Stop-Process -Id $trayProcess.Id -Force -ErrorAction SilentlyContinue
+            $daemonReadyOutput = Wait-ForDaemonReady -CliPath $cliPath
         }
     }
 
     $uninstallExitCode = Invoke-MsiExec -ArgumentList @("/x", $InstallerPath, "/qn", "/norestart") -LogPath $uninstallLog
 
-    Stop-BoundlessProcesses
+    Wait-ForNoBoundlessProcesses
     Wait-ForPathRemoval -Path $installRoot
     if (Test-Path -LiteralPath $startupShortcutPath) {
         throw "Uninstall did not remove startup shortcut."
@@ -448,6 +482,9 @@ try {
     if ($null -ne (Get-UninstallEntry)) {
         throw "Uninstall did not remove Boundless uninstall entry."
     }
+    if ($null -ne (Get-BoundlessService)) {
+        throw "Uninstall left a registered Boundless service."
+    }
 
     $summary = [ordered]@{
         installer_path = $InstallerPath
@@ -455,6 +492,7 @@ try {
         installer_signature = $installerSignature
         tray_signature = $traySignature
         daemon_signature = $daemonSignature
+        service_signature = $serviceSignature
         cli_signature = $cliSignature
         tray_version_output = $trayVersionOutput
         tray_version_exit_code = $trayVersionExitCode
@@ -471,6 +509,8 @@ try {
         upgrade_daemon_status = $upgradeDaemonStatus
         post_upgrade_tray_count = $postUpgradeTrayCount
         post_upgrade_daemon_count = $postUpgradeDaemonCount
+        post_uninstall_processes_cleared = $true
+        post_uninstall_service_removed = $true
         status = "passed"
     }
     $summary | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutputRoot "installer-smoke.json") -Encoding utf8
@@ -478,6 +518,7 @@ try {
     Write-Host "artifacts=$OutputRoot"
 }
 finally {
+    Stop-BoundlessProcesses
     if (-not $KeepArtifacts -and (Test-Path -LiteralPath $OutputRoot)) {
         Remove-Item -LiteralPath $OutputRoot -Recurse -Force -ErrorAction SilentlyContinue
     }

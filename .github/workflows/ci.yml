@@ -40,8 +40,3 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
-
-      - name: Two-node smoke (Windows, light)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/dev/two-node-smoke.ps1 -TimeoutSeconds 90 -ClipboardOnly

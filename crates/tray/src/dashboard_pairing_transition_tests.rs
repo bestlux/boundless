@@ -322,7 +322,7 @@ fn stale_messages_from_a_canceled_attempt_are_ignored_after_restart() {
 fn first_run_snapshot_triggers_onboarding_focus_once() {
     let mut app = test_app();
 
-    app.apply_app_msg(AppMsg::SnapshotUpdated(sample_first_run_snapshot()));
+    app.apply_app_msg(AppMsg::SnapshotUpdated(Box::new(sample_first_run_snapshot())));
 
     assert!(
         app.pending_onboarding_focus,
@@ -335,7 +335,7 @@ fn first_run_snapshot_triggers_onboarding_focus_once() {
 
     app.pending_onboarding_focus = false;
     app.onboarding_focus_shown = true;
-    app.apply_app_msg(AppMsg::SnapshotUpdated(sample_first_run_snapshot()));
+    app.apply_app_msg(AppMsg::SnapshotUpdated(Box::new(sample_first_run_snapshot())));
 
     assert!(
         !app.pending_onboarding_focus,
@@ -347,7 +347,7 @@ fn first_run_snapshot_triggers_onboarding_focus_once() {
 fn paired_snapshot_does_not_trigger_onboarding_focus() {
     let mut app = test_app();
 
-    app.apply_app_msg(AppMsg::SnapshotUpdated(sample_paired_snapshot()));
+    app.apply_app_msg(AppMsg::SnapshotUpdated(Box::new(sample_paired_snapshot())));
 
     assert!(
         !app.pending_onboarding_focus,

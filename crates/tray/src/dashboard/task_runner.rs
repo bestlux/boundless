@@ -47,7 +47,7 @@ impl DashboardTaskRunner {
                 match watch_ui_snapshots_blocking(&app_ctx.endpoint, |snapshot| {
                     next_start_attempt = Instant::now();
                     start_backoff = Duration::from_secs(2);
-                    let _ = tx.send(AppMsg::SnapshotUpdated(snapshot));
+                    let _ = tx.send(AppMsg::SnapshotUpdated(Box::new(snapshot)));
                     egui_ctx.request_repaint();
                     Ok(())
                 }) {
@@ -239,6 +239,7 @@ impl DashboardTaskRunner {
         receive_dir: String,
         organize_by_peer: bool,
         auto_accept_trusted_peers: bool,
+        max_file_bytes: u64,
     ) {
         Self::spawn(move || {
             match set_file_transfer_config_blocking(
@@ -246,6 +247,7 @@ impl DashboardTaskRunner {
                 receive_dir,
                 organize_by_peer,
                 auto_accept_trusted_peers,
+                max_file_bytes,
             ) {
                 Ok(msg) => {
                     let _ = tx.send(AppMsg::ActionComplete(msg));
@@ -253,6 +255,83 @@ impl DashboardTaskRunner {
                 Err(error) => {
                     let _ = tx.send(AppMsg::ActionFailed(error.to_string()));
                 }
+            }
+        });
+    }
+
+    pub(super) fn set_feature(
+        &self,
+        tx: Sender<AppMsg>,
+        endpoint: String,
+        name: String,
+        enabled: bool,
+    ) {
+        Self::spawn(move || match set_feature_blocking(&endpoint, name, enabled) {
+            Ok(msg) => {
+                let _ = tx.send(AppMsg::ActionComplete(msg));
+            }
+            Err(error) => {
+                let _ = tx.send(AppMsg::ActionFailed(error.to_string()));
+            }
+        });
+    }
+
+    pub(super) fn set_input_handoff_config(
+        &self,
+        tx: Sender<AppMsg>,
+        endpoint: String,
+        config: UiInputHandoffConfig,
+    ) {
+        Self::spawn(move || {
+            match set_input_handoff_config_blocking(
+                &endpoint,
+                config.block_screen_corners,
+                config.corner_block_px,
+                config.relative_mouse,
+                config.hide_cursor_at_edge,
+                config.draw_cursor_marker,
+            ) {
+                Ok(msg) => {
+                    let _ = tx.send(AppMsg::ActionComplete(msg));
+                }
+                Err(error) => {
+                    let _ = tx.send(AppMsg::ActionFailed(error.to_string()));
+                }
+            }
+        });
+    }
+
+    pub(super) fn set_hotkey(
+        &self,
+        tx: Sender<AppMsg>,
+        endpoint: String,
+        action: String,
+        combo: String,
+    ) {
+        Self::spawn(move || match set_hotkey_blocking(&endpoint, action, combo) {
+            Ok(msg) => {
+                let _ = tx.send(AppMsg::ActionComplete(msg));
+            }
+            Err(error) => {
+                let _ = tx.send(AppMsg::ActionFailed(error.to_string()));
+            }
+        });
+    }
+
+    pub(super) fn safe_reset(
+        &self,
+        tx: Sender<AppMsg>,
+        endpoint: String,
+        network_only: bool,
+        all: bool,
+        confirm: String,
+    ) {
+        Self::spawn(move || match safe_reset_blocking(&endpoint, network_only, all, confirm) {
+            Ok(msg) => {
+                let _ = tx.send(AppMsg::ActionComplete(msg));
+            }
+            Err(error) => {
+                let _ = tx.send(AppMsg::ActionFailed(error.to_string()));
             }
         });
     }

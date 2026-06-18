@@ -43,6 +43,16 @@ pub struct SetFileTransferConfigCommand {
     pub receive_dir: String,
     pub organize_by_peer: bool,
     pub auto_accept_trusted_peers: bool,
+    pub max_file_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetInputHandoffConfigCommand {
+    pub block_screen_corners: bool,
+    pub corner_block_px: u32,
+    pub relative_mouse: bool,
+    pub hide_cursor_at_edge: bool,
+    pub draw_cursor_marker: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +76,11 @@ pub struct ImportTrustBundleCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotateTrustCommand {
+    pub confirm: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticsDumpCommand {
     pub output_path: Option<String>,
 }
@@ -74,6 +89,7 @@ pub struct DiagnosticsDumpCommand {
 pub struct SafeResetCommand {
     pub network_only: bool,
     pub all: bool,
+    pub confirm: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

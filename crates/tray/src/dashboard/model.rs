@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) enum AppMsg {
-    SnapshotUpdated(UiSnapshot),
+    SnapshotUpdated(Box<UiSnapshot>),
     SnapshotError(String),
     PairingChallenge {
         attempt_id: u64,
@@ -77,6 +77,8 @@ pub(super) struct DashboardApp {
     pub(super) last_layout_peer_ids: Vec<String>,
     pub(super) file_receive_dir_edit: String,
     pub(super) file_receive_dir_last_snapshot: String,
+    pub(super) hotkey_edits: BTreeMap<String, String>,
+    pub(super) hotkey_last_snapshot: BTreeMap<String, String>,
 
     // Undo: stash previous layout state before each drag/action
     pub(super) prev_layout_grid: Option<HashMap<(i32, i32), String>>,
@@ -84,6 +86,8 @@ pub(super) struct DashboardApp {
 
     // Apply confirmation dialog
     pub(super) confirm_apply_pending: bool,
+    pub(super) confirm_network_reset_pending: bool,
+    pub(super) confirm_safe_reset_pending: bool,
 }
 
 impl DashboardApp {
@@ -165,9 +169,13 @@ impl DashboardApp {
             last_layout_peer_ids: Vec::new(),
             file_receive_dir_edit: String::new(),
             file_receive_dir_last_snapshot: String::new(),
+            hotkey_edits: BTreeMap::new(),
+            hotkey_last_snapshot: BTreeMap::new(),
             prev_layout_grid: None,
             prev_layout_unassigned: None,
             confirm_apply_pending: false,
+            confirm_network_reset_pending: false,
+            confirm_safe_reset_pending: false,
         }
     }
 
@@ -244,6 +252,7 @@ impl DashboardApp {
     pub(super) fn apply_app_msg(&mut self, msg: AppMsg) {
         match msg {
             AppMsg::SnapshotUpdated(snap) => {
+                let snap = *snap;
                 let receive_dir = snap.file_transfer_config.receive_dir.clone();
                 if self.file_receive_dir_edit.trim().is_empty()
                     || self.file_receive_dir_edit == self.file_receive_dir_last_snapshot
@@ -251,6 +260,10 @@ impl DashboardApp {
                     self.file_receive_dir_edit = receive_dir.clone();
                 }
                 self.file_receive_dir_last_snapshot = receive_dir;
+                if self.hotkey_edits.is_empty() || self.hotkey_edits == self.hotkey_last_snapshot {
+                    self.hotkey_edits = snap.hotkeys.clone();
+                }
+                self.hotkey_last_snapshot = snap.hotkeys.clone();
                 self.snapshot = snap;
                 if should_offer_first_run_onboarding(&self.snapshot) && !self.onboarding_focus_shown
                 {

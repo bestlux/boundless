@@ -4,8 +4,9 @@ use app_services::{
     SharedControlPlaneApp, commands as app_commands,
     queries::{
         AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
-        FileTransferConfigSnapshot, StatusSnapshot, TransportEventSnapshot, UiDiscoveredPeer,
-        UiPairedPeer, UiPendingRequest, UiSnapshot,
+        FileTransferConfigSnapshot, InputHandoffConfigSnapshot, InputRuntimeSnapshot,
+        StatusSnapshot, TransportEventSnapshot, UiDiscoveredPeer, UiPairedPeer, UiPendingRequest,
+        UiSnapshot,
     },
 };
 use tokio::{sync::mpsc, time};
@@ -17,15 +18,16 @@ use ipc_api::boundless::v1::{
     DiagnosticsDumpReply, DiagnosticsDumpRequest, DiscoveredPeerInfo, Empty, FeatureListReply,
     FeatureSetRequest, FileTransferConfigReply, FileTransferSetRequest, HotkeySetRequest,
     HotkeyTriggerRequest, ImportTrustBundleRequest, InputCaptureTargetReply,
-    InputCaptureTargetRequest, InputOwnerReply, InputOwnerRequest, LayoutReply, LayoutSetRequest,
+    InputCaptureTargetRequest, InputHandoffConfigReply, InputHandoffSetRequest, InputOwnerReply,
+    InputOwnerRequest, InputRuntimeStatusReply, LayoutReply, LayoutSetRequest,
     NearbyJoinStartRequest, NearbyJoinStatusReply, NearbyJoinStatusRequest,
     NearbyPairingCompletionReply, NearbyPairingDecisionRequest, NearbyPairingRequestInfo,
     NearbyRequestCodeStartReply, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
     OperationReply, PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply, PairJoinRequest,
-    PeerInfo, PeerListReply, RemovePeerRequest, SafeResetRequest, SendClipboardImageRequest,
-    SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest, SendInputMoveRequest,
-    StatusReply, StatusRequest, TransportEvent, TransportEventsReply, TrustBundleReply,
-    UiSnapshotReply,
+    PeerInfo, PeerListReply, RemovePeerRequest, RotateTrustRequest, SafeResetRequest,
+    SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
+    SendInputMoveRequest, StatusReply, StatusRequest, TransportEvent, TransportEventsReply,
+    TrustBundleReply, UiSnapshotReply,
     control_plane_service_server::{ControlPlaneService, ControlPlaneServiceServer},
 };
 
@@ -310,6 +312,29 @@ impl ControlPlaneService for ControlPlaneApi {
                 receive_dir: request.receive_dir,
                 organize_by_peer: request.organize_by_peer,
                 auto_accept_trusted_peers: request.auto_accept_trusted_peers,
+                max_file_bytes: request.max_file_bytes,
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
+    }
+
+    async fn set_input_handoff_config(
+        &self,
+        request: Request<InputHandoffSetRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .set_input_handoff_config(app_commands::SetInputHandoffConfigCommand {
+                block_screen_corners: request.block_screen_corners,
+                corner_block_px: request.corner_block_px,
+                relative_mouse: request.relative_mouse,
+                hide_cursor_at_edge: request.hide_cursor_at_edge,
+                draw_cursor_marker: request.draw_cursor_marker,
             })
             .await
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -393,6 +418,24 @@ impl ControlPlaneService for ControlPlaneApi {
         }))
     }
 
+    async fn rotate_trust(
+        &self,
+        request: Request<RotateTrustRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .rotate_trust(app_commands::RotateTrustCommand {
+                confirm: request.confirm,
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
+    }
+
     async fn dump_diagnostics(
         &self,
         request: Request<DiagnosticsDumpRequest>,
@@ -418,6 +461,7 @@ impl ControlPlaneService for ControlPlaneApi {
             .safe_reset(app_commands::SafeResetCommand {
                 network_only: request.network_only,
                 all: request.all,
+                confirm: request.confirm,
             })
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -872,6 +916,10 @@ fn map_ui_snapshot(snapshot: UiSnapshot) -> UiSnapshotReply {
         anti_idle_config: Some(map_anti_idle_config(snapshot.anti_idle_config)),
         anti_idle_status: Some(map_anti_idle_status(snapshot.anti_idle_status)),
         file_transfer_config: Some(map_file_transfer_config(snapshot.file_transfer_config)),
+        input_handoff_config: Some(map_input_handoff_config(snapshot.input_handoff_config)),
+        input_runtime: Some(map_input_runtime(snapshot.input_runtime)),
+        features: snapshot.features.into_iter().collect(),
+        hotkeys: snapshot.hotkeys.into_iter().collect(),
     }
 }
 
@@ -897,6 +945,8 @@ fn map_console_snapshot(snapshot: ConsoleSnapshot) -> ConsoleSnapshotReply {
         anti_idle_config: Some(map_anti_idle_config(snapshot.anti_idle_config)),
         anti_idle_status: Some(map_anti_idle_status(snapshot.anti_idle_status)),
         file_transfer_config: Some(map_file_transfer_config(snapshot.file_transfer_config)),
+        input_handoff_config: Some(map_input_handoff_config(snapshot.input_handoff_config)),
+        input_runtime: Some(map_input_runtime(snapshot.input_runtime)),
     }
 }
 
@@ -944,6 +994,32 @@ fn map_file_transfer_config(snapshot: FileTransferConfigSnapshot) -> FileTransfe
         receive_dir: snapshot.receive_dir,
         organize_by_peer: snapshot.organize_by_peer,
         auto_accept_trusted_peers: snapshot.auto_accept_trusted_peers,
+        max_file_bytes: snapshot.max_file_bytes,
+    }
+}
+
+fn map_input_handoff_config(snapshot: InputHandoffConfigSnapshot) -> InputHandoffConfigReply {
+    InputHandoffConfigReply {
+        block_screen_corners: snapshot.block_screen_corners,
+        corner_block_px: snapshot.corner_block_px,
+        relative_mouse: snapshot.relative_mouse,
+        hide_cursor_at_edge: snapshot.hide_cursor_at_edge,
+        draw_cursor_marker: snapshot.draw_cursor_marker,
+    }
+}
+
+fn map_input_runtime(snapshot: InputRuntimeSnapshot) -> InputRuntimeStatusReply {
+    InputRuntimeStatusReply {
+        owner_peer_id: snapshot.owner_peer_id.unwrap_or_default(),
+        configured_capture_target_peer_id: snapshot
+            .configured_capture_target_peer_id
+            .unwrap_or_default(),
+        active_capture_target_peer_id: snapshot.active_capture_target_peer_id.unwrap_or_default(),
+        lock_active: snapshot.lock_active,
+        lock_supported: snapshot.lock_supported,
+        capture_backend_mode: snapshot.capture_backend_mode,
+        pending_inject_frames: snapshot.pending_inject_frames as u32,
+        pending_inject_high_water: snapshot.pending_inject_high_water as u32,
     }
 }
 
@@ -953,6 +1029,8 @@ fn map_peer_info(peer: UiPairedPeer) -> PeerInfo {
         display_name: peer.display_name,
         address: peer.address,
         connected: peer.connected,
+        health_state: peer.health_state,
+        health_reason: peer.health_reason,
     }
 }
 

@@ -1,9 +1,18 @@
 use super::*;
 use app_services::desktop::{
-    build_orientation_matrix, host_and_pairing_port_from_endpoint,
+    LayoutPeerToken, build_orientation_matrix, host_and_pairing_port_from_endpoint,
     is_local_layout_token as is_local_layout_token_shared, parse_layout_matrix,
     resolve_boundlessd_candidates, spawn_boundlessd_process, terminate_boundlessd_processes,
+    validate_layout_matrix_spec,
 };
+#[cfg(windows)]
+use std::path::PathBuf;
+
+const BOUNDLESS_SERVICE_NAME: &str = "BoundlessService";
+#[cfg(windows)]
+const BOUNDLESS_SERVICE_DISPLAY_NAME: &str = "Boundless Service";
+#[cfg(windows)]
+const USER_WRITABLE_SERVICE_SOURCE_DIRS: [&str; 3] = ["LOCALAPPDATA", "APPDATA", "TEMP"];
 
 pub(super) async fn ensure_daemon_available(endpoint: &str, start_daemon: bool) -> Result<()> {
     let initial_error = match channel(endpoint).await {
@@ -65,6 +74,15 @@ async fn wait_for_daemon_ready(endpoint: &str, context: &str) -> Result<()> {
 fn spawn_daemon_process() -> Result<String> {
     let candidates = resolve_boundlessd_candidates(std::env::current_exe().ok());
     spawn_boundlessd_process(&candidates)
+}
+
+#[cfg(windows)]
+fn resolve_boundless_service_binary() -> Result<PathBuf> {
+    let current_exe = std::env::current_exe().context("resolve current executable")?;
+    let Some(parent) = current_exe.parent() else {
+        bail!("current executable has no parent directory");
+    };
+    Ok(parent.join("boundless-service.exe"))
 }
 
 pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
@@ -718,6 +736,16 @@ pub(super) async fn pair_import_trust(
     Ok(())
 }
 
+pub(super) async fn pair_rotate_trust(endpoint: &str, confirm: String) -> Result<()> {
+    let mut client = connect_control_plane(endpoint).await?;
+    let response = client
+        .rotate_trust(RotateTrustRequest { confirm })
+        .await?
+        .into_inner();
+    println!("ok={} message={}", response.ok, response.message);
+    Ok(())
+}
+
 pub(super) async fn peer_list(endpoint: &str) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let response = client.list_peers(Empty {}).await?.into_inner();
@@ -756,6 +784,7 @@ pub(super) async fn layout_show(endpoint: &str) -> Result<()> {
 }
 
 pub(super) async fn layout_set(endpoint: &str, matrix: String) -> Result<()> {
+    validate_layout_for_endpoint(endpoint, &matrix).await?;
     let mut client = connect_control_plane(endpoint).await?;
     let response = client
         .layout_set(LayoutSetRequest {
@@ -766,6 +795,210 @@ pub(super) async fn layout_set(endpoint: &str, matrix: String) -> Result<()> {
 
     println!("ok={} message={}", response.ok, response.message);
     Ok(())
+}
+
+#[cfg(windows)]
+pub(super) async fn service_status() -> Result<()> {
+    use windows_service::{
+        service::ServiceAccess,
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    match manager.open_service(BOUNDLESS_SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        Ok(service) => {
+            let status = service.query_status()?;
+            println!(
+                "installed=true service={} state={:?} process_id={}",
+                BOUNDLESS_SERVICE_NAME,
+                status.current_state,
+                status.process_id.unwrap_or_default()
+            );
+        }
+        Err(error) => {
+            println!(
+                "installed=false service={} state=not_installed error={}",
+                BOUNDLESS_SERVICE_NAME, error
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(super) async fn service_status() -> Result<()> {
+    println!(
+        "installed=false service={BOUNDLESS_SERVICE_NAME} state=unsupported platform=non-windows"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(super) async fn service_install(binary: Option<String>, auto_start: bool) -> Result<()> {
+    use platform_windows::runtime::current_user_sid_string;
+    use std::ffi::OsString;
+    use windows_service::{
+        service::{ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType},
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let service_binary_path = binary
+        .map(PathBuf::from)
+        .unwrap_or(resolve_boundless_service_binary()?);
+    if !service_binary_path.is_file() {
+        bail!(
+            "service binary was not found: {}",
+            service_binary_path.display()
+        );
+    }
+    reject_user_writable_service_source(&service_binary_path)?;
+    let allowed_user_sid = current_user_sid_string()
+        .context("resolve installing user SID for service control pipe ACL")?;
+
+    let manager = ServiceManager::local_computer(
+        None::<&str>,
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    )?;
+    let service_info = ServiceInfo {
+        name: OsString::from(BOUNDLESS_SERVICE_NAME),
+        display_name: OsString::from(BOUNDLESS_SERVICE_DISPLAY_NAME),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: if auto_start {
+            ServiceStartType::AutoStart
+        } else {
+            ServiceStartType::OnDemand
+        },
+        error_control: ServiceErrorControl::Normal,
+        executable_path: service_binary_path.clone(),
+        launch_arguments: vec![OsString::from(format!(
+            "--allowed-user-sid={allowed_user_sid}"
+        ))],
+        dependencies: vec![],
+        account_name: None,
+        account_password: None,
+    };
+    let service = manager.create_service(
+        &service_info,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::START | ServiceAccess::CHANGE_CONFIG,
+    )?;
+    service.set_description("Boundless service-mode daemon host")?;
+    println!(
+        "installed=true service={} binary={} start_type={} control_pipe_acl=system,administrators,installing_user",
+        BOUNDLESS_SERVICE_NAME,
+        service_binary_path.display(),
+        if auto_start { "auto" } else { "demand" }
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(super) async fn service_install(_binary: Option<String>, _auto_start: bool) -> Result<()> {
+    bail!("service install is only supported on Windows")
+}
+
+#[cfg(windows)]
+fn reject_user_writable_service_source(path: &std::path::Path) -> Result<()> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize service binary {}", path.display()))?;
+    for var in USER_WRITABLE_SERVICE_SOURCE_DIRS {
+        let Ok(root) = std::env::var(var) else {
+            continue;
+        };
+        if root.trim().is_empty() {
+            continue;
+        }
+        let root = PathBuf::from(root);
+        let Ok(root) = root.canonicalize() else {
+            continue;
+        };
+        if canonical.starts_with(&root) {
+            bail!(
+                "refusing to install LocalSystem service from user-writable path `{}`; copy boundless-service.exe to an admin-protected directory such as %ProgramFiles%\\Boundless and rerun with --binary",
+                canonical.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(super) async fn service_start() -> Result<()> {
+    use windows_service::{
+        service::ServiceAccess,
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(
+        BOUNDLESS_SERVICE_NAME,
+        ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+    )?;
+    service.start::<&str>(&[])?;
+    let status = service.query_status()?;
+    println!(
+        "start_requested=true service={} state={:?}",
+        BOUNDLESS_SERVICE_NAME, status.current_state
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(super) async fn service_start() -> Result<()> {
+    bail!("service start is only supported on Windows")
+}
+
+#[cfg(windows)]
+pub(super) async fn service_stop() -> Result<()> {
+    use windows_service::{
+        service::ServiceAccess,
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(
+        BOUNDLESS_SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+    )?;
+    let status = service.stop()?;
+    println!(
+        "stop_requested=true service={} state={:?}",
+        BOUNDLESS_SERVICE_NAME, status.current_state
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(super) async fn service_stop() -> Result<()> {
+    bail!("service stop is only supported on Windows")
+}
+
+#[cfg(windows)]
+pub(super) async fn service_uninstall() -> Result<()> {
+    use windows_service::{
+        service::{ServiceAccess, ServiceState},
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(
+        BOUNDLESS_SERVICE_NAME,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+    )?;
+    if service.query_status()?.current_state != ServiceState::Stopped {
+        let _ = service.stop();
+    }
+    service.delete()?;
+    println!(
+        "uninstall_requested=true service={} state=delete_pending",
+        BOUNDLESS_SERVICE_NAME
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(super) async fn service_uninstall() -> Result<()> {
+    bail!("service uninstall is only supported on Windows")
 }
 
 pub(super) async fn layout_preview(endpoint: &str) -> Result<()> {
@@ -961,8 +1194,11 @@ pub(super) async fn file_transfer_config(endpoint: &str) -> Result<()> {
         .into_inner();
 
     println!(
-        "receive_dir={} organize_by_peer={} auto_accept_trusted_peers={}",
-        config.receive_dir, config.organize_by_peer, config.auto_accept_trusted_peers
+        "receive_dir={} organize_by_peer={} auto_accept_trusted_peers={} max_file_bytes={}",
+        config.receive_dir,
+        config.organize_by_peer,
+        config.auto_accept_trusted_peers,
+        config.max_file_bytes
     );
     Ok(())
 }
@@ -971,14 +1207,32 @@ pub(super) async fn file_transfer_set_receive_dir(
     endpoint: &str,
     path: String,
     organize_by_peer: bool,
-    auto_accept_trusted_peers: bool,
+    no_organize_by_peer: bool,
+    auto_accept_trusted_peers: Option<bool>,
+    max_file_bytes: Option<u64>,
 ) -> Result<()> {
+    if organize_by_peer && no_organize_by_peer {
+        bail!("--organize-by-peer and --no-organize-by-peer cannot both be set");
+    }
+
     let mut client = connect_control_plane(endpoint).await?;
+    let current = client
+        .get_file_transfer_config(Empty {})
+        .await?
+        .into_inner();
     let response = client
         .set_file_transfer_config(FileTransferSetRequest {
             receive_dir: path,
-            organize_by_peer,
-            auto_accept_trusted_peers,
+            organize_by_peer: if organize_by_peer {
+                true
+            } else if no_organize_by_peer {
+                false
+            } else {
+                current.organize_by_peer
+            },
+            auto_accept_trusted_peers: auto_accept_trusted_peers
+                .unwrap_or(current.auto_accept_trusted_peers),
+            max_file_bytes: max_file_bytes.unwrap_or(current.max_file_bytes),
         })
         .await?
         .into_inner();
@@ -1078,15 +1332,19 @@ pub(super) async fn transport_events(endpoint: &str, limit: usize) -> Result<()>
         println!(
             "{} direction={} kind={} peer_id={} size_bytes={} detail={}",
             event.timestamp,
-            event.direction,
-            event.kind,
-            event.peer_id,
+            escape_event_field(&event.direction),
+            escape_event_field(&event.kind),
+            escape_event_field(&event.peer_id),
             event.size_bytes,
-            event.detail
+            escape_event_field(&event.detail)
         );
     }
 
     Ok(())
+}
+
+fn escape_event_field(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
 }
 
 pub(super) async fn input_owner(endpoint: &str) -> Result<()> {
@@ -1102,6 +1360,84 @@ pub(super) async fn input_owner(endpoint: &str) -> Result<()> {
         "ok={} owner={} message={}",
         response.ok, owner, response.message
     );
+    Ok(())
+}
+
+fn none_if_empty(value: String) -> String {
+    if value.is_empty() {
+        "none".to_string()
+    } else {
+        value
+    }
+}
+
+pub(super) async fn input_status(endpoint: &str) -> Result<()> {
+    let mut client = connect_control_plane(endpoint).await?;
+    let snapshot = client.get_console_snapshot(Empty {}).await?.into_inner();
+    let runtime = snapshot.input_runtime.unwrap_or_default();
+    let handoff = snapshot.input_handoff_config.unwrap_or_default();
+    let owner = none_if_empty(runtime.owner_peer_id);
+    let configured_target = none_if_empty(runtime.configured_capture_target_peer_id);
+    let active_target = none_if_empty(runtime.active_capture_target_peer_id);
+
+    println!(
+        "owner={} configured_capture_target={} active_capture_target={} lock_active={} lock_supported={} capture_backend_mode={} pending_inject_frames={} pending_inject_high_water={} block_screen_corners={} corner_block_px={} relative_mouse={} hide_cursor_at_edge={} draw_cursor_marker={}",
+        owner,
+        configured_target,
+        active_target,
+        runtime.lock_active,
+        runtime.lock_supported,
+        none_if_empty(runtime.capture_backend_mode),
+        runtime.pending_inject_frames,
+        runtime.pending_inject_high_water,
+        handoff.block_screen_corners,
+        handoff.corner_block_px,
+        handoff.relative_mouse,
+        handoff.hide_cursor_at_edge,
+        handoff.draw_cursor_marker,
+    );
+    Ok(())
+}
+
+pub(super) async fn input_config(endpoint: &str) -> Result<()> {
+    let mut client = connect_control_plane(endpoint).await?;
+    let snapshot = client.get_console_snapshot(Empty {}).await?.into_inner();
+    let handoff = snapshot.input_handoff_config.unwrap_or_default();
+
+    println!(
+        "block_screen_corners={} corner_block_px={} relative_mouse={} hide_cursor_at_edge={} draw_cursor_marker={}",
+        handoff.block_screen_corners,
+        handoff.corner_block_px,
+        handoff.relative_mouse,
+        handoff.hide_cursor_at_edge,
+        handoff.draw_cursor_marker,
+    );
+    Ok(())
+}
+
+pub(super) async fn input_set_config(
+    endpoint: &str,
+    block_screen_corners: Option<bool>,
+    corner_block_px: Option<u32>,
+    relative_mouse: Option<bool>,
+    hide_cursor_at_edge: Option<bool>,
+    draw_cursor_marker: Option<bool>,
+) -> Result<()> {
+    let mut client = connect_control_plane(endpoint).await?;
+    let snapshot = client.get_console_snapshot(Empty {}).await?.into_inner();
+    let current = snapshot.input_handoff_config.unwrap_or_default();
+    let response = client
+        .set_input_handoff_config(InputHandoffSetRequest {
+            block_screen_corners: block_screen_corners.unwrap_or(current.block_screen_corners),
+            corner_block_px: corner_block_px.unwrap_or(current.corner_block_px),
+            relative_mouse: relative_mouse.unwrap_or(current.relative_mouse),
+            hide_cursor_at_edge: hide_cursor_at_edge.unwrap_or(current.hide_cursor_at_edge),
+            draw_cursor_marker: draw_cursor_marker.unwrap_or(current.draw_cursor_marker),
+        })
+        .await?
+        .into_inner();
+
+    println!("ok={} message={}", response.ok, response.message);
     Ok(())
 }
 
@@ -1265,10 +1601,19 @@ pub(super) async fn diagnostics_run_action(endpoint: &str, action: String) -> Re
     Ok(())
 }
 
-pub(super) async fn safe_reset(endpoint: &str, network_only: bool, all: bool) -> Result<()> {
+pub(super) async fn safe_reset(
+    endpoint: &str,
+    network_only: bool,
+    all: bool,
+    confirm: String,
+) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let response = client
-        .safe_reset(SafeResetRequest { network_only, all })
+        .safe_reset(SafeResetRequest {
+            network_only,
+            all,
+            confirm,
+        })
         .await?
         .into_inner();
 
@@ -1302,6 +1647,8 @@ struct UiPairedPeer {
     display_name: String,
     address: String,
     connected: bool,
+    health_state: String,
+    health_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1361,6 +1708,8 @@ pub(super) async fn ui_snapshot(endpoint: &str, start_daemon: bool) -> Result<()
                 display_name: peer.display_name,
                 address: peer.address,
                 connected: peer.connected,
+                health_state: peer.health_state,
+                health_reason: peer.health_reason,
             })
             .collect(),
         pending_requests: snapshot
@@ -1478,6 +1827,25 @@ async fn fetch_local_layout_tokens(endpoint: &str) -> Result<LocalLayoutTokens> 
         machine_id: status.machine_id,
         display_name: snapshot.local_display_name,
     })
+}
+
+async fn validate_layout_for_endpoint(endpoint: &str, matrix: &str) -> Result<()> {
+    let peers = list_peer_records(endpoint).await?;
+    let local_tokens = fetch_local_layout_tokens(endpoint).await?;
+    let peer_tokens = peers
+        .iter()
+        .map(|peer| LayoutPeerToken {
+            peer_id: peer.peer_id.clone(),
+            display_name: peer.display_name.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    validate_layout_matrix_spec(
+        matrix,
+        &local_tokens.machine_id,
+        Some(local_tokens.display_name.as_str()),
+        &peer_tokens,
+    )
 }
 
 async fn fetch_ui_snapshot(endpoint: &str) -> Result<UiSnapshotReply> {

@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use crate::state::TransportEventRecord;
+use chrono::Utc;
 use core_clipboard::{ClipboardPayload, payload_hash_hex};
 use peer_transport::{
     CLIPBOARD_IMAGE_CHUNK_BYTES, OutboundTransferFlows, consume_outbound_chunk_credit,
@@ -319,7 +321,10 @@ where
             file_name,
             total_bytes,
         } => {
-            validate_transfer_size(*total_bytes)?;
+            core_transfer::validate_transfer_size_with_limit(
+                *total_bytes,
+                state.file_transfer_max_bytes().await,
+            )?;
             send_message(
                 writer_ctx.writer,
                 &WireMessage::FileStart {
@@ -332,6 +337,16 @@ where
             )
             .await?;
             register_outbound_transfer_flow(writer_ctx.outbound_transfer_flow, transfer_id.clone());
+            state.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: "outgoing".to_string(),
+                kind: "file_transfer_started".to_string(),
+                peer_id: peer_id.to_string(),
+                detail: format!(
+                    "transfer_id={transfer_id} file_name={file_name} total_bytes={total_bytes}"
+                ),
+                size_bytes: *total_bytes,
+            });
             Ok(SendPayloadOutcome::Sent)
         }
         OutboundPayload::FileChunk {
@@ -389,6 +404,16 @@ where
             )
             .await?;
             consume_outbound_chunk_credit(writer_ctx.outbound_transfer_flow, transfer_id);
+            state.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: "outgoing".to_string(),
+                kind: "file_transfer_progress".to_string(),
+                peer_id: peer_id.to_string(),
+                detail: format!(
+                    "transfer_id={transfer_id} offset_bytes={offset_bytes} length_bytes={length_bytes}"
+                ),
+                size_bytes: *length_bytes as u64,
+            });
             Ok(SendPayloadOutcome::Sent)
         }
         OutboundPayload::FileEnd {
@@ -409,6 +434,14 @@ where
             state
                 .record_outgoing_file(peer_id, file_name, *total_bytes)
                 .await;
+            state.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: "outgoing".to_string(),
+                kind: "file_transfer_completed".to_string(),
+                peer_id: peer_id.to_string(),
+                detail: format!("transfer_id={transfer_id} file_name={file_name}"),
+                size_bytes: *total_bytes,
+            });
             Ok(SendPayloadOutcome::Sent)
         }
         OutboundPayload::InputFrame {
@@ -503,7 +536,7 @@ where
     .await
 }
 
-async fn send_message<W>(
+pub(super) async fn send_message<W>(
     writer: &mut W,
     message: &WireMessage,
     frame_buffer: &mut Vec<u8>,

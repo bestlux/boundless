@@ -81,10 +81,7 @@ impl DashboardApp {
                         }
                         let peer_id = if shared_is_local_layout_token(token, local_id, None) {
                             local_id.clone()
-                        } else if let Some(p) = peers
-                            .iter()
-                            .find(|p| p.display_name == *token || p.peer_id == *token)
-                        {
+                        } else if let Some(p) = resolve_layout_token_peer(token, peers) {
                             p.peer_id.clone()
                         } else {
                             token.clone()
@@ -566,7 +563,23 @@ impl DashboardApp {
                 egui::Button::new("Apply Layout")
             );
             if apply_btn.clicked() {
-                match validate_layout_before_apply(&self.layout_grid, &self.snapshot.machine_id) {
+                let matrix_str =
+                    serialize_layout_matrix(&self.layout_grid, &self.snapshot.machine_id);
+                let peers = self
+                    .snapshot
+                    .paired_peers
+                    .iter()
+                    .map(|peer| LayoutPeerToken {
+                        peer_id: peer.peer_id.clone(),
+                        display_name: peer.display_name.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                match validate_layout_matrix_spec(
+                    &matrix_str,
+                    &self.snapshot.machine_id,
+                    None,
+                    &peers,
+                ) {
                     Ok(()) => {
                         self.confirm_apply_pending = true;
                     }
@@ -773,9 +786,35 @@ fn build_layout_summary(
     }
 }
 
+fn resolve_layout_token_peer<'a>(
+    token: &str,
+    peers: &'a [UiPairedPeer],
+) -> Option<&'a UiPairedPeer> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let token_lower = token.to_ascii_lowercase();
+    let matches = peers
+        .iter()
+        .filter(|peer| {
+            peer.peer_id.eq_ignore_ascii_case(token)
+                || peer.peer_id.to_ascii_lowercase().starts_with(&token_lower)
+                || peer.display_name.eq_ignore_ascii_case(token)
+        })
+        .collect::<Vec<_>>();
+
+    if matches.len() == 1 {
+        Some(matches[0])
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_rebuild_layout_model;
+    use super::{resolve_layout_token_peer, should_rebuild_layout_model};
+    use crate::windows_app::UiPairedPeer;
 
     #[test]
     fn rebuilds_when_paired_peer_ids_change_without_layout_matrix_change() {
@@ -807,5 +846,40 @@ mod tests {
             &last_peer_ids,
             true,
         ));
+    }
+
+    #[test]
+    fn resolves_layout_token_peer_with_shared_grammar() {
+        let peers = vec![
+            UiPairedPeer {
+                peer_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+                display_name: "Office".to_string(),
+                address: "127.0.0.1:15100".to_string(),
+                connected: true,
+                health_state: "connected".to_string(),
+                health_reason: "connected".to_string(),
+            },
+            UiPairedPeer {
+                peer_id: "11111111-2222-3333-4444-555555555555".to_string(),
+                display_name: "Laptop".to_string(),
+                address: "127.0.0.1:15101".to_string(),
+                connected: false,
+                health_state: "disconnected".to_string(),
+                health_reason: "no recent peer event".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            resolve_layout_token_peer("AAAAAAAA", &peers).map(|peer| peer.peer_id.as_str()),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        );
+        assert_eq!(
+            resolve_layout_token_peer("office", &peers).map(|peer| peer.peer_id.as_str()),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        );
+        assert_eq!(
+            resolve_layout_token_peer("missing", &peers).map(|peer| peer.peer_id.as_str()),
+            None
+        );
     }
 }

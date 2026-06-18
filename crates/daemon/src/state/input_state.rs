@@ -14,6 +14,7 @@ pub(super) struct InputControlState {
     pub(super) owner_last_changed_at: RwLock<Option<Instant>>,
     pub(super) lock_active: RwLock<bool>,
     pub(super) lock_supported: RwLock<bool>,
+    pub(super) capture_backend_mode: RwLock<String>,
 }
 
 #[derive(Debug)]
@@ -32,6 +33,7 @@ impl InputState {
                 owner_last_changed_at: RwLock::new(None),
                 lock_active: RwLock::new(false),
                 lock_supported: RwLock::new(cfg!(windows)),
+                capture_backend_mode: RwLock::new("unknown".to_string()),
             },
             inject: InputInjectState {
                 pending_inject_frames: RwLock::new(VecDeque::new()),
@@ -47,6 +49,7 @@ impl InputState {
         *self.control.capture_target_peer_id.write().await = None;
         *self.control.owner_last_changed_at.write().await = None;
         *self.control.lock_active.write().await = false;
+        *self.control.capture_backend_mode.write().await = "unknown".to_string();
         self.inject
             .pending_inject_high_water
             .store(0, std::sync::atomic::Ordering::Release);

@@ -40,9 +40,13 @@ pub(super) fn test_app() -> DashboardApp {
         last_layout_peer_ids: Vec::new(),
         file_receive_dir_edit: String::new(),
         file_receive_dir_last_snapshot: String::new(),
+        hotkey_edits: BTreeMap::new(),
+        hotkey_last_snapshot: BTreeMap::new(),
         prev_layout_grid: None,
         prev_layout_unassigned: None,
         confirm_apply_pending: false,
+        confirm_network_reset_pending: false,
+        confirm_safe_reset_pending: false,
     }
 }
 
@@ -85,6 +89,22 @@ pub(super) fn sample_first_run_snapshot() -> UiSnapshot {
         daemon_online: true,
         machine_id: "local-machine-1234".to_string(),
         layout_matrix: "self".to_string(),
+        features: BTreeMap::from([
+            ("share_input".to_string(), true),
+            ("share_clipboard".to_string(), true),
+            ("transfer_file".to_string(), true),
+            ("easy_mouse".to_string(), true),
+            ("wrap_mouse".to_string(), true),
+        ]),
+        hotkeys: BTreeMap::from([
+            (
+                "toggle_easy_mouse".to_string(),
+                "Ctrl+Alt+Shift+E".to_string(),
+            ),
+            ("lock_machine".to_string(), "Ctrl+Alt+Shift+L".to_string()),
+            ("switch_all".to_string(), "Disabled".to_string()),
+            ("reconnect".to_string(), "Ctrl+Alt+Shift+R".to_string()),
+        ]),
         discovered_peers: Vec::new(),
         paired_peers: Vec::new(),
         pending_requests: Vec::new(),
@@ -104,7 +124,25 @@ pub(super) fn sample_first_run_snapshot() -> UiSnapshot {
         file_transfer_config: UiFileTransferConfig {
             receive_dir: r"C:\Users\Test\Downloads\Boundless".to_string(),
             organize_by_peer: false,
-            auto_accept_trusted_peers: true,
+            auto_accept_trusted_peers: false,
+            max_file_bytes: 100 * 1024 * 1024,
+        },
+        input_handoff_config: UiInputHandoffConfig {
+            block_screen_corners: true,
+            corner_block_px: 24,
+            relative_mouse: false,
+            hide_cursor_at_edge: false,
+            draw_cursor_marker: false,
+        },
+        input_runtime: UiInputRuntime {
+            owner_peer_id: String::new(),
+            configured_capture_target_peer_id: String::new(),
+            active_capture_target_peer_id: String::new(),
+            lock_active: false,
+            lock_supported: true,
+            capture_backend_mode: "windows_hooks".to_string(),
+            pending_inject_frames: 0,
+            pending_inject_high_water: 0,
         },
     }
 }
@@ -116,6 +154,8 @@ pub(super) fn sample_paired_snapshot() -> UiSnapshot {
             display_name: "Office Desktop".to_string(),
             address: "10.0.0.25:15100".to_string(),
             connected: false,
+            health_state: "disconnected".to_string(),
+            health_reason: "no recent peer event".to_string(),
         }],
         ..sample_first_run_snapshot()
     }

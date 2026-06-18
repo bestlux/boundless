@@ -16,6 +16,13 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const PAIRING_PORT_OFFSET: u16 = 100;
 
 pub const CANONICAL_LOCAL_LAYOUT_TOKEN: &str = "self";
+pub const MAX_LAYOUT_REMOTE_PEERS: usize = 4;
+
+#[derive(Debug, Clone)]
+pub struct LayoutPeerToken {
+    pub peer_id: String,
+    pub display_name: String,
+}
 
 pub fn nearby_pairing_port(transport_port: u16) -> u16 {
     if transport_port <= u16::MAX - PAIRING_PORT_OFFSET {
@@ -181,6 +188,86 @@ pub fn validate_layout_before_apply(
     }
 }
 
+pub fn validate_layout_matrix_spec(
+    matrix: &str,
+    local_machine_id: &str,
+    local_display_name: Option<&str>,
+    peers: &[LayoutPeerToken],
+) -> Result<()> {
+    canonicalize_layout_matrix_spec(matrix, local_machine_id, local_display_name, peers).map(|_| ())
+}
+
+pub fn canonicalize_layout_matrix_spec(
+    matrix: &str,
+    local_machine_id: &str,
+    local_display_name: Option<&str>,
+    peers: &[LayoutPeerToken],
+) -> Result<String> {
+    let rows = parse_layout_matrix(matrix);
+    let mut local_count = 0usize;
+    let mut peer_positions = HashMap::<String, (i32, i32)>::new();
+    let mut occupied_positions = Vec::<(i32, i32)>::new();
+    let mut canonical_rows = Vec::<Vec<String>>::new();
+
+    for (row_index, row) in rows.iter().enumerate() {
+        let mut canonical_row = Vec::<String>::new();
+        for (column_index, token) in row.iter().enumerate() {
+            let token = token.trim();
+            if token.is_empty() {
+                canonical_row.push(String::new());
+                continue;
+            }
+
+            let position = (column_index as i32, row_index as i32);
+            if is_local_layout_token(token, local_machine_id, local_display_name) {
+                local_count += 1;
+                occupied_positions.push(position);
+                canonical_row.push(CANONICAL_LOCAL_LAYOUT_TOKEN.to_string());
+                continue;
+            }
+
+            let peer_id = resolve_layout_peer_token(token, peers)?;
+            if let Some(previous) = peer_positions.insert(peer_id.clone(), position) {
+                anyhow::bail!(
+                    "layout peer `{}` appears more than once at ({}, {}) and ({}, {})",
+                    peer_id,
+                    previous.0,
+                    previous.1,
+                    position.0,
+                    position.1
+                );
+            }
+            occupied_positions.push(position);
+            canonical_row.push(peer_id);
+        }
+        canonical_rows.push(canonical_row);
+    }
+
+    match local_count {
+        1 => {}
+        0 => anyhow::bail!("layout must include This PC exactly once"),
+        _ => anyhow::bail!("layout must include This PC exactly once"),
+    }
+
+    if peer_positions.len() > MAX_LAYOUT_REMOTE_PEERS {
+        anyhow::bail!("layout supports at most {MAX_LAYOUT_REMOTE_PEERS} peers plus This PC");
+    }
+
+    if occupied_positions.len() > 1
+        && !layout_positions_are_cardinally_connected(&occupied_positions)
+    {
+        anyhow::bail!(
+            "layout devices must form one connected cardinal group; avoid diagonal-only or isolated devices"
+        );
+    }
+
+    Ok(canonical_rows
+        .into_iter()
+        .map(|row| row.join(","))
+        .collect::<Vec<_>>()
+        .join(";"))
+}
+
 pub fn serialize_layout_matrix(
     layout_grid: &HashMap<(i32, i32), String>,
     local_machine_id: &str,
@@ -264,6 +351,51 @@ pub fn parse_layout_matrix(matrix: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+fn resolve_layout_peer_token(token: &str, peers: &[LayoutPeerToken]) -> Result<String> {
+    let token = token.trim();
+    let token_lower = token.to_ascii_lowercase();
+    let matches = peers
+        .iter()
+        .filter(|peer| {
+            peer.peer_id.eq_ignore_ascii_case(token)
+                || peer.peer_id.to_ascii_lowercase().starts_with(&token_lower)
+                || peer.display_name.eq_ignore_ascii_case(token)
+        })
+        .collect::<Vec<_>>();
+
+    if matches.is_empty() {
+        anyhow::bail!("layout token `{token}` does not resolve to a known peer");
+    }
+    if matches.len() > 1 {
+        anyhow::bail!("layout token `{token}` is ambiguous across peers");
+    }
+    Ok(matches[0].peer_id.clone())
+}
+
+fn layout_positions_are_cardinally_connected(positions: &[(i32, i32)]) -> bool {
+    use std::collections::{HashSet, VecDeque};
+
+    let occupied = positions.iter().copied().collect::<HashSet<_>>();
+    let Some(&start) = occupied.iter().next() else {
+        return true;
+    };
+
+    let mut seen = HashSet::<(i32, i32)>::new();
+    let mut queue = VecDeque::from([start]);
+    while let Some((x, y)) = queue.pop_front() {
+        if !seen.insert((x, y)) {
+            continue;
+        }
+        for neighbor in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+            if occupied.contains(&neighbor) && !seen.contains(&neighbor) {
+                queue.push_back(neighbor);
+            }
+        }
+    }
+
+    seen.len() == occupied.len()
+}
+
 fn extract_port_from_endpoint(endpoint: &str) -> Result<u16> {
     endpoint
         .rsplit_once(':')
@@ -280,4 +412,72 @@ fn count_local_layout_cells(
         .values()
         .filter(|id| id.eq_ignore_ascii_case(local_machine_id))
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(peer_id: &str, display_name: &str) -> LayoutPeerToken {
+        LayoutPeerToken {
+            peer_id: peer_id.to_string(),
+            display_name: display_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn layout_matrix_validation_accepts_four_remote_peers_plus_local() {
+        let peers = [
+            peer("peer-left", "left"),
+            peer("peer-right", "right"),
+            peer("peer-up", "up"),
+            peer("peer-down", "down"),
+        ];
+
+        let canonical = canonicalize_layout_matrix_spec(
+            ",up,;left,self,right;,down,",
+            "local-machine",
+            Some("local-device"),
+            &peers,
+        )
+        .expect("four peers plus local should validate");
+        assert_eq!(canonical, ",peer-up,;peer-left,self,peer-right;,peer-down,");
+    }
+
+    #[test]
+    fn layout_matrix_validation_rejects_unknown_ambiguous_and_duplicate_tokens() {
+        let peers = [peer("peer-left-a", "office"), peer("peer-left-b", "office")];
+
+        let unknown = validate_layout_matrix_spec("self,missing", "local", None, &peers)
+            .expect_err("unknown peer token must fail");
+        assert!(unknown.to_string().contains("does not resolve"));
+
+        let ambiguous = validate_layout_matrix_spec("self,office", "local", None, &peers)
+            .expect_err("ambiguous peer token must fail");
+        assert!(ambiguous.to_string().contains("ambiguous"));
+
+        let duplicate =
+            validate_layout_matrix_spec("self,peer-left-a;peer-left-a,", "local", None, &peers)
+                .expect_err("duplicate peer token must fail");
+        assert!(duplicate.to_string().contains("appears more than once"));
+    }
+
+    #[test]
+    fn layout_matrix_validation_rejects_isolated_or_too_large_layouts() {
+        let peers = [
+            peer("peer-a", "a"),
+            peer("peer-b", "b"),
+            peer("peer-c", "c"),
+            peer("peer-d", "d"),
+            peer("peer-e", "e"),
+        ];
+
+        let isolated = validate_layout_matrix_spec("self,; ,peer-a", "local", None, &peers)
+            .expect_err("diagonal-only device must fail");
+        assert!(isolated.to_string().contains("connected cardinal group"));
+
+        let too_large = validate_layout_matrix_spec("a,b,c;d,self,e", "local", None, &peers)
+            .expect_err("more than four peers must fail");
+        assert!(too_large.to_string().contains("at most"));
+    }
 }

@@ -64,7 +64,9 @@ impl AppState {
 
         tokio::fs::create_dir_all(&target).await?;
 
-        let file_path = target.join(format!("dump-{}.txt", Utc::now().format("%Y%m%d-%H%M%S")));
+        let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+        let file_path = target.join(format!("dump-{stamp}.txt"));
+        let manifest_path = target.join(format!("dump-{stamp}.redaction.txt"));
 
         let snapshot = self.snapshot().await;
         let trust_count = self
@@ -81,24 +83,35 @@ impl AppState {
             .input_capture_target()
             .await
             .unwrap_or_else(|| "none".to_string());
+        let input_handoff = self.input_handoff_config().await;
+        let input_capture_backend_mode = self.input_capture_backend_mode().await;
+        let (pending_inject_frames, pending_inject_high_water) =
+            self.pending_inject_frame_stats().await;
         let pairing_diagnostics = self.pairing_diagnostics_report().await;
 
         let report = format!(
-            "Boundless Diagnostics\nMachine: {}\nFingerprint: {}\nPeers: {}\nTrusted CAs: {}\nTransport Events: {}\nInput Owner: {}\nInput Capture Target: {}\nAPI: {}\nTransport Port: {}\nProtocol: {}\n{}\n",
-            snapshot.machine_id,
-            self.fingerprint(),
+            "Boundless Diagnostics\nMachine: [redacted-machine-id]\nFingerprint: [redacted-fingerprint]\nPeers: {}\nTrusted CAs: {}\nTransport Events: {}\nInput Owner: {}\nInput Capture Target: {}\nInput Capture Backend Mode: {}\nInput Pending Inject Frames: {}\nInput Pending Inject High Water: {}\nInput Handoff: block_screen_corners={} corner_block_px={} relative_mouse={} hide_cursor_at_edge={} draw_cursor_marker={}\nAPI: [redacted-endpoint]\nTransport Port: {}\nProtocol: {}\n{}\nRedaction Manifest: sidecar redaction manifest written next to this dump\n",
             snapshot.peers.len(),
             trust_count,
             event_count,
-            input_owner,
-            input_capture_target,
-            snapshot.api_bind,
+            redact_identifier(&input_owner),
+            redact_identifier(&input_capture_target),
+            input_capture_backend_mode,
+            pending_inject_frames,
+            pending_inject_high_water,
+            input_handoff.block_screen_corners,
+            input_handoff.corner_block_px,
+            input_handoff.relative_mouse,
+            input_handoff.hide_cursor_at_edge,
+            input_handoff.draw_cursor_marker,
             snapshot.network_port,
             snapshot.protocol_version,
             pairing_diagnostics
         );
+        let manifest = "default_redaction=true\nredacted=machine_id,fingerprint,api_bind,peer_ids,request_ids,lockout_ips,local_paths,trust_material\nfull_diagnostics_opt_in=not_enabled\n";
 
         tokio::fs::write(&file_path, report).await?;
+        tokio::fs::write(&manifest_path, manifest).await?;
         Ok(file_path.display().to_string())
     }
 
@@ -231,10 +244,10 @@ impl AppState {
             "pairing_submission_lockout_ips={}",
             active_lockouts.len()
         );
-        for (index, (ip, remaining_seconds)) in active_lockouts.iter().enumerate() {
+        for (index, (_ip, remaining_seconds)) in active_lockouts.iter().enumerate() {
             let _ = writeln!(
                 report,
-                "pairing_submission_lockout_{}=ip:{ip},remaining_seconds:{}",
+                "pairing_submission_lockout_{}=ip:[redacted-ip],remaining_seconds:{}",
                 index + 1,
                 (*remaining_seconds).max(0)
             );
@@ -242,8 +255,9 @@ impl AppState {
         for (index, (decided_at, request_id, message)) in recent_rejections.iter().enumerate() {
             let _ = writeln!(
                 report,
-                "pairing_recent_rejection_{}=request_id:{request_id},decided_at:{},message:{}",
+                "pairing_recent_rejection_{}=request_id:{},decided_at:{},message:{}",
                 index + 1,
+                redact_identifier(request_id),
                 decided_at.to_rfc3339(),
                 message.replace('\n', " ")
             );
@@ -288,5 +302,13 @@ impl AppState {
             Err(ClipboardPolicyError::Disabled) => Ok(None),
             Err(error) => Err(anyhow::anyhow!(error)),
         }
+    }
+}
+
+fn redact_identifier(value: &str) -> String {
+    if value == "none" || value.is_empty() {
+        value.to_string()
+    } else {
+        "[redacted-id]".to_string()
     }
 }

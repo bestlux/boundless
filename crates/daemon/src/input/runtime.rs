@@ -12,6 +12,9 @@ pub(super) async fn run(state: AppState) -> Result<()> {
         .set_input_lock_runtime(false, capture_backend.lock_supported())
         .await;
     let mut capture_backend_mode = capture_backend.backend_mode();
+    state
+        .set_input_capture_backend_mode(capture_backend_mode)
+        .await;
     record_local_input_runtime_event(
         &state,
         "input_capture_backend_mode",
@@ -111,6 +114,9 @@ pub(super) async fn run(state: AppState) -> Result<()> {
             let next_mode = capture_backend.backend_mode();
             if next_mode != capture_backend_mode {
                 capture_backend_mode = next_mode;
+                state
+                    .set_input_capture_backend_mode(capture_backend_mode)
+                    .await;
                 record_local_input_runtime_event(
                     &state,
                     "input_capture_backend_mode",

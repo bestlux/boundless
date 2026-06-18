@@ -285,6 +285,30 @@ pub fn ensure_device_identity(
     })
 }
 
+pub fn rotate_device_identity(
+    paths: &SecurityPaths,
+    machine_id: &str,
+    display_name: &str,
+    advertised_host: Option<&str>,
+) -> anyhow::Result<DeviceIdentity> {
+    fs::create_dir_all(&paths.root).with_context(|| format!("create {}", paths.root.display()))?;
+    for path in [
+        &paths.device_secret,
+        &paths.ca_cert_pem,
+        &paths.ca_key_pem,
+        &paths.device_cert_pem,
+        &paths.device_key_pem,
+    ] {
+        if path.exists() {
+            fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+        }
+    }
+    fs::write(&paths.trust_store, "[]")
+        .with_context(|| format!("write {}", paths.trust_store.display()))?;
+    let _ = load_or_create_device_secret(paths)?;
+    ensure_device_identity(paths, machine_id, display_name, advertised_host)
+}
+
 pub fn is_within_root(root: &Path, path: &Path) -> bool {
     path.starts_with(root)
 }
@@ -347,6 +371,34 @@ mod tests {
         assert!(
             records.iter().all(|record| record.machine_id != "peer-a"),
             "removed machine id should not be present"
+        );
+    }
+
+    #[test]
+    fn rotate_device_identity_clears_trust_and_changes_ca() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = SecurityPaths::for_root(dir.path().join("security"));
+        let first = ensure_device_identity(&paths, "machine-1", "Machine One", Some("127.0.0.1"))
+            .expect("identity");
+        upsert_trust_record(
+            &paths,
+            TrustRecord {
+                machine_id: "peer-a".to_string(),
+                ca_cert_pem: "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----"
+                    .to_string(),
+                added_at: Utc::now(),
+            },
+        )
+        .expect("insert trust");
+
+        let second = rotate_device_identity(&paths, "machine-1", "Machine One", Some("127.0.0.1"))
+            .expect("rotate identity");
+
+        assert_ne!(first.ca_cert_pem, second.ca_cert_pem);
+        assert!(
+            load_trust_records(&paths)
+                .expect("trust records")
+                .is_empty()
         );
     }
 }

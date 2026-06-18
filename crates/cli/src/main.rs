@@ -15,11 +15,12 @@ use tokio::time::Instant;
 use ipc_api::boundless::v1::{
     AntiIdleSetRequest, DiagnosticsDumpRequest, Empty, FeatureSetRequest, FileTransferSetRequest,
     HotkeySetRequest, HotkeyTriggerRequest, ImportTrustBundleRequest, InputCaptureTargetRequest,
-    InputOwnerRequest, LayoutSetRequest, NearbyJoinStartRequest, NearbyJoinStatusRequest,
-    NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
-    PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest, SafeResetRequest,
-    SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
-    SendInputMoveRequest, StatusReply, StatusRequest, UiSnapshotReply,
+    InputHandoffSetRequest, InputOwnerRequest, LayoutSetRequest, NearbyJoinStartRequest,
+    NearbyJoinStatusRequest, NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest,
+    NearbySubmitCodeRequest, PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest,
+    RotateTrustRequest, SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest,
+    SendFileRequest, SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest,
+    UiSnapshotReply,
 };
 
 mod cli_helpers;
@@ -64,6 +65,10 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
     },
     Pair {
         #[command(subcommand)]
@@ -114,12 +119,28 @@ enum Command {
         network: bool,
         #[arg(long, default_value_t = false)]
         all: bool,
+        #[arg(long)]
+        confirm: String,
     },
 }
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    Status,
+    Install {
+        #[arg(long)]
+        binary: Option<String>,
+        #[arg(long, default_value_t = false)]
+        auto_start: bool,
+    },
+    Start,
+    Stop,
+    Uninstall,
 }
 
 #[derive(Debug, Subcommand)]
@@ -183,6 +204,10 @@ enum PairCommand {
         #[arg(long)]
         alias: Option<String>,
     },
+    RotateTrust {
+        #[arg(long)]
+        confirm: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -239,8 +264,12 @@ enum FileTransferCommand {
         path: String,
         #[arg(long)]
         organize_by_peer: bool,
-        #[arg(long, default_value_t = true)]
-        auto_accept_trusted_peers: bool,
+        #[arg(long)]
+        no_organize_by_peer: bool,
+        #[arg(long)]
+        auto_accept_trusted_peers: Option<bool>,
+        #[arg(long)]
+        max_file_bytes: Option<u64>,
     },
 }
 
@@ -267,6 +296,7 @@ enum TransportCommand {
 
 #[derive(Debug, Subcommand)]
 enum InputCommand {
+    Status,
     Owner,
     CaptureTarget,
     CaptureStart {
@@ -290,6 +320,19 @@ enum InputCommand {
     },
     Release {
         peer_id: String,
+    },
+    Config,
+    SetConfig {
+        #[arg(long)]
+        block_screen_corners: Option<bool>,
+        #[arg(long)]
+        corner_block_px: Option<u32>,
+        #[arg(long)]
+        relative_mouse: Option<bool>,
+        #[arg(long)]
+        hide_cursor_at_edge: Option<bool>,
+        #[arg(long)]
+        draw_cursor_marker: Option<bool>,
     },
 }
 
@@ -354,6 +397,15 @@ async fn main() -> Result<()> {
         Command::Daemon { command } => match command {
             DaemonCommand::Status => daemon_status(&cli.endpoint).await,
         },
+        Command::Service { command } => match command {
+            ServiceCommand::Status => service_status().await,
+            ServiceCommand::Install { binary, auto_start } => {
+                service_install(binary, auto_start).await
+            }
+            ServiceCommand::Start => service_start().await,
+            ServiceCommand::Stop => service_stop().await,
+            ServiceCommand::Uninstall => service_uninstall().await,
+        },
         Command::Pair { command } => match command {
             PairCommand::Discover => pair_discover(&cli.endpoint).await,
             PairCommand::CreateCode { ttl } => pair_create_code(&cli.endpoint, ttl).await,
@@ -401,6 +453,7 @@ async fn main() -> Result<()> {
             PairCommand::ImportTrust { input, alias } => {
                 pair_import_trust(&cli.endpoint, input, alias).await
             }
+            PairCommand::RotateTrust { confirm } => pair_rotate_trust(&cli.endpoint, confirm).await,
         },
         Command::Peer { command } => match command {
             PeerCommand::List => peer_list(&cli.endpoint).await,
@@ -445,13 +498,17 @@ async fn main() -> Result<()> {
             FileTransferCommand::SetReceiveDir {
                 path,
                 organize_by_peer,
+                no_organize_by_peer,
                 auto_accept_trusted_peers,
+                max_file_bytes,
             } => {
                 file_transfer_set_receive_dir(
                     &cli.endpoint,
                     path,
                     organize_by_peer,
+                    no_organize_by_peer,
                     auto_accept_trusted_peers,
+                    max_file_bytes,
                 )
                 .await
             }
@@ -469,6 +526,7 @@ async fn main() -> Result<()> {
             TransportCommand::Events { limit } => transport_events(&cli.endpoint, limit).await,
         },
         Command::Input { command } => match command {
+            InputCommand::Status => input_status(&cli.endpoint).await,
             InputCommand::Owner => input_owner(&cli.endpoint).await,
             InputCommand::CaptureTarget => input_capture_target(&cli.endpoint).await,
             InputCommand::CaptureStart { peer_id } => {
@@ -487,6 +545,24 @@ async fn main() -> Result<()> {
                 input_claim(&cli.endpoint, peer_id, force).await
             }
             InputCommand::Release { peer_id } => input_release(&cli.endpoint, peer_id).await,
+            InputCommand::Config => input_config(&cli.endpoint).await,
+            InputCommand::SetConfig {
+                block_screen_corners,
+                corner_block_px,
+                relative_mouse,
+                hide_cursor_at_edge,
+                draw_cursor_marker,
+            } => {
+                input_set_config(
+                    &cli.endpoint,
+                    block_screen_corners,
+                    corner_block_px,
+                    relative_mouse,
+                    hide_cursor_at_edge,
+                    draw_cursor_marker,
+                )
+                .await
+            }
         },
         Command::Hotkey { action, combo } => hotkey_set(&cli.endpoint, action, combo).await,
         Command::Diagnostics { command } => match command {
@@ -498,7 +574,11 @@ async fn main() -> Result<()> {
         Command::Ui { command } => match command {
             UiCommand::Snapshot { start_daemon } => ui_snapshot(&cli.endpoint, start_daemon).await,
         },
-        Command::SafeReset { network, all } => safe_reset(&cli.endpoint, network, all).await,
+        Command::SafeReset {
+            network,
+            all,
+            confirm,
+        } => safe_reset(&cli.endpoint, network, all, confirm).await,
     }
 }
 

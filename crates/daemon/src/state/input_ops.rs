@@ -721,6 +721,24 @@ impl AppState {
         (active, supported)
     }
 
+    pub async fn set_input_capture_backend_mode(&self, mode: &str) {
+        *self.input.control.capture_backend_mode.write().await = mode.to_string();
+    }
+
+    pub async fn input_capture_backend_mode(&self) -> String {
+        self.input.control.capture_backend_mode.read().await.clone()
+    }
+
+    pub async fn pending_inject_frame_stats(&self) -> (usize, usize) {
+        let pending = self.input.inject.pending_inject_frames.read().await.len();
+        let high_water = self
+            .input
+            .inject
+            .pending_inject_high_water
+            .load(std::sync::atomic::Ordering::Acquire);
+        (pending, high_water)
+    }
+
     fn auto_claim_input_owner_allowed_now(&self, decision: &RouteDecision) -> (bool, &'static str) {
         match decision {
             RouteDecision::IgnoredNoOwner => (true, "no_owner"),

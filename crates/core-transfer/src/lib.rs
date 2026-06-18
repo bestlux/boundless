@@ -8,14 +8,21 @@ pub const MAX_TRANSFER_BYTES: u64 = 100 * 1024 * 1024;
 pub enum TransferPolicyError {
     #[error("file exceeds transfer limit: {size} > {limit}")]
     FileTooLarge { size: u64, limit: u64 },
+    #[error("transfer limit must be greater than zero")]
+    InvalidLimit,
 }
 
 pub fn validate_transfer_size(size: u64) -> Result<(), TransferPolicyError> {
-    if size > MAX_TRANSFER_BYTES {
-        return Err(TransferPolicyError::FileTooLarge {
-            size,
-            limit: MAX_TRANSFER_BYTES,
-        });
+    validate_transfer_size_with_limit(size, MAX_TRANSFER_BYTES)
+}
+
+pub fn validate_transfer_size_with_limit(size: u64, limit: u64) -> Result<(), TransferPolicyError> {
+    if limit == 0 {
+        return Err(TransferPolicyError::InvalidLimit);
+    }
+
+    if size > limit {
+        return Err(TransferPolicyError::FileTooLarge { size, limit });
     }
 
     Ok(())
@@ -66,6 +73,23 @@ mod tests {
     fn rejects_large_files() {
         let err = validate_transfer_size(MAX_TRANSFER_BYTES + 1).expect_err("must fail");
         assert!(matches!(err, TransferPolicyError::FileTooLarge { .. }));
+    }
+
+    #[test]
+    fn validates_configurable_limit() {
+        validate_transfer_size_with_limit(32, 32).expect("at limit should pass");
+        let err = validate_transfer_size_with_limit(33, 32).expect_err("must fail");
+        assert!(matches!(
+            err,
+            TransferPolicyError::FileTooLarge {
+                size: 33,
+                limit: 32
+            }
+        ));
+        assert!(matches!(
+            validate_transfer_size_with_limit(1, 0),
+            Err(TransferPolicyError::InvalidLimit)
+        ));
     }
 
     #[test]
