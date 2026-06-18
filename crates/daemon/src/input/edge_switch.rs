@@ -2,7 +2,10 @@ use core_input::{EasyMouseMode, InputEvent, SwitchDirection};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-use crate::state::{AppState, CaptureHandoffTarget};
+use crate::{
+    config::InputHandoffConfig,
+    state::{AppState, CaptureHandoffTarget},
+};
 
 use super::{
     EDGE_POSITION_TOLERANCE_PX, EDGE_PRESSURE_THRESHOLD,
@@ -28,6 +31,7 @@ pub(super) fn edge_switch_direction_from_motion(
     events: &[InputEvent],
     state: &mut EdgeSwitchState,
     wrap_mouse: bool,
+    input_handoff: &InputHandoffConfig,
     current_target: Option<&str>,
     cursor_position: Option<(i32, i32)>,
     screen_bounds: Option<VirtualScreenBounds>,
@@ -79,6 +83,9 @@ pub(super) fn edge_switch_direction_from_motion(
 
     if current_target.is_none() {
         let direction = batch_direction(batch_dx, batch_dy, wrap_mouse)?;
+        if is_corner_blocked(direction, input_handoff, cursor_position, screen_bounds) {
+            return None;
+        }
         if !is_local_handoff_edge(direction, cursor_position, screen_bounds) {
             return None;
         }
@@ -105,6 +112,10 @@ pub(super) fn edge_switch_direction_from_motion(
     };
 
     let direction = direction?;
+
+    if is_corner_blocked(direction, input_handoff, cursor_position, screen_bounds) {
+        return None;
+    }
 
     if current_target.is_none() && !is_local_handoff_edge(direction, cursor_position, screen_bounds)
     {
@@ -170,7 +181,7 @@ pub(super) async fn maybe_handoff_capture_target_from_motion(
     cursor_position: Option<(i32, i32)>,
     screen_bounds: Option<VirtualScreenBounds>,
 ) {
-    let (mode, wrap_mouse) = state.edge_switch_policy().await;
+    let (mode, wrap_mouse, input_handoff) = state.edge_switch_policy().await;
     if !matches!(mode, EasyMouseMode::Enable) {
         edge_switch_state.last_direction = None;
         edge_switch_state.x_pressure = 0;
@@ -182,6 +193,7 @@ pub(super) async fn maybe_handoff_capture_target_from_motion(
         events,
         edge_switch_state,
         wrap_mouse,
+        &input_handoff,
         current_target,
         cursor_position,
         screen_bounds,
@@ -297,6 +309,35 @@ fn is_local_handoff_edge(
         SwitchDirection::Right => x >= bounds.right.saturating_sub(EDGE_POSITION_TOLERANCE_PX),
         SwitchDirection::Up => y <= bounds.top.saturating_add(EDGE_POSITION_TOLERANCE_PX),
         SwitchDirection::Down => y >= bounds.bottom.saturating_sub(EDGE_POSITION_TOLERANCE_PX),
+    }
+}
+
+fn is_corner_blocked(
+    direction: SwitchDirection,
+    input_handoff: &InputHandoffConfig,
+    cursor_position: Option<(i32, i32)>,
+    screen_bounds: Option<VirtualScreenBounds>,
+) -> bool {
+    if !input_handoff.block_screen_corners || input_handoff.corner_block_px == 0 {
+        return false;
+    }
+
+    let Some((x, y)) = cursor_position else {
+        return false;
+    };
+    let Some(bounds) = screen_bounds else {
+        return false;
+    };
+
+    let corner = input_handoff.corner_block_px as i32;
+    let near_left = x <= bounds.left.saturating_add(corner);
+    let near_right = x >= bounds.right.saturating_sub(corner);
+    let near_top = y <= bounds.top.saturating_add(corner);
+    let near_bottom = y >= bounds.bottom.saturating_sub(corner);
+
+    match direction {
+        SwitchDirection::Left | SwitchDirection::Right => near_top || near_bottom,
+        SwitchDirection::Up | SwitchDirection::Down => near_left || near_right,
     }
 }
 

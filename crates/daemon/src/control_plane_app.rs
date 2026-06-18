@@ -9,21 +9,27 @@ use app_services::{
         InputCaptureTargetReply, InputOwnerCommand, InputOwnerReply, LayoutReply, LayoutSetCommand,
         NearbyJoinStartCommand, NearbyJoinStatusCommand, NearbyPairingDecisionCommand,
         NearbyRequestCodeCommand, NearbySubmitCodeCommand, OperationReply, PairJoinCommand,
-        PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, SafeResetCommand,
-        SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand,
-        SendInputMoveCommand, SetAntiIdleConfigCommand,
+        PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, RotateTrustCommand,
+        SafeResetCommand, SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand,
+        SendInputKeyCommand, SendInputMoveCommand, SetAntiIdleConfigCommand,
+        SetFileTransferConfigCommand, SetInputHandoffConfigCommand,
     },
     queries::{
-        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot, NearbyJoinStatusSnapshot,
-        NearbyPairingCompletionSnapshot, NearbyRequestCodeStartSnapshot, StatusSnapshot,
-        TransportEventSnapshot, TrustBundleSnapshot, UiDiscoveredPeer, UiPairedPeer,
-        UiPendingRequest, UiSnapshot,
+        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
+        FileTransferConfigSnapshot, InputHandoffConfigSnapshot, InputRuntimeSnapshot,
+        NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot, NearbyRequestCodeStartSnapshot,
+        StatusSnapshot, TransportEventSnapshot, TrustBundleSnapshot, UiDiscoveredPeer,
+        UiPairedPeer, UiPendingRequest, UiSnapshot,
     },
 };
 use async_trait::async_trait;
 use core_security::TrustBundle;
 
-use crate::{config::ApiTransport, pairing_wire, state::AppState};
+use crate::{
+    config::{ApiTransport, FileTransferConfig, InputHandoffConfig},
+    pairing_wire,
+    state::AppState,
+};
 
 #[derive(Clone)]
 pub struct DaemonControlPlaneApp {
@@ -159,6 +165,68 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         })
     }
 
+    async fn file_transfer_config(&self) -> Result<FileTransferConfigSnapshot> {
+        Ok(build_file_transfer_config_snapshot(
+            self.state.file_transfer_config().await,
+        ))
+    }
+
+    async fn set_file_transfer_config(
+        &self,
+        command: SetFileTransferConfigCommand,
+    ) -> Result<OperationReply> {
+        let current = self.state.file_transfer_config().await;
+        let max_file_bytes = if command.max_file_bytes == 0 {
+            current.max_file_bytes
+        } else {
+            command.max_file_bytes
+        };
+        self.state
+            .update_file_transfer_config(FileTransferConfig {
+                receive_dir: command.receive_dir.clone(),
+                organize_by_peer: command.organize_by_peer,
+                auto_accept_trusted_peers: command.auto_accept_trusted_peers,
+                max_file_bytes,
+            })
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: format!(
+                "file_transfer receive_dir={} organize_by_peer={} auto_accept_trusted_peers={} max_file_bytes={}",
+                command.receive_dir,
+                command.organize_by_peer,
+                command.auto_accept_trusted_peers,
+                max_file_bytes
+            ),
+        })
+    }
+
+    async fn set_input_handoff_config(
+        &self,
+        command: SetInputHandoffConfigCommand,
+    ) -> Result<OperationReply> {
+        self.state
+            .update_input_handoff_config(InputHandoffConfig {
+                block_screen_corners: command.block_screen_corners,
+                corner_block_px: command.corner_block_px,
+                relative_mouse: command.relative_mouse,
+                hide_cursor_at_edge: command.hide_cursor_at_edge,
+                draw_cursor_marker: command.draw_cursor_marker,
+            })
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: format!(
+                "input_handoff block_screen_corners={} corner_block_px={} relative_mouse={} hide_cursor_at_edge={} draw_cursor_marker={}",
+                command.block_screen_corners,
+                command.corner_block_px,
+                command.relative_mouse,
+                command.hide_cursor_at_edge,
+                command.draw_cursor_marker
+            ),
+        })
+    }
+
     async fn set_hotkey(&self, command: HotkeySetCommand) -> Result<OperationReply> {
         self.state
             .set_hotkey(command.action.clone(), command.combo.clone())
@@ -209,6 +277,16 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         })
     }
 
+    async fn rotate_trust(&self, command: RotateTrustCommand) -> Result<OperationReply> {
+        let machine_id = self.state.snapshot().await.machine_id;
+        let expected = format!("rotate-trust:{machine_id}");
+        if command.confirm != expected {
+            anyhow::bail!("typed confirmation required: --confirm {expected}");
+        }
+        let message = self.state.rotate_trust().await?;
+        Ok(OperationReply { ok: true, message })
+    }
+
     async fn dump_diagnostics(
         &self,
         command: DiagnosticsDumpCommand,
@@ -218,6 +296,17 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
     }
 
     async fn safe_reset(&self, command: SafeResetCommand) -> Result<OperationReply> {
+        let machine_id = self.state.snapshot().await.machine_id;
+        let expected = if command.all {
+            format!("safe-reset-all:{machine_id}")
+        } else if command.network_only {
+            format!("safe-reset-network:{machine_id}")
+        } else {
+            format!("safe-reset-runtime:{machine_id}")
+        };
+        if command.confirm != expected {
+            anyhow::bail!("typed confirmation required: --confirm {expected}");
+        }
         self.state
             .safe_reset(command.network_only, command.all)
             .await?;
@@ -542,17 +631,25 @@ async fn build_ui_snapshot(state: &AppState) -> Result<UiSnapshot> {
     let paired_peers = build_paired_peers(&bundle);
     let discovered_peers = build_discovered_peers(&bundle, &paired_peers);
     let pending_requests = build_pending_requests(&bundle);
+    let input_runtime = build_input_runtime_snapshot(&bundle);
 
     Ok(UiSnapshot {
         generated_at: chrono::Utc::now().to_rfc3339(),
         daemon_online: true,
-        machine_id: bundle.config.machine_id,
+        machine_id: bundle.config.machine_id.clone(),
         layout_matrix: bundle.layout_matrix,
+        features: bundle.features.clone(),
+        hotkeys: bundle.config.hotkeys.clone(),
         discovered_peers,
         paired_peers,
         pending_requests,
-        anti_idle_config: build_anti_idle_config_snapshot(bundle.anti_idle_config),
+        anti_idle_config: build_anti_idle_config_snapshot(bundle.anti_idle_config.clone()),
         anti_idle_status: build_anti_idle_status_snapshot(bundle.anti_idle_runtime),
+        input_handoff_config: build_input_handoff_config_snapshot(
+            bundle.input_handoff_config.clone(),
+        ),
+        input_runtime,
+        file_transfer_config: build_file_transfer_config_snapshot(bundle.config.file_transfer),
     })
 }
 
@@ -569,6 +666,7 @@ fn build_console_snapshot_from_bundle(
     let discovered_peers = build_discovered_peers(&bundle, &paired_peers);
     let pending_requests = build_pending_requests(&bundle);
     let features = bundle.features.clone();
+    let input_runtime = build_input_runtime_snapshot(&bundle);
 
     ConsoleSnapshot {
         status,
@@ -593,8 +691,13 @@ fn build_console_snapshot_from_bundle(
         input_capture_target_peer_id: bundle.input_capture_target_peer_id,
         mdns_active: bundle.mdns_active,
         local_display_name: bundle.config.device_name,
-        anti_idle_config: build_anti_idle_config_snapshot(bundle.anti_idle_config),
+        anti_idle_config: build_anti_idle_config_snapshot(bundle.anti_idle_config.clone()),
         anti_idle_status: build_anti_idle_status_snapshot(bundle.anti_idle_runtime),
+        input_handoff_config: build_input_handoff_config_snapshot(
+            bundle.input_handoff_config.clone(),
+        ),
+        input_runtime,
+        file_transfer_config: build_file_transfer_config_snapshot(bundle.config.file_transfer),
     }
 }
 
@@ -621,18 +724,120 @@ fn build_anti_idle_status_snapshot(
     }
 }
 
+fn build_file_transfer_config_snapshot(
+    config: crate::config::FileTransferConfig,
+) -> FileTransferConfigSnapshot {
+    FileTransferConfigSnapshot {
+        receive_dir: config.receive_dir,
+        organize_by_peer: config.organize_by_peer,
+        auto_accept_trusted_peers: config.auto_accept_trusted_peers,
+        max_file_bytes: config.max_file_bytes,
+    }
+}
+
+fn build_input_handoff_config_snapshot(
+    config: crate::config::InputHandoffConfig,
+) -> InputHandoffConfigSnapshot {
+    InputHandoffConfigSnapshot {
+        block_screen_corners: config.block_screen_corners,
+        corner_block_px: config.corner_block_px,
+        relative_mouse: config.relative_mouse,
+        hide_cursor_at_edge: config.hide_cursor_at_edge,
+        draw_cursor_marker: config.draw_cursor_marker,
+    }
+}
+
+fn build_input_runtime_snapshot(
+    bundle: &crate::state::ControlPlaneSnapshotBundle,
+) -> InputRuntimeSnapshot {
+    InputRuntimeSnapshot {
+        owner_peer_id: bundle.input_owner_peer_id.clone(),
+        configured_capture_target_peer_id: bundle.input_capture_target_peer_id.clone(),
+        active_capture_target_peer_id: bundle.active_input_capture_target_peer_id.clone(),
+        lock_active: bundle.input_locked,
+        lock_supported: bundle.input_lock_supported,
+        capture_backend_mode: bundle.input_capture_backend_mode.clone(),
+        pending_inject_frames: bundle.pending_inject_frames,
+        pending_inject_high_water: bundle.pending_inject_high_water,
+    }
+}
+
 fn build_paired_peers(bundle: &crate::state::ControlPlaneSnapshotBundle) -> Vec<UiPairedPeer> {
     bundle
         .peers
         .clone()
         .into_iter()
         .map(|peer| UiPairedPeer {
+            health_state: peer_health_state(bundle, &peer),
+            health_reason: peer_health_reason(bundle, &peer),
             peer_id: peer.peer_id,
             display_name: peer.display_name,
             address: peer.address,
             connected: peer.connected,
         })
         .collect()
+}
+
+fn peer_health_state(
+    bundle: &crate::state::ControlPlaneSnapshotBundle,
+    peer: &crate::config::PeerConfig,
+) -> String {
+    if peer.connected {
+        return "connected".to_string();
+    }
+    peer_health_event(bundle, peer)
+        .map(|event| match event.kind.as_str() {
+            "peer_reconnect_requested" | "peers_reconnect_requested" => "reconnecting",
+            "transport_trust_error" => "trust_error",
+            "transport_protocol_mismatch" => "protocol_mismatch",
+            "transport_firewall_suspect" => "firewall_suspect",
+            "transport_service_issue" => "service_issue",
+            _ => "disconnected",
+        })
+        .unwrap_or("disconnected")
+        .to_string()
+}
+
+fn peer_health_reason(
+    bundle: &crate::state::ControlPlaneSnapshotBundle,
+    peer: &crate::config::PeerConfig,
+) -> String {
+    if peer.connected {
+        return "peer is connected".to_string();
+    }
+    peer_health_event(bundle, peer)
+        .map(|event| match event.kind.as_str() {
+            "peer_reconnect_requested" | "peers_reconnect_requested" => {
+                "manual or automatic reconnect requested".to_string()
+            }
+            "transport_trust_error" => "transport reported a trust failure".to_string(),
+            "transport_protocol_mismatch" => "transport reported a protocol mismatch".to_string(),
+            "transport_firewall_suspect" => {
+                "transport reported a firewall or reachability suspect".to_string()
+            }
+            "transport_service_issue" => "service mode issue reported".to_string(),
+            _ => "peer is disconnected; no classified transport failure is available".to_string(),
+        })
+        .unwrap_or_else(|| "no recent peer health event".to_string())
+}
+
+fn peer_health_event<'a>(
+    bundle: &'a crate::state::ControlPlaneSnapshotBundle,
+    peer: &crate::config::PeerConfig,
+) -> Option<&'a crate::state::TransportEventRecord> {
+    bundle.transport_events.iter().rev().find(|event| {
+        (event.peer_id == peer.peer_id
+            || (event.peer_id == "all" && event.kind == "peers_reconnect_requested"))
+            && matches!(
+                event.kind.as_str(),
+                "peer_reconnect_requested"
+                    | "peers_reconnect_requested"
+                    | "transport_trust_error"
+                    | "transport_protocol_mismatch"
+                    | "transport_firewall_suspect"
+                    | "transport_service_issue"
+            )
+    })
 }
 
 fn build_discovered_peers(
@@ -702,5 +907,121 @@ fn map_nearby_join_status(result: pairing_wire::NearbyJoinStatus) -> NearbyJoinS
         status: result.status.as_str().to_string(),
         message: result.message,
         peer_machine_id: result.peer_machine_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rotate_trust_requires_machine_typed_confirmation() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-control-plane-rotate-trust-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+        let machine_id = state.snapshot().await.machine_id;
+        let app = DaemonControlPlaneApp::new(state);
+
+        let err = app
+            .rotate_trust(RotateTrustCommand {
+                confirm: "rotate-trust:wrong-machine".to_string(),
+            })
+            .await
+            .expect_err("wrong confirmation should fail");
+        assert!(
+            err.to_string()
+                .contains(&format!("--confirm rotate-trust:{machine_id}")),
+            "error should include exact confirmation token"
+        );
+
+        let reply = app
+            .rotate_trust(RotateTrustCommand {
+                confirm: format!("rotate-trust:{machine_id}"),
+            })
+            .await
+            .expect("matching confirmation should rotate trust");
+        assert!(reply.ok);
+        assert!(reply.message.contains("restart_required=true"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn safe_reset_requires_typed_confirmation() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-control-plane-safe-reset-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+        let machine_id = state.snapshot().await.machine_id;
+        let app = DaemonControlPlaneApp::new(state);
+
+        let err = app
+            .safe_reset(SafeResetCommand {
+                network_only: true,
+                all: false,
+                confirm: "safe-reset-network:wrong-machine".to_string(),
+            })
+            .await
+            .expect_err("wrong confirmation should fail");
+        assert!(
+            err.to_string()
+                .contains(&format!("--confirm safe-reset-network:{machine_id}")),
+            "error should include exact confirmation token"
+        );
+
+        let reply = app
+            .safe_reset(SafeResetCommand {
+                network_only: true,
+                all: false,
+                confirm: format!("safe-reset-network:{machine_id}"),
+            })
+            .await
+            .expect("matching confirmation should reset network");
+        assert!(reply.ok);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn all_peer_reconnect_surfaces_reconnecting_health_per_peer() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-control-plane-peer-health-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        for (port, alias) in [(15100, "left"), (15101, "right")] {
+            let (code, _) = state.create_pairing_code(120).await;
+            state
+                .join_peer(code, format!("127.0.0.1:{port}"), Some(alias.to_string()))
+                .await
+                .expect("join peer");
+        }
+        state
+            .request_all_peers_reconnect_and_reset()
+            .await
+            .expect("reconnect all peers");
+
+        let app = DaemonControlPlaneApp::new(state);
+        let peers = app.list_peers().await.expect("list peers");
+        assert_eq!(peers.len(), 2);
+        assert!(
+            peers.iter().all(|peer| peer.health_state == "reconnecting"),
+            "all-peer reconnect event should apply to every paired peer"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

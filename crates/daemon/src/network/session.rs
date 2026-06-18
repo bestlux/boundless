@@ -4,6 +4,7 @@ use chrono::Utc;
 use peer_transport::{
     DEFAULT_TRANSPORT_TUNING, InboundClipboardImageTransfer, InboundTransfer,
     OutboundTransferFlows, apply_outbound_chunk_credits, reconnect_generation_advanced,
+    remove_outbound_transfer_flow,
 };
 
 use crate::state::TransportEventRecord;
@@ -539,6 +540,19 @@ where
                                 .context("flush outbound bulk after receiving file chunk credit")?;
                         }
                     }
+                    WireMessage::FileTransferRejected {
+                        transfer_id,
+                        reason,
+                    } => {
+                        handle_file_transfer_rejected(
+                            &state,
+                            remote_peer_id.as_deref(),
+                            transfer_id,
+                            reason,
+                            &mut outbound_transfer_flow,
+                        )
+                        .await;
+                    }
                     WireMessage::FileEnd { transfer_id } => {
                         handle_file_end(&state, transfer_id, &mut inbound_transfers).await?;
                     }
@@ -588,6 +602,29 @@ pub(super) async fn reconnect_requested_for_peer(
 ) -> bool {
     let current_generation = state.peer_reconnect_generation(peer_id).await;
     reconnect_generation_advanced(observed_generation, current_generation)
+}
+
+pub(super) async fn handle_file_transfer_rejected(
+    state: &AppState,
+    remote_peer_id: Option<&str>,
+    transfer_id: String,
+    reason: String,
+    outbound_transfer_flow: &mut OutboundTransferFlows,
+) {
+    remove_outbound_transfer_flow(outbound_transfer_flow, &transfer_id);
+    if let Some(peer_id) = remote_peer_id {
+        state
+            .remove_queued_file_transfer(peer_id, &transfer_id)
+            .await;
+        state.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "outgoing".to_string(),
+            kind: "file_transfer_rejected".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("transfer_id={transfer_id} reason={reason}"),
+            size_bytes: 0,
+        });
+    }
 }
 
 async fn authenticated_peer_machine_id<S>(

@@ -668,6 +668,9 @@ try {
         $sampleFile = Join-Path $runRoot "sample-transfer.txt"
         Set-Content -Path $sampleFile -Value "smoke-file-payload" -NoNewline
 
+        Write-Host "[smoke] enabling explicit file receive policy on node2"
+        Invoke-CliChecked -Endpoint $node2Endpoint -CommandArgs @("file-transfer", "set-receive-dir", $node2Inbox, "--organize-by-peer", "--auto-accept-trusted-peers", "true") | Out-Host
+
         Write-Host "[smoke] sending file payload from node1 to node2"
         Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-file", $node1PeerId, $sampleFile) | Out-Host
 

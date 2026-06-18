@@ -46,7 +46,7 @@ jobs:
 
       - name: Checkout main
         if: github.event_name == 'push'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
 
@@ -58,7 +58,7 @@ jobs:
       - name: Release Please
         if: github.event_name == 'push'
         id: release
-        uses: googleapis/release-please-action@16a9c90856f42705d54a6fda1823352bdc62cf38
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7
         with:
           token: ${{ env.RELEASE_PLEASE_TOKEN != '' && env.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
@@ -84,14 +84,14 @@ jobs:
       contents: read
     steps:
       - name: Checkout release tooling
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
           path: .release-tooling
           ref: ${{ github.sha }}
 
       - name: Checkout release source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
           path: source
@@ -138,14 +138,14 @@ jobs:
     environment: release
     steps:
       - name: Checkout release tooling
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
           path: .release-tooling
           ref: ${{ github.sha }}
 
       - name: Checkout release source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
           path: source
@@ -184,6 +184,7 @@ jobs:
             -RequireSigning:$requireSigning `
             -Files @(
               "target/release/boundlessd.exe",
+              "target/release/boundless-service.exe",
               "target/release/boundlessctl.exe",
               "target/release/boundlesstray.exe"
             )
@@ -198,6 +199,7 @@ jobs:
             -RepoRoot (Resolve-Path source).Path `
             -Version $version `
             -DaemonPath "source/target/release/boundlessd.exe" `
+            -ServicePath "source/target/release/boundless-service.exe" `
             -CliPath "source/target/release/boundlessctl.exe" `
             -TrayPath "source/target/release/boundlesstray.exe" `
             -OutputPath $outputPath
@@ -235,7 +237,7 @@ jobs:
 
   validate-windows-installer:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     needs:
       - release-context
       - build-windows
@@ -244,11 +246,21 @@ jobs:
       contents: read
     steps:
       - name: Checkout release tooling
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
           path: .release-tooling
           ref: ${{ github.sha }}
+
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+          path: source
+          ref: ${{ needs.release-context.outputs.source_ref }}
+
+      - name: Setup Rust
+        uses: ./.release-tooling/.github/actions/setup-rust
 
       - name: Download Windows installer
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -269,7 +281,25 @@ jobs:
           ./.release-tooling/scripts/dev/installer-smoke.ps1 `
             -InstallerPath $installer `
             -OutputRoot (Join-Path (Resolve-Path .).Path "artifacts/installer-validation") `
-            -RequireSignature:$requireSignature
+            -RequireSignature:$requireSignature `
+            -KeepArtifacts
+
+      - name: Write v5 readiness packet
+        shell: pwsh
+        run: |
+          ./.release-tooling/scripts/dev/v5-readiness.ps1 `
+            -RepoRoot (Resolve-Path source).Path `
+            -OutputRoot (Join-Path (Resolve-Path .).Path "artifacts/v5-readiness") `
+            -InstallerSmokeSummaryPath (Join-Path (Resolve-Path .).Path "artifacts/installer-validation/installer-smoke.json") `
+            -ReleaseVersion "${{ needs.release-context.outputs.tag_name }}" `
+            -RequireReady
+
+      - name: Upload v5 readiness packet
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: v5-readiness
+          path: artifacts/v5-readiness
 
   publish:
     runs-on: ubuntu-latest
@@ -290,22 +320,29 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Checkout release tooling
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
           path: .release-tooling
           ref: ${{ github.sha }}
 
       - name: Checkout release source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
           path: source
           ref: ${{ needs.release-context.outputs.source_ref }}
 
-      - name: Download release artifacts
+      - name: Download Windows release artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
+          name: boundless-windows-x64
+          path: dist/boundless-windows-x64
+
+      - name: Download Linux release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: boundless-linux-x64
           path: dist
 
       - name: Normalize artifact layout

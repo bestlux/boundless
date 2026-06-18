@@ -31,14 +31,7 @@ impl AppState {
             },
         )?;
 
-        let inbox_root = if let Ok(path) = std::env::var("BOUNDLESS_INBOX_ROOT") {
-            PathBuf::from(path)
-        } else {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("Boundless")
-                .join("inbox")
-        };
+        let inbox_root = PathBuf::from(&config.file_transfer.receive_dir);
         std::fs::create_dir_all(&inbox_root)?;
 
         let fingerprint = fingerprint(&secret);
@@ -65,7 +58,7 @@ impl AppState {
             security_paths: Arc::new(paths),
             identity: Arc::new(identity),
             device_fingerprint: Arc::new(fingerprint),
-            inbox_root: Arc::new(inbox_root),
+            trust_rotation_pending_restart: Arc::new(AtomicBool::new(false)),
             parsed_layout_matrix_cache: Arc::new(RwLock::new(None)),
             input_capture_wake: Arc::new(RuntimeWakeSignal::default()),
             input_inject_wake: Arc::new(RuntimeWakeSignal::default()),
@@ -81,12 +74,36 @@ impl AppState {
         self.identity.as_ref()
     }
 
+    pub fn trust_rotation_pending_restart(&self) -> bool {
+        self.trust_rotation_pending_restart.load(Ordering::Acquire)
+    }
+
+    pub fn ensure_trust_rotation_not_pending(&self) -> Result<()> {
+        if self.trust_rotation_pending_restart() {
+            anyhow::bail!(
+                "trust rotation is pending daemon restart; restart before pairing or trust changes"
+            );
+        }
+        Ok(())
+    }
+
     pub async fn trusted_records(&self) -> Result<Vec<TrustRecord>> {
         load_trust_records(&self.security_paths)
     }
 
     pub async fn export_trust_bundle(&self) -> Result<TrustBundle> {
+        if self.trust_rotation_pending_restart() {
+            anyhow::bail!(
+                "trust rotation is pending daemon restart; restart before exporting trust"
+            );
+        }
+
         let snapshot = self.snapshot().await;
+        if self.trust_rotation_pending_restart() {
+            anyhow::bail!(
+                "trust rotation is pending daemon restart; restart before exporting trust"
+            );
+        }
 
         let advertised_host = std::env::var("BOUNDLESS_ADVERTISE_HOST")
             .ok()
@@ -106,8 +123,11 @@ impl AppState {
         bundle: TrustBundle,
         alias: Option<String>,
     ) -> Result<()> {
+        self.ensure_trust_rotation_not_pending()?;
         validate_ca_cert_pem(&bundle.ca_cert_pem)?;
-        let default_port = self.config.read().await.network_port;
+        let mut config = self.config.write().await;
+        self.ensure_trust_rotation_not_pending()?;
+        let default_port = config.network_port;
         let normalized_address = normalize_peer_address(&bundle.network_address, default_port)?;
 
         upsert_trust_record(
@@ -118,8 +138,6 @@ impl AppState {
                 added_at: Utc::now(),
             },
         )?;
-
-        let mut config = self.config.write().await;
 
         if let Some(peer) = config
             .peers

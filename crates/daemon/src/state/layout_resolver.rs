@@ -79,14 +79,23 @@ pub(super) fn resolve_capture_handoff_target_from_matrix(
             .cloned()
     };
 
-    let token_to_target = |token: String| -> Option<CaptureHandoffTarget> {
+    enum ScannedLayoutToken {
+        Empty,
+        Target(CaptureHandoffTarget),
+        Blocked,
+    }
+
+    let token_to_target = |token: String| -> ScannedLayoutToken {
         if token.trim().is_empty() {
-            return None;
+            return ScannedLayoutToken::Empty;
         }
         if is_local_layout_token(&token, config) {
-            return Some(CaptureHandoffTarget::Local);
+            return ScannedLayoutToken::Target(CaptureHandoffTarget::Local);
         }
-        resolve_peer_layout_token(&token, &config.peers).map(CaptureHandoffTarget::Peer)
+        match resolve_peer_layout_token(&token, &config.peers) {
+            Some(peer_id) => ScannedLayoutToken::Target(CaptureHandoffTarget::Peer(peer_id)),
+            None => ScannedLayoutToken::Blocked,
+        }
     };
 
     match direction {
@@ -95,8 +104,10 @@ pub(super) fn resolve_capture_handoff_target_from_matrix(
                 let Some(token) = token_at(row, next_column) else {
                     continue;
                 };
-                if let Some(target) = token_to_target(token) {
-                    return Some(target);
+                match token_to_target(token) {
+                    ScannedLayoutToken::Empty => continue,
+                    ScannedLayoutToken::Target(target) => return Some(target),
+                    ScannedLayoutToken::Blocked => return None,
                 }
             }
             None
@@ -110,8 +121,10 @@ pub(super) fn resolve_capture_handoff_target_from_matrix(
                 let Some(token) = token_at(row, next_column) else {
                     continue;
                 };
-                if let Some(target) = token_to_target(token) {
-                    return Some(target);
+                match token_to_target(token) {
+                    ScannedLayoutToken::Empty => continue,
+                    ScannedLayoutToken::Target(target) => return Some(target),
+                    ScannedLayoutToken::Blocked => return None,
                 }
             }
             None
@@ -121,8 +134,10 @@ pub(super) fn resolve_capture_handoff_target_from_matrix(
                 let Some(token) = token_at(next_row, column) else {
                     continue;
                 };
-                if let Some(target) = token_to_target(token) {
-                    return Some(target);
+                match token_to_target(token) {
+                    ScannedLayoutToken::Empty => continue,
+                    ScannedLayoutToken::Target(target) => return Some(target),
+                    ScannedLayoutToken::Blocked => return None,
                 }
             }
             None
@@ -132,8 +147,10 @@ pub(super) fn resolve_capture_handoff_target_from_matrix(
                 let Some(token) = token_at(next_row, column) else {
                     continue;
                 };
-                if let Some(target) = token_to_target(token) {
-                    return Some(target);
+                match token_to_target(token) {
+                    ScannedLayoutToken::Empty => continue,
+                    ScannedLayoutToken::Target(target) => return Some(target),
+                    ScannedLayoutToken::Blocked => return None,
                 }
             }
             None

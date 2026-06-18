@@ -1,3 +1,5 @@
+use sha2::{Digest, Sha256};
+
 use super::*;
 
 #[derive(Debug)]
@@ -649,7 +651,7 @@ impl AppState {
             .await
             .map_err(anyhow::Error::from)?;
         let total_bytes = metadata.len();
-        validate_transfer_size(total_bytes)?;
+        validate_transfer_size_with_limit(total_bytes, self.file_transfer_max_bytes().await)?;
 
         let transfer_id = uuid::Uuid::new_v4().to_string();
         let source_path = file_path.to_path_buf();
@@ -739,6 +741,18 @@ impl AppState {
 
         drained.shrink_to_fit();
         drained
+    }
+
+    pub async fn remove_queued_file_transfer(&self, peer_id: &str, transfer_id: &str) {
+        let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
+        let Some(queue) = queue_map.get_mut(peer_id) else {
+            return;
+        };
+
+        queue.retain(|payload| !outbound_payload_has_transfer_id(payload, transfer_id));
+        if queue.is_empty() {
+            queue_map.remove(peer_id);
+        }
     }
 
     #[cfg(test)]
@@ -914,10 +928,13 @@ impl AppState {
         file_name: &str,
         bytes: Vec<u8>,
     ) -> Result<PathBuf> {
-        validate_transfer_size(bytes.len() as u64)?;
+        validate_transfer_size_with_limit(
+            bytes.len() as u64,
+            self.file_transfer_max_bytes().await,
+        )?;
         let sanitized_name = sanitize_incoming_file_name(file_name)?;
 
-        let peer_dir = self.inbox_root.join(peer_id);
+        let peer_dir = self.receive_dir_for_peer(peer_id).await;
         tokio::fs::create_dir_all(&peer_dir).await?;
 
         let final_path = resolve_conflict_path(&peer_dir, &sanitized_name);
@@ -931,7 +948,7 @@ impl AppState {
             direction: "incoming".to_string(),
             kind: "file".to_string(),
             peer_id: peer_id.to_string(),
-            detail: final_path.display().to_string(),
+            detail: sanitized_name.clone(),
             size_bytes: tokio::fs::metadata(&final_path).await?.len(),
         });
 
@@ -945,10 +962,10 @@ impl AppState {
         temp_path: &Path,
         size_bytes: u64,
     ) -> Result<PathBuf> {
-        validate_transfer_size(size_bytes)?;
+        validate_transfer_size_with_limit(size_bytes, self.file_transfer_max_bytes().await)?;
         let sanitized_name = sanitize_incoming_file_name(file_name)?;
 
-        let peer_dir = self.inbox_root.join(peer_id);
+        let peer_dir = self.receive_dir_for_peer(peer_id).await;
         tokio::fs::create_dir_all(&peer_dir).await?;
 
         let final_path = resolve_conflict_path(&peer_dir, &sanitized_name);
@@ -969,11 +986,21 @@ impl AppState {
             direction: "incoming".to_string(),
             kind: "file".to_string(),
             peer_id: peer_id.to_string(),
-            detail: final_path.display().to_string(),
+            detail: sanitized_name,
             size_bytes,
         });
 
         Ok(final_path)
+    }
+
+    async fn receive_dir_for_peer(&self, peer_id: &str) -> PathBuf {
+        let file_transfer = self.config.read().await.file_transfer.clone();
+        let receive_dir = PathBuf::from(file_transfer.receive_dir);
+        if file_transfer.organize_by_peer {
+            receive_dir.join(filesystem_safe_peer_dir_name(peer_id))
+        } else {
+            receive_dir
+        }
     }
 
     pub async fn record_outgoing_file(&self, peer_id: &str, file_name: &str, size_bytes: u64) {
@@ -1007,4 +1034,26 @@ impl AppState {
             size_bytes: event_count as u64,
         });
     }
+}
+
+fn outbound_payload_has_transfer_id(payload: &OutboundPayload, expected_transfer_id: &str) -> bool {
+    match payload {
+        OutboundPayload::FileStart { transfer_id, .. }
+        | OutboundPayload::FileChunk { transfer_id, .. }
+        | OutboundPayload::FileEnd { transfer_id, .. } => transfer_id == expected_transfer_id,
+        _ => false,
+    }
+}
+
+fn filesystem_safe_peer_dir_name(peer_id: &str) -> String {
+    let digest = Sha256::digest(peer_id.as_bytes());
+    format!("peer-{}", bytes_to_hex(&digest[..16]))
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }

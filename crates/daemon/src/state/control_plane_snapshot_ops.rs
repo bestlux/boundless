@@ -8,6 +8,7 @@ impl AppState {
         let layout_matrix = config.layout_matrix.clone();
         let features = config.features.clone();
         let anti_idle_config = config.anti_idle.clone();
+        let input_handoff_config = config.input_handoff.clone();
 
         let (
             discovered_endpoints,
@@ -18,6 +19,8 @@ impl AppState {
             input_lock_runtime,
             mdns_active,
             anti_idle_runtime,
+            input_capture_backend_mode,
+            pending_inject_stats,
         ) = tokio::join!(
             self.discovered_endpoints(),
             self.list_pending_nearby_pairing_requests(),
@@ -27,9 +30,12 @@ impl AppState {
             self.input_lock_runtime(),
             self.mdns_active(),
             self.async_anti_idle_runtime_state(),
+            self.input_capture_backend_mode(),
+            self.pending_inject_frame_stats(),
         );
 
         let (input_locked, input_lock_supported) = input_lock_runtime;
+        let (pending_inject_frames, pending_inject_high_water) = pending_inject_stats;
         let active_input_capture_target_peer_id = input_capture_target_peer_id
             .as_deref()
             .and_then(|target| active_input_capture_target_from_config(&config, target));
@@ -50,6 +56,10 @@ impl AppState {
             mdns_active,
             anti_idle_config,
             anti_idle_runtime,
+            input_handoff_config,
+            input_capture_backend_mode,
+            pending_inject_frames,
+            pending_inject_high_water,
         }
     }
 

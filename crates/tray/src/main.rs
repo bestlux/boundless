@@ -14,22 +14,29 @@ fn main() -> anyhow::Result<()> {
 mod windows_app {
     use anyhow::{Context, Result, bail};
     use app_services::desktop::{
-        CANONICAL_LOCAL_LAYOUT_TOKEN, host_and_pairing_port_from_endpoint,
+        CANONICAL_LOCAL_LAYOUT_TOKEN, LayoutPeerToken, host_and_pairing_port_from_endpoint,
         is_local_layout_token as shared_is_local_layout_token, parse_pairing_port,
         resolve_boundlessd_candidates, serialize_layout_matrix, spawn_boundlessd_process,
-        terminate_boundlessd_processes, validate_layout_before_apply,
+        terminate_boundlessd_processes, validate_layout_matrix_spec,
     };
     use clap::Parser;
-    use control_plane_client::{channel, connect_control_plane, default_endpoint};
+    use control_plane_client::{
+        channel, connect_control_plane, default_endpoint, has_access_denied_io_error,
+        is_named_pipe_endpoint,
+    };
     use eframe::icon_data;
     use image::ImageFormat;
     use ipc_api::boundless::v1::{
-        AntiIdleSetRequest, Empty, HotkeyTriggerRequest, LayoutSetRequest,
+        AntiIdleSetRequest, Empty, FeatureSetRequest, FileTransferSetRequest, HotkeySetRequest,
+        HotkeyTriggerRequest, InputHandoffSetRequest, LayoutSetRequest,
         NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
+        SafeResetRequest, SendFileRequest,
     };
     use serde::Deserialize;
     use std::{
+        collections::BTreeMap,
         future::Future,
+        process::Command as ProcessCommand,
         time::{Duration, Instant},
     };
     use tray_icon::{
@@ -71,11 +78,16 @@ mod windows_app {
         daemon_online: bool,
         machine_id: String,
         layout_matrix: String,
+        features: BTreeMap<String, bool>,
+        hotkeys: BTreeMap<String, String>,
         discovered_peers: Vec<UiDiscoveredPeer>,
         paired_peers: Vec<UiPairedPeer>,
         pending_requests: Vec<UiPendingRequest>,
         anti_idle_config: UiAntiIdleConfig,
         anti_idle_status: UiAntiIdleStatus,
+        file_transfer_config: UiFileTransferConfig,
+        input_handoff_config: UiInputHandoffConfig,
+        input_runtime: UiInputRuntime,
     }
 
     #[derive(Debug, Clone, Deserialize, Default)]
@@ -95,6 +107,35 @@ mod windows_app {
         reason: String,
     }
 
+    #[derive(Debug, Clone, Deserialize, Default)]
+    struct UiFileTransferConfig {
+        receive_dir: String,
+        organize_by_peer: bool,
+        auto_accept_trusted_peers: bool,
+        max_file_bytes: u64,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Default)]
+    struct UiInputHandoffConfig {
+        block_screen_corners: bool,
+        corner_block_px: u32,
+        relative_mouse: bool,
+        hide_cursor_at_edge: bool,
+        draw_cursor_marker: bool,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Default)]
+    struct UiInputRuntime {
+        owner_peer_id: String,
+        configured_capture_target_peer_id: String,
+        active_capture_target_peer_id: String,
+        lock_active: bool,
+        lock_supported: bool,
+        capture_backend_mode: String,
+        pending_inject_frames: u32,
+        pending_inject_high_water: u32,
+    }
+
     #[derive(Debug, Clone, Deserialize)]
     struct UiDiscoveredPeer {
         machine_id: String,
@@ -108,6 +149,8 @@ mod windows_app {
         display_name: String,
         address: String,
         connected: bool,
+        health_state: String,
+        health_reason: String,
     }
 
     #[allow(dead_code)]
@@ -216,6 +259,8 @@ mod windows_app {
                     daemon_online: snapshot.daemon_online,
                     machine_id: snapshot.machine_id,
                     layout_matrix: snapshot.layout_matrix,
+                    features: snapshot.features.into_iter().collect(),
+                    hotkeys: snapshot.hotkeys.into_iter().collect(),
                     discovered_peers: snapshot
                         .discovered_peers
                         .into_iter()
@@ -233,6 +278,8 @@ mod windows_app {
                             display_name: peer.display_name,
                             address: peer.address,
                             connected: peer.connected,
+                            health_state: peer.health_state,
+                            health_reason: peer.health_reason,
                         })
                         .collect(),
                     pending_requests: snapshot
@@ -265,6 +312,39 @@ mod windows_app {
                             active: status.active,
                             display_required: status.display_required,
                             reason: status.reason,
+                        })
+                        .unwrap_or_default(),
+                    file_transfer_config: snapshot
+                        .file_transfer_config
+                        .map(|config| UiFileTransferConfig {
+                            receive_dir: config.receive_dir,
+                            organize_by_peer: config.organize_by_peer,
+                            auto_accept_trusted_peers: config.auto_accept_trusted_peers,
+                            max_file_bytes: config.max_file_bytes,
+                        })
+                        .unwrap_or_default(),
+                    input_handoff_config: snapshot
+                        .input_handoff_config
+                        .map(|config| UiInputHandoffConfig {
+                            block_screen_corners: config.block_screen_corners,
+                            corner_block_px: config.corner_block_px,
+                            relative_mouse: config.relative_mouse,
+                            hide_cursor_at_edge: config.hide_cursor_at_edge,
+                            draw_cursor_marker: config.draw_cursor_marker,
+                        })
+                        .unwrap_or_default(),
+                    input_runtime: snapshot
+                        .input_runtime
+                        .map(|runtime| UiInputRuntime {
+                            owner_peer_id: runtime.owner_peer_id,
+                            configured_capture_target_peer_id: runtime
+                                .configured_capture_target_peer_id,
+                            active_capture_target_peer_id: runtime.active_capture_target_peer_id,
+                            lock_active: runtime.lock_active,
+                            lock_supported: runtime.lock_supported,
+                            capture_backend_mode: runtime.capture_backend_mode,
+                            pending_inject_frames: runtime.pending_inject_frames,
+                            pending_inject_high_water: runtime.pending_inject_high_water,
                         })
                         .unwrap_or_default(),
                 })?;
@@ -339,6 +419,57 @@ mod windows_app {
         ))
     }
 
+    fn set_file_transfer_config_blocking(
+        endpoint: &str,
+        receive_dir: String,
+        organize_by_peer: bool,
+        auto_accept_trusted_peers: bool,
+        max_file_bytes: u64,
+    ) -> Result<String> {
+        block_on_result(set_file_transfer_config(
+            endpoint,
+            receive_dir,
+            organize_by_peer,
+            auto_accept_trusted_peers,
+            max_file_bytes,
+        ))
+    }
+
+    fn set_feature_blocking(endpoint: &str, name: String, enabled: bool) -> Result<String> {
+        block_on_result(set_feature(endpoint, name, enabled))
+    }
+
+    fn set_input_handoff_config_blocking(
+        endpoint: &str,
+        block_screen_corners: bool,
+        corner_block_px: u32,
+        relative_mouse: bool,
+        hide_cursor_at_edge: bool,
+        draw_cursor_marker: bool,
+    ) -> Result<String> {
+        block_on_result(set_input_handoff_config(
+            endpoint,
+            block_screen_corners,
+            corner_block_px,
+            relative_mouse,
+            hide_cursor_at_edge,
+            draw_cursor_marker,
+        ))
+    }
+
+    fn set_hotkey_blocking(endpoint: &str, action: String, combo: String) -> Result<String> {
+        block_on_result(set_hotkey(endpoint, action, combo))
+    }
+
+    fn safe_reset_blocking(
+        endpoint: &str,
+        network_only: bool,
+        all: bool,
+        confirm: String,
+    ) -> Result<String> {
+        block_on_result(safe_reset(endpoint, network_only, all, confirm))
+    }
+
     fn ensure_daemon_available_blocking(ctx: &AppContext) -> Result<Option<String>> {
         block_on_result(ensure_daemon_available(
             &ctx.endpoint,
@@ -397,6 +528,132 @@ mod windows_app {
             bail!(response.message);
         }
         Ok(response.message)
+    }
+
+    async fn set_file_transfer_config(
+        endpoint: &str,
+        receive_dir: String,
+        organize_by_peer: bool,
+        auto_accept_trusted_peers: bool,
+        max_file_bytes: u64,
+    ) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let response = client
+            .set_file_transfer_config(FileTransferSetRequest {
+                receive_dir,
+                organize_by_peer,
+                auto_accept_trusted_peers,
+                max_file_bytes,
+            })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
+        Ok(response.message)
+    }
+
+    async fn set_feature(endpoint: &str, name: String, enabled: bool) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let response = client
+            .set_feature(FeatureSetRequest { name, enabled })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
+        Ok(response.message)
+    }
+
+    async fn set_input_handoff_config(
+        endpoint: &str,
+        block_screen_corners: bool,
+        corner_block_px: u32,
+        relative_mouse: bool,
+        hide_cursor_at_edge: bool,
+        draw_cursor_marker: bool,
+    ) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let response = client
+            .set_input_handoff_config(InputHandoffSetRequest {
+                block_screen_corners,
+                corner_block_px,
+                relative_mouse,
+                hide_cursor_at_edge,
+                draw_cursor_marker,
+            })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
+        Ok(response.message)
+    }
+
+    async fn set_hotkey(endpoint: &str, action: String, combo: String) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let response = client
+            .set_hotkey(HotkeySetRequest { action, combo })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
+        Ok(response.message)
+    }
+
+    async fn safe_reset(
+        endpoint: &str,
+        network_only: bool,
+        all: bool,
+        confirm: String,
+    ) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let response = client
+            .safe_reset(SafeResetRequest {
+                network_only,
+                all,
+                confirm,
+            })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
+        Ok(response.message)
+    }
+
+    fn send_files_to_peer_blocking(
+        endpoint: &str,
+        peer_id: String,
+        paths: Vec<String>,
+    ) -> Result<String> {
+        block_on_result(send_files_to_peer(endpoint, peer_id, paths))
+    }
+
+    async fn send_files_to_peer(
+        endpoint: &str,
+        peer_id: String,
+        paths: Vec<String>,
+    ) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let total = paths.len();
+        for path in paths {
+            let response = client
+                .send_file(SendFileRequest {
+                    peer_id: peer_id.clone(),
+                    file_path: path,
+                })
+                .await?
+                .into_inner();
+            if !response.ok {
+                bail!(response.message);
+            }
+        }
+        Ok(format!(
+            "Queued {total} file{} for transfer",
+            if total == 1 { "" } else { "s" }
+        ))
     }
 
     async fn ensure_daemon_available(
@@ -470,18 +727,6 @@ mod windows_app {
 
     fn spawn_daemon_process(candidates: &[String]) -> Result<String> {
         spawn_boundlessd_process(candidates)
-    }
-
-    fn is_named_pipe_endpoint(endpoint: &str) -> bool {
-        endpoint.trim().starts_with("npipe://")
-    }
-
-    fn has_access_denied_io_error(error: &anyhow::Error) -> bool {
-        error.chain().any(|cause| {
-            cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io_error| io_error.raw_os_error() == Some(5))
-        })
     }
 
     async fn pair_nearby_request_code(
@@ -634,6 +879,10 @@ mod windows_app {
 
     fn short_token(value: &str) -> &str {
         value.get(..8).unwrap_or(value)
+    }
+
+    fn empty_as_none(value: &str) -> &str {
+        if value.is_empty() { "none" } else { value }
     }
 
     fn format_error_for_dialog(error: &anyhow::Error) -> String {
@@ -877,19 +1126,22 @@ mod windows_app {
             let mut grid = std::collections::HashMap::<(i32, i32), String>::new();
             grid.insert((0, 0), "peer-a".to_string());
             assert!(
-                validate_layout_before_apply(&grid, "local-machine-id").is_err(),
+                app_services::desktop::validate_layout_before_apply(&grid, "local-machine-id")
+                    .is_err(),
                 "layout with zero local cells must fail apply validation"
             );
 
             grid.insert((1, 0), "local-machine-id".to_string());
             assert!(
-                validate_layout_before_apply(&grid, "local-machine-id").is_ok(),
+                app_services::desktop::validate_layout_before_apply(&grid, "local-machine-id")
+                    .is_ok(),
                 "layout with one local cell should pass apply validation"
             );
 
             grid.insert((2, 0), "LOCAL-MACHINE-ID".to_string());
             assert!(
-                validate_layout_before_apply(&grid, "local-machine-id").is_err(),
+                app_services::desktop::validate_layout_before_apply(&grid, "local-machine-id")
+                    .is_err(),
                 "layout with multiple local cells must fail apply validation"
             );
         }

@@ -29,9 +29,8 @@ use core_protocol::{
     WireCodecError, WireInputEvent, WireKeyState, WireMessage, WireMouseButton,
     decode_frame_payload, encode_frame_to_vec,
 };
-use core_transfer::validate_transfer_size;
 #[cfg(test)]
-use peer_transport::DEFAULT_TRANSPORT_TUNING;
+use peer_transport::{DEFAULT_TRANSPORT_TUNING, OutboundTransferFlow};
 
 mod codec;
 mod control;
@@ -49,6 +48,7 @@ use control::{HelloHandling, handle_hello_ack_message, handle_hello_message};
 #[cfg(test)]
 use inbound::{
     handle_clipboard_image_chunk, handle_clipboard_image_end, handle_clipboard_image_start,
+    handle_file_start,
 };
 #[cfg(test)]
 use outbound::flush_outgoing_payloads;
@@ -818,6 +818,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flush_honors_configured_file_transfer_limit() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let total_bytes = core_transfer::MAX_TRANSFER_BYTES + 1;
+        let mut config = state.file_transfer_config().await;
+        config.max_file_bytes = total_bytes;
+        state
+            .update_file_transfer_config(config)
+            .await
+            .expect("raise file limit");
+        state
+            .requeue_outgoing_front(
+                &peer_id,
+                vec![OutboundPayload::FileStart {
+                    transfer_id: "large-transfer".to_string(),
+                    file_name: "large.bin".to_string(),
+                    total_bytes,
+                }],
+            )
+            .await;
+
+        let mut writer = CaptureWriter::default();
+        flush_outgoing_payloads(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            &mut writer,
+        )
+        .await
+        .expect("configured limit should allow file start");
+
+        assert!(matches!(
+            decode_written_frames(&writer.bytes).first(),
+            Some(WireMessage::FileStart {
+                transfer_id,
+                total_bytes: actual_total,
+                ..
+            }) if transfer_id == "large-transfer" && *actual_total == total_bytes
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn file_transfer_rejection_clears_flow_and_queued_payloads() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let file_path = root.join("rejected.bin");
+        tokio::fs::write(
+            &file_path,
+            vec![9u8; crate::state::FILE_TRANSFER_CHUNK_BYTES + 7],
+        )
+        .await
+        .expect("write payload");
+
+        state
+            .queue_file_from_path(&peer_id, &file_path)
+            .await
+            .expect("queue file");
+        let mut queued = state.drain_outgoing_bulk(&peer_id, usize::MAX).await;
+        let transfer_id = match queued.first() {
+            Some(OutboundPayload::FileStart { transfer_id, .. }) => transfer_id.clone(),
+            other => panic!("expected first payload to be file start, got {other:?}"),
+        };
+        queued.remove(0);
+        state.requeue_outgoing_front(&peer_id, queued).await;
+
+        let mut outbound_transfer_flow = HashMap::from([(
+            transfer_id.clone(),
+            OutboundTransferFlow {
+                available_chunk_credits: 0,
+            },
+        )]);
+
+        session::handle_file_transfer_rejected(
+            &state,
+            Some(&peer_id),
+            transfer_id.clone(),
+            "receive_policy_denied".to_string(),
+            &mut outbound_transfer_flow,
+        )
+        .await;
+
+        assert!(!outbound_transfer_flow.contains_key(&transfer_id));
+        assert!(
+            state
+                .drain_outgoing_bulk(&peer_id, usize::MAX)
+                .await
+                .is_empty()
+        );
+        assert!(state.transport_events().await.iter().any(|event| {
+            event.kind == "file_transfer_rejected"
+                && event.detail.contains("reason=receive_policy_denied")
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn prepare_listener_uses_configured_port_when_available() {
         let (state, root) = state_for_listener_test().await;
         let probe = TcpListener::bind("0.0.0.0:0").await.expect("probe bind");
@@ -1252,6 +1350,132 @@ mod tests {
             "hash mismatch should be recorded as a transport rejection"
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn inbound_file_start_respects_default_deny_receive_policy() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let mut inbound_transfers = HashMap::new();
+        let mut writer = CaptureWriter::default();
+        let mut frame_buffer = Vec::with_capacity(256);
+
+        handle_file_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            "file-denied".to_string(),
+            "payload.txt".to_string(),
+            5,
+            &mut inbound_transfers,
+            &mut writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("policy denial should not fail the session");
+
+        assert!(inbound_transfers.is_empty());
+        assert!(state.transport_events().await.iter().any(|event| {
+            event.kind == "transport_transfer_rejected"
+                && event.detail.contains("reason=receive_policy_denied")
+        }));
+        assert!(matches!(
+            decode_written_frames(&writer.bytes).first(),
+            Some(WireMessage::FileTransferRejected {
+                transfer_id,
+                reason,
+            }) if transfer_id == "file-denied" && reason == "receive_policy_denied"
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn inbound_file_start_uses_local_temp_file_name() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let mut config = state.file_transfer_config().await;
+        config.auto_accept_trusted_peers = true;
+        state
+            .update_file_transfer_config(config)
+            .await
+            .expect("enable auto accept");
+
+        let mut inbound_transfers = HashMap::new();
+        let mut writer = CaptureWriter::default();
+        let mut frame_buffer = Vec::with_capacity(256);
+
+        handle_file_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            r"..\evil".to_string(),
+            "payload.txt".to_string(),
+            5,
+            &mut inbound_transfers,
+            &mut writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("accepted start");
+
+        let transfer = inbound_transfers
+            .remove(r"..\evil")
+            .expect("transfer tracked by wire id");
+        let temp_file_name = transfer
+            .temp_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("temp file name");
+        assert!(temp_file_name.starts_with("boundless-inbound-"));
+        assert!(!temp_file_name.contains("evil"));
+
+        inbound::discard_inbound_transfer(transfer).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn inbound_file_start_allows_explicit_auto_accept_policy() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let mut config = state.file_transfer_config().await;
+        config.auto_accept_trusted_peers = true;
+        state
+            .update_file_transfer_config(config)
+            .await
+            .expect("enable auto accept");
+
+        let mut inbound_transfers = HashMap::new();
+        let mut writer = CaptureWriter::default();
+        let mut frame_buffer = Vec::with_capacity(256);
+
+        handle_file_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            "file-accepted".to_string(),
+            "payload.txt".to_string(),
+            5,
+            &mut inbound_transfers,
+            &mut writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("accepted start");
+
+        assert!(inbound_transfers.contains_key("file-accepted"));
+        assert!(
+            !writer.bytes.is_empty(),
+            "accepted transfer should receive initial chunk credits"
+        );
+        assert!(state.transport_events().await.iter().any(|event| {
+            event.kind == "file_transfer_started" && event.detail.contains("file-accepted")
+        }));
+
+        for transfer in inbound_transfers.into_values() {
+            inbound::discard_inbound_transfer(transfer).await;
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -259,7 +259,8 @@ impl DashboardApp {
                         ui.label(egui::RichText::new(&peer.display_name).color(color));
                         ui.label(short_token(&peer.peer_id));
                         ui.label(&peer.address);
-                        ui.label(if peer.connected { "Connected" } else { "Offline" });
+                        ui.label(peer.health_state.replace('_', " "))
+                            .on_hover_text(&peer.health_reason);
                         ui.end_row();
                     }
                 });
@@ -390,6 +391,251 @@ impl DashboardApp {
             ui.add_space(16.0);
             ui.separator();
 
+            // ── Product Controls ──────────────────────────────────────
+            ui.add_space(8.0);
+            ui.heading("Product Controls");
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("These match the effective daemon feature flags.").weak());
+            for (name, label, reason) in [
+                ("share_input", "Share keyboard and mouse", None),
+                ("share_clipboard", "Share clipboard", None),
+                ("transfer_file", "Transfer files", None),
+                ("easy_mouse", "Switch at screen edge", None),
+                ("wrap_mouse", "Wrap across layout edges", None),
+                (
+                    "same_subnet_only",
+                    "Same subnet only",
+                    Some("Network policy enforcement is not implemented yet"),
+                ),
+                (
+                    "validate_remote_ip",
+                    "Validate remote IP",
+                    Some("Reverse-DNS warning/enforcement is not implemented yet"),
+                ),
+            ] {
+                let enabled = if reason.is_some() {
+                    false
+                } else {
+                    self.snapshot.features.get(name).copied().unwrap_or(false)
+                };
+                let mut next = enabled;
+                let response = ui.add_enabled(
+                    reason.is_none(),
+                    egui::Checkbox::new(&mut next, label),
+                );
+                if let Some(reason) = reason {
+                    response.on_hover_text(reason);
+                } else if response.clicked() {
+                    self.task_runner().set_feature(
+                        self.tx.clone(),
+                        self.ctx.endpoint.clone(),
+                        name.to_string(),
+                        !enabled,
+                    );
+                }
+            }
+
+            ui.add_space(16.0);
+            ui.separator();
+
+            // ── File Transfer ──────────────────────────────────────────
+            ui.add_space(8.0);
+            ui.heading("File Transfer");
+            ui.add_space(4.0);
+            let file_transfer_config = self.snapshot.file_transfer_config.clone();
+            ui.label(egui::RichText::new("Received files are saved to this folder.").weak());
+            ui.horizontal(|ui| {
+                ui.label("Receive folder:");
+                ui.text_edit_singleline(&mut self.file_receive_dir_edit);
+            });
+            let mut organize_by_peer = file_transfer_config.organize_by_peer;
+            if ui
+                .checkbox(&mut organize_by_peer, "Organize received files by sender")
+                .clicked()
+            {
+                self.task_runner().set_file_transfer_config(
+                    self.tx.clone(),
+                    self.ctx.endpoint.clone(),
+                    self.file_receive_dir_edit.clone(),
+                    !file_transfer_config.organize_by_peer,
+                    file_transfer_config.auto_accept_trusted_peers,
+                    file_transfer_config.max_file_bytes,
+                );
+            }
+            let mut auto_accept_trusted = file_transfer_config.auto_accept_trusted_peers;
+            if ui
+                .checkbox(&mut auto_accept_trusted, "Auto-accept files from trusted peers")
+                .clicked()
+            {
+                self.task_runner().set_file_transfer_config(
+                    self.tx.clone(),
+                    self.ctx.endpoint.clone(),
+                    self.file_receive_dir_edit.clone(),
+                    file_transfer_config.organize_by_peer,
+                    !file_transfer_config.auto_accept_trusted_peers,
+                    file_transfer_config.max_file_bytes,
+                );
+            }
+            ui.label(egui::RichText::new(format!(
+                "Limit: {} MB",
+                file_transfer_config.max_file_bytes / (1024 * 1024)
+            )).weak());
+            ui.horizontal(|ui| {
+                let receive_dir_changed =
+                    self.file_receive_dir_edit != file_transfer_config.receive_dir;
+                if ui
+                    .add_enabled(receive_dir_changed, egui::Button::new("Save Folder"))
+                    .on_hover_text("Persist this receive folder for future incoming files")
+                    .clicked()
+                {
+                    self.task_runner().set_file_transfer_config(
+                        self.tx.clone(),
+                        self.ctx.endpoint.clone(),
+                        self.file_receive_dir_edit.clone(),
+                        file_transfer_config.organize_by_peer,
+                        file_transfer_config.auto_accept_trusted_peers,
+                        file_transfer_config.max_file_bytes,
+                    );
+                }
+                if ui
+                    .button("Open Folder")
+                    .on_hover_text("Open the current receive folder in Explorer")
+                    .clicked()
+                {
+                    self.task_runner().open_receive_folder(
+                        self.tx.clone(),
+                        file_transfer_config.receive_dir.clone(),
+                    );
+                }
+            });
+
+            ui.add_space(16.0);
+            ui.separator();
+
+            // ── Input Handoff ─────────────────────────────────────────
+            ui.add_space(8.0);
+            ui.heading("Input Handoff");
+            ui.add_space(4.0);
+            let handoff = self.snapshot.input_handoff_config.clone();
+            let runtime = self.snapshot.input_runtime.clone();
+            ui.label(
+                egui::RichText::new(format!(
+                    "Capture: {}  |  Backend: {}  |  Queue: {}/{}",
+                    if runtime.lock_active {
+                        "active"
+                    } else {
+                        "idle"
+                    },
+                    if runtime.capture_backend_mode.is_empty() {
+                        "unknown"
+                    } else {
+                        &runtime.capture_backend_mode
+                    },
+                    runtime.pending_inject_frames,
+                    runtime.pending_inject_high_water,
+                ))
+                .weak(),
+            );
+            if !runtime.owner_peer_id.is_empty()
+                || !runtime.configured_capture_target_peer_id.is_empty()
+                || !runtime.active_capture_target_peer_id.is_empty()
+            {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Owner: {}  |  Configured target: {}  |  Active target: {}",
+                        empty_as_none(&runtime.owner_peer_id),
+                        empty_as_none(&runtime.configured_capture_target_peer_id),
+                        empty_as_none(&runtime.active_capture_target_peer_id),
+                    ))
+                    .weak()
+                    .size(12.0),
+                );
+            }
+            if !runtime.lock_supported {
+                ui.label(
+                    egui::RichText::new("Input locking is unavailable on this platform")
+                        .weak()
+                        .italics(),
+                );
+            }
+            let mut block_screen_corners = handoff.block_screen_corners;
+            if ui
+                .checkbox(&mut block_screen_corners, "Block screen corners")
+                .clicked()
+            {
+                self.task_runner().set_input_handoff_config(
+                    self.tx.clone(),
+                    self.ctx.endpoint.clone(),
+                    UiInputHandoffConfig {
+                        block_screen_corners: !handoff.block_screen_corners,
+                        ..handoff.clone()
+                    },
+                );
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Corner block:");
+                for px in [8_u32, 16, 24, 32, 48] {
+                    if ui
+                        .selectable_label(handoff.corner_block_px == px, format!("{px}px"))
+                        .clicked()
+                    {
+                        self.task_runner().set_input_handoff_config(
+                            self.tx.clone(),
+                            self.ctx.endpoint.clone(),
+                            UiInputHandoffConfig {
+                                corner_block_px: px,
+                                ..handoff.clone()
+                            },
+                        );
+                    }
+                }
+            });
+            let mut relative_mouse = handoff.relative_mouse;
+            if ui
+                .checkbox(&mut relative_mouse, "Use relative mouse movement")
+                .clicked()
+            {
+                self.task_runner().set_input_handoff_config(
+                    self.tx.clone(),
+                    self.ctx.endpoint.clone(),
+                    UiInputHandoffConfig {
+                        relative_mouse: !handoff.relative_mouse,
+                        ..handoff.clone()
+                    },
+                );
+            }
+            let mut hide_cursor_at_edge = handoff.hide_cursor_at_edge;
+            if ui
+                .checkbox(&mut hide_cursor_at_edge, "Hide cursor at edge")
+                .clicked()
+            {
+                self.task_runner().set_input_handoff_config(
+                    self.tx.clone(),
+                    self.ctx.endpoint.clone(),
+                    UiInputHandoffConfig {
+                        hide_cursor_at_edge: !handoff.hide_cursor_at_edge,
+                        ..handoff.clone()
+                    },
+                );
+            }
+            let mut draw_cursor_marker = handoff.draw_cursor_marker;
+            if ui
+                .checkbox(&mut draw_cursor_marker, "Draw cursor marker")
+                .clicked()
+            {
+                self.task_runner().set_input_handoff_config(
+                    self.tx.clone(),
+                    self.ctx.endpoint.clone(),
+                    UiInputHandoffConfig {
+                        draw_cursor_marker: !handoff.draw_cursor_marker,
+                        ..handoff.clone()
+                    },
+                );
+            }
+
+            ui.add_space(16.0);
+            ui.separator();
+
             // ── Peer Availability ─────────────────────────────────────
             ui.add_space(8.0);
             ui.heading("Peer Availability");
@@ -503,6 +749,46 @@ impl DashboardApp {
             ui.add_space(16.0);
             ui.separator();
 
+            // ── Hotkeys ───────────────────────────────────────────────
+            ui.add_space(8.0);
+            ui.heading("Hotkeys");
+            ui.add_space(4.0);
+            for (action, label) in [
+                ("toggle_easy_mouse", "Toggle edge switching"),
+                ("lock_machine", "Lock machines"),
+                ("switch_all", "Switch target"),
+                ("reconnect", "Reconnect peers"),
+            ] {
+                let current = self.snapshot.hotkeys.get(action).cloned().unwrap_or_default();
+                let mut edit = self
+                    .hotkey_edits
+                    .get(action)
+                    .cloned()
+                    .unwrap_or_else(|| current.clone());
+                let mut save_clicked = false;
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    ui.text_edit_singleline(&mut edit);
+                    let changed = current != edit;
+                    save_clicked = ui
+                        .add_enabled(changed, egui::Button::new("Save"))
+                        .on_hover_text("Persist this hotkey combo")
+                        .clicked();
+                });
+                self.hotkey_edits.insert(action.to_string(), edit.clone());
+                if save_clicked {
+                    self.task_runner().set_hotkey(
+                        self.tx.clone(),
+                        self.ctx.endpoint.clone(),
+                        action.to_string(),
+                        edit,
+                    );
+                }
+            }
+
+            ui.add_space(16.0);
+            ui.separator();
+
             // ── Actions ────────────────────────────────────────────────
             ui.add_space(8.0);
             ui.heading("Actions");
@@ -518,7 +804,66 @@ impl DashboardApp {
                     self.task_runner()
                         .reconnect_all_peers(self.tx.clone(), self.ctx.endpoint.clone());
                 }
+                let network_reset_label = if self.confirm_network_reset_pending {
+                    "Confirm Network Reset"
+                } else {
+                    "Reset Network"
+                };
+                if ui.button(network_reset_label).on_hover_text(
+                    "Clear paired peers and runtime network state without deleting local identity",
+                ).clicked() {
+                    if !self.confirm_network_reset_pending {
+                        self.confirm_network_reset_pending = true;
+                        self.push_toast(
+                            "Click Confirm Network Reset to clear peer/network state".to_string(),
+                            false,
+                        );
+                        return;
+                    }
+                    self.confirm_network_reset_pending = false;
+                    self.task_runner().safe_reset(
+                        self.tx.clone(),
+                        self.ctx.endpoint.clone(),
+                        true,
+                        false,
+                        format!("safe-reset-network:{}", self.snapshot.machine_id),
+                    );
+                }
+                let safe_reset_label = if self.confirm_safe_reset_pending {
+                    "Confirm Safe Reset"
+                } else {
+                    "Safe Reset"
+                };
+                if ui.button(safe_reset_label).on_hover_text(
+                    "Reset daemon config/runtime state while preserving installed app files and local identity",
+                ).clicked() {
+                    if !self.confirm_safe_reset_pending {
+                        self.confirm_safe_reset_pending = true;
+                        self.push_toast(
+                            "Click Confirm Safe Reset to reset daemon config/runtime state"
+                                .to_string(),
+                            false,
+                        );
+                        return;
+                    }
+                    self.confirm_safe_reset_pending = false;
+                    self.task_runner().safe_reset(
+                        self.tx.clone(),
+                        self.ctx.endpoint.clone(),
+                        false,
+                        true,
+                        format!("safe-reset-all:{}", self.snapshot.machine_id),
+                    );
+                }
             });
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "Service mode actions are admin-owned and available through boundlessctl.",
+                )
+                .weak()
+                .size(12.0),
+            );
 
             ui.add_space(16.0);
             ui.separator();

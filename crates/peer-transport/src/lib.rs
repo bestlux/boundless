@@ -328,7 +328,7 @@ impl Default for TransportRuntimeState {
 }
 
 impl TransportRuntimeState {
-    pub async fn clear(&self) {
+    pub async fn clear(&self) -> usize {
         self.reconnect_generation_by_peer.write().await.clear();
         self.outgoing_input_payloads.write().await.clear();
         self.outgoing_bulk_payloads.write().await.clear();
@@ -338,15 +338,25 @@ impl TransportRuntimeState {
         if let Ok(mut high_water) = self.outgoing_input_high_water_by_peer.lock() {
             high_water.clear();
         }
-        self.pending_transport_session_abort_handles
+        let pending_sessions = self
+            .pending_transport_session_abort_handles
             .write()
             .await
-            .clear();
-        self.transport_session_abort_handles_by_peer
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect::<Vec<_>>();
+        let peer_sessions = self
+            .transport_session_abort_handles_by_peer
             .write()
             .await
-            .clear();
-        self.next_transport_session_id.store(1, Ordering::Release);
+            .drain()
+            .flat_map(|(_, sessions)| sessions.into_values())
+            .collect::<Vec<_>>();
+        let aborted = pending_sessions.len() + peer_sessions.len();
+        for handle in pending_sessions.into_iter().chain(peer_sessions) {
+            handle.abort();
+        }
+        aborted
     }
 
     pub fn allocate_transport_session_id(&self) -> u64 {

@@ -59,6 +59,43 @@ function Get-MsiProductVersion {
     return $record.StringData(1)
 }
 
+function Assert-ReleasePleaseExtraFiles {
+    param(
+        [string]$RepoRoot,
+        [string[]]$CrateCargoTomlPaths
+    )
+
+    $configPath = Join-Path $RepoRoot "release-please-config.json"
+    $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    $package = $config.packages."."
+    if ($null -eq $package) {
+        throw "release-please config does not contain package entry '.'."
+    }
+
+    $configuredPaths = @($package."extra-files" | ForEach-Object { $_.path })
+    $expectedPaths = @(
+        "Cargo.toml",
+        "packaging/windows/package-manifest.json"
+    )
+    $resolvedRepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path.TrimEnd('\', '/')
+    foreach ($crateCargoTomlPath in $CrateCargoTomlPaths) {
+        $resolvedPath = (Resolve-Path -LiteralPath $crateCargoTomlPath).Path
+        if (-not $resolvedPath.StartsWith($resolvedRepoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Crate manifest path is outside repo root: $resolvedPath"
+        }
+        $relativePath = $resolvedPath.Substring($resolvedRepoRoot.Length).TrimStart('\', '/')
+        $expectedPaths += ($relativePath -replace '\\', '/')
+    }
+
+    foreach ($expectedPath in $expectedPaths | Sort-Object -Unique) {
+        $windowsPath = $expectedPath -replace '/', '\'
+        $found = $configuredPaths | Where-Object { $_ -eq $expectedPath -or $_ -eq $windowsPath } | Select-Object -First 1
+        if ($null -eq $found) {
+            throw "release-please config is missing extra-files entry for '$expectedPath'."
+        }
+    }
+}
+
 $repoRoot = if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
     (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 }
@@ -93,6 +130,7 @@ foreach ($crateCargoToml in $crateCargoTomls) {
         throw "Crate manifest version '$crateVersion' does not match workspace version '$workspaceVersion': $($crateCargoToml.FullName)"
     }
 }
+Assert-ReleasePleaseExtraFiles -RepoRoot $repoRoot -CrateCargoTomlPaths @($crateCargoTomls.FullName)
 
 if (-not [string]::IsNullOrWhiteSpace($Tag)) {
     $expectedTag = "v$workspaceVersion"

@@ -81,6 +81,32 @@ pub(super) fn sanitize_incoming_file_name(file_name: &str) -> Result<String> {
     if sanitized.is_empty() {
         anyhow::bail!("incoming file name must not be empty");
     }
+    if sanitized != name.to_string_lossy() {
+        anyhow::bail!("incoming file name must not have leading or trailing whitespace");
+    }
+    if sanitized.ends_with('.') {
+        anyhow::bail!("incoming file name must not end with a dot");
+    }
+    if sanitized.contains(':') {
+        anyhow::bail!("incoming file name must not contain alternate stream separators");
+    }
+    if sanitized.chars().any(char::is_control) {
+        anyhow::bail!("incoming file name must not contain control characters");
+    }
+
+    let stem = sanitized
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    const RESERVED_WINDOWS_NAMES: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4",
+        "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+        "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED_WINDOWS_NAMES.contains(&stem.as_str()) {
+        anyhow::bail!("incoming file name must not be a reserved Windows device name");
+    }
 
     Ok(sanitized)
 }

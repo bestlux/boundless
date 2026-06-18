@@ -15,17 +15,23 @@ Boundless is currently a single-maintainer, alpha-stage Rust workspace. Small, f
 Preferred local validation:
 
 ```powershell
-cargo fmt
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+```
+
+Equivalent wrapper:
+
+```powershell
 ./scripts/dev/test-suite.ps1 -Profile quick
 ```
 
 Use the smallest validation set that matches your change:
 
 - Docs-only changes usually do not need a full test run.
-- Rust code changes should at least run `cargo fmt`, `cargo clippy`, and `cargo test`.
-- Windows-specific runtime or packaging changes should also run the relevant PowerShell script from the README when feasible.
+- Rust code changes should at least run `cargo fmt --all -- --check`, `cargo clippy`, and `cargo test`.
+- Windows-specific runtime changes should add the smallest matching PowerShell smoke or trace script from the README when feasible.
+- Packaging, installer, or release workflow changes should run or explicitly defer the matching installer/release validation.
 
 ## Pull request expectations
 

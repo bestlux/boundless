@@ -8,6 +8,10 @@ license.workspace = true
 name = "boundlessd"
 path = "src/main.rs"
 
+[[bin]]
+name = "boundless-service"
+path = "src/service_main.rs"
+
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
@@ -16,6 +20,7 @@ clap.workspace = true
 dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
@@ -40,4 +45,5 @@ platform-windows = { path = "../platform-windows" }
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4.1"
+windows-service = "0.8.0"
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Shutdown", "Win32_System_Threading", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

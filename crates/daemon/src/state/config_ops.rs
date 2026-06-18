@@ -1,4 +1,5 @@
 use super::*;
+use app_services::desktop::{LayoutPeerToken, canonicalize_layout_matrix_spec};
 
 impl AppState {
     pub async fn update_bind(&self, bind: String) -> Result<()> {
@@ -27,6 +28,61 @@ impl AppState {
         let mut config = self.config.write().await;
         config.network_port = port;
         save_config_at(&self.config_path, &config)
+    }
+
+    pub async fn file_transfer_config(&self) -> FileTransferConfig {
+        self.config.read().await.file_transfer.clone()
+    }
+
+    pub async fn file_transfer_max_bytes(&self) -> u64 {
+        self.config.read().await.file_transfer.max_file_bytes
+    }
+
+    pub async fn file_transfer_auto_accept_trusted_peers(&self) -> bool {
+        self.config
+            .read()
+            .await
+            .file_transfer
+            .auto_accept_trusted_peers
+    }
+
+    pub async fn update_file_transfer_config(
+        &self,
+        file_transfer: FileTransferConfig,
+    ) -> Result<()> {
+        if file_transfer.receive_dir.trim().is_empty() {
+            anyhow::bail!("file transfer receive directory must not be empty");
+        }
+        if file_transfer.max_file_bytes == 0 {
+            anyhow::bail!("file transfer max_file_bytes must be greater than zero");
+        }
+
+        let receive_dir = PathBuf::from(&file_transfer.receive_dir);
+        tokio::fs::create_dir_all(&receive_dir).await?;
+
+        let mut config = self.config.write().await;
+        config.file_transfer = file_transfer;
+        save_config_at(&self.config_path, &config)
+    }
+
+    pub async fn input_handoff_config(&self) -> InputHandoffConfig {
+        self.config.read().await.input_handoff.clone()
+    }
+
+    pub async fn update_input_handoff_config(
+        &self,
+        input_handoff: InputHandoffConfig,
+    ) -> Result<()> {
+        if input_handoff.corner_block_px > 256 {
+            anyhow::bail!("input_handoff.corner_block_px must be <= 256");
+        }
+
+        let mut config = self.config.write().await;
+        config.input_handoff = input_handoff;
+        save_config_at(&self.config_path, &config)?;
+        drop(config);
+        self.notify_input_capture_wake("input_handoff_config_changed");
+        Ok(())
     }
 
     pub async fn set_discovered_endpoint(
@@ -93,7 +149,21 @@ impl AppState {
 
     pub async fn set_layout(&self, matrix: String) -> Result<()> {
         let mut config = self.config.write().await;
-        config.layout_matrix = matrix;
+        let peers = config
+            .peers
+            .iter()
+            .map(|peer| LayoutPeerToken {
+                peer_id: peer.peer_id.clone(),
+                display_name: peer.display_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let canonical_matrix = canonicalize_layout_matrix_spec(
+            &matrix,
+            &config.machine_id,
+            Some(config.device_name.as_str()),
+            &peers,
+        )?;
+        config.layout_matrix = canonical_matrix;
         save_config_at(&self.config_path, &config)?;
         drop(config);
         self.invalidate_cached_layout_matrix().await;
@@ -101,11 +171,12 @@ impl AppState {
         Ok(())
     }
 
-    pub async fn edge_switch_policy(&self) -> (EasyMouseMode, bool) {
+    pub async fn edge_switch_policy(&self) -> (EasyMouseMode, bool, InputHandoffConfig) {
         let config = self.config.read().await;
         let share_input_enabled = config.features.get("share_input").copied().unwrap_or(true);
         let easy_mouse_enabled = config.features.get("easy_mouse").copied().unwrap_or(true);
         let wrap_mouse = config.features.get("wrap_mouse").copied().unwrap_or(true);
+        let input_handoff = config.input_handoff.clone();
 
         let mode = if share_input_enabled && easy_mouse_enabled {
             EasyMouseMode::Enable
@@ -113,7 +184,7 @@ impl AppState {
             EasyMouseMode::Disable
         };
 
-        (mode, wrap_mouse)
+        (mode, wrap_mouse, input_handoff)
     }
 
     pub async fn capture_handoff_target_for_direction(
@@ -175,6 +246,15 @@ impl AppState {
     }
 
     pub async fn set_feature(&self, name: String, enabled: bool) -> Result<()> {
+        match name.as_str() {
+            "share_clipboard" | "transfer_file" | "share_input" | "easy_mouse" | "wrap_mouse" => {}
+            "same_subnet_only" | "validate_remote_ip" => {
+                anyhow::bail!(
+                    "{name} is visible in the tray but unsupported until network policy enforcement lands"
+                );
+            }
+            _ => anyhow::bail!("unknown feature '{name}'"),
+        }
         let mut config = self.config.write().await;
         config.features.insert(name.clone(), enabled);
         save_config_at(&self.config_path, &config)?;
@@ -202,7 +282,19 @@ impl AppState {
     }
 
     pub async fn set_hotkey(&self, action: String, combo: String) -> Result<()> {
+        crate::hotkeys::validate_hotkey_binding(&action, &combo)?;
+        let new_combo = crate::hotkeys::canonical_hotkey_combo(&combo)?;
         let mut config = self.config.write().await;
+        for (existing_action, existing_combo) in &config.hotkeys {
+            if existing_action != &action
+                && new_combo.is_some()
+                && crate::hotkeys::canonical_hotkey_combo(existing_combo)? == new_combo
+            {
+                anyhow::bail!(
+                    "hotkey combo already assigned to {existing_action}; choose a unique combo"
+                );
+            }
+        }
         config.hotkeys.insert(action, combo);
         save_config_at(&self.config_path, &config)
     }

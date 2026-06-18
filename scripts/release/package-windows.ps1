@@ -8,6 +8,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$DaemonPath,
 
+    [string]$ServicePath = "",
+
     [Parameter(Mandatory = $true)]
     [string]$CliPath,
 
@@ -61,6 +63,13 @@ else {
     (Resolve-Path -LiteralPath $RepoRoot).Path
 }
 $daemonBinary = Resolve-RequiredPath -Path $DaemonPath -Label "Daemon binary"
+$servicePathCandidate = if ([string]::IsNullOrWhiteSpace($ServicePath)) {
+    Join-Path (Split-Path -Parent $daemonBinary) "boundless-service.exe"
+}
+else {
+    $ServicePath
+}
+$serviceBinary = Resolve-RequiredPath -Path $servicePathCandidate -Label "Service binary"
 $cliBinary = Resolve-RequiredPath -Path $CliPath -Label "CLI binary"
 $trayBinary = Resolve-RequiredPath -Path $TrayPath -Label "Tray binary"
 $packageAssetRoot = Resolve-RequiredPath -Path (Join-Path $repoRoot "packaging\windows") -Label "Packaging asset root"
@@ -95,6 +104,7 @@ if (Test-Path -LiteralPath $buildOutputRoot) {
 Ensure-Directory -Path $buildOutputRoot
 
 Copy-Item -LiteralPath $daemonBinary -Destination (Join-Path $stageRoot "boundlessd.exe")
+Copy-Item -LiteralPath $serviceBinary -Destination (Join-Path $stageRoot "boundless-service.exe")
 Copy-Item -LiteralPath $cliBinary -Destination (Join-Path $stageRoot "boundlessctl.exe")
 Copy-Item -LiteralPath $trayBinary -Destination (Join-Path $stageRoot "boundlesstray.exe")
 Copy-Item -LiteralPath $trayIconPath -Destination (Join-Path $stageRoot "Boundless.ico")

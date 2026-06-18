@@ -10,14 +10,16 @@ use crate::{
         InputCaptureTargetReply, InputOwnerCommand, InputOwnerReply, LayoutReply, LayoutSetCommand,
         NearbyJoinStartCommand, NearbyJoinStatusCommand, NearbyPairingDecisionCommand,
         NearbyRequestCodeCommand, NearbySubmitCodeCommand, OperationReply, PairJoinCommand,
-        PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, SafeResetCommand,
-        SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand,
-        SendInputMoveCommand, SetAntiIdleConfigCommand,
+        PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, RotateTrustCommand,
+        SafeResetCommand, SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand,
+        SendInputKeyCommand, SendInputMoveCommand, SetAntiIdleConfigCommand,
+        SetFileTransferConfigCommand, SetInputHandoffConfigCommand,
     },
     queries::{
-        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot, NearbyJoinStatusSnapshot,
-        NearbyPairingCompletionSnapshot, NearbyRequestCodeStartSnapshot, StatusSnapshot,
-        TransportEventSnapshot, TrustBundleSnapshot, UiSnapshot,
+        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
+        FileTransferConfigSnapshot, NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot,
+        NearbyRequestCodeStartSnapshot, StatusSnapshot, TransportEventSnapshot,
+        TrustBundleSnapshot, UiSnapshot,
     },
 };
 
@@ -40,6 +42,15 @@ pub trait ControlPlaneApp: Send + Sync {
         &self,
         command: SetAntiIdleConfigCommand,
     ) -> Result<OperationReply>;
+    async fn file_transfer_config(&self) -> Result<FileTransferConfigSnapshot>;
+    async fn set_file_transfer_config(
+        &self,
+        command: SetFileTransferConfigCommand,
+    ) -> Result<OperationReply>;
+    async fn set_input_handoff_config(
+        &self,
+        command: SetInputHandoffConfigCommand,
+    ) -> Result<OperationReply>;
     async fn set_hotkey(&self, command: HotkeySetCommand) -> Result<OperationReply>;
     async fn trigger_hotkey_action(&self, command: HotkeyTriggerCommand) -> Result<OperationReply>;
     async fn export_trust_bundle(&self) -> Result<TrustBundleSnapshot>;
@@ -47,6 +58,7 @@ pub trait ControlPlaneApp: Send + Sync {
         &self,
         command: ImportTrustBundleCommand,
     ) -> Result<OperationReply>;
+    async fn rotate_trust(&self, command: RotateTrustCommand) -> Result<OperationReply>;
     async fn dump_diagnostics(
         &self,
         command: DiagnosticsDumpCommand,

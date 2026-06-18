@@ -6,7 +6,7 @@ use thiserror::Error;
 pub const PROTOCOL_NAME: &str = "boundless";
 pub const PROTOCOL_CURRENT: ProtocolVersion = ProtocolVersion {
     major: 4,
-    minor: 0,
+    minor: 1,
     patch: 0,
 };
 pub const MAX_WIRE_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -115,6 +115,10 @@ pub enum WireMessage {
     FileChunkCredit {
         transfer_id: String,
         chunk_credits: u32,
+    },
+    FileTransferRejected {
+        transfer_id: String,
+        reason: String,
     },
 }
 
@@ -290,6 +294,18 @@ mod tests {
         let original = WireMessage::FileChunkCredit {
             transfer_id: "xfer-1".to_string(),
             chunk_credits: 8,
+        };
+
+        let encoded = encode_frame(&original).expect("encode");
+        let decoded = decode_frame(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn wire_message_file_transfer_rejected_round_trip() {
+        let original = WireMessage::FileTransferRejected {
+            transfer_id: "xfer-1".to_string(),
+            reason: "receive_policy_denied".to_string(),
         };
 
         let encoded = encode_frame(&original).expect("encode");

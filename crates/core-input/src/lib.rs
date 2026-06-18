@@ -236,6 +236,8 @@ pub struct EdgeSwitchRequest {
     pub width: i32,
     pub height: i32,
     pub wrap_mouse: bool,
+    pub block_screen_corners: bool,
+    pub corner_block_px: u32,
     pub mode: EasyMouseMode,
     pub modifier_held: bool,
 }
@@ -251,25 +253,44 @@ pub fn should_switch(req: EdgeSwitchRequest) -> Option<SwitchDirection> {
         return None;
     }
 
-    if req.x <= 0 {
+    if req.x <= 0 && !edge_switch_corner_blocked(&req, SwitchDirection::Left) {
         return Some(SwitchDirection::Left);
     }
 
-    if req.x >= req.width - 1 {
+    if req.x >= req.width - 1 && !edge_switch_corner_blocked(&req, SwitchDirection::Right) {
         return Some(SwitchDirection::Right);
     }
 
     if req.wrap_mouse {
-        if req.y <= 0 {
+        if req.y <= 0 && !edge_switch_corner_blocked(&req, SwitchDirection::Up) {
             return Some(SwitchDirection::Up);
         }
 
-        if req.y >= req.height - 1 {
+        if req.y >= req.height - 1 && !edge_switch_corner_blocked(&req, SwitchDirection::Down) {
             return Some(SwitchDirection::Down);
         }
     }
 
     None
+}
+
+fn edge_switch_corner_blocked(req: &EdgeSwitchRequest, direction: SwitchDirection) -> bool {
+    if !req.block_screen_corners || req.corner_block_px == 0 {
+        return false;
+    }
+
+    let corner = req.corner_block_px as i32;
+    let right = req.width.saturating_sub(1);
+    let bottom = req.height.saturating_sub(1);
+    let near_left = req.x <= corner;
+    let near_right = req.x >= right.saturating_sub(corner);
+    let near_top = req.y <= corner;
+    let near_bottom = req.y >= bottom.saturating_sub(corner);
+
+    match direction {
+        SwitchDirection::Left | SwitchDirection::Right => near_top || near_bottom,
+        SwitchDirection::Up | SwitchDirection::Down => near_left || near_right,
+    }
 }
 
 #[cfg(test)]
@@ -317,10 +338,48 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 wrap_mouse: true,
+                block_screen_corners: true,
+                corner_block_px: 24,
                 mode: EasyMouseMode::Disable,
                 modifier_held: true,
             })
             .is_none()
+        );
+    }
+
+    #[test]
+    fn edge_switch_blocks_corners_when_enabled() {
+        assert!(
+            should_switch(EdgeSwitchRequest {
+                x: 1919,
+                y: 4,
+                width: 1920,
+                height: 1080,
+                wrap_mouse: true,
+                block_screen_corners: true,
+                corner_block_px: 24,
+                mode: EasyMouseMode::Enable,
+                modifier_held: false,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn edge_switch_allows_corners_when_disabled() {
+        assert_eq!(
+            should_switch(EdgeSwitchRequest {
+                x: 1919,
+                y: 4,
+                width: 1920,
+                height: 1080,
+                wrap_mouse: true,
+                block_screen_corners: false,
+                corner_block_px: 24,
+                mode: EasyMouseMode::Enable,
+                modifier_held: false,
+            }),
+            Some(SwitchDirection::Right)
         );
     }
 

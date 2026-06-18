@@ -13,6 +13,8 @@ Boundless is maintained as a small public project. There is no guaranteed SLA, p
 Please check the current documentation first:
 
 - [README.md](README.md)
+- [docs/user/troubleshooting.md](docs/user/troubleshooting.md)
+- [docs/user/migration.md](docs/user/migration.md)
 - relevant scripts under `scripts/dev`
 
 If you are reporting a bug, gather the smallest useful set of evidence:
@@ -20,7 +22,12 @@ If you are reporting a bug, gather the smallest useful set of evidence:
 ```powershell
 cargo test --workspace
 ./scripts/dev/test-suite.ps1 -Profile quick
+$BoundlessCtl = "$env:LOCALAPPDATA\Programs\Boundless\boundlessctl.exe"
+& $BoundlessCtl daemon status
+& $BoundlessCtl diagnostics dump
 ```
+
+For release-candidate issues, attach the `scripts/dev/v5-readiness.ps1` packet when available instead of hand-picking raw logs. Review diagnostics, logs, screenshots, and shell transcripts before posting them publicly. Keep suspected security issues private through [SECURITY.md](SECURITY.md).
 
 Include these details when relevant:
 
