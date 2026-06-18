@@ -252,7 +252,6 @@ async fn apply_hotkey_action(state: &AppState, action: HotkeyAction) -> Result<(
     Ok(())
 }
 
-#[cfg(any(windows, test))]
 fn parse_key_combo(spec: &str) -> Result<Option<KeyCombo>> {
     let trimmed = spec.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("disabled") {
@@ -337,7 +336,6 @@ pub(crate) fn canonical_hotkey_combo(combo: &str) -> Result<Option<KeyCombo>> {
     parse_key_combo(combo)
 }
 
-#[cfg(any(windows, test))]
 fn parse_primary_key_token(token: &str) -> Result<u16> {
     let upper = token.trim().to_ascii_uppercase();
 
