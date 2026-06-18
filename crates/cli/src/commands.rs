@@ -5,9 +5,11 @@ use app_services::desktop::{
     resolve_boundlessd_candidates, spawn_boundlessd_process, terminate_boundlessd_processes,
     validate_layout_matrix_spec,
 };
+#[cfg(windows)]
 use std::path::PathBuf;
 
 const BOUNDLESS_SERVICE_NAME: &str = "BoundlessService";
+#[cfg(windows)]
 const BOUNDLESS_SERVICE_DISPLAY_NAME: &str = "Boundless Service";
 #[cfg(windows)]
 const USER_WRITABLE_SERVICE_SOURCE_DIRS: [&str; 3] = ["LOCALAPPDATA", "APPDATA", "TEMP"];
