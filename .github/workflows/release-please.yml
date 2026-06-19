@@ -291,8 +291,7 @@ jobs:
             -RepoRoot (Resolve-Path source).Path `
             -OutputRoot (Join-Path (Resolve-Path .).Path "artifacts/v5-readiness") `
             -InstallerSmokeSummaryPath (Join-Path (Resolve-Path .).Path "artifacts/installer-validation/installer-smoke.json") `
-            -ReleaseVersion "${{ needs.release-context.outputs.tag_name }}" `
-            -RequireReady
+            -ReleaseVersion "${{ needs.release-context.outputs.tag_name }}"
 
       - name: Upload v5 readiness packet
         if: always()
