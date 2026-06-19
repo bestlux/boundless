@@ -317,7 +317,6 @@ jobs:
       pull-requests: write
     env:
       GH_REPO: ${{ github.repository }}
-      GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN != '' && secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout release tooling
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
@@ -391,7 +390,7 @@ jobs:
 
       - name: Recreate draft release with tag
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -435,12 +434,12 @@ jobs:
 
       - name: Upload release assets
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
         run: gh release upload "${{ needs.release-context.outputs.tag_name }}" dist/* --clobber
 
       - name: Publish draft release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -453,7 +452,7 @@ jobs:
 
       - name: Close superseded autorelease pull requests
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
