@@ -1,5 +1,42 @@
 # Changelog
 
+## [5.0.0](https://github.com/bestlux/boundless/compare/v4.0.2...v5.0.0) (2026-06-19)
+
+
+### Features
+
+* add cluster anti-idle power requests ([3158326](https://github.com/bestlux/boundless/commit/31583269dc1f4004192a53faf5183c5a5b1c1b3c))
+* add cluster anti-idle power requests ([3158326](https://github.com/bestlux/boundless/commit/31583269dc1f4004192a53faf5183c5a5b1c1b3c))
+* add cluster anti-idle power requests ([d6f00db](https://github.com/bestlux/boundless/commit/d6f00db22d3cf3e707c854e5ad729f0ce3882f84))
+* add configurable file receive flow ([a11ad0e](https://github.com/bestlux/boundless/commit/a11ad0e7a49a877dcc950fd6a7696a10ef4bb87c))
+* add configurable file receive flow ([a23fb18](https://github.com/bestlux/boundless/commit/a23fb18f2386c62850bf71685fe20f6eb14c5261))
+* add guarded windows service host ([2bf5f57](https://github.com/bestlux/boundless/commit/2bf5f57a011afac59b17983f160075050de205fa))
+* add reliability health diagnostics ([c0eba8c](https://github.com/bestlux/boundless/commit/c0eba8c3e6e5b5e2938d70f7e80e60f45952f3a8))
+* add trust rotation recovery path ([1387e14](https://github.com/bestlux/boundless/commit/1387e14dae7e45d658605d968b40fb23286c249b))
+* add v5 readiness packet gate ([75c6d32](https://github.com/bestlux/boundless/commit/75c6d32c8cbea9e1a4905aa61cd34dca96476c97))
+* complete tray settings surface ([6f7e46e](https://github.com/bestlux/boundless/commit/6f7e46eba670bceebc03714e2f71742df200e308))
+* enforce v5 topology layout contract ([30391d2](https://github.com/bestlux/boundless/commit/30391d2b6409867b52552092a13841af87fb2e5d))
+* expose input handoff policy ([7b382c4](https://github.com/bestlux/boundless/commit/7b382c452a7c0805f31b3e950661c6163f57ed12))
+* harden file transfer workflows ([5c757ce](https://github.com/bestlux/boundless/commit/5c757ce9dcb3fd4dab2c78ce1c05d8bad806c7af))
+* harden v5 release packaging ([5bfa5b3](https://github.com/bestlux/boundless/commit/5bfa5b3e9aef9a371e032e7fcc13b02f7de7cb64))
+* harden windows service mode ([6b9ec75](https://github.com/bestlux/boundless/commit/6b9ec75e322c1ea20e24e3e97b7fb77f9ac1fd18))
+* prepare Boundless v5 release ([ccb5b8c](https://github.com/bestlux/boundless/commit/ccb5b8c767bebba82be5a8da1e321bf0bd795d75))
+
+
+### Bug Fixes
+
+* align anti-idle tests with platform support ([06dac7d](https://github.com/bestlux/boundless/commit/06dac7da3aebab455dadc9b8b3d5e503f31e9cea))
+* compile hotkey validation on Linux ([0be57ca](https://github.com/bestlux/boundless/commit/0be57cafef600173fdc0dfcc9f666058e520c063))
+* gate Windows-only CLI service symbols ([ccf2b17](https://github.com/bestlux/boundless/commit/ccf2b17a5878f93b6fd91d0eddf05809e9f17186))
+* recover stale named pipe from cli startup ([d6ee7c3](https://github.com/bestlux/boundless/commit/d6ee7c31c73c7837cda872dd8870f0354fe9737a))
+* recover stale named pipe from cli startup ([00b80f6](https://github.com/bestlux/boundless/commit/00b80f6a00889453a8dc830c9cfc76bf487d8200))
+* refresh layout on peer changes ([fea04de](https://github.com/bestlux/boundless/commit/fea04de2341a54bafd5662887a2f93570feae80a))
+* satisfy anti-idle clippy lint ([b016f3d](https://github.com/bestlux/boundless/commit/b016f3d8400e79c37d70c1f4d12c5fda655739ce))
+* satisfy current clippy lints ([30b9d6b](https://github.com/bestlux/boundless/commit/30b9d6ba615934ae93a2e484f40f90e2e77c0032))
+* **tray:** move layout tests after helpers ([bf3b33a](https://github.com/bestlux/boundless/commit/bf3b33a897e48bc4fd7249da88ad121bc12938c6))
+* **tray:** refresh layout on paired peer changes ([fea04de](https://github.com/bestlux/boundless/commit/fea04de2341a54bafd5662887a2f93570feae80a))
+* **tray:** refresh layout on paired peer changes ([eed49e2](https://github.com/bestlux/boundless/commit/eed49e2d881e965bc14bbd859f4f1177ed14d340))
+
 ## [4.0.2](https://github.com/bestlux/boundless/compare/v4.0.1...v4.0.2) (2026-04-13)
 
 
