@@ -1398,7 +1398,12 @@ mod tests {
         };
 
         let challenge = state
-            .queue_nearby_pairing_code_challenge(requester_bundle, Some("remote".to_string()), 120)
+            .queue_nearby_pairing_code_challenge(
+                requester_bundle,
+                Some("remote".to_string()),
+                "10.10.0.5".parse().expect("source ip"),
+                120,
+            )
             .await
             .expect("queue challenge");
         let verification_code = challenge

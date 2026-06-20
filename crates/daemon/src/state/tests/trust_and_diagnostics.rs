@@ -257,7 +257,12 @@ async fn diagnostics_dump_reports_nonce_challenge_rejections() {
     };
 
     let challenge = state
-        .queue_nearby_pairing_code_challenge(requester_bundle, None, 120)
+        .queue_nearby_pairing_code_challenge(
+            requester_bundle,
+            None,
+            "10.10.0.5".parse().expect("source ip"),
+            120,
+        )
         .await
         .expect("queue challenge");
     let request_id = challenge.request_id.clone();

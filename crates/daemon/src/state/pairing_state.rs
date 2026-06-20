@@ -46,6 +46,7 @@ pub(super) struct PendingNearbyPairingRequestRecord {
     pub(super) summary: PendingNearbyPairingRequest,
     pub(super) requester_bundle: TrustBundle,
     pub(super) requester_alias: Option<String>,
+    pub(super) source_ip: IpAddr,
     pub(super) mode: PendingNearbyPairingMode,
 }
 
