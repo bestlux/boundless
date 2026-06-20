@@ -60,6 +60,124 @@ async fn store_incoming_file_uses_configured_receive_dir() {
 }
 
 #[tokio::test]
+async fn store_incoming_file_from_temp_error_leaves_no_visible_partial() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-incoming-file-temp-error-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let receive_dir = root.join("received");
+
+    let mut config = RuntimeConfig::default();
+    config.file_transfer.receive_dir = receive_dir.display().to_string();
+    save_config_at(&config_path, &config).expect("seed config");
+
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+    let missing_temp = root.join("missing-temp.bin");
+
+    let err = state
+        .store_incoming_file_from_temp("peer-a", "report.txt", &missing_temp, 7)
+        .await
+        .expect_err("missing temp source should fail");
+    assert!(
+        err.to_string().contains("open inbound temp source"),
+        "unexpected error: {err:?}"
+    );
+
+    assert!(
+        !receive_dir.join("report.txt").exists(),
+        "failed fallback copy must not expose final path"
+    );
+    let leftovers = std::fs::read_dir(&receive_dir)
+        .expect("receive dir")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("list receive dir");
+    assert!(
+        leftovers.is_empty(),
+        "failed fallback copy should remove reserved .part files"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn reserve_incoming_file_allocates_same_name_conflicts_exclusively() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-incoming-file-conflict-reserve-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let receive_dir = root.join("received");
+
+    let mut config = RuntimeConfig::default();
+    config.file_transfer.receive_dir = receive_dir.display().to_string();
+    save_config_at(&config_path, &config).expect("seed config");
+
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+    let mut first = state
+        .reserve_incoming_file("peer-a", "report.txt", 3)
+        .await
+        .expect("reserve first");
+    let mut second = state
+        .reserve_incoming_file("peer-a", "report.txt", 3)
+        .await
+        .expect("reserve second");
+
+    assert_eq!(first.final_path, receive_dir.join("report.txt"));
+    assert_eq!(second.final_path, receive_dir.join("report (1).txt"));
+    assert!(first.temp_path.exists());
+    assert!(second.temp_path.exists());
+    assert!(
+        !first.final_path.exists() && !second.final_path.exists(),
+        "reserved receives must not expose partial final paths"
+    );
+
+    tokio::io::AsyncWriteExt::write_all(&mut first.temp_file, b"one")
+        .await
+        .expect("write first");
+    first.temp_file.sync_all().await.expect("sync first");
+    tokio::io::AsyncWriteExt::write_all(&mut second.temp_file, b"two")
+        .await
+        .expect("write second");
+    second.temp_file.sync_all().await.expect("sync second");
+    drop(first.temp_file);
+    drop(second.temp_file);
+
+    state
+        .complete_incoming_file(
+            "peer-a",
+            first.sanitized_name.clone(),
+            &first.temp_path,
+            &first.final_path,
+            3,
+        )
+        .await
+        .expect("complete first");
+    state
+        .complete_incoming_file(
+            "peer-a",
+            second.sanitized_name.clone(),
+            &second.temp_path,
+            &second.final_path,
+            3,
+        )
+        .await
+        .expect("complete second");
+
+    assert_eq!(std::fs::read(&first.final_path).expect("first"), b"one");
+    assert_eq!(std::fs::read(&second.final_path).expect("second"), b"two");
+    assert!(!first.temp_path.exists());
+    assert!(!second.temp_path.exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn store_incoming_file_uses_safe_peer_directory_name() {
     let root = std::env::temp_dir().join(format!(
         "boundless-incoming-file-peer-dir-test-{}",

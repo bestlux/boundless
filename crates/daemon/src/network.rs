@@ -48,7 +48,7 @@ use control::{HelloHandling, handle_hello_ack_message, handle_hello_message};
 #[cfg(test)]
 use inbound::{
     handle_clipboard_image_chunk, handle_clipboard_image_end, handle_clipboard_image_start,
-    handle_file_start,
+    handle_file_chunk, handle_file_end, handle_file_start,
 };
 #[cfg(test)]
 use outbound::flush_outgoing_payloads;
@@ -1752,10 +1752,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbound_file_start_uses_local_temp_file_name() {
+    async fn inbound_file_start_uses_reserved_receive_dir_part_file() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let receive_dir = root.join("received");
         let mut config = state.file_transfer_config().await;
         config.auto_accept_trusted_peers = true;
+        config.receive_dir = receive_dir.display().to_string();
         state
             .update_file_transfer_config(config)
             .await
@@ -1788,10 +1790,60 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .expect("temp file name");
-        assert!(temp_file_name.starts_with("boundless-inbound-"));
+        assert_eq!(transfer.final_path, receive_dir.join("payload.txt"));
+        assert_eq!(transfer.temp_path.parent(), Some(receive_dir.as_path()));
+        assert_eq!(temp_file_name, ".payload.txt.boundless.part");
         assert!(!temp_file_name.contains("evil"));
+        assert!(
+            !transfer.final_path.exists(),
+            "accepted transfer must not expose the final path before completion"
+        );
 
         inbound::discard_inbound_transfer(transfer).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn inbound_file_start_credit_flush_error_discards_reserved_part() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let receive_dir = root.join("received");
+        let mut config = state.file_transfer_config().await;
+        config.auto_accept_trusted_peers = true;
+        config.receive_dir = receive_dir.display().to_string();
+        state
+            .update_file_transfer_config(config)
+            .await
+            .expect("enable auto accept");
+
+        let mut inbound_transfers = HashMap::new();
+        let mut writer = FlushFailWriter::new(1);
+        let mut frame_buffer = Vec::with_capacity(256);
+
+        handle_file_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            "file-flush-fails".to_string(),
+            "payload.txt".to_string(),
+            5,
+            &mut inbound_transfers,
+            &mut writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect_err("initial chunk-credit flush should fail");
+
+        let reserved_part = receive_dir.join(".payload.txt.boundless.part");
+        assert!(
+            inbound_transfers.is_empty(),
+            "failed initial credit flush should remove the active transfer"
+        );
+        assert!(
+            !reserved_part.exists(),
+            "failed initial credit flush must remove reserved inbound .part"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1800,6 +1852,7 @@ mod tests {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         let mut config = state.file_transfer_config().await;
         config.auto_accept_trusted_peers = true;
+        config.receive_dir = root.join("received").display().to_string();
         state
             .update_file_transfer_config(config)
             .await
@@ -1836,6 +1889,96 @@ mod tests {
         for transfer in inbound_transfers.into_values() {
             inbound::discard_inbound_transfer(transfer).await;
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn inbound_file_chunks_replenish_credit_at_low_watermark() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let receive_dir = root.join("received");
+        let mut config = state.file_transfer_config().await;
+        config.auto_accept_trusted_peers = true;
+        config.receive_dir = receive_dir.display().to_string();
+        state
+            .update_file_transfer_config(config)
+            .await
+            .expect("enable auto accept");
+
+        let mut inbound_transfers = HashMap::new();
+        let mut writer = CaptureWriter::default();
+        let mut frame_buffer = Vec::with_capacity(256);
+
+        handle_file_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            "file-credit".to_string(),
+            "payload.txt".to_string(),
+            6,
+            &mut inbound_transfers,
+            &mut writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("accepted start");
+
+        assert!(matches!(
+            decode_written_frames(&writer.bytes).first(),
+            Some(WireMessage::FileChunkCredit {
+                transfer_id,
+                chunk_credits: 8,
+            }) if transfer_id == "file-credit"
+        ));
+        writer.bytes.clear();
+
+        for index in 0..5 {
+            handle_file_chunk(
+                &state,
+                "file-credit".to_string(),
+                vec![b'a' + index as u8],
+                &mut inbound_transfers,
+                &mut writer,
+                &mut frame_buffer,
+            )
+            .await
+            .expect("chunk before low watermark");
+            assert!(
+                writer.bytes.is_empty(),
+                "chunk {} should not emit per-chunk credit",
+                index + 1
+            );
+        }
+
+        handle_file_chunk(
+            &state,
+            "file-credit".to_string(),
+            vec![b'f'],
+            &mut inbound_transfers,
+            &mut writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("low watermark chunk");
+
+        let credit_frames = decode_written_frames(&writer.bytes);
+        assert_eq!(credit_frames.len(), 1);
+        assert!(matches!(
+            credit_frames.first(),
+            Some(WireMessage::FileChunkCredit {
+                transfer_id,
+                chunk_credits: 6,
+            }) if transfer_id == "file-credit"
+        ));
+
+        handle_file_end(&state, "file-credit".to_string(), &mut inbound_transfers)
+            .await
+            .expect("complete transfer");
+        assert_eq!(
+            std::fs::read(receive_dir.join("payload.txt")).expect("read completed file"),
+            b"abcdef"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
