@@ -21,7 +21,8 @@ This is the short, version-neutral repo status packet for agents and release wor
 - Service mode is optional/admin-owned. MSI service-mode installation is not enabled by default.
 - Service validation must cover installed service binary version, path, ACLs, named-pipe/API health, process counts, and install/start/status/stop/uninstall behavior.
 - A matching boundless-service.exe --version result is required stable-release evidence when installer smoke evidence is supplied.
-- MSI-owned updates are the supported payload update model: the MSI installer owns install, upgrade, repair, and uninstall of tray, daemon, and service payloads.
+- MSI-owned updates are the supported packaged-payload update model: the MSI installer owns install, upgrade, repair, and uninstall of tray, daemon, and service payloads it installs.
+- Active admin-registered service binary replacement remains explicit service-mode/update validation unless the service is registered against an MSI-owned install location.
 - Service and tray self-update modes are unsupported/deferred. Do not claim service-mode update parity from daemon/tray success alone.
 - Release readiness records `service_update_ownership` and `n_minus_1_msi_upgrade` gates; stable policy fails if N-1 MSI evidence is skipped or malformed.
 
@@ -73,7 +74,7 @@ These are not hidden release blockers by default; they require explicit release-
 | gap_id | status | rationale | recorded in |
 | --- | --- | --- | --- |
 | n_minus_1_msi_upgrade | open | Release-readiness now has an explicit gate, but the evidence still requires a prior GitHub Release MSI asset and Windows installer lab run. Stable packets fail when this evidence is skipped or malformed. | docs/release/v5-release-hardening.md, docs/release/release-readiness.md |
-| service_update_orchestration | deferred | MSI-owned payload updates are the supported boundary; a tray notification or installer-launch UX remains future product work, and service/tray self-update remains unsupported. | this document |
+| service_update_orchestration | deferred | MSI-owned packaged-payload updates are the supported boundary; active admin-registered service binary replacement, tray notification, or installer-launch UX remains future product work, and service/tray self-update remains unsupported. | this document |
 | interactive_desktop_service_mode | deferred | Lock-screen and elevated-app behavior require Windows runtime evidence. | docs/release/v5-release-hardening.md |
 | transport_fault_injection_harness | partially landed | PR #89 landed a narrow post-auth session fault harness; BND-NEXT-7 used it for behavior-neutral reactor cleanup, while broad multi-peer/runtime fault coverage remains deferred. | this document, docs/architecture/network-v1.md |
 | mixed_dpi_input_matrix | deferred | Mixed-DPI and negative-coordinate monitor validation needs Windows hardware/runtime evidence. | this document |
@@ -105,7 +106,7 @@ These are not hidden release blockers by default; they require explicit release-
 | Add project status and component map | addressed by this work | this file and docs/architecture/component-map.md | These are the canonical agent context docs. |
 | Make release evidence self-describing | landed and addressed by this work | release-readiness.json, release-readiness.md, release_policy, gate reasons/impacts | Stable policy fails failed/skipped/missing/stale supported evidence. |
 | MSI-owned service update readiness | landed | release-readiness.ps1, release-readiness-fixtures.ps1 | Readiness records MSI-owned ownership and N-1 MSI upgrade evidence separately from unsupported service/tray self-update modes. |
-| Full MSI-owned service updater | deferred | service_update_orchestration gap | MSI owns payload updates; tray notification/installer-launch UX remains future product work, and service/tray self-update is unsupported. |
+| Full MSI-owned service updater | deferred | service_update_orchestration gap | MSI owns packaged-payload updates; active admin-registered service binary replacement plus tray notification/installer-launch UX remains future product work, and service/tray self-update is unsupported. |
 | Full transport session reactor rewrite | partially landed | PRs #90-#93 and docs/architecture/network-v1.md | BND-NEXT-7 landed behavior-neutral post-auth boundaries: `SessionRuntime`, `SessionExitReason`, and named read/flush helpers. Full `SessionEvent`/`SessionPhase` machinery remains deferred. |
 | Pairing listener admission hardening | landed | PR #88 | Admission caps, duplicate manual join handling, and pre-consumption capacity checks are implemented; broader setup UX remains deferred. |
 | Runtime task supervisor | landed | PR #87 | Top-level task ownership, redacted health, and deterministic shutdown foundation are implemented; richer lifecycle policy remains follow-up reliability work. |

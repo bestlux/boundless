@@ -294,7 +294,7 @@ function Add-ServiceUpdateOwnershipGate {
     param([string]$Mode)
 
     if ($Mode -eq "msi-owned") {
-        Add-GateResult -Id "service_update_ownership" -Category "release" -Command "release-readiness -ServiceUpdateMode msi-owned" -Status "passed" -Reason "MSI installer owns install, upgrade, repair, and uninstall of tray, daemon, and service payloads"
+        Add-GateResult -Id "service_update_ownership" -Category "release" -Command "release-readiness -ServiceUpdateMode msi-owned" -Status "passed" -Reason "MSI installer owns install, upgrade, repair, and uninstall of packaged tray, daemon, and service payloads"
         return
     }
 
@@ -326,13 +326,20 @@ function Add-NMinusOneMsiUpgradeGate {
     }
 
     $previousInstallExitCode = Get-SummaryPropertyValue -Summary $Summary -Name "previous_install_exit_code"
-    if ($null -eq $previousInstallExitCode) {
-        Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "installer smoke summary included upgraded_from but missing previous_install_exit_code" -Impact "N-1 MSI evidence is malformed and cannot prove the prior installer ran"
+    $previousInstallExitCodeText = [string]$previousInstallExitCode
+    if ($null -eq $previousInstallExitCode -or [string]::IsNullOrWhiteSpace($previousInstallExitCodeText)) {
+        Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "installer smoke summary included upgraded_from but missing or empty previous_install_exit_code" -Impact "N-1 MSI evidence is malformed and cannot prove the prior installer ran"
         return
     }
 
-    if ([int]$previousInstallExitCode -ne 0) {
-        Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "previous MSI install exited $previousInstallExitCode" -Impact "N-1 MSI upgrade validation is blocked until the prior installer succeeds before current MSI upgrade"
+    $parsedPreviousInstallExitCode = 0
+    if (-not [int]::TryParse($previousInstallExitCodeText, [ref]$parsedPreviousInstallExitCode)) {
+        Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "installer smoke summary previous_install_exit_code was not an integer: $previousInstallExitCodeText" -Impact "N-1 MSI evidence is malformed and cannot prove the prior installer ran"
+        return
+    }
+
+    if ($parsedPreviousInstallExitCode -ne 0) {
+        Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "previous MSI install exited $parsedPreviousInstallExitCode" -Impact "N-1 MSI upgrade validation is blocked until the prior installer succeeds before current MSI upgrade"
         return
     }
 

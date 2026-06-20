@@ -26,7 +26,7 @@ function New-InstallerSmokeSummary {
         [string]$Path,
         [string]$ServiceVersionOutput,
         [string]$UpgradedFrom = "",
-        [Nullable[int]]$PreviousInstallExitCode = $null
+        [object]$PreviousInstallExitCode = $null
     )
 
     @{
@@ -65,7 +65,7 @@ function Invoke-Fixture {
         [string]$Name,
         [string]$ServiceVersionOutput = "",
         [string]$UpgradedFrom = "",
-        [Nullable[int]]$PreviousInstallExitCode = $null,
+        [object]$PreviousInstallExitCode = $null,
         [switch]$NoInstallerSummary,
         [switch]$RequireReady,
         [ValidateSet("stable", "prerelease")]
@@ -143,6 +143,8 @@ Invoke-Fixture -Name "stable_policy_requires_n_minus_one_msi_evidence" -ServiceV
 Invoke-Fixture -Name "unsupported_service_self_update_fails" -ServiceVersionOutput "boundless-service 5.0.0" -ServiceUpdateMode "service-self-update" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "failed" -ExpectedNMinusOneStatus "failed"
 Invoke-Fixture -Name "unsupported_tray_self_update_fails" -ServiceVersionOutput "boundless-service 5.0.0" -ServiceUpdateMode "tray-self-update" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "failed" -ExpectedNMinusOneStatus "failed"
 Invoke-Fixture -Name "missing_previous_install_exit_code_fails" -ServiceVersionOutput "boundless-service 5.0.0" -UpgradedFrom "Boundless-4.0.2-windows-x64.msi" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedNMinusOneStatus "failed"
+Invoke-Fixture -Name "empty_previous_install_exit_code_fails" -ServiceVersionOutput "boundless-service 5.0.0" -UpgradedFrom "Boundless-4.0.2-windows-x64.msi" -PreviousInstallExitCode "" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedNMinusOneStatus "failed"
+Invoke-Fixture -Name "malformed_previous_install_exit_code_fails" -ServiceVersionOutput "boundless-service 5.0.0" -UpgradedFrom "Boundless-4.0.2-windows-x64.msi" -PreviousInstallExitCode "zero" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedNMinusOneStatus "failed"
 Invoke-Fixture -Name "failed_prior_msi_install_fails" -ServiceVersionOutput "boundless-service 5.0.0" -UpgradedFrom "Boundless-4.0.2-windows-x64.msi" -PreviousInstallExitCode 1603 -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedNMinusOneStatus "failed"
 Invoke-Fixture -Name "substring_version_fails" -ServiceVersionOutput "boundless-service 15.0.0" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "failed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedNMinusOneStatus "skipped"
 Invoke-Fixture -Name "prerelease_service_version_fails_for_stable_release" -ServiceVersionOutput "boundless-service 5.0.0-rc" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "failed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedNMinusOneStatus "skipped"

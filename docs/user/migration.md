@@ -33,7 +33,7 @@ Release validation for upgrade-while-running requires:
   -KeepArtifacts
 ```
 
-The MSI is the authoritative updater for Boundless payloads. The service does not self-update, and the tray does not own update application; any future tray notification flow must launch an MSI installer rather than replacing tray, daemon, or service binaries itself.
+The MSI is the authoritative updater for packaged Boundless payloads. The service does not self-update, and the tray does not own update application; any future tray notification flow must launch an MSI installer rather than replacing tray, daemon, or service payloads itself.
 
 ## From Mouse Without Borders To Boundless
 
