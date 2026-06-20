@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use chrono::Utc;
 use peer_transport::{
@@ -26,6 +26,78 @@ use super::outbound::{
     flush_outgoing_bulk_payloads_with_buffer, flush_outgoing_input_payloads_with_buffer,
 };
 use super::*;
+
+struct AuthenticatedSession {
+    peer_id: String,
+    remote_peer_id: Option<String>,
+    is_outbound: bool,
+    local_machine_id: String,
+    local_device_name: String,
+}
+
+impl AuthenticatedSession {
+    async fn new(state: &AppState, peer_id: String, is_outbound: bool) -> Self {
+        let snapshot = state.snapshot().await;
+        Self {
+            remote_peer_id: Some(peer_id.clone()),
+            peer_id,
+            is_outbound,
+            local_machine_id: snapshot.machine_id,
+            local_device_name: snapshot.device_name,
+        }
+    }
+
+    fn remote_peer_id(&self) -> Option<&str> {
+        self.remote_peer_id.as_deref()
+    }
+
+    fn local_hello(&self) -> WireMessage {
+        WireMessage::Hello {
+            machine_id: self.local_machine_id.clone(),
+            display_name: self.local_device_name.clone(),
+            protocol: PROTOCOL_CURRENT,
+            capability_count: core_protocol::default_capabilities().len(),
+        }
+    }
+}
+
+struct SessionRuntime {
+    observed_reconnect_generation: u64,
+    remote_protocol: Option<ProtocolVersion>,
+    inbound_transfers: HashMap<String, InboundTransfer>,
+    inbound_clipboard_image_transfers: HashMap<String, InboundClipboardImageTransfer>,
+    outbound_transfer_flow: OutboundTransferFlows,
+    frame_payload: Vec<u8>,
+    write_frame_buffer: Vec<u8>,
+    last_anti_idle_pulse_sent_at: Option<Instant>,
+}
+
+impl SessionRuntime {
+    fn new(observed_reconnect_generation: u64, write_frame_buffer: Vec<u8>) -> Self {
+        Self {
+            observed_reconnect_generation,
+            remote_protocol: None,
+            inbound_transfers: HashMap::new(),
+            inbound_clipboard_image_transfers: HashMap::new(),
+            outbound_transfer_flow: HashMap::new(),
+            frame_payload: Vec::with_capacity(4096),
+            write_frame_buffer,
+            last_anti_idle_pulse_sent_at: None,
+        }
+    }
+
+    async fn discard_inbound_state(self, state: &AppState) {
+        for (transfer_id, transfer) in self.inbound_transfers {
+            state
+                .mark_file_transfer_failed(&transfer_id, "session_closed")
+                .await;
+            discard_inbound_transfer(transfer).await;
+        }
+        for transfer in self.inbound_clipboard_image_transfers.into_values() {
+            discard_inbound_clipboard_image_transfer(transfer).await;
+        }
+    }
+}
 
 pub(super) async fn connect_and_run_outbound(
     state: AppState,
@@ -131,7 +203,6 @@ where
     let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
-    let mut frame_payload = Vec::<u8>::with_capacity(4096);
     let mut write_frame_buffer = Vec::<u8>::with_capacity(4096);
     let mut heartbeat_interval = time::interval(DEFAULT_TRANSPORT_TUNING.heartbeat_interval);
     let mut outgoing_input_flush_interval =
@@ -143,27 +214,14 @@ where
     outgoing_input_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     outgoing_bulk_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
-    let snapshot = state.snapshot().await;
-    let local_hello = WireMessage::Hello {
-        machine_id: snapshot.machine_id.clone(),
-        display_name: snapshot.device_name.clone(),
-        protocol: PROTOCOL_CURRENT,
-        capability_count: core_protocol::default_capabilities().len(),
-    };
+    let session = AuthenticatedSession::new(&state, authenticated_peer_id, is_outbound).await;
+    let local_hello = session.local_hello();
 
     send_message(&mut writer, &local_hello, &mut write_frame_buffer).await?;
     writer.flush().await.context("flush local hello")?;
 
-    let remote_peer_id = Some(authenticated_peer_id.clone());
-    let mut observed_reconnect_generation = state
-        .peer_reconnect_generation(&authenticated_peer_id)
-        .await;
-    let mut remote_protocol: Option<ProtocolVersion> = None;
-    let mut inbound_transfers: HashMap<String, InboundTransfer> = HashMap::new();
-    let mut inbound_clipboard_image_transfers: HashMap<String, InboundClipboardImageTransfer> =
-        HashMap::new();
-    let mut outbound_transfer_flow: OutboundTransferFlows = HashMap::new();
-    let mut last_anti_idle_pulse_sent_at: Option<std::time::Instant> = None;
+    let observed_reconnect_generation = state.peer_reconnect_generation(&session.peer_id).await;
+    let mut runtime = SessionRuntime::new(observed_reconnect_generation, write_frame_buffer);
 
     let session_result: Result<()> = {
         async {
@@ -172,25 +230,25 @@ where
             _ = heartbeat_interval.tick() => {
                 if reconnect_requested_for_peer(
                     &state,
-                    &authenticated_peer_id,
-                    &mut observed_reconnect_generation,
+                    &session.peer_id,
+                    &mut runtime.observed_reconnect_generation,
                 )
                 .await
                 {
                     info!(
-                        peer_id = %authenticated_peer_id,
+                        peer_id = %session.peer_id,
                         "ending session due to explicit reconnect request"
                     );
                     break;
                 }
 
                 let heartbeat = WireMessage::Heartbeat {
-                    machine_id: snapshot.machine_id.clone(),
+                    machine_id: session.local_machine_id.clone(),
                     timestamp_unix_ms: now_millis(),
                 };
-                send_message(&mut writer, &heartbeat, &mut write_frame_buffer).await?;
+                send_message(&mut writer, &heartbeat, &mut runtime.write_frame_buffer).await?;
                 if let Some(pulse) = state.anti_idle_outbound_pulse().await
-                    && last_anti_idle_pulse_sent_at
+                    && runtime.last_anti_idle_pulse_sent_at
                         .is_none_or(|last| last.elapsed() >= pulse.interval)
                 {
                     send_message(
@@ -198,102 +256,102 @@ where
                         &WireMessage::AntiIdlePulse {
                             keep_display_on: pulse.keep_display_on,
                         },
-                        &mut write_frame_buffer,
+                        &mut runtime.write_frame_buffer,
                     )
                     .await?;
                     state.record_transport_event(TransportEventRecord {
                         timestamp: Utc::now(),
                         direction: "outgoing".to_string(),
                         kind: "anti_idle_pulse_sent".to_string(),
-                        peer_id: authenticated_peer_id.clone(),
+                        peer_id: session.peer_id.clone(),
                         detail: format!("keep_display_on={}", pulse.keep_display_on),
                         size_bytes: 0,
                     });
-                    last_anti_idle_pulse_sent_at = Some(std::time::Instant::now());
+                    runtime.last_anti_idle_pulse_sent_at = Some(std::time::Instant::now());
                 }
-                if let Some(remote_protocol) = remote_protocol {
+                if let Some(remote_protocol) = runtime.remote_protocol {
                     flush_outgoing_input_payloads_with_buffer(
                         &state,
-                        &snapshot.machine_id,
-                        remote_peer_id.as_deref(),
+                        &session.local_machine_id,
+                        session.remote_peer_id(),
                         remote_protocol,
-                        &mut outbound_transfer_flow,
+                        &mut runtime.outbound_transfer_flow,
                         &mut writer,
-                        &mut write_frame_buffer,
+                        &mut runtime.write_frame_buffer,
                     )
                     .await?;
                     flush_outgoing_bulk_payloads_with_buffer(
                         &state,
-                        &snapshot.machine_id,
-                        remote_peer_id.as_deref(),
+                        &session.local_machine_id,
+                        session.remote_peer_id(),
                         remote_protocol,
                         DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
-                        &mut outbound_transfer_flow,
+                        &mut runtime.outbound_transfer_flow,
                         &mut writer,
-                        &mut write_frame_buffer,
+                        &mut runtime.write_frame_buffer,
                     )
                     .await?;
                 }
                 writer.flush().await.context("flush heartbeat batch")?;
             }
-            _ = outgoing_input_flush_interval.tick(), if remote_protocol.is_some() => {
+            _ = outgoing_input_flush_interval.tick(), if runtime.remote_protocol.is_some() => {
                 if reconnect_requested_for_peer(
                     &state,
-                    &authenticated_peer_id,
-                    &mut observed_reconnect_generation,
+                    &session.peer_id,
+                    &mut runtime.observed_reconnect_generation,
                 )
                 .await
                 {
                     info!(
-                        peer_id = %authenticated_peer_id,
+                        peer_id = %session.peer_id,
                         "ending session due to explicit reconnect request"
                     );
                     break;
                 }
 
-                if let Some(remote_protocol) = remote_protocol {
+                if let Some(remote_protocol) = runtime.remote_protocol {
                     flush_outgoing_input_payloads_with_buffer(
                         &state,
-                        &snapshot.machine_id,
-                        remote_peer_id.as_deref(),
+                        &session.local_machine_id,
+                        session.remote_peer_id(),
                         remote_protocol,
-                        &mut outbound_transfer_flow,
+                        &mut runtime.outbound_transfer_flow,
                         &mut writer,
-                        &mut write_frame_buffer,
+                        &mut runtime.write_frame_buffer,
                     )
                     .await?;
                 }
             }
-            _ = outgoing_bulk_flush_interval.tick(), if remote_protocol.is_some() => {
+            _ = outgoing_bulk_flush_interval.tick(), if runtime.remote_protocol.is_some() => {
                 if reconnect_requested_for_peer(
                     &state,
-                    &authenticated_peer_id,
-                    &mut observed_reconnect_generation,
+                    &session.peer_id,
+                    &mut runtime.observed_reconnect_generation,
                 )
                 .await
                 {
                     info!(
-                        peer_id = %authenticated_peer_id,
+                        peer_id = %session.peer_id,
                         "ending session due to explicit reconnect request"
                     );
                     break;
                 }
 
-                if let Some(remote_protocol) = remote_protocol {
+                if let Some(remote_protocol) = runtime.remote_protocol {
                     flush_outgoing_bulk_payloads_with_buffer(
                         &state,
-                        &snapshot.machine_id,
-                        remote_peer_id.as_deref(),
+                        &session.local_machine_id,
+                        session.remote_peer_id(),
                         remote_protocol,
                         DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
-                        &mut outbound_transfer_flow,
+                        &mut runtime.outbound_transfer_flow,
                         &mut writer,
-                        &mut write_frame_buffer,
+                        &mut runtime.write_frame_buffer,
                     )
                     .await?;
                 }
             }
-            changed = outgoing_flush_signal.changed(), if remote_protocol.is_some() => {
+            changed = outgoing_flush_signal.changed(), if runtime.remote_protocol.is_some() => {
                 if changed.is_err() {
                     // State dropped; session will naturally unwind shortly.
                     break;
@@ -301,41 +359,41 @@ where
 
                 if reconnect_requested_for_peer(
                     &state,
-                    &authenticated_peer_id,
-                    &mut observed_reconnect_generation,
+                    &session.peer_id,
+                    &mut runtime.observed_reconnect_generation,
                 )
                 .await
                 {
                     info!(
-                        peer_id = %authenticated_peer_id,
+                        peer_id = %session.peer_id,
                         "ending session due to explicit reconnect request"
                     );
                     break;
                 }
 
-                if let Some(remote_protocol) = remote_protocol {
+                if let Some(remote_protocol) = runtime.remote_protocol {
                     flush_outgoing_input_payloads_with_buffer(
                         &state,
-                        &snapshot.machine_id,
-                        remote_peer_id.as_deref(),
+                        &session.local_machine_id,
+                        session.remote_peer_id(),
                         remote_protocol,
-                        &mut outbound_transfer_flow,
+                        &mut runtime.outbound_transfer_flow,
                         &mut writer,
-                        &mut write_frame_buffer,
+                        &mut runtime.write_frame_buffer,
                     )
                     .await?;
                 }
             }
-            read = read_wire_frame_payload(&mut reader, &mut frame_payload) => {
+            read = read_wire_frame_payload(&mut reader, &mut runtime.frame_payload) => {
                 if reconnect_requested_for_peer(
                     &state,
-                    &authenticated_peer_id,
-                    &mut observed_reconnect_generation,
+                    &session.peer_id,
+                    &mut runtime.observed_reconnect_generation,
                 )
                 .await
                 {
                     info!(
-                        peer_id = %authenticated_peer_id,
+                        peer_id = %session.peer_id,
                         "ending session due to explicit reconnect request"
                     );
                     break;
@@ -346,13 +404,13 @@ where
                     Err(error) => {
                         record_transport_frame_rejected(
                             &state,
-                            &authenticated_peer_id,
+                            &session.peer_id,
                             format!("reason=invalid_frame error={error:#}"),
-                            frame_payload.len() as u64,
+                            runtime.frame_payload.len() as u64,
                         )
                         .await;
                         warn!(
-                            peer_id = %authenticated_peer_id,
+                            peer_id = %session.peer_id,
                             error = ?error,
                             "transport frame rejected"
                         );
@@ -362,18 +420,18 @@ where
                     break;
                 };
 
-                let message = match decode_frame_payload(&frame_payload) {
+                let message = match decode_frame_payload(&runtime.frame_payload) {
                     Ok(message) => message,
                     Err(error) => {
                         record_transport_frame_rejected(
                             &state,
-                            &authenticated_peer_id,
+                            &session.peer_id,
                             format!("reason=decode_failed error={error}"),
                             read as u64,
                         )
                         .await;
                         warn!(
-                            peer_id = %authenticated_peer_id,
+                            peer_id = %session.peer_id,
                             error = ?error,
                             "dropping undecodable wire message"
                         );
@@ -389,16 +447,16 @@ where
                     } => {
                         let handling = handle_hello_message(
                             &state,
-                            &authenticated_peer_id,
-                            remote_peer_id.as_deref(),
-                            is_outbound,
-                            &snapshot.machine_id,
+                            &session.peer_id,
+                            session.remote_peer_id(),
+                            session.is_outbound,
+                            &session.local_machine_id,
                             machine_id,
                             protocol,
-                            &mut remote_protocol,
-                            &mut outbound_transfer_flow,
+                            &mut runtime.remote_protocol,
+                            &mut runtime.outbound_transfer_flow,
                             &mut writer,
-                            &mut write_frame_buffer,
+                            &mut runtime.write_frame_buffer,
                         )
                         .await?;
                         if matches!(handling, HelloHandling::TerminateSession) {
@@ -408,23 +466,23 @@ where
                     WireMessage::HelloAck { accepted, .. } => {
                         handle_hello_ack_message(
                             &state,
-                            remote_peer_id.as_deref(),
-                            &snapshot.machine_id,
-                            remote_protocol,
-                            &mut outbound_transfer_flow,
+                            session.remote_peer_id(),
+                            &session.local_machine_id,
+                            runtime.remote_protocol,
+                            &mut runtime.outbound_transfer_flow,
                             accepted,
                             &mut writer,
-                            &mut write_frame_buffer,
+                            &mut runtime.write_frame_buffer,
                         )
                         .await?;
                     }
                     WireMessage::Heartbeat { .. } => {
-                        handle_heartbeat_message(&state, remote_peer_id.as_deref()).await;
+                        handle_heartbeat_message(&state, session.remote_peer_id()).await;
                     }
                     WireMessage::AntiIdlePulse { keep_display_on } => {
                         handle_anti_idle_pulse_message(
                             &state,
-                            remote_peer_id.as_deref(),
+                            session.remote_peer_id(),
                             keep_display_on,
                         )
                         .await;
@@ -432,8 +490,8 @@ where
                     WireMessage::ClipboardText { machine_id, text } => {
                         handle_clipboard_text_message(
                             &state,
-                            &authenticated_peer_id,
-                            remote_peer_id.as_deref(),
+                            &session.peer_id,
+                            session.remote_peer_id(),
                             machine_id,
                             text,
                         )
@@ -445,8 +503,8 @@ where
                     } => {
                         handle_clipboard_image_message(
                             &state,
-                            &authenticated_peer_id,
-                            remote_peer_id.as_deref(),
+                            &session.peer_id,
+                            session.remote_peer_id(),
                             machine_id,
                             data,
                         )
@@ -461,13 +519,13 @@ where
                     } => {
                         handle_clipboard_image_start(
                             &state,
-                            &authenticated_peer_id,
-                            remote_peer_id.as_deref(),
+                            &session.peer_id,
+                            session.remote_peer_id(),
                             machine_id,
                             transfer_id,
                             total_bytes,
                             hash_hex,
-                            &mut inbound_clipboard_image_transfers,
+                            &mut runtime.inbound_clipboard_image_transfers,
                         )
                         .await?;
                     }
@@ -476,7 +534,7 @@ where
                             &state,
                             transfer_id,
                             data,
-                            &mut inbound_clipboard_image_transfers,
+                            &mut runtime.inbound_clipboard_image_transfers,
                         )
                         .await?;
                     }
@@ -484,7 +542,7 @@ where
                         handle_clipboard_image_end(
                             &state,
                             transfer_id,
-                            &mut inbound_clipboard_image_transfers,
+                            &mut runtime.inbound_clipboard_image_transfers,
                         )
                         .await?;
                     }
@@ -496,15 +554,15 @@ where
                     } => {
                         handle_file_start(
                             &state,
-                            &authenticated_peer_id,
-                            remote_peer_id.as_deref(),
+                            &session.peer_id,
+                            session.remote_peer_id(),
                             machine_id,
                             transfer_id,
                             file_name,
                             total_bytes,
-                            &mut inbound_transfers,
+                            &mut runtime.inbound_transfers,
                             &mut writer,
-                            &mut write_frame_buffer,
+                            &mut runtime.write_frame_buffer,
                         )
                         .await?;
                     }
@@ -516,9 +574,9 @@ where
                             &state,
                             transfer_id,
                             data,
-                            &mut inbound_transfers,
+                            &mut runtime.inbound_transfers,
                             &mut writer,
-                            &mut write_frame_buffer,
+                            &mut runtime.write_frame_buffer,
                         )
                         .await?;
                     }
@@ -531,7 +589,7 @@ where
                         }
 
                         let Some(_current_credits) = apply_outbound_chunk_credits(
-                            &mut outbound_transfer_flow,
+                            &mut runtime.outbound_transfer_flow,
                             &transfer_id,
                             chunk_credits,
                         ) else {
@@ -543,16 +601,16 @@ where
                             continue;
                         };
 
-                        if let Some(remote_protocol) = remote_protocol {
+                        if let Some(remote_protocol) = runtime.remote_protocol {
                             flush_outgoing_bulk_payloads_with_buffer(
                                 &state,
-                                &snapshot.machine_id,
-                                remote_peer_id.as_deref(),
+                                &session.local_machine_id,
+                                session.remote_peer_id(),
                                 remote_protocol,
                                 DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
-                                &mut outbound_transfer_flow,
+                                &mut runtime.outbound_transfer_flow,
                                 &mut writer,
-                                &mut write_frame_buffer,
+                                &mut runtime.write_frame_buffer,
                             )
                             .await?;
                             writer
@@ -567,15 +625,15 @@ where
                     } => {
                         handle_file_transfer_rejected(
                             &state,
-                            remote_peer_id.as_deref(),
+                            session.remote_peer_id(),
                             transfer_id,
                             reason,
-                            &mut outbound_transfer_flow,
+                            &mut runtime.outbound_transfer_flow,
                         )
                         .await;
                     }
                     WireMessage::FileEnd { transfer_id } => {
-                        handle_file_end(&state, transfer_id, &mut inbound_transfers).await?;
+                        handle_file_end(&state, transfer_id, &mut runtime.inbound_transfers).await?;
                     }
                     WireMessage::InputFrame {
                         machine_id,
@@ -585,8 +643,8 @@ where
                     } => {
                         handle_input_frame_message(
                             &state,
-                            &authenticated_peer_id,
-                            remote_peer_id.as_deref(),
+                            &session.peer_id,
+                            session.remote_peer_id(),
                             machine_id,
                             sequence,
                             timestamp_unix_ms,
@@ -607,17 +665,9 @@ where
         .await
     };
 
-    for (transfer_id, transfer) in inbound_transfers {
-        state
-            .mark_file_transfer_failed(&transfer_id, "session_closed")
-            .await;
-        discard_inbound_transfer(transfer).await;
-    }
-    for transfer in inbound_clipboard_image_transfers.into_values() {
-        discard_inbound_clipboard_image_transfer(transfer).await;
-    }
+    runtime.discard_inbound_state(&state).await;
 
-    if let Some(peer_id) = &remote_peer_id {
+    if let Some(peer_id) = session.remote_peer_id() {
         let _ = state.set_peer_connected(peer_id, false).await;
     }
 
