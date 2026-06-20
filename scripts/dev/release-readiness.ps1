@@ -17,6 +17,8 @@ param(
     [string]$ReleaseManagerSignoff = "",
     [ValidateSet("stable", "prerelease")]
     [string]$Policy = "prerelease",
+    [ValidateSet("msi-owned", "service-self-update", "tray-self-update")]
+    [string]$ServiceUpdateMode = "msi-owned",
     [int]$MaxEvidenceAgeHours = 168
 )
 
@@ -42,6 +44,7 @@ $results = New-Object System.Collections.Generic.List[object]
 $evidenceRoot = Join-Path $OutputRoot "evidence"
 New-Item -ItemType Directory -Force -Path $evidenceRoot | Out-Null
 $installerSmokeSummary = $null
+$nMinusOneMsiCommand = "scripts/dev/installer-smoke.ps1 -InstallerPath <current-msi> -PreviousInstallerPath <prior-msi> -KeepArtifacts"
 
 $packageManifestPath = Join-Path $repoRoot "packaging/windows/package-manifest.json"
 $packageManifestVersion = ""
@@ -189,6 +192,22 @@ function Copy-AndValidateInstallerSmokeSummary {
     return $summary
 }
 
+function Get-SummaryPropertyValue {
+    param(
+        [object]$Summary,
+        [string]$Name
+    )
+
+    if ($null -eq $Summary) {
+        return $null
+    }
+    $property = $Summary.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+    return $property.Value
+}
+
 function Normalize-ReleaseVersion {
     param([string]$Version)
 
@@ -269,6 +288,62 @@ function Add-ServiceVersionGate {
         "prerelease service host version mismatch must be reviewed before promotion"
     }
     Add-GateResult -Id "service_version_parity" -Category "release" -Command "installed boundless-service.exe --version" -Status $status -LogPath $LogPath -Reason $reason -Impact $impact
+}
+
+function Add-ServiceUpdateOwnershipGate {
+    param([string]$Mode)
+
+    if ($Mode -eq "msi-owned") {
+        Add-GateResult -Id "service_update_ownership" -Category "release" -Command "release-readiness -ServiceUpdateMode msi-owned" -Status "passed" -Reason "MSI installer owns install, upgrade, repair, and uninstall of packaged tray, daemon, and service payloads"
+        return
+    }
+
+    $owner = if ($Mode -eq "service-self-update") { "service self-update" } else { "tray self-update" }
+    Add-GateResult -Id "service_update_ownership" -Category "release" -Command "release-readiness -ServiceUpdateMode $Mode" -Status "failed" -Reason "$owner is unsupported/deferred" -Impact "release readiness accepts MSI-owned update evidence only; service and tray self-update modes must not be treated as supported update evidence"
+}
+
+function Add-NMinusOneMsiUpgradeGate {
+    param(
+        [object]$Summary,
+        [string]$Mode,
+        [string]$Command
+    )
+
+    if ($Mode -ne "msi-owned") {
+        Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "N-1 upgrade validation requires MSI-owned update mode, not $Mode" -Impact "unsupported service/tray self-update evidence cannot satisfy MSI upgrade readiness"
+        return
+    }
+
+    if ($null -eq $Summary) {
+        Add-SkippedGate -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Reason "installer smoke summary was not provided" -Impact "provide current and prior MSI artifacts, then run $Command before stable release signoff"
+        return
+    }
+
+    $upgradedFrom = [string](Get-SummaryPropertyValue -Summary $Summary -Name "upgraded_from")
+    if ([string]::IsNullOrWhiteSpace($upgradedFrom)) {
+        Add-SkippedGate -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Reason "installer smoke summary did not include a prior MSI in upgraded_from" -Impact "provide the previous release MSI with -PreviousInstallerPath; current supported source is a GitHub Release asset named Boundless-<version>-windows-x64.msi"
+        return
+    }
+
+    $previousInstallExitCode = Get-SummaryPropertyValue -Summary $Summary -Name "previous_install_exit_code"
+    $previousInstallExitCodeText = [string]$previousInstallExitCode
+    if ($null -eq $previousInstallExitCode -or [string]::IsNullOrWhiteSpace($previousInstallExitCodeText)) {
+        Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "installer smoke summary included upgraded_from but missing or empty previous_install_exit_code" -Impact "N-1 MSI evidence is malformed and cannot prove the prior installer ran"
+        return
+    }
+
+    $parsedPreviousInstallExitCode = 0
+    if (-not [int]::TryParse($previousInstallExitCodeText, [ref]$parsedPreviousInstallExitCode)) {
+        Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "installer smoke summary previous_install_exit_code was not an integer: $previousInstallExitCodeText" -Impact "N-1 MSI evidence is malformed and cannot prove the prior installer ran"
+        return
+    }
+
+    if ($parsedPreviousInstallExitCode -ne 0) {
+        Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "previous MSI install exited $parsedPreviousInstallExitCode" -Impact "N-1 MSI upgrade validation is blocked until the prior installer succeeds before current MSI upgrade"
+        return
+    }
+
+    Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "passed" -LogPath $upgradedFrom
 }
 
 function Get-ParityReleaseBlockers {
@@ -405,6 +480,9 @@ else {
     Add-SkippedGate -Id "service_version_parity" -Category "release" -Command "installed boundless-service.exe --version" -Reason "installer smoke summary was not provided" -Impact "service/runtime version parity evidence must be supplied before stable release signoff"
 }
 
+Add-ServiceUpdateOwnershipGate -Mode $ServiceUpdateMode
+Add-NMinusOneMsiUpgradeGate -Summary $installerSmokeSummary -Mode $ServiceUpdateMode -Command $nMinusOneMsiCommand
+
 if ($IncludeServiceSmoke) {
     Invoke-Gate -Id "service_smoke" -Category "release" -Command "scripts/dev/service-smoke.ps1" -Action {
         & (Join-Path $repoRoot "scripts/dev/service-smoke.ps1") -OutputRoot (Join-Path $OutputRoot "service-smoke")
@@ -450,6 +528,7 @@ $packet = [pscustomobject]@{
     git_commit = $gitCommit
     release_version = $effectiveReleaseVersion
     release_policy = $Policy
+    service_update_mode = $ServiceUpdateMode
     risk_classification = $risk
     release_manager_signoff = $ReleaseManagerSignoff
     environment = $environment
@@ -471,6 +550,7 @@ $markdown.Add("- Git branch: $($packet.git_branch)")
 $markdown.Add("- Git commit: $($packet.git_commit)")
 $markdown.Add("- Release version: $($packet.release_version)")
 $markdown.Add("- Release policy: $($packet.release_policy)")
+$markdown.Add("- Service update mode: $($packet.service_update_mode)")
 $markdown.Add("- Risk classification: $risk")
 $markdown.Add("- Release manager signoff: $($packet.release_manager_signoff)")
 $markdown.Add("- Parity matrix: ``docs/parity/mouse-without-borders.md``")
