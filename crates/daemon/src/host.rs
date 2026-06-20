@@ -61,12 +61,26 @@ where
         "boundless daemon starting"
     );
 
-    serve(DaemonRuntime {
+    let runtime_state = state.clone();
+    let result = serve(DaemonRuntime {
         state,
         snapshot,
         effective_api_transport,
     })
-    .await
+    .await;
+
+    runtime_state.begin_transport_session_shutdown();
+    runtime_state.shutdown_runtime_tasks().await;
+    let aborted_transport_sessions = runtime_state
+        .abort_all_transport_sessions_for_shutdown()
+        .await;
+    if aborted_transport_sessions > 0 {
+        info!(
+            aborted_transport_sessions,
+            "aborted transport sessions during daemon shutdown"
+        );
+    }
+    result
 }
 
 pub async fn shutdown_signal() {

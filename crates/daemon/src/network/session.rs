@@ -95,9 +95,7 @@ where
 {
     let authenticated_peer_id = authenticated_peer_machine_id(&state, &stream).await?;
     if let Some(session_id) = session_registration_id {
-        state
-            .bind_pending_transport_session_to_peer(session_id, &authenticated_peer_id)
-            .await;
+        state.bind_pending_transport_session_to_peer(session_id, &authenticated_peer_id);
     }
     if let Some(expected_peer_id) = peer_hint.as_deref()
         && expected_peer_id != authenticated_peer_id

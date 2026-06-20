@@ -9,14 +9,25 @@ use tracing::{debug, info, warn};
 
 use core_discovery::{DiscoveryAnnouncement, MDNS_SERVICE_TYPE, mdns_instance_name};
 
-use crate::state::AppState;
+use crate::{
+    runtime_tasks::{RuntimeTaskOwner, RuntimeTaskShutdown, RuntimeTaskSpec},
+    state::AppState,
+};
 
 pub fn start(state: AppState) {
-    tokio::spawn(async move {
-        if let Err(error) = run(state).await {
-            warn!(error = ?error, "mDNS discovery runtime stopped");
-        }
-    });
+    let task_state = state.clone();
+    state.spawn_runtime_task(
+        RuntimeTaskSpec::new(
+            "discovery.mdns",
+            RuntimeTaskOwner::Discovery,
+            RuntimeTaskShutdown::AbortOnDaemonShutdown,
+        ),
+        async move {
+            if let Err(error) = run(task_state).await {
+                warn!(error = ?error, "mDNS discovery runtime stopped");
+            }
+        },
+    );
 }
 
 async fn run(state: AppState) -> Result<()> {

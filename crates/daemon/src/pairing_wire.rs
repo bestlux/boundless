@@ -13,7 +13,10 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-use crate::state::{AppState, NearbyPairingStatus};
+use crate::{
+    runtime_tasks::{RuntimeTaskOwner, RuntimeTaskShutdown, RuntimeTaskSpec},
+    state::{AppState, NearbyPairingStatus},
+};
 
 const PAIRING_BIND_HOST: &str = "0.0.0.0";
 const PAIRING_PORT_OFFSET: u16 = 100;
@@ -281,11 +284,19 @@ pub(crate) async fn check_nearby_pairing_join(
 }
 
 pub fn start(state: AppState) {
-    tokio::spawn(async move {
-        if let Err(error) = run(state).await {
-            warn!(error = ?error, "pairing listener stopped");
-        }
-    });
+    let task_state = state.clone();
+    state.spawn_runtime_task(
+        RuntimeTaskSpec::new(
+            "pairing.listener",
+            RuntimeTaskOwner::Pairing,
+            RuntimeTaskShutdown::AbortOnDaemonShutdown,
+        ),
+        async move {
+            if let Err(error) = run(task_state).await {
+                warn!(error = ?error, "pairing listener stopped");
+            }
+        },
+    );
 }
 
 async fn map_join_status_response(

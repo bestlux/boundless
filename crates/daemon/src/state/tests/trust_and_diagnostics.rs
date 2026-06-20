@@ -191,9 +191,7 @@ async fn rotate_trust_clears_peers_trust_and_requires_restart() {
     let session = tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     });
-    state
-        .register_transport_session_for_peer("remote-machine", session.abort_handle())
-        .await;
+    state.register_transport_session_for_peer("remote-machine", session.abort_handle());
 
     let message = state.rotate_trust().await.expect("rotate trust");
     assert!(message.contains("restart_required=true"));

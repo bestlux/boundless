@@ -4,16 +4,27 @@ use anyhow::Result;
 use tokio::time;
 use tracing::warn;
 
-use crate::state::AppState;
+use crate::{
+    runtime_tasks::{RuntimeTaskOwner, RuntimeTaskShutdown, RuntimeTaskSpec},
+    state::AppState,
+};
 
 const ANTI_IDLE_SAFETY_TICK: Duration = Duration::from_secs(1);
 
 pub fn start(state: AppState) {
-    tokio::spawn(async move {
-        if let Err(error) = run(state).await {
-            warn!(error = ?error, "anti-idle runtime stopped");
-        }
-    });
+    let task_state = state.clone();
+    state.spawn_runtime_task(
+        RuntimeTaskSpec::new(
+            "anti_idle.runtime",
+            RuntimeTaskOwner::AntiIdle,
+            RuntimeTaskShutdown::AbortOnDaemonShutdown,
+        ),
+        async move {
+            if let Err(error) = run(task_state).await {
+                warn!(error = ?error, "anti-idle runtime stopped");
+            }
+        },
+    );
 }
 
 async fn run(state: AppState) -> Result<()> {

@@ -65,6 +65,7 @@ impl AppState {
             input_capture_wake: Arc::new(RuntimeWakeSignal::default()),
             input_inject_wake: Arc::new(RuntimeWakeSignal::default()),
             anti_idle_wake: Arc::new(RuntimeWakeSignal::default()),
+            runtime_tasks: RuntimeTaskRegistry::default(),
         })
     }
 
@@ -236,6 +237,21 @@ impl AppState {
 
     pub(crate) fn input_inject_wake_signal(&self) -> Arc<RuntimeWakeSignal> {
         self.input_inject_wake.clone()
+    }
+
+    pub(crate) fn spawn_runtime_task<F>(&self, spec: RuntimeTaskSpec, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.runtime_tasks.spawn(spec, future);
+    }
+
+    pub(crate) fn runtime_task_snapshots(&self) -> Vec<RuntimeTaskSnapshot> {
+        self.runtime_tasks.snapshots()
+    }
+
+    pub(crate) async fn shutdown_runtime_tasks(&self) {
+        self.runtime_tasks.shutdown().await;
     }
 
     pub(crate) fn notify_input_inject_wake(&self, source: &str) {

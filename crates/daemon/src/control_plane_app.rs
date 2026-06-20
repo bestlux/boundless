@@ -28,10 +28,12 @@ use app_services::{
 };
 use async_trait::async_trait;
 use core_security::{TrustBundle, fingerprint};
+use serde_json::Value;
 
 use crate::{
     config::{ApiTransport, FileTransferConfig, InputHandoffConfig},
     pairing_wire,
+    runtime_tasks::{RuntimeTaskSnapshot, task_health_json},
     state::AppState,
 };
 
@@ -344,11 +346,12 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         command: DiagnosticsDumpCommand,
     ) -> Result<DiagnosticsDumpReply> {
         let snapshot = build_console_snapshot(&self.state).await?;
-        let bundle = build_online_bundle(
+        let mut bundle = build_online_bundle(
             snapshot,
             collect_service_diagnostics(),
             command.include_filenames,
         );
+        insert_runtime_task_health(&mut bundle, self.state.runtime_task_snapshots());
         let export = write_diagnostic_bundle(
             bundle,
             DiagnosticExportOptions {
@@ -665,6 +668,17 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             },
         })
     }
+}
+
+fn insert_runtime_task_health(bundle: &mut Value, snapshots: Vec<RuntimeTaskSnapshot>) {
+    let Some(component_health) = bundle
+        .get_mut("component_health")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+
+    component_health.insert("runtime_tasks".to_string(), task_health_json(&snapshots));
 }
 
 async fn build_status_snapshot(state: &AppState) -> Result<StatusSnapshot> {
@@ -1280,6 +1294,16 @@ mod tests {
                 .to_string(),
             size_bytes: 9,
         });
+        state.spawn_runtime_task(
+            crate::runtime_tasks::RuntimeTaskSpec::new(
+                "network.supervisor",
+                crate::runtime_tasks::RuntimeTaskOwner::Network,
+                crate::runtime_tasks::RuntimeTaskShutdown::AbortOnDaemonShutdown,
+            ),
+            async {
+                std::future::pending::<()>().await;
+            },
+        );
 
         let app = DaemonControlPlaneApp::new(state);
         let reply = app
@@ -1297,6 +1321,10 @@ mod tests {
         assert!(content.contains("[redacted-clipboard-text]"));
         assert!(content.contains("[redacted-file-name]"));
         assert!(content.contains(r#""peer_id": "peer-1""#));
+        assert!(content.contains(r#""runtime_tasks""#));
+        assert!(content.contains(r#""name": "network.supervisor""#));
+        assert!(content.contains(r#""owner": "network""#));
+        assert!(content.contains(r#""shutdown": "abort_on_daemon_shutdown""#));
         assert!(!content.contains("hunter2"));
         assert!(!content.contains("abc123"));
         assert!(!content.contains("peer-alpha"));

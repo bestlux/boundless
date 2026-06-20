@@ -530,14 +530,128 @@ async fn abort_transport_sessions_for_peer_cancels_registered_tasks() {
     let session = tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     });
-    state
-        .register_transport_session_for_peer(&peer_id, session.abort_handle())
-        .await;
+    state.register_transport_session_for_peer(&peer_id, session.abort_handle());
 
     let aborted = state.abort_transport_sessions_for_peer(&peer_id).await;
     assert_eq!(aborted, 1);
     let join_error = session.await.expect_err("session should be aborted");
     assert!(join_error.is_cancelled());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn shutdown_abort_cancels_all_transport_sessions_without_clearing_diagnostics() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-transport-shutdown-abort-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+    let (code, _) = state.create_pairing_code(120).await;
+    let peer_id = state
+        .join_peer(
+            code,
+            "127.0.0.1:15100".to_string(),
+            Some("peer".to_string()),
+        )
+        .await
+        .expect("join peer");
+
+    state.record_transport_event(TransportEventRecord {
+        timestamp: Utc::now(),
+        direction: "local".to_string(),
+        kind: "shutdown_test_event".to_string(),
+        peer_id: "none".to_string(),
+        detail: "before_shutdown_abort".to_string(),
+        size_bytes: 0,
+    });
+
+    let pending_session = tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+    state.register_pending_transport_session(pending_session.abort_handle());
+
+    let peer_session = tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+    state.register_transport_session_for_peer(&peer_id, peer_session.abort_handle());
+    let pending_bind_session = tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+    let pending_bind_session_id =
+        state.register_pending_transport_session(pending_bind_session.abort_handle());
+
+    state.begin_transport_session_shutdown();
+
+    assert!(
+        !state.bind_pending_transport_session_to_peer(pending_bind_session_id, &peer_id),
+        "pending sessions must not bind to peers after shutdown begins"
+    );
+
+    let late_pending_session = tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+    let late_pending_id =
+        state.register_pending_transport_session(late_pending_session.abort_handle());
+    assert_eq!(
+        late_pending_id, 0,
+        "pending sessions registered after shutdown begins should be refused"
+    );
+
+    let late_peer_session = tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+    let late_peer_session_id =
+        state.register_transport_session_for_peer(&peer_id, late_peer_session.abort_handle());
+    assert_eq!(
+        late_peer_session_id, 0,
+        "peer sessions registered after shutdown begins should be refused"
+    );
+
+    let late_pending_error = late_pending_session
+        .await
+        .expect_err("late pending session should be aborted immediately");
+    assert!(late_pending_error.is_cancelled());
+    let late_peer_error = late_peer_session
+        .await
+        .expect_err("late peer session should be aborted immediately");
+    assert!(late_peer_error.is_cancelled());
+    let pending_bind_error = pending_bind_session
+        .await
+        .expect_err("pending bind session should be aborted during shutdown bind");
+    assert!(pending_bind_error.is_cancelled());
+
+    let aborted = state.abort_all_transport_sessions_for_shutdown().await;
+    assert_eq!(
+        aborted, 2,
+        "pending and peer-bound sessions should both be aborted"
+    );
+
+    let pending_error = pending_session
+        .await
+        .expect_err("pending session should be aborted");
+    assert!(pending_error.is_cancelled());
+    let peer_error = peer_session
+        .await
+        .expect_err("peer session should be aborted");
+    assert!(peer_error.is_cancelled());
+
+    assert_eq!(
+        state.abort_all_transport_sessions_for_shutdown().await,
+        0,
+        "shutdown abort should drain session registrations"
+    );
+    let events = state.transport_events().await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "shutdown_test_event"),
+        "shutdown abort must not clear transport diagnostics"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -595,9 +709,7 @@ async fn request_peer_reconnect_and_reset_clears_input_state_and_sessions() {
     let session = tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     });
-    state
-        .register_transport_session_for_peer(&peer_id, session.abort_handle())
-        .await;
+    state.register_transport_session_for_peer(&peer_id, session.abort_handle());
 
     let (generation, aborted_sessions) = state
         .request_peer_reconnect_and_reset(&peer_id)
@@ -700,12 +812,8 @@ async fn request_all_peers_reconnect_and_reset_clears_shared_input_state() {
     let session_two = tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     });
-    state
-        .register_transport_session_for_peer(&peer_one, session_one.abort_handle())
-        .await;
-    state
-        .register_transport_session_for_peer(&peer_two, session_two.abort_handle())
-        .await;
+    state.register_transport_session_for_peer(&peer_one, session_one.abort_handle());
+    state.register_transport_session_for_peer(&peer_two, session_two.abort_handle());
 
     let (disconnected, aborted_sessions) = state
         .request_all_peers_reconnect_and_reset()

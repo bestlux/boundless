@@ -29,9 +29,8 @@ pub(super) async fn listener_loop(state: AppState, listener: TcpListener) {
                     }
                 });
 
-                let session_id = registration_state
-                    .register_pending_transport_session(task.abort_handle())
-                    .await;
+                let session_id =
+                    registration_state.register_pending_transport_session(task.abort_handle());
                 let _ = session_id_tx.send(session_id);
             }
             Err(error) => {
@@ -90,8 +89,7 @@ pub(super) async fn supervisor_loop(state: AppState) {
                 peer_worker(worker_state, peer_id).await;
             });
             let session_id = registration_state
-                .register_transport_session_for_peer(&peer.peer_id, handle.abort_handle())
-                .await;
+                .register_transport_session_for_peer(&peer.peer_id, handle.abort_handle());
             workers.insert(peer.peer_id.clone(), handle);
             worker_session_ids.insert(peer.peer_id, session_id);
         }

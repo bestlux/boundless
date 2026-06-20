@@ -58,33 +58,26 @@ impl AppState {
         Ok((disconnected_peers, aborted_sessions))
     }
 
-    pub async fn register_pending_transport_session(
+    pub fn register_pending_transport_session(
         &self,
         abort_handle: tokio::task::AbortHandle,
     ) -> u64 {
         self.transport
             .register_pending_transport_session(abort_handle)
-            .await
     }
 
-    pub async fn register_transport_session_for_peer(
+    pub fn register_transport_session_for_peer(
         &self,
         peer_id: &str,
         abort_handle: tokio::task::AbortHandle,
     ) -> u64 {
         self.transport
             .register_transport_session_for_peer(peer_id, abort_handle)
-            .await
     }
 
-    pub async fn bind_pending_transport_session_to_peer(
-        &self,
-        session_id: u64,
-        peer_id: &str,
-    ) -> bool {
+    pub fn bind_pending_transport_session_to_peer(&self, session_id: u64, peer_id: &str) -> bool {
         self.transport
             .bind_pending_transport_session_to_peer(session_id, peer_id)
-            .await
     }
 
     pub async fn clear_transport_session_registration(&self, session_id: u64) {
@@ -105,6 +98,14 @@ impl AppState {
             total += self.abort_transport_sessions_for_peer(peer_id).await;
         }
         total
+    }
+
+    pub fn begin_transport_session_shutdown(&self) {
+        self.transport.begin_transport_session_shutdown();
+    }
+
+    pub async fn abort_all_transport_sessions_for_shutdown(&self) -> usize {
+        self.transport.abort_all_transport_sessions().await
     }
 
     pub async fn mark_all_peers_disconnected(&self) -> Result<usize> {

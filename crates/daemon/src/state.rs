@@ -41,6 +41,7 @@ use crate::config::{
     AntiIdleConfig, ApiTransport, FileTransferConfig, InputHandoffConfig, PeerConfig,
     RuntimeConfig, config_path, load_or_create_config_at, save_config_at,
 };
+use crate::runtime_tasks::{RuntimeTaskRegistry, RuntimeTaskSnapshot, RuntimeTaskSpec};
 
 const MAX_PENDING_REMOTE_CLIPBOARD_ITEMS: usize = 64;
 const MAX_PENDING_INJECT_INPUT_FRAMES: usize = 128;
@@ -303,6 +304,7 @@ pub struct AppState {
     input_capture_wake: Arc<RuntimeWakeSignal>,
     input_inject_wake: Arc<RuntimeWakeSignal>,
     anti_idle_wake: Arc<RuntimeWakeSignal>,
+    runtime_tasks: RuntimeTaskRegistry,
 }
 
 #[cfg(test)]

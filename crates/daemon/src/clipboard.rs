@@ -8,7 +8,10 @@ use core_clipboard::ClipboardPayload;
 #[cfg(windows)]
 use platform_windows::clipboard_backend::WindowsClipboardBackend;
 
-use crate::state::{AppState, PendingRemoteClipboardPayload};
+use crate::{
+    runtime_tasks::{RuntimeTaskOwner, RuntimeTaskShutdown, RuntimeTaskSpec},
+    state::{AppState, PendingRemoteClipboardPayload},
+};
 
 const CLIPBOARD_TICK: Duration = Duration::from_millis(200);
 const MAX_REMOTE_CLIPBOARD_APPLY_RETRIES: u8 = 3;
@@ -70,11 +73,19 @@ impl ClipboardRuntimeState for AppState {
 }
 
 pub fn start(state: AppState) {
-    tokio::spawn(async move {
-        if let Err(error) = run(state).await {
-            warn!(error = ?error, "clipboard runtime stopped");
-        }
-    });
+    let task_state = state.clone();
+    state.spawn_runtime_task(
+        RuntimeTaskSpec::new(
+            "clipboard.runtime",
+            RuntimeTaskOwner::Clipboard,
+            RuntimeTaskShutdown::AbortOnDaemonShutdown,
+        ),
+        async move {
+            if let Err(error) = run(task_state).await {
+                warn!(error = ?error, "clipboard runtime stopped");
+            }
+        },
+    );
 }
 
 async fn run(state: AppState) -> Result<()> {

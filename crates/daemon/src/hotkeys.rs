@@ -14,7 +14,10 @@ use tracing::info;
 #[cfg(any(windows, test))]
 use tracing::warn;
 
-use crate::state::AppState;
+use crate::{
+    runtime_tasks::{RuntimeTaskOwner, RuntimeTaskShutdown, RuntimeTaskSpec},
+    state::AppState,
+};
 
 #[cfg(windows)]
 const HOTKEY_TICK: Duration = Duration::from_millis(50);
@@ -162,19 +165,27 @@ impl HotkeyEngine {
 }
 
 pub fn start(state: AppState) {
-    tokio::spawn(async move {
-        #[cfg(windows)]
-        {
-            if let Err(error) = run_windows_hotkeys(state).await {
-                warn!(error = ?error, "hotkey runtime stopped");
+    let task_state = state.clone();
+    state.spawn_runtime_task(
+        RuntimeTaskSpec::new(
+            "hotkeys.runtime",
+            RuntimeTaskOwner::Hotkeys,
+            RuntimeTaskShutdown::AbortOnDaemonShutdown,
+        ),
+        async move {
+            #[cfg(windows)]
+            {
+                if let Err(error) = run_windows_hotkeys(task_state).await {
+                    warn!(error = ?error, "hotkey runtime stopped");
+                }
             }
-        }
 
-        #[cfg(not(windows))]
-        {
-            let _ = state;
-        }
-    });
+            #[cfg(not(windows))]
+            {
+                let _ = task_state;
+            }
+        },
+    );
 }
 
 pub async fn trigger_action_for_diagnostics(state: &AppState, action: &str) -> Result<String> {
@@ -550,15 +561,11 @@ mod tests {
         let session_one = tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
-        state
-            .register_transport_session_for_peer(&peer_one, session_one.abort_handle())
-            .await;
+        state.register_transport_session_for_peer(&peer_one, session_one.abort_handle());
         let session_two = tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
-        state
-            .register_transport_session_for_peer(&peer_two, session_two.abort_handle())
-            .await;
+        state.register_transport_session_for_peer(&peer_two, session_two.abort_handle());
 
         apply_hotkey_action(&state, HotkeyAction::Reconnect)
             .await

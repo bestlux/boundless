@@ -18,7 +18,10 @@ use chrono::Utc;
 
 use core_input::{InputEvent, MAX_EVENTS_PER_FRAME, SwitchDirection};
 
-use crate::state::{AppState, PendingInjectInputFrame, TransportEventRecord};
+use crate::{
+    runtime_tasks::{RuntimeTaskOwner, RuntimeTaskShutdown, RuntimeTaskSpec},
+    state::{AppState, PendingInjectInputFrame, TransportEventRecord},
+};
 
 #[cfg(all(windows, test))]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -97,11 +100,19 @@ struct VirtualScreenBounds {
 }
 
 pub fn start(state: AppState) {
-    tokio::spawn(async move {
-        if let Err(error) = run(state).await {
-            warn!(error = ?error, "input runtime stopped");
-        }
-    });
+    let task_state = state.clone();
+    state.spawn_runtime_task(
+        RuntimeTaskSpec::new(
+            "input.runtime",
+            RuntimeTaskOwner::Input,
+            RuntimeTaskShutdown::AbortOnDaemonShutdown,
+        ),
+        async move {
+            if let Err(error) = run(task_state).await {
+                warn!(error = ?error, "input runtime stopped");
+            }
+        },
+    );
 }
 
 trait InputBackend: Send {
