@@ -440,14 +440,20 @@ impl ControlPlaneService for ControlPlaneApi {
         &self,
         request: Request<DiagnosticsDumpRequest>,
     ) -> Result<Response<DiagnosticsDumpReply>, Status> {
-        let output_path = parse_optional_alias(request.into_inner().output_path);
+        let request = request.into_inner();
+        let output_path = parse_optional_alias(request.output_path);
         let reply = self
             .app
-            .dump_diagnostics(app_commands::DiagnosticsDumpCommand { output_path })
+            .dump_diagnostics(app_commands::DiagnosticsDumpCommand {
+                output_path,
+                include_filenames: request.include_filenames,
+            })
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
         Ok(Response::new(DiagnosticsDumpReply {
             bundle_path: reply.bundle_path,
+            manifest_path: reply.manifest_path,
+            filenames_included: reply.filenames_included,
         }))
     }
 

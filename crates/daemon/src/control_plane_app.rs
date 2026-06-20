@@ -14,6 +14,10 @@ use app_services::{
         SendInputKeyCommand, SendInputMoveCommand, SetAntiIdleConfigCommand,
         SetFileTransferConfigCommand, SetInputHandoffConfigCommand,
     },
+    diagnostics::{
+        DiagnosticExportOptions, ServiceDiagnosticSnapshot, build_online_bundle,
+        write_diagnostic_bundle,
+    },
     queries::{
         AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
         FileTransferConfigSnapshot, InputHandoffConfigSnapshot, InputRuntimeSnapshot,
@@ -29,6 +33,11 @@ use crate::{
     config::{ApiTransport, FileTransferConfig, InputHandoffConfig},
     pairing_wire,
     state::AppState,
+};
+
+#[cfg(windows)]
+use app_services::diagnostics::{
+    extract_service_executable_path, service_binary_manifest_version, service_version_parity,
 };
 
 #[derive(Clone)]
@@ -291,8 +300,25 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         &self,
         command: DiagnosticsDumpCommand,
     ) -> Result<DiagnosticsDumpReply> {
-        let bundle_path = self.state.diagnostics_dump(command.output_path).await?;
-        Ok(DiagnosticsDumpReply { bundle_path })
+        let snapshot = build_console_snapshot(&self.state).await?;
+        let bundle = build_online_bundle(
+            snapshot,
+            collect_service_diagnostics(),
+            command.include_filenames,
+        );
+        let export = write_diagnostic_bundle(
+            bundle,
+            DiagnosticExportOptions {
+                output_path: command.output_path,
+                include_filenames: command.include_filenames,
+            },
+        )
+        .await?;
+        Ok(DiagnosticsDumpReply {
+            bundle_path: export.bundle_path,
+            manifest_path: export.manifest_path,
+            filenames_included: export.filenames_included,
+        })
     }
 
     async fn safe_reset(&self, command: SafeResetCommand) -> Result<OperationReply> {
@@ -840,6 +866,127 @@ fn peer_health_event<'a>(
     })
 }
 
+const BOUNDLESS_SERVICE_NAME: &str = "BoundlessService";
+
+#[cfg(windows)]
+fn collect_service_diagnostics() -> ServiceDiagnosticSnapshot {
+    use windows_service::{
+        service::ServiceAccess,
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    {
+        Ok(manager) => manager,
+        Err(error) => {
+            return ServiceDiagnosticSnapshot {
+                platform: "windows".to_string(),
+                service_name: BOUNDLESS_SERVICE_NAME.to_string(),
+                installed: false,
+                state: "unknown".to_string(),
+                process_id: None,
+                binary_path: None,
+                service_version: "unknown".to_string(),
+                service_version_source: "service_manager_unavailable".to_string(),
+                current_version,
+                version_parity: "unknown".to_string(),
+                error: Some(error.to_string()),
+            };
+        }
+    };
+
+    match manager.open_service(
+        BOUNDLESS_SERVICE_NAME,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+    ) {
+        Ok(service) => {
+            let status = service.query_status();
+            let config = service.query_config();
+            match (status, config) {
+                (Ok(status), Ok(config)) => {
+                    let binary =
+                        extract_service_executable_path(&config.executable_path.to_string_lossy());
+                    let (service_version, version_source) =
+                        service_binary_manifest_version(&binary);
+                    let known_service_version =
+                        (service_version != "unknown").then_some(service_version.as_str());
+                    ServiceDiagnosticSnapshot {
+                        platform: "windows".to_string(),
+                        service_name: BOUNDLESS_SERVICE_NAME.to_string(),
+                        installed: true,
+                        state: format!("{:?}", status.current_state),
+                        process_id: status.process_id,
+                        binary_path: Some(binary.display().to_string()),
+                        version_parity: service_version_parity(
+                            known_service_version,
+                            &current_version,
+                        )
+                        .to_string(),
+                        service_version,
+                        service_version_source: version_source.to_string(),
+                        current_version,
+                        error: None,
+                    }
+                }
+                (status, config) => ServiceDiagnosticSnapshot {
+                    platform: "windows".to_string(),
+                    service_name: BOUNDLESS_SERVICE_NAME.to_string(),
+                    installed: true,
+                    state: "unknown".to_string(),
+                    process_id: None,
+                    binary_path: None,
+                    service_version: "unknown".to_string(),
+                    service_version_source: "query_failed".to_string(),
+                    current_version,
+                    version_parity: "unknown".to_string(),
+                    error: Some(format!(
+                        "status_error={} config_error={}",
+                        status
+                            .err()
+                            .map(|error| error.to_string())
+                            .unwrap_or_default(),
+                        config
+                            .err()
+                            .map(|error| error.to_string())
+                            .unwrap_or_default()
+                    )),
+                },
+            }
+        }
+        Err(error) => ServiceDiagnosticSnapshot {
+            platform: "windows".to_string(),
+            service_name: BOUNDLESS_SERVICE_NAME.to_string(),
+            installed: false,
+            state: "not_installed".to_string(),
+            process_id: None,
+            binary_path: None,
+            service_version: "unknown".to_string(),
+            service_version_source: "not_installed".to_string(),
+            current_version,
+            version_parity: "not_installed".to_string(),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+#[cfg(not(windows))]
+fn collect_service_diagnostics() -> ServiceDiagnosticSnapshot {
+    ServiceDiagnosticSnapshot {
+        platform: "non-windows".to_string(),
+        service_name: BOUNDLESS_SERVICE_NAME.to_string(),
+        installed: false,
+        state: "unsupported".to_string(),
+        process_id: None,
+        binary_path: None,
+        service_version: "unknown".to_string(),
+        service_version_source: "unsupported".to_string(),
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        version_parity: "unsupported".to_string(),
+        error: None,
+    }
+}
+
 fn build_discovered_peers(
     bundle: &crate::state::ControlPlaneSnapshotBundle,
     paired_peers: &[UiPairedPeer],
@@ -987,6 +1134,60 @@ mod tests {
             .await
             .expect("matching confirmation should reset network");
         assert!(reply.ok);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_dump_writes_redacted_json_bundle() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-control-plane-diagnostics-bundle-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let output_dir = root.join("diagnostics");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+        state.record_transport_event(crate::state::TransportEventRecord {
+            timestamp: chrono::Utc::now(),
+            direction: "outgoing".to_string(),
+            kind: "clipboard_text".to_string(),
+            peer_id: "peer-alpha".to_string(),
+            detail: "password=hunter2 token=abc123".to_string(),
+            size_bytes: 29,
+        });
+        state.record_transport_event(crate::state::TransportEventRecord {
+            timestamp: chrono::Utc::now(),
+            direction: "outgoing".to_string(),
+            kind: "file_transfer_started".to_string(),
+            peer_id: "peer-alpha".to_string(),
+            detail: "transfer_id=file-123 file_name=C:\\Users\\Alice\\taxes.pdf total_bytes=9"
+                .to_string(),
+            size_bytes: 9,
+        });
+
+        let app = DaemonControlPlaneApp::new(state);
+        let reply = app
+            .dump_diagnostics(DiagnosticsDumpCommand {
+                output_path: Some(output_dir.to_string_lossy().to_string()),
+                include_filenames: false,
+            })
+            .await
+            .expect("dump diagnostics");
+        let content = std::fs::read_to_string(&reply.bundle_path).expect("read bundle");
+        let manifest = std::fs::read_to_string(&reply.manifest_path).expect("read manifest");
+
+        assert!(content.contains(r#""mode": "online""#));
+        assert!(content.contains("[redacted-clipboard-text]"));
+        assert!(content.contains("[redacted-file-name]"));
+        assert!(content.contains(r#""peer_id": "peer-1""#));
+        assert!(!content.contains("hunter2"));
+        assert!(!content.contains("abc123"));
+        assert!(!content.contains("peer-alpha"));
+        assert!(!content.contains("file-123"));
+        assert!(!content.contains("taxes.pdf"));
+        assert!(manifest.contains("filenames_included=false"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

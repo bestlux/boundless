@@ -5,6 +5,10 @@ use app_services::desktop::{
     resolve_boundlessd_candidates, spawn_boundlessd_process, terminate_boundlessd_processes,
     validate_layout_matrix_spec,
 };
+use app_services::diagnostics::{
+    DiagnosticExportOptions, ServiceDiagnosticSnapshot, build_offline_bundle,
+    write_diagnostic_bundle,
+};
 #[cfg(any(windows, test))]
 use std::path::PathBuf as StdPathBuf;
 #[cfg(windows)]
@@ -861,6 +865,125 @@ fn service_binary_manifest_version(binary_path: &Path) -> (String, &'static str)
 }
 
 #[cfg(windows)]
+fn collect_service_diagnostics() -> ServiceDiagnosticSnapshot {
+    use windows_service::{
+        service::ServiceAccess,
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    {
+        Ok(manager) => manager,
+        Err(error) => {
+            return ServiceDiagnosticSnapshot {
+                platform: "windows".to_string(),
+                service_name: BOUNDLESS_SERVICE_NAME.to_string(),
+                installed: false,
+                state: "unknown".to_string(),
+                process_id: None,
+                binary_path: None,
+                service_version: "unknown".to_string(),
+                service_version_source: "service_manager_unavailable".to_string(),
+                current_version,
+                version_parity: "unknown".to_string(),
+                error: Some(error.to_string()),
+            };
+        }
+    };
+
+    match manager.open_service(
+        BOUNDLESS_SERVICE_NAME,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+    ) {
+        Ok(service) => {
+            let status = service.query_status();
+            let config = service.query_config();
+            match (status, config) {
+                (Ok(status), Ok(config)) => {
+                    let binary =
+                        extract_service_executable_path(&config.executable_path.to_string_lossy());
+                    let (service_version, version_source) =
+                        service_binary_manifest_version(&binary);
+                    let known_service_version =
+                        (service_version != "unknown").then_some(service_version.as_str());
+                    ServiceDiagnosticSnapshot {
+                        platform: "windows".to_string(),
+                        service_name: BOUNDLESS_SERVICE_NAME.to_string(),
+                        installed: true,
+                        state: format!("{:?}", status.current_state),
+                        process_id: status.process_id,
+                        binary_path: Some(binary.display().to_string()),
+                        version_parity: service_version_parity(
+                            known_service_version,
+                            &current_version,
+                        )
+                        .to_string(),
+                        service_version,
+                        service_version_source: version_source.to_string(),
+                        current_version,
+                        error: None,
+                    }
+                }
+                (status, config) => ServiceDiagnosticSnapshot {
+                    platform: "windows".to_string(),
+                    service_name: BOUNDLESS_SERVICE_NAME.to_string(),
+                    installed: true,
+                    state: "unknown".to_string(),
+                    process_id: None,
+                    binary_path: None,
+                    service_version: "unknown".to_string(),
+                    service_version_source: "query_failed".to_string(),
+                    current_version,
+                    version_parity: "unknown".to_string(),
+                    error: Some(format!(
+                        "status_error={} config_error={}",
+                        status
+                            .err()
+                            .map(|error| error.to_string())
+                            .unwrap_or_default(),
+                        config
+                            .err()
+                            .map(|error| error.to_string())
+                            .unwrap_or_default()
+                    )),
+                },
+            }
+        }
+        Err(error) => ServiceDiagnosticSnapshot {
+            platform: "windows".to_string(),
+            service_name: BOUNDLESS_SERVICE_NAME.to_string(),
+            installed: false,
+            state: "not_installed".to_string(),
+            process_id: None,
+            binary_path: None,
+            service_version: "unknown".to_string(),
+            service_version_source: "not_installed".to_string(),
+            current_version,
+            version_parity: "not_installed".to_string(),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+#[cfg(not(windows))]
+fn collect_service_diagnostics() -> ServiceDiagnosticSnapshot {
+    ServiceDiagnosticSnapshot {
+        platform: "non-windows".to_string(),
+        service_name: BOUNDLESS_SERVICE_NAME.to_string(),
+        installed: false,
+        state: "unsupported".to_string(),
+        process_id: None,
+        binary_path: None,
+        service_version: "unknown".to_string(),
+        service_version_source: "unsupported".to_string(),
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        version_parity: "unsupported".to_string(),
+        error: None,
+    }
+}
+
+#[cfg(windows)]
 pub(super) async fn service_status() -> Result<()> {
     use windows_service::{
         service::ServiceAccess,
@@ -1657,16 +1780,75 @@ pub(super) async fn input_release(endpoint: &str, peer_id: String) -> Result<()>
     Ok(())
 }
 
-pub(super) async fn diagnostics_dump(endpoint: &str, output: Option<String>) -> Result<()> {
-    let mut client = connect_control_plane(endpoint).await?;
-    let response = client
-        .dump_diagnostics(DiagnosticsDumpRequest {
-            output_path: output.unwrap_or_default(),
-        })
-        .await?
-        .into_inner();
+pub(super) async fn diagnostics_dump(
+    endpoint: &str,
+    output: Option<String>,
+    include_filenames: bool,
+    offline: bool,
+    open_folder: bool,
+) -> Result<()> {
+    let response = if offline {
+        let bundle = build_offline_bundle(
+            env!("CARGO_PKG_VERSION"),
+            endpoint,
+            collect_service_diagnostics(),
+            include_filenames,
+            "offline flag requested",
+        );
+        let export = write_diagnostic_bundle(
+            bundle,
+            DiagnosticExportOptions {
+                output_path: output,
+                include_filenames,
+            },
+        )
+        .await?;
+        ipc_api::boundless::v1::DiagnosticsDumpReply {
+            bundle_path: export.bundle_path,
+            manifest_path: export.manifest_path,
+            filenames_included: export.filenames_included,
+        }
+    } else {
+        let mut client = connect_control_plane(endpoint).await?;
+        client
+            .dump_diagnostics(DiagnosticsDumpRequest {
+                output_path: output.unwrap_or_default(),
+                include_filenames,
+            })
+            .await?
+            .into_inner()
+    };
 
-    println!("bundle_path={}", response.bundle_path);
+    println!(
+        "bundle_path={} manifest_path={} filenames_included={}",
+        response.bundle_path, response.manifest_path, response.filenames_included
+    );
+    if open_folder {
+        open_containing_folder(&response.bundle_path)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_containing_folder(bundle_path: &str) -> Result<()> {
+    let path = std::path::Path::new(bundle_path);
+    let parent = path
+        .parent()
+        .context("diagnostic bundle path has no containing folder")?;
+    std::process::Command::new("explorer")
+        .arg(parent)
+        .spawn()
+        .context("open diagnostic bundle containing folder")?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_containing_folder(bundle_path: &str) -> Result<()> {
+    let path = std::path::Path::new(bundle_path);
+    let parent = path
+        .parent()
+        .context("diagnostic bundle path has no containing folder")?;
+    println!("containing_folder={}", parent.display());
     Ok(())
 }
 
