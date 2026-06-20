@@ -61,6 +61,14 @@ impl AuthenticatedSession {
     }
 }
 
+enum SessionExitReason {
+    ReconnectRequested,
+    StateDropped,
+    PeerClosed,
+    InvalidFrame,
+    ProtocolRejected,
+}
+
 struct SessionRuntime {
     observed_reconnect_generation: u64,
     remote_protocol: Option<ProtocolVersion>,
@@ -83,6 +91,24 @@ impl SessionRuntime {
             frame_payload: Vec::with_capacity(4096),
             write_frame_buffer,
             last_anti_idle_pulse_sent_at: None,
+        }
+    }
+
+    async fn reconnect_requested_exit(
+        &mut self,
+        state: &AppState,
+        peer_id: &str,
+    ) -> Option<SessionExitReason> {
+        if reconnect_requested_for_peer(state, peer_id, &mut self.observed_reconnect_generation)
+            .await
+        {
+            info!(
+                peer_id = %peer_id,
+                "ending session due to explicit reconnect request"
+            );
+            Some(SessionExitReason::ReconnectRequested)
+        } else {
+            None
         }
     }
 
@@ -223,23 +249,16 @@ where
     let observed_reconnect_generation = state.peer_reconnect_generation(&session.peer_id).await;
     let mut runtime = SessionRuntime::new(observed_reconnect_generation, write_frame_buffer);
 
-    let session_result: Result<()> = {
+    let session_result: Result<SessionExitReason> = {
         async {
             loop {
         tokio::select! {
             _ = heartbeat_interval.tick() => {
-                if reconnect_requested_for_peer(
-                    &state,
-                    &session.peer_id,
-                    &mut runtime.observed_reconnect_generation,
-                )
-                .await
+                if let Some(exit_reason) = runtime
+                    .reconnect_requested_exit(&state, &session.peer_id)
+                    .await
                 {
-                    info!(
-                        peer_id = %session.peer_id,
-                        "ending session due to explicit reconnect request"
-                    );
-                    break;
+                    break Ok(exit_reason);
                 }
 
                 let heartbeat = WireMessage::Heartbeat {
@@ -295,18 +314,11 @@ where
                 writer.flush().await.context("flush heartbeat batch")?;
             }
             _ = outgoing_input_flush_interval.tick(), if runtime.remote_protocol.is_some() => {
-                if reconnect_requested_for_peer(
-                    &state,
-                    &session.peer_id,
-                    &mut runtime.observed_reconnect_generation,
-                )
-                .await
+                if let Some(exit_reason) = runtime
+                    .reconnect_requested_exit(&state, &session.peer_id)
+                    .await
                 {
-                    info!(
-                        peer_id = %session.peer_id,
-                        "ending session due to explicit reconnect request"
-                    );
-                    break;
+                    break Ok(exit_reason);
                 }
 
                 if let Some(remote_protocol) = runtime.remote_protocol {
@@ -323,18 +335,11 @@ where
                 }
             }
             _ = outgoing_bulk_flush_interval.tick(), if runtime.remote_protocol.is_some() => {
-                if reconnect_requested_for_peer(
-                    &state,
-                    &session.peer_id,
-                    &mut runtime.observed_reconnect_generation,
-                )
-                .await
+                if let Some(exit_reason) = runtime
+                    .reconnect_requested_exit(&state, &session.peer_id)
+                    .await
                 {
-                    info!(
-                        peer_id = %session.peer_id,
-                        "ending session due to explicit reconnect request"
-                    );
-                    break;
+                    break Ok(exit_reason);
                 }
 
                 if let Some(remote_protocol) = runtime.remote_protocol {
@@ -353,22 +358,14 @@ where
             }
             changed = outgoing_flush_signal.changed(), if runtime.remote_protocol.is_some() => {
                 if changed.is_err() {
-                    // State dropped; session will naturally unwind shortly.
-                    break;
+                    break Ok(SessionExitReason::StateDropped);
                 }
 
-                if reconnect_requested_for_peer(
-                    &state,
-                    &session.peer_id,
-                    &mut runtime.observed_reconnect_generation,
-                )
-                .await
+                if let Some(exit_reason) = runtime
+                    .reconnect_requested_exit(&state, &session.peer_id)
+                    .await
                 {
-                    info!(
-                        peer_id = %session.peer_id,
-                        "ending session due to explicit reconnect request"
-                    );
-                    break;
+                    break Ok(exit_reason);
                 }
 
                 if let Some(remote_protocol) = runtime.remote_protocol {
@@ -385,18 +382,11 @@ where
                 }
             }
             read = read_wire_frame_payload(&mut reader, &mut runtime.frame_payload) => {
-                if reconnect_requested_for_peer(
-                    &state,
-                    &session.peer_id,
-                    &mut runtime.observed_reconnect_generation,
-                )
-                .await
+                if let Some(exit_reason) = runtime
+                    .reconnect_requested_exit(&state, &session.peer_id)
+                    .await
                 {
-                    info!(
-                        peer_id = %session.peer_id,
-                        "ending session due to explicit reconnect request"
-                    );
-                    break;
+                    break Ok(exit_reason);
                 }
 
                 let Some(read) = (match read {
@@ -414,10 +404,10 @@ where
                             error = ?error,
                             "transport frame rejected"
                         );
-                        break;
+                        break Ok(SessionExitReason::InvalidFrame);
                     }
                 }) else {
-                    break;
+                    break Ok(SessionExitReason::PeerClosed);
                 };
 
                 let message = match decode_frame_payload(&runtime.frame_payload) {
@@ -460,7 +450,7 @@ where
                         )
                         .await?;
                         if matches!(handling, HelloHandling::TerminateSession) {
-                            break;
+                            break Ok(SessionExitReason::ProtocolRejected);
                         }
                     }
                     WireMessage::HelloAck { accepted, .. } => {
@@ -659,8 +649,6 @@ where
             }
         }
             }
-
-            Ok(())
         }
         .await
     };
@@ -671,7 +659,7 @@ where
         let _ = state.set_peer_connected(peer_id, false).await;
     }
 
-    session_result
+    session_result.map(|_| ())
 }
 
 pub(super) async fn reconnect_requested_for_peer(
