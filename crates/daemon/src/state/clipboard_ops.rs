@@ -639,31 +639,78 @@ impl AppState {
         });
     }
 
-    pub async fn queue_file_from_path(&self, peer_id: &str, file_path: &Path) -> Result<()> {
-        if self.get_peer(peer_id).await.is_none() {
+    pub async fn queue_file_from_path(&self, peer_id: &str, file_path: &Path) -> Result<String> {
+        self.queue_file_from_path_with_previous(peer_id, file_path, None)
+            .await
+    }
+
+    pub(crate) async fn queue_file_from_path_with_previous(
+        &self,
+        peer_id: &str,
+        file_path: &Path,
+        previous_transfer_id: Option<String>,
+    ) -> Result<String> {
+        let Some(_peer) = self.get_peer(peer_id).await else {
             anyhow::bail!("unknown peer {peer_id}");
-        }
+        };
 
         let file_name = file_path
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .ok_or_else(|| anyhow::anyhow!("invalid file path"))?;
 
-        let metadata = tokio::fs::metadata(file_path)
-            .await
-            .map_err(anyhow::Error::from)?;
-        if !metadata.is_file() {
-            anyhow::bail!("file path must reference a regular file");
-        }
-        tokio::fs::File::open(file_path)
-            .await
-            .map_err(anyhow::Error::from)?;
-        let total_bytes = metadata.len();
-        let source_modified = metadata.modified().ok();
-        validate_transfer_size_with_limit(total_bytes, self.file_transfer_max_bytes().await)?;
-
         let transfer_id = uuid::Uuid::new_v4().to_string();
         let source_path = file_path.to_path_buf();
+        let outgoing_projection = |total_bytes| OutgoingFileTransferProjection {
+            transfer_id: transfer_id.clone(),
+            previous_transfer_id: previous_transfer_id.clone(),
+            peer_id: peer_id.to_string(),
+            file_name: file_name.clone(),
+            source_path: source_path.clone(),
+            total_bytes,
+        };
+        let metadata = match tokio::fs::metadata(file_path).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.record_outgoing_file_transfer_failed(
+                    outgoing_projection(0),
+                    format!("source_unavailable: {error}"),
+                )
+                .await;
+                return Err(anyhow::Error::from(error));
+            }
+        };
+        if !metadata.is_file() {
+            self.record_outgoing_file_transfer_failed(
+                outgoing_projection(metadata.len()),
+                "source_not_regular_file".to_string(),
+            )
+            .await;
+            anyhow::bail!("file path must reference a regular file");
+        }
+        if let Err(error) = tokio::fs::File::open(file_path).await {
+            self.record_outgoing_file_transfer_failed(
+                outgoing_projection(metadata.len()),
+                format!("source_open_failed: {error}"),
+            )
+            .await;
+            return Err(anyhow::Error::from(error));
+        }
+        let total_bytes = metadata.len();
+        let source_modified = metadata.modified().ok();
+        if let Err(error) =
+            validate_transfer_size_with_limit(total_bytes, self.file_transfer_max_bytes().await)
+        {
+            self.record_outgoing_file_transfer_failed(
+                outgoing_projection(total_bytes),
+                error.to_string(),
+            )
+            .await;
+            return Err(anyhow::Error::from(error));
+        }
+
+        self.record_outgoing_file_transfer_queued(outgoing_projection(total_bytes))
+            .await;
         self.outbound_file_transfers.write().await.insert(
             transfer_id.clone(),
             OutboundFileTransfer {
@@ -689,7 +736,7 @@ impl AppState {
             });
         }
         self.notify_outgoing_flush_signal();
-        Ok(())
+        Ok(transfer_id)
     }
 
     pub(crate) async fn outbound_file_transfer_remaining_bytes(
@@ -817,6 +864,8 @@ impl AppState {
             return None;
         }
         let transfer = transfers.remove(transfer_id)?;
+        drop(transfers);
+        self.mark_file_transfer_completed(transfer_id, None).await;
         Some((transfer.file_name, transfer.total_bytes))
     }
 
@@ -834,9 +883,11 @@ impl AppState {
             return false;
         }
         let transfer = transfers.remove(transfer_id);
+        drop(transfers);
         let Some(transfer) = transfer else {
             return false;
         };
+        self.mark_file_transfer_failed(transfer_id, reason).await;
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
             direction: "outgoing".to_string(),
@@ -910,11 +961,18 @@ impl AppState {
         let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
         let Some(queue) = queue_map.get_mut(peer_id) else {
             let mut transfers = self.outbound_file_transfers.write().await;
-            if transfers
+            let removed = if transfers
                 .get(transfer_id)
                 .is_some_and(|transfer| transfer.peer_id == peer_id)
             {
-                transfers.remove(transfer_id);
+                transfers.remove(transfer_id).is_some()
+            } else {
+                false
+            };
+            drop(transfers);
+            if removed {
+                self.mark_file_transfer_cancelled(transfer_id, "removed_from_queue")
+                    .await;
             }
             return;
         };
@@ -923,12 +981,21 @@ impl AppState {
         if queue.is_empty() {
             queue_map.remove(peer_id);
         }
+        drop(queue_map);
+
         let mut transfers = self.outbound_file_transfers.write().await;
-        if transfers
+        let removed = if transfers
             .get(transfer_id)
             .is_some_and(|transfer| transfer.peer_id == peer_id)
         {
-            transfers.remove(transfer_id);
+            transfers.remove(transfer_id).is_some()
+        } else {
+            false
+        };
+        drop(transfers);
+        if removed {
+            self.mark_file_transfer_cancelled(transfer_id, "removed_from_queue")
+                .await;
         }
     }
 
@@ -960,6 +1027,7 @@ impl AppState {
         }
         drop(queue_map);
 
+        self.mark_file_transfer_cancelled(transfer_id, reason).await;
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
             direction: "outgoing".to_string(),

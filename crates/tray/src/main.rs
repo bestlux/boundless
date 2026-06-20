@@ -27,10 +27,10 @@ mod windows_app {
     use eframe::icon_data;
     use image::ImageFormat;
     use ipc_api::boundless::v1::{
-        AntiIdleSetRequest, Empty, FeatureSetRequest, FileTransferSetRequest, HotkeySetRequest,
-        HotkeyTriggerRequest, InputHandoffSetRequest, LayoutSetRequest,
-        NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
-        RemovePeerRequest, SafeResetRequest, SendFileRequest,
+        AntiIdleSetRequest, Empty, FeatureSetRequest, FileTransferActionRequest,
+        FileTransferSetRequest, HotkeySetRequest, HotkeyTriggerRequest, InputHandoffSetRequest,
+        LayoutSetRequest, NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest,
+        NearbySubmitCodeRequest, RemovePeerRequest, SafeResetRequest, SendFileRequest,
     };
     use serde::Deserialize;
     use std::{
@@ -86,6 +86,7 @@ mod windows_app {
         anti_idle_config: UiAntiIdleConfig,
         anti_idle_status: UiAntiIdleStatus,
         file_transfer_config: UiFileTransferConfig,
+        file_transfers: Vec<UiFileTransfer>,
         input_handoff_config: UiInputHandoffConfig,
         input_runtime: UiInputRuntime,
     }
@@ -113,6 +114,23 @@ mod windows_app {
         organize_by_peer: bool,
         auto_accept_trusted_peers: bool,
         max_file_bytes: u64,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Default)]
+    struct UiFileTransfer {
+        transfer_id: String,
+        previous_transfer_id: String,
+        direction: String,
+        peer_id: String,
+        file_name: String,
+        state: String,
+        transferred_bytes: u64,
+        total_bytes: u64,
+        failure_reason: String,
+        source_path: String,
+        final_path: String,
+        queued_at: String,
+        updated_at: String,
     }
 
     #[derive(Debug, Clone, Deserialize, Default)]
@@ -231,6 +249,11 @@ mod windows_app {
     }
 
     #[cfg(test)]
+    mod dashboard_transfer_center_tests {
+        include!("dashboard_transfer_center_tests.rs");
+    }
+
+    #[cfg(test)]
     fn filter_connectable_discovered_peers(
         discovered_peers: Vec<UiDiscoveredPeer>,
         local_machine_id: &str,
@@ -338,6 +361,25 @@ mod windows_app {
                             max_file_bytes: config.max_file_bytes,
                         })
                         .unwrap_or_default(),
+                    file_transfers: snapshot
+                        .file_transfers
+                        .into_iter()
+                        .map(|transfer| UiFileTransfer {
+                            transfer_id: transfer.transfer_id,
+                            previous_transfer_id: transfer.previous_transfer_id,
+                            direction: transfer.direction,
+                            peer_id: transfer.peer_id,
+                            file_name: transfer.file_name,
+                            state: transfer.state,
+                            transferred_bytes: transfer.transferred_bytes,
+                            total_bytes: transfer.total_bytes,
+                            failure_reason: transfer.failure_reason,
+                            source_path: transfer.source_path,
+                            final_path: transfer.final_path,
+                            queued_at: transfer.queued_at,
+                            updated_at: transfer.updated_at,
+                        })
+                        .collect(),
                     input_handoff_config: snapshot
                         .input_handoff_config
                         .map(|config| UiInputHandoffConfig {
@@ -454,6 +496,18 @@ mod windows_app {
         ))
     }
 
+    fn cancel_file_transfer_blocking(endpoint: &str, transfer_id: String) -> Result<String> {
+        block_on_result(cancel_file_transfer(endpoint, transfer_id))
+    }
+
+    fn retry_file_transfer_blocking(endpoint: &str, transfer_id: String) -> Result<String> {
+        block_on_result(retry_file_transfer(endpoint, transfer_id))
+    }
+
+    fn clear_completed_file_transfers_blocking(endpoint: &str) -> Result<String> {
+        block_on_result(clear_completed_file_transfers(endpoint))
+    }
+
     fn set_feature_blocking(endpoint: &str, name: String, enabled: bool) -> Result<String> {
         block_on_result(set_feature(endpoint, name, enabled))
     }
@@ -564,6 +618,42 @@ mod windows_app {
                 auto_accept_trusted_peers,
                 max_file_bytes,
             })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
+        Ok(response.message)
+    }
+
+    async fn cancel_file_transfer(endpoint: &str, transfer_id: String) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let response = client
+            .cancel_file_transfer(FileTransferActionRequest { transfer_id })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
+        Ok(response.message)
+    }
+
+    async fn retry_file_transfer(endpoint: &str, transfer_id: String) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let response = client
+            .retry_file_transfer(FileTransferActionRequest { transfer_id })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
+        Ok(response.message)
+    }
+
+    async fn clear_completed_file_transfers(endpoint: &str) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let response = client
+            .clear_completed_file_transfers(Empty {})
             .await?
             .into_inner();
         if !response.ok {

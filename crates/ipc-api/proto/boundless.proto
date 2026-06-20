@@ -156,6 +156,26 @@ message FileTransferSetRequest {
   uint64 max_file_bytes = 4;
 }
 
+message FileTransferInfo {
+  string transfer_id = 1;
+  string previous_transfer_id = 2;
+  string direction = 3;
+  string peer_id = 4;
+  string file_name = 5;
+  string state = 6;
+  uint64 transferred_bytes = 7;
+  uint64 total_bytes = 8;
+  string failure_reason = 9;
+  string source_path = 10;
+  string final_path = 11;
+  string queued_at = 12;
+  string updated_at = 13;
+}
+
+message FileTransferActionRequest {
+  string transfer_id = 1;
+}
+
 message InputHandoffConfigReply {
   bool block_screen_corners = 1;
   uint32 corner_block_px = 2;
@@ -295,6 +315,7 @@ message UiSnapshotReply {
   InputRuntimeStatusReply input_runtime = 12;
   map<string, bool> features = 13;
   map<string, string> hotkeys = 14;
+  repeated FileTransferInfo file_transfers = 15;
 }
 
 message ConsoleSnapshotReply {
@@ -312,6 +333,7 @@ message ConsoleSnapshotReply {
   FileTransferConfigReply file_transfer_config = 12;
   InputHandoffConfigReply input_handoff_config = 13;
   InputRuntimeStatusReply input_runtime = 14;
+  repeated FileTransferInfo file_transfers = 15;
 }
 
 message NearbyRequestCodeStartRequest {
@@ -391,6 +413,9 @@ service ControlPlaneService {
   rpc SetAntiIdleConfig(AntiIdleSetRequest) returns (OperationReply);
   rpc GetFileTransferConfig(Empty) returns (FileTransferConfigReply);
   rpc SetFileTransferConfig(FileTransferSetRequest) returns (OperationReply);
+  rpc CancelFileTransfer(FileTransferActionRequest) returns (OperationReply);
+  rpc RetryFileTransfer(FileTransferActionRequest) returns (OperationReply);
+  rpc ClearCompletedFileTransfers(Empty) returns (OperationReply);
   rpc SetInputHandoffConfig(InputHandoffSetRequest) returns (OperationReply);
   rpc SetHotkey(HotkeySetRequest) returns (OperationReply);
   rpc TriggerHotkeyAction(HotkeyTriggerRequest) returns (OperationReply);

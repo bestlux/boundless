@@ -351,6 +351,63 @@ impl DashboardTaskRunner {
         });
     }
 
+    pub(super) fn open_received_file_location(&self, tx: Sender<AppMsg>, final_path: String) {
+        Self::spawn(move || {
+            let result = ProcessCommand::new("explorer")
+                .arg(format!("/select,{final_path}"))
+                .spawn()
+                .map(|_| "Opened received file location".to_string())
+                .map_err(|error| format!("Failed to open received file location: {error}"));
+            let _ = tx.send(match result {
+                Ok(message) => AppMsg::ActionComplete(message),
+                Err(error) => AppMsg::ActionFailed(error),
+            });
+        });
+    }
+
+    pub(super) fn cancel_file_transfer(
+        &self,
+        tx: Sender<AppMsg>,
+        endpoint: String,
+        transfer_id: String,
+    ) {
+        Self::spawn(move || match cancel_file_transfer_blocking(&endpoint, transfer_id) {
+            Ok(msg) => {
+                let _ = tx.send(AppMsg::ActionComplete(msg));
+            }
+            Err(error) => {
+                let _ = tx.send(AppMsg::ActionFailed(error.to_string()));
+            }
+        });
+    }
+
+    pub(super) fn retry_file_transfer(
+        &self,
+        tx: Sender<AppMsg>,
+        endpoint: String,
+        transfer_id: String,
+    ) {
+        Self::spawn(move || match retry_file_transfer_blocking(&endpoint, transfer_id) {
+            Ok(msg) => {
+                let _ = tx.send(AppMsg::ActionComplete(msg));
+            }
+            Err(error) => {
+                let _ = tx.send(AppMsg::ActionFailed(error.to_string()));
+            }
+        });
+    }
+
+    pub(super) fn clear_completed_file_transfers(&self, tx: Sender<AppMsg>, endpoint: String) {
+        Self::spawn(move || match clear_completed_file_transfers_blocking(&endpoint) {
+            Ok(msg) => {
+                let _ = tx.send(AppMsg::ActionComplete(msg));
+            }
+            Err(error) => {
+                let _ = tx.send(AppMsg::ActionFailed(error.to_string()));
+            }
+        });
+    }
+
     pub(super) fn send_files_to_peer(
         &self,
         tx: Sender<AppMsg>,

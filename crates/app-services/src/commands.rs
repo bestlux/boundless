@@ -47,6 +47,11 @@ pub struct SetFileTransferConfigCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTransferActionCommand {
+    pub transfer_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetInputHandoffConfigCommand {
     pub block_screen_corners: bool,
     pub corner_block_px: u32,

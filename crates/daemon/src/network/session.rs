@@ -588,7 +588,10 @@ where
         .await
     };
 
-    for transfer in inbound_transfers.into_values() {
+    for (transfer_id, transfer) in inbound_transfers {
+        state
+            .mark_file_transfer_failed(&transfer_id, "session_closed")
+            .await;
         discard_inbound_transfer(transfer).await;
     }
     for transfer in inbound_clipboard_image_transfers.into_values() {
@@ -621,7 +624,7 @@ pub(super) async fn handle_file_transfer_rejected(
     remove_outbound_transfer_flow(outbound_transfer_flow, &transfer_id);
     if let Some(peer_id) = remote_peer_id {
         state
-            .remove_queued_file_transfer(peer_id, &transfer_id)
+            .reject_outbound_file_transfer(peer_id, &transfer_id, &reason)
             .await;
         state.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),

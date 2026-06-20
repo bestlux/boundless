@@ -4,9 +4,9 @@ use app_services::{
     SharedControlPlaneApp, commands as app_commands,
     queries::{
         AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
-        FileTransferConfigSnapshot, InputHandoffConfigSnapshot, InputRuntimeSnapshot,
-        StatusSnapshot, TransportEventSnapshot, UiDiscoveredPeer, UiPairedPeer, UiPendingRequest,
-        UiSnapshot,
+        FileTransferConfigSnapshot, FileTransferSnapshot, InputHandoffConfigSnapshot,
+        InputRuntimeSnapshot, StatusSnapshot, TransportEventSnapshot, UiDiscoveredPeer,
+        UiPairedPeer, UiPendingRequest, UiSnapshot,
     },
 };
 use tokio::{sync::mpsc, time};
@@ -16,18 +16,18 @@ use tonic::{Request, Response, Status};
 use ipc_api::boundless::v1::{
     AntiIdleConfigReply, AntiIdleSetRequest, AntiIdleStatusReply, ConsoleSnapshotReply,
     DiagnosticsDumpReply, DiagnosticsDumpRequest, DiscoveredPeerInfo, Empty, FeatureListReply,
-    FeatureSetRequest, FileTransferConfigReply, FileTransferSetRequest, HotkeySetRequest,
-    HotkeyTriggerRequest, ImportTrustBundleRequest, InputCaptureTargetReply,
-    InputCaptureTargetRequest, InputHandoffConfigReply, InputHandoffSetRequest, InputOwnerReply,
-    InputOwnerRequest, InputRuntimeStatusReply, LayoutReply, LayoutSetRequest,
-    NearbyJoinStartRequest, NearbyJoinStatusReply, NearbyJoinStatusRequest,
-    NearbyPairingCompletionReply, NearbyPairingDecisionRequest, NearbyPairingRequestInfo,
-    NearbyRequestCodeStartReply, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
-    OperationReply, PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply, PairJoinRequest,
-    PeerInfo, PeerListReply, RemovePeerRequest, RotateTrustRequest, SafeResetRequest,
-    SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
-    SendInputMoveRequest, StatusReply, StatusRequest, TransportEvent, TransportEventsReply,
-    TrustBundleReply, UiSnapshotReply,
+    FeatureSetRequest, FileTransferActionRequest, FileTransferConfigReply, FileTransferInfo,
+    FileTransferSetRequest, HotkeySetRequest, HotkeyTriggerRequest, ImportTrustBundleRequest,
+    InputCaptureTargetReply, InputCaptureTargetRequest, InputHandoffConfigReply,
+    InputHandoffSetRequest, InputOwnerReply, InputOwnerRequest, InputRuntimeStatusReply,
+    LayoutReply, LayoutSetRequest, NearbyJoinStartRequest, NearbyJoinStatusReply,
+    NearbyJoinStatusRequest, NearbyPairingCompletionReply, NearbyPairingDecisionRequest,
+    NearbyPairingRequestInfo, NearbyRequestCodeStartReply, NearbyRequestCodeStartRequest,
+    NearbySubmitCodeRequest, OperationReply, PairCreateCodeReply, PairCreateCodeRequest,
+    PairJoinReply, PairJoinRequest, PeerInfo, PeerListReply, RemovePeerRequest, RotateTrustRequest,
+    SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest,
+    SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest, TransportEvent,
+    TransportEventsReply, TrustBundleReply, UiSnapshotReply,
     control_plane_service_server::{ControlPlaneService, ControlPlaneServiceServer},
 };
 
@@ -316,6 +316,57 @@ impl ControlPlaneService for ControlPlaneApi {
             })
             .await
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
+    }
+
+    async fn cancel_file_transfer(
+        &self,
+        request: Request<FileTransferActionRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .cancel_file_transfer(app_commands::FileTransferActionCommand {
+                transfer_id: parse_required_field("transfer_id", &request.transfer_id)?,
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
+    }
+
+    async fn retry_file_transfer(
+        &self,
+        request: Request<FileTransferActionRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .retry_file_transfer(app_commands::FileTransferActionCommand {
+                transfer_id: parse_required_field("transfer_id", &request.transfer_id)?,
+            })
+            .await
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
+    }
+
+    async fn clear_completed_file_transfers(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let reply = self
+            .app
+            .clear_completed_file_transfers()
+            .await
+            .map_err(|error| Status::internal(format!("clear completed transfers: {error:#}")))?;
         Ok(Response::new(OperationReply {
             ok: reply.ok,
             message: reply.message,
@@ -929,6 +980,11 @@ fn map_ui_snapshot(snapshot: UiSnapshot) -> UiSnapshotReply {
         input_runtime: Some(map_input_runtime(snapshot.input_runtime)),
         features: snapshot.features.into_iter().collect(),
         hotkeys: snapshot.hotkeys.into_iter().collect(),
+        file_transfers: snapshot
+            .file_transfers
+            .into_iter()
+            .map(map_file_transfer)
+            .collect(),
     }
 }
 
@@ -956,6 +1012,11 @@ fn map_console_snapshot(snapshot: ConsoleSnapshot) -> ConsoleSnapshotReply {
         file_transfer_config: Some(map_file_transfer_config(snapshot.file_transfer_config)),
         input_handoff_config: Some(map_input_handoff_config(snapshot.input_handoff_config)),
         input_runtime: Some(map_input_runtime(snapshot.input_runtime)),
+        file_transfers: snapshot
+            .file_transfers
+            .into_iter()
+            .map(map_file_transfer)
+            .collect(),
     }
 }
 
@@ -1004,6 +1065,24 @@ fn map_file_transfer_config(snapshot: FileTransferConfigSnapshot) -> FileTransfe
         organize_by_peer: snapshot.organize_by_peer,
         auto_accept_trusted_peers: snapshot.auto_accept_trusted_peers,
         max_file_bytes: snapshot.max_file_bytes,
+    }
+}
+
+fn map_file_transfer(snapshot: FileTransferSnapshot) -> FileTransferInfo {
+    FileTransferInfo {
+        transfer_id: snapshot.transfer_id,
+        previous_transfer_id: snapshot.previous_transfer_id.unwrap_or_default(),
+        direction: snapshot.direction,
+        peer_id: snapshot.peer_id,
+        file_name: snapshot.file_name,
+        state: snapshot.state,
+        transferred_bytes: snapshot.transferred_bytes,
+        total_bytes: snapshot.total_bytes,
+        failure_reason: snapshot.failure_reason.unwrap_or_default(),
+        source_path: snapshot.source_path.unwrap_or_default(),
+        final_path: snapshot.final_path.unwrap_or_default(),
+        queued_at: snapshot.queued_at,
+        updated_at: snapshot.updated_at,
     }
 }
 

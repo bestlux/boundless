@@ -128,6 +128,7 @@ pub(super) fn sample_first_run_snapshot() -> UiSnapshot {
             auto_accept_trusted_peers: false,
             max_file_bytes: 100 * 1024 * 1024,
         },
+        file_transfers: Vec::new(),
         input_handoff_config: UiInputHandoffConfig {
             block_screen_corners: true,
             corner_block_px: 24,

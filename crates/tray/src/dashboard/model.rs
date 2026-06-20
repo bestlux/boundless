@@ -23,6 +23,7 @@ pub(super) enum AppMsg {
 pub(super) enum Tab {
     Status,
     Layout,
+    TransferCenter,
     Settings,
 }
 

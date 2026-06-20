@@ -56,6 +56,7 @@ impl AppState {
             input: Arc::new(InputState::new(input_enabled)),
             anti_idle: Arc::new(AntiIdleState::default()),
             outbound_file_transfers: Arc::new(RwLock::new(HashMap::new())),
+            file_transfer_records: Arc::new(RwLock::new(VecDeque::new())),
             security_paths: Arc::new(paths),
             identity: Arc::new(identity),
             device_fingerprint: Arc::new(fingerprint),

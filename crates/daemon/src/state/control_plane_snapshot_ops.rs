@@ -22,6 +22,7 @@ impl AppState {
             anti_idle_runtime,
             input_capture_backend_mode,
             pending_inject_stats,
+            file_transfers,
         ) = tokio::join!(
             self.discovered_endpoints(),
             self.list_pending_nearby_pairing_requests(),
@@ -34,6 +35,7 @@ impl AppState {
             self.async_anti_idle_runtime_state(),
             self.input_capture_backend_mode(),
             self.pending_inject_frame_stats(),
+            self.file_transfer_records(),
         );
 
         let (input_locked, input_lock_supported) = input_lock_runtime;
@@ -63,6 +65,7 @@ impl AppState {
             input_capture_backend_mode,
             pending_inject_frames,
             pending_inject_high_water,
+            file_transfers,
         }
     }
 

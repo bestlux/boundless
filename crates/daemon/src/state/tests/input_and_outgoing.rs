@@ -1,5 +1,33 @@
 use super::*;
 
+async fn state_with_transfer_peer(prefix: &str) -> (AppState, String, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+    let (code, _) = state.create_pairing_code(120).await;
+    let peer_id = state
+        .join_peer(
+            code,
+            "127.0.0.1:15100".to_string(),
+            Some("peer".to_string()),
+        )
+        .await
+        .expect("join peer");
+    (state, peer_id, root)
+}
+
+fn transfer_record<'a>(
+    records: &'a [FileTransferRecord],
+    transfer_id: &str,
+) -> &'a FileTransferRecord {
+    records
+        .iter()
+        .find(|record| record.transfer_id == transfer_id)
+        .expect("transfer record")
+}
+
 #[tokio::test]
 async fn store_incoming_file_rejects_unsafe_name() {
     let root = std::env::temp_dir().join(format!(
@@ -1559,6 +1587,179 @@ async fn cancel_outbound_file_transfer_before_start_emits_one_terminal_event() {
         .filter(|event| event.kind == "file_transfer_cancelled")
         .count();
     assert_eq!(cancelled, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn transfer_center_projects_queued_zero_byte_and_multi_file_attempts() {
+    let (state, peer_id, root) =
+        state_with_transfer_peer("boundless-transfer-center-queued-test").await;
+    let zero_path = root.join("empty.bin");
+    let small_path = root.join("small.bin");
+    tokio::fs::write(&zero_path, [])
+        .await
+        .expect("write zero-byte file");
+    tokio::fs::write(&small_path, [1_u8, 2, 3])
+        .await
+        .expect("write small file");
+
+    let zero_id = state
+        .queue_file_from_path(&peer_id, &zero_path)
+        .await
+        .expect("queue zero-byte file");
+    let small_id = state
+        .queue_file_from_path(&peer_id, &small_path)
+        .await
+        .expect("queue small file");
+
+    let records = state.file_transfer_records().await;
+    assert_ne!(zero_id, small_id, "each visible transfer needs a stable id");
+    let zero = transfer_record(&records, &zero_id);
+    assert_eq!(zero.state, FileTransferState::Queued);
+    assert_eq!(zero.total_bytes, 0);
+    assert_eq!(zero.transferred_bytes, 0);
+    assert_eq!(zero.file_name, "empty.bin");
+    let small = transfer_record(&records, &small_id);
+    assert_eq!(small.state, FileTransferState::Queued);
+    assert_eq!(small.total_bytes, 3);
+    assert_eq!(small.file_name, "small.bin");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn transfer_center_cancel_retry_and_clear_completed_entries() {
+    let (state, peer_id, root) =
+        state_with_transfer_peer("boundless-transfer-center-action-test").await;
+    let file_path = root.join("retry.bin");
+    tokio::fs::write(&file_path, [9_u8; 8])
+        .await
+        .expect("write file");
+
+    let transfer_id = state
+        .queue_file_from_path(&peer_id, &file_path)
+        .await
+        .expect("queue file");
+    assert!(
+        state
+            .cancel_file_transfer_by_id(&transfer_id, "user_cancelled")
+            .await
+    );
+    let records = state.file_transfer_records().await;
+    let cancelled = transfer_record(&records, &transfer_id);
+    assert_eq!(cancelled.state, FileTransferState::Cancelled);
+    assert_eq!(cancelled.failure_reason.as_deref(), Some("user_cancelled"));
+
+    let retry_id = state
+        .retry_file_transfer_from_beginning(&transfer_id)
+        .await
+        .expect("retry cancelled transfer");
+    let records = state.file_transfer_records().await;
+    let retry = transfer_record(&records, &retry_id);
+    assert_eq!(
+        retry.previous_transfer_id.as_deref(),
+        Some(transfer_id.as_str())
+    );
+    assert_eq!(retry.state, FileTransferState::Queued);
+    assert_eq!(retry.transferred_bytes, 0);
+
+    state.mark_file_transfer_completed(&retry_id, None).await;
+    assert_eq!(state.clear_completed_file_transfers().await, 1);
+    let records = state.file_transfer_records().await;
+    assert!(
+        records
+            .iter()
+            .any(|record| record.transfer_id == transfer_id),
+        "clear completed should retain cancelled attempts for retry context"
+    );
+    assert!(
+        records.iter().all(|record| record.transfer_id != retry_id),
+        "completed retry should be cleared"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn transfer_center_records_source_missing_failures_and_linked_retry_attempts() {
+    let (state, peer_id, root) =
+        state_with_transfer_peer("boundless-transfer-center-source-missing-test").await;
+    let missing_path = root.join("missing.bin");
+
+    let error = state
+        .queue_file_from_path(&peer_id, &missing_path)
+        .await
+        .expect_err("missing source should fail");
+    assert!(
+        error.to_string().contains("missing.bin")
+            || error.to_string().contains("cannot find")
+            || error.to_string().contains("No such file"),
+        "unexpected missing-source error: {error:#}"
+    );
+    let records = state.file_transfer_records().await;
+    assert_eq!(records.len(), 1);
+    let failed = &records[0];
+    assert_eq!(failed.state, FileTransferState::Failed);
+    assert!(
+        failed
+            .failure_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("source_unavailable")
+    );
+
+    let retry_error = state
+        .retry_file_transfer_from_beginning(&failed.transfer_id)
+        .await
+        .expect_err("retry should fail while source is still missing");
+    assert!(
+        retry_error.to_string().contains("missing.bin")
+            || retry_error.to_string().contains("cannot find")
+            || retry_error.to_string().contains("No such file"),
+        "unexpected retry error: {retry_error:#}"
+    );
+    let records = state.file_transfer_records().await;
+    assert_eq!(records.len(), 2);
+    let retry = records.last().expect("retry record");
+    assert_eq!(
+        retry.previous_transfer_id.as_deref(),
+        Some(failed.transfer_id.as_str())
+    );
+    assert_eq!(retry.state, FileTransferState::Failed);
+    assert_eq!(retry.transferred_bytes, 0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn transfer_center_incoming_progress_is_monotonic_and_keeps_final_path() {
+    let (state, peer_id, root) =
+        state_with_transfer_peer("boundless-transfer-center-incoming-test").await;
+    let final_path = root.join("received.bin");
+    let transfer_id = "incoming-transfer-1".to_string();
+
+    state
+        .record_incoming_file_transfer_started(
+            transfer_id.clone(),
+            peer_id,
+            "received.bin".to_string(),
+            10,
+            final_path.clone(),
+        )
+        .await;
+    state.mark_file_transfer_progress(&transfer_id, 6).await;
+    state.mark_file_transfer_progress(&transfer_id, 4).await;
+    state
+        .mark_file_transfer_completed(&transfer_id, Some(final_path.clone()))
+        .await;
+
+    let records = state.file_transfer_records().await;
+    let record = transfer_record(&records, &transfer_id);
+    assert_eq!(record.direction, FileTransferDirection::Incoming);
+    assert_eq!(record.state, FileTransferState::Completed);
+    assert_eq!(record.transferred_bytes, 10);
+    assert_eq!(record.final_path.as_deref(), Some(final_path.as_path()));
 
     let _ = std::fs::remove_dir_all(&root);
 }
