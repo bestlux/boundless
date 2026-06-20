@@ -14,7 +14,10 @@ param(
     [string]$EndpointA = "http://127.0.0.1:50051",
     [string]$EndpointB = "",
     [string]$ReleaseVersion = "",
-    [string]$ReleaseManagerSignoff = ""
+    [string]$ReleaseManagerSignoff = "",
+    [ValidateSet("stable", "prerelease")]
+    [string]$Policy = "prerelease",
+    [int]$MaxEvidenceAgeHours = 168
 )
 
 Set-StrictMode -Version Latest
@@ -134,8 +137,27 @@ function Copy-AndValidateInstallerSmokeSummary {
         [string]$ExpectedVersion
     )
 
-    $resolvedSummaryPath = (Resolve-Path -LiteralPath $Path).Path
+    $resolvedSummaryItem = Resolve-Path -LiteralPath $Path
+    $resolvedSummaryPath = $resolvedSummaryItem.Path
     $destinationPath = Join-Path $evidenceRoot "installer-smoke.json"
+
+    if ($MaxEvidenceAgeHours -gt 0) {
+        $age = [DateTime]::UtcNow - (Get-Item -LiteralPath $resolvedSummaryPath).LastWriteTimeUtc
+        if ($age.TotalHours -gt $MaxEvidenceAgeHours) {
+            $staleStatus = if ($Policy -eq "stable") { "failed" } else { "skipped" }
+            $staleImpact = if ($Policy -eq "stable") {
+                "stable release is blocked until fresh installer smoke evidence is supplied"
+            }
+            else {
+                "prerelease packet must document why stale installer evidence is acceptable"
+            }
+            Add-GateResult -Id "installer_smoke_evidence_freshness" -Category "release" -Command "existing installer-smoke summary freshness" -Status $staleStatus -LogPath $resolvedSummaryPath -Reason "installer summary is older than $MaxEvidenceAgeHours hours" -Impact $staleImpact
+        }
+        else {
+            Add-GateResult -Id "installer_smoke_evidence_freshness" -Category "release" -Command "existing installer-smoke summary freshness" -Status "passed" -LogPath $resolvedSummaryPath
+        }
+    }
+
     Copy-Item -LiteralPath $resolvedSummaryPath -Destination $destinationPath -Force
 
     $summary = Get-Content -LiteralPath $destinationPath -Raw | ConvertFrom-Json
@@ -432,6 +454,7 @@ $packet = [pscustomobject]@{
     git_branch = $gitBranch
     git_commit = $gitCommit
     release_version = $effectiveReleaseVersion
+    release_policy = $Policy
     risk_classification = $risk
     release_manager_signoff = $ReleaseManagerSignoff
     environment = $environment
@@ -452,6 +475,7 @@ $markdown.Add("- Generated UTC: $($packet.generated_at_utc)")
 $markdown.Add("- Git branch: $($packet.git_branch)")
 $markdown.Add("- Git commit: $($packet.git_commit)")
 $markdown.Add("- Release version: $($packet.release_version)")
+$markdown.Add("- Release policy: $($packet.release_policy)")
 $markdown.Add("- Risk classification: $risk")
 $markdown.Add("- Release manager signoff: $($packet.release_manager_signoff)")
 $markdown.Add("- Parity matrix: ``docs/parity/mouse-without-borders.md``")
@@ -477,6 +501,7 @@ Write-Host "release_readiness=$risk"
 Write-Host "release_readiness_json=$jsonPath"
 Write-Host "release_readiness_markdown=$markdownPath"
 
-if ($failed.Count -gt 0 -or ($RequireReady -and $skipped.Count -gt 0)) {
+$effectiveRequireReady = $RequireReady -or ($Policy -eq "stable")
+if ($failed.Count -gt 0 -or ($effectiveRequireReady -and $skipped.Count -gt 0)) {
     exit 1
 }

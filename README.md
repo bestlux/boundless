@@ -14,6 +14,7 @@ Boundless is still pre-release software. Windows is the primary product target; 
 - Migrate from v4 or Mouse Without Borders: [Migration Guide](docs/user/migration.md)
 - Understand trust boundaries: [Security And Trust Model](docs/security-trust-model.md)
 - Track parity and release blockers: [Mouse Without Borders Parity](docs/parity/mouse-without-borders.md)
+- Current repo status for agents/release workers: [Project Status](docs/project-status.md)
 
 ## Developer Quick Start
 
@@ -79,6 +80,13 @@ Unified test suite (PowerShell):
 
 ```powershell
 ./scripts/dev/test-suite.ps1 -Profile quick
+```
+
+Machine-readable area checks:
+
+```powershell
+./scripts/dev/check.ps1 -Area workspace -Format json
+./scripts/dev/check.ps1 -Area docs/status -Format json
 ```
 
 Profiles:

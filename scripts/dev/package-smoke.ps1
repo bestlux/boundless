@@ -31,5 +31,6 @@ if ($KeepArtifacts) {
     $arguments += "-KeepArtifacts"
 }
 
+Write-Warning "scripts/dev/package-smoke.ps1 is a transitional wrapper; use scripts/dev/installer-smoke.ps1 or scripts/dev/check.ps1 -Area installer."
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "installer-smoke.ps1") @arguments
 exit $LASTEXITCODE
