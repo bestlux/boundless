@@ -94,9 +94,6 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let authenticated_peer_id = authenticated_peer_machine_id(&state, &stream).await?;
-    if let Some(session_id) = session_registration_id {
-        state.bind_pending_transport_session_to_peer(session_id, &authenticated_peer_id);
-    }
     if let Some(expected_peer_id) = peer_hint.as_deref()
         && expected_peer_id != authenticated_peer_id
     {
@@ -105,6 +102,30 @@ where
             expected_peer_id,
             authenticated_peer_id
         );
+    }
+
+    run_authenticated_session(
+        state,
+        authenticated_peer_id,
+        stream,
+        is_outbound,
+        session_registration_id,
+    )
+    .await
+}
+
+pub(super) async fn run_authenticated_session<S>(
+    state: AppState,
+    authenticated_peer_id: String,
+    stream: S,
+    is_outbound: bool,
+    session_registration_id: Option<u64>,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if let Some(session_id) = session_registration_id {
+        state.bind_pending_transport_session_to_peer(session_id, &authenticated_peer_id);
     }
 
     let (reader, writer) = tokio::io::split(stream);

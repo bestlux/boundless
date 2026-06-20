@@ -59,7 +59,9 @@ use runtime::{listener_loop, supervisor_loop};
 #[cfg(test)]
 use runtime::{outbound_target_candidates, wait_for_reconcile_or_backoff};
 #[cfg(test)]
-use session::{configure_low_latency_socket, reconnect_requested_for_peer};
+use session::{
+    configure_low_latency_socket, reconnect_requested_for_peer, run_authenticated_session,
+};
 use session::{connect_and_run_outbound, handle_incoming_connection};
 #[cfg(test)]
 use tls::parse_server_name;
@@ -160,9 +162,13 @@ pub async fn prepare_listener(state: &AppState) -> Option<TcpListener> {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
         io,
         pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         task::{Context, Poll},
     };
 
@@ -170,7 +176,7 @@ mod tests {
     use chrono::Utc;
     use core_clipboard::{ClipboardPayload, payload_hash_hex};
     use core_security::{SecurityPaths, TrustRecord, ensure_device_identity};
-    use tokio::io::AsyncWrite;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 
     struct FailAfterCallsWriter {
         calls: usize,
@@ -319,6 +325,174 @@ mod tests {
         frames
     }
 
+    async fn read_framed_message<R>(reader: &mut R) -> WireMessage
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut length_prefix = [0u8; WIRE_FRAME_LENGTH_PREFIX_BYTES];
+        reader
+            .read_exact(&mut length_prefix)
+            .await
+            .expect("read frame length");
+        let payload_len = u32::from_be_bytes(length_prefix) as usize;
+        let mut payload = vec![0; payload_len];
+        reader
+            .read_exact(&mut payload)
+            .await
+            .expect("read frame payload");
+        decode_frame_payload(&payload).expect("decode frame payload")
+    }
+
+    #[derive(Default)]
+    struct FaultSwitches {
+        fail_next_read: AtomicBool,
+        fail_next_write: AtomicBool,
+        fail_next_flush: AtomicBool,
+    }
+
+    struct FaultInjectedStream {
+        inner: DuplexStream,
+        faults: Arc<FaultSwitches>,
+    }
+
+    struct FaultRemotePeer {
+        inner: DuplexStream,
+        faults: Arc<FaultSwitches>,
+        delayed_frames: VecDeque<WireMessage>,
+        frame_buffer: Vec<u8>,
+    }
+
+    struct TransportFaultHarness;
+
+    impl TransportFaultHarness {
+        fn pair() -> (FaultInjectedStream, FaultRemotePeer) {
+            let (session_side, remote_side) = tokio::io::duplex(64 * 1024);
+            let faults = Arc::new(FaultSwitches::default());
+            (
+                FaultInjectedStream {
+                    inner: session_side,
+                    faults: Arc::clone(&faults),
+                },
+                FaultRemotePeer {
+                    inner: remote_side,
+                    faults,
+                    delayed_frames: VecDeque::new(),
+                    frame_buffer: Vec::with_capacity(4096),
+                },
+            )
+        }
+
+        fn reconnect_pair() -> (FaultInjectedStream, FaultRemotePeer) {
+            Self::pair()
+        }
+    }
+
+    impl FaultRemotePeer {
+        fn fail_next_read(&self) {
+            self.faults.fail_next_read.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_next_write(&self) {
+            self.faults.fail_next_write.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_next_flush(&self) {
+            self.faults.fail_next_flush.store(true, Ordering::SeqCst);
+        }
+
+        async fn send_frame(&mut self, message: WireMessage) {
+            encode_frame_to_vec(&message, &mut self.frame_buffer).expect("encode frame");
+            self.inner
+                .write_all(&self.frame_buffer)
+                .await
+                .expect("write remote frame");
+            self.inner.flush().await.expect("flush remote frame");
+        }
+
+        fn queue_delayed_frame(&mut self, message: WireMessage) {
+            self.delayed_frames.push_back(message);
+        }
+
+        async fn release_delayed_frame(&mut self) {
+            let message = self
+                .delayed_frames
+                .pop_front()
+                .expect("delayed frame queued");
+            self.send_frame(message).await;
+        }
+
+        async fn read_frame(&mut self) -> WireMessage {
+            read_framed_message(&mut self.inner).await
+        }
+
+        async fn read_until<F>(&mut self, description: &str, mut predicate: F) -> WireMessage
+        where
+            F: FnMut(&WireMessage) -> bool,
+        {
+            let mut frames = Vec::new();
+            for _ in 0..16 {
+                let frame = time::timeout(Duration::from_secs(1), self.read_frame())
+                    .await
+                    .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
+                if predicate(&frame) {
+                    return frame;
+                }
+                frames.push(frame);
+            }
+            panic!("did not observe {description}; saw {frames:?}");
+        }
+
+        async fn disconnect(&mut self) {
+            self.inner.shutdown().await.expect("remote disconnect");
+        }
+    }
+
+    impl AsyncRead for FaultInjectedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.faults.fail_next_read.swap(false, Ordering::SeqCst) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "forced read failure",
+                )));
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for FaultInjectedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.faults.fail_next_write.swap(false, Ordering::SeqCst) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "forced write failure",
+                )));
+            }
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.faults.fail_next_flush.swap(false, Ordering::SeqCst) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "forced flush failure",
+                )));
+            }
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
     #[test]
     fn extracts_server_name_from_ipv4_socket() {
         let server_name = parse_server_name("127.0.0.1:15100").expect("server name");
@@ -461,6 +635,207 @@ mod tests {
             1, 0, 24, 0, 0, 0, 0, 0, 4, 0, 0, 0, 19, 11, 0, 0, 19, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 255, 0,
         ]
+    }
+
+    fn remote_hello(peer_id: &str) -> WireMessage {
+        WireMessage::Hello {
+            machine_id: peer_id.to_string(),
+            display_name: "peer".to_string(),
+            protocol: PROTOCOL_CURRENT,
+            capability_count: core_protocol::default_capabilities().len(),
+        }
+    }
+
+    #[tokio::test]
+    async fn fault_harness_injects_read_write_flush_and_disconnect() {
+        let (mut stream, mut remote) = TransportFaultHarness::pair();
+
+        remote.fail_next_write();
+        let write_error = stream.write_all(b"hello").await.expect_err("write fails");
+        assert_eq!(write_error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(write_error.to_string().contains("forced write failure"));
+
+        remote.fail_next_flush();
+        let flush_error = stream.flush().await.expect_err("flush fails");
+        assert_eq!(flush_error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(flush_error.to_string().contains("forced flush failure"));
+
+        remote.fail_next_read();
+        let mut byte = [0];
+        let read_error = stream.read_exact(&mut byte).await.expect_err("read fails");
+        assert_eq!(read_error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(read_error.to_string().contains("forced read failure"));
+
+        remote.disconnect().await;
+        let eof = stream.read(&mut byte).await.expect("read eof");
+        assert_eq!(eof, 0, "remote shutdown should surface as disconnect EOF");
+    }
+
+    #[tokio::test]
+    async fn fault_harness_delayed_hello_flushes_clipboard_replay_then_disconnects() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        state
+            .queue_clipboard_text(&peer_id, "delayed-clipboard".to_string())
+            .await
+            .expect("queue clipboard replay");
+        let (stream, mut remote) = TransportFaultHarness::pair();
+
+        let session = tokio::spawn(run_authenticated_session(
+            state.clone(),
+            peer_id.clone(),
+            stream,
+            true,
+            None,
+        ));
+
+        assert!(matches!(
+            remote
+                .read_until("local hello", |frame| matches!(
+                    frame,
+                    WireMessage::Hello { .. }
+                ))
+                .await,
+            WireMessage::Hello { .. }
+        ));
+
+        remote.queue_delayed_frame(remote_hello(&peer_id));
+        remote.release_delayed_frame().await;
+
+        let local_machine_id = state.snapshot().await.machine_id;
+        let replay = remote
+            .read_until("clipboard replay", |frame| {
+                matches!(frame, WireMessage::ClipboardText { text, .. } if text == "delayed-clipboard")
+            })
+            .await;
+        assert!(matches!(
+            replay,
+            WireMessage::ClipboardText { machine_id, text }
+                if machine_id == local_machine_id && text == "delayed-clipboard"
+        ));
+
+        remote.disconnect().await;
+        session
+            .await
+            .expect("session task joins")
+            .expect("disconnect closes session cleanly");
+        assert!(
+            !state
+                .snapshot()
+                .await
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == peer_id && peer.connected),
+            "session close should mark the peer disconnected"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn fault_harness_input_flushes_across_reconnect_after_delayed_frame() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        state
+            .queue_input_events(&peer_id, vec![InputEvent::MouseMove { dx: 7, dy: -3 }])
+            .await
+            .expect("queue input frame");
+        let (stream, mut remote) = TransportFaultHarness::pair();
+
+        let session = tokio::spawn(run_authenticated_session(
+            state.clone(),
+            peer_id.clone(),
+            stream,
+            true,
+            None,
+        ));
+
+        remote
+            .read_until("local hello", |frame| {
+                matches!(frame, WireMessage::Hello { .. })
+            })
+            .await;
+        remote.send_frame(remote_hello(&peer_id)).await;
+
+        let local_machine_id = state.snapshot().await.machine_id;
+        let input_frame = remote
+            .read_until("queued input frame", |frame| {
+                matches!(frame, WireMessage::InputFrame { .. })
+            })
+            .await;
+        assert!(matches!(
+            input_frame,
+            WireMessage::InputFrame {
+                machine_id,
+                sequence: 1,
+                events,
+                ..
+            } if machine_id == local_machine_id
+                && matches!(events.as_slice(), [WireInputEvent::MouseMove { dx: 7, dy: -3 }])
+        ));
+
+        remote.queue_delayed_frame(WireMessage::Heartbeat {
+            machine_id: peer_id.clone(),
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+        });
+        state.request_peer_reconnect(&peer_id).await;
+        remote.release_delayed_frame().await;
+
+        session
+            .await
+            .expect("session task joins")
+            .expect("reconnect request closes session cleanly");
+        assert!(
+            !state
+                .snapshot()
+                .await
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == peer_id && peer.connected),
+            "reconnect should end the active session and mark the peer disconnected"
+        );
+
+        state
+            .queue_input_events(&peer_id, vec![InputEvent::MouseMove { dx: -2, dy: 5 }])
+            .await
+            .expect("queue input after reconnect request");
+        let (stream, mut remote) = TransportFaultHarness::reconnect_pair();
+        let session = tokio::spawn(run_authenticated_session(
+            state.clone(),
+            peer_id.clone(),
+            stream,
+            true,
+            None,
+        ));
+
+        remote
+            .read_until("second local hello", |frame| {
+                matches!(frame, WireMessage::Hello { .. })
+            })
+            .await;
+        remote.send_frame(remote_hello(&peer_id)).await;
+
+        let input_frame = remote
+            .read_until("input frame after reconnect", |frame| {
+                matches!(frame, WireMessage::InputFrame { .. })
+            })
+            .await;
+        assert!(matches!(
+            input_frame,
+            WireMessage::InputFrame {
+                machine_id,
+                sequence: 2,
+                events,
+                ..
+            } if machine_id == local_machine_id
+                && matches!(events.as_slice(), [WireInputEvent::MouseMove { dx: -2, dy: 5 }])
+        ));
+
+        remote.disconnect().await;
+        session
+            .await
+            .expect("second session task joins")
+            .expect("second disconnect closes session cleanly");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
