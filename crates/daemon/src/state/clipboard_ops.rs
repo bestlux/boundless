@@ -698,7 +698,7 @@ impl AppState {
         Some(transfer.total_bytes.saturating_sub(transfer.offset_bytes))
     }
 
-    pub(crate) async fn read_next_outbound_file_chunk(
+    pub(crate) async fn materialize_outbound_file_chunk(
         &self,
         peer_id: &str,
         transfer_id: &str,
@@ -730,7 +730,7 @@ impl AppState {
         }
 
         if transfer.source_file.is_none() {
-            let mut source_file = tokio::fs::File::open(&transfer.source_path)
+            let source_file = tokio::fs::File::open(&transfer.source_path)
                 .await
                 .with_context(|| {
                     format!(
@@ -738,18 +738,6 @@ impl AppState {
                         transfer.source_path.display()
                     )
                 })?;
-            if transfer.offset_bytes > 0 {
-                source_file
-                    .seek(std::io::SeekFrom::Start(transfer.offset_bytes))
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "seek outbound file source {} to offset {}",
-                            transfer.source_path.display(),
-                            transfer.offset_bytes
-                        )
-                    })?;
-            }
             transfer.source_file = Some(source_file);
         }
 
@@ -762,6 +750,16 @@ impl AppState {
                 .source_file
                 .as_mut()
                 .expect("outbound source file should be open before reading");
+            source_file
+                .seek(std::io::SeekFrom::Start(offset_bytes))
+                .await
+                .with_context(|| {
+                    format!(
+                        "seek outbound file source {} to offset {}",
+                        transfer.source_path.display(),
+                        offset_bytes
+                    )
+                })?;
             source_file.read_exact(&mut data).await.with_context(|| {
                 format!(
                     "read outbound file source {} offset {} length {}",
@@ -770,15 +768,33 @@ impl AppState {
                     length_bytes
                 )
             })?;
-            transfer.offset_bytes = transfer.offset_bytes.saturating_add(length_bytes as u64);
         }
 
+        let next_offset = offset_bytes.saturating_add(length_bytes as u64);
         Ok(OutboundFileChunk {
             transfer_id: transfer_id.to_string(),
             offset_bytes,
             data,
-            finished: transfer.offset_bytes >= transfer.total_bytes,
+            finished: next_offset >= transfer.total_bytes,
         })
+    }
+
+    pub(crate) async fn commit_outbound_file_chunk(
+        &self,
+        peer_id: &str,
+        transfer_id: &str,
+        offset_bytes: u64,
+        length_bytes: usize,
+    ) -> bool {
+        let mut transfers = self.outbound_file_transfers.write().await;
+        let Some(transfer) = transfers.get_mut(transfer_id) else {
+            return false;
+        };
+        if transfer.peer_id != peer_id || transfer.offset_bytes != offset_bytes {
+            return false;
+        }
+        transfer.offset_bytes = transfer.offset_bytes.saturating_add(length_bytes as u64);
+        true
     }
 
     pub(crate) async fn complete_outbound_file_transfer(

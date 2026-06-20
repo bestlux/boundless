@@ -899,6 +899,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flush_failure_after_file_chunk_retries_same_cursor_bytes() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let file_path = root.join("chunk-flush-fail.bin");
+        let payload = vec![5u8; crate::state::FILE_TRANSFER_CHUNK_BYTES + 11];
+        tokio::fs::write(&file_path, &payload)
+            .await
+            .expect("write payload");
+        state
+            .queue_file_from_path(&peer_id, &file_path)
+            .await
+            .expect("queue file");
+
+        let mut outbound_transfer_flow = HashMap::new();
+        let mut frame_buffer = Vec::new();
+        let mut start_writer = CaptureWriter::default();
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+            &mut outbound_transfer_flow,
+            &mut start_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("flush start");
+        let transfer_id = match decode_written_frames(&start_writer.bytes).first() {
+            Some(WireMessage::FileStart { transfer_id, .. }) => transfer_id.clone(),
+            other => panic!("expected file start, got {other:?}"),
+        };
+
+        outbound_transfer_flow
+            .get_mut(&transfer_id)
+            .expect("registered outbound flow")
+            .available_chunk_credits = 1;
+        let mut failing_writer = FlushFailWriter::new(1);
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+            &mut outbound_transfer_flow,
+            &mut failing_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect_err("chunk batch flush should fail");
+
+        assert_eq!(
+            outbound_transfer_flow
+                .get(&transfer_id)
+                .expect("active flow")
+                .available_chunk_credits,
+            1,
+            "failed flush should restore chunk credit for retry"
+        );
+        assert_eq!(state.outgoing_bulk_queue_len(&peer_id).await, 1);
+        assert_eq!(state.outbound_file_transfer_count().await, 1);
+
+        let mut retry_writer = CaptureWriter::default();
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+            &mut outbound_transfer_flow,
+            &mut retry_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("retry chunk");
+
+        let retry_frames = decode_written_frames(&retry_writer.bytes);
+        assert_eq!(retry_frames.len(), 1);
+        assert!(matches!(
+            retry_frames.first(),
+            Some(WireMessage::FileChunk { transfer_id: chunk_transfer_id, data })
+                if chunk_transfer_id == &transfer_id
+                    && data.as_slice() == &payload[..crate::state::FILE_TRANSFER_CHUNK_BYTES]
+        ));
+        assert_eq!(state.outgoing_bulk_queue_len(&peer_id).await, 1);
+        assert_eq!(state.outbound_file_transfer_count().await, 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn flush_failure_after_final_file_chunk_does_not_complete_until_retry() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let file_path = root.join("final-flush-fail.bin");
+        let payload = vec![6u8; 32];
+        tokio::fs::write(&file_path, &payload)
+            .await
+            .expect("write payload");
+        state
+            .queue_file_from_path(&peer_id, &file_path)
+            .await
+            .expect("queue file");
+
+        let mut outbound_transfer_flow = HashMap::new();
+        let mut frame_buffer = Vec::new();
+        let mut start_writer = CaptureWriter::default();
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+            &mut outbound_transfer_flow,
+            &mut start_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("flush start");
+        let transfer_id = match decode_written_frames(&start_writer.bytes).first() {
+            Some(WireMessage::FileStart { transfer_id, .. }) => transfer_id.clone(),
+            other => panic!("expected file start, got {other:?}"),
+        };
+
+        outbound_transfer_flow
+            .get_mut(&transfer_id)
+            .expect("registered outbound flow")
+            .available_chunk_credits = 1;
+        let mut failing_writer = FlushFailWriter::new(1);
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+            &mut outbound_transfer_flow,
+            &mut failing_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect_err("final batch flush should fail");
+
+        assert!(
+            outbound_transfer_flow.contains_key(&transfer_id),
+            "failed final flush must not remove flow state"
+        );
+        assert_eq!(
+            outbound_transfer_flow
+                .get(&transfer_id)
+                .expect("active flow")
+                .available_chunk_credits,
+            1,
+            "failed final flush should restore chunk credit for retry"
+        );
+        assert_eq!(state.outgoing_bulk_queue_len(&peer_id).await, 1);
+        assert_eq!(state.outbound_file_transfer_count().await, 1);
+        assert!(
+            state
+                .transport_events()
+                .await
+                .iter()
+                .all(|event| event.kind != "file_transfer_completed"),
+            "failed final flush must not emit completion"
+        );
+
+        let mut retry_writer = CaptureWriter::default();
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+            &mut outbound_transfer_flow,
+            &mut retry_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("retry final chunk");
+
+        let retry_frames = decode_written_frames(&retry_writer.bytes);
+        assert_eq!(retry_frames.len(), 2);
+        assert!(matches!(
+            retry_frames.first(),
+            Some(WireMessage::FileChunk { transfer_id: chunk_transfer_id, data })
+                if chunk_transfer_id == &transfer_id && data.as_slice() == payload.as_slice()
+        ));
+        assert!(matches!(
+            retry_frames.get(1),
+            Some(WireMessage::FileEnd { transfer_id: end_transfer_id })
+                if end_transfer_id == &transfer_id
+        ));
+        assert!(!outbound_transfer_flow.contains_key(&transfer_id));
+        assert_eq!(state.outgoing_bulk_queue_len(&peer_id).await, 0);
+        assert_eq!(state.outbound_file_transfer_count().await, 0);
+        let completed = state
+            .transport_events()
+            .await
+            .into_iter()
+            .filter(|event| event.kind == "file_transfer_completed")
+            .count();
+        assert_eq!(completed, 1, "retry should emit one completion event");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn flush_file_transfer_cursor_fails_after_source_mutation() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         let file_path = root.join("mutated.bin");
