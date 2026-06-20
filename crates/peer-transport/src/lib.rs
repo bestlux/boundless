@@ -247,6 +247,8 @@ pub struct InboundTransfer {
     pub file_name: String,
     pub total_bytes: u64,
     pub bytes_received: u64,
+    pub remaining_chunk_credits: u32,
+    pub final_path: PathBuf,
     pub temp_path: PathBuf,
     pub temp_file: tokio::fs::File,
 }
