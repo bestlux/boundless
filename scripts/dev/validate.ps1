@@ -33,6 +33,7 @@ if ($KeepArtifacts) {
     $suiteParams.KeepArtifacts = $true
 }
 
+Write-Warning "scripts/dev/validate.ps1 is a transitional wrapper; use scripts/dev/test-suite.ps1 or scripts/dev/check.ps1."
 Write-Host "[validate] forwarding to scripts/dev/test-suite.ps1 profile=$profile"
 & (Join-Path $repoRoot "scripts/dev/test-suite.ps1") @suiteParams | Out-Host
 if ($LASTEXITCODE -ne 0) {

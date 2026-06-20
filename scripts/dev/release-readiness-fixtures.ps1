@@ -62,6 +62,8 @@ function Invoke-Fixture {
         [string]$ServiceVersionOutput = "",
         [switch]$NoInstallerSummary,
         [switch]$RequireReady,
+        [ValidateSet("stable", "prerelease")]
+        [string]$Policy = "prerelease",
         [int]$ExpectedExitCode,
         [string]$ExpectedRisk,
         [string]$ExpectedInstallerStatus,
@@ -85,6 +87,8 @@ function Invoke-Fixture {
         "-SkipUnitGates",
         "-ReleaseVersion",
         "v5.0.0",
+        "-Policy",
+        $Policy,
         "-OutputRoot",
         $readinessRoot
     )
@@ -121,5 +125,6 @@ Invoke-Fixture -Name "substring_version_fails" -ServiceVersionOutput "boundless-
 Invoke-Fixture -Name "prerelease_service_version_fails_for_stable_release" -ServiceVersionOutput "boundless-service 5.0.0-rc" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "failed"
 Invoke-Fixture -Name "empty_service_version_output_fails" -ServiceVersionOutput "" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "failed"
 Invoke-Fixture -Name "missing_installer_summary_skips_and_require_ready_fails" -NoInstallerSummary -RequireReady -ExpectedExitCode 1 -ExpectedRisk "at-risk" -ExpectedInstallerStatus "skipped" -ExpectedServiceVersionStatus "skipped"
+Invoke-Fixture -Name "missing_installer_summary_stable_policy_fails" -NoInstallerSummary -Policy stable -ExpectedExitCode 1 -ExpectedRisk "at-risk" -ExpectedInstallerStatus "skipped" -ExpectedServiceVersionStatus "skipped"
 
 Write-Host "release_readiness_fixtures=passed artifacts=$OutputRoot"
