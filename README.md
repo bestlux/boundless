@@ -124,13 +124,14 @@ Follow-up modes:
 - `-Mode lockout-only`
 - `-Mode success-and-lockout`
 
-Compatibility wrapper (legacy command still works):
+Quick validation:
 
 ```powershell
-./scripts/dev/validate.ps1
+./scripts/dev/test-suite.ps1 -Profile quick
+./scripts/dev/check.ps1 -Area workspace -Format json
 ```
 
-The wrapper defaults to `-Profile quick`. Use `-IncludeSmoke` for the 2-node smoke path or `-IncludeThreeNodeSmoke` for the full 3-node path.
+Use `./scripts/dev/test-suite.ps1 -Profile smoke` for the 2-node smoke path, `./scripts/dev/test-suite.ps1 -Profile full` for the full 3-node path, and `./scripts/dev/installer-smoke.ps1` or `./scripts/dev/release-readiness.ps1 -Policy stable` for packaging and release evidence.
 
 ## Run locally
 

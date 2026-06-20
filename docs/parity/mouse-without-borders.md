@@ -98,6 +98,6 @@ Each milestone commit must update this checklist when it moves a matrix row clos
 
 ## Current Required Follow-Ups
 
-- Build a `docs/parity/v5-readiness-template.md` packet template before release hardening begins.
+- Keep release-readiness packets version-neutral and refresh them before release hardening begins.
 - Add one issue or work item per release-blocking row that is not yet `validated`.
 - Update this matrix after every v5 milestone commit.

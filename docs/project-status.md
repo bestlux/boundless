@@ -48,11 +48,11 @@ Use scripts/dev/check.ps1 -Area <area> -Format json for machine-readable area ch
 | release | scripts/dev/release-readiness.ps1 -Policy stable | release packet and evidence gate |
 | docs/status | status and component-map checks | agent context freshness |
 
-Legacy wrappers:
+Removed transitional wrappers:
 
-- scripts/dev/package-smoke.ps1 is a warning shim to installer-smoke.ps1.
-- scripts/dev/validate.ps1 is a warning shim to test-suite.ps1.
-- scripts/dev/v5-readiness.ps1 is a compatibility shim to release-readiness.ps1; new automation should use version-neutral readiness packets.
+- Installer smoke compatibility wrapper was removed. Use scripts/dev/installer-smoke.ps1 or scripts/dev/check.ps1 -Area installer.
+- Broad validation compatibility wrapper was removed. Use scripts/dev/test-suite.ps1 for profile runs or scripts/dev/check.ps1 for area checks.
+- Release readiness compatibility wrapper was removed. Use scripts/dev/release-readiness.ps1 -Policy stable and version-neutral readiness packets.
 
 ## Current Architecture Links
 
@@ -88,9 +88,9 @@ These are not hidden release blockers by default; they require explicit release-
 | Pairing trust recovery UX | landed | PR #81 | Guided setup remains deferred as a larger UX feature. |
 | Transfer Center MVP | landed | PR #82 | Resumable transfers remain intentionally deferred. |
 | Keep high-signal workspace, smoke, installer, service, release checks | addressed by this work | scripts/dev/check.ps1, this validation ladder | Uses existing scripts underneath. |
-| Deprecate package-smoke.ps1 | addressed by this work | warning shim | Remove later after docs/automation have migrated. |
-| Keep validate.ps1 only as a warning shim | addressed by this work | warning shim | Canonical commands are test-suite.ps1 and check.ps1. |
-| Replace v5-readiness naming with version-neutral release readiness | landed and addressed by this work | release-readiness.ps1, v5-readiness.ps1 compatibility shim | Stable policy is now named as -Policy stable. |
+| Remove installer smoke compatibility wrapper | landed | installer-smoke.ps1, check.ps1 -Area installer | Transitional wrapper deleted after docs/automation migrated. |
+| Remove broad validation compatibility wrapper | landed | test-suite.ps1, check.ps1 | Canonical commands are test-suite.ps1 and check.ps1. |
+| Replace version-specific release readiness naming | landed | release-readiness.ps1 | Stable policy is now named as -Policy stable. |
 | Add project status and component map | addressed by this work | this file and docs/architecture/component-map.md | These are the canonical agent context docs. |
 | Make release evidence self-describing | landed and addressed by this work | release-readiness.json, release-readiness.md, release_policy, gate reasons/impacts | Stable policy fails failed/skipped/missing/stale supported evidence. |
 | Full MSI-owned service updater | deferred | service_update_orchestration gap | Requires product/installer work, not docs-only readiness. |
