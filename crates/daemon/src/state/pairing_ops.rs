@@ -1,5 +1,8 @@
 use super::*;
 
+const PAIRING_RECONNECT_STATUS_CONNECTIVITY_PENDING: &str = "connectivity_pending";
+const PAIRING_RECONNECT_STATUS_FAILED: &str = "reconnect_failed";
+
 #[derive(Debug, Clone, Copy)]
 enum VerificationMismatchKind {
     Code,
@@ -241,11 +244,17 @@ impl AppState {
         });
         if let Some(record) = decisions.get(request_id) {
             return match &record.decision {
-                NearbyPairingDecision::Approved { responder_bundle } => {
-                    NearbyPairingStatus::Approved {
-                        responder_bundle: responder_bundle.clone(),
-                    }
-                }
+                NearbyPairingDecision::Approved {
+                    responder_bundle,
+                    peer_machine_id,
+                    reconnect_status,
+                    message,
+                } => NearbyPairingStatus::Approved {
+                    responder_bundle: responder_bundle.clone(),
+                    peer_machine_id: peer_machine_id.clone(),
+                    reconnect_status: reconnect_status.clone(),
+                    message: message.clone(),
+                },
                 NearbyPairingDecision::Rejected { message } => NearbyPairingStatus::Rejected {
                     message: message.clone(),
                 },
@@ -259,18 +268,25 @@ impl AppState {
         &self,
         request_id: &str,
         alias_override: Option<String>,
-    ) -> Result<TrustBundle> {
+    ) -> Result<NearbyPairingCommitResult> {
         self.ensure_trust_rotation_not_pending()?;
         self.expire_nearby_pairing_challenges().await;
 
-        let pending = {
-            self.pairing
-                .pending_requests
-                .write()
-                .await
-                .remove(request_id)
-        }
-        .ok_or_else(|| anyhow::anyhow!("nearby pairing request not found"))?;
+        let pending = match self
+            .pairing
+            .pending_requests
+            .write()
+            .await
+            .remove(request_id)
+        {
+            Some(pending) => pending,
+            None => {
+                if let Some(result) = self.approved_pairing_commit_result(request_id, true).await {
+                    return Ok(result);
+                }
+                anyhow::bail!("nearby pairing request not found");
+            }
+        };
         if matches!(pending.mode, PendingNearbyPairingMode::CodeChallenge { .. }) {
             self.pairing
                 .pending_requests
@@ -283,6 +299,7 @@ impl AppState {
         let effective_alias = alias_override
             .and_then(normalize_optional_alias)
             .or(pending.requester_alias.clone());
+        let responder_bundle = self.export_trust_bundle().await?;
 
         if let Err(error) = self
             .import_trust_bundle(pending.requester_bundle.clone(), effective_alias)
@@ -296,21 +313,9 @@ impl AppState {
             return Err(error);
         }
 
-        let responder_bundle = self.export_trust_bundle().await?;
-        self.pairing.decisions.write().await.insert(
-            request_id.to_string(),
-            NearbyPairingDecisionRecord {
-                decision: NearbyPairingDecision::Approved {
-                    responder_bundle: responder_bundle.clone(),
-                },
-                decided_at: Utc::now(),
-            },
-        );
-        let _ = self
-            .request_peer_reconnect_and_reset(&peer_id)
-            .await
-            .context("request reconnect after nearby pairing approval")?;
-        Ok(responder_bundle)
+        Ok(self
+            .finish_pairing_trust_commit(request_id, peer_id, responder_bundle, false)
+            .await)
     }
 
     pub async fn submit_nearby_pairing_code(
@@ -319,7 +324,7 @@ impl AppState {
         code: &str,
         verification_nonce: &str,
         alias_override: Option<String>,
-    ) -> Result<TrustBundle> {
+    ) -> Result<NearbyPairingCommitResult> {
         self.ensure_trust_rotation_not_pending()?;
         self.expire_nearby_pairing_challenges().await;
 
@@ -332,14 +337,21 @@ impl AppState {
             anyhow::bail!("verification nonce must not be empty");
         }
 
-        let mut pending = {
-            self.pairing
-                .pending_requests
-                .write()
-                .await
-                .remove(request_id)
-        }
-        .ok_or_else(|| anyhow::anyhow!("nearby pairing request not found"))?;
+        let mut pending = match self
+            .pairing
+            .pending_requests
+            .write()
+            .await
+            .remove(request_id)
+        {
+            Some(pending) => pending,
+            None => {
+                if let Some(result) = self.approved_pairing_commit_result(request_id, true).await {
+                    return Ok(result);
+                }
+                anyhow::bail!("nearby pairing request not found");
+            }
+        };
 
         let now = Utc::now();
         let mut invalid_attempt: Option<(u8, VerificationMismatchKind)> = None;
@@ -425,6 +437,7 @@ impl AppState {
         let effective_alias = alias_override
             .and_then(normalize_optional_alias)
             .or(pending.requester_alias.clone());
+        let responder_bundle = self.export_trust_bundle().await?;
 
         if let Err(error) = self
             .import_trust_bundle(pending.requester_bundle.clone(), effective_alias)
@@ -438,21 +451,125 @@ impl AppState {
             return Err(error);
         }
 
-        let responder_bundle = self.export_trust_bundle().await?;
+        Ok(self
+            .finish_pairing_trust_commit(request_id, peer_id, responder_bundle, false)
+            .await)
+    }
+
+    async fn approved_pairing_commit_result(
+        &self,
+        request_id: &str,
+        already_committed: bool,
+    ) -> Option<NearbyPairingCommitResult> {
+        let decisions = self.pairing.decisions.read().await;
+        let record = decisions.get(request_id)?;
+        let NearbyPairingDecision::Approved {
+            responder_bundle,
+            peer_machine_id,
+            reconnect_status,
+            ..
+        } = &record.decision
+        else {
+            return None;
+        };
+        Some(NearbyPairingCommitResult {
+            responder_bundle: responder_bundle.clone(),
+            peer_machine_id: peer_machine_id.clone(),
+            trust_committed: true,
+            already_committed,
+            reconnect_status: reconnect_status.clone(),
+            message: pairing_commit_message(already_committed, reconnect_status),
+        })
+    }
+
+    async fn finish_pairing_trust_commit(
+        &self,
+        request_id: &str,
+        peer_id: String,
+        responder_bundle: TrustBundle,
+        already_committed: bool,
+    ) -> NearbyPairingCommitResult {
+        let provisional_status = PAIRING_RECONNECT_STATUS_CONNECTIVITY_PENDING.to_string();
+        let provisional_message = pairing_commit_message(already_committed, &provisional_status);
+        self.record_approved_pairing_decision(
+            request_id,
+            responder_bundle.clone(),
+            peer_id.clone(),
+            provisional_status,
+            provisional_message,
+        )
+        .await;
+
+        let reconnect_status = self.request_pairing_reconnect_after_commit(&peer_id).await;
+        let message = pairing_commit_message(already_committed, &reconnect_status);
+        self.record_approved_pairing_decision(
+            request_id,
+            responder_bundle.clone(),
+            peer_id.clone(),
+            reconnect_status.clone(),
+            message.clone(),
+        )
+        .await;
+
+        NearbyPairingCommitResult {
+            responder_bundle,
+            peer_machine_id: peer_id,
+            trust_committed: true,
+            already_committed,
+            reconnect_status,
+            message,
+        }
+    }
+
+    async fn record_approved_pairing_decision(
+        &self,
+        request_id: &str,
+        responder_bundle: TrustBundle,
+        peer_machine_id: String,
+        reconnect_status: String,
+        message: String,
+    ) {
         self.pairing.decisions.write().await.insert(
             request_id.to_string(),
             NearbyPairingDecisionRecord {
                 decision: NearbyPairingDecision::Approved {
-                    responder_bundle: responder_bundle.clone(),
+                    responder_bundle,
+                    peer_machine_id,
+                    reconnect_status,
+                    message,
                 },
                 decided_at: Utc::now(),
             },
         );
-        let _ = self
-            .request_peer_reconnect_and_reset(&peer_id)
-            .await
-            .context("request reconnect after nearby pairing code confirmation")?;
-        Ok(responder_bundle)
+    }
+
+    async fn request_pairing_reconnect_after_commit(&self, peer_id: &str) -> String {
+        match self.request_peer_reconnect_and_reset(peer_id).await {
+            Ok((generation, aborted_sessions)) => {
+                self.record_transport_event(TransportEventRecord {
+                    timestamp: Utc::now(),
+                    direction: "local".to_string(),
+                    kind: "pairing_connectivity_pending".to_string(),
+                    peer_id: peer_id.to_string(),
+                    detail: format!(
+                        "trust_committed=true generation={generation} aborted_sessions={aborted_sessions}"
+                    ),
+                    size_bytes: 0,
+                });
+                PAIRING_RECONNECT_STATUS_CONNECTIVITY_PENDING.to_string()
+            }
+            Err(error) => {
+                self.record_transport_event(TransportEventRecord {
+                    timestamp: Utc::now(),
+                    direction: "local".to_string(),
+                    kind: "pairing_reconnect_failed".to_string(),
+                    peer_id: peer_id.to_string(),
+                    detail: format!("trust_committed=true error={error}"),
+                    size_bytes: 0,
+                });
+                PAIRING_RECONNECT_STATUS_FAILED.to_string()
+            }
+        }
     }
 
     pub async fn reject_nearby_pairing_request(&self, request_id: &str) -> bool {
@@ -514,5 +631,22 @@ impl AppState {
                 },
             );
         }
+    }
+}
+
+fn pairing_commit_message(already_committed: bool, reconnect_status: &str) -> String {
+    let trust = if already_committed {
+        "nearby pairing already trusted"
+    } else {
+        "nearby pairing trust established"
+    };
+    match reconnect_status {
+        PAIRING_RECONNECT_STATUS_FAILED => {
+            format!("{trust}; reconnect request failed; use reconnect or remove peer to re-pair")
+        }
+        PAIRING_RECONNECT_STATUS_CONNECTIVITY_PENDING => {
+            format!("{trust}; connectivity pending")
+        }
+        _ => trust.to_string(),
     }
 }

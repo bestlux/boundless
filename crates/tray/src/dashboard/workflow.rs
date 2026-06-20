@@ -247,8 +247,10 @@ impl DashboardApp {
                 egui::Grid::new("paired_peers").striped(true).show(ui, |ui| {
                     ui.label(egui::RichText::new("Name").strong());
                     ui.label(egui::RichText::new("ID").strong());
-                    ui.label(egui::RichText::new("Address").strong());
+                    ui.label(egui::RichText::new("Trust").strong());
                     ui.label(egui::RichText::new("Status").strong());
+                    ui.label(egui::RichText::new("Address").strong());
+                    ui.label(egui::RichText::new("Action").strong());
                     ui.end_row();
                     for peer in &self.snapshot.paired_peers {
                         let color = if peer.connected {
@@ -258,9 +260,26 @@ impl DashboardApp {
                         };
                         ui.label(egui::RichText::new(&peer.display_name).color(color));
                         ui.label(short_token(&peer.peer_id));
-                        ui.label(&peer.address);
+                        let trust_label = peer.trust_state.replace('_', " ");
+                        ui.label(trust_label).on_hover_text(format!(
+                            "Device: {}\nTrusted since: {}\nFingerprint: {}",
+                            empty_as_none(&peer.device_identity),
+                            empty_as_none(&peer.trusted_since),
+                            empty_as_none(&peer.trust_fingerprint)
+                        ));
                         ui.label(peer.health_state.replace('_', " "))
                             .on_hover_text(&peer.health_reason);
+                        ui.label(&peer.address);
+                        let remove = ui
+                            .button("Remove")
+                            .on_hover_text("Revoke trust and remove this peer");
+                        if remove.clicked() {
+                            self.task_runner().remove_peer(
+                                self.tx.clone(),
+                                self.ctx.endpoint.clone(),
+                                peer.peer_id.clone(),
+                            );
+                        }
                         ui.end_row();
                     }
                 });

@@ -754,6 +754,9 @@ impl ControlPlaneService for ControlPlaneApi {
             message: reply.message,
             request_id: reply.request_id,
             peer_machine_id: reply.peer_machine_id,
+            trust_committed: reply.trust_committed,
+            already_committed: reply.already_committed,
+            reconnect_status: reply.reconnect_status,
         }))
     }
 
@@ -1037,6 +1040,10 @@ fn map_peer_info(peer: UiPairedPeer) -> PeerInfo {
         connected: peer.connected,
         health_state: peer.health_state,
         health_reason: peer.health_reason,
+        trust_state: peer.trust_state,
+        trusted_since: peer.trusted_since,
+        trust_fingerprint: peer.trust_fingerprint,
+        device_identity: peer.device_identity,
     }
 }
 

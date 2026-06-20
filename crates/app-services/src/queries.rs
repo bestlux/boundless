@@ -80,6 +80,10 @@ pub struct UiPairedPeer {
     pub connected: bool,
     pub health_state: String,
     pub health_reason: String,
+    pub trust_state: String,
+    pub trusted_since: String,
+    pub trust_fingerprint: String,
+    pub device_identity: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,4 +177,7 @@ pub struct NearbyPairingCompletionSnapshot {
     pub message: String,
     pub request_id: String,
     pub peer_machine_id: String,
+    pub trust_committed: bool,
+    pub already_committed: bool,
+    pub reconnect_status: String,
 }

@@ -858,6 +858,10 @@ mod tests {
                 connected: true,
                 health_state: "connected".to_string(),
                 health_reason: "connected".to_string(),
+                trust_state: "trusted".to_string(),
+                trusted_since: "2026-03-03T18:00:00Z".to_string(),
+                trust_fingerprint: "aaaaaaaaaaaaaaaa".to_string(),
+                device_identity: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
             },
             UiPairedPeer {
                 peer_id: "11111111-2222-3333-4444-555555555555".to_string(),
@@ -866,6 +870,10 @@ mod tests {
                 connected: false,
                 health_state: "disconnected".to_string(),
                 health_reason: "no recent peer event".to_string(),
+                trust_state: "trusted".to_string(),
+                trusted_since: "2026-03-03T18:00:00Z".to_string(),
+                trust_fingerprint: "1111111111111111".to_string(),
+                device_identity: "11111111-2222-3333-4444-555555555555".to_string(),
             },
         ];
 

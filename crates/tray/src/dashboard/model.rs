@@ -304,9 +304,10 @@ impl DashboardApp {
                 self.selected_tab = Tab::Layout;
                 self.push_toast(
                     format!(
-                        "Pairing successful with {} (selector: {})",
+                        "Pairing successful with {} (selector: {}): {}",
                         short_token(&result.peer_machine_id),
-                        result.orientation_selector
+                        result.orientation_selector,
+                        result.message
                     ),
                     false,
                 );

@@ -87,6 +87,10 @@ message PeerInfo {
   bool connected = 4;
   string health_state = 5;
   string health_reason = 6;
+  string trust_state = 7;
+  string trusted_since = 8;
+  string trust_fingerprint = 9;
+  string device_identity = 10;
 }
 message PeerListReply {
   repeated PeerInfo peers = 1;
@@ -360,6 +364,9 @@ message NearbyPairingCompletionReply {
   string message = 2;
   string request_id = 3;
   string peer_machine_id = 4;
+  bool trust_committed = 5;
+  bool already_committed = 6;
+  string reconnect_status = 7;
 }
 
 service DaemonService {
