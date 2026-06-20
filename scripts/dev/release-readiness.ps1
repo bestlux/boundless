@@ -180,6 +180,33 @@ function Test-StableReleaseVersion {
     return -not [string]::IsNullOrWhiteSpace($normalized) -and -not $normalized.Contains("-")
 }
 
+function Parse-ServiceVersionOutput {
+    param([string]$Output)
+
+    $trimmed = $Output.Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        return [pscustomobject]@{
+            ok = $false
+            version = ""
+            reason = "service version output was empty"
+        }
+    }
+
+    if ($trimmed -notmatch '^boundless-service (?<version>\S+)$') {
+        return [pscustomobject]@{
+            ok = $false
+            version = ""
+            reason = "service version output must exactly match 'boundless-service <version>'"
+        }
+    }
+
+    return [pscustomobject]@{
+        ok = $true
+        version = $Matches.version
+        reason = ""
+    }
+}
+
 function Add-ServiceVersionGate {
     param(
         [object]$Summary,
@@ -200,13 +227,19 @@ function Add-ServiceVersionGate {
     }
 
     $serviceVersionOutput = [string]$Summary.service_version_output
-    if ($serviceVersionOutput -match [regex]::Escape($normalizedExpected)) {
+    $parsedVersion = Parse-ServiceVersionOutput -Output $serviceVersionOutput
+    if (-not $parsedVersion.ok) {
+        Add-GateResult -Id "service_version_parity" -Category "release" -Command "installed boundless-service.exe --version" -Status "failed" -LogPath $LogPath -Reason $parsedVersion.reason -Impact "service host build version evidence is incomplete"
+        return
+    }
+
+    if ($parsedVersion.version -eq $normalizedExpected) {
         Add-GateResult -Id "service_version_parity" -Category "release" -Command "installed boundless-service.exe --version" -Status "passed" -LogPath $LogPath
         return
     }
 
     $status = if ($stableRelease) { "failed" } else { "skipped" }
-    $reason = "service version output '$serviceVersionOutput' did not contain expected version '$normalizedExpected'"
+    $reason = "service version '$($parsedVersion.version)' did not exactly match expected version '$normalizedExpected'"
     $impact = if ($stableRelease) {
         "stable release is blocked until the installed service host version matches"
     }
@@ -352,6 +385,7 @@ elseif ($IncludeInstallerSmoke) {
 }
 else {
     Add-SkippedGate -Id "installer_smoke" -Category "release" -Command "scripts/dev/installer-smoke.ps1" -Reason "IncludeInstallerSmoke was not set and no InstallerSmokeSummaryPath was provided" -Impact "installer validation must be supplied before release signoff"
+    Add-SkippedGate -Id "service_version_parity" -Category "release" -Command "installed boundless-service.exe --version" -Reason "installer smoke summary was not provided" -Impact "service/runtime version parity evidence must be supplied before stable release signoff"
 }
 
 if ($IncludeServiceSmoke) {

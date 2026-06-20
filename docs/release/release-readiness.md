@@ -55,3 +55,11 @@ Release-blocking packet:
 ```
 
 `-RequireReady` exits non-zero when any gate is skipped. Stable release readiness also fails when installer smoke does not include matching `boundless-service.exe --version` evidence.
+
+The service-version gate parses `boundless-service.exe --version` strictly as `boundless-service <version>`. For a stable release such as `v5.0.0`, the parsed service version must exactly equal `5.0.0`; substring matches, prerelease suffixes, empty output, and malformed output fail. If no installer-smoke summary is supplied, `service_version_parity` is recorded as skipped and `-RequireReady` blocks the packet.
+
+Run the targeted fixture matrix with:
+
+```powershell
+./scripts/dev/release-readiness-fixtures.ps1
+```
