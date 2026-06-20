@@ -266,6 +266,14 @@ async fn apply_cursor_post_flush_action<W>(
         {
             return;
         }
+        state
+            .mark_file_transfer_progress(
+                &action.transfer_id,
+                action
+                    .offset_bytes
+                    .saturating_add(action.length_bytes as u64),
+            )
+            .await;
         state.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
             direction: "outgoing".to_string(),
@@ -428,6 +436,7 @@ where
             )
             .await?;
             register_outbound_transfer_flow(writer_ctx.outbound_transfer_flow, transfer_id.clone());
+            state.mark_file_transfer_active(transfer_id).await;
             state.record_transport_event(TransportEventRecord {
                 timestamp: Utc::now(),
                 direction: "outgoing".to_string(),
@@ -495,6 +504,12 @@ where
             )
             .await?;
             consume_outbound_chunk_credit(writer_ctx.outbound_transfer_flow, transfer_id);
+            state
+                .mark_file_transfer_progress(
+                    transfer_id,
+                    offset_bytes.saturating_add(*length_bytes as u64),
+                )
+                .await;
             state.record_transport_event(TransportEventRecord {
                 timestamp: Utc::now(),
                 direction: "outgoing".to_string(),
@@ -622,6 +637,7 @@ where
             state
                 .record_outgoing_file(peer_id, file_name, *total_bytes)
                 .await;
+            state.mark_file_transfer_completed(transfer_id, None).await;
             state.record_transport_event(TransportEventRecord {
                 timestamp: Utc::now(),
                 direction: "outgoing".to_string(),

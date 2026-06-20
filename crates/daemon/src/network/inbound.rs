@@ -48,6 +48,15 @@ where
     }
 
     if inbound_transfers.len() >= MAX_INBOUND_TRANSFERS_PER_PEER {
+        state
+            .record_incoming_file_transfer_failed(
+                transfer_id.clone(),
+                authenticated_peer_id.to_string(),
+                file_name,
+                total_bytes,
+                "too_many_transfers".to_string(),
+            )
+            .await;
         record_transport_transfer_rejected(
             state,
             authenticated_peer_id,
@@ -65,6 +74,15 @@ where
     }
 
     if inbound_transfers.contains_key(&transfer_id) {
+        state
+            .record_incoming_file_transfer_failed(
+                transfer_id.clone(),
+                authenticated_peer_id.to_string(),
+                file_name,
+                total_bytes,
+                "duplicate_transfer_id".to_string(),
+            )
+            .await;
         record_transport_transfer_rejected(
             state,
             authenticated_peer_id,
@@ -78,6 +96,15 @@ where
     }
 
     if !state.file_transfer_auto_accept_trusted_peers().await {
+        state
+            .record_incoming_file_transfer_failed(
+                transfer_id.clone(),
+                authenticated_peer_id.to_string(),
+                file_name,
+                total_bytes,
+                "receive_policy_denied".to_string(),
+            )
+            .await;
         record_transport_transfer_rejected(
             state,
             authenticated_peer_id,
@@ -94,6 +121,15 @@ where
         total_bytes,
         state.file_transfer_max_bytes().await,
     ) {
+        state
+            .record_incoming_file_transfer_failed(
+                transfer_id.clone(),
+                authenticated_peer_id.to_string(),
+                file_name,
+                total_bytes,
+                format!("invalid_total_size: {error}"),
+            )
+            .await;
         record_transport_transfer_rejected(
             state,
             authenticated_peer_id,
@@ -116,6 +152,15 @@ where
     {
         Ok(reserved) => reserved,
         Err(error) => {
+            state
+                .record_incoming_file_transfer_failed(
+                    transfer_id.clone(),
+                    authenticated_peer_id.to_string(),
+                    file_name,
+                    total_bytes,
+                    format!("temp_reserve_failed: {error}"),
+                )
+                .await;
             record_transport_transfer_rejected(
                 state,
                 authenticated_peer_id,
@@ -130,6 +175,7 @@ where
     };
 
     let file_name = reserved.sanitized_name;
+    let final_path = reserved.final_path.clone();
     inbound_transfers.insert(
         transfer_id.clone(),
         InboundTransfer {
@@ -143,6 +189,15 @@ where
             temp_file: reserved.temp_file,
         },
     );
+    state
+        .record_incoming_file_transfer_started(
+            transfer_id.clone(),
+            peer_id.to_string(),
+            file_name.clone(),
+            total_bytes,
+            final_path,
+        )
+        .await;
     info!(
         peer_id = %peer_id,
         transfer_id = %transfer_id,
@@ -174,6 +229,9 @@ where
     }
     .await;
     if let Err(error) = initial_credit_result {
+        state
+            .mark_file_transfer_failed(&transfer_id, &format!("initial_credit_failed: {error}"))
+            .await;
         if let Some(transfer) = inbound_transfers.remove(&transfer_id) {
             discard_inbound_transfer(transfer).await;
         }
@@ -303,6 +361,9 @@ where
         next_size,
         state.file_transfer_max_bytes().await,
     ) {
+        state
+            .mark_file_transfer_failed(&transfer_id, &format!("chunk_size_invalid: {error}"))
+            .await;
         record_transport_transfer_rejected(
             state,
             &transfer.peer_id,
@@ -331,11 +392,17 @@ where
             next_size,
         )
         .await;
+        state
+            .mark_file_transfer_failed(&transfer_id, "chunk_exceeds_total")
+            .await;
         discard_inbound_transfer(transfer).await;
         return Ok(());
     }
 
     if let Err(error) = tokio::io::AsyncWriteExt::write_all(&mut transfer.temp_file, &chunk).await {
+        state
+            .mark_file_transfer_failed(&transfer_id, &format!("temp_write_failed: {error}"))
+            .await;
         record_transport_transfer_rejected(
             state,
             &transfer.peer_id,
@@ -371,6 +438,9 @@ where
         ),
         size_bytes: next_size,
     });
+    state
+        .mark_file_transfer_progress(&transfer_id, next_size)
+        .await;
     if replenish_credits > 0 {
         let credit_result = async {
             send_file_chunk_credit(writer, &transfer_id, replenish_credits, frame_buffer).await?;
@@ -467,11 +537,17 @@ pub(super) async fn handle_file_end(
             transfer.bytes_received,
         )
         .await;
+        state
+            .mark_file_transfer_failed(&transfer_id, "size_mismatch")
+            .await;
         discard_inbound_transfer(transfer).await;
         return Ok(());
     }
 
     if let Err(error) = tokio::io::AsyncWriteExt::flush(&mut transfer.temp_file).await {
+        state
+            .mark_file_transfer_failed(&transfer_id, &format!("temp_flush_failed: {error}"))
+            .await;
         record_transport_transfer_rejected(
             state,
             &transfer.peer_id,
@@ -483,6 +559,9 @@ pub(super) async fn handle_file_end(
         return Ok(());
     }
     if let Err(error) = transfer.temp_file.sync_all().await {
+        state
+            .mark_file_transfer_failed(&transfer_id, &format!("temp_sync_failed: {error}"))
+            .await;
         record_transport_transfer_rejected(
             state,
             &transfer.peer_id,
@@ -506,6 +585,9 @@ pub(super) async fn handle_file_end(
         .await
     {
         Ok(path) => {
+            state
+                .mark_file_transfer_completed(&transfer_id, Some(path.clone()))
+                .await;
             info!(
                 peer_id = %transfer.peer_id,
                 transfer_id = %transfer_id,
@@ -523,6 +605,9 @@ pub(super) async fn handle_file_end(
             });
         }
         Err(error) => {
+            state
+                .mark_file_transfer_failed(&transfer_id, &format!("finalize_failed: {error}"))
+                .await;
             warn!(
                 peer_id = %transfer.peer_id,
                 transfer_id = %transfer_id,

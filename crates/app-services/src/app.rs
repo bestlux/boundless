@@ -5,15 +5,15 @@ use async_trait::async_trait;
 
 use crate::{
     commands::{
-        DiagnosticsDumpCommand, DiagnosticsDumpReply, FeatureSetCommand, HotkeySetCommand,
-        HotkeyTriggerCommand, ImportTrustBundleCommand, InputCaptureTargetCommand,
-        InputCaptureTargetReply, InputOwnerCommand, InputOwnerReply, LayoutReply, LayoutSetCommand,
-        NearbyJoinStartCommand, NearbyJoinStatusCommand, NearbyPairingDecisionCommand,
-        NearbyRequestCodeCommand, NearbySubmitCodeCommand, OperationReply, PairJoinCommand,
-        PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, RotateTrustCommand,
-        SafeResetCommand, SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand,
-        SendInputKeyCommand, SendInputMoveCommand, SetAntiIdleConfigCommand,
-        SetFileTransferConfigCommand, SetInputHandoffConfigCommand,
+        DiagnosticsDumpCommand, DiagnosticsDumpReply, FeatureSetCommand, FileTransferActionCommand,
+        HotkeySetCommand, HotkeyTriggerCommand, ImportTrustBundleCommand,
+        InputCaptureTargetCommand, InputCaptureTargetReply, InputOwnerCommand, InputOwnerReply,
+        LayoutReply, LayoutSetCommand, NearbyJoinStartCommand, NearbyJoinStatusCommand,
+        NearbyPairingDecisionCommand, NearbyRequestCodeCommand, NearbySubmitCodeCommand,
+        OperationReply, PairJoinCommand, PairJoinReply, PairingCodeReply, PairingCodeRequest,
+        RemovePeerCommand, RotateTrustCommand, SafeResetCommand, SendClipboardImageCommand,
+        SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand, SendInputMoveCommand,
+        SetAntiIdleConfigCommand, SetFileTransferConfigCommand, SetInputHandoffConfigCommand,
     },
     queries::{
         AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
@@ -47,6 +47,15 @@ pub trait ControlPlaneApp: Send + Sync {
         &self,
         command: SetFileTransferConfigCommand,
     ) -> Result<OperationReply>;
+    async fn cancel_file_transfer(
+        &self,
+        command: FileTransferActionCommand,
+    ) -> Result<OperationReply>;
+    async fn retry_file_transfer(
+        &self,
+        command: FileTransferActionCommand,
+    ) -> Result<OperationReply>;
+    async fn clear_completed_file_transfers(&self) -> Result<OperationReply>;
     async fn set_input_handoff_config(
         &self,
         command: SetInputHandoffConfigCommand,

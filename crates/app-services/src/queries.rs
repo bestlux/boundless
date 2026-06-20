@@ -27,6 +27,23 @@ pub struct FileTransferConfigSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTransferSnapshot {
+    pub transfer_id: String,
+    pub previous_transfer_id: Option<String>,
+    pub direction: String,
+    pub peer_id: String,
+    pub file_name: String,
+    pub state: String,
+    pub transferred_bytes: u64,
+    pub total_bytes: u64,
+    pub failure_reason: Option<String>,
+    pub source_path: Option<String>,
+    pub final_path: Option<String>,
+    pub queued_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputHandoffConfigSnapshot {
     pub block_screen_corners: bool,
     pub corner_block_px: u32,
@@ -111,6 +128,7 @@ pub struct UiSnapshot {
     pub anti_idle_config: AntiIdleConfigSnapshot,
     pub anti_idle_status: AntiIdleStatusSnapshot,
     pub file_transfer_config: FileTransferConfigSnapshot,
+    pub file_transfers: Vec<FileTransferSnapshot>,
     pub input_handoff_config: InputHandoffConfigSnapshot,
     pub input_runtime: InputRuntimeSnapshot,
 }
@@ -131,6 +149,7 @@ pub struct ConsoleSnapshot {
     pub anti_idle_config: AntiIdleConfigSnapshot,
     pub anti_idle_status: AntiIdleStatusSnapshot,
     pub file_transfer_config: FileTransferConfigSnapshot,
+    pub file_transfers: Vec<FileTransferSnapshot>,
     pub input_handoff_config: InputHandoffConfigSnapshot,
     pub input_runtime: InputRuntimeSnapshot,
 }

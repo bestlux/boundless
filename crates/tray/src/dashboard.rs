@@ -21,6 +21,9 @@ mod dashboard_model {
 mod dashboard_task_runner {
     include!("dashboard/task_runner.rs");
 }
+mod dashboard_transfer_center {
+    include!("dashboard/transfer_center.rs");
+}
 mod dashboard_window {
     include!("dashboard/window.rs");
 }
@@ -152,6 +155,7 @@ impl eframe::App for DashboardApp {
                 ui.separator();
                 ui.selectable_value(&mut self.selected_tab, Tab::Status, "Status & Pairing");
                 ui.selectable_value(&mut self.selected_tab, Tab::Layout, "Layout Manager");
+                ui.selectable_value(&mut self.selected_tab, Tab::TransferCenter, "Transfer Center");
                 ui.selectable_value(&mut self.selected_tab, Tab::Settings, "Settings");
             });
             ui.separator();
@@ -166,6 +170,7 @@ impl eframe::App for DashboardApp {
             match self.selected_tab {
                 Tab::Status => self.render_status_tab(ui, &ctx),
                 Tab::Layout => self.render_layout_tab(ui, &ctx),
+                Tab::TransferCenter => self.render_transfer_center_tab(ui),
                 Tab::Settings => self.render_settings_tab(ui),
             }
         });

@@ -47,6 +47,7 @@ const MAX_PENDING_INJECT_INPUT_FRAMES: usize = 128;
 const MAX_PENDING_OUTGOING_INPUT_FRAMES: usize = 128;
 const MAX_PENDING_NEARBY_PAIRING_REQUESTS: usize = 128;
 const MAX_PENDING_NEARBY_CODE_CHALLENGES: usize = 64;
+const MAX_FILE_TRANSFER_RECORDS: usize = 128;
 const INPUT_OWNER_AUTO_STEAL_COOLDOWN_MS: u64 = 1_000;
 const NEARBY_PAIRING_DECISION_RETENTION_MINUTES: i64 = 10;
 const NEARBY_PAIRING_CHALLENGE_MAX_ATTEMPTS: u8 = 5;
@@ -72,6 +73,7 @@ mod pairing_ops;
 mod pairing_state;
 mod peer_ops;
 mod routing_helpers;
+mod transfer_center_ops;
 mod transport_ops;
 mod transport_state;
 mod validation;
@@ -137,6 +139,73 @@ struct OutboundFileTransfer {
     source_file: Option<tokio::fs::File>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct OutgoingFileTransferProjection {
+    pub(crate) transfer_id: String,
+    pub(crate) previous_transfer_id: Option<String>,
+    pub(crate) peer_id: String,
+    pub(crate) file_name: String,
+    pub(crate) source_path: PathBuf,
+    pub(crate) total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileTransferDirection {
+    Incoming,
+    Outgoing,
+}
+
+impl FileTransferDirection {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Incoming => "incoming",
+            Self::Outgoing => "outgoing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileTransferState {
+    Queued,
+    Active,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl FileTransferState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FileTransferRecord {
+    pub(crate) transfer_id: String,
+    pub(crate) previous_transfer_id: Option<String>,
+    pub(crate) direction: FileTransferDirection,
+    pub(crate) peer_id: String,
+    pub(crate) file_name: String,
+    pub(crate) state: FileTransferState,
+    pub(crate) transferred_bytes: u64,
+    pub(crate) total_bytes: u64,
+    pub(crate) failure_reason: Option<String>,
+    pub(crate) source_path: Option<PathBuf>,
+    pub(crate) final_path: Option<PathBuf>,
+    pub(crate) queued_at: chrono::DateTime<Utc>,
+    pub(crate) updated_at: chrono::DateTime<Utc>,
+}
+
 pub(crate) struct OutboundFileChunk {
     pub(crate) transfer_id: String,
     pub(crate) offset_bytes: u64,
@@ -166,6 +235,7 @@ pub(crate) struct ControlPlaneSnapshotBundle {
     pub(crate) input_capture_backend_mode: String,
     pub(crate) pending_inject_frames: usize,
     pub(crate) pending_inject_high_water: usize,
+    pub(crate) file_transfers: Vec<FileTransferRecord>,
 }
 
 impl PendingInjectInputFrame {
@@ -224,6 +294,7 @@ pub struct AppState {
     input: Arc<InputState>,
     anti_idle: Arc<AntiIdleState>,
     outbound_file_transfers: Arc<RwLock<HashMap<String, OutboundFileTransfer>>>,
+    file_transfer_records: Arc<RwLock<VecDeque<FileTransferRecord>>>,
     security_paths: Arc<SecurityPaths>,
     identity: Arc<DeviceIdentity>,
     device_fingerprint: Arc<String>,

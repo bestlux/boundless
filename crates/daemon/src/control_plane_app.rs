@@ -4,15 +4,15 @@ use anyhow::Result;
 use app_services::{
     ControlPlaneApp, SharedControlPlaneApp,
     commands::{
-        DiagnosticsDumpCommand, DiagnosticsDumpReply, FeatureSetCommand, HotkeySetCommand,
-        HotkeyTriggerCommand, ImportTrustBundleCommand, InputCaptureTargetCommand,
-        InputCaptureTargetReply, InputOwnerCommand, InputOwnerReply, LayoutReply, LayoutSetCommand,
-        NearbyJoinStartCommand, NearbyJoinStatusCommand, NearbyPairingDecisionCommand,
-        NearbyRequestCodeCommand, NearbySubmitCodeCommand, OperationReply, PairJoinCommand,
-        PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, RotateTrustCommand,
-        SafeResetCommand, SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand,
-        SendInputKeyCommand, SendInputMoveCommand, SetAntiIdleConfigCommand,
-        SetFileTransferConfigCommand, SetInputHandoffConfigCommand,
+        DiagnosticsDumpCommand, DiagnosticsDumpReply, FeatureSetCommand, FileTransferActionCommand,
+        HotkeySetCommand, HotkeyTriggerCommand, ImportTrustBundleCommand,
+        InputCaptureTargetCommand, InputCaptureTargetReply, InputOwnerCommand, InputOwnerReply,
+        LayoutReply, LayoutSetCommand, NearbyJoinStartCommand, NearbyJoinStatusCommand,
+        NearbyPairingDecisionCommand, NearbyRequestCodeCommand, NearbySubmitCodeCommand,
+        OperationReply, PairJoinCommand, PairJoinReply, PairingCodeReply, PairingCodeRequest,
+        RemovePeerCommand, RotateTrustCommand, SafeResetCommand, SendClipboardImageCommand,
+        SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand, SendInputMoveCommand,
+        SetAntiIdleConfigCommand, SetFileTransferConfigCommand, SetInputHandoffConfigCommand,
     },
     diagnostics::{
         DiagnosticExportOptions, ServiceDiagnosticSnapshot, build_online_bundle,
@@ -20,10 +20,10 @@ use app_services::{
     },
     queries::{
         AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
-        FileTransferConfigSnapshot, InputHandoffConfigSnapshot, InputRuntimeSnapshot,
-        NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot, NearbyRequestCodeStartSnapshot,
-        StatusSnapshot, TransportEventSnapshot, TrustBundleSnapshot, UiDiscoveredPeer,
-        UiPairedPeer, UiPendingRequest, UiSnapshot,
+        FileTransferConfigSnapshot, FileTransferSnapshot, InputHandoffConfigSnapshot,
+        InputRuntimeSnapshot, NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot,
+        NearbyRequestCodeStartSnapshot, StatusSnapshot, TransportEventSnapshot,
+        TrustBundleSnapshot, UiDiscoveredPeer, UiPairedPeer, UiPendingRequest, UiSnapshot,
     },
 };
 use async_trait::async_trait;
@@ -210,6 +210,49 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         })
     }
 
+    async fn cancel_file_transfer(
+        &self,
+        command: FileTransferActionCommand,
+    ) -> Result<OperationReply> {
+        let cancelled = self
+            .state
+            .cancel_file_transfer_by_id(&command.transfer_id, "user_cancelled")
+            .await;
+        Ok(OperationReply {
+            ok: cancelled,
+            message: if cancelled {
+                format!("cancelled transfer {}", command.transfer_id)
+            } else {
+                format!("transfer {} not cancellable", command.transfer_id)
+            },
+        })
+    }
+
+    async fn retry_file_transfer(
+        &self,
+        command: FileTransferActionCommand,
+    ) -> Result<OperationReply> {
+        let new_transfer_id = self
+            .state
+            .retry_file_transfer_from_beginning(&command.transfer_id)
+            .await?;
+        Ok(OperationReply {
+            ok: true,
+            message: format!(
+                "queued retry {new_transfer_id} for transfer {}",
+                command.transfer_id
+            ),
+        })
+    }
+
+    async fn clear_completed_file_transfers(&self) -> Result<OperationReply> {
+        let removed = self.state.clear_completed_file_transfers().await;
+        Ok(OperationReply {
+            ok: true,
+            message: format!("cleared {removed} completed transfer entries"),
+        })
+    }
+
     async fn set_input_handoff_config(
         &self,
         command: SetInputHandoffConfigCommand,
@@ -369,12 +412,13 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
     }
 
     async fn send_file(&self, command: SendFileCommand) -> Result<OperationReply> {
-        self.state
+        let transfer_id = self
+            .state
             .queue_file_from_path(&command.peer_id, Path::new(&command.file_path))
             .await?;
         Ok(OperationReply {
             ok: true,
-            message: "file payload queued".to_string(),
+            message: format!("file transfer queued: {transfer_id}"),
         })
     }
 
@@ -680,6 +724,7 @@ async fn build_ui_snapshot(state: &AppState) -> Result<UiSnapshot> {
         ),
         input_runtime,
         file_transfer_config: build_file_transfer_config_snapshot(bundle.config.file_transfer),
+        file_transfers: build_file_transfer_snapshots(bundle.file_transfers),
     })
 }
 
@@ -728,6 +773,7 @@ fn build_console_snapshot_from_bundle(
         ),
         input_runtime,
         file_transfer_config: build_file_transfer_config_snapshot(bundle.config.file_transfer),
+        file_transfers: build_file_transfer_snapshots(bundle.file_transfers),
     }
 }
 
@@ -763,6 +809,29 @@ fn build_file_transfer_config_snapshot(
         auto_accept_trusted_peers: config.auto_accept_trusted_peers,
         max_file_bytes: config.max_file_bytes,
     }
+}
+
+fn build_file_transfer_snapshots(
+    records: Vec<crate::state::FileTransferRecord>,
+) -> Vec<FileTransferSnapshot> {
+    records
+        .into_iter()
+        .map(|record| FileTransferSnapshot {
+            transfer_id: record.transfer_id,
+            previous_transfer_id: record.previous_transfer_id,
+            direction: record.direction.as_str().to_string(),
+            peer_id: record.peer_id,
+            file_name: record.file_name,
+            state: record.state.as_str().to_string(),
+            transferred_bytes: record.transferred_bytes,
+            total_bytes: record.total_bytes,
+            failure_reason: record.failure_reason,
+            source_path: record.source_path.map(|path| path.display().to_string()),
+            final_path: record.final_path.map(|path| path.display().to_string()),
+            queued_at: record.queued_at.to_rfc3339(),
+            updated_at: record.updated_at.to_rfc3339(),
+        })
+        .collect()
 }
 
 fn build_input_handoff_config_snapshot(
