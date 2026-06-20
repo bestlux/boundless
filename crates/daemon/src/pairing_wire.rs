@@ -633,6 +633,7 @@ async fn process_pairing_request(
                 .queue_nearby_pairing_code_challenge(
                     requester_bundle,
                     requester_alias,
+                    remote_ip,
                     NEARBY_CHALLENGE_TTL_SECONDS,
                 )
                 .await?;
@@ -715,7 +716,7 @@ async fn process_pairing_request(
             let requester_display_name = requester_bundle.display_name.clone();
             let requester_address = requester_bundle.network_address.clone();
             let pending = state
-                .queue_nearby_pairing_request(requester_bundle, requester_alias)
+                .queue_nearby_pairing_request(requester_bundle, requester_alias, remote_ip)
                 .await?;
 
             info!(

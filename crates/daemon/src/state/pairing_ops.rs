@@ -51,17 +51,31 @@ impl AppState {
         &self,
         requester_bundle: TrustBundle,
         requester_alias: Option<String>,
+        source_ip: IpAddr,
     ) -> Result<PendingNearbyPairingRequest> {
         self.ensure_trust_rotation_not_pending()?;
+        self.expire_nearby_pairing_requests().await;
         let mut pending_requests = self.pairing.pending_requests.write().await;
         self.ensure_trust_rotation_not_pending()?;
-        if pending_requests.len() >= MAX_PENDING_NEARBY_PAIRING_REQUESTS {
-            anyhow::bail!("too many pending pairing requests; try again later");
+        let requester_machine_id = requester_bundle.machine_id.clone();
+        if let Some(existing) = find_pending_nearby_pairing_request(
+            &pending_requests,
+            &requester_machine_id,
+            source_ip,
+            PendingNearbyPairingAdmissionMode::ManualApproval,
+        ) {
+            return Ok(existing.summary.clone());
         }
+        ensure_nearby_pairing_admission_capacity(
+            &pending_requests,
+            &requester_machine_id,
+            source_ip,
+            PendingNearbyPairingAdmissionMode::ManualApproval,
+        )?;
 
         let summary = PendingNearbyPairingRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
-            requester_machine_id: requester_bundle.machine_id.clone(),
+            requester_machine_id,
             requester_display_name: requester_bundle.display_name.clone(),
             created_at: Utc::now(),
             verification_code: None,
@@ -76,6 +90,7 @@ impl AppState {
                 summary: summary.clone(),
                 requester_bundle,
                 requester_alias: requester_alias.and_then(normalize_optional_alias),
+                source_ip,
                 mode: PendingNearbyPairingMode::ManualApproval,
             },
         );
@@ -86,27 +101,28 @@ impl AppState {
         &self,
         requester_bundle: TrustBundle,
         requester_alias: Option<String>,
+        source_ip: IpAddr,
         ttl_secs: u64,
     ) -> Result<PendingNearbyPairingRequest> {
         self.ensure_trust_rotation_not_pending()?;
+        self.expire_nearby_pairing_requests().await;
         let mut pending_requests = self.pairing.pending_requests.write().await;
         self.ensure_trust_rotation_not_pending()?;
         let requester_machine_id = requester_bundle.machine_id.clone();
-        pending_requests.retain(|_, record| {
-            !(record.summary.requester_machine_id == requester_machine_id
-                && matches!(record.mode, PendingNearbyPairingMode::CodeChallenge { .. }))
-        });
-
-        let pending_code_challenge_count = pending_requests
-            .values()
-            .filter(|record| matches!(record.mode, PendingNearbyPairingMode::CodeChallenge { .. }))
-            .count();
-        if pending_code_challenge_count >= MAX_PENDING_NEARBY_CODE_CHALLENGES {
-            anyhow::bail!("too many pending code confirmation requests; try again later");
+        if let Some(existing) = find_pending_nearby_pairing_request(
+            &pending_requests,
+            &requester_machine_id,
+            source_ip,
+            PendingNearbyPairingAdmissionMode::CodeChallenge,
+        ) {
+            return Ok(existing.summary.clone());
         }
-        if pending_requests.len() >= MAX_PENDING_NEARBY_PAIRING_REQUESTS {
-            anyhow::bail!("too many pending pairing requests; try again later");
-        }
+        ensure_nearby_pairing_admission_capacity(
+            &pending_requests,
+            &requester_machine_id,
+            source_ip,
+            PendingNearbyPairingAdmissionMode::CodeChallenge,
+        )?;
 
         let code = generate_pairing_code(Duration::from_secs(ttl_secs.max(30)));
         let verification_nonce = uuid::Uuid::new_v4().simple().to_string();
@@ -127,6 +143,7 @@ impl AppState {
                 summary: summary.clone(),
                 requester_bundle,
                 requester_alias: requester_alias.and_then(normalize_optional_alias),
+                source_ip,
                 mode: PendingNearbyPairingMode::CodeChallenge {
                     code: code.value,
                     nonce: verification_nonce,
@@ -208,7 +225,7 @@ impl AppState {
     }
 
     pub async fn list_pending_nearby_pairing_requests(&self) -> Vec<PendingNearbyPairingRequest> {
-        self.expire_nearby_pairing_challenges().await;
+        self.expire_nearby_pairing_requests().await;
 
         let mut requests = self
             .pairing
@@ -223,7 +240,7 @@ impl AppState {
     }
 
     pub async fn nearby_pairing_status(&self, request_id: &str) -> NearbyPairingStatus {
-        self.expire_nearby_pairing_challenges().await;
+        self.expire_nearby_pairing_requests().await;
 
         if self
             .pairing
@@ -270,7 +287,7 @@ impl AppState {
         alias_override: Option<String>,
     ) -> Result<NearbyPairingCommitResult> {
         self.ensure_trust_rotation_not_pending()?;
-        self.expire_nearby_pairing_challenges().await;
+        self.expire_nearby_pairing_requests().await;
 
         let pending = match self
             .pairing
@@ -326,7 +343,7 @@ impl AppState {
         alias_override: Option<String>,
     ) -> Result<NearbyPairingCommitResult> {
         self.ensure_trust_rotation_not_pending()?;
-        self.expire_nearby_pairing_challenges().await;
+        self.expire_nearby_pairing_requests().await;
 
         let normalized_code = code.trim();
         if normalized_code.is_empty() {
@@ -573,7 +590,7 @@ impl AppState {
     }
 
     pub async fn reject_nearby_pairing_request(&self, request_id: &str) -> bool {
-        self.expire_nearby_pairing_challenges().await;
+        self.expire_nearby_pairing_requests().await;
 
         let removed = self
             .pairing
@@ -597,41 +614,128 @@ impl AppState {
         true
     }
 
-    async fn expire_nearby_pairing_challenges(&self) {
+    async fn expire_nearby_pairing_requests(&self) {
         let now = Utc::now();
-        let mut expired_ids = Vec::<String>::new();
 
-        {
+        let expired = {
             let mut pending = self.pairing.pending_requests.write().await;
-            pending.retain(|request_id, record| match &record.mode {
-                PendingNearbyPairingMode::ManualApproval => true,
-                PendingNearbyPairingMode::CodeChallenge { expires_at, .. } => {
-                    let keep = *expires_at >= now;
-                    if !keep {
-                        expired_ids.push(request_id.clone());
-                    }
-                    keep
-                }
-            });
-        }
+            prune_expired_nearby_pairing_requests(&mut pending, now)
+        };
 
-        if expired_ids.is_empty() {
+        if expired.is_empty() {
             return;
         }
 
         let mut decisions = self.pairing.decisions.write().await;
-        for request_id in expired_ids {
+        for (request_id, message) in expired {
             decisions.insert(
                 request_id,
                 NearbyPairingDecisionRecord {
-                    decision: NearbyPairingDecision::Rejected {
-                        message: "verification code expired".to_string(),
-                    },
+                    decision: NearbyPairingDecision::Rejected { message },
                     decided_at: now,
                 },
             );
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingNearbyPairingAdmissionMode {
+    ManualApproval,
+    CodeChallenge,
+}
+
+fn find_pending_nearby_pairing_request<'a>(
+    pending_requests: &'a HashMap<String, PendingNearbyPairingRequestRecord>,
+    requester_machine_id: &str,
+    source_ip: IpAddr,
+    mode: PendingNearbyPairingAdmissionMode,
+) -> Option<&'a PendingNearbyPairingRequestRecord> {
+    pending_requests.values().find(|record| {
+        record.summary.requester_machine_id == requester_machine_id
+            && record.source_ip == source_ip
+            && pairing_mode_matches(&record.mode, mode)
+    })
+}
+
+fn ensure_nearby_pairing_admission_capacity(
+    pending_requests: &HashMap<String, PendingNearbyPairingRequestRecord>,
+    requester_machine_id: &str,
+    source_ip: IpAddr,
+    mode: PendingNearbyPairingAdmissionMode,
+) -> Result<()> {
+    let pending_for_peer = pending_requests
+        .values()
+        .filter(|record| record.summary.requester_machine_id == requester_machine_id)
+        .count();
+    if pending_for_peer >= MAX_PENDING_NEARBY_PAIRING_REQUESTS_PER_PEER {
+        anyhow::bail!("too many pending pairing requests for this peer; try again later");
+    }
+
+    let pending_for_source = pending_requests
+        .values()
+        .filter(|record| record.source_ip == source_ip)
+        .count();
+    if pending_for_source >= MAX_PENDING_NEARBY_PAIRING_REQUESTS_PER_SOURCE {
+        anyhow::bail!("too many pending pairing requests from this source; try again later");
+    }
+
+    if matches!(mode, PendingNearbyPairingAdmissionMode::CodeChallenge) {
+        let pending_code_challenge_count = pending_requests
+            .values()
+            .filter(|record| matches!(record.mode, PendingNearbyPairingMode::CodeChallenge { .. }))
+            .count();
+        if pending_code_challenge_count >= MAX_PENDING_NEARBY_CODE_CHALLENGES {
+            anyhow::bail!("too many pending code confirmation requests; try again later");
+        }
+    }
+
+    if pending_requests.len() >= MAX_PENDING_NEARBY_PAIRING_REQUESTS {
+        anyhow::bail!("too many pending pairing requests; try again later");
+    }
+
+    Ok(())
+}
+
+fn pairing_mode_matches(
+    record_mode: &PendingNearbyPairingMode,
+    admission_mode: PendingNearbyPairingAdmissionMode,
+) -> bool {
+    matches!(
+        (record_mode, admission_mode),
+        (
+            PendingNearbyPairingMode::ManualApproval,
+            PendingNearbyPairingAdmissionMode::ManualApproval
+        ) | (
+            PendingNearbyPairingMode::CodeChallenge { .. },
+            PendingNearbyPairingAdmissionMode::CodeChallenge
+        )
+    )
+}
+
+fn prune_expired_nearby_pairing_requests(
+    pending_requests: &mut HashMap<String, PendingNearbyPairingRequestRecord>,
+    now: chrono::DateTime<Utc>,
+) -> Vec<(String, String)> {
+    let mut expired = Vec::new();
+    pending_requests.retain(|request_id, record| {
+        let rejection_message = match &record.mode {
+            PendingNearbyPairingMode::ManualApproval => (record.summary.created_at
+                + chrono::TimeDelta::seconds(NEARBY_PAIRING_PENDING_REQUEST_TTL_SECONDS)
+                < now)
+                .then_some("pairing request expired"),
+            PendingNearbyPairingMode::CodeChallenge { expires_at, .. } => {
+                (*expires_at < now).then_some("verification code expired")
+            }
+        };
+        if let Some(message) = rejection_message {
+            expired.push((request_id.clone(), message.to_string()));
+            false
+        } else {
+            true
+        }
+    });
+    expired
 }
 
 fn pairing_commit_message(already_committed: bool, reconnect_status: &str) -> String {
