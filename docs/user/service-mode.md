@@ -10,6 +10,7 @@ The per-user MSI installs `boundless-service.exe` as a payload, but it does not 
 - `service install` rejects service binaries under user-writable locations such as `%LocalAppData%`, `%AppData%`, `%TEMP%`, and Downloads.
 - The service control named pipe uses an explicit ACL for `SYSTEM`, local Administrators, and the Windows user SID that installed the service.
 - Service mode has separate LocalSystem runtime state from the normal per-user daemon. Pairing, layout, and feature settings should be configured while the service is the active daemon.
+- Service binaries are updated by the MSI payload owner. The service does not self-update, and tray-owned update application is unsupported/deferred.
 - Elevated-app and lock-screen input control still need Windows runtime evidence before they are release-grade claims in v5.
 
 ## Commands

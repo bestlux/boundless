@@ -15,6 +15,8 @@ This document records the release-hardening contract for the Boundless v5 Window
 - The Windows MSI includes tray, daemon, service host, CLI, reset helper, icon, changelog, license, README, and package manifest payloads.
 - The WiX installer is configured to close tray, daemon, and service executable names during upgrade/uninstall.
 - `installer-smoke.ps1` validates install, shortcut targets/icons, installed executable signatures including the service host, uninstall registry entry, optional upgrade-while-running behavior, uninstall cleanup, absence of Boundless processes before harness cleanup, and absence of a registered Boundless service after uninstall.
+- MSI-owned updates are the supported update model. The MSI installer owns install, upgrade, repair, and uninstall of tray, daemon, and service payloads; service and tray self-update flows are unsupported/deferred.
+- The release workflow packages the Windows MSI as `Boundless-<version>-windows-x64.msi`, uploads it under the `boundless-windows-x64` workflow artifact, and publishes the same MSI name as a GitHub Release asset.
 - Windows code signing remains policy-driven:
   - stable releases require signing only when `WINDOWS_SIGN_REQUIRED=true`,
   - unsigned artifacts are explicit when signing variables are not configured,
@@ -25,8 +27,27 @@ This document records the release-hardening contract for the Boundless v5 Window
 
 - MSI service-mode installation is not enabled by default; service commands remain CLI/admin-owned and require an admin-protected service binary path.
 - Upgrade from the last supported v4 build requires a previous MSI path passed to `installer-smoke.ps1 -PreviousInstallerPath`.
+- The service must not self-update. The tray may later notify or launch an installer, but it is not the authoritative updater for this release-readiness contract.
 - Lock-screen and elevated-app service behavior still require Windows runtime evidence before V5 can mark those claims validated.
 - Signing validation depends on release environment variables and Windows SDK `signtool.exe` availability.
+
+## Prior MSI Artifact Source
+
+Use GitHub Release MSI assets as prior installer evidence. As of 2026-06-20, read-only release inspection showed:
+
+- latest stable: `v5.0.0`, asset `Boundless-5.0.0-windows-x64.msi`, SHA-256 digest `39c4f4d9e675927f16ee8a9a1be730f6230888acbd6889d79b915eac13e1f645`.
+- last v4 stable: `v4.0.2`, asset `Boundless-4.0.2-windows-x64.msi`, SHA-256 digest `7d7d0d71d2e172b57ae5363700b9c94d95b8f7dc875f1936ca7ab084f8e669bd`.
+
+For a future stable release, N-1 MSI validation should download the previous stable release asset, keep the current release MSI from the `boundless-windows-x64` workflow artifact or local package output, and run:
+
+```powershell
+./scripts/dev/installer-smoke.ps1 `
+  -InstallerPath <current-msi> `
+  -PreviousInstallerPath <prior-msi> `
+  -KeepArtifacts
+```
+
+If the prior MSI is unavailable in the environment, do not synthesize evidence. Record the `n_minus_1_msi_upgrade` gate as skipped with the required prior asset and command shape.
 
 ## Required Release Evidence
 
@@ -39,4 +60,5 @@ The release readiness packet must include:
 - matching service-host version evidence from `boundless-service.exe --version`,
 - signing status for each `.exe` and `.msi`,
 - previous installer version used for upgrade validation or explicit skip rationale,
+- `service_update_ownership=msi-owned` and `n_minus_1_msi_upgrade` gate status,
 - service-mode smoke summary JSON path or deferral rationale.

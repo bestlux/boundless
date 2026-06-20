@@ -26,7 +26,8 @@ Skipped gates are never hidden. A release reviewer must either provide the missi
 - `-Policy prerelease` records skipped gates as `at-risk` evidence and exits non-zero only for failed gates unless `-RequireReady` is also supplied.
 - `-Policy stable` is the release-blocking policy. It exits non-zero for failed, skipped, missing, or stale evidence that this packet can evaluate.
 - Installer-smoke summary freshness is checked from the evidence file timestamp by default. Evidence older than `-MaxEvidenceAgeHours` fails stable policy.
-- Full N-1 interactive installer upgrade and service-upgrade coverage still require a prior MSI path, service smoke, and Windows lab/runtime evidence; missing coverage must remain visible as skipped evidence or a documented release-review deferral.
+- Service update evidence is MSI-owned by default with `-ServiceUpdateMode msi-owned`. `service-self-update` and `tray-self-update` are accepted only as explicit unsupported/deferred modes and fail readiness when selected.
+- N-1 MSI upgrade coverage requires a prior MSI path passed to installer smoke. Missing prior-MSI coverage is recorded as skipped evidence, which fails `-Policy stable`.
 
 ## Common Commands
 
@@ -62,9 +63,24 @@ Release-blocking packet:
   -Policy stable
 ```
 
+N-1 MSI upgrade evidence:
+
+```powershell
+./scripts/dev/installer-smoke.ps1 `
+  -InstallerPath <current-msi> `
+  -PreviousInstallerPath <prior-msi> `
+  -KeepArtifacts
+
+./scripts/dev/release-readiness.ps1 `
+  -InstallerSmokeSummaryPath artifacts/installer-validation/installer-smoke.json `
+  -Policy stable
+```
+
 `-RequireReady` remains available as a compatibility switch. `-Policy stable` is the preferred version-neutral stable-release gate and exits non-zero when any gate is skipped. Stable release readiness also fails when installer smoke does not include matching `boundless-service.exe --version` evidence.
 
 The service-version gate parses `boundless-service.exe --version` strictly as `boundless-service <version>`. For a stable release such as `v5.0.0`, the parsed service version must exactly equal `5.0.0`; substring matches, prerelease suffixes, empty output, and malformed output fail. If no installer-smoke summary is supplied, `service_version_parity` is recorded as skipped and `-RequireReady` blocks the packet.
+
+The `n_minus_1_msi_upgrade` gate passes only when installer smoke summary evidence includes `upgraded_from` and `previous_install_exit_code = 0`. The supported prior artifact source is a GitHub Release MSI asset named `Boundless-<version>-windows-x64.msi`; the release workflow also stages the current Windows MSI under the `boundless-windows-x64` artifact before publish.
 
 Run the targeted fixture matrix with:
 

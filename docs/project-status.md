@@ -21,7 +21,9 @@ This is the short, version-neutral repo status packet for agents and release wor
 - Service mode is optional/admin-owned. MSI service-mode installation is not enabled by default.
 - Service validation must cover installed service binary version, path, ACLs, named-pipe/API health, process counts, and install/start/status/stop/uninstall behavior.
 - A matching boundless-service.exe --version result is required stable-release evidence when installer smoke evidence is supplied.
-- Full MSI-owned service update orchestration remains deferred; do not claim service-mode update parity from daemon/tray success alone.
+- MSI-owned updates are the supported payload update model: the MSI installer owns install, upgrade, repair, and uninstall of tray, daemon, and service payloads.
+- Service and tray self-update modes are unsupported/deferred. Do not claim service-mode update parity from daemon/tray success alone.
+- Release readiness records `service_update_ownership` and `n_minus_1_msi_upgrade` gates; stable policy fails if N-1 MSI evidence is skipped or malformed.
 
 ## Canonical Release Flow
 
@@ -30,8 +32,9 @@ This is the short, version-neutral repo status packet for agents and release wor
 3. Run structural consistency: scripts/release/assert-release-consistency.ps1.
 4. Produce a release-readiness packet: scripts/dev/release-readiness.ps1 -Policy stable.
 5. Supply installer evidence with scripts/dev/installer-smoke.ps1 or an existing installer-smoke summary.
-6. Supply service evidence with scripts/dev/service-smoke.ps1 when service-mode claims are in scope.
-7. Publish only after the release-readiness packet is ready; stable policy fails failed, skipped, missing, or stale supported evidence.
+6. For stable MSI-owned update readiness, supply N-1 upgrade evidence with scripts/dev/installer-smoke.ps1 -InstallerPath <current-msi> -PreviousInstallerPath <prior-msi> -KeepArtifacts.
+7. Supply service evidence with scripts/dev/service-smoke.ps1 when service-mode claims are in scope.
+8. Publish only after the release-readiness packet is ready; stable policy fails failed, skipped, missing, or stale supported evidence.
 
 The version-neutral release packet contract lives in [docs/release/release-readiness.md](release/release-readiness.md). The release-hardening limits live in [docs/release/v5-release-hardening.md](release/v5-release-hardening.md).
 
@@ -69,8 +72,8 @@ These are not hidden release blockers by default; they require explicit release-
 
 | gap_id | status | rationale | recorded in |
 | --- | --- | --- | --- |
-| n_minus_1_msi_upgrade | deferred | Requires a prior MSI artifact and Windows installer lab evidence; stable release packets must record the prior version used or a skip rationale. | docs/release/v5-release-hardening.md |
-| service_update_orchestration | deferred | Full MSI-owned service updater is larger than release-readiness evidence and remains outside the default MSI service boundary. | this document |
+| n_minus_1_msi_upgrade | open | Release-readiness now has an explicit gate, but the evidence still requires a prior GitHub Release MSI asset and Windows installer lab run. Stable packets fail when this evidence is skipped or malformed. | docs/release/v5-release-hardening.md, docs/release/release-readiness.md |
+| service_update_orchestration | deferred | MSI-owned payload updates are the supported boundary; a tray notification or installer-launch UX remains future product work, and service/tray self-update remains unsupported. | this document |
 | interactive_desktop_service_mode | deferred | Lock-screen and elevated-app behavior require Windows runtime evidence. | docs/release/v5-release-hardening.md |
 | transport_fault_injection_harness | partially landed | PR #89 landed a narrow post-auth session fault harness; BND-NEXT-7 used it for behavior-neutral reactor cleanup, while broad multi-peer/runtime fault coverage remains deferred. | this document, docs/architecture/network-v1.md |
 | mixed_dpi_input_matrix | deferred | Mixed-DPI and negative-coordinate monitor validation needs Windows hardware/runtime evidence. | this document |
@@ -81,7 +84,8 @@ These are not hidden release blockers by default; they require explicit release-
 
 - BND-NEXT-7 is complete at the behavior-neutral post-auth session reactor cleanup level. PRs #90-#93 landed the code and earlier docs boundaries; [docs/architecture/network-v1.md](architecture/network-v1.md) records the final architecture state.
 - BND-NEXT-8A profiled clipboard image memory pressure and applies a bounded allocation fix for local/outbound large image paths; [docs/performance/clipboard-image-memory.md](performance/clipboard-image-memory.md) records the command, path map, evidence, and recommendation.
-- Full `SessionEvent`/`SessionPhase` machinery, broader multi-peer/runtime fault coverage, graceful per-session join lifecycle, clipboard image streaming/spooling, and feature/product behavior remain deferred.
+- BND-NEXT-9A makes MSI-owned service update readiness explicit in release-readiness evidence. Actual N-1 validation still requires current and prior MSI artifacts in a Windows installer lab.
+- Full `SessionEvent`/`SessionPhase` machinery, broader multi-peer/runtime fault coverage, graceful per-session join lifecycle, clipboard image streaming/spooling, tray update notification UX, and feature/product behavior remain deferred.
 
 ## Pro Oversight Item Accounting
 
@@ -100,7 +104,8 @@ These are not hidden release blockers by default; they require explicit release-
 | Replace version-specific release readiness naming | landed | release-readiness.ps1 | Stable policy is now named as -Policy stable. |
 | Add project status and component map | addressed by this work | this file and docs/architecture/component-map.md | These are the canonical agent context docs. |
 | Make release evidence self-describing | landed and addressed by this work | release-readiness.json, release-readiness.md, release_policy, gate reasons/impacts | Stable policy fails failed/skipped/missing/stale supported evidence. |
-| Full MSI-owned service updater | deferred | service_update_orchestration gap | Requires product/installer work, not docs-only readiness. |
+| MSI-owned service update readiness | landed | release-readiness.ps1, release-readiness-fixtures.ps1 | Readiness records MSI-owned ownership and N-1 MSI upgrade evidence separately from unsupported service/tray self-update modes. |
+| Full MSI-owned service updater | deferred | service_update_orchestration gap | MSI owns payload updates; tray notification/installer-launch UX remains future product work, and service/tray self-update is unsupported. |
 | Full transport session reactor rewrite | partially landed | PRs #90-#93 and docs/architecture/network-v1.md | BND-NEXT-7 landed behavior-neutral post-auth boundaries: `SessionRuntime`, `SessionExitReason`, and named read/flush helpers. Full `SessionEvent`/`SessionPhase` machinery remains deferred. |
 | Pairing listener admission hardening | landed | PR #88 | Admission caps, duplicate manual join handling, and pre-consumption capacity checks are implemented; broader setup UX remains deferred. |
 | Runtime task supervisor | landed | PR #87 | Top-level task ownership, redacted health, and deterministic shutdown foundation are implemented; richer lifecycle policy remains follow-up reliability work. |
