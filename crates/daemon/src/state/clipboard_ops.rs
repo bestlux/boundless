@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::*;
 
@@ -651,10 +652,23 @@ impl AppState {
             .await
             .map_err(anyhow::Error::from)?;
         let total_bytes = metadata.len();
+        let source_modified = metadata.modified().ok();
         validate_transfer_size_with_limit(total_bytes, self.file_transfer_max_bytes().await)?;
 
         let transfer_id = uuid::Uuid::new_v4().to_string();
         let source_path = file_path.to_path_buf();
+        self.outbound_file_transfers.write().await.insert(
+            transfer_id.clone(),
+            OutboundFileTransfer {
+                peer_id: peer_id.to_string(),
+                file_name: file_name.clone(),
+                source_path,
+                total_bytes,
+                source_modified,
+                offset_bytes: 0,
+                source_file: None,
+            },
+        );
         {
             let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
             let queue = queue_map.entry(peer_id.to_string()).or_default();
@@ -663,26 +677,168 @@ impl AppState {
                 file_name: file_name.clone(),
                 total_bytes,
             });
-            let mut offset_bytes = 0u64;
-            while offset_bytes < total_bytes {
-                let remaining = (total_bytes - offset_bytes) as usize;
-                let length_bytes = remaining.min(FILE_TRANSFER_CHUNK_BYTES);
-                queue.push_back(OutboundPayload::FileChunk {
-                    transfer_id: transfer_id.clone(),
-                    source_path: source_path.clone(),
-                    offset_bytes,
-                    length_bytes,
-                });
-                offset_bytes = offset_bytes.saturating_add(length_bytes as u64);
-            }
-            queue.push_back(OutboundPayload::FileEnd {
-                transfer_id,
-                file_name,
-                total_bytes,
+            queue.push_back(OutboundPayload::FileTransferCursor {
+                transfer_id: transfer_id.clone(),
             });
         }
         self.notify_outgoing_flush_signal();
         Ok(())
+    }
+
+    pub(crate) async fn outbound_file_transfer_remaining_bytes(
+        &self,
+        peer_id: &str,
+        transfer_id: &str,
+    ) -> Option<u64> {
+        let transfers = self.outbound_file_transfers.read().await;
+        let transfer = transfers.get(transfer_id)?;
+        if transfer.peer_id != peer_id {
+            return None;
+        }
+        Some(transfer.total_bytes.saturating_sub(transfer.offset_bytes))
+    }
+
+    pub(crate) async fn materialize_outbound_file_chunk(
+        &self,
+        peer_id: &str,
+        transfer_id: &str,
+    ) -> Result<OutboundFileChunk> {
+        let mut transfers = self.outbound_file_transfers.write().await;
+        let Some(transfer) = transfers.get_mut(transfer_id) else {
+            anyhow::bail!("unknown outbound file transfer {transfer_id}");
+        };
+        if transfer.peer_id != peer_id {
+            anyhow::bail!("outbound file transfer {transfer_id} does not belong to peer {peer_id}");
+        }
+
+        let metadata = tokio::fs::metadata(&transfer.source_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "inspect outbound file source {}",
+                    transfer.source_path.display()
+                )
+            })?;
+        if !metadata.is_file() {
+            anyhow::bail!("outbound file source is no longer a regular file");
+        }
+        if metadata.len() != transfer.total_bytes
+            || (transfer.source_modified.is_some()
+                && metadata.modified().ok() != transfer.source_modified)
+        {
+            anyhow::bail!("outbound file source changed after transfer was queued");
+        }
+
+        if transfer.source_file.is_none() {
+            let source_file = tokio::fs::File::open(&transfer.source_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "open outbound file source {}",
+                        transfer.source_path.display()
+                    )
+                })?;
+            transfer.source_file = Some(source_file);
+        }
+
+        let remaining = transfer.total_bytes.saturating_sub(transfer.offset_bytes);
+        let length_bytes = (remaining as usize).min(FILE_TRANSFER_CHUNK_BYTES);
+        let offset_bytes = transfer.offset_bytes;
+        let mut data = vec![0u8; length_bytes];
+        if length_bytes > 0 {
+            let source_file = transfer
+                .source_file
+                .as_mut()
+                .expect("outbound source file should be open before reading");
+            source_file
+                .seek(std::io::SeekFrom::Start(offset_bytes))
+                .await
+                .with_context(|| {
+                    format!(
+                        "seek outbound file source {} to offset {}",
+                        transfer.source_path.display(),
+                        offset_bytes
+                    )
+                })?;
+            source_file.read_exact(&mut data).await.with_context(|| {
+                format!(
+                    "read outbound file source {} offset {} length {}",
+                    transfer.source_path.display(),
+                    offset_bytes,
+                    length_bytes
+                )
+            })?;
+        }
+
+        let next_offset = offset_bytes.saturating_add(length_bytes as u64);
+        Ok(OutboundFileChunk {
+            transfer_id: transfer_id.to_string(),
+            offset_bytes,
+            data,
+            finished: next_offset >= transfer.total_bytes,
+        })
+    }
+
+    pub(crate) async fn commit_outbound_file_chunk(
+        &self,
+        peer_id: &str,
+        transfer_id: &str,
+        offset_bytes: u64,
+        length_bytes: usize,
+    ) -> bool {
+        let mut transfers = self.outbound_file_transfers.write().await;
+        let Some(transfer) = transfers.get_mut(transfer_id) else {
+            return false;
+        };
+        if transfer.peer_id != peer_id || transfer.offset_bytes != offset_bytes {
+            return false;
+        }
+        transfer.offset_bytes = transfer.offset_bytes.saturating_add(length_bytes as u64);
+        true
+    }
+
+    pub(crate) async fn complete_outbound_file_transfer(
+        &self,
+        peer_id: &str,
+        transfer_id: &str,
+    ) -> Option<(String, u64)> {
+        let mut transfers = self.outbound_file_transfers.write().await;
+        if transfers
+            .get(transfer_id)
+            .is_none_or(|transfer| transfer.peer_id != peer_id)
+        {
+            return None;
+        }
+        let transfer = transfers.remove(transfer_id)?;
+        Some((transfer.file_name, transfer.total_bytes))
+    }
+
+    pub(crate) async fn fail_outbound_file_transfer(
+        &self,
+        peer_id: &str,
+        transfer_id: &str,
+        reason: &str,
+    ) -> bool {
+        let mut transfers = self.outbound_file_transfers.write().await;
+        if transfers
+            .get(transfer_id)
+            .is_none_or(|transfer| transfer.peer_id != peer_id)
+        {
+            return false;
+        }
+        let transfer = transfers.remove(transfer_id);
+        let Some(transfer) = transfer else {
+            return false;
+        };
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "outgoing".to_string(),
+            kind: "file_transfer_failed".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("transfer_id={transfer_id} reason={reason}"),
+            size_bytes: transfer.total_bytes,
+        });
+        true
     }
 
     pub async fn drain_outgoing_input(
@@ -746,6 +902,13 @@ impl AppState {
     pub async fn remove_queued_file_transfer(&self, peer_id: &str, transfer_id: &str) {
         let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
         let Some(queue) = queue_map.get_mut(peer_id) else {
+            let mut transfers = self.outbound_file_transfers.write().await;
+            if transfers
+                .get(transfer_id)
+                .is_some_and(|transfer| transfer.peer_id == peer_id)
+            {
+                transfers.remove(transfer_id);
+            }
             return;
         };
 
@@ -753,6 +916,68 @@ impl AppState {
         if queue.is_empty() {
             queue_map.remove(peer_id);
         }
+        let mut transfers = self.outbound_file_transfers.write().await;
+        if transfers
+            .get(transfer_id)
+            .is_some_and(|transfer| transfer.peer_id == peer_id)
+        {
+            transfers.remove(transfer_id);
+        }
+    }
+
+    pub async fn cancel_outbound_file_transfer(
+        &self,
+        peer_id: &str,
+        transfer_id: &str,
+        reason: &str,
+    ) -> bool {
+        let mut transfers = self.outbound_file_transfers.write().await;
+        if transfers
+            .get(transfer_id)
+            .is_none_or(|transfer| transfer.peer_id != peer_id)
+        {
+            return false;
+        }
+        let removed = transfers.remove(transfer_id);
+        drop(transfers);
+        let Some(transfer) = removed else {
+            return false;
+        };
+
+        let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
+        if let Some(queue) = queue_map.get_mut(peer_id) {
+            queue.retain(|payload| !outbound_payload_has_transfer_id(payload, transfer_id));
+            if queue.is_empty() {
+                queue_map.remove(peer_id);
+            }
+        }
+        drop(queue_map);
+
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "outgoing".to_string(),
+            kind: "file_transfer_cancelled".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("transfer_id={transfer_id} reason={reason}"),
+            size_bytes: transfer.total_bytes,
+        });
+        true
+    }
+
+    #[cfg(test)]
+    pub async fn outgoing_bulk_queue_len(&self, peer_id: &str) -> usize {
+        self.transport
+            .outgoing_bulk_payloads
+            .read()
+            .await
+            .get(peer_id)
+            .map(VecDeque::len)
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub async fn outbound_file_transfer_count(&self) -> usize {
+        self.outbound_file_transfers.read().await.len()
     }
 
     #[cfg(test)]
@@ -1040,6 +1265,7 @@ fn outbound_payload_has_transfer_id(payload: &OutboundPayload, expected_transfer
     match payload {
         OutboundPayload::FileStart { transfer_id, .. }
         | OutboundPayload::FileChunk { transfer_id, .. }
+        | OutboundPayload::FileTransferCursor { transfer_id }
         | OutboundPayload::FileEnd { transfer_id, .. } => transfer_id == expected_transfer_id,
         _ => false,
     }
