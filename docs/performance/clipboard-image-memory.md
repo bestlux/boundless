@@ -9,6 +9,10 @@ Run from the repo root:
 
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\profile-clipboard-image-memory.ps1
 
+Canonical validation command:
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\profile-clipboard-image-memory.ps1 -Mode Validate
+
 To preserve a named evidence file:
 
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\profile-clipboard-image-memory.ps1 -OutputPath .\artifacts\performance\clipboard-image-memory\clipboard-image-memory.json

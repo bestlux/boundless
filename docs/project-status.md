@@ -109,4 +109,4 @@ These are not hidden release blockers by default; they require explicit release-
 | Clipboard status/policy UX | deferred | product feature backlog | Requires tray UX work; default clipboard content history remains out of scope. |
 | Guided two-device setup | deferred | product feature backlog | Builds on pairing/status diagnostics; not part of this docs/validation task. |
 | Broad reusable fault-injection harness | partially landed | PR #89 and transport_fault_injection_harness gap | Narrow post-auth session coverage exists; broad multi-peer/runtime fault coverage remains deferred outside BND-NEXT-7. |
-| BND-PRO-3.3 remaining open work | open | BND-NEXT-8 profiling candidate after BND-NEXT-7 | Remaining work is separate backlog, not unfinished BND-NEXT-7 implementation. |
+| BND-PRO-3.3 remaining open work | deferred | clipboard_image_spooling gap; product feature backlog | BND-NEXT-8A profiled and bounded the outbound/local clipboard image allocation path. Remaining work is inbound/apply full-buffer spooling if future evidence warrants it, plus deferred product UX backlog items. |

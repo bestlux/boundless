@@ -1,5 +1,8 @@
 [CmdletBinding()]
 param(
+    [ValidateSet("Profile", "Validate")]
+    [string]$Mode = "Profile",
+
     [long[]]$SizeBytes = @(2MB, 8MB),
 
     [ValidateSet("noop", "direct-outbound", "local-outbound", "inbound-chunked")]
@@ -142,7 +145,8 @@ foreach ($item in $Scenario) {
 $summary = [pscustomobject]@{
     generated_at = (Get-Date).ToString("o")
     repo_head = (& git rev-parse HEAD).Trim()
-    command = "scripts/dev/profile-clipboard-image-memory.ps1"
+    command = "scripts/dev/profile-clipboard-image-memory.ps1 -Mode $Mode"
+    mode = $Mode
     size_bytes = $SizeBytes
     scenarios = $Scenario
     test_executable = $testExecutable
