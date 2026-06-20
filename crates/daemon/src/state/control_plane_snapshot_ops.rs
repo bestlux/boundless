@@ -13,6 +13,7 @@ impl AppState {
         let (
             discovered_endpoints,
             pending_requests,
+            trusted_records,
             transport_events,
             input_owner_peer_id,
             input_capture_target_peer_id,
@@ -24,6 +25,7 @@ impl AppState {
         ) = tokio::join!(
             self.discovered_endpoints(),
             self.list_pending_nearby_pairing_requests(),
+            self.trusted_records(),
             self.transport_events(),
             self.input_owner(),
             self.input_capture_target(),
@@ -47,6 +49,7 @@ impl AppState {
             features,
             discovered_endpoints,
             pending_requests,
+            trusted_records: trusted_records.unwrap_or_default(),
             transport_events,
             input_owner_peer_id,
             input_capture_target_peer_id,

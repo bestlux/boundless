@@ -30,7 +30,7 @@ mod windows_app {
         AntiIdleSetRequest, Empty, FeatureSetRequest, FileTransferSetRequest, HotkeySetRequest,
         HotkeyTriggerRequest, InputHandoffSetRequest, LayoutSetRequest,
         NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
-        SafeResetRequest, SendFileRequest,
+        RemovePeerRequest, SafeResetRequest, SendFileRequest,
     };
     use serde::Deserialize;
     use std::{
@@ -151,6 +151,10 @@ mod windows_app {
         connected: bool,
         health_state: String,
         health_reason: String,
+        trust_state: String,
+        trusted_since: String,
+        trust_fingerprint: String,
+        device_identity: String,
     }
 
     #[allow(dead_code)]
@@ -199,6 +203,13 @@ mod windows_app {
     struct GuidedPairingResult {
         peer_machine_id: String,
         orientation_selector: String,
+        message: String,
+    }
+
+    #[derive(Debug, Clone)]
+    struct PairingSubmitResult {
+        peer_machine_id: String,
+        message: String,
     }
 
     include!("dashboard.rs");
@@ -280,6 +291,10 @@ mod windows_app {
                             connected: peer.connected,
                             health_state: peer.health_state,
                             health_reason: peer.health_reason,
+                            trust_state: peer.trust_state,
+                            trusted_since: peer.trusted_since,
+                            trust_fingerprint: peer.trust_fingerprint,
+                            device_identity: peer.device_identity,
                         })
                         .collect(),
                     pending_requests: snapshot
@@ -369,7 +384,7 @@ mod windows_app {
         host: String,
         port: u16,
         alias: Option<String>,
-    ) -> Result<String> {
+    ) -> Result<PairingSubmitResult> {
         block_on_result(pair_nearby_submit_code(
             endpoint,
             request_id,
@@ -397,6 +412,10 @@ mod windows_app {
 
     fn trigger_hotkey_action_blocking(endpoint: &str, action: &str) -> Result<String> {
         block_on_result(trigger_hotkey_action(endpoint, action.to_string()))
+    }
+
+    fn remove_peer_blocking(endpoint: &str, peer_id: String) -> Result<String> {
+        block_on_result(remove_peer(endpoint, peer_id))
     }
 
     fn layout_set_blocking(endpoint: &str, matrix_spec: String) -> Result<String> {
@@ -769,7 +788,7 @@ mod windows_app {
         host: String,
         port: u16,
         alias: Option<String>,
-    ) -> Result<String> {
+    ) -> Result<PairingSubmitResult> {
         let mut client = connect_control_plane(endpoint).await?;
         let response = client
             .submit_nearby_pairing_code(NearbySubmitCodeRequest {
@@ -790,7 +809,10 @@ mod windows_app {
             bail!("nearby pairing request id mismatch");
         }
 
-        Ok(response.peer_machine_id)
+        Ok(PairingSubmitResult {
+            peer_machine_id: response.peer_machine_id,
+            message: response.message,
+        })
     }
 
     async fn approve_nearby_pairing_request(endpoint: &str, request_id: String) -> Result<String> {
@@ -814,6 +836,18 @@ mod windows_app {
             })
             .await?
             .into_inner();
+        Ok(response.message)
+    }
+
+    async fn remove_peer(endpoint: &str, peer_id: String) -> Result<String> {
+        let mut client = connect_control_plane(endpoint).await?;
+        let response = client
+            .remove_peer(RemovePeerRequest { peer_id })
+            .await?
+            .into_inner();
+        if !response.ok {
+            bail!(response.message);
+        }
         Ok(response.message)
     }
 

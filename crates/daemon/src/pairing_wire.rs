@@ -114,6 +114,15 @@ pub(crate) struct NearbyJoinStatus {
     pub(crate) peer_machine_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct NearbyPairingOutcome {
+    pub(crate) peer_machine_id: String,
+    pub(crate) trust_committed: bool,
+    pub(crate) already_committed: bool,
+    pub(crate) reconnect_status: String,
+    pub(crate) message: String,
+}
+
 pub(crate) async fn request_nearby_pairing_code(
     state: &AppState,
     host: &str,
@@ -172,7 +181,7 @@ pub(crate) async fn submit_nearby_pairing_code(
     code: String,
     verification_nonce: String,
     alias: Option<String>,
-) -> Result<String> {
+) -> Result<NearbyPairingOutcome> {
     let target = format_host_port(host, port);
     let response = send_nearby_pairing_request(
         &target,
@@ -185,16 +194,17 @@ pub(crate) async fn submit_nearby_pairing_code(
     )
     .await?;
 
-    let responder_bundle = match response {
+    let (responder_bundle, response_message) = match response {
         PairingWireResponse::Approved {
             request_id: approved_request_id,
+            message,
             responder_bundle,
             ..
         } => {
             if approved_request_id != request_id {
                 anyhow::bail!("nearby pairing request id mismatch");
             }
-            responder_bundle
+            (responder_bundle, message)
         }
         PairingWireResponse::Pending { .. } => {
             anyhow::bail!(
@@ -212,7 +222,11 @@ pub(crate) async fn submit_nearby_pairing_code(
         }
     };
 
-    import_nearby_responder_bundle(state, responder_bundle, host, alias).await
+    let mut outcome = import_nearby_responder_bundle(state, responder_bundle, host, alias).await?;
+    if response_message.contains("already trusted") && !outcome.already_committed {
+        outcome.message = format!("{response_message}; local {}", outcome.message);
+    }
+    Ok(outcome)
 }
 
 pub(crate) async fn start_nearby_pairing_join(
@@ -295,13 +309,13 @@ async fn map_join_status_response(
             message,
             responder_bundle,
         } => {
-            let peer_machine_id =
+            let outcome =
                 import_nearby_responder_bundle(state, responder_bundle, host, alias).await?;
             Ok(NearbyJoinStatus {
                 request_id,
                 status: NearbyJoinStatusKind::Approved,
-                message,
-                peer_machine_id: Some(peer_machine_id),
+                message: format!("{message}; local {}", outcome.message),
+                peer_machine_id: Some(outcome.peer_machine_id),
             })
         }
         PairingWireResponse::Rejected {
@@ -337,19 +351,67 @@ async fn import_nearby_responder_bundle(
     mut responder_bundle: TrustBundle,
     host: &str,
     alias: Option<String>,
-) -> Result<String> {
+) -> Result<NearbyPairingOutcome> {
     normalize_bundle_address_for_host(&mut responder_bundle, host)?;
     let machine_id = responder_bundle.machine_id.clone();
+    let already_committed = state.get_peer(&machine_id).await.is_some();
 
     state
         .import_trust_bundle(responder_bundle, normalize_alias(alias))
         .await?;
-    let _ = state
-        .request_peer_reconnect_and_reset(&machine_id)
-        .await
-        .context("request reconnect after nearby pairing import")?;
+    let reconnect_status = request_pairing_reconnect_after_import(state, &machine_id).await;
 
-    Ok(machine_id)
+    Ok(NearbyPairingOutcome {
+        peer_machine_id: machine_id,
+        trust_committed: true,
+        already_committed,
+        message: pairing_import_message(already_committed, &reconnect_status),
+        reconnect_status,
+    })
+}
+
+async fn request_pairing_reconnect_after_import(state: &AppState, peer_id: &str) -> String {
+    match state.request_peer_reconnect_and_reset(peer_id).await {
+        Ok((generation, aborted_sessions)) => {
+            state.record_transport_event(crate::state::TransportEventRecord {
+                timestamp: chrono::Utc::now(),
+                direction: "local".to_string(),
+                kind: "pairing_connectivity_pending".to_string(),
+                peer_id: peer_id.to_string(),
+                detail: format!(
+                    "trust_committed=true generation={generation} aborted_sessions={aborted_sessions}"
+                ),
+                size_bytes: 0,
+            });
+            "connectivity_pending".to_string()
+        }
+        Err(error) => {
+            state.record_transport_event(crate::state::TransportEventRecord {
+                timestamp: chrono::Utc::now(),
+                direction: "local".to_string(),
+                kind: "pairing_reconnect_failed".to_string(),
+                peer_id: peer_id.to_string(),
+                detail: format!("trust_committed=true error={error}"),
+                size_bytes: 0,
+            });
+            "reconnect_failed".to_string()
+        }
+    }
+}
+
+fn pairing_import_message(already_committed: bool, reconnect_status: &str) -> String {
+    let trust = if already_committed {
+        "nearby pairing already trusted"
+    } else {
+        "nearby pairing trust established"
+    };
+    match reconnect_status {
+        "reconnect_failed" => {
+            format!("{trust}; reconnect request failed; use reconnect or remove peer to re-pair")
+        }
+        "connectivity_pending" => format!("{trust}; connectivity pending"),
+        _ => trust.to_string(),
+    }
 }
 
 async fn send_nearby_pairing_request(
@@ -593,7 +655,7 @@ async fn process_pairing_request(
             state
                 .validate_nearby_code_submission_allowed(remote_ip)
                 .await?;
-            let responder_bundle = match state
+            let commit = match state
                 .submit_nearby_pairing_code(
                     &request_id,
                     &code,
@@ -609,11 +671,11 @@ async fn process_pairing_request(
                 )
                 .await
             {
-                Ok(bundle) => {
+                Ok(commit) => {
                     state
                         .record_nearby_code_submission_result(remote_ip, true)
                         .await;
-                    bundle
+                    commit
                 }
                 Err(error) => {
                     if is_invalid_nearby_verification_error(&error) {
@@ -626,8 +688,8 @@ async fn process_pairing_request(
             };
             Ok(PairingWireResponse::Approved {
                 request_id,
-                message: "approved".to_string(),
-                responder_bundle,
+                message: commit.message,
+                responder_bundle: commit.responder_bundle,
             })
         }
         PairingWireRequest::NearbyJoin {
@@ -664,13 +726,15 @@ async fn process_pairing_request(
                     request_id,
                     message: "pending approval".to_string(),
                 }),
-                NearbyPairingStatus::Approved { responder_bundle } => {
-                    Ok(PairingWireResponse::Approved {
-                        request_id,
-                        message: "approved".to_string(),
-                        responder_bundle,
-                    })
-                }
+                NearbyPairingStatus::Approved {
+                    responder_bundle,
+                    message,
+                    ..
+                } => Ok(PairingWireResponse::Approved {
+                    request_id,
+                    message,
+                    responder_bundle,
+                }),
                 NearbyPairingStatus::Rejected { message } => Ok(PairingWireResponse::Rejected {
                     request_id,
                     message,
@@ -894,9 +958,17 @@ mod tests {
         )
         .await
         .expect("submit code");
+        let submit_message = match submitted {
+            PairingWireResponse::Approved { message, .. } => message,
+            other => panic!("expected approved response, got {other:?}"),
+        };
         assert!(
-            matches!(submitted, PairingWireResponse::Approved { .. }),
-            "submit should approve"
+            submit_message.contains("trust established"),
+            "submit should report committed trust"
+        );
+        assert!(
+            submit_message.contains("connectivity pending"),
+            "submit should report connectivity separately"
         );
 
         let requester_peer = state.get_peer("requester-machine").await.expect("peer");
@@ -963,10 +1035,28 @@ mod tests {
             "status should be pending before approval"
         );
 
-        state
+        let first_approval = state
             .approve_nearby_pairing_request(&request_id, None)
             .await
             .expect("approve request");
+        assert!(
+            !first_approval.already_committed,
+            "first approval should be a fresh trust commit"
+        );
+        assert_eq!(first_approval.reconnect_status, "connectivity_pending");
+
+        let duplicate_approval = state
+            .approve_nearby_pairing_request(&request_id, None)
+            .await
+            .expect("duplicate approval should be idempotent");
+        assert!(
+            duplicate_approval.already_committed,
+            "duplicate approval should replay committed trust"
+        );
+        assert!(
+            duplicate_approval.message.contains("already trusted"),
+            "duplicate approval should explain the already-trusted state"
+        );
 
         let approved_status = process_pairing_request(
             &state,
@@ -984,7 +1074,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_code_replay_submission_is_rejected_and_status_stays_approved() {
+    async fn request_code_replay_submission_returns_already_trusted_status() {
         let root = std::env::temp_dir().join(format!(
             "boundless-nearby-code-replay-test-{}",
             uuid::Uuid::new_v4()
@@ -1054,7 +1144,7 @@ mod tests {
             "first submit should approve"
         );
 
-        let replay_error = process_pairing_request(
+        let replay_submit = process_pairing_request(
             &state,
             "192.168.1.44".parse().expect("ip"),
             PairingWireRequest::NearbySubmitCode {
@@ -1065,10 +1155,18 @@ mod tests {
             },
         )
         .await
-        .expect_err("replay submission must fail");
+        .expect("replay submission should return approved");
+        let replay_message = match replay_submit {
+            PairingWireResponse::Approved { message, .. } => message,
+            other => panic!("expected approved replay response, got {other:?}"),
+        };
         assert!(
-            replay_error.to_string().contains("not found"),
-            "replay should fail because request is already finalized"
+            replay_message.contains("already trusted"),
+            "replay should be idempotent and actionable"
+        );
+        assert!(
+            replay_message.contains("connectivity pending"),
+            "replay should preserve connectivity-pending status"
         );
 
         let status_after_replay = process_pairing_request(

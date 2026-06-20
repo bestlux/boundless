@@ -153,12 +153,13 @@ impl DashboardTaskRunner {
                 flow.pairing_port,
                 alias.clone(),
             ) {
-                Ok(peer_machine_id) => {
+                Ok(submit_result) => {
                     let _ = tx.send(AppMsg::PairingComplete {
                         attempt_id,
                         result: GuidedPairingResult {
-                            peer_machine_id,
+                            peer_machine_id: submit_result.peer_machine_id,
                             orientation_selector: alias.unwrap_or(fallback_alias),
+                            message: submit_result.message,
                         },
                     });
                 }
@@ -369,6 +370,17 @@ impl DashboardTaskRunner {
 
     pub(super) fn reconnect_all_peers(&self, tx: Sender<AppMsg>, endpoint: String) {
         Self::spawn(move || match trigger_hotkey_action_blocking(&endpoint, "reconnect") {
+            Ok(msg) => {
+                let _ = tx.send(AppMsg::ActionComplete(msg));
+            }
+            Err(error) => {
+                let _ = tx.send(AppMsg::ActionFailed(error.to_string()));
+            }
+        });
+    }
+
+    pub(super) fn remove_peer(&self, tx: Sender<AppMsg>, endpoint: String, peer_id: String) {
+        Self::spawn(move || match remove_peer_blocking(&endpoint, peer_id) {
             Ok(msg) => {
                 let _ = tx.send(AppMsg::ActionComplete(msg));
             }

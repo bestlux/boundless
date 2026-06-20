@@ -723,6 +723,10 @@ mod tests {
                 connected: true,
                 health_state: "connected".to_string(),
                 health_reason: "peer is connected".to_string(),
+                trust_state: "trusted".to_string(),
+                trusted_since: "2026-03-03T18:00:00Z".to_string(),
+                trust_fingerprint: "abcdef1234567890".to_string(),
+                device_identity: "peer-alpha-full".to_string(),
             },
             crate::queries::UiPairedPeer {
                 peer_id: "peer-beta-full".to_string(),
@@ -731,6 +735,10 @@ mod tests {
                 connected: false,
                 health_state: "disconnected".to_string(),
                 health_reason: "not connected".to_string(),
+                trust_state: "trusted".to_string(),
+                trusted_since: "2026-03-03T18:00:00Z".to_string(),
+                trust_fingerprint: "1234567890abcdef".to_string(),
+                device_identity: "peer-beta-full".to_string(),
             },
         ];
         let mut context = RedactionContext::default();

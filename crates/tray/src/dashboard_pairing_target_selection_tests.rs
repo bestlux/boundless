@@ -154,6 +154,10 @@ fn filter_connectable_discovered_peers_hides_self_and_existing_pairings() {
         connected: true,
         health_state: "connected".to_string(),
         health_reason: "connected".to_string(),
+        trust_state: "trusted".to_string(),
+        trusted_since: "2026-03-03T18:00:00Z".to_string(),
+        trust_fingerprint: "abcdef1234567890".to_string(),
+        device_identity: "peer-machine-1234".to_string(),
     }];
 
     let filtered = filter_connectable_discovered_peers(discovered, "LOCAL-MACHINE-1234", &paired);

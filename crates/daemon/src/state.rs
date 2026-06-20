@@ -93,11 +93,13 @@ use layout_resolver::{
 use layout_resolver::{
     resolve_capture_handoff_target_with_fallback, resolve_switch_all_target_order,
 };
+pub(crate) use pairing_state::{
+    NearbyPairingCommitResult, NearbyPairingStatus, PendingNearbyPairingRequest,
+};
 use pairing_state::{
     NearbyPairingDecision, NearbyPairingDecisionRecord, PairingState, PendingNearbyPairingMode,
     PendingNearbyPairingRequestRecord,
 };
-pub(crate) use pairing_state::{NearbyPairingStatus, PendingNearbyPairingRequest};
 use routing_helpers::{describe_input_frame_decision, elapsed_ms};
 use transport_state::TransportState;
 use validation::{
@@ -150,6 +152,7 @@ pub(crate) struct ControlPlaneSnapshotBundle {
     pub(crate) features: BTreeMap<String, bool>,
     pub(crate) discovered_endpoints: Vec<(String, DiscoveredPeerEndpoint)>,
     pub(crate) pending_requests: Vec<PendingNearbyPairingRequest>,
+    pub(crate) trusted_records: Vec<TrustRecord>,
     pub(crate) transport_events: Vec<TransportEventRecord>,
     pub(crate) input_owner_peer_id: Option<String>,
     pub(crate) input_capture_target_peer_id: Option<String>,

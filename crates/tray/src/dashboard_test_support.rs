@@ -80,6 +80,7 @@ pub(super) fn sample_pairing_result() -> GuidedPairingResult {
     GuidedPairingResult {
         peer_machine_id: "peer-machine-1234".to_string(),
         orientation_selector: "Office Desktop".to_string(),
+        message: "nearby pairing trust established; connectivity pending".to_string(),
     }
 }
 
@@ -156,6 +157,10 @@ pub(super) fn sample_paired_snapshot() -> UiSnapshot {
             connected: false,
             health_state: "disconnected".to_string(),
             health_reason: "no recent peer event".to_string(),
+            trust_state: "trusted".to_string(),
+            trusted_since: "2026-03-03T18:00:00Z".to_string(),
+            trust_fingerprint: "abcdef1234567890".to_string(),
+            device_identity: "peer-1234".to_string(),
         }],
         ..sample_first_run_snapshot()
     }

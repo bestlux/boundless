@@ -27,7 +27,7 @@ use app_services::{
     },
 };
 use async_trait::async_trait;
-use core_security::TrustBundle;
+use core_security::{TrustBundle, fingerprint};
 
 use crate::{
     config::{ApiTransport, FileTransferConfig, InputHandoffConfig},
@@ -538,7 +538,7 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         command: NearbySubmitCodeCommand,
     ) -> Result<NearbyPairingCompletionSnapshot> {
         let request_id = command.request_id.clone();
-        let peer_machine_id = pairing_wire::submit_nearby_pairing_code(
+        let outcome = pairing_wire::submit_nearby_pairing_code(
             &self.state,
             &command.host,
             command.port,
@@ -551,9 +551,12 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
 
         Ok(NearbyPairingCompletionSnapshot {
             ok: true,
-            message: "nearby pairing complete".to_string(),
+            message: outcome.message,
             request_id,
-            peer_machine_id,
+            peer_machine_id: outcome.peer_machine_id,
+            trust_committed: outcome.trust_committed,
+            already_committed: outcome.already_committed,
+            reconnect_status: outcome.reconnect_status,
         })
     }
 
@@ -591,12 +594,13 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         &self,
         command: NearbyPairingDecisionCommand,
     ) -> Result<OperationReply> {
-        self.state
+        let result = self
+            .state
             .approve_nearby_pairing_request(&command.request_id, command.alias)
             .await?;
         Ok(OperationReply {
             ok: true,
-            message: "nearby pairing request approved".to_string(),
+            message: result.message,
         })
     }
 
@@ -793,13 +797,31 @@ fn build_paired_peers(bundle: &crate::state::ControlPlaneSnapshotBundle) -> Vec<
         .peers
         .clone()
         .into_iter()
-        .map(|peer| UiPairedPeer {
-            health_state: peer_health_state(bundle, &peer),
-            health_reason: peer_health_reason(bundle, &peer),
-            peer_id: peer.peer_id,
-            display_name: peer.display_name,
-            address: peer.address,
-            connected: peer.connected,
+        .map(|peer| {
+            let trust_record = bundle
+                .trusted_records
+                .iter()
+                .find(|record| record.machine_id == peer.peer_id);
+            UiPairedPeer {
+                health_state: peer_health_state(bundle, &peer),
+                health_reason: peer_health_reason(bundle, &peer),
+                trust_state: if trust_record.is_some() {
+                    "trusted".to_string()
+                } else {
+                    "missing_trust".to_string()
+                },
+                trusted_since: trust_record
+                    .map(|record| record.added_at.to_rfc3339())
+                    .unwrap_or_default(),
+                trust_fingerprint: trust_record
+                    .map(|record| fingerprint(&record.ca_cert_pem))
+                    .unwrap_or_default(),
+                device_identity: peer.peer_id.clone(),
+                peer_id: peer.peer_id,
+                display_name: peer.display_name,
+                address: peer.address,
+                connected: peer.connected,
+            }
         })
         .collect()
 }
@@ -813,6 +835,7 @@ fn peer_health_state(
     }
     peer_health_event(bundle, peer)
         .map(|event| match event.kind.as_str() {
+            "pairing_connectivity_pending" | "pairing_reconnect_failed" => "connectivity_pending",
             "peer_reconnect_requested" | "peers_reconnect_requested" => "reconnecting",
             "transport_trust_error" => "trust_error",
             "transport_protocol_mismatch" => "protocol_mismatch",
@@ -833,6 +856,13 @@ fn peer_health_reason(
     }
     peer_health_event(bundle, peer)
         .map(|event| match event.kind.as_str() {
+            "pairing_connectivity_pending" => {
+                "trust established; waiting for connectivity".to_string()
+            }
+            "pairing_reconnect_failed" => {
+                "trust established; reconnect request failed; use reconnect or remove peer to re-pair"
+                    .to_string()
+            }
             "peer_reconnect_requested" | "peers_reconnect_requested" => {
                 "manual or automatic reconnect requested".to_string()
             }
@@ -857,6 +887,8 @@ fn peer_health_event<'a>(
             && matches!(
                 event.kind.as_str(),
                 "peer_reconnect_requested"
+                    | "pairing_connectivity_pending"
+                    | "pairing_reconnect_failed"
                     | "peers_reconnect_requested"
                     | "transport_trust_error"
                     | "transport_protocol_mismatch"
@@ -1238,6 +1270,83 @@ mod tests {
             peers.iter().all(|peer| peer.health_state == "reconnecting"),
             "all-peer reconnect event should apply to every paired peer"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn pairing_commit_surfaces_trust_metadata_and_survives_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-control-plane-pairing-trust-status-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state = AppState::load_or_create_with_paths(config_path.clone(), security_root.clone())
+            .expect("load state");
+
+        let remote_paths = core_security::SecurityPaths::for_root(root.join("remote-security"));
+        let remote_identity = core_security::ensure_device_identity(
+            &remote_paths,
+            "remote-machine",
+            "remote",
+            Some("10.10.0.5"),
+        )
+        .expect("remote identity");
+        let requester_bundle = core_security::TrustBundle {
+            machine_id: "remote-machine".to_string(),
+            display_name: "remote".to_string(),
+            network_address: "10.10.0.5:15100".to_string(),
+            ca_cert_pem: remote_identity.ca_cert_pem,
+        };
+
+        let challenge = state
+            .queue_nearby_pairing_code_challenge(requester_bundle, Some("remote".to_string()), 120)
+            .await
+            .expect("queue challenge");
+        let verification_code = challenge
+            .verification_code
+            .clone()
+            .expect("verification code");
+        let verification_nonce = challenge
+            .verification_nonce
+            .clone()
+            .expect("verification nonce");
+        let commit = state
+            .submit_nearby_pairing_code(
+                &challenge.request_id,
+                &verification_code,
+                &verification_nonce,
+                None,
+            )
+            .await
+            .expect("submit code");
+        assert!(commit.trust_committed);
+        assert_eq!(commit.reconnect_status, "connectivity_pending");
+
+        let app = DaemonControlPlaneApp::new(state);
+        let peers = app.list_peers().await.expect("list peers");
+        let peer = peers
+            .iter()
+            .find(|peer| peer.peer_id == "remote-machine")
+            .expect("remote peer");
+        assert_eq!(peer.health_state, "connectivity_pending");
+        assert_eq!(peer.trust_state, "trusted");
+        assert!(!peer.trusted_since.is_empty());
+        assert!(!peer.trust_fingerprint.is_empty());
+        assert_eq!(peer.device_identity, "remote-machine");
+
+        let restarted =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("reload state");
+        let restarted_app = DaemonControlPlaneApp::new(restarted);
+        let restarted_peers = restarted_app.list_peers().await.expect("list peers");
+        let restarted_peer = restarted_peers
+            .iter()
+            .find(|peer| peer.peer_id == "remote-machine")
+            .expect("remote peer after restart");
+        assert_eq!(restarted_peer.trust_state, "trusted");
+        assert!(!restarted_peer.trusted_since.is_empty());
+        assert!(!restarted_peer.trust_fingerprint.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }

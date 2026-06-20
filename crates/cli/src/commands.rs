@@ -619,7 +619,14 @@ async fn pair_nearby_submit_code(endpoint: &str, request: NearbySubmitCodeReques
         bail!("nearby pairing request id mismatch");
     }
     let peer_machine_id = response.peer_machine_id;
-    println!("accepted=true peer_machine_id={peer_machine_id} message=nearby pairing complete");
+    println!(
+        "accepted=true peer_machine_id={} trust_committed={} already_committed={} reconnect_status={} message={}",
+        peer_machine_id,
+        response.trust_committed,
+        response.already_committed,
+        response.reconnect_status,
+        response.message
+    );
     Ok(())
 }
 
@@ -764,8 +771,15 @@ pub(super) async fn peer_list(endpoint: &str) -> Result<()> {
 
     for peer in response.peers {
         println!(
-            "peer_id={} name={} address={} connected={}",
-            peer.peer_id, peer.display_name, peer.address, peer.connected
+            "peer_id={} name={} address={} connected={} health_state={} trust_state={} trusted_since={} trust_fingerprint={}",
+            peer.peer_id,
+            peer.display_name,
+            peer.address,
+            peer.connected,
+            peer.health_state,
+            peer.trust_state,
+            peer.trusted_since,
+            peer.trust_fingerprint
         );
     }
 
@@ -1911,6 +1925,10 @@ struct UiPairedPeer {
     connected: bool,
     health_state: String,
     health_reason: String,
+    trust_state: String,
+    trusted_since: String,
+    trust_fingerprint: String,
+    device_identity: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1972,6 +1990,10 @@ pub(super) async fn ui_snapshot(endpoint: &str, start_daemon: bool) -> Result<()
                 connected: peer.connected,
                 health_state: peer.health_state,
                 health_reason: peer.health_reason,
+                trust_state: peer.trust_state,
+                trusted_since: peer.trusted_since,
+                trust_fingerprint: peer.trust_fingerprint,
+                device_identity: peer.device_identity,
             })
             .collect(),
         pending_requests: snapshot

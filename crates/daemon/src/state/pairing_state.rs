@@ -19,9 +19,26 @@ pub struct PendingNearbyPairingRequest {
 #[derive(Debug, Clone)]
 pub enum NearbyPairingStatus {
     Pending,
-    Approved { responder_bundle: TrustBundle },
-    Rejected { message: String },
+    Approved {
+        responder_bundle: TrustBundle,
+        peer_machine_id: String,
+        reconnect_status: String,
+        message: String,
+    },
+    Rejected {
+        message: String,
+    },
     Missing,
+}
+
+#[derive(Debug, Clone)]
+pub struct NearbyPairingCommitResult {
+    pub responder_bundle: TrustBundle,
+    pub peer_machine_id: String,
+    pub trust_committed: bool,
+    pub already_committed: bool,
+    pub reconnect_status: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -45,8 +62,15 @@ pub(super) enum PendingNearbyPairingMode {
 
 #[derive(Debug, Clone)]
 pub(super) enum NearbyPairingDecision {
-    Approved { responder_bundle: TrustBundle },
-    Rejected { message: String },
+    Approved {
+        responder_bundle: TrustBundle,
+        peer_machine_id: String,
+        reconnect_status: String,
+        message: String,
+    },
+    Rejected {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
