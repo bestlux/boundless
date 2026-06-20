@@ -28,28 +28,33 @@ fn classify_pairing_rejection(message: &str) -> &'static str {
 
 impl AppState {
     pub async fn safe_reset(&self, network_only: bool, all: bool) -> Result<()> {
-        let mut config = self.config.write().await;
+        let input_enabled = self
+            .mutate_config_and_save(|config| {
+                if all {
+                    let machine_id = config.machine_id.clone();
+                    let device_name = config.device_name.clone();
+                    *config = RuntimeConfig::default();
+                    config.machine_id = machine_id;
+                    config.device_name = device_name;
+                } else if network_only {
+                    config.peers.clear();
+                }
 
-        if all {
-            let machine_id = config.machine_id.clone();
-            let device_name = config.device_name.clone();
-            *config = RuntimeConfig::default();
-            config.machine_id = machine_id;
-            config.device_name = device_name;
-        } else if network_only {
-            config.peers.clear();
-        }
+                Ok((
+                    config.features.get("share_input").copied().unwrap_or(true),
+                    true,
+                ))
+            })
+            .await?;
 
         self.transport.clear().await;
         self.clipboard.clear().await;
         self.discovery.clear().await;
-        self.input
-            .reset(config.features.get("share_input").copied().unwrap_or(true))
-            .await;
+        self.input.reset(input_enabled).await;
         self.pairing.clear().await;
         self.invalidate_cached_layout_matrix().await;
 
-        save_config_at(&self.config_path, &config)
+        Ok(())
     }
 
     pub async fn diagnostics_dump(&self, output_path: Option<String>) -> Result<String> {

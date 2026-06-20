@@ -236,6 +236,32 @@ mod tests {
         }
     }
 
+    struct FailOnceBackend {
+        fail_scan_code_once: u16,
+        failed: bool,
+        applied_scan_codes: Vec<u16>,
+    }
+
+    impl InputBackend for FailOnceBackend {
+        fn apply(&mut self, event: &InputEvent) -> Result<()> {
+            match event {
+                InputEvent::Key { scan_code, .. }
+                    if *scan_code == self.fail_scan_code_once && !self.failed =>
+                {
+                    self.failed = true;
+                    Err(anyhow::anyhow!(
+                        "scripted injection failure for scan code {scan_code}"
+                    ))
+                }
+                InputEvent::Key { scan_code, .. } => {
+                    self.applied_scan_codes.push(*scan_code);
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+
     struct ScriptedCaptureBackend {
         batches: VecDeque<Vec<InputEvent>>,
         release_events: Vec<InputEvent>,
@@ -422,6 +448,80 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == "input_inject_skipped" && event.peer_id == peer_id),
             "runtime should emit skipped event telemetry"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn drain_preserves_fifo_when_earlier_frame_retries() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim owner")
+        );
+
+        let frame_count = INPUT_INJECT_MAX_FRAMES_PER_WAKE + 1;
+        let timestamp_unix_ms = Utc::now().timestamp_millis();
+        for sequence in 1..=frame_count as u64 {
+            state
+                .route_incoming_input_frame(
+                    &peer_id,
+                    InputFrame {
+                        source_peer_id: peer_id.clone(),
+                        sequence,
+                        timestamp_unix_ms,
+                        events: vec![InputEvent::Key {
+                            scan_code: sequence as u16,
+                            state: KeyState::Down,
+                        }],
+                    },
+                )
+                .await
+                .expect("route");
+        }
+
+        let mut backend = FailOnceBackend {
+            fail_scan_code_once: 1,
+            failed: false,
+            applied_scan_codes: Vec::new(),
+        };
+
+        let first_outcome = drain_pending_inject_frames(&state, &mut backend).await;
+        assert!(
+            !first_outcome.continue_immediately,
+            "retry backoff should prevent an immediate follow-up drain"
+        );
+        assert_eq!(
+            backend.applied_scan_codes,
+            Vec::<u16>::new(),
+            "later frames must wait behind a failed earlier frame"
+        );
+
+        let early_retry_outcome = drain_pending_inject_frames(&state, &mut backend).await;
+        assert!(
+            !early_retry_outcome.continue_immediately,
+            "retry backoff should still block follow-up drains before the deadline"
+        );
+        assert_eq!(
+            backend.applied_scan_codes,
+            Vec::<u16>::new(),
+            "later frames must also wait during pre-deadline retry drains"
+        );
+
+        tokio::time::sleep(Duration::from_millis(
+            INPUT_INJECT_RETRY_BASE_BACKOFF_MS + 5,
+        ))
+        .await;
+        while state.pending_inject_input_frame_count().await > 0 {
+            drain_pending_inject_frames(&state, &mut backend).await;
+        }
+        assert_eq!(
+            backend.applied_scan_codes,
+            (1..=frame_count as u16).collect::<Vec<_>>(),
+            "retry must preserve FIFO order for non-coalescible frames"
         );
 
         let _ = std::fs::remove_dir_all(root);

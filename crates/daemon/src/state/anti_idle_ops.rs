@@ -21,13 +21,14 @@ impl AppState {
     ) -> Result<()> {
         validate_recent_activity_window_secs(recent_activity_window_secs)?;
 
-        let mut config = self.config.write().await;
-        config.anti_idle.enabled = enabled;
-        config.anti_idle.recent_activity_window_secs = recent_activity_window_secs;
-        config.anti_idle.allow_on_battery = allow_on_battery;
-        config.anti_idle.keep_display_on = keep_display_on;
-        save_config_at(&self.config_path, &config)?;
-        drop(config);
+        self.mutate_config_and_save(|config| {
+            config.anti_idle.enabled = enabled;
+            config.anti_idle.recent_activity_window_secs = recent_activity_window_secs;
+            config.anti_idle.allow_on_battery = allow_on_battery;
+            config.anti_idle.keep_display_on = keep_display_on;
+            Ok(((), true))
+        })
+        .await?;
 
         self.notify_anti_idle_wake("anti_idle_config_changed");
         Ok(())

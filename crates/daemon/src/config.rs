@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use core_protocol::PROTOCOL_CURRENT;
+use core_security::atomic_write_file;
 use core_transfer::MAX_TRANSFER_BYTES;
 
 const DEFAULT_LAYOUT_MATRIX: &str = "self";
@@ -383,7 +384,7 @@ pub fn save_config_at(path: &Path, config: &RuntimeConfig) -> Result<()> {
     cloned.updated_at = Utc::now();
 
     let payload = serde_json::to_string_pretty(&cloned).context("serialize config")?;
-    fs::write(path, payload).with_context(|| format!("write {}", path.display()))?;
+    atomic_write_file(path, payload).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -613,6 +614,49 @@ mod tests {
         assert!(
             error.to_string().contains("regenerate config"),
             "unexpected error: {error:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_config_at_replaces_existing_config_file() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-config-replace-existing-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("config.json");
+        std::fs::create_dir_all(&root).expect("create temp root");
+
+        let first = RuntimeConfig {
+            device_name: "first-device".to_string(),
+            ..RuntimeConfig::default()
+        };
+        save_config_at(&path, &first).expect("write first config");
+
+        let second = RuntimeConfig {
+            machine_id: first.machine_id,
+            device_name: "second-device".to_string(),
+            ..RuntimeConfig::default()
+        };
+        save_config_at(&path, &second).expect("replace existing config");
+
+        let saved = load_or_create_config_at(&path).expect("read saved config");
+        assert_eq!(saved.device_name, "second-device");
+
+        let leftovers = std::fs::read_dir(&root)
+            .expect("read root")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("boundless-tmp")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "successful config replacement should not leave temp files"
         );
 
         let _ = std::fs::remove_dir_all(root);

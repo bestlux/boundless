@@ -149,6 +149,7 @@ pub(super) async fn drain_pending_inject_frames(
 
     let started = std::time::Instant::now();
     let mut deferred_frames = Vec::new();
+    let mut preserve_deferred_front = false;
     let mut processed = 0usize;
     let mut remaining = frames.into_iter();
     while let Some(mut frame) = remaining.next() {
@@ -165,7 +166,9 @@ pub(super) async fn drain_pending_inject_frames(
             .is_some_and(|next| std::time::Instant::now() < next)
         {
             deferred_frames.push(frame);
-            continue;
+            deferred_frames.extend(remaining);
+            preserve_deferred_front = true;
+            break;
         }
 
         if !state.input_injection_allowed_for_peer(&frame.peer_id).await {
@@ -244,15 +247,24 @@ pub(super) async fn drain_pending_inject_frames(
                     )
                     .await;
                 deferred_frames.push(frame);
+                deferred_frames.extend(remaining);
+                preserve_deferred_front = true;
+                break;
             }
         }
         processed += 1;
     }
 
     if !deferred_frames.is_empty() {
-        state
-            .requeue_pending_inject_input_frames_back(deferred_frames)
-            .await;
+        if preserve_deferred_front {
+            state
+                .requeue_pending_inject_input_frames_front(deferred_frames)
+                .await;
+        } else {
+            state
+                .requeue_pending_inject_input_frames_back(deferred_frames)
+                .await;
+        }
     }
 
     let now = std::time::Instant::now();

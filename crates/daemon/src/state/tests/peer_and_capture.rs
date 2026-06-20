@@ -64,6 +64,39 @@ async fn touch_peer_does_not_persist_config_on_heartbeat() {
 }
 
 #[tokio::test]
+async fn set_peer_connected_does_not_persist_already_disconnected_peer() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-disconnected-persist-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+
+    let state = AppState::load_or_create_with_paths(config_path.clone(), security_root)
+        .expect("load state");
+
+    let (code, _) = state.create_pairing_code(120).await;
+    let peer_id = state
+        .join_peer(code, "127.0.0.1:15100".to_string(), None)
+        .await
+        .expect("join");
+
+    let before = std::fs::read_to_string(&config_path).expect("read before");
+    state
+        .set_peer_connected(&peer_id, false)
+        .await
+        .expect("mark disconnected");
+    let after = std::fs::read_to_string(&config_path).expect("read after");
+
+    assert_eq!(
+        before, after,
+        "already-disconnected retry should not rewrite config"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn set_feature_rejects_unsupported_network_policy_names() {
     let root = std::env::temp_dir().join(format!(
         "boundless-feature-policy-test-{}",
