@@ -397,7 +397,7 @@ Deliverables:
   - three-node smoke,
   - four-node topology smoke or equivalent deterministic validation,
   - edge handoff trace matrix,
-  - clipboard/file matrix,
+  - focused daemon/core clipboard tests plus runtime clipboard/file smoke,
   - pairing recovery matrix,
   - installer smoke,
   - service smoke when implemented.
