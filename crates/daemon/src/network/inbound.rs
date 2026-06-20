@@ -160,16 +160,25 @@ where
         ),
         size_bytes: total_bytes,
     });
-    send_file_chunk_credit(
-        writer,
-        &transfer_id,
-        FILE_TRANSFER_INITIAL_CHUNK_CREDITS,
-        frame_buffer,
-    )
-    .await?;
-    tokio::io::AsyncWriteExt::flush(writer)
-        .await
-        .context("flush inbound file transfer initial credit")?;
+    let initial_credit_result = async {
+        send_file_chunk_credit(
+            writer,
+            &transfer_id,
+            FILE_TRANSFER_INITIAL_CHUNK_CREDITS,
+            frame_buffer,
+        )
+        .await?;
+        tokio::io::AsyncWriteExt::flush(writer)
+            .await
+            .context("flush inbound file transfer initial credit")
+    }
+    .await;
+    if let Err(error) = initial_credit_result {
+        if let Some(transfer) = inbound_transfers.remove(&transfer_id) {
+            discard_inbound_transfer(transfer).await;
+        }
+        return Err(error);
+    }
 
     Ok(())
 }
@@ -363,10 +372,19 @@ where
         size_bytes: next_size,
     });
     if replenish_credits > 0 {
-        send_file_chunk_credit(writer, &transfer_id, replenish_credits, frame_buffer).await?;
-        tokio::io::AsyncWriteExt::flush(writer)
-            .await
-            .context("flush inbound file transfer chunk credit")?;
+        let credit_result = async {
+            send_file_chunk_credit(writer, &transfer_id, replenish_credits, frame_buffer).await?;
+            tokio::io::AsyncWriteExt::flush(writer)
+                .await
+                .context("flush inbound file transfer chunk credit")
+        }
+        .await;
+        if let Err(error) = credit_result {
+            if let Some(transfer) = inbound_transfers.remove(&transfer_id) {
+                discard_inbound_transfer(transfer).await;
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }

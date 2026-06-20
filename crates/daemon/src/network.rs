@@ -1804,6 +1804,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_file_start_credit_flush_error_discards_reserved_part() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let receive_dir = root.join("received");
+        let mut config = state.file_transfer_config().await;
+        config.auto_accept_trusted_peers = true;
+        config.receive_dir = receive_dir.display().to_string();
+        state
+            .update_file_transfer_config(config)
+            .await
+            .expect("enable auto accept");
+
+        let mut inbound_transfers = HashMap::new();
+        let mut writer = FlushFailWriter::new(1);
+        let mut frame_buffer = Vec::with_capacity(256);
+
+        handle_file_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            "file-flush-fails".to_string(),
+            "payload.txt".to_string(),
+            5,
+            &mut inbound_transfers,
+            &mut writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect_err("initial chunk-credit flush should fail");
+
+        let reserved_part = receive_dir.join(".payload.txt.boundless.part");
+        assert!(
+            inbound_transfers.is_empty(),
+            "failed initial credit flush should remove the active transfer"
+        );
+        assert!(
+            !reserved_part.exists(),
+            "failed initial credit flush must remove reserved inbound .part"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn inbound_file_start_allows_explicit_auto_accept_policy() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         let mut config = state.file_transfer_config().await;
