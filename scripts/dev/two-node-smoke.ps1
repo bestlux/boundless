@@ -18,6 +18,8 @@ Set-Location $repoRoot
 
 $daemonExe = Join-Path $repoRoot "target/debug/boundlessd.exe"
 $cliExe = Join-Path $repoRoot "target/debug/boundlessctl.exe"
+. (Join-Path $PSScriptRoot "smoke-harness.ps1")
+Initialize-SmokeHarness -RepoRoot $repoRoot -DaemonExe $daemonExe -CliExe $cliExe -LogPrefix "[smoke]"
 
 $runRoot = Join-Path $env:TEMP ("boundless-smoke-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
 $node1Root = Join-Path $runRoot "node1"
@@ -48,111 +50,8 @@ $node2Err = Join-Path $node2Root "daemon.stderr.log"
 
 $node1 = $null
 $node2 = $null
-
-function Invoke-Cli {
-    param(
-        [string]$Endpoint,
-        [string[]]$CommandArgs
-    )
-
-    $allArgs = @("--endpoint", $Endpoint) + $CommandArgs
-    & $cliExe @allArgs 2>&1
-}
-
-function Invoke-CliChecked {
-    param(
-        [string]$Endpoint,
-        [string[]]$CommandArgs
-    )
-
-    $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs $CommandArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "CLI command failed at ${Endpoint}: args='$($CommandArgs -join " ")' exit=$LASTEXITCODE output=$output"
-    }
-
-    return $output
-}
-
-function Wait-ForDaemon {
-    param(
-        [string]$Endpoint,
-        [int]$Seconds,
-        [System.Diagnostics.Process]$Process,
-        [string]$StdErrPath
-    )
-
-    $deadline = (Get-Date).AddSeconds($Seconds)
-    $attempt = 0
-    while ((Get-Date) -lt $deadline) {
-        $attempt++
-        try {
-            $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs @("daemon", "status")
-            if ($LASTEXITCODE -eq 0 -and $output -match "running=true") {
-                return
-            }
-            if ($attempt -le 5) {
-                Write-Host "[smoke] daemon probe $Endpoint attempt=$attempt code=$LASTEXITCODE output=$output"
-            }
-        }
-        catch {
-            if ($attempt -le 5) {
-                Write-Host "[smoke] daemon probe $Endpoint attempt=$attempt threw: $($_.Exception.Message)"
-            }
-        }
-
-        Start-Sleep -Milliseconds 500
-
-        if ($Process.HasExited) {
-            $stderr = if (Test-Path $StdErrPath) { Get-Content $StdErrPath -Raw } else { "" }
-            throw "Daemon at $Endpoint exited early. stderr: $stderr"
-        }
-    }
-
-    throw "Timed out waiting for daemon at $Endpoint"
-}
-
-function Wait-ForConnectedPeer {
-    param(
-        [string]$Endpoint,
-        [int]$Seconds
-    )
-
-    $deadline = (Get-Date).AddSeconds($Seconds)
-    while ((Get-Date) -lt $deadline) {
-        $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs @("peer", "list")
-        if ($LASTEXITCODE -eq 0 -and $output -match "connected=true") {
-            return
-        }
-
-        Start-Sleep -Milliseconds 700
-    }
-
-    throw "Timed out waiting for connected peer at $Endpoint"
-}
-
-function Wait-ForPeerConnectionState {
-    param(
-        [string]$Endpoint,
-        [string]$PeerId,
-        [bool]$Connected,
-        [int]$Seconds
-    )
-
-    $expected = if ($Connected) { "true" } else { "false" }
-    $peerPattern = [regex]::Escape($PeerId)
-    $pattern = "peer_id=$peerPattern\s+name=.*\s+address=.*\s+connected=$expected"
-    $deadline = (Get-Date).AddSeconds($Seconds)
-    while ((Get-Date) -lt $deadline) {
-        $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs @("peer", "list")
-        if ($LASTEXITCODE -eq 0 -and $output -match $pattern) {
-            return
-        }
-
-        Start-Sleep -Milliseconds 700
-    }
-
-    throw "Timed out waiting for peer connection state connected=$expected for peer_id=$PeerId at $Endpoint"
-}
+$shouldKeepArtifacts = [bool]$KeepArtifacts
+$reportedFailureArtifacts = $false
 
 function Get-FirstPeerId {
     param(
@@ -281,30 +180,6 @@ function Wait-ForInputOwner {
     throw "Timed out waiting for input owner '$ExpectedOwner' at $Endpoint"
 }
 
-function Wait-ForInputCaptureTarget {
-    param(
-        [string]$Endpoint,
-        [string]$ExpectedTarget,
-        [int]$Seconds
-    )
-
-    $deadline = (Get-Date).AddSeconds($Seconds)
-    while ((Get-Date) -lt $deadline) {
-        $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs @("input", "capture-target")
-        if ($LASTEXITCODE -eq 0) {
-            if ($ExpectedTarget -eq "none" -and $output -match "target=none") {
-                return
-            }
-            if ($ExpectedTarget -ne "none" -and $output -match "target=$ExpectedTarget") {
-                return
-            }
-        }
-        Start-Sleep -Milliseconds 500
-    }
-
-    throw "Timed out waiting for input capture target '$ExpectedTarget' at $Endpoint"
-}
-
 function Wait-ForFeatureValue {
     param(
         [string]$Endpoint,
@@ -327,89 +202,34 @@ function Wait-ForFeatureValue {
     throw "Timed out waiting for feature ${FeatureName}=${expected} at $Endpoint"
 }
 
-function Wait-ForPath {
+function Wait-ForReceivedFile {
     param(
-        [string]$Path,
+        [string]$Root,
+        [string]$FileName,
         [int]$Seconds
     )
 
     $deadline = (Get-Date).AddSeconds($Seconds)
     while ((Get-Date) -lt $deadline) {
-        if (Test-Path $Path) {
-            return
+        $matches = @(Get-ChildItem -Path $Root -Filter $FileName -File -Recurse -ErrorAction SilentlyContinue)
+        if ($matches.Count -eq 1) {
+            return $matches[0].FullName
         }
+        if ($matches.Count -gt 1) {
+            $paths = ($matches | ForEach-Object { $_.FullName }) -join ", "
+            throw "Found multiple received files named ${FileName} under ${Root}: $paths"
+        }
+
         Start-Sleep -Milliseconds 500
     }
 
-    throw "Timed out waiting for path $Path"
-}
-
-function Start-DaemonProcess {
-    param(
-        [string]$Bind,
-        [int]$NetworkPort,
-        [string]$ApiTransport,
-        [string]$StdOutPath,
-        [string]$StdErrPath,
-        [hashtable]$Environment
-    )
-
-    $startProcessCommand = Get-Command Start-Process
-    if ($startProcessCommand.Parameters.ContainsKey("Environment")) {
-        return Start-Process -FilePath $daemonExe -ArgumentList @("--bind", $Bind, "--api-transport", $ApiTransport, "--network-port", "$NetworkPort") -PassThru -WindowStyle Hidden -RedirectStandardOutput $StdOutPath -RedirectStandardError $StdErrPath -Environment $Environment
+    $entries = if (Test-Path $Root) {
+        (Get-ChildItem -Path $Root -Recurse -Force | ForEach-Object { $_.FullName }) -join ", "
     }
-
-    $setCommands = @()
-    foreach ($entry in $Environment.GetEnumerator()) {
-        $setCommands += "set `"$($entry.Key)=$($entry.Value)`""
+    else {
+        "<missing inbox root>"
     }
-
-    $daemonCommand = "`"$daemonExe`" --bind $Bind --api-transport $ApiTransport --network-port $NetworkPort"
-    $commandLine = ($setCommands + $daemonCommand) -join " && "
-
-    return Start-Process -FilePath "cmd.exe" -ArgumentList @("/d", "/s", "/c", $commandLine) -PassThru -WindowStyle Hidden -RedirectStandardOutput $StdOutPath -RedirectStandardError $StdErrPath
-}
-
-function Stop-DaemonProcess {
-    param(
-        [System.Diagnostics.Process]$Process,
-        [int]$WaitMs = 5000
-    )
-
-    if ($null -eq $Process -or $Process.HasExited) {
-        return
-    }
-
-    Stop-Process -Id $Process.Id -Force
-    if (-not $Process.WaitForExit($WaitMs)) {
-        throw "Timed out waiting for daemon process $($Process.Id) to stop"
-    }
-}
-
-function Remove-PathWithRetry {
-    param(
-        [string]$Path,
-        [int]$Attempts = 10,
-        [int]$DelayMs = 200
-    )
-
-    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        try {
-            if (Test-Path $Path) {
-                Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
-            }
-            return $true
-        }
-        catch {
-            if ($attempt -eq $Attempts) {
-                Write-Warning "[smoke] failed to remove artifacts at ${Path}: $($_.Exception.Message)"
-                return $false
-            }
-            Start-Sleep -Milliseconds $DelayMs
-        }
-    }
-
-    return $false
+    throw "Timed out waiting for received file ${FileName} under ${Root}. Existing entries: $entries"
 }
 
 function Set-LittleEndianUInt16 {
@@ -501,17 +321,6 @@ function New-BmpFile {
     return $bytes.Length
 }
 
-function Get-FreeTcpPort {
-    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
-    $listener.Start()
-    try {
-        return $listener.LocalEndpoint.Port
-    }
-    finally {
-        $listener.Stop()
-    }
-}
-
 try {
     $originalCargoIncremental = $env:CARGO_INCREMENTAL
     $env:CARGO_INCREMENTAL = "0"
@@ -525,16 +334,7 @@ try {
     $node1Bind = "127.0.0.1:$node1ApiPort"
     $node2Bind = "127.0.0.1:$node2ApiPort"
 
-    Write-Host "[smoke] building debug binaries"
-    cargo build -p boundless-daemon -p boundless-cli | Out-Host
-    $buildExitCode = $LASTEXITCODE
-    if ($buildExitCode -ne 0) {
-        throw "cargo build failed with exit code $buildExitCode"
-    }
-
-    if (-not (Test-Path $daemonExe) -or -not (Test-Path $cliExe)) {
-        throw "Expected binaries were not built"
-    }
+    Invoke-SmokeBinaryBuild
 
     $node1Env = @{
         BOUNDLESS_CONFIG_PATH = $node1Config
@@ -676,8 +476,11 @@ try {
 
         Wait-ForTransportEvent -Endpoint $node1Endpoint -Pattern "direction=outgoing kind=file peer_id=$node1PeerId" -Seconds $TimeoutSeconds
 
-        $receivedPath = Join-Path $node2Inbox (Join-Path $node2PeerId "sample-transfer.txt")
-        Wait-ForPath -Path $receivedPath -Seconds $TimeoutSeconds
+        $receivedPath = Wait-ForReceivedFile -Root $node2Inbox -FileName "sample-transfer.txt" -Seconds $TimeoutSeconds
+        $receivedContent = Get-Content -Path $receivedPath -Raw
+        if ($receivedContent -ne "smoke-file-payload") {
+            throw "Received file content mismatch at ${receivedPath}: '$receivedContent'"
+        }
     }
 
     Write-Host "[smoke] validating clipboard delivery after peer restart and reconnect"
@@ -718,6 +521,14 @@ try {
         Write-Host "[smoke] success: clipboard text/image transfer and reconnect delivery validated"
     }
 }
+catch {
+    $shouldKeepArtifacts = $true
+    if (Test-Path $runRoot) {
+        Write-Host "[smoke] failure artifacts kept at: $runRoot"
+        $reportedFailureArtifacts = $true
+    }
+    throw
+}
 finally {
     if ($null -eq $originalCargoIncremental) {
         Remove-Item Env:CARGO_INCREMENTAL -ErrorAction SilentlyContinue
@@ -732,10 +543,10 @@ finally {
         }
     }
 
-    if (-not $KeepArtifacts -and (Test-Path $runRoot)) {
+    if (-not $shouldKeepArtifacts -and (Test-Path $runRoot)) {
         $null = Remove-PathWithRetry -Path $runRoot
     }
-    elseif (Test-Path $runRoot) {
+    elseif ((Test-Path $runRoot) -and -not $reportedFailureArtifacts) {
         Write-Host "[smoke] artifacts kept at: $runRoot"
     }
 }
