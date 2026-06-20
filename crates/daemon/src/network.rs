@@ -789,30 +789,186 @@ mod tests {
         let queued = state.drain_outgoing_bulk(&peer_id, usize::MAX).await;
         assert_eq!(
             queued.len(),
-            3,
-            "two file chunks and file-end should remain queued after backpressure defer"
+            1,
+            "file cursor should remain queued after backpressure defer"
         );
         assert!(matches!(
             queued.first(),
-            Some(OutboundPayload::FileChunk {
-                transfer_id: chunk_transfer_id,
-                ..
-            }) if chunk_transfer_id == &transfer_id
+            Some(OutboundPayload::FileTransferCursor {
+                transfer_id: cursor_transfer_id,
+            }) if cursor_transfer_id == &transfer_id
         ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn flush_file_transfer_cursor_sends_one_lazy_chunk_per_credit() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let file_path = root.join("lazy.bin");
+        let payload = vec![7u8; crate::state::FILE_TRANSFER_CHUNK_BYTES + 11];
+        tokio::fs::write(&file_path, &payload)
+            .await
+            .expect("write payload");
+        state
+            .queue_file_from_path(&peer_id, &file_path)
+            .await
+            .expect("queue file");
+
+        let mut outbound_transfer_flow = HashMap::new();
+        let mut frame_buffer = Vec::new();
+        let mut start_writer = CaptureWriter::default();
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+            &mut outbound_transfer_flow,
+            &mut start_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("flush start");
+
+        let start_frames = decode_written_frames(&start_writer.bytes);
+        let transfer_id = match start_frames.first() {
+            Some(WireMessage::FileStart { transfer_id, .. }) => transfer_id.clone(),
+            other => panic!("expected file start, got {other:?}"),
+        };
+        assert_eq!(start_frames.len(), 1);
+        assert_eq!(state.outgoing_bulk_queue_len(&peer_id).await, 1);
+
+        outbound_transfer_flow
+            .get_mut(&transfer_id)
+            .expect("registered outbound flow")
+            .available_chunk_credits = 1;
+
+        let mut chunk_writer = CaptureWriter::default();
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+            &mut outbound_transfer_flow,
+            &mut chunk_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("flush first chunk");
+
+        let chunk_frames = decode_written_frames(&chunk_writer.bytes);
+        assert_eq!(chunk_frames.len(), 1);
         assert!(matches!(
-            queued.get(1),
-            Some(OutboundPayload::FileChunk {
-                transfer_id: chunk_transfer_id,
-                ..
-            }) if chunk_transfer_id == &transfer_id
+            chunk_frames.first(),
+            Some(WireMessage::FileChunk { transfer_id: chunk_transfer_id, data })
+                if chunk_transfer_id == &transfer_id
+                    && data.len() == crate::state::FILE_TRANSFER_CHUNK_BYTES
         ));
-        assert!(matches!(
-            queued.get(2),
-            Some(OutboundPayload::FileEnd {
-                transfer_id: end_transfer_id,
-                ..
-            }) if end_transfer_id == &transfer_id
-        ));
+        assert_eq!(
+            outbound_transfer_flow
+                .get(&transfer_id)
+                .expect("active flow")
+                .available_chunk_credits,
+            0
+        );
+        assert_eq!(
+            state.outgoing_bulk_queue_len(&peer_id).await,
+            1,
+            "remaining data should stay represented by one cursor"
+        );
+        assert_eq!(state.outbound_file_transfer_count().await, 1);
+
+        assert!(
+            state
+                .cancel_outbound_file_transfer(&peer_id, &transfer_id, "user_cancelled")
+                .await
+        );
+        assert_eq!(state.outgoing_bulk_queue_len(&peer_id).await, 0);
+        assert_eq!(state.outbound_file_transfer_count().await, 0);
+        let cancelled = state
+            .transport_events()
+            .await
+            .into_iter()
+            .filter(|event| event.kind == "file_transfer_cancelled")
+            .count();
+        assert_eq!(cancelled, 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn flush_file_transfer_cursor_fails_after_source_mutation() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let file_path = root.join("mutated.bin");
+        tokio::fs::write(
+            &file_path,
+            vec![7u8; crate::state::FILE_TRANSFER_CHUNK_BYTES + 11],
+        )
+        .await
+        .expect("write payload");
+        state
+            .queue_file_from_path(&peer_id, &file_path)
+            .await
+            .expect("queue file");
+
+        let mut outbound_transfer_flow = HashMap::new();
+        let mut frame_buffer = Vec::new();
+        let mut start_writer = CaptureWriter::default();
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+            &mut outbound_transfer_flow,
+            &mut start_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("flush start");
+        let transfer_id = match decode_written_frames(&start_writer.bytes).first() {
+            Some(WireMessage::FileStart { transfer_id, .. }) => transfer_id.clone(),
+            other => panic!("expected file start, got {other:?}"),
+        };
+
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .await
+            .expect("open payload for mutation");
+        file.set_len(3).await.expect("mutate payload length");
+        drop(file);
+
+        outbound_transfer_flow
+            .get_mut(&transfer_id)
+            .expect("registered outbound flow")
+            .available_chunk_credits = 1;
+        let mut chunk_writer = CaptureWriter::default();
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+            &mut outbound_transfer_flow,
+            &mut chunk_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("mutation should fail transfer without failing session flush");
+
+        assert!(decode_written_frames(&chunk_writer.bytes).is_empty());
+        assert!(!outbound_transfer_flow.contains_key(&transfer_id));
+        assert_eq!(state.outgoing_bulk_queue_len(&peer_id).await, 0);
+        assert_eq!(state.outbound_file_transfer_count().await, 0);
+        assert!(state.transport_events().await.iter().any(|event| {
+            event.kind == "file_transfer_failed"
+                && event
+                    .detail
+                    .contains("source changed after transfer was queued")
+        }));
 
         let _ = std::fs::remove_dir_all(root);
     }

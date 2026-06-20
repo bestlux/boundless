@@ -12,9 +12,10 @@ use peer_transport::{
 use super::codec::input_events_to_wire;
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum SendPayloadOutcome {
     Sent,
+    SentAndRequeue(OutboundPayload),
     Dropped,
     DeferredForBackpressure,
 }
@@ -150,6 +151,7 @@ where
 
     let mut pending = VecDeque::from(pending_payloads);
     let mut sent_for_flush = Vec::<OutboundPayload>::new();
+    let mut requeue_after_flush = Vec::<OutboundPayload>::new();
     let mut sent_any = false;
     while let Some(payload) = pending.pop_front() {
         match send_outbound_payload(
@@ -165,6 +167,11 @@ where
             Ok(SendPayloadOutcome::Sent) => {
                 sent_any = true;
                 sent_for_flush.push(payload);
+            }
+            Ok(SendPayloadOutcome::SentAndRequeue(requeue_payload)) => {
+                sent_any = true;
+                sent_for_flush.push(payload);
+                requeue_after_flush.push(requeue_payload);
             }
             Ok(SendPayloadOutcome::Dropped) => {}
             Ok(SendPayloadOutcome::DeferredForBackpressure) => {
@@ -190,21 +197,28 @@ where
         }
     }
 
-    if sent_any
-        && let Err(error) = writer_ctx
+    if sent_any {
+        if let Err(error) = writer_ctx
             .writer
             .flush()
             .await
             .context("flush outbound payload batch")
-    {
-        if !sent_for_flush.is_empty() {
-            restore_outbound_chunk_credits_for_payloads(
-                writer_ctx.outbound_transfer_flow,
-                &sent_for_flush,
-            );
-            state.requeue_outgoing_front(peer_id, sent_for_flush).await;
+        {
+            if !sent_for_flush.is_empty() {
+                restore_outbound_chunk_credits_for_payloads(
+                    writer_ctx.outbound_transfer_flow,
+                    &sent_for_flush,
+                );
+                state.requeue_outgoing_front(peer_id, sent_for_flush).await;
+            }
+            return Err(error);
         }
-        return Err(error);
+
+        if !requeue_after_flush.is_empty() {
+            state
+                .requeue_outgoing_front(peer_id, requeue_after_flush)
+                .await;
+        }
     }
 
     Ok(())
@@ -415,6 +429,122 @@ where
                 size_bytes: *length_bytes as u64,
             });
             Ok(SendPayloadOutcome::Sent)
+        }
+        OutboundPayload::FileTransferCursor { transfer_id } => {
+            let Some(remaining_bytes) = state
+                .outbound_file_transfer_remaining_bytes(peer_id, transfer_id)
+                .await
+            else {
+                warn!(
+                    peer_id = %peer_id,
+                    transfer_id = %transfer_id,
+                    "dropping outbound file cursor without active transfer state"
+                );
+                remove_outbound_transfer_flow(writer_ctx.outbound_transfer_flow, transfer_id);
+                return Ok(SendPayloadOutcome::Dropped);
+            };
+
+            if remaining_bytes > 0 {
+                let Some(has_credit) = has_available_outbound_chunk_credit(
+                    writer_ctx.outbound_transfer_flow,
+                    transfer_id,
+                ) else {
+                    warn!(
+                        peer_id = %peer_id,
+                        transfer_id = %transfer_id,
+                        "dropping outbound file cursor without active transfer flow state"
+                    );
+                    state
+                        .fail_outbound_file_transfer(peer_id, transfer_id, "missing_transfer_flow")
+                        .await;
+                    return Ok(SendPayloadOutcome::Dropped);
+                };
+
+                if !has_credit {
+                    return Ok(SendPayloadOutcome::DeferredForBackpressure);
+                }
+            }
+
+            let chunk = match state
+                .read_next_outbound_file_chunk(peer_id, transfer_id)
+                .await
+            {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    warn!(
+                        peer_id = %peer_id,
+                        transfer_id = %transfer_id,
+                        error = %error,
+                        "failing outbound file transfer cursor"
+                    );
+                    remove_outbound_transfer_flow(writer_ctx.outbound_transfer_flow, transfer_id);
+                    state
+                        .fail_outbound_file_transfer(peer_id, transfer_id, &error.to_string())
+                        .await;
+                    return Ok(SendPayloadOutcome::Dropped);
+                }
+            };
+
+            if !chunk.data.is_empty() {
+                let chunk_len = chunk.data.len();
+                send_message(
+                    writer_ctx.writer,
+                    &WireMessage::FileChunk {
+                        transfer_id: chunk.transfer_id.clone(),
+                        data: chunk.data,
+                    },
+                    writer_ctx.frame_buffer,
+                )
+                .await?;
+                consume_outbound_chunk_credit(writer_ctx.outbound_transfer_flow, transfer_id);
+                state.record_transport_event(TransportEventRecord {
+                    timestamp: Utc::now(),
+                    direction: "outgoing".to_string(),
+                    kind: "file_transfer_progress".to_string(),
+                    peer_id: peer_id.to_string(),
+                    detail: format!(
+                        "transfer_id={} offset_bytes={} length_bytes={}",
+                        chunk.transfer_id, chunk.offset_bytes, chunk_len
+                    ),
+                    size_bytes: chunk_len as u64,
+                });
+            }
+
+            if chunk.finished {
+                send_message(
+                    writer_ctx.writer,
+                    &WireMessage::FileEnd {
+                        transfer_id: chunk.transfer_id.clone(),
+                    },
+                    writer_ctx.frame_buffer,
+                )
+                .await?;
+                remove_outbound_transfer_flow(writer_ctx.outbound_transfer_flow, transfer_id);
+
+                if let Some((file_name, total_bytes)) = state
+                    .complete_outbound_file_transfer(peer_id, transfer_id)
+                    .await
+                {
+                    state
+                        .record_outgoing_file(peer_id, &file_name, total_bytes)
+                        .await;
+                    state.record_transport_event(TransportEventRecord {
+                        timestamp: Utc::now(),
+                        direction: "outgoing".to_string(),
+                        kind: "file_transfer_completed".to_string(),
+                        peer_id: peer_id.to_string(),
+                        detail: format!("transfer_id={transfer_id} file_name={file_name}"),
+                        size_bytes: total_bytes,
+                    });
+                }
+                Ok(SendPayloadOutcome::Sent)
+            } else {
+                Ok(SendPayloadOutcome::SentAndRequeue(
+                    OutboundPayload::FileTransferCursor {
+                        transfer_id: transfer_id.clone(),
+                    },
+                ))
+            }
         }
         OutboundPayload::FileEnd {
             transfer_id,

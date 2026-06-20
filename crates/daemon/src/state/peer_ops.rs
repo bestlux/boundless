@@ -76,6 +76,10 @@ impl AppState {
             self.clear_pending_clipboard_replay_for_peer(peer_id).await;
             self.clear_obsolete_inflight_clipboard_replays_for_peer(peer_id)
                 .await;
+            self.outbound_file_transfers
+                .write()
+                .await
+                .retain(|_, transfer| transfer.peer_id != peer_id);
             self.clear_remote_anti_idle_peer(peer_id).await;
             self.transport
                 .reconnect_generation_by_peer
@@ -125,6 +129,7 @@ impl AppState {
         .await?;
 
         let aborted_sessions = self.transport.clear().await;
+        self.outbound_file_transfers.write().await.clear();
         self.clipboard.clear().await;
         self.discovery.clear().await;
         self.pairing.clear().await;

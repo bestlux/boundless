@@ -7,7 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -125,6 +125,23 @@ pub struct PendingInjectInputFrame {
     pub events: Vec<InputEvent>,
 }
 
+struct OutboundFileTransfer {
+    peer_id: String,
+    file_name: String,
+    source_path: PathBuf,
+    total_bytes: u64,
+    source_modified: Option<SystemTime>,
+    offset_bytes: u64,
+    source_file: Option<tokio::fs::File>,
+}
+
+pub(crate) struct OutboundFileChunk {
+    pub(crate) transfer_id: String,
+    pub(crate) offset_bytes: u64,
+    pub(crate) data: Vec<u8>,
+    pub(crate) finished: bool,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ControlPlaneSnapshotBundle {
     pub(crate) config: RuntimeConfig,
@@ -203,6 +220,7 @@ pub struct AppState {
     discovery: Arc<DiscoveryState>,
     input: Arc<InputState>,
     anti_idle: Arc<AntiIdleState>,
+    outbound_file_transfers: Arc<RwLock<HashMap<String, OutboundFileTransfer>>>,
     security_paths: Arc<SecurityPaths>,
     identity: Arc<DeviceIdentity>,
     device_fingerprint: Arc<String>,
