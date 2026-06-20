@@ -159,7 +159,7 @@ async fn file_transfer_uses_configured_size_limit() {
 }
 
 #[tokio::test]
-async fn remove_queued_file_transfer_drops_deferred_chunks() {
+async fn remove_queued_file_transfer_drops_deferred_cursor() {
     let root = std::env::temp_dir().join(format!(
         "boundless-file-transfer-remove-queued-test-{}",
         uuid::Uuid::new_v4()
@@ -1298,7 +1298,8 @@ async fn queue_file_from_path_enqueues_chunked_bulk_transfer() {
         .expect("queue file");
 
     let queued = state.drain_outgoing_bulk(&peer_id, usize::MAX).await;
-    assert_eq!(queued.len(), 5, "start + 3 chunks + end expected");
+    assert_eq!(queued.len(), 2, "start + cursor expected");
+    assert_eq!(state.outbound_file_transfer_count().await, 1);
 
     let transfer_id = match queued.first() {
         Some(OutboundPayload::FileStart {
@@ -1313,45 +1314,133 @@ async fn queue_file_from_path_enqueues_chunked_bulk_transfer() {
         other => panic!("expected file start payload, got {other:?}"),
     };
 
-    let expected_chunks = [
-        (0u64, FILE_TRANSFER_CHUNK_BYTES),
-        (FILE_TRANSFER_CHUNK_BYTES as u64, FILE_TRANSFER_CHUNK_BYTES),
-        ((FILE_TRANSFER_CHUNK_BYTES * 2) as u64, 17usize),
-    ];
-    for (payload_item, (expected_offset, expected_size)) in queued
-        .iter()
-        .skip(1)
-        .take(3)
-        .zip(expected_chunks.into_iter())
-    {
-        match payload_item {
-            OutboundPayload::FileChunk {
-                transfer_id: chunk_transfer_id,
-                source_path,
-                offset_bytes,
-                length_bytes,
-            } => {
-                assert_eq!(chunk_transfer_id, &transfer_id);
-                assert_eq!(source_path, &file_path);
-                assert_eq!(*offset_bytes, expected_offset);
-                assert_eq!(*length_bytes, expected_size);
-            }
-            other => panic!("expected file chunk payload, got {other:?}"),
+    match queued.get(1) {
+        Some(OutboundPayload::FileTransferCursor {
+            transfer_id: cursor_transfer_id,
+        }) => {
+            assert_eq!(cursor_transfer_id, &transfer_id);
         }
+        other => panic!("expected file transfer cursor payload, got {other:?}"),
     }
 
-    match queued.get(4) {
-        Some(OutboundPayload::FileEnd {
-            transfer_id: end_transfer_id,
-            file_name,
-            total_bytes,
-        }) => {
-            assert_eq!(end_transfer_id, &transfer_id);
-            assert_eq!(file_name, "payload.bin");
-            assert_eq!(*total_bytes, payload.len() as u64);
-        }
-        other => panic!("expected file end payload, got {other:?}"),
-    }
+    state.requeue_outgoing_front(&peer_id, queued).await;
+    assert_eq!(state.outgoing_bulk_queue_len(&peer_id).await, 2);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn queue_large_file_uses_bounded_cursor_state() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-file-outgoing-large-cursor-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+    let (code, _) = state.create_pairing_code(120).await;
+    let peer_id = state
+        .join_peer(
+            code,
+            "127.0.0.1:15100".to_string(),
+            Some("peer".to_string()),
+        )
+        .await
+        .expect("join peer");
+
+    let file_path = root.join("large.bin");
+    tokio::fs::create_dir_all(&root).await.expect("create root");
+    let file = tokio::fs::File::create(&file_path)
+        .await
+        .expect("create sparse payload");
+    file.set_len(100 * 1024 * 1024)
+        .await
+        .expect("size sparse payload");
+    drop(file);
+
+    state
+        .queue_file_from_path(&peer_id, &file_path)
+        .await
+        .expect("queue large file");
+
+    assert_eq!(
+        state.outgoing_bulk_queue_len(&peer_id).await,
+        2,
+        "large file should queue only start + cursor"
+    );
+    assert_eq!(state.outbound_file_transfer_count().await, 1);
+
+    let queued = state.drain_outgoing_bulk(&peer_id, usize::MAX).await;
+    assert_eq!(queued.len(), 2);
+    assert!(matches!(
+        queued.first(),
+        Some(OutboundPayload::FileStart { .. })
+    ));
+    assert!(matches!(
+        queued.get(1),
+        Some(OutboundPayload::FileTransferCursor { .. })
+    ));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn cancel_outbound_file_transfer_before_start_emits_one_terminal_event() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-file-outgoing-cancel-before-start-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+    let (code, _) = state.create_pairing_code(120).await;
+    let peer_id = state
+        .join_peer(
+            code,
+            "127.0.0.1:15100".to_string(),
+            Some("peer".to_string()),
+        )
+        .await
+        .expect("join peer");
+    let file_path = root.join("cancel.bin");
+    tokio::fs::write(&file_path, vec![3u8; FILE_TRANSFER_CHUNK_BYTES + 1])
+        .await
+        .expect("write payload");
+
+    state
+        .queue_file_from_path(&peer_id, &file_path)
+        .await
+        .expect("queue file");
+    let queued = state.drain_outgoing_bulk(&peer_id, 1).await;
+    let transfer_id = match queued.first() {
+        Some(OutboundPayload::FileStart { transfer_id, .. }) => transfer_id.clone(),
+        other => panic!("expected file start payload, got {other:?}"),
+    };
+    state.requeue_outgoing_front(&peer_id, queued).await;
+
+    assert!(
+        state
+            .cancel_outbound_file_transfer(&peer_id, &transfer_id, "user_cancelled")
+            .await
+    );
+    assert!(
+        !state
+            .cancel_outbound_file_transfer(&peer_id, &transfer_id, "user_cancelled")
+            .await
+    );
+    assert_eq!(state.outgoing_bulk_queue_len(&peer_id).await, 0);
+    assert_eq!(state.outbound_file_transfer_count().await, 0);
+    let cancelled = state
+        .transport_events()
+        .await
+        .into_iter()
+        .filter(|event| event.kind == "file_transfer_cancelled")
+        .count();
+    assert_eq!(cancelled, 1);
 
     let _ = std::fs::remove_dir_all(&root);
 }

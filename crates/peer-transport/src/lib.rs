@@ -95,6 +95,9 @@ pub enum OutboundPayload {
         offset_bytes: u64,
         length_bytes: usize,
     },
+    FileTransferCursor {
+        transfer_id: String,
+    },
     FileEnd {
         transfer_id: String,
         file_name: String,
@@ -178,8 +181,10 @@ pub fn restore_outbound_chunk_credits_for_payloads(
     payloads: &[OutboundPayload],
 ) {
     for payload in payloads {
-        let OutboundPayload::FileChunk { transfer_id, .. } = payload else {
-            continue;
+        let transfer_id = match payload {
+            OutboundPayload::FileChunk { transfer_id, .. }
+            | OutboundPayload::FileTransferCursor { transfer_id } => transfer_id,
+            _ => continue,
         };
         let Some(flow) = outbound_transfer_flow.get_mut(transfer_id) else {
             continue;
