@@ -72,9 +72,15 @@ These are not hidden release blockers by default; they require explicit release-
 | n_minus_1_msi_upgrade | deferred | Requires a prior MSI artifact and Windows installer lab evidence; stable release packets must record the prior version used or a skip rationale. | docs/release/v5-release-hardening.md |
 | service_update_orchestration | deferred | Full MSI-owned service updater is larger than release-readiness evidence and remains outside the default MSI service boundary. | this document |
 | interactive_desktop_service_mode | deferred | Lock-screen and elevated-app behavior require Windows runtime evidence. | docs/release/v5-release-hardening.md |
-| transport_fault_injection_harness | partially landed | PR #89 landed a narrow post-auth session fault harness; broad multi-peer and reactor-level fault coverage remains BND-NEXT-7 scope. | this document, docs/architecture/network-v1.md |
+| transport_fault_injection_harness | partially landed | PR #89 landed a narrow post-auth session fault harness; BND-NEXT-7 used it for behavior-neutral reactor cleanup, while broad multi-peer/runtime fault coverage remains deferred. | this document, docs/architecture/network-v1.md |
 | mixed_dpi_input_matrix | deferred | Mixed-DPI and negative-coordinate monitor validation needs Windows hardware/runtime evidence. | this document |
 | stale_non_file_evidence | deferred | Current strict freshness enforcement is file-summary based; external workflow/run freshness still depends on release review metadata. | docs/release/release-readiness.md |
+
+## Next Backlog Step
+
+- BND-NEXT-7 is complete at the behavior-neutral post-auth session reactor cleanup level. PRs #90-#93 landed the code and earlier docs boundaries; [docs/architecture/network-v1.md](architecture/network-v1.md) records the final architecture state.
+- Full `SessionEvent`/`SessionPhase` machinery, broader multi-peer/runtime fault coverage, graceful per-session join lifecycle, and feature/product behavior remain deferred.
+- Recommended next backlog item: BND-NEXT-8, Clipboard Image Memory Profiling And Targeted Optimization. Start with profiling evidence and implement only if measured memory pressure is material.
 
 ## Pro Oversight Item Accounting
 
@@ -94,12 +100,12 @@ These are not hidden release blockers by default; they require explicit release-
 | Add project status and component map | addressed by this work | this file and docs/architecture/component-map.md | These are the canonical agent context docs. |
 | Make release evidence self-describing | landed and addressed by this work | release-readiness.json, release-readiness.md, release_policy, gate reasons/impacts | Stable policy fails failed/skipped/missing/stale supported evidence. |
 | Full MSI-owned service updater | deferred | service_update_orchestration gap | Requires product/installer work, not docs-only readiness. |
-| Full transport session reactor rewrite | deferred | BND-NEXT-7 architecture plan | High-risk refactor should use the PR #89 fault harness and land in small behavior-preserving slices. |
+| Full transport session reactor rewrite | partially landed | PRs #90-#93 and docs/architecture/network-v1.md | BND-NEXT-7 landed behavior-neutral post-auth boundaries: `SessionRuntime`, `SessionExitReason`, and named read/flush helpers. Full `SessionEvent`/`SessionPhase` machinery remains deferred. |
 | Pairing listener admission hardening | landed | PR #88 | Admission caps, duplicate manual join handling, and pre-consumption capacity checks are implemented; broader setup UX remains deferred. |
 | Runtime task supervisor | landed | PR #87 | Top-level task ownership, redacted health, and deterministic shutdown foundation are implemented; richer lifecycle policy remains follow-up reliability work. |
 | Clipboard image memory optimization | deferred | component map clipboard row | Requires runtime profiling and targeted implementation. |
 | Explorer shell integration | deferred | product feature backlog | Requires installer/shell UX work after transfer readiness. |
 | Clipboard status/policy UX | deferred | product feature backlog | Requires tray UX work; default clipboard content history remains out of scope. |
 | Guided two-device setup | deferred | product feature backlog | Builds on pairing/status diagnostics; not part of this docs/validation task. |
-| Broad reusable fault-injection harness | partially landed | PR #89 and transport_fault_injection_harness gap | Narrow post-auth session coverage exists; broad multi-peer/runtime reactor coverage remains BND-NEXT-7 follow-up. |
-| BND-PRO-3.3 remaining open work | open | none after this docs/validation change | Future work should be tracked as separate product/runtime/test issues. |
+| Broad reusable fault-injection harness | partially landed | PR #89 and transport_fault_injection_harness gap | Narrow post-auth session coverage exists; broad multi-peer/runtime fault coverage remains deferred outside BND-NEXT-7. |
+| BND-PRO-3.3 remaining open work | open | BND-NEXT-8 profiling candidate after BND-NEXT-7 | Remaining work is separate backlog, not unfinished BND-NEXT-7 implementation. |

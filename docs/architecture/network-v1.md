@@ -5,10 +5,14 @@ This document defines the canonical transport module boundaries after Slice 1 sl
 ## Module responsibilities
 
 - `crates/daemon/src/network/session.rs`
-  - Owns TLS session lifecycle and orchestrates read/write loops.
-  - Owns per-session transfer maps:
+  - Validates post-TLS peer identity before entering the post-auth session loop.
+  - Owns the authenticated session context and orchestrates read/write loop branches.
+  - Owns per-session runtime state:
+    - `SessionRuntime`
     - `inbound_transfers`
+    - `inbound_clipboard_image_transfers`
     - `outbound_transfer_flow`
+  - Names session exits with `SessionExitReason`.
   - Delegates message-specific behavior to specialized handlers.
 - `crates/daemon/src/network/control.rs`
   - Handles `Hello`, `HelloAck`, and `Heartbeat` transport control frames.
@@ -55,34 +59,32 @@ This document defines the canonical transport module boundaries after Slice 1 sl
   - `hello_handler_accepts_canonical_protocol_and_emits_ack_for_inbound`
   - `hello_ack_handler_flushes_pending_outgoing_payloads`
 
-## BND-NEXT-7 reactor rewrite planning
+## BND-NEXT-7 post-auth reactor boundaries
 
-The transport session reactor rewrite should stay behavior-preserving until the existing fault harness proves the current behavior on the new boundaries.
+PRs #90-#93 landed the behavior-neutral BND-NEXT-7 cleanup of the authenticated transport session loop. This section records the finalized architecture state: not a new public API or product feature, but a clearer internal reactor surface around the behavior that already existed.
 
-Current reactor problems to address:
+Landed boundaries:
 
-- `session.rs` still centralizes timers, outgoing flushes, incoming frame dispatch, reconnect checks, transfer cleanup, and session exit handling in one large post-auth loop.
-- Reconnect checks are repeated across heartbeat, input flush, bulk flush, flush-signal, and read branches.
-- Local session maps for inbound files, inbound clipboard images, and outbound transfer flow share control flow with wire I/O and protocol dispatch.
-- Session exit reasons are mostly implicit `break` or error paths, which makes fault handling harder to review.
-
-Preliminary target boundaries:
-
-- Keep TLS authentication and peer identity mismatch checks before the reactor boundary.
-- Introduce an internal `AuthenticatedSession` or equivalent context that owns immutable post-auth identity and local snapshot data.
-- Move mutable per-session state into a `SessionRuntime` or equivalent internal struct.
-- Name reactor inputs as explicit events such as heartbeat tick, input flush tick, bulk flush tick, outgoing flush signal, inbound frame, invalid frame, reconnect requested, state dropped, and I/O failure.
-- Name session phases such as starting, awaiting remote hello, active, draining, and closing.
-- Name session exits such as peer closed, reconnect requested, invalid frame, I/O failure, state dropped, and protocol rejected.
+- TLS setup, certificate validation, and topology peer-identity mismatch checks stay outside the reactor boundary. `run_session` authenticates the peer first, then `run_authenticated_session` drives the post-auth loop.
+- `AuthenticatedSession` owns immutable post-auth identity and local snapshot data: authenticated peer id, remote peer id, outbound/inbound direction, local machine id, and local device name.
+- `SessionRuntime` owns mutable post-auth state: remote protocol, inbound file transfers, inbound clipboard-image transfers, outbound transfer flow, reconnect generation, frame buffers, and anti-idle pulse timing.
+- `SessionExitReason` names clean session exits for reconnect requests, dropped state, peer close, invalid frames, and protocol rejection.
+- Outgoing work has named private branch boundaries for heartbeat ticks, input flush ticks, bulk flush ticks, explicit flush signals, file chunk credit handling, and shared input/bulk flush helpers.
+- Inbound work has named private boundaries for reading a frame result, decoding/recording rejected frames, and dispatching decoded `WireMessage` values.
+- Session-close cleanup still discards inbound transfer staging and marks the peer disconnected after the loop exits.
 
 Fault-harness status:
 
 - PR #89 landed a narrow post-auth in-memory harness that can drive the real session loop after TLS authentication has already established peer identity.
-- The harness covers read, write, flush, disconnect, delayed-frame, and reconnect-pair scenarios.
-- Broader multi-peer, multi-process, and full reactor-lifecycle fault coverage remains BND-NEXT-7 follow-up work.
+- The harness covers read, write, flush, disconnect, delayed-frame, and reconnect-pair scenarios used by the BND-NEXT-7 behavior-preserving slices.
+- Broader multi-peer, multi-process, and full runtime fault coverage remains deferred test infrastructure.
 
-Implementation guardrails:
+Deferred reactor work:
 
-- Do not change protocol semantics, retry policy, transfer resume behavior, or product UX inside the reactor rewrite.
-- Land the rewrite in small slices: docs/status cleanup, state extraction, eventized reconnect/exit handling, separated read dispatch/outgoing flush helpers, then final cleanup.
-- Each behavior-changing slice should run the PR #89 fault harness plus focused transfer/reconnect tests before workspace validation.
+- A full `SessionEvent` enum and `SessionPhase` state machine are not implemented. They remain future options if later behavior changes need explicit transition rules beyond the current private branch helpers.
+- Graceful per-session join/drain lifecycle is still separate reliability work; BND-NEXT-7 did not change task supervision, registration cleanup semantics, or transport shutdown policy.
+- Retry/resume behavior, product UX, diagnostics expansion, TLS/auth changes, public APIs, and transport protocol semantics remain out of scope.
+
+Next backlog step:
+
+- After BND-NEXT-7, the next quality-stack backlog item is BND-NEXT-8: clipboard image memory profiling and targeted optimization. Start with profiling evidence and implement only if it shows material memory pressure.
