@@ -709,14 +709,18 @@ async fn process_pairing_request(
             mut requester_bundle,
             requester_alias,
         } => {
-            state.consume_pairing_code(&code).await?;
             requester_bundle =
                 rewrite_requester_bundle_for_remote(state, remote_ip, requester_bundle).await;
             let requester_machine_id = requester_bundle.machine_id.clone();
             let requester_display_name = requester_bundle.display_name.clone();
             let requester_address = requester_bundle.network_address.clone();
             let pending = state
-                .queue_nearby_pairing_request(requester_bundle, requester_alias, remote_ip)
+                .queue_nearby_pairing_request_with_code(
+                    &code,
+                    requester_bundle,
+                    requester_alias,
+                    remote_ip,
+                )
                 .await?;
 
             info!(
@@ -892,6 +896,167 @@ mod tests {
         let requester_peer = state.get_peer("requester-machine").await.expect("peer");
         assert_eq!(requester_peer.address, "192.168.1.44:17777");
         assert_eq!(requester_peer.display_name, "Requester Alias");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn process_nearby_join_duplicate_retry_reuses_existing_pending_request() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-nearby-join-duplicate-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let receiver_config_path = root.join("receiver-config.json");
+        let receiver_security_root = root.join("receiver-security");
+        let state =
+            AppState::load_or_create_with_paths(receiver_config_path, receiver_security_root)
+                .expect("receiver state");
+
+        let requester_paths = SecurityPaths::for_root(root.join("requester-security"));
+        let requester_identity = ensure_device_identity(
+            &requester_paths,
+            "requester-machine",
+            "requester",
+            Some("10.10.0.5"),
+        )
+        .expect("requester identity");
+        let requester_bundle = TrustBundle {
+            machine_id: "requester-machine".to_string(),
+            display_name: "requester".to_string(),
+            network_address: "some-host:17777".to_string(),
+            ca_cert_pem: requester_identity.ca_cert_pem,
+        };
+        let remote_ip = "192.168.1.44".parse().expect("ip");
+        let (code, _) = state.create_pairing_code(120).await;
+
+        let first = process_pairing_request(
+            &state,
+            remote_ip,
+            PairingWireRequest::NearbyJoin {
+                code: code.clone(),
+                requester_bundle: requester_bundle.clone(),
+                requester_alias: None,
+            },
+        )
+        .await
+        .expect("first join should queue request");
+        let first_request_id = match first {
+            PairingWireResponse::Pending { request_id, .. } => request_id,
+            other => panic!("expected pending response, got {other:?}"),
+        };
+
+        let retry = process_pairing_request(
+            &state,
+            remote_ip,
+            PairingWireRequest::NearbyJoin {
+                code,
+                requester_bundle,
+                requester_alias: None,
+            },
+        )
+        .await
+        .expect("retry should reuse pending request even after code was consumed");
+        let retry_request_id = match retry {
+            PairingWireResponse::Pending { request_id, .. } => request_id,
+            other => panic!("expected pending retry response, got {other:?}"),
+        };
+
+        assert_eq!(retry_request_id, first_request_id);
+        assert_eq!(state.list_pending_nearby_pairing_requests().await.len(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn process_nearby_join_capacity_rejection_does_not_consume_pairing_code() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-nearby-join-capacity-code-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let receiver_config_path = root.join("receiver-config.json");
+        let receiver_security_root = root.join("receiver-security");
+        let state =
+            AppState::load_or_create_with_paths(receiver_config_path, receiver_security_root)
+                .expect("receiver state");
+
+        let requester_paths = SecurityPaths::for_root(root.join("requester-security"));
+        let requester_identity = ensure_device_identity(
+            &requester_paths,
+            "requester-machine",
+            "requester",
+            Some("10.10.0.5"),
+        )
+        .expect("requester identity");
+        let requester_bundle = TrustBundle {
+            machine_id: "requester-machine".to_string(),
+            display_name: "requester".to_string(),
+            network_address: "some-host:17777".to_string(),
+            ca_cert_pem: requester_identity.ca_cert_pem,
+        };
+        let (first_code, _) = state.create_pairing_code(120).await;
+        let (second_code, _) = state.create_pairing_code(120).await;
+        let (capacity_rejected_code, _) = state.create_pairing_code(120).await;
+
+        let first = process_pairing_request(
+            &state,
+            "192.168.1.44".parse().expect("ip"),
+            PairingWireRequest::NearbyJoin {
+                code: first_code,
+                requester_bundle: requester_bundle.clone(),
+                requester_alias: None,
+            },
+        )
+        .await
+        .expect("first join should queue request");
+        let first_request_id = match first {
+            PairingWireResponse::Pending { request_id, .. } => request_id,
+            other => panic!("expected pending response, got {other:?}"),
+        };
+
+        process_pairing_request(
+            &state,
+            "192.168.1.45".parse().expect("ip"),
+            PairingWireRequest::NearbyJoin {
+                code: second_code,
+                requester_bundle: requester_bundle.clone(),
+                requester_alias: None,
+            },
+        )
+        .await
+        .expect("second join should queue request at per-peer cap");
+
+        let capacity_error = process_pairing_request(
+            &state,
+            "192.168.1.46".parse().expect("ip"),
+            PairingWireRequest::NearbyJoin {
+                code: capacity_rejected_code.clone(),
+                requester_bundle: requester_bundle.clone(),
+                requester_alias: None,
+            },
+        )
+        .await
+        .expect_err("third join should be rejected by admission capacity");
+        assert!(
+            capacity_error.to_string().contains("for this peer"),
+            "capacity error should be returned before any code validation error"
+        );
+
+        assert!(state.reject_nearby_pairing_request(&first_request_id).await);
+        let retry = process_pairing_request(
+            &state,
+            "192.168.1.46".parse().expect("ip"),
+            PairingWireRequest::NearbyJoin {
+                code: capacity_rejected_code,
+                requester_bundle,
+                requester_alias: None,
+            },
+        )
+        .await
+        .expect("capacity-rejected code should remain usable after capacity is freed");
+        assert!(
+            matches!(retry, PairingWireResponse::Pending { .. }),
+            "retry should queue instead of reporting consumed code"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

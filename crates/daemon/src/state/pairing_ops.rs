@@ -53,6 +53,38 @@ impl AppState {
         requester_alias: Option<String>,
         source_ip: IpAddr,
     ) -> Result<PendingNearbyPairingRequest> {
+        self.queue_nearby_pairing_request_after_admission(
+            None,
+            requester_bundle,
+            requester_alias,
+            source_ip,
+        )
+        .await
+    }
+
+    pub async fn queue_nearby_pairing_request_with_code(
+        &self,
+        code: &str,
+        requester_bundle: TrustBundle,
+        requester_alias: Option<String>,
+        source_ip: IpAddr,
+    ) -> Result<PendingNearbyPairingRequest> {
+        self.queue_nearby_pairing_request_after_admission(
+            Some(code),
+            requester_bundle,
+            requester_alias,
+            source_ip,
+        )
+        .await
+    }
+
+    async fn queue_nearby_pairing_request_after_admission(
+        &self,
+        code: Option<&str>,
+        requester_bundle: TrustBundle,
+        requester_alias: Option<String>,
+        source_ip: IpAddr,
+    ) -> Result<PendingNearbyPairingRequest> {
         self.ensure_trust_rotation_not_pending()?;
         self.expire_nearby_pairing_requests().await;
         let mut pending_requests = self.pairing.pending_requests.write().await;
@@ -72,6 +104,13 @@ impl AppState {
             source_ip,
             PendingNearbyPairingAdmissionMode::ManualApproval,
         )?;
+
+        if let Some(code) = code {
+            let now = Utc::now();
+            let mut pairing_codes = self.pairing.pairing_codes.write().await;
+            validate_and_consume_pairing_code(&mut pairing_codes, code, now)?;
+            pairing_codes.retain(|_, expires_at| *expires_at >= now);
+        }
 
         let summary = PendingNearbyPairingRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
