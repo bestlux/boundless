@@ -358,15 +358,15 @@ fn redact_json_value(
                 redact_json_value(child, include_filenames, context, key_hint);
             }
         }
-        Value::String(text) => {
+        Value::String(text)
             if key_hint
                 .map(|key| key.eq_ignore_ascii_case("detail"))
                 .unwrap_or(false)
-                && looks_like_clipboard_secret(text)
-            {
-                *text = REDACTED_CLIPBOARD_TEXT.to_string();
-            }
+                && looks_like_clipboard_secret(text) =>
+        {
+            *text = REDACTED_CLIPBOARD_TEXT.to_string();
         }
+        Value::String(_) => {}
         _ => {}
     }
 }
