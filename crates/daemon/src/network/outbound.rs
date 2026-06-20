@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use crate::state::TransportEventRecord;
 use chrono::Utc;
-use core_clipboard::{ClipboardPayload, payload_hash_hex};
+use core_clipboard::image_hash_hex;
 use peer_transport::{
     CLIPBOARD_IMAGE_CHUNK_BYTES, OutboundTransferFlows, consume_outbound_chunk_credit,
     has_available_outbound_chunk_credit, register_outbound_transfer_flow,
@@ -368,6 +368,20 @@ where
             Ok(SendPayloadOutcome::Sent)
         }
         OutboundPayload::ClipboardImage { image_bmp } => {
+            if image_bmp.len() >= MAX_WIRE_FRAME_BYTES {
+                send_chunked_clipboard_image(
+                    writer_ctx.writer,
+                    writer_ctx.frame_buffer,
+                    local_machine_id,
+                    image_bmp,
+                )
+                .await?;
+                state
+                    .record_outgoing_clipboard_image(peer_id, image_bmp.len())
+                    .await;
+                return Ok(SendPayloadOutcome::Sent);
+            }
+
             let message = WireMessage::ClipboardImage {
                 machine_id: local_machine_id.to_string(),
                 data: image_bmp.clone(),
@@ -683,7 +697,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let transfer_id = uuid::Uuid::new_v4().to_string();
-    let hash_hex = payload_hash_hex(&ClipboardPayload::Image(image_bmp.to_vec()));
+    let hash_hex = image_hash_hex(image_bmp);
     send_message(
         writer,
         &WireMessage::ClipboardImageStart {

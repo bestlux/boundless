@@ -176,6 +176,7 @@ mod tests {
     use chrono::Utc;
     use core_clipboard::{ClipboardPayload, payload_hash_hex};
     use core_security::{SecurityPaths, TrustRecord, ensure_device_identity};
+    use sha2::{Digest, Sha256};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 
     struct FailAfterCallsWriter {
@@ -635,6 +636,159 @@ mod tests {
             1, 0, 24, 0, 0, 0, 0, 0, 4, 0, 0, 0, 19, 11, 0, 0, 19, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 255, 0,
         ]
+    }
+
+    fn synthetic_bmp_payload(size_bytes: usize) -> Vec<u8> {
+        const BMP_FILE_HEADER_BYTES: usize = 14;
+        const BMP_INFO_HEADER_BYTES: usize = 40;
+        const BMP_PIXEL_OFFSET: usize = BMP_FILE_HEADER_BYTES + BMP_INFO_HEADER_BYTES;
+        assert!(
+            size_bytes > BMP_PIXEL_OFFSET,
+            "synthetic BMP must leave room for pixel data"
+        );
+        assert!(
+            u32::try_from(size_bytes).is_ok(),
+            "synthetic BMP size must fit the BMP file-size header"
+        );
+
+        let pixel_bytes = size_bytes - BMP_PIXEL_OFFSET;
+        let mut payload = vec![0u8; size_bytes];
+        payload[0] = b'B';
+        payload[1] = b'M';
+        payload[2..6].copy_from_slice(&(size_bytes as u32).to_le_bytes());
+        payload[10..14].copy_from_slice(&(BMP_PIXEL_OFFSET as u32).to_le_bytes());
+        payload[14..18].copy_from_slice(&(BMP_INFO_HEADER_BYTES as u32).to_le_bytes());
+        payload[18..22].copy_from_slice(&1u32.to_le_bytes());
+        payload[22..26].copy_from_slice(&1u32.to_le_bytes());
+        payload[26..28].copy_from_slice(&1u16.to_le_bytes());
+        payload[28..30].copy_from_slice(&24u16.to_le_bytes());
+        payload[34..38].copy_from_slice(&(pixel_bytes as u32).to_le_bytes());
+        payload[BMP_PIXEL_OFFSET] = 0x7f;
+        payload
+    }
+
+    fn clipboard_image_hash_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update([0x02]);
+        hasher.update(bytes);
+        let digest = hasher.finalize();
+        let mut out = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
+    }
+
+    #[tokio::test]
+    #[ignore = "run with scripts/dev/profile-clipboard-image-memory.ps1"]
+    async fn clipboard_image_memory_profile_workload() {
+        let scenario = std::env::var("BOUNDLESS_CLIPBOARD_IMAGE_PROFILE_SCENARIO")
+            .unwrap_or_else(|_| "local-outbound".to_string());
+        let size_bytes = std::env::var("BOUNDLESS_CLIPBOARD_IMAGE_PROFILE_SIZE_BYTES")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(2 * 1024 * 1024);
+
+        match scenario.as_str() {
+            "noop" => {
+                let (_state, _peer_id, root) = state_with_peer_for_queue_test().await;
+                let _ = std::fs::remove_dir_all(root);
+            }
+            "direct-outbound" => {
+                let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+                state
+                    .queue_clipboard_image(&peer_id, synthetic_bmp_payload(size_bytes))
+                    .await
+                    .expect("queue direct clipboard image");
+                let mut writer = tokio::io::sink();
+                flush_outgoing_payloads(
+                    &state,
+                    "local",
+                    Some(&peer_id),
+                    PROTOCOL_CURRENT,
+                    &mut writer,
+                )
+                .await
+                .expect("flush direct clipboard image");
+                assert!(
+                    state.drain_outgoing(&peer_id).await.is_empty(),
+                    "direct outbound profile must drain queued payloads"
+                );
+                let _ = std::fs::remove_dir_all(root);
+            }
+            "local-outbound" => {
+                let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+                state
+                    .set_peer_connected(&peer_id, true)
+                    .await
+                    .expect("connect peer for local clipboard replay");
+                let queued = state
+                    .queue_local_clipboard_image_for_connected_peers(synthetic_bmp_payload(
+                        size_bytes,
+                    ))
+                    .await
+                    .expect("queue local clipboard image");
+                assert!(queued, "local image should queue for connected peer");
+                let mut writer = tokio::io::sink();
+                flush_outgoing_payloads(
+                    &state,
+                    "local",
+                    Some(&peer_id),
+                    PROTOCOL_CURRENT,
+                    &mut writer,
+                )
+                .await
+                .expect("flush local clipboard image");
+                assert!(
+                    state.drain_outgoing(&peer_id).await.is_empty(),
+                    "local outbound profile must drain queued payloads"
+                );
+                let _ = std::fs::remove_dir_all(root);
+            }
+            "inbound-chunked" => {
+                let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+                let image = synthetic_bmp_payload(size_bytes);
+                let hash_hex = clipboard_image_hash_hex(&image);
+                let mut inbound_transfers = HashMap::new();
+                handle_clipboard_image_start(
+                    &state,
+                    &peer_id,
+                    Some(&peer_id),
+                    peer_id.clone(),
+                    "profile-clipboard-image".to_string(),
+                    image.len() as u64,
+                    hash_hex,
+                    &mut inbound_transfers,
+                )
+                .await
+                .expect("start inbound clipboard image profile transfer");
+                for chunk in image.chunks(peer_transport::CLIPBOARD_IMAGE_CHUNK_BYTES) {
+                    handle_clipboard_image_chunk(
+                        &state,
+                        "profile-clipboard-image".to_string(),
+                        chunk.to_vec(),
+                        &mut inbound_transfers,
+                    )
+                    .await
+                    .expect("append inbound clipboard image profile chunk");
+                }
+                handle_clipboard_image_end(
+                    &state,
+                    "profile-clipboard-image".to_string(),
+                    &mut inbound_transfers,
+                )
+                .await
+                .expect("finish inbound clipboard image profile transfer");
+                assert!(
+                    state.dequeue_remote_clipboard_payload().await.is_some(),
+                    "inbound profile must enqueue remote clipboard image"
+                );
+                let _ = std::fs::remove_dir_all(root);
+            }
+            other => panic!("unknown clipboard image memory profile scenario: {other}"),
+        }
+
+        println!("clipboard_image_memory_profile scenario={scenario} size_bytes={size_bytes}");
     }
 
     fn remote_hello(peer_id: &str) -> WireMessage {

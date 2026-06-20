@@ -58,22 +58,25 @@ pub enum BmpValidationError {
 }
 
 pub fn payload_hash_hex(payload: &ClipboardPayload) -> String {
-    let mut hasher = Sha256::new();
     match payload {
-        ClipboardPayload::Text(text) => {
-            hasher.update([0x01]);
-            hasher.update(text.as_bytes());
-        }
-        ClipboardPayload::Image(bytes) => {
-            hasher.update([0x02]);
-            hasher.update(bytes);
-        }
+        ClipboardPayload::Text(text) => hash_bytes_hex(0x01, text.as_bytes()),
+        ClipboardPayload::Image(bytes) => image_hash_hex(bytes),
     }
-    bytes_to_hex(&hasher.finalize())
 }
 
 pub fn text_hash_hex(text: &str) -> String {
-    payload_hash_hex(&ClipboardPayload::Text(text.to_string()))
+    hash_bytes_hex(0x01, text.as_bytes())
+}
+
+pub fn image_hash_hex(bytes: &[u8]) -> String {
+    hash_bytes_hex(0x02, bytes)
+}
+
+fn hash_bytes_hex(kind: u8, bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update([kind]);
+    hasher.update(bytes);
+    bytes_to_hex(&hasher.finalize())
 }
 
 pub fn validate_payload(
@@ -234,5 +237,17 @@ mod tests {
         let text = payload_hash_hex(&ClipboardPayload::Text("abc".to_string()));
         let image = payload_hash_hex(&ClipboardPayload::Image(b"abc".to_vec()));
         assert_ne!(text, image);
+    }
+
+    #[test]
+    fn direct_hash_helpers_match_payload_hashes() {
+        assert_eq!(
+            text_hash_hex("abc"),
+            payload_hash_hex(&ClipboardPayload::Text("abc".to_string()))
+        );
+        assert_eq!(
+            image_hash_hex(b"abc"),
+            payload_hash_hex(&ClipboardPayload::Image(b"abc".to_vec()))
+        );
     }
 }

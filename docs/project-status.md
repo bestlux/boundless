@@ -75,12 +75,13 @@ These are not hidden release blockers by default; they require explicit release-
 | transport_fault_injection_harness | partially landed | PR #89 landed a narrow post-auth session fault harness; BND-NEXT-7 used it for behavior-neutral reactor cleanup, while broad multi-peer/runtime fault coverage remains deferred. | this document, docs/architecture/network-v1.md |
 | mixed_dpi_input_matrix | deferred | Mixed-DPI and negative-coordinate monitor validation needs Windows hardware/runtime evidence. | this document |
 | stale_non_file_evidence | deferred | Current strict freshness enforcement is file-summary based; external workflow/run freshness still depends on release review metadata. | docs/release/release-readiness.md |
+| clipboard_image_spooling | deferred | BND-NEXT-8A bounded the measured outbound/local image allocation path; inbound/apply still materializes full BMP buffers and should become streaming or spooling work only with separate architecture evidence. | docs/performance/clipboard-image-memory.md |
 
 ## Next Backlog Step
 
 - BND-NEXT-7 is complete at the behavior-neutral post-auth session reactor cleanup level. PRs #90-#93 landed the code and earlier docs boundaries; [docs/architecture/network-v1.md](architecture/network-v1.md) records the final architecture state.
-- Full `SessionEvent`/`SessionPhase` machinery, broader multi-peer/runtime fault coverage, graceful per-session join lifecycle, and feature/product behavior remain deferred.
-- Recommended next backlog item: BND-NEXT-8, Clipboard Image Memory Profiling And Targeted Optimization. Start with profiling evidence and implement only if measured memory pressure is material.
+- BND-NEXT-8A profiled clipboard image memory pressure and applies a bounded allocation fix for local/outbound large image paths; [docs/performance/clipboard-image-memory.md](performance/clipboard-image-memory.md) records the command, path map, evidence, and recommendation.
+- Full `SessionEvent`/`SessionPhase` machinery, broader multi-peer/runtime fault coverage, graceful per-session join lifecycle, clipboard image streaming/spooling, and feature/product behavior remain deferred.
 
 ## Pro Oversight Item Accounting
 
@@ -103,7 +104,7 @@ These are not hidden release blockers by default; they require explicit release-
 | Full transport session reactor rewrite | partially landed | PRs #90-#93 and docs/architecture/network-v1.md | BND-NEXT-7 landed behavior-neutral post-auth boundaries: `SessionRuntime`, `SessionExitReason`, and named read/flush helpers. Full `SessionEvent`/`SessionPhase` machinery remains deferred. |
 | Pairing listener admission hardening | landed | PR #88 | Admission caps, duplicate manual join handling, and pre-consumption capacity checks are implemented; broader setup UX remains deferred. |
 | Runtime task supervisor | landed | PR #87 | Top-level task ownership, redacted health, and deterministic shutdown foundation are implemented; richer lifecycle policy remains follow-up reliability work. |
-| Clipboard image memory optimization | deferred | component map clipboard row | Requires runtime profiling and targeted implementation. |
+| Clipboard image memory optimization | partially landed | scripts/dev/profile-clipboard-image-memory.ps1; docs/performance/clipboard-image-memory.md | BND-NEXT-8A profiled synthetic 2 MiB and 8 MiB BMP payloads and bounded the outbound/local allocation path; inbound/apply full-buffer streaming or spooling remains deferred. |
 | Explorer shell integration | deferred | product feature backlog | Requires installer/shell UX work after transfer readiness. |
 | Clipboard status/policy UX | deferred | product feature backlog | Requires tray UX work; default clipboard content history remains out of scope. |
 | Guided two-device setup | deferred | product feature backlog | Builds on pairing/status diagnostics; not part of this docs/validation task. |
