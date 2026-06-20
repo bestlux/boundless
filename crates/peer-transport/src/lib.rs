@@ -310,9 +310,15 @@ pub struct TransportRuntimeState {
     pub outgoing_flush_signal: watch::Sender<u64>,
     pub outgoing_flush_generation: AtomicU64,
     pub peer_reconcile_wake: Arc<RuntimeWakeSignal>,
-    pub pending_transport_session_abort_handles: RwLock<HashMap<u64, AbortHandle>>,
-    pub transport_session_abort_handles_by_peer: RwLock<HashMap<String, HashMap<u64, AbortHandle>>>,
+    pub transport_session_registry: Mutex<TransportSessionRegistry>,
     pub next_transport_session_id: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+pub struct TransportSessionRegistry {
+    closed: bool,
+    pending_abort_handles: HashMap<u64, AbortHandle>,
+    abort_handles_by_peer: HashMap<String, HashMap<u64, AbortHandle>>,
 }
 
 impl Default for TransportRuntimeState {
@@ -327,8 +333,7 @@ impl Default for TransportRuntimeState {
             outgoing_flush_signal,
             outgoing_flush_generation: AtomicU64::new(0),
             peer_reconcile_wake: Arc::new(RuntimeWakeSignal::default()),
-            pending_transport_session_abort_handles: RwLock::new(HashMap::new()),
-            transport_session_abort_handles_by_peer: RwLock::new(HashMap::new()),
+            transport_session_registry: Mutex::new(TransportSessionRegistry::default()),
             next_transport_session_id: AtomicU64::new(1),
         }
     }
@@ -345,20 +350,22 @@ impl TransportRuntimeState {
         if let Ok(mut high_water) = self.outgoing_input_high_water_by_peer.lock() {
             high_water.clear();
         }
-        let pending_sessions = self
-            .pending_transport_session_abort_handles
-            .write()
-            .await
-            .drain()
-            .map(|(_, handle)| handle)
-            .collect::<Vec<_>>();
-        let peer_sessions = self
-            .transport_session_abort_handles_by_peer
-            .write()
-            .await
-            .drain()
-            .flat_map(|(_, sessions)| sessions.into_values())
-            .collect::<Vec<_>>();
+        let (pending_sessions, peer_sessions) =
+            if let Ok(mut registry) = self.transport_session_registry.lock() {
+                let pending_sessions = registry
+                    .pending_abort_handles
+                    .drain()
+                    .map(|(_, handle)| handle)
+                    .collect::<Vec<_>>();
+                let peer_sessions = registry
+                    .abort_handles_by_peer
+                    .drain()
+                    .flat_map(|(_, sessions)| sessions.into_values())
+                    .collect::<Vec<_>>();
+                (pending_sessions, peer_sessions)
+            } else {
+                (Vec::new(), Vec::new())
+            };
         let aborted = pending_sessions.len() + peer_sessions.len();
         for handle in pending_sessions.into_iter().chain(peer_sessions) {
             handle.abort();
@@ -436,47 +443,62 @@ impl TransportRuntimeState {
         events.iter().cloned().collect()
     }
 
-    pub async fn register_pending_transport_session(&self, abort_handle: AbortHandle) -> u64 {
+    pub fn register_pending_transport_session(&self, abort_handle: AbortHandle) -> u64 {
+        let Ok(mut registry) = self.transport_session_registry.lock() else {
+            abort_handle.abort();
+            return 0;
+        };
+
+        if registry.closed {
+            abort_handle.abort();
+            return 0;
+        }
         let session_id = self.allocate_transport_session_id();
-        self.pending_transport_session_abort_handles
-            .write()
-            .await
+        registry
+            .pending_abort_handles
             .insert(session_id, abort_handle);
         session_id
     }
 
-    pub async fn register_transport_session_for_peer(
+    pub fn register_transport_session_for_peer(
         &self,
         peer_id: &str,
         abort_handle: AbortHandle,
     ) -> u64 {
+        let Ok(mut registry) = self.transport_session_registry.lock() else {
+            abort_handle.abort();
+            return 0;
+        };
+
+        if registry.closed {
+            abort_handle.abort();
+            return 0;
+        }
         let session_id = self.allocate_transport_session_id();
-        self.transport_session_abort_handles_by_peer
-            .write()
-            .await
+        registry
+            .abort_handles_by_peer
             .entry(peer_id.to_string())
             .or_default()
             .insert(session_id, abort_handle);
         session_id
     }
 
-    pub async fn bind_pending_transport_session_to_peer(
-        &self,
-        session_id: u64,
-        peer_id: &str,
-    ) -> bool {
-        let abort_handle = self
-            .pending_transport_session_abort_handles
-            .write()
-            .await
-            .remove(&session_id);
-        let Some(abort_handle) = abort_handle else {
+    pub fn bind_pending_transport_session_to_peer(&self, session_id: u64, peer_id: &str) -> bool {
+        let Ok(mut registry) = self.transport_session_registry.lock() else {
             return false;
         };
 
-        self.transport_session_abort_handles_by_peer
-            .write()
-            .await
+        let abort_handle = registry.pending_abort_handles.remove(&session_id);
+        let Some(abort_handle) = abort_handle else {
+            return false;
+        };
+        if registry.closed {
+            abort_handle.abort();
+            return false;
+        }
+
+        registry
+            .abort_handles_by_peer
             .entry(peer_id.to_string())
             .or_default()
             .insert(session_id, abort_handle);
@@ -484,39 +506,95 @@ impl TransportRuntimeState {
     }
 
     pub async fn clear_transport_session_registration(&self, session_id: u64) {
-        if self
-            .pending_transport_session_abort_handles
-            .write()
-            .await
-            .remove(&session_id)
-            .is_some()
-        {
+        let Ok(mut registry) = self.transport_session_registry.lock() else {
+            return;
+        };
+
+        if registry.pending_abort_handles.remove(&session_id).is_some() {
             return;
         }
-
-        let mut by_peer = self.transport_session_abort_handles_by_peer.write().await;
         let mut empty_peers = Vec::<String>::new();
-        for (peer_id, sessions) in by_peer.iter_mut() {
+        for (peer_id, sessions) in registry.abort_handles_by_peer.iter_mut() {
             if sessions.remove(&session_id).is_some() && sessions.is_empty() {
                 empty_peers.push(peer_id.clone());
             }
         }
         for peer_id in empty_peers {
-            by_peer.remove(&peer_id);
+            registry.abort_handles_by_peer.remove(&peer_id);
         }
     }
 
     pub async fn abort_transport_sessions_for_peer(&self, peer_id: &str) -> usize {
         let sessions = self
-            .transport_session_abort_handles_by_peer
-            .write()
-            .await
-            .remove(peer_id)
+            .transport_session_registry
+            .lock()
+            .ok()
+            .and_then(|mut registry| registry.abort_handles_by_peer.remove(peer_id))
             .unwrap_or_default();
         let aborted = sessions.len();
         for handle in sessions.into_values() {
             handle.abort();
         }
         aborted
+    }
+
+    pub fn begin_transport_session_shutdown(&self) {
+        if let Ok(mut registry) = self.transport_session_registry.lock() {
+            registry.closed = true;
+        }
+    }
+
+    pub async fn abort_all_transport_sessions(&self) -> usize {
+        let (pending_sessions, peer_sessions) =
+            if let Ok(mut registry) = self.transport_session_registry.lock() {
+                let pending_sessions = registry
+                    .pending_abort_handles
+                    .drain()
+                    .map(|(_, handle)| handle)
+                    .collect::<Vec<_>>();
+                let peer_sessions = registry
+                    .abort_handles_by_peer
+                    .drain()
+                    .flat_map(|(_, sessions)| sessions.into_values())
+                    .collect::<Vec<_>>();
+                (pending_sessions, peer_sessions)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+        let aborted = pending_sessions.len() + peer_sessions.len();
+        for handle in pending_sessions.into_iter().chain(peer_sessions) {
+            handle.abort();
+        }
+        aborted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closed_session_registry_aborts_child_spawned_before_registration() {
+        let state = TransportRuntimeState::default();
+        let child = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        state.begin_transport_session_shutdown();
+        let session_id = state.register_transport_session_for_peer("peer-a", child.abort_handle());
+
+        assert_eq!(
+            session_id, 0,
+            "registration should be refused after shutdown begins"
+        );
+        let join_error = child
+            .await
+            .expect_err("child spawned before registration should be aborted");
+        assert!(join_error.is_cancelled());
+        assert_eq!(
+            state.abort_all_transport_sessions().await,
+            0,
+            "refused registration must not leave a drainable session behind"
+        );
     }
 }

@@ -9,6 +9,7 @@ pub mod input;
 pub mod logging;
 pub mod network;
 pub mod pairing_wire;
+pub(crate) mod runtime_tasks;
 pub mod state;
 
 pub use config::ApiTransport;

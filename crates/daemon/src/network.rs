@@ -22,7 +22,10 @@ use tokio_rustls::{
 };
 use tracing::{error, info, warn};
 
-use crate::state::{AppState, OutboundPayload};
+use crate::{
+    runtime_tasks::{RuntimeTaskOwner, RuntimeTaskShutdown, RuntimeTaskSpec},
+    state::{AppState, OutboundPayload},
+};
 use core_input::{InputEvent, InputFrame, KeyState, MouseButton};
 use core_protocol::{
     MAX_WIRE_PAYLOAD_BYTES, PROTOCOL_CURRENT, ProtocolVersion, WIRE_FRAME_LENGTH_PREFIX_BYTES,
@@ -72,11 +75,27 @@ const FALLBACK_BIND_HOST: &str = "0.0.0.0";
 
 pub fn start(state: AppState, listener: Option<TcpListener>) {
     if let Some(listener) = listener {
-        tokio::spawn(listener_loop(state.clone(), listener));
+        let listener_state = state.clone();
+        state.spawn_runtime_task(
+            RuntimeTaskSpec::new(
+                "network.listener",
+                RuntimeTaskOwner::Network,
+                RuntimeTaskShutdown::AbortOnDaemonShutdown,
+            ),
+            listener_loop(listener_state, listener),
+        );
     } else {
         warn!("transport listener not started");
     }
-    tokio::spawn(supervisor_loop(state));
+    let supervisor_state = state.clone();
+    state.spawn_runtime_task(
+        RuntimeTaskSpec::new(
+            "network.supervisor",
+            RuntimeTaskOwner::Network,
+            RuntimeTaskShutdown::AbortOnDaemonShutdown,
+        ),
+        supervisor_loop(supervisor_state),
+    );
 }
 
 pub async fn prepare_listener(state: &AppState) -> Option<TcpListener> {
