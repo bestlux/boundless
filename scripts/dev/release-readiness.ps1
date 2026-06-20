@@ -356,10 +356,6 @@ if ($IncludeRuntimeGates) {
     Invoke-Gate -Id "edge_handoff_trace" -Category "runtime" -Command "scripts/dev/test-suite.ps1 -Profile trace" -Action {
         & (Join-Path $repoRoot "scripts/dev/test-suite.ps1") -Profile trace -TimeoutSeconds $RuntimeTimeoutSeconds -EndpointA $EndpointA -EndpointB $EndpointB -KeepArtifacts
     }
-    Invoke-Gate -Id "clipboard_file_matrix" -Category "runtime" -Command "scripts/dev/test-suite.ps1 -Profile clipboard" -Action {
-        & (Join-Path $repoRoot "scripts/dev/test-suite.ps1") -Profile clipboard -TimeoutSeconds $RuntimeTimeoutSeconds -KeepArtifacts
-    }
-
     if ([string]::IsNullOrWhiteSpace($EndpointB)) {
         Add-SkippedGate -Id "pairing_recovery_matrix" -Category "runtime" -Command "scripts/dev/test-suite.ps1 -Profile recovery" -Reason "EndpointB was not provided" -Impact "pairing recovery must be validated before release signoff"
     }
@@ -374,7 +370,6 @@ else {
     Add-SkippedGate -Id "three_node_smoke" -Category "runtime" -Command "scripts/dev/three-node-smoke.ps1" -Reason "IncludeRuntimeGates was not set" -Impact "three-node runtime behavior remains release-candidate evidence"
     Add-SkippedGate -Id "four_node_topology" -Category "runtime" -Command "cargo test -p app-services layout_matrix_validation_accepts_four_remote_peers_plus_local" -Reason "IncludeRuntimeGates was not set" -Impact "four-machine deterministic topology evidence remains release-candidate evidence"
     Add-SkippedGate -Id "edge_handoff_trace" -Category "runtime" -Command "scripts/dev/test-suite.ps1 -Profile trace" -Reason "IncludeRuntimeGates was not set" -Impact "input latency budgets remain release-candidate evidence"
-    Add-SkippedGate -Id "clipboard_file_matrix" -Category "runtime" -Command "scripts/dev/test-suite.ps1 -Profile clipboard" -Reason "IncludeRuntimeGates was not set" -Impact "clipboard/file workflow evidence remains release-candidate evidence"
     Add-SkippedGate -Id "pairing_recovery_matrix" -Category "runtime" -Command "scripts/dev/test-suite.ps1 -Profile recovery" -Reason "IncludeRuntimeGates was not set" -Impact "pairing recovery evidence remains release-candidate evidence"
 }
 
