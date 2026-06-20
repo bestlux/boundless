@@ -1,6 +1,6 @@
 # V5 Readiness Packet Template
 
-The generated packet from `scripts/dev/v5-readiness.ps1` is the canonical v5 readiness packet. Release reviewers should treat this template as the required shape when reading or extending the generated JSON and Markdown.
+The generated packet from `scripts/dev/release-readiness.ps1` is the canonical release readiness packet for v5. Release reviewers should treat this template as the required shape when reading or extending the generated JSON and Markdown.
 
 ## Required Sections
 
@@ -9,7 +9,7 @@ The generated packet from `scripts/dev/v5-readiness.ps1` is the canonical v5 rea
 - Evidence: log path or copied artifact path for every passed or failed gate.
 - Skip rationale: reason and release impact for every skipped gate.
 - Parity release blockers: snapshot of each `yes` row from `docs/parity/mouse-without-borders.md`.
-- Installer evidence: copied `installer-smoke.json` with binary signature status for MSI, tray, daemon, service host, and CLI.
+- Installer evidence: copied `installer-smoke.json` with binary signature status for MSI, tray, daemon, service host, and CLI, plus matching service-host version output.
 
 ## Release Rule
 

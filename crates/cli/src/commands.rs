@@ -5,8 +5,10 @@ use app_services::desktop::{
     resolve_boundlessd_candidates, spawn_boundlessd_process, terminate_boundlessd_processes,
     validate_layout_matrix_spec,
 };
+#[cfg(any(windows, test))]
+use std::path::PathBuf as StdPathBuf;
 #[cfg(windows)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const BOUNDLESS_SERVICE_NAME: &str = "BoundlessService";
 #[cfg(windows)]
@@ -89,8 +91,9 @@ pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let status = client.get_status(StatusRequest {}).await?.into_inner();
     println!(
-        "running={} machine_id={} peers={} protocol={} api_transport={} api_bind={} api_pipe_name={} input_locked={} input_lock_supported={} active_capture_target={} anti_idle_supported={} anti_idle_enabled={} anti_idle_active={} anti_idle_display_required={}",
+        "running={} daemon_version={} machine_id={} peers={} protocol={} api_transport={} api_bind={} api_pipe_name={} input_locked={} input_lock_supported={} active_capture_target={} anti_idle_supported={} anti_idle_enabled={} anti_idle_active={} anti_idle_display_required={}",
         status.running,
+        status.daemon_version,
         status.machine_id,
         status.peer_count,
         status.protocol_version,
@@ -797,6 +800,66 @@ pub(super) async fn layout_set(endpoint: &str, matrix: String) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+fn extract_service_executable_path(raw_binary_path: &str) -> StdPathBuf {
+    let trimmed = raw_binary_path.trim();
+    if let Some(rest) = trimmed.strip_prefix('"')
+        && let Some((path, _)) = rest.split_once('"')
+    {
+        return StdPathBuf::from(path);
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(index) = lower.find(".exe") {
+        return StdPathBuf::from(&trimmed[..index + 4]);
+    }
+
+    StdPathBuf::from(trimmed.split_whitespace().next().unwrap_or(trimmed))
+}
+
+#[cfg(any(windows, test))]
+fn service_version_parity(service_version: Option<&str>, expected_version: &str) -> &'static str {
+    let Some(service_version) = service_version else {
+        return "unknown";
+    };
+    if normalize_version(service_version) == normalize_version(expected_version) {
+        "matched"
+    } else {
+        "mismatched"
+    }
+}
+
+#[cfg(any(windows, test))]
+fn normalize_version(version: &str) -> &str {
+    version.trim().trim_start_matches('v')
+}
+
+#[cfg(windows)]
+fn service_binary_manifest_version(binary_path: &Path) -> (String, &'static str) {
+    let Some(parent) = binary_path.parent() else {
+        return ("unknown".to_string(), "missing_binary_parent");
+    };
+    let manifest_path = parent.join("package-manifest.json");
+    if !manifest_path.is_file() {
+        return ("unknown".to_string(), "missing_package_manifest");
+    }
+
+    let version = std::fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .and_then(|manifest| {
+            manifest
+                .get("version")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        });
+
+    match version {
+        Some(version) if !version.trim().is_empty() => (version, "package_manifest"),
+        _ => ("unknown".to_string(), "invalid_package_manifest"),
+    }
+}
+
 #[cfg(windows)]
 pub(super) async fn service_status() -> Result<()> {
     use windows_service::{
@@ -805,20 +868,36 @@ pub(super) async fn service_status() -> Result<()> {
     };
 
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    match manager.open_service(BOUNDLESS_SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+    match manager.open_service(
+        BOUNDLESS_SERVICE_NAME,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+    ) {
         Ok(service) => {
             let status = service.query_status()?;
+            let config = service.query_config()?;
+            let binary = extract_service_executable_path(&config.executable_path.to_string_lossy());
+            let (service_version, version_source) = service_binary_manifest_version(&binary);
+            let known_service_version =
+                (service_version != "unknown").then_some(service_version.as_str());
+            let parity = service_version_parity(known_service_version, env!("CARGO_PKG_VERSION"));
             println!(
-                "installed=true service={} state={:?} process_id={}",
+                "installed=true service={} state={:?} process_id={} binary={} service_version={} service_version_source={} cli_version={} version_parity={}",
                 BOUNDLESS_SERVICE_NAME,
                 status.current_state,
-                status.process_id.unwrap_or_default()
+                status.process_id.unwrap_or_default(),
+                binary.display(),
+                service_version,
+                version_source,
+                env!("CARGO_PKG_VERSION"),
+                parity
             );
         }
         Err(error) => {
             println!(
-                "installed=false service={} state=not_installed error={}",
-                BOUNDLESS_SERVICE_NAME, error
+                "installed=false service={} state=not_installed cli_version={} version_parity=not_installed error={}",
+                BOUNDLESS_SERVICE_NAME,
+                env!("CARGO_PKG_VERSION"),
+                error
             );
         }
     }
@@ -828,7 +907,8 @@ pub(super) async fn service_status() -> Result<()> {
 #[cfg(not(windows))]
 pub(super) async fn service_status() -> Result<()> {
     println!(
-        "installed=false service={BOUNDLESS_SERVICE_NAME} state=unsupported platform=non-windows"
+        "installed=false service={BOUNDLESS_SERVICE_NAME} state=unsupported platform=non-windows cli_version={} version_parity=unsupported",
+        env!("CARGO_PKG_VERSION")
     );
     Ok(())
 }
@@ -2349,6 +2429,37 @@ mod tests {
             host_and_pairing_port_from_endpoint("DESKTOP-ABC:15100").expect("parse endpoint");
         assert_eq!(host, "DESKTOP-ABC");
         assert_eq!(port, 15200);
+    }
+
+    #[test]
+    fn extract_service_executable_path_handles_quoted_path_with_args() {
+        let path = extract_service_executable_path(
+            r#""C:\Program Files\Boundless\boundless-service.exe" --allowed-user-sid=S-1-5-21-1"#,
+        );
+
+        assert_eq!(
+            path,
+            StdPathBuf::from(r"C:\Program Files\Boundless\boundless-service.exe")
+        );
+    }
+
+    #[test]
+    fn extract_service_executable_path_handles_unquoted_path_with_args() {
+        let path = extract_service_executable_path(
+            r"C:\Tools\Boundless\boundless-service.exe --allowed-user-sid=S-1-5-21-1",
+        );
+
+        assert_eq!(
+            path,
+            StdPathBuf::from(r"C:\Tools\Boundless\boundless-service.exe")
+        );
+    }
+
+    #[test]
+    fn service_version_parity_reports_match_mismatch_and_unknown() {
+        assert_eq!(service_version_parity(Some("v5.0.0"), "5.0.0"), "matched");
+        assert_eq!(service_version_parity(Some("4.0.2"), "5.0.0"), "mismatched");
+        assert_eq!(service_version_parity(None, "5.0.0"), "unknown");
     }
 
     #[test]

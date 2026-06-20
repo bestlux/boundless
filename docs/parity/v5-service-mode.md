@@ -51,7 +51,7 @@ The v5 readiness packet must classify elevated-app and lock-screen behavior as:
 
 The Windows packaging manifest, WiX payload, package script, and release signing list include `boundless-service.exe`. The service is not silently installed by the per-user MSI; service installation remains an explicit admin action until the installer owns a reviewed elevated/service option.
 
-Installer smoke asserts the service payload/signature and that uninstall leaves no registered Boundless service. The separate service smoke harness proves install/start/status/daemon-health/stop/uninstall when `v5-readiness.ps1 -IncludeServiceSmoke` is run from an elevated Windows shell.
+Installer smoke asserts the service payload/signature, service-host version output, and that uninstall leaves no registered Boundless service. The separate service smoke harness proves install/start/status/daemon-health/stop/uninstall when `release-readiness.ps1 -IncludeServiceSmoke` is run from an elevated Windows shell.
 
 ## Current Validation Evidence
 

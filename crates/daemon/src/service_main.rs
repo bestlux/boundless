@@ -1,10 +1,20 @@
 #[cfg(windows)]
 fn main() -> windows_service::Result<()> {
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("boundless-service {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     service_entry::run()
 }
 
 #[cfg(not(windows))]
 fn main() {
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("boundless-service {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     eprintln!("boundless-service is only supported on Windows");
 }
 
