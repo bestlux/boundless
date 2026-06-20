@@ -190,9 +190,12 @@ message HotkeyTriggerRequest {
 
 message DiagnosticsDumpRequest {
   string output_path = 1;
+  bool include_filenames = 2;
 }
 message DiagnosticsDumpReply {
   string bundle_path = 1;
+  string manifest_path = 2;
+  bool filenames_included = 3;
 }
 
 message SafeResetRequest {

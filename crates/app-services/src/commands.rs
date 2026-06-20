@@ -83,6 +83,7 @@ pub struct RotateTrustCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticsDumpCommand {
     pub output_path: Option<String>,
+    pub include_filenames: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +202,8 @@ pub struct LayoutReply {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticsDumpReply {
     pub bundle_path: String,
+    pub manifest_path: String,
+    pub filenames_included: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

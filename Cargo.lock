@@ -166,7 +166,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "dirs",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-stream",
 ]

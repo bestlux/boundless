@@ -11,6 +11,14 @@ $BoundlessDaemon = "$env:LOCALAPPDATA\Programs\Boundless\boundlessd.exe"
 
 For release candidates, also attach the latest `scripts/dev/release-readiness.ps1` packet.
 
+## Diagnostic Bundle Privacy
+
+`boundlessctl diagnostics dump` writes a redacted JSON bundle and a `.redaction.txt` manifest, then prints both paths. Use `--offline` when the daemon is not reachable; offline bundles still include CLI version and service metadata, but in-memory peer health and recent transfer history are unavailable. Use `--open-folder` to open the containing folder after export.
+
+The default bundle includes versions, runtime mode, service install/path/version parity, component health, file-transfer settings, peer health aliases, and recent redacted transfer or transport events. It excludes clipboard plaintext, private keys, trust secrets, cert/key material, tokens, auth material, raw peer IDs, raw machine IDs, transfer IDs, request IDs, and local paths.
+
+Filenames are redacted by default. Passing `--include-filenames` is an explicit opt-in that includes only basename values, not full local paths.
+
 ## Discovery
 
 Symptoms:

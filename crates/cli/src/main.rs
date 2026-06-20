@@ -365,6 +365,12 @@ enum DiagnosticsCommand {
     Dump {
         #[arg(long)]
         output: Option<String>,
+        #[arg(long, default_value_t = false)]
+        include_filenames: bool,
+        #[arg(long, default_value_t = false)]
+        offline: bool,
+        #[arg(long, default_value_t = false)]
+        open_folder: bool,
     },
     RunAction {
         action: String,
@@ -566,7 +572,21 @@ async fn main() -> Result<()> {
         },
         Command::Hotkey { action, combo } => hotkey_set(&cli.endpoint, action, combo).await,
         Command::Diagnostics { command } => match command {
-            DiagnosticsCommand::Dump { output } => diagnostics_dump(&cli.endpoint, output).await,
+            DiagnosticsCommand::Dump {
+                output,
+                include_filenames,
+                offline,
+                open_folder,
+            } => {
+                diagnostics_dump(
+                    &cli.endpoint,
+                    output,
+                    include_filenames,
+                    offline,
+                    open_folder,
+                )
+                .await
+            }
             DiagnosticsCommand::RunAction { action } => {
                 diagnostics_run_action(&cli.endpoint, action).await
             }
