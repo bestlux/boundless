@@ -199,11 +199,9 @@ function Run-RecoveryMatrix {
     }
 }
 
-function Run-ClipboardMatrix {
-    Invoke-CheckedCommand -Label "scripts/dev/clipboard-matrix.ps1" -Action {
-        & (Join-Path $repoRoot "scripts/dev/clipboard-matrix.ps1") | Out-Host
-    }
-
+function Run-ClipboardRuntimeSmoke {
+    # Deterministic clipboard behavior is covered by workspace Rust tests.
+    # This profile is the focused runtime smoke path for clipboard delivery.
     $smokeParams = @{
         TimeoutSeconds = $TimeoutSeconds
         ClipboardOnly = $true
@@ -241,7 +239,7 @@ try {
             Run-RecoveryMatrix
         }
         "clipboard" {
-            Run-ClipboardMatrix
+            Run-ClipboardRuntimeSmoke
         }
     }
 
