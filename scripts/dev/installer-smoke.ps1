@@ -436,6 +436,19 @@ try {
         throw "Installed tray executable reported an unexpected version string: $trayVersionOutput"
     }
 
+    $serviceVersionOutput = (& $servicePath --version 2>&1 | Out-String).Trim()
+    $serviceVersionExitCode = $LASTEXITCODE
+    if ($serviceVersionExitCode -ne 0) {
+        throw "Installed service executable failed to report its version. Exit code: $serviceVersionExitCode."
+    }
+    if (
+        -not [string]::IsNullOrWhiteSpace($expectedDisplayVersion) -and
+        -not [string]::IsNullOrWhiteSpace($serviceVersionOutput) -and
+        $serviceVersionOutput -notmatch [regex]::Escape($expectedDisplayVersion)
+    ) {
+        throw "Installed service executable reported an unexpected version string: $serviceVersionOutput"
+    }
+
     $trayLaunchMode = if ($interactiveDesktopSession) { "interactive_desktop" } else { "headless_session" }
     $trayExitedEarly = $false
     $trayExitCode = $null
@@ -496,6 +509,8 @@ try {
         cli_signature = $cliSignature
         tray_version_output = $trayVersionOutput
         tray_version_exit_code = $trayVersionExitCode
+        service_version_output = $serviceVersionOutput
+        service_version_exit_code = $serviceVersionExitCode
         tray_launch_mode = $trayLaunchMode
         tray_exited_early = $trayExitedEarly
         tray_exit_code = $trayExitCode

@@ -19,7 +19,7 @@ This document records the release-hardening contract for the Boundless v5 Window
   - stable releases require signing only when `WINDOWS_SIGN_REQUIRED=true`,
   - unsigned artifacts are explicit when signing variables are not configured,
   - signing scripts never silently convert missing signing credentials into success when policy requires signing.
-- Service mode has an elevated runtime smoke harness at `scripts/dev/service-smoke.ps1`, and `scripts/dev/v5-readiness.ps1 -IncludeServiceSmoke` runs it as a release gate.
+- Service mode has an elevated runtime smoke harness at `scripts/dev/service-smoke.ps1`, and `scripts/dev/release-readiness.ps1 -IncludeServiceSmoke` runs it as a release gate.
 
 ## Honest Limits
 
@@ -30,12 +30,13 @@ This document records the release-hardening contract for the Boundless v5 Window
 
 ## Required Release Evidence
 
-The v5 readiness packet must include:
+The release readiness packet must include:
 
 - `scripts/release/assert-release-consistency.ps1` output,
-- `scripts/dev/v5-readiness.ps1` JSON and Markdown summaries,
+- `scripts/dev/release-readiness.ps1` JSON and Markdown summaries,
 - Windows release workflow artifact names,
 - installer smoke summary JSON path,
+- matching service-host version evidence from `boundless-service.exe --version`,
 - signing status for each `.exe` and `.msi`,
 - previous installer version used for upgrade validation or explicit skip rationale,
 - service-mode smoke summary JSON path or deferral rationale.

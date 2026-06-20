@@ -284,21 +284,21 @@ jobs:
             -RequireSignature:$requireSignature `
             -KeepArtifacts
 
-      - name: Write v5 readiness packet
+      - name: Write release readiness packet
         shell: pwsh
         run: |
-          ./.release-tooling/scripts/dev/v5-readiness.ps1 `
+          ./.release-tooling/scripts/dev/release-readiness.ps1 `
             -RepoRoot (Resolve-Path source).Path `
-            -OutputRoot (Join-Path (Resolve-Path .).Path "artifacts/v5-readiness") `
+            -OutputRoot (Join-Path (Resolve-Path .).Path "artifacts/release-readiness") `
             -InstallerSmokeSummaryPath (Join-Path (Resolve-Path .).Path "artifacts/installer-validation/installer-smoke.json") `
             -ReleaseVersion "${{ needs.release-context.outputs.tag_name }}"
 
-      - name: Upload v5 readiness packet
+      - name: Upload release readiness packet
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: v5-readiness
-          path: artifacts/v5-readiness
+          name: release-readiness
+          path: artifacts/release-readiness
 
   publish:
     runs-on: ubuntu-latest

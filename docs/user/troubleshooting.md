@@ -9,7 +9,7 @@ $BoundlessDaemon = "$env:LOCALAPPDATA\Programs\Boundless\boundlessd.exe"
 & $BoundlessCtl diagnostics dump
 ```
 
-For release candidates, also attach the latest `scripts/dev/v5-readiness.ps1` packet.
+For release candidates, also attach the latest `scripts/dev/release-readiness.ps1` packet.
 
 ## Discovery
 

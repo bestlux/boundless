@@ -387,7 +387,7 @@ V5 should not rely on broad smoke tests for confidence, but release readiness ne
 
 Deliverables:
 
-- `scripts/dev/v5-readiness.ps1` that orchestrates targeted checks and writes a summary artifact.
+- `scripts/dev/release-readiness.ps1` that orchestrates targeted checks and writes a summary artifact.
 - Unit gates:
   - `cargo fmt --all -- --check`,
   - `cargo clippy --workspace --all-targets -- -D warnings`,
@@ -401,7 +401,7 @@ Deliverables:
   - pairing recovery matrix,
   - installer smoke,
   - service smoke when implemented.
-- Readiness packet under `artifacts/v5-readiness/` with exact command output, skipped checks, environment details, and risk classification.
+- Readiness packet under `artifacts/release-readiness/` with exact command output, skipped checks, environment details, and risk classification.
 - CI split:
   - PR CI remains unit-focused,
   - scheduled/manual Windows workflows run extended runtime checks,
