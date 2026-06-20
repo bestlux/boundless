@@ -54,3 +54,35 @@ This document defines the canonical transport module boundaries after Slice 1 sl
   - `hello_handler_rejects_machine_id_mismatch_with_error_frame`
   - `hello_handler_accepts_canonical_protocol_and_emits_ack_for_inbound`
   - `hello_ack_handler_flushes_pending_outgoing_payloads`
+
+## BND-NEXT-7 reactor rewrite planning
+
+The transport session reactor rewrite should stay behavior-preserving until the existing fault harness proves the current behavior on the new boundaries.
+
+Current reactor problems to address:
+
+- `session.rs` still centralizes timers, outgoing flushes, incoming frame dispatch, reconnect checks, transfer cleanup, and session exit handling in one large post-auth loop.
+- Reconnect checks are repeated across heartbeat, input flush, bulk flush, flush-signal, and read branches.
+- Local session maps for inbound files, inbound clipboard images, and outbound transfer flow share control flow with wire I/O and protocol dispatch.
+- Session exit reasons are mostly implicit `break` or error paths, which makes fault handling harder to review.
+
+Preliminary target boundaries:
+
+- Keep TLS authentication and peer identity mismatch checks before the reactor boundary.
+- Introduce an internal `AuthenticatedSession` or equivalent context that owns immutable post-auth identity and local snapshot data.
+- Move mutable per-session state into a `SessionRuntime` or equivalent internal struct.
+- Name reactor inputs as explicit events such as heartbeat tick, input flush tick, bulk flush tick, outgoing flush signal, inbound frame, invalid frame, reconnect requested, state dropped, and I/O failure.
+- Name session phases such as starting, awaiting remote hello, active, draining, and closing.
+- Name session exits such as peer closed, reconnect requested, invalid frame, I/O failure, state dropped, and protocol rejected.
+
+Fault-harness status:
+
+- PR #89 landed a narrow post-auth in-memory harness that can drive the real session loop after TLS authentication has already established peer identity.
+- The harness covers read, write, flush, disconnect, delayed-frame, and reconnect-pair scenarios.
+- Broader multi-peer, multi-process, and full reactor-lifecycle fault coverage remains BND-NEXT-7 follow-up work.
+
+Implementation guardrails:
+
+- Do not change protocol semantics, retry policy, transfer resume behavior, or product UX inside the reactor rewrite.
+- Land the rewrite in small slices: docs/status cleanup, state extraction, eventized reconnect/exit handling, separated read dispatch/outgoing flush helpers, then final cleanup.
+- Each behavior-changing slice should run the PR #89 fault harness plus focused transfer/reconnect tests before workspace validation.
