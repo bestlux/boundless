@@ -1,33 +1,111 @@
+use std::sync::OnceLock;
+
 use super::*;
 use app_services::desktop::{LayoutPeerToken, canonicalize_layout_matrix_spec};
+use tokio::sync::Mutex;
+
+static CONFIG_SAVE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn config_save_lock() -> &'static Mutex<()> {
+    CONFIG_SAVE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn preserve_in_memory_peer_touches(
+    base: &RuntimeConfig,
+    current: &RuntimeConfig,
+    candidate: &mut RuntimeConfig,
+) {
+    for current_peer in &current.peers {
+        let Some(base_peer) = base
+            .peers
+            .iter()
+            .find(|peer| peer.peer_id == current_peer.peer_id)
+        else {
+            continue;
+        };
+
+        if current_peer.display_name != base_peer.display_name
+            || current_peer.address != base_peer.address
+            || current_peer.connected != base_peer.connected
+            || current_peer.last_seen <= base_peer.last_seen
+        {
+            continue;
+        }
+
+        if let Some(candidate_peer) = candidate
+            .peers
+            .iter_mut()
+            .find(|peer| peer.peer_id == current_peer.peer_id)
+            && current_peer.last_seen > candidate_peer.last_seen
+        {
+            candidate_peer.last_seen = current_peer.last_seen;
+        }
+    }
+}
 
 impl AppState {
+    pub(super) async fn mutate_config_and_save<F, T>(&self, mutate: F) -> Result<T>
+    where
+        F: FnOnce(&mut RuntimeConfig) -> Result<(T, bool)>,
+        T: Send,
+    {
+        let _save_guard = config_save_lock().lock().await;
+
+        let base = self.config.read().await.clone();
+        let mut candidate = base.clone();
+        let (result, should_save) = mutate(&mut candidate)?;
+
+        if should_save {
+            self.save_config_snapshot(candidate.clone()).await?;
+            let mut config = self.config.write().await;
+            preserve_in_memory_peer_touches(&base, &config, &mut candidate);
+            *config = candidate;
+        }
+
+        Ok(result)
+    }
+
+    async fn save_config_snapshot(&self, snapshot: RuntimeConfig) -> Result<()> {
+        let path = self.config_path.as_ref().clone();
+        tokio::task::spawn_blocking(move || save_config_at(&path, &snapshot))
+            .await
+            .context("join config save task")?
+    }
+
     pub async fn update_bind(&self, bind: String) -> Result<()> {
         validate_bind_address(&bind)?;
 
-        let mut config = self.config.write().await;
-        config.api_bind = bind;
-        save_config_at(&self.config_path, &config)
+        self.mutate_config_and_save(|config| {
+            config.api_bind = bind;
+            Ok(((), true))
+        })
+        .await
     }
 
     pub async fn update_api_transport(&self, api_transport: ApiTransport) -> Result<()> {
-        let mut config = self.config.write().await;
-        config.api_transport = api_transport;
-        save_config_at(&self.config_path, &config)
+        self.mutate_config_and_save(|config| {
+            config.api_transport = api_transport;
+            Ok(((), true))
+        })
+        .await
     }
 
     pub async fn update_api_pipe_name(&self, pipe_name: String) -> Result<()> {
         validate_pipe_name(&pipe_name)?;
 
-        let mut config = self.config.write().await;
-        config.api_pipe_name = pipe_name;
-        save_config_at(&self.config_path, &config)
+        self.mutate_config_and_save(|config| {
+            config.api_pipe_name = pipe_name;
+            Ok(((), true))
+        })
+        .await
     }
 
     pub async fn update_network_port(&self, port: u16) -> Result<()> {
-        let mut config = self.config.write().await;
-        config.network_port = port;
-        save_config_at(&self.config_path, &config)
+        self.mutate_config_and_save(|config| {
+            config.network_port = port;
+            Ok(((), true))
+        })
+        .await
     }
 
     pub async fn file_transfer_config(&self) -> FileTransferConfig {
@@ -60,9 +138,11 @@ impl AppState {
         let receive_dir = PathBuf::from(&file_transfer.receive_dir);
         tokio::fs::create_dir_all(&receive_dir).await?;
 
-        let mut config = self.config.write().await;
-        config.file_transfer = file_transfer;
-        save_config_at(&self.config_path, &config)
+        self.mutate_config_and_save(|config| {
+            config.file_transfer = file_transfer;
+            Ok(((), true))
+        })
+        .await
     }
 
     pub async fn input_handoff_config(&self) -> InputHandoffConfig {
@@ -77,10 +157,11 @@ impl AppState {
             anyhow::bail!("input_handoff.corner_block_px must be <= 256");
         }
 
-        let mut config = self.config.write().await;
-        config.input_handoff = input_handoff;
-        save_config_at(&self.config_path, &config)?;
-        drop(config);
+        self.mutate_config_and_save(|config| {
+            config.input_handoff = input_handoff;
+            Ok(((), true))
+        })
+        .await?;
         self.notify_input_capture_wake("input_handoff_config_changed");
         Ok(())
     }
@@ -148,24 +229,25 @@ impl AppState {
     }
 
     pub async fn set_layout(&self, matrix: String) -> Result<()> {
-        let mut config = self.config.write().await;
-        let peers = config
-            .peers
-            .iter()
-            .map(|peer| LayoutPeerToken {
-                peer_id: peer.peer_id.clone(),
-                display_name: peer.display_name.clone(),
-            })
-            .collect::<Vec<_>>();
-        let canonical_matrix = canonicalize_layout_matrix_spec(
-            &matrix,
-            &config.machine_id,
-            Some(config.device_name.as_str()),
-            &peers,
-        )?;
-        config.layout_matrix = canonical_matrix;
-        save_config_at(&self.config_path, &config)?;
-        drop(config);
+        self.mutate_config_and_save(|config| {
+            let peers = config
+                .peers
+                .iter()
+                .map(|peer| LayoutPeerToken {
+                    peer_id: peer.peer_id.clone(),
+                    display_name: peer.display_name.clone(),
+                })
+                .collect::<Vec<_>>();
+            let canonical_matrix = canonicalize_layout_matrix_spec(
+                &matrix,
+                &config.machine_id,
+                Some(config.device_name.as_str()),
+                &peers,
+            )?;
+            config.layout_matrix = canonical_matrix;
+            Ok(((), true))
+        })
+        .await?;
         self.invalidate_cached_layout_matrix().await;
         self.notify_input_capture_wake("layout_changed");
         Ok(())
@@ -255,9 +337,12 @@ impl AppState {
             }
             _ => anyhow::bail!("unknown feature '{name}'"),
         }
-        let mut config = self.config.write().await;
-        config.features.insert(name.clone(), enabled);
-        save_config_at(&self.config_path, &config)?;
+        let feature_name = name.clone();
+        self.mutate_config_and_save(|config| {
+            config.features.insert(feature_name, enabled);
+            Ok(((), true))
+        })
+        .await?;
 
         if name == "share_input" {
             self.input.control.router.write().await.set_enabled(enabled);
@@ -284,18 +369,20 @@ impl AppState {
     pub async fn set_hotkey(&self, action: String, combo: String) -> Result<()> {
         crate::hotkeys::validate_hotkey_binding(&action, &combo)?;
         let new_combo = crate::hotkeys::canonical_hotkey_combo(&combo)?;
-        let mut config = self.config.write().await;
-        for (existing_action, existing_combo) in &config.hotkeys {
-            if existing_action != &action
-                && new_combo.is_some()
-                && crate::hotkeys::canonical_hotkey_combo(existing_combo)? == new_combo
-            {
-                anyhow::bail!(
-                    "hotkey combo already assigned to {existing_action}; choose a unique combo"
-                );
+        self.mutate_config_and_save(|config| {
+            for (existing_action, existing_combo) in &config.hotkeys {
+                if existing_action != &action
+                    && new_combo.is_some()
+                    && crate::hotkeys::canonical_hotkey_combo(existing_combo)? == new_combo
+                {
+                    anyhow::bail!(
+                        "hotkey combo already assigned to {existing_action}; choose a unique combo"
+                    );
+                }
             }
-        }
-        config.hotkeys.insert(action, combo);
-        save_config_at(&self.config_path, &config)
+            config.hotkeys.insert(action, combo);
+            Ok(((), true))
+        })
+        .await
     }
 }

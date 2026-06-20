@@ -75,6 +75,17 @@ fn remove_oldest_coalescible_pending_inject_frame(
     queue.remove(index)
 }
 
+fn remove_newest_coalescible_pending_inject_frame(
+    queue: &mut VecDeque<PendingInjectInputFrame>,
+) -> Option<PendingInjectInputFrame> {
+    let index = queue
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, frame)| move_only_delta(&frame.events).is_some().then_some(index))?;
+    queue.remove(index)
+}
+
 impl AppState {
     pub async fn queue_input_move(&self, peer_id: &str, dx: i32, dy: i32) -> Result<()> {
         self.queue_input_events(peer_id, vec![InputEvent::MouseMove { dx, dy }])
@@ -472,6 +483,43 @@ impl AppState {
         }
         let depth = queue.len();
         drop(queue);
+        if let Some(depth) = self.observe_pending_inject_high_water(depth) {
+            self.record_input_queue_high_water("inject", "requeue", depth);
+        }
+        self.notify_input_inject_wake("retry_requeue");
+    }
+
+    pub async fn requeue_pending_inject_input_frames_front(
+        &self,
+        frames: Vec<PendingInjectInputFrame>,
+    ) {
+        if frames.is_empty() {
+            return;
+        }
+
+        let mut dropped = Vec::new();
+        let mut queue = self.input.inject.pending_inject_frames.write().await;
+        for frame in frames.into_iter().rev() {
+            if queue.len() >= MAX_PENDING_INJECT_INPUT_FRAMES {
+                let dropped_frame = remove_newest_coalescible_pending_inject_frame(&mut queue)
+                    .map(|frame| (frame, "evict_newest_move"))
+                    .or_else(|| {
+                        queue
+                            .pop_back()
+                            .map(|frame| (frame, "evict_newest_fallback"))
+                    });
+                if let Some((dropped_frame, reason)) = dropped_frame {
+                    dropped.push((dropped_frame.peer_id, dropped_frame.sequence, reason));
+                }
+            }
+            queue.push_front(frame);
+        }
+        let depth = queue.len();
+        drop(queue);
+
+        for (peer_id, sequence, reason) in dropped {
+            self.record_input_queue_overflow_drop("inject", &peer_id, sequence, reason);
+        }
         if let Some(depth) = self.observe_pending_inject_high_water(depth) {
             self.record_input_queue_high_water("inject", "requeue", depth);
         }

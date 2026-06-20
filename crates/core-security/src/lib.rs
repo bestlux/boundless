@@ -1,6 +1,8 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -13,6 +15,8 @@ use rcgen::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairingCode {
@@ -95,6 +99,122 @@ pub fn generate_pairing_code(ttl: Duration) -> PairingCode {
     }
 }
 
+pub fn atomic_write_file(path: &Path, contents: impl AsRef<[u8]>) -> anyhow::Result<()> {
+    let contents = contents.as_ref();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .context("atomic write target must include a file name")?;
+
+    for _ in 0..16 {
+        let counter = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{}.boundless-tmp-{}-{counter}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        ));
+
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("create temp {}", temp_path.display()));
+            }
+        };
+
+        let write_result = (|| -> anyhow::Result<()> {
+            file.write_all(contents)
+                .with_context(|| format!("write temp {}", temp_path.display()))?;
+            file.flush()
+                .with_context(|| format!("flush temp {}", temp_path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("sync temp {}", temp_path.display()))?;
+            Ok(())
+        })();
+        drop(file);
+
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+
+        if let Err(error) = replace_file(&temp_path, path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error).with_context(|| {
+                format!("replace {} with {}", path.display(), temp_path.display())
+            });
+        }
+
+        sync_parent_dir(parent);
+        return Ok(());
+    }
+
+    anyhow::bail!("create temp file for {}", path.display());
+}
+
+#[cfg(windows)]
+fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+    unsafe extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let temp_path_wide = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+
+    // SAFETY: both buffers are null-terminated UTF-16 paths and live for the call.
+    let moved = unsafe {
+        MoveFileExW(
+            temp_path_wide.as_ptr(),
+            path_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(temp_path, path)
+}
+
+fn sync_parent_dir(parent: &Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = parent;
+}
+
 pub fn load_or_create_device_secret(paths: &SecurityPaths) -> anyhow::Result<String> {
     fs::create_dir_all(&paths.root).with_context(|| format!("create {}", paths.root.display()))?;
 
@@ -107,7 +227,7 @@ pub fn load_or_create_device_secret(paths: &SecurityPaths) -> anyhow::Result<Str
     let mut bytes = [0u8; 32];
     rand::fill(&mut bytes);
     let value = base64::engine::general_purpose::STANDARD.encode(bytes);
-    fs::write(&paths.device_secret, &value)
+    atomic_write_file(&paths.device_secret, &value)
         .with_context(|| format!("write {}", paths.device_secret.display()))?;
     Ok(value)
 }
@@ -132,7 +252,7 @@ pub fn ensure_trust_store(paths: &SecurityPaths) -> anyhow::Result<()> {
     fs::create_dir_all(&paths.root).with_context(|| format!("create {}", paths.root.display()))?;
 
     if !paths.trust_store.exists() {
-        fs::write(&paths.trust_store, "[]")
+        atomic_write_file(&paths.trust_store, "[]")
             .with_context(|| format!("write {}", paths.trust_store.display()))?;
     }
     Ok(())
@@ -159,7 +279,7 @@ pub fn upsert_trust_record(paths: &SecurityPaths, record: TrustRecord) -> anyhow
     }
 
     let payload = serde_json::to_string_pretty(&records).context("serialize trust store")?;
-    fs::write(&paths.trust_store, payload)
+    atomic_write_file(&paths.trust_store, payload)
         .with_context(|| format!("write {}", paths.trust_store.display()))?;
     Ok(())
 }
@@ -174,7 +294,7 @@ pub fn remove_trust_record(paths: &SecurityPaths, machine_id: &str) -> anyhow::R
     }
 
     let payload = serde_json::to_string_pretty(&records).context("serialize trust store")?;
-    fs::write(&paths.trust_store, payload)
+    atomic_write_file(&paths.trust_store, payload)
         .with_context(|| format!("write {}", paths.trust_store.display()))?;
     Ok(true)
 }
@@ -267,13 +387,13 @@ pub fn ensure_device_identity(
     let device_cert_pem = leaf_cert.pem();
     let device_key_pem = leaf_key.serialize_pem();
 
-    fs::write(&paths.ca_cert_pem, &ca_cert_pem)
+    atomic_write_file(&paths.ca_cert_pem, &ca_cert_pem)
         .with_context(|| format!("write {}", paths.ca_cert_pem.display()))?;
-    fs::write(&paths.ca_key_pem, &ca_key_pem)
+    atomic_write_file(&paths.ca_key_pem, &ca_key_pem)
         .with_context(|| format!("write {}", paths.ca_key_pem.display()))?;
-    fs::write(&paths.device_cert_pem, &device_cert_pem)
+    atomic_write_file(&paths.device_cert_pem, &device_cert_pem)
         .with_context(|| format!("write {}", paths.device_cert_pem.display()))?;
-    fs::write(&paths.device_key_pem, &device_key_pem)
+    atomic_write_file(&paths.device_key_pem, &device_key_pem)
         .with_context(|| format!("write {}", paths.device_key_pem.display()))?;
 
     Ok(DeviceIdentity {
@@ -303,7 +423,7 @@ pub fn rotate_device_identity(
             fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
         }
     }
-    fs::write(&paths.trust_store, "[]")
+    atomic_write_file(&paths.trust_store, "[]")
         .with_context(|| format!("write {}", paths.trust_store.display()))?;
     let _ = load_or_create_device_secret(paths)?;
     ensure_device_identity(paths, machine_id, display_name, advertised_host)
@@ -329,6 +449,59 @@ mod tests {
         assert_eq!(
             fingerprint("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn atomic_write_file_replaces_existing_file_without_temp_leftovers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+
+        atomic_write_file(&path, "one").expect("initial write");
+        atomic_write_file(&path, "two").expect("replacement write");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("read state"), "two");
+        let leftovers = std::fs::read_dir(dir.path())
+            .expect("read tempdir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("boundless-tmp")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "atomic writes should not leave temp files after success"
+        );
+    }
+
+    #[test]
+    fn atomic_write_file_cleans_temp_file_when_replace_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("target");
+        std::fs::create_dir(&path).expect("create target directory");
+
+        let error = atomic_write_file(&path, "payload").expect_err("replace over directory fails");
+        assert!(
+            error.to_string().contains("replace"),
+            "unexpected error: {error:#}"
+        );
+
+        let leftovers = std::fs::read_dir(dir.path())
+            .expect("read tempdir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("boundless-tmp")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "atomic write should clean temp files after replace failure"
         );
     }
 

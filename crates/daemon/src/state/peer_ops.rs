@@ -11,22 +11,24 @@ impl AppState {
         self.ensure_trust_rotation_not_pending()?;
         self.consume_pairing_code(&code).await?;
 
-        let mut config = self.config.write().await;
-        self.ensure_trust_rotation_not_pending()?;
-        let normalized_address = normalize_peer_address(&host, config.network_port)?;
-        let peer_id = uuid::Uuid::new_v4().to_string();
+        let peer_id = self
+            .mutate_config_and_save(|config| {
+                self.ensure_trust_rotation_not_pending()?;
+                let normalized_address = normalize_peer_address(&host, config.network_port)?;
+                let peer_id = uuid::Uuid::new_v4().to_string();
 
-        let peer = PeerConfig {
-            peer_id: peer_id.clone(),
-            display_name: alias.unwrap_or_else(|| format!("peer-{}", &peer_id[..8])),
-            address: normalized_address,
-            connected: false,
-            last_seen: now,
-        };
+                let peer = PeerConfig {
+                    peer_id: peer_id.clone(),
+                    display_name: alias.unwrap_or_else(|| format!("peer-{}", &peer_id[..8])),
+                    address: normalized_address,
+                    connected: false,
+                    last_seen: now,
+                };
 
-        config.peers.push(peer);
-        save_config_at(&self.config_path, &config)?;
-        drop(config);
+                config.peers.push(peer);
+                Ok((peer_id, true))
+            })
+            .await?;
         self.notify_peer_reconcile_wake("peer_joined");
         Ok(peer_id)
     }
@@ -46,16 +48,14 @@ impl AppState {
     }
 
     pub async fn remove_peer(&self, peer_id: &str) -> Result<bool> {
-        let removed = {
-            let mut config = self.config.write().await;
-            let before = config.peers.len();
-            config.peers.retain(|p| p.peer_id != peer_id);
-            let removed = before != config.peers.len();
-            if removed {
-                save_config_at(&self.config_path, &config)?;
-            }
-            removed
-        };
+        let removed = self
+            .mutate_config_and_save(|config| {
+                let before = config.peers.len();
+                config.peers.retain(|p| p.peer_id != peer_id);
+                let removed = before != config.peers.len();
+                Ok((removed, removed))
+            })
+            .await?;
         if removed {
             let mut router = self.input.control.router.write().await;
             let released_owner = router.release_owner(peer_id);
@@ -97,30 +97,32 @@ impl AppState {
     pub async fn rotate_trust(&self) -> Result<String> {
         self.trust_rotation_pending_restart
             .store(true, Ordering::Release);
-        {
-            let mut config = self.config.write().await;
-            let machine_id = config.machine_id.clone();
-            let device_name = config.device_name.clone();
-            let advertised_host = std::env::var("BOUNDLESS_ADVERTISE_HOST").ok();
-            let identity = rotate_device_identity(
-                &self.security_paths,
-                &machine_id,
-                &device_name,
-                advertised_host.as_deref(),
-            )?;
-            upsert_trust_record(
-                &self.security_paths,
-                TrustRecord {
-                    machine_id: machine_id.clone(),
-                    ca_cert_pem: identity.ca_cert_pem,
-                    added_at: Utc::now(),
-                },
-            )?;
+        let (machine_id, device_name) = {
+            let config = self.config.read().await;
+            (config.machine_id.clone(), config.device_name.clone())
+        };
+        let advertised_host = std::env::var("BOUNDLESS_ADVERTISE_HOST").ok();
+        let identity = rotate_device_identity(
+            &self.security_paths,
+            &machine_id,
+            &device_name,
+            advertised_host.as_deref(),
+        )?;
+        upsert_trust_record(
+            &self.security_paths,
+            TrustRecord {
+                machine_id: machine_id.clone(),
+                ca_cert_pem: identity.ca_cert_pem,
+                added_at: Utc::now(),
+            },
+        )?;
+        self.mutate_config_and_save(|config| {
             config.peers.clear();
             config.layout_matrix = "self".to_string();
             config.updated_at = Utc::now();
-            save_config_at(&self.config_path, &config)?;
-        }
+            Ok(((), true))
+        })
+        .await?;
 
         let aborted_sessions = self.transport.clear().await;
         self.clipboard.clear().await;
@@ -147,28 +149,27 @@ impl AppState {
     }
 
     pub async fn set_peer_connected(&self, peer_id: &str, connected: bool) -> Result<()> {
-        let (peer_found, transitioned_to_connected) = {
-            let mut config = self.config.write().await;
-            let mut peer_found = false;
-            let mut transitioned_to_connected = false;
+        let (peer_found, transitioned_to_connected) = self
+            .mutate_config_and_save(|config| {
+                let mut peer_found = false;
+                let mut transitioned_to_connected = false;
+                let mut should_save = false;
 
-            if let Some(peer_index) = config.peers.iter().position(|p| p.peer_id == peer_id) {
-                let previous_connected = config.peers[peer_index].connected;
-                let previous_last_seen = config.peers[peer_index].last_seen;
-                transitioned_to_connected = !previous_connected && connected;
-                config.peers[peer_index].connected = connected;
-                config.peers[peer_index].last_seen = Utc::now();
-                peer_found = true;
+                if let Some(peer_index) = config.peers.iter().position(|p| p.peer_id == peer_id) {
+                    let previous_connected = config.peers[peer_index].connected;
+                    transitioned_to_connected = !previous_connected && connected;
+                    peer_found = true;
 
-                if let Err(error) = save_config_at(&self.config_path, &config) {
-                    config.peers[peer_index].connected = previous_connected;
-                    config.peers[peer_index].last_seen = previous_last_seen;
-                    return Err(error);
+                    if previous_connected || connected {
+                        config.peers[peer_index].connected = connected;
+                        config.peers[peer_index].last_seen = Utc::now();
+                        should_save = true;
+                    }
                 }
-            }
 
-            (peer_found, transitioned_to_connected)
-        };
+                Ok(((peer_found, transitioned_to_connected), should_save))
+            })
+            .await?;
 
         if !peer_found {
             return Ok(());

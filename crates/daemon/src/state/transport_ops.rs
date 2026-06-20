@@ -108,22 +108,23 @@ impl AppState {
     }
 
     pub async fn mark_all_peers_disconnected(&self) -> Result<usize> {
-        let mut config = self.config.write().await;
-        let mut disconnected_peer_ids = Vec::<String>::new();
+        let disconnected_peer_ids = self
+            .mutate_config_and_save(|config| {
+                let mut disconnected_peer_ids = Vec::<String>::new();
 
-        for peer in &mut config.peers {
-            if !peer.connected {
-                continue;
-            }
-            peer.connected = false;
-            peer.last_seen = Utc::now();
-            disconnected_peer_ids.push(peer.peer_id.clone());
-        }
+                for peer in &mut config.peers {
+                    if !peer.connected {
+                        continue;
+                    }
+                    peer.connected = false;
+                    peer.last_seen = Utc::now();
+                    disconnected_peer_ids.push(peer.peer_id.clone());
+                }
 
-        if !disconnected_peer_ids.is_empty() {
-            save_config_at(&self.config_path, &config)?;
-        }
-        drop(config);
+                let should_save = !disconnected_peer_ids.is_empty();
+                Ok((disconnected_peer_ids, should_save))
+            })
+            .await?;
 
         if !disconnected_peer_ids.is_empty() {
             let mut router = self.input.control.router.write().await;

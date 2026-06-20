@@ -124,41 +124,53 @@ impl AppState {
         alias: Option<String>,
     ) -> Result<()> {
         self.ensure_trust_rotation_not_pending()?;
-        validate_ca_cert_pem(&bundle.ca_cert_pem)?;
-        let mut config = self.config.write().await;
-        self.ensure_trust_rotation_not_pending()?;
-        let default_port = config.network_port;
-        let normalized_address = normalize_peer_address(&bundle.network_address, default_port)?;
+        let TrustBundle {
+            machine_id,
+            display_name,
+            network_address,
+            ca_cert_pem,
+        } = bundle;
+        validate_ca_cert_pem(&ca_cert_pem)?;
+        let default_port = {
+            let config = self.config.read().await;
+            self.ensure_trust_rotation_not_pending()?;
+            config.network_port
+        };
+        let normalized_address = normalize_peer_address(&network_address, default_port)?;
 
         upsert_trust_record(
             &self.security_paths,
             TrustRecord {
-                machine_id: bundle.machine_id.clone(),
-                ca_cert_pem: bundle.ca_cert_pem.clone(),
+                machine_id: machine_id.clone(),
+                ca_cert_pem,
                 added_at: Utc::now(),
             },
         )?;
 
-        if let Some(peer) = config
-            .peers
-            .iter_mut()
-            .find(|p| p.peer_id == bundle.machine_id)
-        {
-            peer.address = normalized_address;
-            peer.display_name = alias.unwrap_or(bundle.display_name);
-            peer.connected = false;
-            peer.last_seen = Utc::now();
-        } else {
-            config.peers.push(PeerConfig {
-                peer_id: bundle.machine_id,
-                display_name: alias.unwrap_or(bundle.display_name),
-                address: normalized_address,
-                connected: false,
-                last_seen: Utc::now(),
-            });
-        }
+        self.mutate_config_and_save(|config| {
+            self.ensure_trust_rotation_not_pending()?;
+            if let Some(peer) = config
+                .peers
+                .iter_mut()
+                .find(|p| p.peer_id == machine_id.as_str())
+            {
+                peer.address = normalized_address;
+                peer.display_name = alias.unwrap_or(display_name);
+                peer.connected = false;
+                peer.last_seen = Utc::now();
+            } else {
+                config.peers.push(PeerConfig {
+                    peer_id: machine_id,
+                    display_name: alias.unwrap_or(display_name),
+                    address: normalized_address,
+                    connected: false,
+                    last_seen: Utc::now(),
+                });
+            }
 
-        save_config_at(&self.config_path, &config)
+            Ok(((), true))
+        })
+        .await
     }
 
     pub async fn snapshot(&self) -> RuntimeConfig {
