@@ -488,8 +488,18 @@ impl AppState {
             }
         }
 
+        let initially_connected_payloads = initially_connected_peer_ids
+            .iter()
+            .map(|peer_id| {
+                (
+                    peer_id.clone(),
+                    outbound_payload_from_clipboard_payload(&payload),
+                )
+            })
+            .collect::<Vec<_>>();
+
         self.prune_stale_outgoing_clipboard_payloads().await;
-        self.store_latest_clipboard_replay(payload.clone(), hash, HashSet::new())
+        self.store_latest_clipboard_replay(payload, hash, HashSet::new())
             .await;
 
         let currently_connected_peer_ids = self.connected_peer_ids().await;
@@ -519,20 +529,8 @@ impl AppState {
 
         {
             let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
-            for peer_id in &initially_connected_peer_ids {
-                let outbound = match &payload {
-                    ClipboardPayload::Text(text) => {
-                        OutboundPayload::ClipboardText { text: text.clone() }
-                    }
-                    ClipboardPayload::Image(bytes) => OutboundPayload::ClipboardImage {
-                        image_bmp: bytes.clone(),
-                    },
-                };
-
-                queue_map
-                    .entry(peer_id.clone())
-                    .or_default()
-                    .push_back(outbound);
+            for (peer_id, outbound) in initially_connected_payloads {
+                queue_map.entry(peer_id).or_default().push_back(outbound);
             }
         }
         self.notify_outgoing_flush_signal();

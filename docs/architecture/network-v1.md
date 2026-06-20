@@ -87,4 +87,4 @@ Deferred reactor work:
 
 Next backlog step:
 
-- After BND-NEXT-7, the next quality-stack backlog item is BND-NEXT-8: clipboard image memory profiling and targeted optimization. Start with profiling evidence and implement only if it shows material memory pressure.
+- After BND-NEXT-8A, the deferred clipboard image quality item is inbound/apply full-buffer streaming or spooling if future evidence warrants it; otherwise BND-NEXT-9 service updater and N-1 MSI planning is the next backlog item needing human decision.
