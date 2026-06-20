@@ -91,6 +91,14 @@ pub fn build_online_bundle(
         .map(|event| redact_transport_event(event, include_filenames, &mut redaction))
         .collect::<Vec<_>>();
 
+    let layout_matrix = sanitize_layout_matrix(
+        &snapshot.layout_matrix,
+        &snapshot.status.machine_id,
+        &snapshot.local_display_name,
+        &snapshot.peers,
+        &mut redaction,
+    );
+
     json!({
         "schema_version": 1,
         "generated_at": Utc::now().to_rfc3339(),
@@ -123,7 +131,7 @@ pub fn build_online_bundle(
             },
         },
         "configuration": {
-            "layout_matrix": snapshot.layout_matrix,
+            "layout_matrix": layout_matrix,
             "features": snapshot.features,
             "file_transfer": {
                 "receive_dir": redact_path(&snapshot.file_transfer_config.receive_dir, false),
@@ -226,24 +234,41 @@ pub fn redact_transport_event(
     include_filenames: bool,
     context: &mut RedactionContext,
 ) -> Value {
+    let peer_id = context.pseudonymize_identifier(&event.peer_id);
+    let detail =
+        redact_event_detail_with_context(&event.kind, &event.detail, include_filenames, context);
     json!({
         "timestamp": event.timestamp,
         "direction": event.direction,
         "kind": event.kind,
-        "peer_id": context.pseudonymize_identifier(&event.peer_id),
-        "detail": redact_event_detail(&event.kind, &event.detail, include_filenames),
+        "peer_id": peer_id,
+        "detail": detail,
         "size_bytes": event.size_bytes,
     })
 }
 
 pub fn redact_event_detail(kind: &str, detail: &str, include_filenames: bool) -> String {
+    redact_event_detail_with_context(
+        kind,
+        detail,
+        include_filenames,
+        &mut RedactionContext::default(),
+    )
+}
+
+fn redact_event_detail_with_context(
+    kind: &str,
+    detail: &str,
+    include_filenames: bool,
+    context: &mut RedactionContext,
+) -> String {
     if kind == "clipboard_text" {
         return REDACTED_CLIPBOARD_TEXT.to_string();
     }
 
     let mut redacted = detail
         .split_whitespace()
-        .map(|token| redact_detail_token(kind, token, include_filenames))
+        .map(|token| redact_detail_token(kind, token, include_filenames, context))
         .collect::<Vec<_>>()
         .join(" ");
 
@@ -252,6 +277,33 @@ pub fn redact_event_detail(kind: &str, detail: &str, include_filenames: bool) ->
     }
 
     redacted
+}
+
+pub fn sanitize_layout_matrix(
+    layout_matrix: &str,
+    local_machine_id: &str,
+    local_display_name: &str,
+    peers: &[crate::queries::UiPairedPeer],
+    context: &mut RedactionContext,
+) -> String {
+    layout_matrix
+        .split(';')
+        .map(|row| {
+            row.split(',')
+                .map(|token| {
+                    sanitize_layout_token(
+                        token.trim(),
+                        local_machine_id,
+                        local_display_name,
+                        peers,
+                        context,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 pub fn service_version_parity(
@@ -464,7 +516,68 @@ fn is_endpoint_key(key: &str) -> bool {
         || key == "address"
 }
 
-fn redact_detail_token(kind: &str, token: &str, include_filenames: bool) -> String {
+fn sanitize_layout_token(
+    token: &str,
+    local_machine_id: &str,
+    local_display_name: &str,
+    peers: &[crate::queries::UiPairedPeer],
+    context: &mut RedactionContext,
+) -> String {
+    if token.is_empty() {
+        return String::new();
+    }
+
+    let token_lower = token.to_ascii_lowercase();
+    if matches!(token_lower.as_str(), "self" | "local" | "this" | "me")
+        || token.eq_ignore_ascii_case(local_machine_id)
+        || token.eq_ignore_ascii_case(local_display_name)
+    {
+        return "self".to_string();
+    }
+
+    if let Some(peer_id) = resolve_layout_peer_token(token, peers) {
+        return context.pseudonymize_identifier(peer_id);
+    }
+
+    "[redacted-layout-token]".to_string()
+}
+
+fn resolve_layout_peer_token<'a>(
+    token: &str,
+    peers: &'a [crate::queries::UiPairedPeer],
+) -> Option<&'a str> {
+    let token_lower = token.to_ascii_lowercase();
+    let mut matched_peer_ids = Vec::<&str>::new();
+
+    for peer in peers {
+        let peer_id_match = peer.peer_id.eq_ignore_ascii_case(token);
+        let display_name_match = peer.display_name.eq_ignore_ascii_case(token);
+        let peer_id_prefix_match = peer.peer_id.to_ascii_lowercase().starts_with(&token_lower);
+        if !(peer_id_match || display_name_match || peer_id_prefix_match) {
+            continue;
+        }
+
+        if !matched_peer_ids
+            .iter()
+            .any(|peer_id| *peer_id == peer.peer_id)
+        {
+            matched_peer_ids.push(peer.peer_id.as_str());
+        }
+    }
+
+    if matched_peer_ids.len() == 1 {
+        matched_peer_ids.pop()
+    } else {
+        None
+    }
+}
+
+fn redact_detail_token(
+    kind: &str,
+    token: &str,
+    include_filenames: bool,
+    context: &mut RedactionContext,
+) -> String {
     let Some((key, value)) = token.split_once('=') else {
         return if kind == "file" || kind.contains("file_transfer") {
             redact_filename(token, include_filenames)
@@ -475,10 +588,29 @@ fn redact_detail_token(kind: &str, token: &str, include_filenames: bool) -> Stri
 
     match key {
         "file_name" => format!("{key}={}", redact_filename(value, include_filenames)),
-        "transfer_id" | "request_id" => format!("{key}={REDACTED_ID}"),
+        key if is_transfer_or_request_key(&key.to_ascii_lowercase()) => {
+            format!("{key}={REDACTED_ID}")
+        }
+        key if is_peer_or_machine_key(&key.to_ascii_lowercase()) => {
+            format!("{key}={}", context.pseudonymize_identifier(value))
+        }
         key if key.contains("path") => format!("{key}={}", redact_path(value, include_filenames)),
         _ => token.to_string(),
     }
+}
+
+fn is_transfer_or_request_key(key: &str) -> bool {
+    key == "request_id"
+        || key == "transfer_id"
+        || key.ends_with("_request_id")
+        || key.ends_with("_transfer_id")
+}
+
+fn is_peer_or_machine_key(key: &str) -> bool {
+    key == "peer_id"
+        || key == "machine_id"
+        || key.ends_with("_peer_id")
+        || key.ends_with("_machine_id")
 }
 
 fn redact_filename(value: &str, include_filenames: bool) -> String {
@@ -579,6 +711,74 @@ mod tests {
         );
         assert_eq!(redacted["peers"][0]["peer_id"], redacted["peer_id"]);
         assert_ne!(redacted["peers"][1]["peer_id"], redacted["peer_id"]);
+    }
+
+    #[test]
+    fn layout_matrix_preserves_shape_with_redacted_aliases() {
+        let peers = vec![
+            crate::queries::UiPairedPeer {
+                peer_id: "peer-alpha-full".to_string(),
+                display_name: "Office Display".to_string(),
+                address: "10.0.0.8:15100".to_string(),
+                connected: true,
+                health_state: "connected".to_string(),
+                health_reason: "peer is connected".to_string(),
+            },
+            crate::queries::UiPairedPeer {
+                peer_id: "peer-beta-full".to_string(),
+                display_name: "Kitchen Display".to_string(),
+                address: "10.0.0.9:15100".to_string(),
+                connected: false,
+                health_state: "disconnected".to_string(),
+                health_reason: "not connected".to_string(),
+            },
+        ];
+        let mut context = RedactionContext::default();
+
+        let sanitized = sanitize_layout_matrix(
+            "machine-local-raw,peer-alpha;Office Display,Local Laptop;peer-beta-full,,unknown-room",
+            "machine-local-raw",
+            "Local Laptop",
+            &peers,
+            &mut context,
+        );
+
+        assert_eq!(
+            sanitized,
+            "self,peer-1;peer-1,self;peer-2,,[redacted-layout-token]"
+        );
+        assert!(!sanitized.contains("machine-local-raw"));
+        assert!(!sanitized.contains("Local Laptop"));
+        assert!(!sanitized.contains("peer-alpha"));
+        assert!(!sanitized.contains("peer-beta-full"));
+        assert!(!sanitized.contains("Office Display"));
+        assert!(!sanitized.contains("Kitchen Display"));
+        assert!(!sanitized.contains("unknown-room"));
+    }
+
+    #[test]
+    fn event_detail_redacts_freeform_identifier_keys() {
+        let mut context = RedactionContext::default();
+        let event = TransportEventSnapshot {
+            timestamp: "2026-06-20T00:00:00Z".to_string(),
+            direction: "local".to_string(),
+            kind: "transport_service_issue".to_string(),
+            peer_id: "peer-alpha-full".to_string(),
+            detail: "peer_id=peer-alpha-full machine_id=machine-local-raw request_id=req-123 transfer_id=file-456 source=diagnostic".to_string(),
+            size_bytes: 0,
+        };
+
+        let redacted = redact_transport_event(&event, false, &mut context);
+        let rendered = serde_json::to_string(&redacted).expect("serialize redacted event");
+
+        assert!(rendered.contains("peer_id=peer-1"));
+        assert!(rendered.contains("machine_id=peer-2"));
+        assert!(rendered.contains("request_id=[redacted-id]"));
+        assert!(rendered.contains("transfer_id=[redacted-id]"));
+        assert!(!rendered.contains("peer-alpha-full"));
+        assert!(!rendered.contains("machine-local-raw"));
+        assert!(!rendered.contains("req-123"));
+        assert!(!rendered.contains("file-456"));
     }
 
     #[test]

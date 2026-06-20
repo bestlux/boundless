@@ -1149,6 +1149,19 @@ mod tests {
         let output_dir = root.join("diagnostics");
         let state =
             AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+        let (code, _) = state.create_pairing_code(120).await;
+        let layout_peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("Office Display".to_string()),
+            )
+            .await
+            .expect("join layout peer");
+        state
+            .set_layout(format!("self,{layout_peer_id}"))
+            .await
+            .expect("set raw peer-id layout");
         state.record_transport_event(crate::state::TransportEventRecord {
             timestamp: chrono::Utc::now(),
             direction: "outgoing".to_string(),
@@ -1179,12 +1192,15 @@ mod tests {
         let manifest = std::fs::read_to_string(&reply.manifest_path).expect("read manifest");
 
         assert!(content.contains(r#""mode": "online""#));
+        assert!(content.contains(r#""layout_matrix": "self,peer-2""#));
         assert!(content.contains("[redacted-clipboard-text]"));
         assert!(content.contains("[redacted-file-name]"));
         assert!(content.contains(r#""peer_id": "peer-1""#));
         assert!(!content.contains("hunter2"));
         assert!(!content.contains("abc123"));
         assert!(!content.contains("peer-alpha"));
+        assert!(!content.contains(&layout_peer_id));
+        assert!(!content.contains("Office Display"));
         assert!(!content.contains("file-123"));
         assert!(!content.contains("taxes.pdf"));
         assert!(manifest.contains("filenames_included=false"));
