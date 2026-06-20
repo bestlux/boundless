@@ -146,7 +146,9 @@ where
     let mut outbound_transfer_flow: OutboundTransferFlows = HashMap::new();
     let mut last_anti_idle_pulse_sent_at: Option<std::time::Instant> = None;
 
-    loop {
+    let session_result: Result<()> = {
+        async {
+            loop {
         tokio::select! {
             _ = heartbeat_interval.tick() => {
                 if reconnect_requested_for_peer(
@@ -579,7 +581,12 @@ where
                 }
             }
         }
-    }
+            }
+
+            Ok(())
+        }
+        .await
+    };
 
     for transfer in inbound_transfers.into_values() {
         discard_inbound_transfer(transfer).await;
@@ -592,7 +599,7 @@ where
         let _ = state.set_peer_connected(peer_id, false).await;
     }
 
-    Ok(())
+    session_result
 }
 
 pub(super) async fn reconnect_requested_for_peer(

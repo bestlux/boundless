@@ -3,6 +3,13 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::*;
 
+pub(crate) struct ReservedIncomingFile {
+    pub(crate) sanitized_name: String,
+    pub(crate) final_path: PathBuf,
+    pub(crate) temp_path: PathBuf,
+    pub(crate) temp_file: tokio::fs::File,
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct OutgoingInputQueueReport {
@@ -1153,31 +1160,44 @@ impl AppState {
         file_name: &str,
         bytes: Vec<u8>,
     ) -> Result<PathBuf> {
-        validate_transfer_size_with_limit(
-            bytes.len() as u64,
-            self.file_transfer_max_bytes().await,
-        )?;
-        let sanitized_name = sanitize_incoming_file_name(file_name)?;
-
-        let peer_dir = self.receive_dir_for_peer(peer_id).await;
-        tokio::fs::create_dir_all(&peer_dir).await?;
-
-        let final_path = resolve_conflict_path(&peer_dir, &sanitized_name);
-        if !final_path.starts_with(&peer_dir) {
-            anyhow::bail!("incoming file path escaped inbox root");
+        let mut reserved = self
+            .reserve_incoming_file(peer_id, file_name, bytes.len() as u64)
+            .await?;
+        tokio::io::AsyncWriteExt::write_all(&mut reserved.temp_file, &bytes).await?;
+        reserved.temp_file.sync_all().await?;
+        drop(reserved.temp_file);
+        if let Err(error) =
+            complete_reserved_incoming_file(&reserved.temp_path, &reserved.final_path).await
+        {
+            let _ = tokio::fs::remove_file(&reserved.temp_path).await;
+            return Err(error);
         }
-        tokio::fs::write(&final_path, bytes).await?;
 
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
             direction: "incoming".to_string(),
             kind: "file".to_string(),
             peer_id: peer_id.to_string(),
-            detail: sanitized_name.clone(),
-            size_bytes: tokio::fs::metadata(&final_path).await?.len(),
+            detail: reserved.sanitized_name,
+            size_bytes: tokio::fs::metadata(&reserved.final_path).await?.len(),
         });
 
-        Ok(final_path)
+        Ok(reserved.final_path)
+    }
+
+    pub(crate) async fn reserve_incoming_file(
+        &self,
+        peer_id: &str,
+        file_name: &str,
+        size_bytes: u64,
+    ) -> Result<ReservedIncomingFile> {
+        validate_transfer_size_with_limit(size_bytes, self.file_transfer_max_bytes().await)?;
+        let sanitized_name = sanitize_incoming_file_name(file_name)?;
+
+        let peer_dir = self.receive_dir_for_peer(peer_id).await;
+        tokio::fs::create_dir_all(&peer_dir).await?;
+
+        reserve_incoming_file_path(&peer_dir, sanitized_name).await
     }
 
     pub async fn store_incoming_file_from_temp(
@@ -1187,23 +1207,30 @@ impl AppState {
         temp_path: &Path,
         size_bytes: u64,
     ) -> Result<PathBuf> {
-        validate_transfer_size_with_limit(size_bytes, self.file_transfer_max_bytes().await)?;
-        let sanitized_name = sanitize_incoming_file_name(file_name)?;
+        let reserved = self
+            .reserve_incoming_file(peer_id, file_name, size_bytes)
+            .await?;
+        let sanitized_name = reserved.sanitized_name;
+        let final_path = reserved.final_path;
+        let part_path = reserved.temp_path;
+        drop(reserved.temp_file);
 
-        let peer_dir = self.receive_dir_for_peer(peer_id).await;
-        tokio::fs::create_dir_all(&peer_dir).await?;
-
-        let final_path = resolve_conflict_path(&peer_dir, &sanitized_name);
-        if !final_path.starts_with(&peer_dir) {
-            anyhow::bail!("incoming file path escaped inbox root");
-        }
-
-        match tokio::fs::rename(temp_path, &final_path).await {
-            Ok(()) => {}
+        match tokio::fs::rename(temp_path, &part_path).await {
+            Ok(()) => {
+                sync_file_at(&part_path).await?;
+            }
             Err(_) => {
-                tokio::fs::copy(temp_path, &final_path).await?;
+                if let Err(error) = copy_file_to_reserved_part(temp_path, &part_path).await {
+                    let _ = tokio::fs::remove_file(&part_path).await;
+                    return Err(error);
+                }
                 let _ = tokio::fs::remove_file(temp_path).await;
             }
+        }
+
+        if let Err(error) = complete_reserved_incoming_file(&part_path, &final_path).await {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(error);
         }
 
         self.record_transport_event(TransportEventRecord {
@@ -1216,6 +1243,28 @@ impl AppState {
         });
 
         Ok(final_path)
+    }
+
+    pub(crate) async fn complete_incoming_file(
+        &self,
+        peer_id: &str,
+        sanitized_name: String,
+        temp_path: &Path,
+        final_path: &Path,
+        size_bytes: u64,
+    ) -> Result<PathBuf> {
+        complete_reserved_incoming_file(temp_path, final_path).await?;
+
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "incoming".to_string(),
+            kind: "file".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: sanitized_name,
+            size_bytes,
+        });
+
+        Ok(final_path.to_path_buf())
     }
 
     async fn receive_dir_for_peer(&self, peer_id: &str) -> PathBuf {
@@ -1274,6 +1323,136 @@ fn outbound_payload_has_transfer_id(payload: &OutboundPayload, expected_transfer
 fn filesystem_safe_peer_dir_name(peer_id: &str) -> String {
     let digest = Sha256::digest(peer_id.as_bytes());
     format!("peer-{}", bytes_to_hex(&digest[..16]))
+}
+
+async fn reserve_incoming_file_path(
+    peer_dir: &Path,
+    sanitized_name: String,
+) -> Result<ReservedIncomingFile> {
+    for suffix in 0..=9_999u32 {
+        let final_path = peer_dir.join(conflict_file_name(&sanitized_name, suffix));
+        if !final_path.starts_with(peer_dir) {
+            anyhow::bail!("incoming file path escaped inbox root");
+        }
+        if tokio::fs::try_exists(&final_path).await? {
+            continue;
+        }
+
+        let temp_path = incoming_part_path(&final_path)?;
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await
+        {
+            Ok(temp_file) => {
+                return Ok(ReservedIncomingFile {
+                    sanitized_name,
+                    final_path,
+                    temp_path,
+                    temp_file,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("reserve inbound file part path"),
+        }
+    }
+
+    let fallback_name = format!(
+        "{} ({})",
+        file_stem_or_default(&sanitized_name),
+        uuid::Uuid::new_v4()
+    );
+    let final_path = peer_dir.join(fallback_name);
+    let temp_path = incoming_part_path(&final_path)?;
+    let temp_file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .await
+        .context("reserve fallback inbound file part path")?;
+
+    Ok(ReservedIncomingFile {
+        sanitized_name,
+        final_path,
+        temp_path,
+        temp_file,
+    })
+}
+
+fn conflict_file_name(file_name: &str, suffix: u32) -> String {
+    if suffix == 0 {
+        return file_name.to_string();
+    }
+
+    let stem = file_stem_or_default(file_name);
+    let extension = Path::new(file_name)
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_string());
+    let mut candidate = format!("{stem} ({suffix})");
+    if let Some(extension) = extension {
+        candidate.push('.');
+        candidate.push_str(&extension);
+    }
+    candidate
+}
+
+fn file_stem_or_default(file_name: &str) -> String {
+    Path::new(file_name)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "file".to_string())
+}
+
+fn incoming_part_path(final_path: &Path) -> Result<PathBuf> {
+    let final_name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("incoming final path must have UTF-8 file name")?;
+    Ok(final_path.with_file_name(format!(".{final_name}.boundless.part")))
+}
+
+async fn copy_file_to_reserved_part(source_path: &Path, part_path: &Path) -> Result<()> {
+    let mut source = tokio::fs::File::open(source_path)
+        .await
+        .with_context(|| format!("open inbound temp source {}", source_path.display()))?;
+    let mut target = tokio::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(part_path)
+        .await
+        .with_context(|| format!("open inbound reserved part {}", part_path.display()))?;
+    tokio::io::copy(&mut source, &mut target)
+        .await
+        .with_context(|| format!("copy inbound temp payload to {}", part_path.display()))?;
+    target
+        .sync_all()
+        .await
+        .with_context(|| format!("sync inbound reserved part {}", part_path.display()))
+}
+
+async fn sync_file_at(path: &Path) -> Result<()> {
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .await
+        .with_context(|| format!("open inbound part for sync {}", path.display()))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("sync inbound part {}", path.display()))
+}
+
+async fn complete_reserved_incoming_file(temp_path: &Path, final_path: &Path) -> Result<()> {
+    if tokio::fs::try_exists(final_path).await? {
+        anyhow::bail!(
+            "incoming file destination already exists: {}",
+            final_path.display()
+        );
+    }
+    tokio::fs::rename(temp_path, final_path)
+        .await
+        .with_context(|| format!("finalize inbound file {}", final_path.display()))
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {

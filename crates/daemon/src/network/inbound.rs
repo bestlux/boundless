@@ -13,9 +13,10 @@ use peer_transport::{
     MAX_INBOUND_TRANSFERS_PER_PEER,
 };
 
-use super::codec::now_millis;
 use super::inbound_payload::enqueue_clipboard_image_payload;
 use super::outbound::{send_file_chunk_credit, send_message};
+
+const FILE_TRANSFER_CHUNK_CREDIT_LOW_WATERMARK: u32 = 2;
 
 #[expect(
     clippy::too_many_arguments,
@@ -105,56 +106,61 @@ where
         return Ok(());
     }
 
-    let temp_path = std::env::temp_dir().join(format!(
-        "boundless-inbound-{}-{}.part",
-        now_millis(),
-        uuid::Uuid::new_v4()
-    ));
-    let temp_file = match tokio::fs::File::create(&temp_path).await {
-        Ok(file) => file,
+    let Some(peer_id) = remote_peer_id else {
+        return Ok(());
+    };
+
+    let reserved = match state
+        .reserve_incoming_file(peer_id, &file_name, total_bytes)
+        .await
+    {
+        Ok(reserved) => reserved,
         Err(error) => {
             record_transport_transfer_rejected(
                 state,
                 authenticated_peer_id,
-                format!("reason=temp_create_failed transfer_id={transfer_id} error={error}"),
+                format!("reason=temp_reserve_failed transfer_id={transfer_id} error={error}"),
                 total_bytes,
             )
             .await;
-            send_file_transfer_rejected(writer, frame_buffer, &transfer_id, "temp_create_failed")
+            send_file_transfer_rejected(writer, frame_buffer, &transfer_id, "temp_reserve_failed")
                 .await?;
             return Ok(());
         }
     };
 
-    if let Some(peer_id) = remote_peer_id {
-        inbound_transfers.insert(
-            transfer_id.clone(),
-            InboundTransfer {
-                peer_id: peer_id.to_string(),
-                file_name: file_name.clone(),
-                total_bytes,
-                bytes_received: 0,
-                temp_path,
-                temp_file,
-            },
-        );
-        info!(
-            peer_id = %peer_id,
-            transfer_id = %transfer_id,
-            file_name = %file_name,
-            total_bytes,
-            "started inbound file transfer"
-        );
-        state.record_transport_event(TransportEventRecord {
-            timestamp: Utc::now(),
-            direction: "incoming".to_string(),
-            kind: "file_transfer_started".to_string(),
+    let file_name = reserved.sanitized_name;
+    inbound_transfers.insert(
+        transfer_id.clone(),
+        InboundTransfer {
             peer_id: peer_id.to_string(),
-            detail: format!(
-                "transfer_id={transfer_id} file_name={file_name} total_bytes={total_bytes}"
-            ),
-            size_bytes: total_bytes,
-        });
+            file_name: file_name.clone(),
+            total_bytes,
+            bytes_received: 0,
+            remaining_chunk_credits: FILE_TRANSFER_INITIAL_CHUNK_CREDITS,
+            final_path: reserved.final_path,
+            temp_path: reserved.temp_path,
+            temp_file: reserved.temp_file,
+        },
+    );
+    info!(
+        peer_id = %peer_id,
+        transfer_id = %transfer_id,
+        file_name = %file_name,
+        total_bytes,
+        "started inbound file transfer"
+    );
+    state.record_transport_event(TransportEventRecord {
+        timestamp: Utc::now(),
+        direction: "incoming".to_string(),
+        kind: "file_transfer_started".to_string(),
+        peer_id: peer_id.to_string(),
+        detail: format!(
+            "transfer_id={transfer_id} file_name={file_name} total_bytes={total_bytes}"
+        ),
+        size_bytes: total_bytes,
+    });
+    let initial_credit_result = async {
         send_file_chunk_credit(
             writer,
             &transfer_id,
@@ -164,7 +170,14 @@ where
         .await?;
         tokio::io::AsyncWriteExt::flush(writer)
             .await
-            .context("flush inbound file transfer initial credit")?;
+            .context("flush inbound file transfer initial credit")
+    }
+    .await;
+    if let Err(error) = initial_credit_result {
+        if let Some(transfer) = inbound_transfers.remove(&transfer_id) {
+            discard_inbound_transfer(transfer).await;
+        }
+        return Err(error);
     }
 
     Ok(())
@@ -335,6 +348,16 @@ where
     }
 
     transfer.bytes_received = next_size;
+    transfer.remaining_chunk_credits = transfer.remaining_chunk_credits.saturating_sub(1);
+    let replenish_credits = if transfer.remaining_chunk_credits
+        <= FILE_TRANSFER_CHUNK_CREDIT_LOW_WATERMARK
+    {
+        let credits = FILE_TRANSFER_INITIAL_CHUNK_CREDITS - transfer.remaining_chunk_credits;
+        transfer.remaining_chunk_credits = transfer.remaining_chunk_credits.saturating_add(credits);
+        credits
+    } else {
+        0
+    };
     let peer_id = transfer.peer_id.clone();
     let total_bytes = transfer.total_bytes;
     inbound_transfers.insert(transfer_id.clone(), transfer);
@@ -348,10 +371,21 @@ where
         ),
         size_bytes: next_size,
     });
-    send_file_chunk_credit(writer, &transfer_id, 1, frame_buffer).await?;
-    tokio::io::AsyncWriteExt::flush(writer)
-        .await
-        .context("flush inbound file transfer chunk credit")?;
+    if replenish_credits > 0 {
+        let credit_result = async {
+            send_file_chunk_credit(writer, &transfer_id, replenish_credits, frame_buffer).await?;
+            tokio::io::AsyncWriteExt::flush(writer)
+                .await
+                .context("flush inbound file transfer chunk credit")
+        }
+        .await;
+        if let Err(error) = credit_result {
+            if let Some(transfer) = inbound_transfers.remove(&transfer_id) {
+                discard_inbound_transfer(transfer).await;
+            }
+            return Err(error);
+        }
+    }
     Ok(())
 }
 
@@ -448,13 +482,25 @@ pub(super) async fn handle_file_end(
         discard_inbound_transfer(transfer).await;
         return Ok(());
     }
+    if let Err(error) = transfer.temp_file.sync_all().await {
+        record_transport_transfer_rejected(
+            state,
+            &transfer.peer_id,
+            format!("reason=temp_sync_failed transfer_id={transfer_id} error={error}"),
+            transfer.bytes_received,
+        )
+        .await;
+        discard_inbound_transfer(transfer).await;
+        return Ok(());
+    }
     drop(transfer.temp_file);
 
     match state
-        .store_incoming_file_from_temp(
+        .complete_incoming_file(
             &transfer.peer_id,
-            &transfer.file_name,
+            transfer.file_name.clone(),
             &transfer.temp_path,
+            &transfer.final_path,
             transfer.bytes_received,
         )
         .await
