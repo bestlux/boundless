@@ -77,6 +77,7 @@ const SUPERVISOR_TICK: Duration = Duration::from_secs(1);
 const MAX_BACKOFF_SECONDS: u64 = 30;
 const MAX_WIRE_FRAME_BYTES: usize = MAX_WIRE_PAYLOAD_BYTES;
 const LISTEN_BACKLOG: i32 = 1024;
+const PORT_ZERO_SPLIT_STACK_RETRIES: usize = 8;
 
 pub fn start(state: AppState, listeners: Vec<TcpListener>) {
     if !listeners.is_empty() {
@@ -174,6 +175,33 @@ pub(crate) fn bind_dual_stack_tcp_listeners(port: u16) -> Result<Vec<TcpListener
         }
     }
 
+    let attempts = if port == 0 {
+        PORT_ZERO_SPLIT_STACK_RETRIES
+    } else {
+        1
+    };
+    let mut last_addr_in_use_error = None;
+    for attempt in 1..=attempts {
+        match bind_split_stack_tcp_listeners(port) {
+            Ok(listeners) => return Ok(listeners),
+            Err(error) if port == 0 && error_chain_has_addr_in_use(&error) => {
+                warn!(
+                    attempt,
+                    attempts,
+                    error = %error,
+                    "split-stack TCP listener hit random port collision; retrying"
+                );
+                last_addr_in_use_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_addr_in_use_error
+        .expect("port zero split-stack retry loop should record an address-in-use error"))
+}
+
+fn bind_split_stack_tcp_listeners(port: u16) -> Result<Vec<TcpListener>> {
     let mut listeners = Vec::new();
     let mut target_port = port;
     match bind_single_stack_listener(
@@ -188,6 +216,9 @@ pub(crate) fn bind_dual_stack_tcp_listeners(port: u16) -> Result<Vec<TcpListener
             listeners.push(listener);
         }
         Err(error) => {
+            if error.kind() == io::ErrorKind::AddrInUse {
+                return Err(error).context("bind IPv6 fallback listener");
+            }
             warn!(port, error = %error, "IPv6-only TCP listener bind failed");
         }
     }
@@ -199,6 +230,9 @@ pub(crate) fn bind_dual_stack_tcp_listeners(port: u16) -> Result<Vec<TcpListener
     ) {
         Ok(listener) => listeners.push(listener),
         Err(error) => {
+            if error.kind() == io::ErrorKind::AddrInUse {
+                return Err(error).context("bind IPv4 fallback listener");
+            }
             if listeners.is_empty() {
                 return Err(error).context("bind IPv4 fallback listener");
             }
@@ -216,6 +250,14 @@ pub(crate) fn bind_dual_stack_tcp_listeners(port: u16) -> Result<Vec<TcpListener
     Ok(listeners)
 }
 
+fn error_chain_has_addr_in_use(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io_error| io_error.kind() == io::ErrorKind::AddrInUse)
+    })
+}
+
 fn bind_dual_stack_listener(port: u16) -> io::Result<TcpListener> {
     bind_socket2_listener(
         SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
@@ -223,8 +265,8 @@ fn bind_dual_stack_listener(port: u16) -> io::Result<TcpListener> {
     )
 }
 
-fn bind_single_stack_listener(addr: SocketAddr, only_v6: bool) -> Result<TcpListener> {
-    bind_socket2_listener(addr, addr.is_ipv6().then_some(only_v6)).map_err(anyhow::Error::from)
+fn bind_single_stack_listener(addr: SocketAddr, only_v6: bool) -> io::Result<TcpListener> {
+    bind_socket2_listener(addr, addr.is_ipv6().then_some(only_v6))
 }
 
 fn bind_socket2_listener(addr: SocketAddr, only_v6: Option<bool>) -> io::Result<TcpListener> {
@@ -1991,6 +2033,42 @@ mod tests {
         assert_ne!(
             effective_port, blocked_port,
             "fallback must avoid blocked configured port"
+        );
+        assert_eq!(state.snapshot().await.network_port, effective_port);
+
+        drop(listeners);
+        drop(blocker);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn prepare_listener_falls_back_when_ipv4_only_blocks_configured_port() {
+        let (state, root) = state_for_listener_test().await;
+        let blocker = TcpListener::bind("0.0.0.0:0")
+            .await
+            .expect("bind IPv4 blocker");
+        let blocked_port = blocker.local_addr().expect("block addr").port();
+
+        let direct_bind = bind_dual_stack_tcp_listeners(blocked_port);
+        assert!(
+            direct_bind.is_err(),
+            "partial IPv6-only fallback must not succeed on an IPv4-blocked configured port"
+        );
+
+        state
+            .update_network_port(blocked_port)
+            .await
+            .expect("set blocked port");
+
+        let listeners = prepare_listener(&state).await;
+        assert!(
+            !listeners.is_empty(),
+            "fallback listener bind should succeed"
+        );
+        let effective_port = listeners[0].local_addr().expect("addr").port();
+        assert_ne!(
+            effective_port, blocked_port,
+            "fallback must avoid IPv4-blocked configured port"
         );
         assert_eq!(state.snapshot().await.network_port, effective_port);
 
