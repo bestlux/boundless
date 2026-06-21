@@ -38,6 +38,7 @@ This is the short, version-neutral repo status packet for agents and release wor
 8. Publish only after the release-readiness packet is ready; stable policy fails failed, skipped, missing, or stale supported evidence.
 
 The version-neutral release packet contract lives in [docs/release/release-readiness.md](release/release-readiness.md). The release-hardening limits live in [docs/release/v5-release-hardening.md](release/v5-release-hardening.md).
+The product performance scorecard lives in [docs/performance/product-scorecard.md](performance/product-scorecard.md) and classifies install/startup, discovery/pairing, clipboard, file-transfer, reconnect, input handoff, and soak evidence without making physical two-machine labs default PR gates.
 
 ## Validation Ladder
 
@@ -80,6 +81,7 @@ These are not hidden release blockers by default; they require explicit release-
 | mixed_dpi_input_matrix | deferred | Mixed-DPI and negative-coordinate monitor validation needs Windows hardware/runtime evidence. | this document |
 | stale_non_file_evidence | deferred | Current strict freshness enforcement is file-summary based; external workflow/run freshness still depends on release review metadata. | docs/release/release-readiness.md |
 | clipboard_image_spooling | deferred | BND-NEXT-8A bounded the measured outbound/local image allocation path; inbound/apply still materializes full BMP buffers and should become streaming or spooling work only with separate architecture evidence. | docs/performance/clipboard-image-memory.md |
+| product_scorecard_real_lab_runs | open | Scorecard thresholds are provisional until at least two real two-PC runs exist for each category; fixture rows validate artifact shape but do not make product-performance thresholds binding. | docs/performance/product-scorecard.md |
 
 ## Next Backlog Step
 
