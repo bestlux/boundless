@@ -406,6 +406,21 @@ function Assert-FileTransferObservationMetadata {
     }
 }
 
+function Assert-ObservationIdsUnique {
+    param([object[]]$PacketObservations)
+
+    $ids = @($PacketObservations | ForEach-Object { [string]$_.id })
+    $missingIds = @($ids | Where-Object { [string]::IsNullOrWhiteSpace($_) })
+    if ($missingIds.Count -gt 0) {
+        throw "file-transfer observations must include non-empty ids."
+    }
+
+    $duplicateIds = @($ids | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+    if ($duplicateIds.Count -gt 0) {
+        throw "file-transfer observation ids must be unique across variant/direction/iteration rows; duplicates: $($duplicateIds -join ",")."
+    }
+}
+
 function Invoke-FileTransferLabValidation {
     $result = Invoke-FileTransferLabDryRun
     $packet = Get-Content -LiteralPath $result.packet_path -Raw | ConvertFrom-Json
@@ -414,6 +429,7 @@ function Invoke-FileTransferLabValidation {
 
     Assert-SummaryMatchesObservations -Packet $packet -Observations $observations
     Assert-FileTransferObservationMetadata -PacketObservations $packetObservations
+    Assert-ObservationIdsUnique -PacketObservations $packetObservations
     Assert-FileTransferReliabilitySignals -PacketObservations $packetObservations
 
     $passedRows = @($packetObservations | Where-Object { $_.status -eq "passed" })

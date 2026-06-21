@@ -303,6 +303,7 @@ function New-Observation {
         [Nullable[double]]$DurationMs,
         [Nullable[int64]]$Bytes,
         [string]$MeasurementSource,
+        [string]$ObservationId = "",
         [string]$FailureKind = "",
         [string]$StartedAtUtc = "",
         [string]$ScenarioVariant = "",
@@ -338,12 +339,28 @@ function New-Observation {
     }
 
     $effectivePayloadBytes = if ($null -ne $PayloadBytes) { $PayloadBytes } elseif ($null -ne $Bytes) { $Bytes } else { $null }
+    $sanitizedObservationId = Redact-Text $ObservationId
+    $sanitizedScenarioVariant = Redact-Text $ScenarioVariant
+    $sanitizedDirection = Redact-Text $Direction
+    $generatedIdParts = @(
+        $RunScenario,
+        $sanitizedScenarioVariant,
+        $sanitizedDirection,
+        $RunRole,
+        [string]$RunIteration
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    $effectiveObservationId = if (-not [string]::IsNullOrWhiteSpace($sanitizedObservationId)) {
+        $sanitizedObservationId
+    }
+    else {
+        $generatedIdParts -join "-"
+    }
 
     return [pscustomobject]@{
-        id = "$RunScenario-$RunRole-$RunIteration"
+        id = $effectiveObservationId
         scenario = $RunScenario
-        scenario_variant = Redact-Text $ScenarioVariant
-        direction = Redact-Text $Direction
+        scenario_variant = $sanitizedScenarioVariant
+        direction = $sanitizedDirection
         iteration = $RunIteration
         role = $RunRole
         status = $Status
@@ -535,6 +552,7 @@ function Read-ObservationFile {
             DurationMs = $durationMs
             Bytes = $bytes
             MeasurementSource = "observation-file"
+            ObservationId = Redact-Text (Get-ObjectProperty -Object $source -Name "id")
             FailureKind = Redact-Text (Get-ObjectProperty -Object $source -Name "failure_kind")
             StartedAtUtc = Redact-Text (Get-ObjectProperty -Object $source -Name "started_at_utc")
             ScenarioVariant = Redact-Text (Get-ObjectProperty -Object $source -Name "scenario_variant")
