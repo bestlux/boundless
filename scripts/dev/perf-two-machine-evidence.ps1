@@ -304,7 +304,17 @@ function New-Observation {
         [Nullable[int64]]$Bytes,
         [string]$MeasurementSource,
         [string]$FailureKind = "",
-        [string]$StartedAtUtc = ""
+        [string]$StartedAtUtc = "",
+        [string]$ScenarioVariant = "",
+        [string]$Direction = "",
+        [string]$PayloadKind = "",
+        [string]$PayloadLabel = "",
+        [Nullable[int64]]$PayloadBytes = $null,
+        [Nullable[int64]]$PolicyLimitBytes = $null,
+        [string]$PolicyExpected = "",
+        [bool]$PayloadSynthetic = $false,
+        [string]$ProvisionalClassification = "",
+        [string]$ProvisionalClassificationReason = ""
     )
 
     if ([string]::IsNullOrWhiteSpace($StartedAtUtc)) {
@@ -316,9 +326,13 @@ function New-Observation {
         $throughputMbps = [Math]::Round((($Bytes * 8.0) / ($DurationMs / 1000.0)) / 1000000.0, 3)
     }
 
+    $effectivePayloadBytes = if ($null -ne $PayloadBytes) { $PayloadBytes } elseif ($null -ne $Bytes) { $Bytes } else { $null }
+
     return [pscustomobject]@{
         id = "$RunScenario-$RunRole-$RunIteration"
         scenario = $RunScenario
+        scenario_variant = Redact-Text $ScenarioVariant
+        direction = Redact-Text $Direction
         iteration = $RunIteration
         role = $RunRole
         status = $Status
@@ -326,9 +340,17 @@ function New-Observation {
         latency_ms = if ($null -ne $LatencyMs) { [Math]::Round($LatencyMs, 3) } else { $null }
         duration_ms = if ($null -ne $DurationMs) { [Math]::Round($DurationMs, 3) } else { $null }
         bytes = if ($null -ne $Bytes) { $Bytes } else { $null }
+        payload_kind = Redact-Text $PayloadKind
+        payload_label = Redact-Text $PayloadLabel
+        payload_bytes = if ($null -ne $effectivePayloadBytes) { $effectivePayloadBytes } else { $null }
+        policy_limit_bytes = if ($null -ne $PolicyLimitBytes) { $PolicyLimitBytes } else { $null }
+        policy_expected = Redact-Text $PolicyExpected
+        payload_synthetic = $PayloadSynthetic
         throughput_mbps = $throughputMbps
         measurement_source = $MeasurementSource
         failure_kind = Redact-Text $FailureKind
+        provisional_classification = Redact-Text $ProvisionalClassification
+        provisional_classification_reason = Redact-Text $ProvisionalClassificationReason
         payload_contents_recorded = $false
         raw_peer_ids_recorded = $false
         raw_paths_recorded = $false
@@ -372,6 +394,39 @@ function ConvertTo-ObservationNumber {
     }
 
     return [double]$Value
+}
+
+function ConvertTo-ObservationBoolean {
+    param([object]$Value)
+
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return $false
+    }
+
+    if ($Value -is [bool]) {
+        return [bool]$Value
+    }
+
+    return ([string]$Value).Equals("true", [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Normalize-ProvisionalClassification {
+    param([object]$Value)
+
+    $classification = (Redact-Text $Value).ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($classification)) {
+        return ""
+    }
+
+    if ($classification -eq "noop") {
+        return "no-op"
+    }
+
+    if ($classification -in @("no-op", "acceptable", "warning", "fail")) {
+        return $classification
+    }
+
+    return "warning"
 }
 
 function Get-ObjectProperty {
@@ -443,7 +498,31 @@ function Read-ObservationFile {
         $latencyMs = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "latency_ms")
         $durationMs = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "duration_ms")
         $bytes = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "bytes") -Integer
-        $items.Add((New-Observation -RunScenario $scenarioName -RunIteration ([int]$iteration) -RunRole $sourceRole -Status $status -LatencyMs $latencyMs -DurationMs $durationMs -Bytes $bytes -MeasurementSource "observation-file" -FailureKind (Redact-Text (Get-ObjectProperty -Object $source -Name "failure_kind")) -StartedAtUtc (Redact-Text (Get-ObjectProperty -Object $source -Name "started_at_utc"))))
+        $payloadBytes = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "payload_bytes") -Integer
+        $policyLimitBytes = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "policy_limit_bytes") -Integer
+        $observationArgs = @{
+            RunScenario = $scenarioName
+            RunIteration = [int]$iteration
+            RunRole = $sourceRole
+            Status = $status
+            LatencyMs = $latencyMs
+            DurationMs = $durationMs
+            Bytes = $bytes
+            MeasurementSource = "observation-file"
+            FailureKind = Redact-Text (Get-ObjectProperty -Object $source -Name "failure_kind")
+            StartedAtUtc = Redact-Text (Get-ObjectProperty -Object $source -Name "started_at_utc")
+            ScenarioVariant = Redact-Text (Get-ObjectProperty -Object $source -Name "scenario_variant")
+            Direction = Redact-Text (Get-ObjectProperty -Object $source -Name "direction")
+            PayloadKind = Redact-Text (Get-ObjectProperty -Object $source -Name "payload_kind")
+            PayloadLabel = Redact-Text (Get-ObjectProperty -Object $source -Name "payload_label")
+            PayloadBytes = $payloadBytes
+            PolicyLimitBytes = $policyLimitBytes
+            PolicyExpected = Redact-Text (Get-ObjectProperty -Object $source -Name "policy_expected")
+            PayloadSynthetic = ConvertTo-ObservationBoolean (Get-ObjectProperty -Object $source -Name "payload_synthetic")
+            ProvisionalClassification = Normalize-ProvisionalClassification (Get-ObjectProperty -Object $source -Name "provisional_classification")
+            ProvisionalClassificationReason = Redact-Text (Get-ObjectProperty -Object $source -Name "provisional_classification_reason")
+        }
+        $items.Add((New-Observation @observationArgs))
     }
 
     return @($items.ToArray())
@@ -487,6 +566,14 @@ function New-ScenarioSummary {
             $bytesTotal += [int64]$row.bytes
         }
     }
+    $payloadByteValues = @($rows | Where-Object { $null -ne $_.payload_bytes } | ForEach-Object { [int64]$_.payload_bytes })
+    $classificationCounts = [ordered]@{
+        no_op = @($rows | Where-Object { $_.provisional_classification -eq "no-op" }).Count
+        acceptable = @($rows | Where-Object { $_.provisional_classification -eq "acceptable" }).Count
+        warning = @($rows | Where-Object { $_.provisional_classification -eq "warning" }).Count
+        fail = @($rows | Where-Object { $_.provisional_classification -eq "fail" }).Count
+        unclassified = @($rows | Where-Object { [string]::IsNullOrWhiteSpace([string]$_.provisional_classification) }).Count
+    }
 
     $durationTotalMs = 0.0
     foreach ($duration in $durations) {
@@ -510,7 +597,12 @@ function New-ScenarioSummary {
             max = if ($latencies.Count -gt 0) { [Math]::Round([double](@($latencies | Measure-Object -Maximum).Maximum), 3) } else { $null }
         }
         bytes_total = $bytesTotal
+        payload_bytes = [pscustomobject]@{
+            min = if ($payloadByteValues.Count -gt 0) { [int64](@($payloadByteValues | Measure-Object -Minimum).Minimum) } else { $null }
+            max = if ($payloadByteValues.Count -gt 0) { [int64](@($payloadByteValues | Measure-Object -Maximum).Maximum) } else { $null }
+        }
         throughput_mbps = $throughputMbps
+        provisional_classifications = [pscustomobject]$classificationCounts
     }
 }
 
@@ -620,10 +712,10 @@ function Write-MarkdownSummary {
     $lines.Add("- Raw peer IDs recorded: $($Packet.privacy.raw_peer_ids_recorded)")
     $lines.Add("- Raw paths recorded: $($Packet.privacy.raw_paths_recorded)")
     $lines.Add("")
-    $lines.Add("| Scenario | Iterations | Success | Failed | Skipped | p50 ms | p95 ms | max ms | Bytes | Throughput Mbps |")
-    $lines.Add("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    $lines.Add("| Scenario | Iterations | Success | Failed | Skipped | p50 ms | p95 ms | max ms | Bytes | Payload min | Payload max | Acceptable | Warning | Fail | No-op | Throughput Mbps |")
+    $lines.Add("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     foreach ($summary in $Packet.summary.scenario_summaries) {
-        $lines.Add("| $($summary.scenario) | $($summary.iterations) | $($summary.success_count) | $($summary.failure_count) | $($summary.skipped_count) | $($summary.latency_ms.p50) | $($summary.latency_ms.p95) | $($summary.latency_ms.max) | $($summary.bytes_total) | $($summary.throughput_mbps) |")
+        $lines.Add("| $($summary.scenario) | $($summary.iterations) | $($summary.success_count) | $($summary.failure_count) | $($summary.skipped_count) | $($summary.latency_ms.p50) | $($summary.latency_ms.p95) | $($summary.latency_ms.max) | $($summary.bytes_total) | $($summary.payload_bytes.min) | $($summary.payload_bytes.max) | $($summary.provisional_classifications.acceptable) | $($summary.provisional_classifications.warning) | $($summary.provisional_classifications.fail) | $($summary.provisional_classifications.no_op) | $($summary.throughput_mbps) |")
     }
     $lines.Add("")
     $lines.Add("## Artifact Paths")

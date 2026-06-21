@@ -28,6 +28,10 @@ $harness = Join-Path $repoRoot "scripts/dev/perf-two-machine-evidence.ps1"
 if (-not (Test-Path -LiteralPath $harness)) {
     throw "Missing harness script: $harness"
 }
+$clipboardLab = Join-Path $repoRoot "scripts/dev/perf-clipboard-lab.ps1"
+if (-not (Test-Path -LiteralPath $clipboardLab)) {
+    throw "Missing clipboard lab script: $clipboardLab"
+}
 
 function Redact-FixtureLogLine {
     param([object]$Value)
@@ -113,6 +117,41 @@ $dryScenarios = @($dryRunPacket.summary.scenario_summaries | ForEach-Object { $_
 foreach ($required in @("text-clipboard", "image-clipboard", "file-transfer", "reconnect-input", "soak")) {
     if ($dryScenarios -notcontains $required) {
         throw "Dry-run fixture missing scenario '$required'."
+    }
+}
+
+$clipboardCaseRoot = Join-Path $OutputRoot "clipboard-lab"
+New-Item -ItemType Directory -Force -Path $clipboardCaseRoot | Out-Null
+$clipboardCaptured = & powershell -NoProfile -ExecutionPolicy Bypass -File $clipboardLab -Mode Validate -OutputRoot $clipboardCaseRoot *>&1
+$clipboardExitCode = if ($null -eq $global:LASTEXITCODE) { 0 } else { $global:LASTEXITCODE }
+$clipboardCaptured | ForEach-Object { Redact-FixtureLogLine $_ } | Set-Content -LiteralPath (Join-Path $clipboardCaseRoot "clipboard-lab.log") -Encoding utf8
+if ($clipboardExitCode -ne 0) {
+    throw "Clipboard lab fixture failed with exit code $clipboardExitCode; see generated fixture log"
+}
+
+$clipboardPacketPath = Join-Path $clipboardCaseRoot "two-machine-evidence.json"
+if (-not (Test-Path -LiteralPath $clipboardPacketPath)) {
+    throw "Clipboard lab fixture did not produce two-machine-evidence.json."
+}
+$clipboardPacket = Get-Content -LiteralPath $clipboardPacketPath -Raw | ConvertFrom-Json
+$clipboardTextSummary = @($clipboardPacket.summary.scenario_summaries | Where-Object { $_.scenario -eq "text-clipboard" })[0]
+$clipboardImageSummary = @($clipboardPacket.summary.scenario_summaries | Where-Object { $_.scenario -eq "image-clipboard" })[0]
+if ($clipboardTextSummary.success_count -ne 60 -or $clipboardTextSummary.failure_count -ne 0) {
+    throw "Clipboard lab text summary did not preserve expected success/failure counts."
+}
+if ($clipboardImageSummary.success_count -ne 60 -or $clipboardImageSummary.skipped_count -ne 20) {
+    throw "Clipboard lab image summary did not preserve expected success/skipped counts."
+}
+if ($clipboardImageSummary.provisional_classifications.no_op -ne 20) {
+    throw "Clipboard lab image summary did not classify the 4K policy-bound rows as no-op."
+}
+
+foreach ($artifact in Get-ChildItem -LiteralPath $OutputRoot -File -Recurse -Include "*.json", "*.md", "*.log") {
+    $content = Get-Content -LiteralPath $artifact.FullName -Raw
+    foreach ($forbidden in @("raw-peer", "raw-machine", "C:\Users\secret", "192.168.1.22", "12345678-1234-1234-1234-123456789abc", $repoRoot, $OutputRoot)) {
+        if (-not [string]::IsNullOrWhiteSpace($forbidden) -and $content.Contains($forbidden)) {
+            throw "Fixture artifact '$($artifact.Name)' leaked forbidden token '$forbidden'."
+        }
     }
 }
 
