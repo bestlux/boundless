@@ -4,10 +4,18 @@ This guide covers the normal Windows tray flow for installing, pairing, arrangin
 
 ## Install
 
-1. Install the Windows MSI.
-2. Launch Boundless from the Start Menu, Desktop shortcut, or `boundlesstray.exe`.
-3. Open the tray icon and choose `Dashboard`.
-4. Confirm the daemon is reachable on the Status & Pairing tab.
+1. Download the Windows MSI and matching `Boundless-<version>-windows-x64-install.ps1` helper into the same folder.
+2. From the intended desktop user's normal, non-elevated PowerShell session, run:
+
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\Boundless-<version>-windows-x64-install.ps1
+   ```
+
+   The helper captures that user's SID before the UAC prompt and passes it to the elevated MSI. If you are already in an elevated shell, use the fallback in [Service Mode](service-mode.md) and pass the intended SID explicitly.
+
+3. Launch Boundless from the Start Menu, Desktop shortcut, or `boundlesstray.exe`.
+4. Open the tray icon and choose `Dashboard`.
+5. Confirm the daemon is reachable on the Status & Pairing tab.
 
 The default machine-wide install root is `%ProgramFiles%\Boundless`. The tray is the primary entrypoint and starts `boundlessd` when needed.
 

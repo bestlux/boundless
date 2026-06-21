@@ -14,6 +14,7 @@
     "cli": "boundlessctl.exe"
   },
   "scripts": {
+    "install": "Boundless-Install.ps1",
     "reset": "Boundless-Reset.ps1"
   },
   "reset_modes": [

@@ -9,9 +9,10 @@ machine-wide MSI is the primary service installation path.
 - The MSI installs the service binary under `%ProgramFiles%\Boundless`, registers
   `BoundlessService` as LocalSystem, sets AutoStart, starts the service during
   install, stops it for upgrade/uninstall, and removes it on uninstall.
-- The MSI requires an explicit `BOUNDLESS_ALLOWED_USER_SID=S-...` property so
-  the service control pipe is authorized for exactly the intended desktop user.
-  It fails closed instead of guessing the elevating administrator account.
+- The preferred install helper captures the intended desktop user's SID before
+  UAC and supplies the secure `BOUNDLESS_ALLOWED_USER_SID=S-...` MSI property.
+  The MSI still requires that property and fails closed instead of guessing the
+  elevating administrator account.
 - `service install` rejects service binaries under user-writable locations such as `%LocalAppData%`, `%AppData%`, `%TEMP%`, and Downloads.
 - The service control named pipe uses an explicit ACL for `SYSTEM`, local Administrators, and the selected Windows user SID.
 - Service mode has separate LocalSystem runtime state from the normal per-user daemon. Pairing, layout, and feature settings should be configured while the service is the active daemon.
@@ -20,12 +21,22 @@ machine-wide MSI is the primary service installation path.
 
 ## Commands
 
-Install from an elevated prompt with the intended desktop user's SID:
+Install from the intended desktop user's normal, non-elevated PowerShell session:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Boundless-<version>-windows-x64-install.ps1
+```
+
+Fallback/debug path from an elevated prompt with the intended desktop user's SID:
 
 ```powershell
 msiexec /i .\Boundless-<version>-windows-x64.msi `
   BOUNDLESS_ALLOWED_USER_SID=S-...
 ```
+
+Do not run the helper from an already-elevated shell and accept its current user
+by default. It refuses that path unless you pass `-AllowedUserSid`,
+`-AllowedUserName`, or `-UseCurrentUserWhenElevated` explicitly.
 
 Installed CLI examples use the full executable path because the MSI does not add Boundless to `PATH`:
 

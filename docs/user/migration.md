@@ -21,7 +21,14 @@ This guide covers migration from Boundless v4 and from Mouse Without Borders.
 
 3. If `Boundless-Install.ps1` exists under `%LocalAppData%\Programs\Boundless`, remove the old script-based install before running the MSI. The first MSI releases intentionally block over legacy script-installed layouts.
 4. If `BoundlessService` was installed manually from a copied service binary, uninstall that manual service from an elevated shell before using the MSI-owned service path. The v5 MSI is the owner of future service registration, repair, upgrade, and uninstall.
-5. Install the v5 MSI from an elevated shell with the intended desktop user's SID:
+5. Install v5 from the intended desktop user's normal, non-elevated PowerShell session:
+
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\Boundless-<version>-windows-x64-install.ps1
+   ```
+
+   The helper captures that user's SID before UAC. If you must install from an
+   already-elevated shell, pass the intended SID explicitly:
 
    ```powershell
    msiexec /i .\Boundless-<version>-windows-x64.msi BOUNDLESS_ALLOWED_USER_SID=S-...

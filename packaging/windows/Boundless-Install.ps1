@@ -1,173 +1,217 @@
 [CmdletBinding()]
 param(
-    [string]$PackageRoot = "",
-    [string]$InstallRoot = "",
-    [string]$StartupFolderPath = "",
-    [string]$StartMenuProgramsPath = "",
-    [string]$DesktopFolderPath = "",
-    [string]$UninstallRegistryKeyPath = "",
-    [switch]$NoLaunch
+    [string]$InstallerPath = "",
+    [string]$AllowedUserSid = "",
+    [string]$AllowedUserName = "",
+    [switch]$UseCurrentUserWhenElevated,
+    [switch]$Quiet,
+    [switch]$NoRestart,
+    [string]$LogPath = "",
+    [switch]$ResolveOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function Get-LocalAppDataPath {
-    return [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+function Test-IsAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Get-DefaultInstallRoot {
-    return Join-Path (Join-Path (Get-LocalAppDataPath) "Programs") "Boundless"
-}
+function Assert-AllowedUserSid {
+    param([string]$Sid)
 
-function Get-DefaultStartupFolderPath {
-    return [Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)
-}
-
-function Get-DefaultStartMenuProgramsPath {
-    return [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)
-}
-
-function Get-DefaultDesktopFolderPath {
-    return [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
-}
-
-function Get-DefaultUninstallRegistryKeyPath {
-    return "Registry::HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\Boundless"
-}
-
-function Resolve-RequiredPackagePath {
-    param(
-        [string]$Root,
-        [string]$Name
-    )
-
-    $path = Join-Path $Root $Name
-    if (-not (Test-Path -LiteralPath $path)) {
-        throw "Required package asset is missing: $path"
+    if ([string]::IsNullOrWhiteSpace($Sid)) {
+        throw "Allowed user SID was empty."
     }
 
-    return (Resolve-Path -LiteralPath $path).Path
+    if ($Sid -notmatch '^S-1-\d+(?:-\d+)+$') {
+        throw "Allowed user SID must be a strict numeric SID such as S-1-5-21-... Got: $Sid"
+    }
 }
 
-function Ensure-Directory {
-    param([string]$Path)
+function Resolve-AccountSid {
+    param([string]$AccountName)
 
-    New-Item -ItemType Directory -Force -Path $Path | Out-Null
+    if ([string]::IsNullOrWhiteSpace($AccountName)) {
+        throw "Allowed user name was empty."
+    }
+
+    try {
+        $account = [Security.Principal.NTAccount]::new($AccountName)
+        return $account.Translate([Security.Principal.SecurityIdentifier]).Value
+    }
+    catch {
+        throw "Could not resolve Windows account '$AccountName' to a SID. Use DOMAIN\user format or pass -AllowedUserSid explicitly. $($_.Exception.Message)"
+    }
 }
 
-function New-Shortcut {
+function Resolve-AccountNameFromSid {
+    param([string]$Sid)
+
+    try {
+        $securityIdentifier = [Security.Principal.SecurityIdentifier]::new($Sid)
+        return $securityIdentifier.Translate([Security.Principal.NTAccount]).Value
+    }
+    catch {
+        return ""
+    }
+}
+
+function Resolve-AllowedUser {
+    if (-not [string]::IsNullOrWhiteSpace($AllowedUserSid) -and -not [string]::IsNullOrWhiteSpace($AllowedUserName)) {
+        throw "Pass either -AllowedUserSid or -AllowedUserName, not both."
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($AllowedUserSid)) {
+        Assert-AllowedUserSid -Sid $AllowedUserSid
+        return [pscustomobject]@{
+            sid = $AllowedUserSid
+            account = Resolve-AccountNameFromSid -Sid $AllowedUserSid
+            source = "explicit_sid"
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($AllowedUserName)) {
+        $sid = Resolve-AccountSid -AccountName $AllowedUserName
+        Assert-AllowedUserSid -Sid $sid
+        return [pscustomobject]@{
+            sid = $sid
+            account = $AllowedUserName
+            source = "explicit_account"
+        }
+    }
+
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $isElevated = Test-IsAdministrator
+    if ($isElevated -and -not $UseCurrentUserWhenElevated) {
+        throw "Refusing to infer the allowed user from an already-elevated shell. Run this helper from the intended desktop user's normal PowerShell so it can capture that SID before UAC, or pass -AllowedUserSid for the intended user. Use -UseCurrentUserWhenElevated only when the elevated account is intentionally the desktop user to authorize."
+    }
+
+    $source = if ($isElevated) {
+        "current_elevated_user_explicitly_allowed"
+    }
+    else {
+        "current_unelevated_user"
+    }
+
+    return [pscustomobject]@{
+        sid = $identity.User.Value
+        account = $identity.Name
+        source = $source
+    }
+}
+
+function Resolve-InstallerPath {
+    if (-not [string]::IsNullOrWhiteSpace($InstallerPath)) {
+        if (-not (Test-Path -LiteralPath $InstallerPath)) {
+            throw "InstallerPath was not found: $InstallerPath"
+        }
+
+        return (Resolve-Path -LiteralPath $InstallerPath).Path
+    }
+
+    $scriptRoot = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        (Resolve-Path ".").Path
+    }
+    else {
+        $PSScriptRoot
+    }
+
+    $candidates = @(Get-ChildItem -LiteralPath $scriptRoot -Filter "Boundless-*-windows-x64.msi" -File -ErrorAction SilentlyContinue)
+    if ($candidates.Count -eq 0) {
+        throw "No Boundless Windows MSI was found next to this helper. Pass -InstallerPath <path-to-msi>."
+    }
+    if ($candidates.Count -gt 1) {
+        $names = @($candidates | Select-Object -ExpandProperty Name) -join ", "
+        throw "Multiple Boundless Windows MSI files were found next to this helper. Pass -InstallerPath explicitly. Found: $names"
+    }
+
+    return $candidates[0].FullName
+}
+
+function ConvertTo-ProcessArgument {
+    param([string]$Value)
+
+    if ($Value -notmatch '[\s"]') {
+        return $Value
+    }
+
+    return '"' + ($Value -replace '"', '\"') + '"'
+}
+
+function Invoke-BoundlessMsi {
     param(
-        [string]$ShortcutPath,
-        [string]$TargetPath,
-        [string]$WorkingDirectory,
-        [string]$Description,
-        [string]$IconLocation
+        [string]$ResolvedInstallerPath,
+        [string]$Sid
     )
 
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut($ShortcutPath)
-    $shortcut.TargetPath = $TargetPath
-    $shortcut.WorkingDirectory = $WorkingDirectory
-    if (-not [string]::IsNullOrWhiteSpace($IconLocation)) {
-        $shortcut.IconLocation = $IconLocation
-    } else {
-        $shortcut.IconLocation = $TargetPath
+    $arguments = @(
+        "/i",
+        $ResolvedInstallerPath,
+        "BOUNDLESS_ALLOWED_USER_SID=$Sid"
+    )
+
+    if ($Quiet) {
+        $arguments += "/qn"
     }
-    $shortcut.Description = $Description
-    $shortcut.Save()
+    if ($NoRestart) {
+        $arguments += "/norestart"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
+        $resolvedLogPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogPath)
+        $logParent = Split-Path -Parent $resolvedLogPath
+        if (-not [string]::IsNullOrWhiteSpace($logParent)) {
+            New-Item -ItemType Directory -Force -Path $logParent | Out-Null
+        }
+        $arguments += @("/l*v", $resolvedLogPath)
+    }
+
+    $argumentLine = @($arguments | ForEach-Object { ConvertTo-ProcessArgument -Value $_ }) -join " "
+    $startArgs = @{
+        FilePath = "msiexec.exe"
+        ArgumentList = $argumentLine
+        Wait = $true
+        PassThru = $true
+    }
+
+    if (-not (Test-IsAdministrator)) {
+        $startArgs.Verb = "RunAs"
+    }
+
+    $process = Start-Process @startArgs
+    if ($process.ExitCode -notin @(0, 3010)) {
+        throw "msiexec.exe failed with exit code $($process.ExitCode)."
+    }
+
+    return $process.ExitCode
 }
 
-if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
-    $InstallRoot = Get-DefaultInstallRoot
-}
-if ([string]::IsNullOrWhiteSpace($PackageRoot)) {
-    $PackageRoot = $PSScriptRoot
-}
-if ([string]::IsNullOrWhiteSpace($StartupFolderPath)) {
-    $StartupFolderPath = Get-DefaultStartupFolderPath
-}
-if ([string]::IsNullOrWhiteSpace($StartMenuProgramsPath)) {
-    $StartMenuProgramsPath = Get-DefaultStartMenuProgramsPath
-}
-if ([string]::IsNullOrWhiteSpace($DesktopFolderPath)) {
-    $DesktopFolderPath = Get-DefaultDesktopFolderPath
-}
-if ([string]::IsNullOrWhiteSpace($UninstallRegistryKeyPath)) {
-    $UninstallRegistryKeyPath = Get-DefaultUninstallRegistryKeyPath
+$selection = Resolve-AllowedUser
+Assert-AllowedUserSid -Sid $selection.sid
+
+$summary = [ordered]@{
+    selected_user_sid = $selection.sid
+    selected_user_account = $selection.account
+    selected_user_source = $selection.source
+    elevated_process = Test-IsAdministrator
 }
 
-$PackageRoot = (Resolve-Path -LiteralPath $PackageRoot).Path
-$manifestPath = Resolve-RequiredPackagePath -Root $PackageRoot -Name "package-manifest.json"
-$manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-
-$payloadFiles = @(
-    "boundlessd.exe"
-    "boundlessctl.exe"
-    "boundlesstray.exe"
-    "Boundless.ico"
-    "Boundless-Install.ps1"
-    "Boundless-Uninstall.ps1"
-    "Boundless-Reset.ps1"
-    "README.txt"
-    "LICENSE.txt"
-    "CHANGELOG.md"
-    "package-manifest.json"
-)
-
-Ensure-Directory -Path $InstallRoot
-foreach ($file in $payloadFiles) {
-    $source = Resolve-RequiredPackagePath -Root $PackageRoot -Name $file
-    Copy-Item -LiteralPath $source -Destination (Join-Path $InstallRoot $file) -Force
+if ($ResolveOnly) {
+    $summary.status = "resolved"
+    $summary | ConvertTo-Json -Depth 3
+    return
 }
 
-Ensure-Directory -Path $StartupFolderPath
-$trayPath = Join-Path $InstallRoot "boundlesstray.exe"
-$iconPath = Join-Path $InstallRoot "Boundless.ico"
-$startupShortcutPath = Join-Path $StartupFolderPath "Boundless.lnk"
-New-Shortcut `
-    -ShortcutPath $startupShortcutPath `
-    -TargetPath $trayPath `
-    -WorkingDirectory $InstallRoot `
-    -Description "Launch Boundless tray at sign-in" `
-    -IconLocation $iconPath
+$resolvedInstallerPath = Resolve-InstallerPath
+$summary.installer_path = $resolvedInstallerPath
 
-Ensure-Directory -Path $StartMenuProgramsPath
-$startMenuShortcutPath = Join-Path $StartMenuProgramsPath "Boundless.lnk"
-New-Shortcut `
-    -ShortcutPath $startMenuShortcutPath `
-    -TargetPath $trayPath `
-    -WorkingDirectory $InstallRoot `
-    -Description "Launch Boundless" `
-    -IconLocation $iconPath
-
-Ensure-Directory -Path $DesktopFolderPath
-$desktopShortcutPath = Join-Path $DesktopFolderPath "Boundless.lnk"
-New-Shortcut `
-    -ShortcutPath $desktopShortcutPath `
-    -TargetPath $trayPath `
-    -WorkingDirectory $InstallRoot `
-    -Description "Launch Boundless" `
-    -IconLocation $iconPath
-
-$uninstallCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $InstallRoot "Boundless-Uninstall.ps1")
-New-Item -Path $UninstallRegistryKeyPath -Force | Out-Null
-Set-ItemProperty -Path $UninstallRegistryKeyPath -Name DisplayName -Value "Boundless"
-Set-ItemProperty -Path $UninstallRegistryKeyPath -Name DisplayVersion -Value $manifest.version
-Set-ItemProperty -Path $UninstallRegistryKeyPath -Name Publisher -Value $manifest.publisher
-Set-ItemProperty -Path $UninstallRegistryKeyPath -Name InstallLocation -Value $InstallRoot
-Set-ItemProperty -Path $UninstallRegistryKeyPath -Name DisplayIcon -Value $iconPath
-Set-ItemProperty -Path $UninstallRegistryKeyPath -Name UninstallString -Value $uninstallCommand
-Set-ItemProperty -Path $UninstallRegistryKeyPath -Name QuietUninstallString -Value $uninstallCommand
-Set-ItemProperty -Path $UninstallRegistryKeyPath -Name NoModify -Value 1 -Type DWord
-Set-ItemProperty -Path $UninstallRegistryKeyPath -Name NoRepair -Value 1 -Type DWord
-
-if (-not $NoLaunch) {
-    Start-Process -FilePath $trayPath -WorkingDirectory $InstallRoot | Out-Null
+Write-Host "boundless_install_selected_user_sid=$($selection.sid)"
+if (-not [string]::IsNullOrWhiteSpace($selection.account)) {
+    Write-Host "boundless_install_selected_user_account=$($selection.account)"
 }
+Write-Host "boundless_install_selected_user_source=$($selection.source)"
 
-Write-Host "install_root=$InstallRoot"
-Write-Host "startup_shortcut=$startupShortcutPath"
-Write-Host "start_menu_shortcut=$startMenuShortcutPath"
-Write-Host "desktop_shortcut=$desktopShortcutPath"
-Write-Host "uninstall_key=$UninstallRegistryKeyPath"
+$exitCode = Invoke-BoundlessMsi -ResolvedInstallerPath $resolvedInstallerPath -Sid $selection.sid
+Write-Host "boundless_install_exit_code=$exitCode"

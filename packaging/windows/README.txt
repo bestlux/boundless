@@ -6,6 +6,7 @@ This installer deploys:
 - boundlessd.exe
 - boundless-service.exe
 - boundlessctl.exe
+- Boundless-Install.ps1
 - Boundless-Reset.ps1
 - README.txt
 - LICENSE.txt
@@ -13,11 +14,22 @@ This installer deploys:
 
 Recommended flow
 ----------------
-1. Run the MSI installer from an elevated prompt with the intended desktop user's SID:
+1. From the intended desktop user's normal, non-elevated PowerShell session, run the install helper that ships beside the MSI:
 
-   msiexec /i Boundless-<version>-windows-x64.msi BOUNDLESS_ALLOWED_USER_SID=S-...
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\Boundless-<version>-windows-x64-install.ps1
+
+   The helper captures that user's SID before the UAC prompt and passes it to the elevated MSI.
 
 2. Launch Boundless from the Start Menu, desktop shortcut, or boundlesstray.exe.
+
+Fallback/debug flow
+-------------------
+- If the helper cannot infer the intended desktop user safely, it fails closed.
+- From an already-elevated shell, pass the intended user's SID explicitly:
+
+  msiexec /i Boundless-<version>-windows-x64.msi BOUNDLESS_ALLOWED_USER_SID=S-...
+
+- Use the helper's -UseCurrentUserWhenElevated switch only when the elevated account is intentionally the desktop user that should control Boundless.
 
 Install behavior
 ----------------
@@ -44,6 +56,6 @@ Recovery
 Notes
 -----
 - The MSI blocks over an existing legacy script-installed Boundless layout. Remove the old script-based install first, then rerun the installer.
-- The MSI fails closed without BOUNDLESS_ALLOWED_USER_SID so elevation does not silently authorize the wrong Windows account.
+- The MSI fails closed without BOUNDLESS_ALLOWED_USER_SID, and the helper refuses to infer a user from an already-elevated shell by default, so elevation does not silently authorize the wrong Windows account.
 - The tray and CLI default to the local named-pipe API endpoint.
 - If your daemon is configured for TCP, launch the tray or CLI with an explicit endpoint.

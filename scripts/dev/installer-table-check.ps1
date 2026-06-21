@@ -172,6 +172,12 @@ if ($file[0] -notmatch '(^|[|])boundless-service\.exe$') {
 }
 Assert-Equals -Actual $file[1] -Expected "BoundlessServicePayloadComponent" -Label "File.Component_"
 
+Set-MsiSingleRow -Database $database -Sql "SELECT FileName, Component_ FROM File WHERE File = 'InstallHelperScriptFile'" -ColumnCount 2 -Label "install helper File" -VariableName "installHelperFile"
+if ($installHelperFile[0] -notmatch '(^|[|])Boundless-Install\.ps1$') {
+    throw "InstallHelperScriptFile does not install Boundless-Install.ps1: $($installHelperFile[0])"
+}
+Assert-Equals -Actual $installHelperFile[1] -Expected "BoundlessPayloadComponent" -Label "InstallHelperScriptFile.Component_"
+
 Set-MsiSingleRow -Database $database -Sql "SELECT Directory_Parent, DefaultDir FROM Directory WHERE Directory = 'INSTALLDIR'" -ColumnCount 2 -Label "INSTALLDIR Directory" -VariableName "installDir"
 Assert-Equals -Actual $installDir[0] -Expected "ProgramFiles64Folder" -Label "INSTALLDIR.Directory_Parent"
 if ($installDir[1] -notmatch '(^|[|])Boundless$') {
@@ -187,6 +193,7 @@ $summary = [ordered]@{
     service_component = $serviceInstall[7]
     service_control_event = [int]$serviceControl[1]
     service_binary_file = $file[0]
+    install_helper_file = $installHelperFile[0]
     install_directory_parent = $installDir[0]
     invalid_sid_examples_rejected = $true
     sid_launch_condition_count = @($launchConditions | Where-Object { $_ -like "*BOUNDLESS_ALLOWED_USER_SID*" }).Count
