@@ -162,12 +162,24 @@ async fn peer_worker(state: AppState, peer_id: String) {
         }
 
         if !connected {
+            state.record_transport_event(crate::state::TransportEventRecord {
+                timestamp: chrono::Utc::now(),
+                direction: "outbound".to_string(),
+                kind: "transport_reachability_failed".to_string(),
+                peer_id: peer_id.clone(),
+                detail: transport_reachability_failure_detail(
+                    &target_candidates,
+                    !discovered_endpoints.is_empty(),
+                ),
+                size_bytes: 0,
+            });
             warn!(
                 peer_id = %peer_id,
-                configured_address = %peer.address,
-                target_candidates = ?target_candidates,
-                discovered_endpoints = ?discovered_endpoints,
-                error = ?last_error,
+                configured_address = %app_services::desktop::redacted_tcp_endpoint_label(&peer.address),
+                target_candidates = %redacted_tcp_endpoint_labels_for_runtime(&target_candidates),
+                discovered_endpoint_count = discovered_endpoints.len(),
+                discovered_endpoints = %redacted_tcp_socketaddr_labels_for_runtime(&discovered_endpoints),
+                error = %transport_error_summary(last_error.as_ref()),
                 "outbound connect failed"
             );
             if let Err(mark_error) = state.set_peer_connected(&peer_id, false).await {
@@ -192,4 +204,122 @@ pub(super) fn outbound_target_candidates(
     discovered_endpoints: &[SocketAddr],
 ) -> Vec<String> {
     transport_outbound_target_candidates(configured_address, discovered_endpoints)
+}
+
+fn transport_reachability_failure_detail(candidates: &[String], mdns_discovered: bool) -> String {
+    format!(
+        "mdns_discovered={} tcp_transport_reachability=failed attempted=[{}] next_action=verify Private network, VLAN routing, and manual admin-approved firewall policy for the listed TCP ports",
+        mdns_discovered,
+        redacted_tcp_endpoint_labels_for_runtime(candidates)
+    )
+}
+
+fn redacted_tcp_endpoint_labels_for_runtime(candidates: &[String]) -> String {
+    if candidates.is_empty() {
+        return "none".to_string();
+    }
+    candidates
+        .iter()
+        .map(|candidate| app_services::desktop::redacted_tcp_endpoint_label(candidate))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn redacted_tcp_socketaddr_labels_for_runtime(candidates: &[SocketAddr]) -> String {
+    if candidates.is_empty() {
+        return "none".to_string();
+    }
+    candidates
+        .iter()
+        .map(|candidate| app_services::desktop::redacted_tcp_endpoint_label(&candidate.to_string()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn transport_error_summary(error: Option<&anyhow::Error>) -> &'static str {
+    let Some(error) = error else {
+        return "none";
+    };
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                )
+            })
+    }) {
+        return "refused";
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("tcp connect") {
+        "tcp_connect_failed"
+    } else if message.contains("tls connect") {
+        "tls_connect_failed"
+    } else {
+        "failed"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_reachability_failure_detail_redacts_candidates() {
+        let detail = transport_reachability_failure_detail(
+            &[
+                "[fe80::1%4]:15100".to_string(),
+                "10.0.0.9:15100".to_string(),
+            ],
+            true,
+        );
+
+        assert!(detail.contains("mdns_discovered=true"));
+        assert!(detail.contains("tcp_transport_reachability=failed"));
+        assert!(detail.contains("tcp ipv6 port 15100"));
+        assert!(detail.contains("tcp ipv4 port 15100"));
+        assert!(detail.contains("next_action=verify Private network"));
+        assert!(!detail.contains("10.0.0.9"));
+        assert!(!detail.contains("fe80::1"));
+    }
+
+    #[test]
+    fn transport_runtime_log_labels_redact_configured_and_discovered_endpoints() {
+        let configured = app_services::desktop::redacted_tcp_endpoint_label("10.0.0.10:15100");
+        let discovered = redacted_tcp_socketaddr_labels_for_runtime(&[
+            "10.0.0.9:15100".parse().expect("ipv4 endpoint"),
+            "[2001:db8::7]:15100".parse().expect("ipv6 endpoint"),
+        ]);
+        let targets = redacted_tcp_endpoint_labels_for_runtime(&[
+            "10.0.0.10:15100".to_string(),
+            "[2001:db8::7]:15100".to_string(),
+        ]);
+
+        assert_eq!(configured, "tcp ipv4 port 15100");
+        assert!(discovered.contains("tcp ipv4 port 15100"));
+        assert!(discovered.contains("tcp ipv6 port 15100"));
+        assert!(targets.contains("tcp ipv4 port 15100"));
+        assert!(targets.contains("tcp ipv6 port 15100"));
+        assert!(!discovered.contains("10.0.0.9"));
+        assert!(!discovered.contains("2001:db8::7"));
+        assert!(!targets.contains("10.0.0.10"));
+        assert!(!targets.contains("2001:db8::7"));
+    }
+
+    #[test]
+    fn transport_error_summary_redacts_endpoint_context() {
+        let error = Err::<(), _>(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "blocked",
+        ))
+        .context("tcp connect 10.0.0.9:15100")
+        .expect_err("build contextual error");
+
+        assert_eq!(transport_error_summary(Some(&error)), "refused");
+        assert!(!transport_error_summary(Some(&error)).contains("10.0.0.9"));
+    }
 }

@@ -1147,6 +1147,16 @@ mod windows_app {
                 "{message}\n\nThe remote pairing service did not respond.\nVerify both trays are updated and retry."
             );
         }
+        if lowered.contains("manual host tcp pairing reachability failed") {
+            return format!(
+                "{message}\n\nThe manually entered host or port could not be reached for TCP pairing. Verify the host, pairing port, trusted Private network profile, VLAN routing, and any firewall rule manually with admin approval. This failed before trust or code validation started."
+            );
+        }
+        if lowered.contains("tcp pairing reachability failed") {
+            return format!(
+                "{message}\n\nThis machine discovered the peer over mDNS, but none of the listed TCP pairing candidates could be reached. This usually means a firewall, VLAN, or asymmetric route is blocking pairing before trust or code validation starts. Keep manual host fallback available, verify both machines are on a trusted Private network, and add any firewall rule manually with admin approval."
+            );
+        }
         if lowered.contains("read nearby pairing response timed out")
             || lowered.contains("connect nearby pairing endpoint")
             || lowered.contains("send nearby pairing request timed out")
@@ -1169,6 +1179,7 @@ mod windows_app {
             || lowered.contains("timed out waiting for nearby pairing approval")
             || lowered.contains("nearby pairing request not found")
             || lowered.contains("nearby pairing endpoint closed without a response")
+            || lowered.contains("tcp pairing reachability failed")
             || lowered.contains("read nearby pairing response timed out")
             || lowered.contains("connect nearby pairing endpoint")
             || lowered.contains("send nearby pairing request timed out")
@@ -1230,6 +1241,33 @@ mod windows_app {
             assert!(formatted.contains("admin-approved"));
             assert!(formatted.contains("%ProgramFiles%\\Boundless\\boundless-service.exe"));
             assert!(formatted.contains("TCP 15100"));
+        }
+
+        #[test]
+        fn format_error_for_dialog_separates_mdns_from_pairing_reachability() {
+            let error = anyhow::anyhow!(
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv6 port 15200 timeout, tcp ipv4 port 15200 refused]; likely firewall/VLAN/asymmetric-route reachability issue before trust/code/daemon pairing could complete"
+            );
+            let formatted = format_error_for_dialog(&error);
+
+            assert!(formatted.contains("discovered the peer over mDNS"));
+            assert!(formatted.contains("TCP pairing candidates"));
+            assert!(formatted.contains("before trust or code validation starts"));
+            assert!(formatted.contains("manual host fallback"));
+            assert!(should_offer_new_request_retry(&error));
+        }
+
+        #[test]
+        fn format_error_for_dialog_separates_manual_host_reachability() {
+            let error = anyhow::anyhow!(
+                "manual host TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 refused]; the host was entered manually and no mDNS endpoint candidate was used"
+            );
+            let formatted = format_error_for_dialog(&error);
+
+            assert!(formatted.contains("manually entered host or port"));
+            assert!(formatted.contains("before trust or code validation started"));
+            assert!(!formatted.contains("discovered the peer over mDNS"));
+            assert!(should_offer_new_request_retry(&error));
         }
 
         #[test]
