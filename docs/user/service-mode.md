@@ -1,20 +1,31 @@
 # Service Mode
 
-Service mode is an explicit administrator workflow for running the Boundless daemon as `BoundlessService`.
-
-The machine-wide MSI installs `boundless-service.exe` as a payload under `%ProgramFiles%\Boundless`, but it does not silently register or start a Windows service. The tray/daemon path remains the normal install path unless an administrator opts into service mode.
+Service mode runs the Boundless daemon as the Windows `BoundlessService`. The
+machine-wide MSI is the primary service installation path.
 
 ## Current Boundary
 
-- Service installation is an explicit admin action.
+- Service installation is owned by the elevated machine-wide MSI.
+- The MSI installs the service binary under `%ProgramFiles%\Boundless`, registers
+  `BoundlessService` as LocalSystem, sets AutoStart, starts the service during
+  install, stops it for upgrade/uninstall, and removes it on uninstall.
+- The MSI requires an explicit `BOUNDLESS_ALLOWED_USER_SID=S-...` property so
+  the service control pipe is authorized for exactly the intended desktop user.
+  It fails closed instead of guessing the elevating administrator account.
 - `service install` rejects service binaries under user-writable locations such as `%LocalAppData%`, `%AppData%`, `%TEMP%`, and Downloads.
-- The service control named pipe uses an explicit ACL for `SYSTEM`, local Administrators, and the Windows user SID that installed the service.
+- The service control named pipe uses an explicit ACL for `SYSTEM`, local Administrators, and the selected Windows user SID.
 - Service mode has separate LocalSystem runtime state from the normal per-user daemon. Pairing, layout, and feature settings should be configured while the service is the active daemon.
-- BND-NEXT-9B-2 puts the packaged service binary under `%ProgramFiles%\Boundless`, but it does not prove replacement of an active admin-registered service. SCM registration, autostart, stop/start during upgrade, and rollback behavior remain explicit BND-NEXT-9B-3 work.
 - The service does not self-update, and tray-owned update application is unsupported/deferred.
 - Elevated-app and lock-screen input control still need Windows runtime evidence before they are release-grade claims in v5.
 
 ## Commands
+
+Install from an elevated prompt with the intended desktop user's SID:
+
+```powershell
+msiexec /i .\Boundless-<version>-windows-x64.msi `
+  BOUNDLESS_ALLOWED_USER_SID=S-...
+```
 
 Installed CLI examples use the full executable path because the MSI does not add Boundless to `PATH`:
 
@@ -23,14 +34,18 @@ $BoundlessCtl = "$env:ProgramFiles\Boundless\boundlessctl.exe"
 & $BoundlessCtl service status
 ```
 
-Run service installation from an elevated PowerShell session and point it at the MSI-owned service payload:
+Manual CLI service installation remains a developer fallback for unpackaged
+builds. Copy the service binary to an admin-protected directory first, then run
+the install from an elevated PowerShell session:
 
 ```powershell
+New-Item -ItemType Directory -Force -Path "C:\Program Files\Boundless" | Out-Null
+Copy-Item ".\target\release\boundless-service.exe" "C:\Program Files\Boundless\boundless-service.exe" -Force
 & $BoundlessCtl service install `
-  --binary "$env:ProgramFiles\Boundless\boundless-service.exe"
+  --binary "C:\Program Files\Boundless\boundless-service.exe"
 ```
 
-Start, stop, and uninstall:
+Manual fallback start, stop, and uninstall:
 
 ```powershell
 & $BoundlessCtl service start

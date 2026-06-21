@@ -24,9 +24,9 @@ Tray and CLI default to the same endpoint. Boundless creates Windows named pipes
 
 ## Service Mode
 
-The service binary exists under the machine-wide `%ProgramFiles%\Boundless` install root, but the MSI does not silently register or start a service. Service install remains an explicit admin action from an admin-protected service binary path.
+The machine-wide MSI installs the service binary under `%ProgramFiles%\Boundless`, registers `BoundlessService` as LocalSystem with AutoStart, and requires an explicit `BOUNDLESS_ALLOWED_USER_SID` for the intended desktop user. It fails closed rather than silently authorizing the elevating administrator account.
 
-When installed through current `boundlessctl`, the service receives the installing user's SID and hosts the control pipe with an ACL for `SYSTEM`, local Administrators, and that installing user. The service should not be installed from `%LocalAppData%`, `%AppData%`, `%TEMP%`, Downloads, or another user-writable path.
+The service hosts the control pipe with an ACL for `SYSTEM`, local Administrators, and the selected user SID. Manual `boundlessctl service install` remains a developer fallback and should not use `%LocalAppData%`, `%AppData%`, `%TEMP%`, Downloads, or another user-writable path.
 
 Lock-screen and elevated-app control are not release-grade claims until validated on Windows with service smoke evidence.
 

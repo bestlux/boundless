@@ -19,6 +19,7 @@
     <Property Id="ARPPRODUCTICON" Value="BoundlessIcon.ico" />
     <Property Id="ARPNOMODIFY" Value="1" />
     <Property Id="ARPNOREPAIR" Value="1" />
+    <Property Id="BOUNDLESS_ALLOWED_USER_SID" Secure="yes" />
     <util:CloseApplication
       Id="CloseBoundlessTray"
       Target="boundlesstray.exe"
@@ -47,6 +48,18 @@
     <Launch
       Condition="Installed OR NOT BOUNDLESSLEGACYSCRIPTINSTALL"
       Message="A legacy script-installed Boundless build was detected in %LocalAppData%\Programs\Boundless. Uninstall the script-based package first, then rerun this installer." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (BOUNDLESS_ALLOWED_USER_SID AND BOUNDLESS_ALLOWED_USER_SID &lt;&lt; "S-1-")'
+      Message="BoundlessService requires an explicit intended desktop user SID. Rerun from an elevated prompt with BOUNDLESS_ALLOWED_USER_SID=S-..." />
+    <Launch
+      Condition='REMOVE = "ALL" OR NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; " ")'
+      Message="BOUNDLESS_ALLOWED_USER_SID must be one SID without spaces." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; ";") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "(") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; ")"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID contains invalid SID characters." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "[") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "]"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID contains invalid SID characters." />
 
     <Feature Id="MainFeature" Title="Boundless" Level="1">
       <ComponentGroupRef Id="BoundlessPayload" />
@@ -84,6 +97,23 @@
       </Component>
       <Component Id="BoundlessServicePayloadComponent" Guid="84E63D4D-84EE-485D-91CF-A5E04D07EC86">
         <File Id="ServiceBinaryFile" Source="$(var.PayloadDir)\boundless-service.exe" KeyPath="yes" />
+        <ServiceInstall
+          Id="BoundlessServiceInstall"
+          Name="BoundlessService"
+          DisplayName="Boundless Service"
+          Description="Boundless service-mode daemon host."
+          Type="ownProcess"
+          Start="auto"
+          ErrorControl="normal"
+          Account="LocalSystem"
+          Arguments="--allowed-user-sid=[BOUNDLESS_ALLOWED_USER_SID]" />
+        <ServiceControl
+          Id="BoundlessServiceControl"
+          Name="BoundlessService"
+          Start="install"
+          Stop="both"
+          Remove="uninstall"
+          Wait="yes" />
         <RegistryValue
           Root="HKLM"
           Key="Software\Boundless\Installer"

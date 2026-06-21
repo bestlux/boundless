@@ -14,8 +14,8 @@ This document records the release-hardening contract for the Boundless v5 Window
   - and the release-please `extra-files` list.
 - The Windows MSI includes tray, daemon, service host, CLI, reset helper, icon, changelog, license, README, and package manifest payloads.
 - The WiX installer is configured to close tray, daemon, and service executable names during upgrade/uninstall.
-- `installer-smoke.ps1` validates machine-wide install under `%ProgramFiles%\Boundless`, HKLM installer/uninstall evidence, shortcut targets/icons, installed executable signatures including the service host, optional upgrade-while-running behavior, uninstall cleanup, absence of Boundless processes before harness cleanup, and absence of a registered Boundless service after uninstall.
-- MSI-owned packaged-payload updates are the supported update model. The MSI installer owns install, upgrade, repair, and uninstall of tray, daemon, and service payloads it installs; service and tray self-update flows are unsupported/deferred.
+- `installer-smoke.ps1` validates machine-wide install under `%ProgramFiles%\Boundless`, HKLM installer/uninstall evidence, shortcut targets/icons, installed executable signatures including the service host, MSI-owned service registration, AutoStart, service daemon health, optional upgrade-while-running behavior, service stop before uninstall, uninstall cleanup, absence of Boundless processes before harness cleanup, and absence of a registered Boundless service after uninstall.
+- MSI-owned packaged-payload updates are the supported update model. The MSI installer owns install, upgrade, repair, and uninstall of tray, daemon, service payloads, and `BoundlessService`; service and tray self-update flows are unsupported/deferred.
 - The release workflow packages the Windows MSI as `Boundless-<version>-windows-x64.msi`, uploads it under the `boundless-windows-x64` workflow artifact, and publishes the same MSI name as a GitHub Release asset.
 - Windows code signing remains policy-driven:
   - stable releases require signing only when `WINDOWS_SIGN_REQUIRED=true`,
@@ -25,8 +25,8 @@ This document records the release-hardening contract for the Boundless v5 Window
 
 ## Honest Limits
 
-- MSI service-mode registration and autostart are not enabled by default; service commands remain CLI/admin-owned against the MSI-owned Program Files service payload.
-- Active admin-registered service binary replacement remains explicit service-mode/update validation until the MSI owns service stop/start, rollback, registration, and removal.
+- The MSI service path requires an explicit `BOUNDLESS_ALLOWED_USER_SID` property. A bootstrapper or installer UI that safely selects the desktop user SID remains follow-up work.
+- Manual CLI service installation remains a developer fallback for unpackaged builds and requires an admin-protected service binary path.
 - Upgrade from the last supported v4 build requires a previous MSI path passed to `installer-smoke.ps1 -PreviousInstallerPath`.
 - The service must not self-update. The tray may later notify or launch an installer, but it is not the authoritative updater for this release-readiness contract.
 - Lock-screen and elevated-app service behavior still require Windows runtime evidence before V5 can mark those claims validated.
