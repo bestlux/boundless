@@ -18,7 +18,7 @@ This is the short, version-neutral repo status packet for agents and release wor
 ## Service Mode Boundary
 
 - Default local control endpoint on Windows is npipe://./pipe/boundlessd-api.
-- Service mode is optional/admin-owned. MSI service-mode installation is not enabled by default.
+- Service mode is optional/admin-owned. MSI service registration and autostart are not enabled by default.
 - Service validation must cover installed service binary version, path, ACLs, named-pipe/API health, process counts, and install/start/status/stop/uninstall behavior.
 - A matching boundless-service.exe --version result is required stable-release evidence when installer smoke evidence is supplied.
 - MSI-owned updates are the supported packaged-payload update model: the MSI installer owns install, upgrade, repair, and uninstall of tray, daemon, and service payloads it installs.
@@ -47,7 +47,7 @@ Use scripts/dev/check.ps1 -Area <area> -Format json for machine-readable area ch
 | --- | --- | --- |
 | workspace | scripts/dev/test-suite.ps1 -Profile quick | fmt, workspace tests, Clippy |
 | smoke | scripts/dev/test-suite.ps1 -Profile smoke | workspace plus two-node smoke |
-| installer | scripts/dev/installer-smoke.ps1 | MSI install/startup/uninstall evidence |
+| installer | scripts/dev/installer-smoke.ps1 | MSI install/shortcut/uninstall evidence |
 | service | scripts/dev/service-smoke.ps1 | elevated Windows service-mode evidence |
 | release | scripts/dev/release-readiness.ps1 -Policy stable | release packet and evidence gate |
 | docs/status | status and component-map checks | agent context freshness |

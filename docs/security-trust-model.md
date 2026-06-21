@@ -24,7 +24,7 @@ Tray and CLI default to the same endpoint. Boundless creates Windows named pipes
 
 ## Service Mode
 
-The service binary exists, but the per-user MSI does not silently install a service. Service install remains an explicit admin action from an admin-protected service binary path.
+The service binary exists under the machine-wide `%ProgramFiles%\Boundless` install root, but the MSI does not silently register or start a service. Service install remains an explicit admin action from an admin-protected service binary path.
 
 When installed through current `boundlessctl`, the service receives the installing user's SID and hosts the control pipe with an ACL for `SYSTEM`, local Administrators, and that installing user. The service should not be installed from `%LocalAppData%`, `%AppData%`, `%TEMP%`, Downloads, or another user-writable path.
 

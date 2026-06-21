@@ -14,7 +14,7 @@ This document records the release-hardening contract for the Boundless v5 Window
   - and the release-please `extra-files` list.
 - The Windows MSI includes tray, daemon, service host, CLI, reset helper, icon, changelog, license, README, and package manifest payloads.
 - The WiX installer is configured to close tray, daemon, and service executable names during upgrade/uninstall.
-- `installer-smoke.ps1` validates install, shortcut targets/icons, installed executable signatures including the service host, uninstall registry entry, optional upgrade-while-running behavior, uninstall cleanup, absence of Boundless processes before harness cleanup, and absence of a registered Boundless service after uninstall.
+- `installer-smoke.ps1` validates machine-wide install under `%ProgramFiles%\Boundless`, HKLM installer/uninstall evidence, shortcut targets/icons, installed executable signatures including the service host, optional upgrade-while-running behavior, uninstall cleanup, absence of Boundless processes before harness cleanup, and absence of a registered Boundless service after uninstall.
 - MSI-owned packaged-payload updates are the supported update model. The MSI installer owns install, upgrade, repair, and uninstall of tray, daemon, and service payloads it installs; service and tray self-update flows are unsupported/deferred.
 - The release workflow packages the Windows MSI as `Boundless-<version>-windows-x64.msi`, uploads it under the `boundless-windows-x64` workflow artifact, and publishes the same MSI name as a GitHub Release asset.
 - Windows code signing remains policy-driven:
@@ -25,8 +25,8 @@ This document records the release-hardening contract for the Boundless v5 Window
 
 ## Honest Limits
 
-- MSI service-mode installation is not enabled by default; service commands remain CLI/admin-owned and require an admin-protected service binary path.
-- Active admin-registered service binary replacement remains explicit service-mode/update validation unless the service is registered against an MSI-owned install location.
+- MSI service-mode registration and autostart are not enabled by default; service commands remain CLI/admin-owned against the MSI-owned Program Files service payload.
+- Active admin-registered service binary replacement remains explicit service-mode/update validation until the MSI owns service stop/start, rollback, registration, and removal.
 - Upgrade from the last supported v4 build requires a previous MSI path passed to `installer-smoke.ps1 -PreviousInstallerPath`.
 - The service must not self-update. The tray may later notify or launch an installer, but it is not the authoritative updater for this release-readiness contract.
 - Lock-screen and elevated-app service behavior still require Windows runtime evidence before V5 can mark those claims validated.

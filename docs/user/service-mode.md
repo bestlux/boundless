@@ -2,7 +2,7 @@
 
 Service mode is an explicit administrator workflow for running the Boundless daemon as `BoundlessService`.
 
-The per-user MSI installs `boundless-service.exe` as a payload, but it does not silently register or start a Windows service. The tray/daemon path remains the normal install path unless an administrator opts into service mode.
+The machine-wide MSI installs `boundless-service.exe` as a payload under `%ProgramFiles%\Boundless`, but it does not silently register or start a Windows service. The tray/daemon path remains the normal install path unless an administrator opts into service mode.
 
 ## Current Boundary
 
@@ -10,7 +10,7 @@ The per-user MSI installs `boundless-service.exe` as a payload, but it does not 
 - `service install` rejects service binaries under user-writable locations such as `%LocalAppData%`, `%AppData%`, `%TEMP%`, and Downloads.
 - The service control named pipe uses an explicit ACL for `SYSTEM`, local Administrators, and the Windows user SID that installed the service.
 - Service mode has separate LocalSystem runtime state from the normal per-user daemon. Pairing, layout, and feature settings should be configured while the service is the active daemon.
-- BND-NEXT-9A readiness proves MSI ownership of packaged payload updates and N-1 MSI upgrade evidence. It does not prove replacement of an active admin-registered service binary copied to `C:\Program Files\Boundless`; that remains explicit service-mode/update validation unless the service is registered against an MSI-owned install location.
+- BND-NEXT-9B-2 puts the packaged service binary under `%ProgramFiles%\Boundless`, but it does not prove replacement of an active admin-registered service. SCM registration, autostart, stop/start during upgrade, and rollback behavior remain explicit BND-NEXT-9B-3 work.
 - The service does not self-update, and tray-owned update application is unsupported/deferred.
 - Elevated-app and lock-screen input control still need Windows runtime evidence before they are release-grade claims in v5.
 
@@ -19,17 +19,15 @@ The per-user MSI installs `boundless-service.exe` as a payload, but it does not 
 Installed CLI examples use the full executable path because the MSI does not add Boundless to `PATH`:
 
 ```powershell
-$BoundlessCtl = "$env:LOCALAPPDATA\Programs\Boundless\boundlessctl.exe"
+$BoundlessCtl = "$env:ProgramFiles\Boundless\boundlessctl.exe"
 & $BoundlessCtl service status
 ```
 
-Copy the service binary to an admin-protected directory before installation, then run the install from an elevated PowerShell session:
+Run service installation from an elevated PowerShell session and point it at the MSI-owned service payload:
 
 ```powershell
-New-Item -ItemType Directory -Force -Path "C:\Program Files\Boundless" | Out-Null
-Copy-Item "$env:LOCALAPPDATA\Programs\Boundless\boundless-service.exe" "C:\Program Files\Boundless\boundless-service.exe" -Force
 & $BoundlessCtl service install `
-  --binary "C:\Program Files\Boundless\boundless-service.exe"
+  --binary "$env:ProgramFiles\Boundless\boundless-service.exe"
 ```
 
 Start, stop, and uninstall:

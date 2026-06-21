@@ -32,6 +32,17 @@ function Assert-PathExists {
     }
 }
 
+function Assert-PathMissing {
+    param(
+        [string]$Path,
+        [string]$Message
+    )
+
+    if (Test-Path -LiteralPath $Path) {
+        throw $Message
+    }
+}
+
 function Wait-ForPathRemoval {
     param(
         [string]$Path,
@@ -148,23 +159,77 @@ function Get-ExpectedDisplayVersion {
 
 function Get-UninstallEntry {
     $keys = @(
-        "Registry::HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
-        "Registry::HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        [pscustomobject]@{
+            Root = "HKLM"
+            Path = "Registry::HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        },
+        [pscustomobject]@{
+            Root = "HKCU"
+            Path = "Registry::HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        }
     )
 
     foreach ($key in $keys) {
-        $entry = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue |
+        $entry = Get-ItemProperty -Path $key.Path -ErrorAction SilentlyContinue |
             Where-Object {
                 $_.PSObject.Properties.Match("DisplayName").Count -gt 0 -and
                 $_.DisplayName -eq "Boundless"
             } |
             Select-Object -First 1
         if ($null -ne $entry) {
+            $entry | Add-Member -NotePropertyName RegistryRoot -NotePropertyValue $key.Root -Force
             return $entry
         }
     }
 
     return $null
+}
+
+function Test-IsAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-InstallerEvidence {
+    $keyPath = "Registry::HKEY_LOCAL_MACHINE\Software\Boundless\Installer"
+    if (-not (Test-Path -LiteralPath $keyPath)) {
+        throw "Machine-wide installer evidence key was not found: HKLM\Software\Boundless\Installer"
+    }
+
+    $evidence = Get-ItemProperty -LiteralPath $keyPath
+    foreach ($name in @("PayloadInstalled", "ServicePayloadInstalled", "Installed")) {
+        if ($evidence.PSObject.Properties.Match($name).Count -eq 0) {
+            throw "Machine-wide installer evidence value was not found: HKLM\Software\Boundless\Installer\$name"
+        }
+        if ([int]$evidence.$name -ne 1) {
+            throw "Machine-wide installer evidence value was unexpected: $name=$($evidence.$name)"
+        }
+    }
+
+    return [ordered]@{
+        root = "HKLM"
+        key = "Software\Boundless\Installer"
+        payload_installed = [int]$evidence.PayloadInstalled
+        service_payload_installed = [int]$evidence.ServicePayloadInstalled
+        shortcuts_installed = [int]$evidence.Installed
+    }
+}
+
+function Test-InstallerEvidencePresent {
+    $keyPath = "Registry::HKEY_LOCAL_MACHINE\Software\Boundless\Installer"
+    if (-not (Test-Path -LiteralPath $keyPath)) {
+        return $false
+    }
+
+    $evidence = Get-ItemProperty -LiteralPath $keyPath
+    foreach ($name in @("PayloadInstalled", "ServicePayloadInstalled", "Installed")) {
+        if ($evidence.PSObject.Properties.Match($name).Count -gt 0) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 function Test-InteractiveDesktopSession {
@@ -284,6 +349,9 @@ if ((Get-Variable -Name IsWindows -ErrorAction SilentlyContinue) -and (-not $IsW
 if ((-not (Get-Variable -Name IsWindows -ErrorAction SilentlyContinue)) -and ($env:OS -ne "Windows_NT")) {
     throw "installer-smoke.ps1 is supported on Windows only."
 }
+if (-not (Test-IsAdministrator)) {
+    throw "installer-smoke.ps1 must run from an elevated PowerShell session for machine-wide Program Files MSI validation."
+}
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
@@ -328,17 +396,19 @@ $installLog = Join-Path $OutputRoot "install.log"
 $upgradeLog = Join-Path $OutputRoot "upgrade.log"
 $uninstallLog = Join-Path $OutputRoot "uninstall.log"
 
-$startupShortcutPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)) "Boundless.lnk"
-$startMenuShortcutPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)) "Boundless.lnk"
-$desktopShortcutPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)) "Boundless.lnk"
-$installRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) "Programs\Boundless"
+$currentUserStartupShortcutPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)) "Boundless.lnk"
+$commonStartupShortcutPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonStartup)) "Boundless.lnk"
+$startMenuShortcutPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonPrograms)) "Boundless.lnk"
+$desktopShortcutPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonDesktopDirectory)) "Boundless.lnk"
+$installRoot = Join-Path $env:ProgramFiles "Boundless"
+$legacyInstallRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) "Programs\Boundless"
 $resetScriptPath = Join-Path $installRoot "Boundless-Reset.ps1"
 $iconPath = Join-Path $installRoot "Boundless.ico"
-$legacyInstallScriptPath = Join-Path $installRoot "Boundless-Install.ps1"
+$legacyInstallScriptPath = Join-Path $legacyInstallRoot "Boundless-Install.ps1"
 $interactiveDesktopSession = Test-InteractiveDesktopSession
 
 if ([string]::IsNullOrWhiteSpace($PreviousInstallerPath) -and (Test-Path -LiteralPath $legacyInstallScriptPath)) {
-    throw "Legacy script-installed Boundless files were detected at $installRoot. Remove that installation before running installer-smoke.ps1."
+    throw "Legacy script-installed Boundless files were detected at $legacyInstallRoot. Remove that installation before running installer-smoke.ps1."
 }
 
 try {
@@ -358,12 +428,13 @@ try {
         $upgradeInstallExitCode = Invoke-MsiExec -ArgumentList @("/i", $PreviousInstallerPath, "/qn", "/norestart") -LogPath $upgradeLog
 
         if ($interactiveDesktopSession) {
-            $previousTrayPath = Join-Path $installRoot "boundlesstray.exe"
-            $previousCliPath = Join-Path $installRoot "boundlessctl.exe"
+            $previousInstallRoot = $legacyInstallRoot
+            $previousTrayPath = Join-Path $previousInstallRoot "boundlesstray.exe"
+            $previousCliPath = Join-Path $previousInstallRoot "boundlessctl.exe"
             Assert-PathExists -Path $previousTrayPath -Message "Previous installer did not lay down tray executable."
             Assert-PathExists -Path $previousCliPath -Message "Previous installer did not lay down CLI executable."
 
-            $previousTrayProcess = Start-Process -FilePath $previousTrayPath -WorkingDirectory $installRoot -PassThru
+            $previousTrayProcess = Start-Process -FilePath $previousTrayPath -WorkingDirectory $previousInstallRoot -PassThru
             Start-Sleep -Seconds 3
             if ($previousTrayProcess.HasExited) {
                 throw "Previous installer tray exited before upgrade-running smoke could begin. Exit code: $($previousTrayProcess.ExitCode)"
@@ -389,11 +460,15 @@ try {
     Assert-PathExists -Path $trayPath -Message "Installed tray binary is missing."
     Assert-PathExists -Path $resetScriptPath -Message "Installed reset helper is missing."
     Assert-PathExists -Path $iconPath -Message "Installed icon asset is missing."
-    Assert-PathExists -Path $startupShortcutPath -Message "Startup shortcut is missing."
     Assert-PathExists -Path $startMenuShortcutPath -Message "Start menu shortcut is missing."
     Assert-PathExists -Path $desktopShortcutPath -Message "Desktop shortcut is missing."
+    Assert-PathMissing -Path $currentUserStartupShortcutPath -Message "Installer created a current-user Startup shortcut, but tray startup is deferred in the 9B-2 machine-wide skeleton."
+    Assert-PathMissing -Path $commonStartupShortcutPath -Message "Installer created a common Startup shortcut, but tray startup is deferred in the 9B-2 machine-wide skeleton."
+    if ($null -ne (Get-BoundlessService)) {
+        throw "Installer registered BoundlessService during install; 9B-2 must leave service registration deferred."
+    }
 
-    foreach ($shortcutPath in @($startupShortcutPath, $startMenuShortcutPath, $desktopShortcutPath)) {
+    foreach ($shortcutPath in @($startMenuShortcutPath, $desktopShortcutPath)) {
         if ((Get-ShortcutTarget -ShortcutPath $shortcutPath) -ne $trayPath) {
             throw "Shortcut target was unexpected: $shortcutPath"
         }
@@ -408,6 +483,9 @@ try {
     if ($null -eq $uninstallEntry) {
         throw "Boundless uninstall entry was not found."
     }
+    if ($uninstallEntry.RegistryRoot -ne "HKLM") {
+        throw "Boundless uninstall entry was expected under HKLM but was found under $($uninstallEntry.RegistryRoot)."
+    }
     if (-not [string]::IsNullOrWhiteSpace($expectedDisplayVersion) -and $uninstallEntry.DisplayVersion -ne $expectedDisplayVersion) {
         throw "Unexpected uninstall DisplayVersion: $($uninstallEntry.DisplayVersion)"
     }
@@ -417,6 +495,7 @@ try {
     ) {
         throw "Unexpected uninstall InstallLocation: $($uninstallEntry.InstallLocation)"
     }
+    $installerEvidence = Get-InstallerEvidence
 
     $traySignature = Assert-Authenticode -Path $trayPath -Required:$RequireSignature.IsPresent
     $daemonSignature = Assert-Authenticode -Path $daemonPath -Required:$RequireSignature.IsPresent
@@ -483,9 +562,6 @@ try {
 
     Wait-ForNoBoundlessProcesses
     Wait-ForPathRemoval -Path $installRoot
-    if (Test-Path -LiteralPath $startupShortcutPath) {
-        throw "Uninstall did not remove startup shortcut."
-    }
     if (Test-Path -LiteralPath $startMenuShortcutPath) {
         throw "Uninstall did not remove start menu shortcut."
     }
@@ -498,10 +574,16 @@ try {
     if ($null -ne (Get-BoundlessService)) {
         throw "Uninstall left a registered Boundless service."
     }
+    if (Test-InstallerEvidencePresent) {
+        throw "Uninstall left machine-wide installer evidence under HKLM\Software\Boundless\Installer."
+    }
 
     $summary = [ordered]@{
         installer_path = $InstallerPath
         install_root = $installRoot
+        installer_registry_evidence = $installerEvidence
+        uninstall_registry_root = $uninstallEntry.RegistryRoot
+        tray_startup_policy = "deferred_no_startup_shortcut"
         installer_signature = $installerSignature
         tray_signature = $traySignature
         daemon_signature = $daemonSignature

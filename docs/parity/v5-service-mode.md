@@ -21,7 +21,7 @@ boundlessctl service stop
 boundlessctl service uninstall
 ```
 
-`install` defaults to a `boundless-service.exe` next to the running `boundlessctl.exe`, but it refuses user-writable source locations such as `%LocalAppData%`, `%AppData%`, `%TEMP%`, and Downloads. Administrators must install from an admin-protected location such as `%ProgramFiles%\Boundless` until the installer owns a reviewed elevated/service option.
+`install` defaults to a `boundless-service.exe` next to the running `boundlessctl.exe`, but it refuses user-writable source locations such as `%LocalAppData%`, `%AppData%`, `%TEMP%`, and Downloads. The machine-wide MSI now lays down an admin-protected payload under `%ProgramFiles%\Boundless`; MSI-owned service registration and autostart remain future work.
 
 During installation, `boundlessctl` resolves the installing Windows user's SID and passes it to the service. The service hosts the control pipe with an explicit ACL for `SYSTEM`, local Administrators, and that installing user.
 
@@ -49,7 +49,7 @@ The v5 readiness packet must classify elevated-app and lock-screen behavior as:
 
 ## Packaging
 
-The Windows packaging manifest, WiX payload, package script, and release signing list include `boundless-service.exe`. The service is not silently installed by the per-user MSI; service installation remains an explicit admin action until the installer owns a reviewed elevated/service option.
+The Windows packaging manifest, WiX payload, package script, and release signing list include `boundless-service.exe`. The service is not silently registered or started by the machine-wide MSI; service installation remains an explicit admin action until the installer owns a reviewed elevated/service option.
 
 Installer smoke asserts the service payload/signature, service-host version output, and that uninstall leaves no registered Boundless service. The separate service smoke harness proves install/start/status/daemon-health/stop/uninstall when `release-readiness.ps1 -IncludeServiceSmoke` is run from an elevated Windows shell.
 

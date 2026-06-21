@@ -5,16 +5,16 @@ This guide covers the normal Windows tray flow for installing, pairing, arrangin
 ## Install
 
 1. Install the Windows MSI.
-2. Launch Boundless from the Start Menu, Desktop shortcut, or sign-in startup shortcut.
+2. Launch Boundless from the Start Menu, Desktop shortcut, or `boundlesstray.exe`.
 3. Open the tray icon and choose `Dashboard`.
 4. Confirm the daemon is reachable on the Status & Pairing tab.
 
-The default per-user install root is `%LocalAppData%\Programs\Boundless`. The tray is the primary entrypoint and starts `boundlessd` when needed.
+The default machine-wide install root is `%ProgramFiles%\Boundless`. The tray is the primary entrypoint and starts `boundlessd` when needed.
 
 Installed CLI examples use the full executable path because the MSI does not add Boundless to `PATH`:
 
 ```powershell
-$BoundlessCtl = "$env:LOCALAPPDATA\Programs\Boundless\boundlessctl.exe"
+$BoundlessCtl = "$env:ProgramFiles\Boundless\boundlessctl.exe"
 ```
 
 ## Pair Two Machines
@@ -83,4 +83,4 @@ Use Windows Apps & Features or:
 Start-Process msiexec.exe -Wait -ArgumentList @('/x', '<path-to-boundless-msi>', '/qn', '/norestart')
 ```
 
-The MSI uninstall removes the per-user install root, shortcuts, and uninstall registry entry. User config and trust state are not silently destroyed by ordinary uninstall; use the packaged reset helper when you intentionally want to reset local state.
+The MSI uninstall removes the machine-wide install root, shortcuts, and uninstall registry entry. User config and trust state are not silently destroyed by ordinary uninstall; use the packaged reset helper when you intentionally want to reset local state.
