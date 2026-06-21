@@ -181,7 +181,16 @@ service ACL authorizes only one user SID.
 The remaining installer-design blocker is safely identifying the intended
 desktop user from an elevated install without user-supplied MSI properties.
 
-9B-3 uses an explicit SID property path:
+9B-5 adds a small PowerShell helper as the preferred user-facing launch path.
+Run from the intended desktop user's normal, non-elevated PowerShell session,
+`Boundless-<version>-windows-x64-install.ps1` captures that user's SID before
+UAC and launches the MSI with the secure `BOUNDLESS_ALLOWED_USER_SID` property.
+If the helper is already elevated, it refuses to infer the current user unless
+the caller passes an explicit SID/account or uses an explicit current-user
+override. This keeps same-user elevation supported without silently authorizing
+a different admin account.
+
+The MSI still keeps the explicit SID property path as the enforcement boundary:
 
 - installers must pass a numeric SID-shaped `BOUNDLESS_ALLOWED_USER_SID=S-...`;
 - the property is secure and survives into the elevated execute context;

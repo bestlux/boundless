@@ -90,3 +90,15 @@ Run the targeted fixture matrix with:
 ```powershell
 ./scripts/dev/release-readiness-fixtures.ps1
 ```
+
+Installer user-selection helper evidence:
+
+```powershell
+./scripts/dev/installer-helper-fixtures.ps1
+```
+
+The helper fixture does not invoke UAC or install the MSI. It verifies that the
+preferred helper accepts explicit SIDs, resolves an explicit account, rejects
+malformed SIDs, captures the current user only from a non-elevated shell, and
+fails closed from an already-elevated shell unless the current elevated account
+is explicitly allowed.

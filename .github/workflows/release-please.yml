@@ -203,7 +203,9 @@ jobs:
             -CliPath "source/target/release/boundlessctl.exe" `
             -TrayPath "source/target/release/boundlesstray.exe" `
             -OutputPath $outputPath
+          $helperPath = Join-Path (Split-Path -Parent $outputPath) "Boundless-$version-windows-x64-install.ps1"
           "installer_path=$outputPath" >> $env:GITHUB_OUTPUT
+          "installer_helper_path=$helperPath" >> $env:GITHUB_OUTPUT
 
       - name: Sign Windows installer
         shell: pwsh
@@ -227,13 +229,15 @@ jobs:
 
       - name: Validate Windows asset name
         shell: pwsh
-        run: ./.release-tooling/scripts/release/assert-release-consistency.ps1 -RepoRoot (Resolve-Path source).Path -Tag "${{ needs.release-context.outputs.tag_name }}" -AssetPaths "${{ steps.package.outputs.installer_path }}" -CheckWindowsInstallerVersion
+        run: ./.release-tooling/scripts/release/assert-release-consistency.ps1 -RepoRoot (Resolve-Path source).Path -Tag "${{ needs.release-context.outputs.tag_name }}" -AssetPaths @("${{ steps.package.outputs.installer_path }}", "${{ steps.package.outputs.installer_helper_path }}") -CheckWindowsInstallerVersion
 
       - name: Upload Windows release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: boundless-windows-x64
-          path: ${{ steps.package.outputs.installer_path }}
+          path: |
+            ${{ steps.package.outputs.installer_path }}
+            ${{ steps.package.outputs.installer_helper_path }}
 
   validate-windows-installer:
     runs-on: windows-latest

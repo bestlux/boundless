@@ -112,6 +112,7 @@ Copy-Item -LiteralPath $licensePath -Destination (Join-Path $stageRoot "LICENSE.
 Copy-Item -LiteralPath $changeLogPath -Destination (Join-Path $stageRoot "CHANGELOG.md")
 
 $packageFiles = @(
+    "Boundless-Install.ps1"
     "Boundless-Reset.ps1"
     "README.txt"
     "package-manifest.json"
@@ -170,8 +171,12 @@ if ($null -eq $builtInstaller) {
 
 Copy-Item -LiteralPath $builtInstaller.FullName -Destination $outputPathResolved -Force
 
+$installHelperOutputPath = Join-Path $outputParent "$outputFileName-install.ps1"
+Copy-Item -LiteralPath (Join-Path $packageAssetRoot "Boundless-Install.ps1") -Destination $installHelperOutputPath -Force
+
 Write-Host "package_root=$stageRoot"
 Write-Host "installer_path=$outputPathResolved"
+Write-Host "installer_helper_path=$installHelperOutputPath"
 Write-Host "msi_version=$msiVersion"
 
 if (-not $KeepWorkingDirectory -and (Test-Path -LiteralPath $WorkingDirectory)) {

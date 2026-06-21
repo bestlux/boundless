@@ -151,6 +151,7 @@ foreach ($assetPath in $AssetPaths) {
 
     $expectedNames = @(
         "Boundless-$workspaceVersion-windows-x64.msi",
+        "Boundless-$workspaceVersion-windows-x64-install.ps1",
         "boundless-$workspaceVersion-linux-x64.tar.gz"
     )
 
