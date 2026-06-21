@@ -32,6 +32,17 @@ function Assert-PathExists {
     }
 }
 
+function Assert-PathMissing {
+    param(
+        [string]$Path,
+        [string]$Message
+    )
+
+    if (Test-Path -LiteralPath $Path) {
+        throw $Message
+    }
+}
+
 function Wait-ForPathRemoval {
     param(
         [string]$Path,
@@ -385,6 +396,8 @@ $installLog = Join-Path $OutputRoot "install.log"
 $upgradeLog = Join-Path $OutputRoot "upgrade.log"
 $uninstallLog = Join-Path $OutputRoot "uninstall.log"
 
+$currentUserStartupShortcutPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)) "Boundless.lnk"
+$commonStartupShortcutPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonStartup)) "Boundless.lnk"
 $startMenuShortcutPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonPrograms)) "Boundless.lnk"
 $desktopShortcutPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonDesktopDirectory)) "Boundless.lnk"
 $installRoot = Join-Path $env:ProgramFiles "Boundless"
@@ -449,6 +462,11 @@ try {
     Assert-PathExists -Path $iconPath -Message "Installed icon asset is missing."
     Assert-PathExists -Path $startMenuShortcutPath -Message "Start menu shortcut is missing."
     Assert-PathExists -Path $desktopShortcutPath -Message "Desktop shortcut is missing."
+    Assert-PathMissing -Path $currentUserStartupShortcutPath -Message "Installer created a current-user Startup shortcut, but tray startup is deferred in the 9B-2 machine-wide skeleton."
+    Assert-PathMissing -Path $commonStartupShortcutPath -Message "Installer created a common Startup shortcut, but tray startup is deferred in the 9B-2 machine-wide skeleton."
+    if ($null -ne (Get-BoundlessService)) {
+        throw "Installer registered BoundlessService during install; 9B-2 must leave service registration deferred."
+    }
 
     foreach ($shortcutPath in @($startMenuShortcutPath, $desktopShortcutPath)) {
         if ((Get-ShortcutTarget -ShortcutPath $shortcutPath) -ne $trayPath) {

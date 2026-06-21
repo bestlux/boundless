@@ -96,6 +96,13 @@ Applied component split:
 - machine-wide key paths moved to HKLM instead of HKCU;
 - tray/daemon/CLI payloads remain in a separate payload component.
 
+`Boundless.Installer.wixproj` intentionally suppresses ICE43 and ICE57 for the
+9B-2 skeleton. Those ICEs expect non-advertised shortcuts to use an HKCU key
+path, but this MSI creates machine-wide common Start Menu/Desktop shortcuts with
+HKLM component key paths and no Startup shortcut. Installer smoke and MSI table
+inspection both keep Startup shortcut creation as a negative assertion until
+selected-user tray startup is implemented separately.
+
 Service registration skeleton:
 
 ```xml
