@@ -99,6 +99,8 @@ Required component split:
 Service registration skeleton:
 
 ```xml
+<Property Id="BOUNDLESS_ALLOWED_USER_SID" Secure="yes" />
+
 <Component Id="BoundlessServiceComponent" Directory="INSTALLDIR" Guid="PUT-GUID-HERE">
   <File
     Id="ServiceBinaryFile"
@@ -136,6 +138,12 @@ AutoStart, and the installed service executable resolves from the parent
 component key-path file. `ServiceControl` covers start, stop, and uninstall
 removal for the service component.
 
+`BOUNDLESS_ALLOWED_USER_SID` must be declared as a secure public property before
+it is used from the elevated execute/server side of the install. Without
+`Secure="yes"` / `SecureCustomProperties`, an explicit command-line fallback can
+be lost during managed elevation and the service can be installed with an empty
+or unintended SID.
+
 ## Tray Startup
 
 The first full installer should configure tray startup for the selected
@@ -163,6 +171,8 @@ it is safely identifying the intended desktop user from an elevated install.
 - if UAC elevation switches to another admin account, fail closed with a clear
   message or require an explicit MSI property such as
   `BOUNDLESS_ALLOWED_USER_SID=S-...`;
+- any explicit `BOUNDLESS_ALLOWED_USER_SID` fallback must be a secure public MSI
+  property and survive into the elevated execute context;
 - record the selected SID in installer-smoke evidence without logging unrelated
   local identities.
 
@@ -185,8 +195,13 @@ first, then validate:
 - install registers `BoundlessService`;
 - service image path is `%ProgramFiles%\Boundless\boundless-service.exe`;
 - start type is AutoStart;
-- service command line includes the intended `--allowed-user-sid`;
+- service command line includes exactly one non-empty intended
+  `--allowed-user-sid`;
 - install/repair/upgrade stops and restarts the service as expected;
+- failed install or upgrade after service stop, service install, or service
+  start failure leaves either the previous service restored/running or a
+  documented fail-closed state with no orphaned LocalSystem service or active
+  Program Files payload drift;
 - uninstall removes service registration and installed payloads;
 - `scripts/dev/service-smoke.ps1` or an installer-owned variant proves pipe ACL,
   daemon API health, version parity, process cleanup, and service removal.
