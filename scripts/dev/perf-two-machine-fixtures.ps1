@@ -76,6 +76,69 @@ function Invoke-Harness {
     return Get-Content -LiteralPath $jsonPath -Raw | ConvertFrom-Json
 }
 
+function Assert-PacketFieldSet {
+    param(
+        [object[]]$Observations,
+        [string]$PropertyName,
+        [string[]]$ExpectedValues,
+        [string]$Label
+    )
+
+    $actual = @($Observations | ForEach-Object {
+            $property = $_.PSObject.Properties[$PropertyName]
+            if ($null -ne $property) {
+                [string]$property.Value
+            }
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    $expected = @($ExpectedValues | Sort-Object -Unique)
+    if ($actual.Count -ne $expected.Count) {
+        throw "$Label expected values '$($expected -join ",")', found '$($actual -join ",")'."
+    }
+
+    foreach ($value in $expected) {
+        if ($actual -notcontains $value) {
+            throw "$Label missing expected value '$value'; found '$($actual -join ",")'."
+        }
+    }
+}
+
+function Assert-PacketVariantRows {
+    param(
+        [object[]]$Observations,
+        [string]$Variant,
+        [int]$ExpectedCount,
+        [string]$ExpectedPayloadKind,
+        [string]$ExpectedStatus,
+        [string]$ExpectedClassification,
+        [string]$ExpectedPolicy
+    )
+
+    $rows = @($Observations | Where-Object { $_.scenario_variant -eq $Variant })
+    if ($rows.Count -ne $ExpectedCount) {
+        throw "$Variant expected $ExpectedCount observation rows, found $($rows.Count)."
+    }
+
+    foreach ($row in $rows) {
+        if ($row.payload_kind -ne $ExpectedPayloadKind) {
+            throw "$Variant did not preserve payload_kind=$ExpectedPayloadKind."
+        }
+        if ($row.status -ne $ExpectedStatus) {
+            throw "$Variant did not preserve status=$ExpectedStatus."
+        }
+        if ($row.provisional_classification -ne $ExpectedClassification) {
+            throw "$Variant did not preserve provisional_classification=$ExpectedClassification."
+        }
+        if ($row.policy_expected -ne $ExpectedPolicy) {
+            throw "$Variant did not preserve policy_expected=$ExpectedPolicy."
+        }
+        if ([bool]$row.payload_synthetic -ne $true) {
+            throw "$Variant did not preserve payload_synthetic=true."
+        }
+    }
+
+    return $rows
+}
+
 $validatePacket = Invoke-Harness -Name "validate" -Arguments @("-Mode", "Validate", "-Role", "coordinator")
 $validateSummary = @($validatePacket.summary.scenario_summaries | Where-Object { $_.scenario -eq "text-clipboard" })[0]
 if ($validateSummary.latency_ms.p50 -ne 20 -or $validateSummary.latency_ms.p95 -ne 40 -or $validateSummary.latency_ms.max -ne 40) {
@@ -144,6 +207,28 @@ if ($clipboardImageSummary.success_count -ne 60 -or $clipboardImageSummary.skipp
 }
 if ($clipboardImageSummary.provisional_classifications.no_op -ne 20) {
     throw "Clipboard lab image summary did not classify the 4K policy-bound rows as no-op."
+}
+$clipboardObservations = @($clipboardPacket.observations)
+$textVariants = @("text-small", "text-medium", "text-large-policy-limit")
+$imageAcceptedVariants = @("image-screenshot-scale", "image-1080p", "image-near-limit")
+$allVariants = @($textVariants + $imageAcceptedVariants + @("image-4k-policy-bound"))
+Assert-PacketFieldSet -Observations $clipboardObservations -PropertyName "direction" -ExpectedValues @("A-to-B", "B-to-A") -Label "clipboard lab directions"
+Assert-PacketFieldSet -Observations $clipboardObservations -PropertyName "scenario_variant" -ExpectedValues $allVariants -Label "clipboard lab scenario variants"
+Assert-PacketFieldSet -Observations $clipboardObservations -PropertyName "payload_kind" -ExpectedValues @("text", "image-bmp") -Label "clipboard lab payload kinds"
+foreach ($variant in $textVariants) {
+    Assert-PacketVariantRows -Observations $clipboardObservations -Variant $variant -ExpectedCount 20 -ExpectedPayloadKind "text" -ExpectedStatus "passed" -ExpectedClassification "acceptable" -ExpectedPolicy "accepted" | Out-Null
+}
+foreach ($variant in $imageAcceptedVariants) {
+    Assert-PacketVariantRows -Observations $clipboardObservations -Variant $variant -ExpectedCount 20 -ExpectedPayloadKind "image-bmp" -ExpectedStatus "passed" -ExpectedClassification "acceptable" -ExpectedPolicy "accepted" | Out-Null
+}
+$policyBoundRows = Assert-PacketVariantRows -Observations $clipboardObservations -Variant "image-4k-policy-bound" -ExpectedCount 20 -ExpectedPayloadKind "image-bmp" -ExpectedStatus "skipped" -ExpectedClassification "no-op" -ExpectedPolicy "rejected-by-current-policy"
+foreach ($row in $policyBoundRows) {
+    if ([int64]$row.bytes -ne 0L) {
+        throw "image-4k-policy-bound rows must preserve bytes=0 for skipped policy-bound observations."
+    }
+    if ([int64]$row.payload_bytes -le [int64]$row.policy_limit_bytes) {
+        throw "image-4k-policy-bound rows must preserve payload_bytes greater than policy_limit_bytes."
+    }
 }
 
 foreach ($artifact in Get-ChildItem -LiteralPath $OutputRoot -File -Recurse -Include "*.json", "*.md", "*.log") {

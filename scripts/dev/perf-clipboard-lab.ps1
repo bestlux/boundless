@@ -260,14 +260,126 @@ function Assert-SummaryMatchesObservations {
     }
 }
 
+function Get-ObservationField {
+    param(
+        [object]$Observation,
+        [string]$Name
+    )
+
+    $property = $Observation.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return ""
+    }
+
+    return [string]$property.Value
+}
+
+function Assert-ObservationFieldSet {
+    param(
+        [object[]]$Observations,
+        [string]$PropertyName,
+        [string[]]$ExpectedValues,
+        [string]$Label
+    )
+
+    $actual = @($Observations | ForEach-Object { Get-ObservationField -Observation $_ -Name $PropertyName } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    $expected = @($ExpectedValues | Sort-Object -Unique)
+    if ($actual.Count -ne $expected.Count) {
+        throw "$Label expected values '$($expected -join ",")', found '$($actual -join ",")'."
+    }
+
+    foreach ($value in $expected) {
+        if ($actual -notcontains $value) {
+            throw "$Label missing expected value '$value'; found '$($actual -join ",")'."
+        }
+    }
+}
+
+function Assert-ObservationRows {
+    param(
+        [object[]]$Rows,
+        [int]$ExpectedCount,
+        [string]$Label,
+        [string]$ExpectedPayloadKind,
+        [string]$ExpectedStatus,
+        [string]$ExpectedClassification,
+        [string]$ExpectedPolicy,
+        [bool]$ExpectSynthetic
+    )
+
+    if ($Rows.Count -ne $ExpectedCount) {
+        throw "$Label expected $ExpectedCount observation rows, found $($Rows.Count)."
+    }
+
+    foreach ($row in $Rows) {
+        if ((Get-ObservationField -Observation $row -Name "payload_kind") -ne $ExpectedPayloadKind) {
+            throw "$Label did not preserve payload_kind=$ExpectedPayloadKind."
+        }
+        if ((Get-ObservationField -Observation $row -Name "status") -ne $ExpectedStatus) {
+            throw "$Label did not preserve status=$ExpectedStatus."
+        }
+        if ((Get-ObservationField -Observation $row -Name "provisional_classification") -ne $ExpectedClassification) {
+            throw "$Label did not preserve provisional_classification=$ExpectedClassification."
+        }
+        if ((Get-ObservationField -Observation $row -Name "policy_expected") -ne $ExpectedPolicy) {
+            throw "$Label did not preserve policy_expected=$ExpectedPolicy."
+        }
+        if ([bool]$row.payload_synthetic -ne $ExpectSynthetic) {
+            throw "$Label did not preserve payload_synthetic=$ExpectSynthetic."
+        }
+    }
+}
+
+function Assert-ClipboardObservationMetadata {
+    param(
+        [object[]]$PacketObservations,
+        [int]$ExpectedIterations,
+        [string[]]$ExpectedDirections
+    )
+
+    $expectedTextVariants = @("text-small", "text-medium", "text-large-policy-limit")
+    $expectedImageVariants = @("image-screenshot-scale", "image-1080p", "image-4k-policy-bound", "image-near-limit")
+    $expectedVariants = @($expectedTextVariants + $expectedImageVariants)
+    $expectedDirectionsSorted = @($ExpectedDirections | Sort-Object -Unique)
+    $directionCount = $expectedDirectionsSorted.Count
+    $rowsPerVariant = $directionCount * $ExpectedIterations
+
+    Assert-ObservationFieldSet -Observations $PacketObservations -PropertyName "direction" -ExpectedValues $expectedDirectionsSorted -Label "clipboard lab directions"
+    Assert-ObservationFieldSet -Observations $PacketObservations -PropertyName "scenario_variant" -ExpectedValues $expectedVariants -Label "clipboard lab scenario variants"
+    Assert-ObservationFieldSet -Observations $PacketObservations -PropertyName "payload_kind" -ExpectedValues @("text", "image-bmp") -Label "clipboard lab payload kinds"
+
+    foreach ($variant in $expectedTextVariants) {
+        $rows = @($PacketObservations | Where-Object { $_.scenario_variant -eq $variant })
+        Assert-ObservationRows -Rows $rows -ExpectedCount $rowsPerVariant -Label $variant -ExpectedPayloadKind "text" -ExpectedStatus "passed" -ExpectedClassification "acceptable" -ExpectedPolicy "accepted" -ExpectSynthetic $true
+    }
+
+    foreach ($variant in @("image-screenshot-scale", "image-1080p", "image-near-limit")) {
+        $rows = @($PacketObservations | Where-Object { $_.scenario_variant -eq $variant })
+        Assert-ObservationRows -Rows $rows -ExpectedCount $rowsPerVariant -Label $variant -ExpectedPayloadKind "image-bmp" -ExpectedStatus "passed" -ExpectedClassification "acceptable" -ExpectedPolicy "accepted" -ExpectSynthetic $true
+    }
+
+    $policyBoundRows = @($PacketObservations | Where-Object { $_.scenario_variant -eq "image-4k-policy-bound" })
+    Assert-ObservationRows -Rows $policyBoundRows -ExpectedCount $rowsPerVariant -Label "image-4k-policy-bound" -ExpectedPayloadKind "image-bmp" -ExpectedStatus "skipped" -ExpectedClassification "no-op" -ExpectedPolicy "rejected-by-current-policy" -ExpectSynthetic $true
+    foreach ($row in $policyBoundRows) {
+        if ([int64]$row.bytes -ne 0L) {
+            throw "image-4k-policy-bound rows must preserve bytes=0 for skipped policy-bound observations."
+        }
+        if ([int64]$row.payload_bytes -le [int64]$row.policy_limit_bytes) {
+            throw "image-4k-policy-bound rows must preserve payload_bytes greater than policy_limit_bytes."
+        }
+    }
+}
+
 function Invoke-ClipboardLabValidation {
     $result = Invoke-ClipboardLabDryRun
     $packet = Get-Content -LiteralPath $result.packet_path -Raw | ConvertFrom-Json
     $observations = @($result.observations)
+    $packetObservations = @($packet.observations)
     $directionCount = $Direction.Count
 
     Assert-SummaryMatchesObservations -Packet $packet -Observations $observations -ScenarioName "text-clipboard" -ExpectedSuccess (3 * $directionCount * $Iterations) -ExpectedFailure 0 -ExpectedSkipped 0 -ExpectedNoOp 0 -ExpectedAcceptable (3 * $directionCount * $Iterations) -ExpectedPayloadMin 128L -ExpectedPayloadMax ([int64]$MaxClipboardTextBytes)
     Assert-SummaryMatchesObservations -Packet $packet -Observations $observations -ScenarioName "image-clipboard" -ExpectedSuccess (3 * $directionCount * $Iterations) -ExpectedFailure 0 -ExpectedSkipped (1 * $directionCount * $Iterations) -ExpectedNoOp (1 * $directionCount * $Iterations) -ExpectedAcceptable (3 * $directionCount * $Iterations) -ExpectedPayloadMin (Get-BmpPayloadBytes -Width 1366 -Height 768) -ExpectedPayloadMax (Get-BmpPayloadBytes -Width 3840 -Height 2160)
+    Assert-ClipboardObservationMetadata -PacketObservations $packetObservations -ExpectedIterations $Iterations -ExpectedDirections $Direction
 
     if ($packet.privacy.payload_contents_recorded -ne $false -or $packet.privacy.raw_peer_ids_recorded -ne $false -or $packet.privacy.raw_paths_recorded -ne $false) {
         throw "Clipboard lab packet did not preserve privacy flags."
