@@ -64,6 +64,6 @@ Scenario summaries use nearest-rank percentiles over successful latency rows:
 
 Dry-run and fixture packets are developer diagnostics only. They prove schema, redaction, and summary math, not product speed or reliability.
 
-Release evidence requires a real two-machine run with matching coordinator and peer packets, known build provenance, scenario observations from actual Boundless operations, and review of all failed or missing rows. This harness is suitable input for that review, but it does not make BND-NEXT-14, BND-NEXT-15, or BND-NEXT-16 default PR gates.
+Release evidence requires a real two-machine run with matching coordinator and peer packets, known build provenance, and at least one scenario observation for every selected scenario. Empty metadata-only capture packets remain developer diagnostics even when the ReleaseEvidence switch is supplied. This harness is suitable input for review of actual scenario rows, but it does not make BND-NEXT-14, BND-NEXT-15, or BND-NEXT-16 default PR gates.
 
 The harness does not claim lock-screen, secure desktop, UAC prompt, elevated-app, or Mouse Without Borders parity. Those remain separate Windows lab evidence items.

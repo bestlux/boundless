@@ -29,6 +29,21 @@ if (-not (Test-Path -LiteralPath $harness)) {
     throw "Missing harness script: $harness"
 }
 
+function Redact-FixtureLogLine {
+    param([object]$Value)
+
+    $line = if ($null -eq $Value) { "" } else { [string]$Value }
+    if ([string]::IsNullOrWhiteSpace($line)) {
+        return ""
+    }
+
+    $line = $line.Replace($repoRoot, "[repo-root]")
+    $line = $line.Replace($OutputRoot, "[output-root]")
+    $line = [regex]::Replace($line, "(?i)\b[A-Z]:\\[^\s,;|]+", "[redacted-path]")
+    $line = [regex]::Replace($line, "\\\\[^\s,;|]+", "[redacted-path]")
+    return $line
+}
+
 function Invoke-Harness {
     param(
         [string]$Name,
@@ -40,9 +55,9 @@ function Invoke-Harness {
     $logPath = Join-Path $caseRoot "$Name.log"
     $captured = & powershell -NoProfile -ExecutionPolicy Bypass -File $harness @Arguments -OutputRoot $caseRoot *>&1
     $exitCode = if ($null -eq $global:LASTEXITCODE) { 0 } else { $global:LASTEXITCODE }
-    $captured | ForEach-Object { $_.ToString() } | Set-Content -LiteralPath $logPath -Encoding utf8
+    $captured | ForEach-Object { Redact-FixtureLogLine $_ } | Set-Content -LiteralPath $logPath -Encoding utf8
     if ($exitCode -ne 0) {
-        throw "Harness fixture '$Name' failed with exit code $exitCode; see $logPath"
+        throw "Harness fixture '$Name' failed with exit code $exitCode; see generated fixture log"
     }
 
     $jsonPath = Join-Path $caseRoot "two-machine-evidence.json"
@@ -65,11 +80,24 @@ if ($validateSummary.latency_ms.p50 -ne 20 -or $validateSummary.latency_ms.p95 -
 if ($validateSummary.failure_count -ne 1) {
     throw "Validate fixture did not preserve the expected failure count."
 }
+if ($validateSummary.throughput_mbps -ne 0.041) {
+    throw "Validate fixture did not preserve expected throughput math."
+}
 
-$validateJson = Get-Content -LiteralPath (Join-Path $OutputRoot "validate/two-machine-evidence.json") -Raw
-foreach ($forbidden in @("raw-peer", "raw-machine", "C:\Users\secret", "192.168.1.22", "12345678-1234-1234-1234-123456789abc")) {
-    if ($validateJson.Contains($forbidden)) {
-        throw "Validate fixture leaked forbidden token '$forbidden'."
+$emptyCapturePacket = Invoke-Harness -Name "empty-capture-release-evidence" -Arguments @("-Mode", "Capture", "-Role", "coordinator", "-ReleaseEvidence")
+if ($emptyCapturePacket.release_evidence.eligible -ne $false) {
+    throw "Empty Capture fixture must not be eligible for release evidence."
+}
+if ($emptyCapturePacket.evidence_class -ne "developer-diagnostics") {
+    throw "Empty Capture fixture must remain developer diagnostics."
+}
+
+foreach ($artifact in Get-ChildItem -LiteralPath $OutputRoot -File -Recurse -Include "*.json", "*.md", "*.log") {
+    $content = Get-Content -LiteralPath $artifact.FullName -Raw
+    foreach ($forbidden in @("raw-peer", "raw-machine", "C:\Users\secret", "192.168.1.22", "12345678-1234-1234-1234-123456789abc", $repoRoot, $OutputRoot)) {
+        if (-not [string]::IsNullOrWhiteSpace($forbidden) -and $content.Contains($forbidden)) {
+            throw "Fixture artifact '$($artifact.Name)' leaked forbidden token '$forbidden'."
+        }
     }
 }
 
@@ -89,4 +117,4 @@ foreach ($required in @("text-clipboard", "image-clipboard", "file-transfer", "r
 }
 
 Write-Host "two_machine_perf_fixtures=passed"
-Write-Host "output_root=$OutputRoot"
+Write-Host "output_root=[redacted]"

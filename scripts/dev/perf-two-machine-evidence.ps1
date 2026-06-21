@@ -514,6 +514,37 @@ function New-ScenarioSummary {
     }
 }
 
+function Get-ReleaseEvidenceEligibility {
+    param([object[]]$ScenarioSummaries)
+
+    if (-not $ReleaseEvidence.IsPresent) {
+        return [pscustomobject]@{
+            eligible = $false
+            reason = "ReleaseEvidence was not set"
+        }
+    }
+    if ($Mode -eq "DryRun" -or $Mode -eq "Validate") {
+        return [pscustomobject]@{
+            eligible = $false
+            reason = "dry-run and validation output is developer diagnostics only"
+        }
+    }
+
+    $missing = @($ScenarioSummaries | Where-Object { $_.iterations -lt 1 })
+    if ($missing.Count -gt 0) {
+        $missingNames = ($missing | ForEach-Object { $_.scenario }) -join ", "
+        return [pscustomobject]@{
+            eligible = $false
+            reason = "missing observations for selected scenario(s): $missingNames"
+        }
+    }
+
+    return [pscustomobject]@{
+        eligible = $true
+        reason = "caller marked real two-machine evidence candidate with observations for each selected scenario"
+    }
+}
+
 function New-EvidencePacket {
     param([object[]]$Observations)
 
@@ -521,18 +552,11 @@ function New-EvidencePacket {
     foreach ($item in $Scenario) {
         $summaries.Add((New-ScenarioSummary -ScenarioName $item -Observations $Observations))
     }
+    $summaryArray = @($summaries.ToArray())
 
     $failedCount = @($Observations | Where-Object { $_.status -eq "failed" }).Count
-    $evidenceClass = if ($ReleaseEvidence) { "release-evidence-candidate" } else { "developer-diagnostics" }
-    if ($Mode -eq "DryRun" -or $Mode -eq "Validate") {
-        $evidenceClass = "developer-diagnostics"
-    }
-
-    $eligible = $ReleaseEvidence.IsPresent -and $Mode -ne "DryRun" -and $Mode -ne "Validate"
-    $reason = "dry-run, validation, or unmarked capture is developer diagnostics only"
-    if ($eligible) {
-        $reason = "caller marked real two-machine evidence candidate"
-    }
+    $eligibility = Get-ReleaseEvidenceEligibility -ScenarioSummaries $summaryArray
+    $evidenceClass = if ($eligibility.eligible) { "release-evidence-candidate" } else { "developer-diagnostics" }
 
     return [pscustomobject]@{
         schema_version = "boundless.performance.two_machine.v1"
@@ -540,8 +564,8 @@ function New-EvidencePacket {
         mode = $Mode
         evidence_class = $evidenceClass
         release_evidence = [pscustomobject]@{
-            eligible = $eligible
-            reason = $reason
+            eligible = $eligibility.eligible
+            reason = $eligibility.reason
         }
         command = "scripts/dev/perf-two-machine-evidence.ps1 -Mode $Mode -Role $Role"
         repo = [pscustomobject]@{
@@ -563,7 +587,7 @@ function New-EvidencePacket {
         iteration_count = $Iterations
         observations = @($Observations)
         summary = [pscustomobject]@{
-            scenario_summaries = @($summaries.ToArray())
+            scenario_summaries = $summaryArray
             total_observations = $Observations.Count
             total_failures = $failedCount
         }
@@ -618,8 +642,8 @@ function Write-Packet {
 
     $Packet | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $jsonPath -Encoding utf8
     Write-MarkdownSummary -Packet $Packet
-    Write-Host "two_machine_evidence_json=$jsonPath"
-    Write-Host "two_machine_evidence_markdown=$markdownPath"
+    Write-Host "two_machine_evidence_json=$($Packet.artifacts.json)"
+    Write-Host "two_machine_evidence_markdown=$($Packet.artifacts.markdown)"
 }
 
 function Invoke-Validation {
@@ -630,9 +654,14 @@ function Invoke-Validation {
         [pscustomobject]@{ scenario = "text-clipboard"; iteration = 4; role = "coordinator"; status = "passed"; latency_ms = 40; duration_ms = 40; bytes = 128 },
         [pscustomobject]@{ scenario = "text-clipboard"; iteration = 5; role = "coordinator"; status = "failed"; latency_ms = $null; duration_ms = $null; bytes = 0; failure_kind = "peer_id=raw-peer machine_id=raw-machine C:\Users\secret\payload.txt 192.168.1.22 12345678-1234-1234-1234-123456789abc" }
     )
-    $fixturePath = Join-Path $OutputRoot "fixture-observations.json"
-    $fixtureRows | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $fixturePath -Encoding utf8
-    $observations = Read-ObservationFile -Path $fixturePath
+    $fixturePath = New-TemporaryFile
+    try {
+        $fixtureRows | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $fixturePath.FullName -Encoding utf8
+        $observations = Read-ObservationFile -Path $fixturePath.FullName
+    }
+    finally {
+        Remove-Item -LiteralPath $fixturePath.FullName -Force -ErrorAction SilentlyContinue
+    }
     $packet = New-EvidencePacket -Observations $observations
     $summary = @($packet.summary.scenario_summaries | Where-Object { $_.scenario -eq "text-clipboard" })[0]
     if ($summary.latency_ms.p50 -ne 20) {
@@ -646,6 +675,9 @@ function Invoke-Validation {
     }
     if ($summary.failure_count -ne 1) {
         throw "Expected fixture failure_count=1, found $($summary.failure_count)."
+    }
+    if ($summary.throughput_mbps -ne 0.041) {
+        throw "Expected fixture throughput_mbps=0.041, found $($summary.throughput_mbps)."
     }
 
     Write-Packet -Packet $packet
