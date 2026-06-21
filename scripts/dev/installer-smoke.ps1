@@ -186,6 +186,57 @@ function Get-UninstallEntry {
     return $null
 }
 
+function Get-BoundlessInstallRoot {
+    param([object]$UninstallEntry)
+
+    if (
+        $null -ne $UninstallEntry -and
+        $UninstallEntry.PSObject.Properties.Match("InstallLocation").Count -gt 0 -and
+        -not [string]::IsNullOrWhiteSpace($UninstallEntry.InstallLocation)
+    ) {
+        return $UninstallEntry.InstallLocation
+    }
+
+    $programFilesRoot = Join-Path $env:ProgramFiles "Boundless"
+    if (Test-Path -LiteralPath $programFilesRoot) {
+        return $programFilesRoot
+    }
+
+    $legacyRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) "Programs\Boundless"
+    if (Test-Path -LiteralPath $legacyRoot) {
+        return $legacyRoot
+    }
+
+    return $programFilesRoot
+}
+
+function Get-FileEvidence {
+    param(
+        [string]$Path,
+        [string]$Label
+    )
+
+    Assert-PathExists -Path $Path -Message "$Label is missing: $Path"
+    $item = Get-Item -LiteralPath $Path
+    return [ordered]@{
+        path = $item.FullName
+        sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $item.FullName).Hash
+        length = $item.Length
+        last_write_time_utc = $item.LastWriteTimeUtc.ToString("o")
+    }
+}
+
+function Test-IsUnderPath {
+    param(
+        [string]$Path,
+        [string]$Root
+    )
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $resolvedRoot = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+    return $resolvedPath.StartsWith($resolvedRoot, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -325,6 +376,41 @@ function Wait-BoundlessServiceStatus {
         throw "BoundlessService was not found while waiting for $ExpectedStatus."
     }
     throw "BoundlessService did not reach $ExpectedStatus within $($TimeoutSeconds)s; current=$($service.Status)."
+}
+
+function Wait-BoundlessServiceRemoved {
+    param([int]$TimeoutSeconds = 20)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        if ($null -eq (Get-BoundlessService)) {
+            return
+        }
+
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+
+    throw "BoundlessService registration was still present after $($TimeoutSeconds)s."
+}
+
+function Remove-BoundlessServiceRegistrationForRepair {
+    $service = Get-BoundlessService
+    if ($null -eq $service) {
+        throw "BoundlessService was not present before repair registration recovery test."
+    }
+
+    if ($service.Status.ToString() -ne "Stopped") {
+        Stop-Service -Name "BoundlessService" -Force -ErrorAction Stop
+        Wait-BoundlessServiceStatus -ExpectedStatus "Stopped" | Out-Null
+    }
+
+    $deleteOutput = sc.exe delete BoundlessService 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to delete BoundlessService before repair test. Exit code: $LASTEXITCODE Output: $deleteOutput"
+    }
+
+    Wait-BoundlessServiceRemoved
+    return $deleteOutput.Trim()
 }
 
 function Assert-BoundlessServiceConfig {
@@ -489,6 +575,7 @@ $expectedDisplayVersion = Get-ExpectedDisplayVersion -Path $InstallerPath
 
 $installLog = Join-Path $OutputRoot "install.log"
 $upgradeLog = Join-Path $OutputRoot "upgrade.log"
+$repairLog = Join-Path $OutputRoot "repair.log"
 $uninstallLog = Join-Path $OutputRoot "uninstall.log"
 
 $currentUserStartupShortcutPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)) "Boundless.lnk"
@@ -516,16 +603,48 @@ try {
     $postUpgradeDaemonCount = $null
     $upgradeInstallExitCode = $null
     $installExitCode = $null
+    $repairExitCode = $null
     $uninstallExitCode = $null
+    $previousInstallRoot = $null
+    $previousUninstallRegistryRoot = $null
+    $previousAppPayloadEvidence = $null
+    $previousServicePayloadEvidence = $null
+    $previousServiceInstallConfig = $null
+    $currentAppPayloadEvidence = $null
+    $currentServicePayloadEvidence = $null
+    $upgradePayloadReplacement = $null
+    $repairServiceDeleteOutput = $null
+    $repairServiceConfig = $null
+    $repairDaemonStatusOutput = $null
+    $serviceRunningAfterRepair = $false
 
     if (-not [string]::IsNullOrWhiteSpace($PreviousInstallerPath)) {
         $PreviousInstallerPath = (Resolve-Path -LiteralPath $PreviousInstallerPath).Path
         $upgradeInstallExitCode = Invoke-MsiExec -ArgumentList (@("/i", $PreviousInstallerPath, "/qn", "/norestart") + $msiInstallProperties) -LogPath $upgradeLog
 
+        $previousUninstallEntry = Get-UninstallEntry
+        if ($null -eq $previousUninstallEntry) {
+            throw "Previous installer did not create a Boundless uninstall entry."
+        }
+        $previousUninstallRegistryRoot = $previousUninstallEntry.RegistryRoot
+        $previousInstallRoot = Get-BoundlessInstallRoot -UninstallEntry $previousUninstallEntry
+        $previousTrayPath = Join-Path $previousInstallRoot "boundlesstray.exe"
+        $previousServicePath = Join-Path $previousInstallRoot "boundless-service.exe"
+        $previousCliPath = Join-Path $previousInstallRoot "boundlessctl.exe"
+        $previousAppPayloadEvidence = Get-FileEvidence -Path $previousTrayPath -Label "Previous installer tray executable"
+        $previousServicePayloadEvidence = Get-FileEvidence -Path $previousServicePath -Label "Previous installer service executable"
+        $previousServiceConfig = Get-BoundlessServiceConfig
+        if ($null -ne $previousServiceConfig) {
+            $previousServiceInstallConfig = [ordered]@{
+                name = $previousServiceConfig.Name
+                path_name = $previousServiceConfig.PathName
+                start_mode = $previousServiceConfig.StartMode
+                start_name = $previousServiceConfig.StartName
+                state = $previousServiceConfig.State
+            }
+        }
+
         if ($interactiveDesktopSession) {
-            $previousInstallRoot = $legacyInstallRoot
-            $previousTrayPath = Join-Path $previousInstallRoot "boundlesstray.exe"
-            $previousCliPath = Join-Path $previousInstallRoot "boundlessctl.exe"
             Assert-PathExists -Path $previousTrayPath -Message "Previous installer did not lay down tray executable."
             Assert-PathExists -Path $previousCliPath -Message "Previous installer did not lay down CLI executable."
 
@@ -562,6 +681,43 @@ try {
     $serviceInstallConfig = Assert-BoundlessServiceConfig -ExpectedServicePath $servicePath -ExpectedAllowedUserSid $AllowedUserSid
     Wait-BoundlessServiceStatus -ExpectedStatus "Running" | Out-Null
     $serviceDaemonStatusOutput = Wait-ForDaemonReady -CliPath $cliPath
+    $currentAppPayloadEvidence = Get-FileEvidence -Path $trayPath -Label "Current installer tray executable"
+    $currentServicePayloadEvidence = Get-FileEvidence -Path $servicePath -Label "Current installer service executable"
+    if (-not [string]::IsNullOrWhiteSpace($PreviousInstallerPath)) {
+        $upgradePayloadReplacement = [ordered]@{
+            previous_app_payload = $previousAppPayloadEvidence
+            current_app_payload = $currentAppPayloadEvidence
+            previous_service_payload = $previousServicePayloadEvidence
+            current_service_payload = $currentServicePayloadEvidence
+            app_payload_replaced = ($previousAppPayloadEvidence.sha256 -ne $currentAppPayloadEvidence.sha256)
+            service_payload_replaced = ($previousServicePayloadEvidence.sha256 -ne $currentServicePayloadEvidence.sha256)
+            current_payload_owned_by_program_files = (Test-IsUnderPath -Path $currentAppPayloadEvidence.path -Root $env:ProgramFiles)
+            current_service_payload_owned_by_program_files = (Test-IsUnderPath -Path $currentServicePayloadEvidence.path -Root $env:ProgramFiles)
+            current_active_service_uses_program_files_payload = ($serviceInstallConfig.path_name -match [regex]::Escape($servicePath))
+        }
+        if (-not $upgradePayloadReplacement.app_payload_replaced) {
+            throw "N-1 upgrade did not replace the tray payload. Previous and current SHA-256 both $($currentAppPayloadEvidence.sha256)."
+        }
+        if (-not $upgradePayloadReplacement.service_payload_replaced) {
+            throw "N-1 upgrade did not replace the service payload. Previous and current SHA-256 both $($currentServicePayloadEvidence.sha256)."
+        }
+        if (-not $upgradePayloadReplacement.current_payload_owned_by_program_files) {
+            throw "Current app payload is not under Program Files after N-1 upgrade: $($currentAppPayloadEvidence.path)"
+        }
+        if (-not $upgradePayloadReplacement.current_service_payload_owned_by_program_files) {
+            throw "Current service payload is not under Program Files after N-1 upgrade: $($currentServicePayloadEvidence.path)"
+        }
+        if (-not $upgradePayloadReplacement.current_active_service_uses_program_files_payload) {
+            throw "Active BoundlessService does not use the current Program Files service payload after N-1 upgrade."
+        }
+    }
+
+    $repairServiceDeleteOutput = Remove-BoundlessServiceRegistrationForRepair
+    $repairExitCode = Invoke-MsiExec -ArgumentList (@("/fa", $InstallerPath, "/qn", "/norestart") + $msiInstallProperties) -LogPath $repairLog
+    $repairServiceConfig = Assert-BoundlessServiceConfig -ExpectedServicePath $servicePath -ExpectedAllowedUserSid $AllowedUserSid
+    Wait-BoundlessServiceStatus -ExpectedStatus "Running" | Out-Null
+    $repairDaemonStatusOutput = Wait-ForDaemonReady -CliPath $cliPath
+    $serviceRunningAfterRepair = ((Get-BoundlessService).Status.ToString() -eq "Running")
 
     foreach ($shortcutPath in @($startMenuShortcutPath, $desktopShortcutPath)) {
         if ((Get-ShortcutTarget -ShortcutPath $shortcutPath) -ne $trayPath) {
@@ -671,6 +827,9 @@ try {
     if ($null -ne (Get-BoundlessService)) {
         throw "Uninstall left a registered Boundless service."
     }
+    if (Test-Path -LiteralPath $servicePath) {
+        throw "Uninstall left the Program Files service binary: $servicePath"
+    }
     if (Test-InstallerEvidencePresent) {
         throw "Uninstall left machine-wide installer evidence under HKLM\Software\Boundless\Installer."
     }
@@ -686,6 +845,12 @@ try {
         service_install_config = $serviceInstallConfig
         service_daemon_status_output = $serviceDaemonStatusOutput
         service_running_before_uninstall = $serviceRunningBeforeUninstall
+        repair_tested = $true
+        repair_exit_code = $repairExitCode
+        repair_service_delete_output = $repairServiceDeleteOutput
+        repair_service_config = $repairServiceConfig
+        repair_daemon_status_output = $repairDaemonStatusOutput
+        service_running_after_repair = $serviceRunningAfterRepair
         installer_signature = $installerSignature
         tray_signature = $traySignature
         daemon_signature = $daemonSignature
@@ -700,6 +865,14 @@ try {
         tray_exit_code = $trayExitCode
         daemon_ready_output = $daemonReadyOutput
         upgraded_from = $PreviousInstallerPath
+        previous_install_root = $previousInstallRoot
+        previous_uninstall_registry_root = $previousUninstallRegistryRoot
+        previous_app_payload = $previousAppPayloadEvidence
+        previous_service_payload = $previousServicePayloadEvidence
+        previous_service_install_config = $previousServiceInstallConfig
+        current_app_payload = $currentAppPayloadEvidence
+        current_service_payload = $currentServicePayloadEvidence
+        upgrade_payload_replacement = $upgradePayloadReplacement
         previous_install_exit_code = $upgradeInstallExitCode
         install_exit_code = $installExitCode
         uninstall_exit_code = $uninstallExitCode
@@ -710,6 +883,8 @@ try {
         post_upgrade_daemon_count = $postUpgradeDaemonCount
         post_uninstall_processes_cleared = $true
         post_uninstall_service_removed = $true
+        post_uninstall_program_files_root_removed = $true
+        post_uninstall_service_binary_removed = $true
         status = "passed"
     }
     $summary | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutputRoot "installer-smoke.json") -Encoding utf8

@@ -27,7 +27,8 @@ Skipped gates are never hidden. A release reviewer must either provide the missi
 - `-Policy stable` is the release-blocking policy. It exits non-zero for failed, skipped, missing, or stale evidence that this packet can evaluate.
 - Installer-smoke summary freshness is checked from the evidence file timestamp by default. Evidence older than `-MaxEvidenceAgeHours` fails stable policy.
 - Service update evidence is MSI-owned by default with `-ServiceUpdateMode msi-owned`. `service-self-update` and `tray-self-update` are accepted only as explicit unsupported/deferred modes and fail readiness when selected.
-- N-1 MSI upgrade coverage requires a prior MSI path passed to installer smoke. Missing prior-MSI coverage is recorded as skipped evidence, which fails `-Policy stable`.
+- Full-service installer coverage requires installer-smoke evidence for MSI-owned service registration, repair recovery, and uninstall cleanup. Missing repair or stale-service cleanup evidence blocks readiness.
+- N-1 MSI upgrade coverage requires a prior MSI path passed to installer smoke. The summary must prove both app payload and service payload replacement, Program Files ownership of the current payloads, and the active service path after upgrade. Missing prior-MSI coverage is recorded as skipped evidence, which fails `-Policy stable`.
 
 ## Common Commands
 
@@ -80,7 +81,9 @@ N-1 MSI upgrade evidence:
 
 The service-version gate parses `boundless-service.exe --version` strictly as `boundless-service <version>`. For a stable release such as `v5.0.0`, the parsed service version must exactly equal `5.0.0`; substring matches, prerelease suffixes, empty output, and malformed output fail. If no installer-smoke summary is supplied, `service_version_parity` is recorded as skipped and `-RequireReady` blocks the packet.
 
-The `n_minus_1_msi_upgrade` gate passes only when installer smoke summary evidence includes `upgraded_from` and `previous_install_exit_code = 0`. The supported prior artifact source is a GitHub Release MSI asset named `Boundless-<version>-windows-x64.msi`; the release workflow also stages the current Windows MSI under the `boundless-windows-x64` artifact before publish.
+The `service_lifecycle_evidence` gate passes only when installer smoke summary evidence shows MSI-owned service registration, AutoStart LocalSystem config, a repair run that restores a deleted `BoundlessService` registration and daemon health, and uninstall cleanup that removes the service registration, Program Files install root, and Program Files service binary.
+
+The `n_minus_1_msi_upgrade` gate passes only when installer smoke summary evidence includes `upgraded_from`, `previous_install_exit_code = 0`, and `upgrade_payload_replacement` booleans proving app payload replacement, service payload replacement, Program Files ownership, and active service use of the current Program Files service binary. The supported prior artifact source is a GitHub Release MSI asset named `Boundless-<version>-windows-x64.msi`; the release workflow also stages the current Windows MSI under the `boundless-windows-x64` artifact before publish.
 
 Run the targeted fixture matrix with:
 

@@ -208,6 +208,31 @@ function Get-SummaryPropertyValue {
     return $property.Value
 }
 
+function Get-ObjectPropertyValue {
+    param(
+        [object]$Object,
+        [string]$Name
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+    return $property.Value
+}
+
+function Test-StrictTrue {
+    param([object]$Value)
+
+    if ($Value -is [bool]) {
+        return $Value
+    }
+    return [string]::Equals([string]$Value, "true", [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Normalize-ReleaseVersion {
     param([string]$Version)
 
@@ -302,6 +327,77 @@ function Add-ServiceUpdateOwnershipGate {
     Add-GateResult -Id "service_update_ownership" -Category "release" -Command "release-readiness -ServiceUpdateMode $Mode" -Status "failed" -Reason "$owner is unsupported/deferred" -Impact "release readiness accepts MSI-owned update evidence only; service and tray self-update modes must not be treated as supported update evidence"
 }
 
+function Add-ServiceLifecycleEvidenceGate {
+    param(
+        [object]$Summary,
+        [string]$Command
+    )
+
+    if ($null -eq $Summary) {
+        Add-SkippedGate -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Reason "installer smoke summary was not provided" -Impact "stable full-service installer readiness requires service install, repair, and uninstall cleanup evidence"
+        return
+    }
+
+    $serviceInstallConfig = Get-SummaryPropertyValue -Summary $Summary -Name "service_install_config"
+    if ($null -eq $serviceInstallConfig) {
+        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "installer summary missing service_install_config" -Impact "service registration evidence is incomplete"
+        return
+    }
+
+    $installPath = [string](Get-ObjectPropertyValue -Object $serviceInstallConfig -Name "path_name")
+    $startMode = [string](Get-ObjectPropertyValue -Object $serviceInstallConfig -Name "start_mode")
+    $startName = [string](Get-ObjectPropertyValue -Object $serviceInstallConfig -Name "start_name")
+    if ([string]::IsNullOrWhiteSpace($installPath) -or $installPath -notmatch "boundless-service\.exe") {
+        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "service_install_config did not identify the active service binary" -Impact "release readiness cannot prove the MSI-owned service path"
+        return
+    }
+    if ($startMode -ne "Auto") {
+        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "service StartMode was '$startMode', expected Auto" -Impact "service autostart evidence is incomplete"
+        return
+    }
+    if ($startName -ne "LocalSystem") {
+        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "service StartName was '$startName', expected LocalSystem" -Impact "service account evidence is incomplete"
+        return
+    }
+
+    foreach ($field in @(
+        "service_running_before_uninstall",
+        "repair_tested",
+        "service_running_after_repair",
+        "post_uninstall_processes_cleared",
+        "post_uninstall_service_removed",
+        "post_uninstall_program_files_root_removed",
+        "post_uninstall_service_binary_removed"
+    )) {
+        if (-not (Test-StrictTrue -Value (Get-SummaryPropertyValue -Summary $Summary -Name $field))) {
+            Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "installer summary did not prove $field=true" -Impact "service lifecycle evidence is incomplete"
+            return
+        }
+    }
+
+    $repairExitCode = Get-SummaryPropertyValue -Summary $Summary -Name "repair_exit_code"
+    $repairExitCodeText = [string]$repairExitCode
+    $parsedRepairExitCode = 0
+    if ($null -eq $repairExitCode -or [string]::IsNullOrWhiteSpace($repairExitCodeText) -or -not [int]::TryParse($repairExitCodeText, [ref]$parsedRepairExitCode) -or $parsedRepairExitCode -ne 0) {
+        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "repair_exit_code was not a successful MSI repair exit code: $repairExitCodeText" -Impact "repair evidence must prove service registration recovery"
+        return
+    }
+
+    $repairServiceConfig = Get-SummaryPropertyValue -Summary $Summary -Name "repair_service_config"
+    if ($null -eq $repairServiceConfig) {
+        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "installer summary missing repair_service_config" -Impact "repair evidence did not prove service registration recovery"
+        return
+    }
+
+    $repairDaemonStatus = [string](Get-SummaryPropertyValue -Summary $Summary -Name "repair_daemon_status_output")
+    if ([string]::IsNullOrWhiteSpace($repairDaemonStatus)) {
+        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "installer summary missing repair_daemon_status_output" -Impact "repair evidence did not prove daemon health after service recovery"
+        return
+    }
+
+    Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "passed" -Reason "installer smoke proved MSI-owned service install, repair recovery, running state, and uninstall cleanup"
+}
+
 function Add-NMinusOneMsiUpgradeGate {
     param(
         [object]$Summary,
@@ -341,6 +437,25 @@ function Add-NMinusOneMsiUpgradeGate {
     if ($parsedPreviousInstallExitCode -ne 0) {
         Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "previous MSI install exited $parsedPreviousInstallExitCode" -Impact "N-1 MSI upgrade validation is blocked until the prior installer succeeds before current MSI upgrade"
         return
+    }
+
+    $replacement = Get-SummaryPropertyValue -Summary $Summary -Name "upgrade_payload_replacement"
+    if ($null -eq $replacement) {
+        Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "installer summary missing upgrade_payload_replacement" -Impact "N-1 evidence must prove app and service payload replacement, not only that a prior MSI ran"
+        return
+    }
+
+    foreach ($field in @(
+        "app_payload_replaced",
+        "service_payload_replaced",
+        "current_payload_owned_by_program_files",
+        "current_service_payload_owned_by_program_files",
+        "current_active_service_uses_program_files_payload"
+    )) {
+        if (-not (Test-StrictTrue -Value (Get-ObjectPropertyValue -Object $replacement -Name $field))) {
+            Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "installer summary did not prove $field=true" -Impact "N-1 MSI upgrade evidence must prove app payload and MSI-owned active service payload replacement"
+            return
+        }
     }
 
     Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "passed" -LogPath $upgradedFrom
@@ -481,6 +596,7 @@ else {
 }
 
 Add-ServiceUpdateOwnershipGate -Mode $ServiceUpdateMode
+Add-ServiceLifecycleEvidenceGate -Summary $installerSmokeSummary -Command "scripts/dev/installer-smoke.ps1"
 Add-NMinusOneMsiUpgradeGate -Summary $installerSmokeSummary -Mode $ServiceUpdateMode -Command $nMinusOneMsiCommand
 
 if ($IncludeServiceSmoke) {
