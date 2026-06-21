@@ -829,7 +829,7 @@ impl DashboardApp {
                     "Reset Network"
                 };
                 if ui.button(network_reset_label).on_hover_text(
-                    "Clear paired peers and runtime network state without deleting local identity",
+                    "Clear paired peers and runtime network state without deleting local identity or live discovery results",
                 ).clicked() {
                     if !self.confirm_network_reset_pending {
                         self.confirm_network_reset_pending = true;
