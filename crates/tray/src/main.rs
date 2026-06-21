@@ -1147,6 +1147,11 @@ mod windows_app {
                 "{message}\n\nThe remote pairing service did not respond.\nVerify both trays are updated and retry."
             );
         }
+        if lowered.contains("manual host tcp pairing reachability failed") {
+            return format!(
+                "{message}\n\nThe manually entered host or port could not be reached for TCP pairing. Verify the host, pairing port, trusted Private network profile, VLAN routing, and any firewall rule manually with admin approval. This failed before trust or code validation started."
+            );
+        }
         if lowered.contains("tcp pairing reachability failed") {
             return format!(
                 "{message}\n\nThis machine discovered the peer over mDNS, but none of the listed TCP pairing candidates could be reached. This usually means a firewall, VLAN, or asymmetric route is blocking pairing before trust or code validation starts. Keep manual host fallback available, verify both machines are on a trusted Private network, and add any firewall rule manually with admin approval."
@@ -1249,6 +1254,19 @@ mod windows_app {
             assert!(formatted.contains("TCP pairing candidates"));
             assert!(formatted.contains("before trust or code validation starts"));
             assert!(formatted.contains("manual host fallback"));
+            assert!(should_offer_new_request_retry(&error));
+        }
+
+        #[test]
+        fn format_error_for_dialog_separates_manual_host_reachability() {
+            let error = anyhow::anyhow!(
+                "manual host TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 refused]; the host was entered manually and no mDNS endpoint candidate was used"
+            );
+            let formatted = format_error_for_dialog(&error);
+
+            assert!(formatted.contains("manually entered host or port"));
+            assert!(formatted.contains("before trust or code validation started"));
+            assert!(!formatted.contains("discovered the peer over mDNS"));
             assert!(should_offer_new_request_retry(&error));
         }
 
