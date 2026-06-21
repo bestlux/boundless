@@ -32,6 +32,10 @@ $clipboardLab = Join-Path $repoRoot "scripts/dev/perf-clipboard-lab.ps1"
 if (-not (Test-Path -LiteralPath $clipboardLab)) {
     throw "Missing clipboard lab script: $clipboardLab"
 }
+$fileTransferLab = Join-Path $repoRoot "scripts/dev/perf-file-transfer-lab.ps1"
+if (-not (Test-Path -LiteralPath $fileTransferLab)) {
+    throw "Missing file-transfer lab script: $fileTransferLab"
+}
 
 function Redact-FixtureLogLine {
     param([object]$Value)
@@ -228,6 +232,49 @@ foreach ($row in $policyBoundRows) {
     }
     if ([int64]$row.payload_bytes -le [int64]$row.policy_limit_bytes) {
         throw "image-4k-policy-bound rows must preserve payload_bytes greater than policy_limit_bytes."
+    }
+}
+
+$fileTransferCaseRoot = Join-Path $OutputRoot "file-transfer-lab"
+New-Item -ItemType Directory -Force -Path $fileTransferCaseRoot | Out-Null
+$fileTransferCaptured = & powershell -NoProfile -ExecutionPolicy Bypass -File $fileTransferLab -Mode Validate -OutputRoot $fileTransferCaseRoot *>&1
+$fileTransferExitCode = if ($null -eq $global:LASTEXITCODE) { 0 } else { $global:LASTEXITCODE }
+$fileTransferCaptured | ForEach-Object { Redact-FixtureLogLine $_ } | Set-Content -LiteralPath (Join-Path $fileTransferCaseRoot "file-transfer-lab.log") -Encoding utf8
+if ($fileTransferExitCode -ne 0) {
+    throw "File-transfer lab fixture failed with exit code $fileTransferExitCode; see generated fixture log"
+}
+
+$fileTransferPacketPath = Join-Path $fileTransferCaseRoot "two-machine-evidence.json"
+if (-not (Test-Path -LiteralPath $fileTransferPacketPath)) {
+    throw "File-transfer lab fixture did not produce two-machine-evidence.json."
+}
+$fileTransferPacket = Get-Content -LiteralPath $fileTransferPacketPath -Raw | ConvertFrom-Json
+$fileTransferSummary = @($fileTransferPacket.summary.scenario_summaries | Where-Object { $_.scenario -eq "file-transfer" })[0]
+if ($fileTransferSummary.success_count -ne 18 -or $fileTransferSummary.failure_count -ne 0 -or $fileTransferSummary.skipped_count -ne 6) {
+    throw "File-transfer lab summary did not preserve expected success/failure/skipped counts."
+}
+if ($fileTransferSummary.provisional_classifications.no_op -ne 6) {
+    throw "File-transfer lab did not classify disabled large-file rows as no-op."
+}
+if ($fileTransferSummary.throughput_mbps -le 0) {
+    throw "File-transfer lab summary did not compute throughput."
+}
+if ($fileTransferSummary.setup_latency_ms.p50 -le 0 -or $fileTransferSummary.setup_latency_ms.p95 -le 0 -or $fileTransferSummary.setup_latency_ms.max -le 0) {
+    throw "File-transfer lab summary did not compute setup latency percentiles."
+}
+$fileTransferObservations = @($fileTransferPacket.observations)
+Assert-PacketFieldSet -Observations $fileTransferObservations -PropertyName "direction" -ExpectedValues @("A-to-B", "B-to-A") -Label "file-transfer lab directions"
+Assert-PacketFieldSet -Observations $fileTransferObservations -PropertyName "scenario_variant" -ExpectedValues @("single-small-file", "many-small-files", "medium-100mb", "large-1gb-opt-in") -Label "file-transfer lab scenario variants"
+Assert-PacketFieldSet -Observations $fileTransferObservations -PropertyName "file_count_class" -ExpectedValues @("single-file", "many-small-files", "medium-file", "large-file") -Label "file-transfer lab file-count classes"
+Assert-PacketFieldSet -Observations $fileTransferObservations -PropertyName "integrity_hash_status" -ExpectedValues @("synthetic-match", "not-checked") -Label "file-transfer lab hash statuses"
+Assert-PacketFieldSet -Observations $fileTransferObservations -PropertyName "cleanup_status" -ExpectedValues @("clean", "not-created") -Label "file-transfer lab cleanup statuses"
+$largeRows = @($fileTransferObservations | Where-Object { $_.scenario_variant -eq "large-1gb-opt-in" })
+foreach ($row in $largeRows) {
+    if ($row.status -ne "skipped" -or $row.provisional_classification -ne "no-op" -or [int64]$row.bytes -ne 0L) {
+        throw "File-transfer large-file rows must stay skipped/no-op by default."
+    }
+    if ([int64]$row.payload_bytes -ne (1024L * 1024L * 1024L)) {
+        throw "File-transfer large-file metadata must preserve a 1 GiB payload size."
     }
 }
 

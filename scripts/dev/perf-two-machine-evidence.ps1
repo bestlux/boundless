@@ -303,6 +303,7 @@ function New-Observation {
         [Nullable[double]]$DurationMs,
         [Nullable[int64]]$Bytes,
         [string]$MeasurementSource,
+        [string]$ObservationId = "",
         [string]$FailureKind = "",
         [string]$StartedAtUtc = "",
         [string]$ScenarioVariant = "",
@@ -313,6 +314,17 @@ function New-Observation {
         [Nullable[int64]]$PolicyLimitBytes = $null,
         [string]$PolicyExpected = "",
         [bool]$PayloadSynthetic = $false,
+        [Nullable[double]]$SetupLatencyMs = $null,
+        [string]$IntegrityHashStatus = "",
+        [string]$ExpectedHashLabel = "",
+        [string]$ReceivedHashLabel = "",
+        [string]$PartialFileStatus = "",
+        [string]$ReceivePathClass = "",
+        [string]$CleanupStatus = "",
+        [string]$FileCountClass = "",
+        [Nullable[int]]$FileCount = $null,
+        [Nullable[int]]$RetryCount = $null,
+        [Nullable[int]]$ReconnectCount = $null,
         [string]$ProvisionalClassification = "",
         [string]$ProvisionalClassificationReason = ""
     )
@@ -327,12 +339,28 @@ function New-Observation {
     }
 
     $effectivePayloadBytes = if ($null -ne $PayloadBytes) { $PayloadBytes } elseif ($null -ne $Bytes) { $Bytes } else { $null }
+    $sanitizedObservationId = Redact-Text $ObservationId
+    $sanitizedScenarioVariant = Redact-Text $ScenarioVariant
+    $sanitizedDirection = Redact-Text $Direction
+    $generatedIdParts = @(
+        $RunScenario,
+        $sanitizedScenarioVariant,
+        $sanitizedDirection,
+        $RunRole,
+        [string]$RunIteration
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    $effectiveObservationId = if (-not [string]::IsNullOrWhiteSpace($sanitizedObservationId)) {
+        $sanitizedObservationId
+    }
+    else {
+        $generatedIdParts -join "-"
+    }
 
     return [pscustomobject]@{
-        id = "$RunScenario-$RunRole-$RunIteration"
+        id = $effectiveObservationId
         scenario = $RunScenario
-        scenario_variant = Redact-Text $ScenarioVariant
-        direction = Redact-Text $Direction
+        scenario_variant = $sanitizedScenarioVariant
+        direction = $sanitizedDirection
         iteration = $RunIteration
         role = $RunRole
         status = $Status
@@ -346,6 +374,17 @@ function New-Observation {
         policy_limit_bytes = if ($null -ne $PolicyLimitBytes) { $PolicyLimitBytes } else { $null }
         policy_expected = Redact-Text $PolicyExpected
         payload_synthetic = $PayloadSynthetic
+        setup_latency_ms = if ($null -ne $SetupLatencyMs) { [Math]::Round($SetupLatencyMs, 3) } else { $null }
+        integrity_hash_status = Redact-Text $IntegrityHashStatus
+        expected_hash_label = Redact-Text $ExpectedHashLabel
+        received_hash_label = Redact-Text $ReceivedHashLabel
+        partial_file_status = Redact-Text $PartialFileStatus
+        receive_path_class = Redact-Text $ReceivePathClass
+        cleanup_status = Redact-Text $CleanupStatus
+        file_count_class = Redact-Text $FileCountClass
+        file_count = if ($null -ne $FileCount) { [int]$FileCount } else { $null }
+        retry_count = if ($null -ne $RetryCount) { [int]$RetryCount } else { $null }
+        reconnect_count = if ($null -ne $ReconnectCount) { [int]$ReconnectCount } else { $null }
         throughput_mbps = $throughputMbps
         measurement_source = $MeasurementSource
         failure_kind = Redact-Text $FailureKind
@@ -500,6 +539,10 @@ function Read-ObservationFile {
         $bytes = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "bytes") -Integer
         $payloadBytes = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "payload_bytes") -Integer
         $policyLimitBytes = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "policy_limit_bytes") -Integer
+        $setupLatencyMs = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "setup_latency_ms")
+        $fileCount = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "file_count") -Integer
+        $retryCount = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "retry_count") -Integer
+        $reconnectCount = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "reconnect_count") -Integer
         $observationArgs = @{
             RunScenario = $scenarioName
             RunIteration = [int]$iteration
@@ -509,6 +552,7 @@ function Read-ObservationFile {
             DurationMs = $durationMs
             Bytes = $bytes
             MeasurementSource = "observation-file"
+            ObservationId = Redact-Text (Get-ObjectProperty -Object $source -Name "id")
             FailureKind = Redact-Text (Get-ObjectProperty -Object $source -Name "failure_kind")
             StartedAtUtc = Redact-Text (Get-ObjectProperty -Object $source -Name "started_at_utc")
             ScenarioVariant = Redact-Text (Get-ObjectProperty -Object $source -Name "scenario_variant")
@@ -519,6 +563,17 @@ function Read-ObservationFile {
             PolicyLimitBytes = $policyLimitBytes
             PolicyExpected = Redact-Text (Get-ObjectProperty -Object $source -Name "policy_expected")
             PayloadSynthetic = ConvertTo-ObservationBoolean (Get-ObjectProperty -Object $source -Name "payload_synthetic")
+            SetupLatencyMs = $setupLatencyMs
+            IntegrityHashStatus = Redact-Text (Get-ObjectProperty -Object $source -Name "integrity_hash_status")
+            ExpectedHashLabel = Redact-Text (Get-ObjectProperty -Object $source -Name "expected_hash_label")
+            ReceivedHashLabel = Redact-Text (Get-ObjectProperty -Object $source -Name "received_hash_label")
+            PartialFileStatus = Redact-Text (Get-ObjectProperty -Object $source -Name "partial_file_status")
+            ReceivePathClass = Redact-Text (Get-ObjectProperty -Object $source -Name "receive_path_class")
+            CleanupStatus = Redact-Text (Get-ObjectProperty -Object $source -Name "cleanup_status")
+            FileCountClass = Redact-Text (Get-ObjectProperty -Object $source -Name "file_count_class")
+            FileCount = $fileCount
+            RetryCount = $retryCount
+            ReconnectCount = $reconnectCount
             ProvisionalClassification = Normalize-ProvisionalClassification (Get-ObjectProperty -Object $source -Name "provisional_classification")
             ProvisionalClassificationReason = Redact-Text (Get-ObjectProperty -Object $source -Name "provisional_classification_reason")
         }
@@ -548,6 +603,34 @@ function Get-Percentile {
     return [Math]::Round([double]$sorted[$index], 3)
 }
 
+function Get-ObservationValueCounts {
+    param(
+        [object[]]$Rows,
+        [string]$PropertyName
+    )
+
+    $counts = [ordered]@{}
+    foreach ($row in $Rows) {
+        $property = $row.PSObject.Properties[$PropertyName]
+        if ($null -eq $property) {
+            continue
+        }
+
+        $value = [string]$property.Value
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            continue
+        }
+
+        $key = $value.Replace("-", "_")
+        if (-not $counts.Contains($key)) {
+            $counts[$key] = 0
+        }
+        $counts[$key] += 1
+    }
+
+    return [pscustomobject]$counts
+}
+
 function New-ScenarioSummary {
     param(
         [string]$ScenarioName,
@@ -559,11 +642,20 @@ function New-ScenarioSummary {
     $failed = @($rows | Where-Object { $_.status -eq "failed" })
     $skipped = @($rows | Where-Object { $_.status -eq "skipped" })
     $latencies = @($passed | Where-Object { $null -ne $_.latency_ms } | ForEach-Object { [double]$_.latency_ms })
+    $setupLatencies = @($passed | Where-Object { $null -ne $_.setup_latency_ms } | ForEach-Object { [double]$_.setup_latency_ms })
     $durations = @($passed | Where-Object { $null -ne $_.duration_ms -and $_.duration_ms -gt 0 } | ForEach-Object { [double]$_.duration_ms })
     $bytesTotal = 0L
+    $retryCountTotal = 0
+    $reconnectCountTotal = 0
     foreach ($row in $passed) {
         if ($null -ne $row.bytes) {
             $bytesTotal += [int64]$row.bytes
+        }
+        if ($null -ne $row.retry_count) {
+            $retryCountTotal += [int]$row.retry_count
+        }
+        if ($null -ne $row.reconnect_count) {
+            $reconnectCountTotal += [int]$row.reconnect_count
         }
     }
     $payloadByteValues = @($rows | Where-Object { $null -ne $_.payload_bytes } | ForEach-Object { [int64]$_.payload_bytes })
@@ -596,12 +688,26 @@ function New-ScenarioSummary {
             p95 = Get-Percentile -Values $latencies -Percentile 95
             max = if ($latencies.Count -gt 0) { [Math]::Round([double](@($latencies | Measure-Object -Maximum).Maximum), 3) } else { $null }
         }
+        setup_latency_ms = [pscustomobject]@{
+            p50 = Get-Percentile -Values $setupLatencies -Percentile 50
+            p95 = Get-Percentile -Values $setupLatencies -Percentile 95
+            max = if ($setupLatencies.Count -gt 0) { [Math]::Round([double](@($setupLatencies | Measure-Object -Maximum).Maximum), 3) } else { $null }
+        }
         bytes_total = $bytesTotal
         payload_bytes = [pscustomobject]@{
             min = if ($payloadByteValues.Count -gt 0) { [int64](@($payloadByteValues | Measure-Object -Minimum).Minimum) } else { $null }
             max = if ($payloadByteValues.Count -gt 0) { [int64](@($payloadByteValues | Measure-Object -Maximum).Maximum) } else { $null }
         }
         throughput_mbps = $throughputMbps
+        retry_count_total = $retryCountTotal
+        reconnect_count_total = $reconnectCountTotal
+        directions = @($rows | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.direction) } | ForEach-Object { [string]$_.direction } | Sort-Object -Unique)
+        scenario_variants = @($rows | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.scenario_variant) } | ForEach-Object { [string]$_.scenario_variant } | Sort-Object -Unique)
+        file_count_classes = Get-ObservationValueCounts -Rows $rows -PropertyName "file_count_class"
+        integrity_hash_statuses = Get-ObservationValueCounts -Rows $rows -PropertyName "integrity_hash_status"
+        cleanup_statuses = Get-ObservationValueCounts -Rows $rows -PropertyName "cleanup_status"
+        partial_file_statuses = Get-ObservationValueCounts -Rows $rows -PropertyName "partial_file_status"
+        receive_path_classes = Get-ObservationValueCounts -Rows $rows -PropertyName "receive_path_class"
         provisional_classifications = [pscustomobject]$classificationCounts
     }
 }

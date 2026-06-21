@@ -26,9 +26,21 @@ Validate the clipboard and image clipboard lab scenarios without two machines:
 
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-clipboard-lab.ps1 -Mode Validate
 
+Validate the file-transfer lab scenarios without two machines or large payload writes:
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-file-transfer-lab.ps1 -Mode Validate
+
 Generate deterministic clipboard and image clipboard dry-run artifacts:
 
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-clipboard-lab.ps1 -Mode DryRun -Role coordinator -Iterations 10
+
+Generate deterministic file-transfer dry-run artifacts:
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-file-transfer-lab.ps1 -Mode DryRun -Role coordinator -Iterations 3
+
+Include the 1 GiB large-file row only as an explicit opt-in:
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-file-transfer-lab.ps1 -Mode DryRun -Role coordinator -IncludeLarge
 
 Generate deterministic dry-run artifacts:
 
@@ -46,6 +58,8 @@ Summarize sanitized observations collected by a later lab driver:
 Observation files may be a JSON array or a packet with an observations array. The harness imports the core fields scenario, iteration, role, status, started_at_utc, latency_ms, duration_ms, bytes, and failure_kind. Unrecognized fields are ignored so raw peer IDs, local paths, endpoints, or payload text are not copied into artifacts.
 
 The harness also preserves optional sanitized scenario metadata when present: scenario_variant, direction, payload_kind, payload_label, payload_bytes, policy_limit_bytes, policy_expected, payload_synthetic, provisional_classification, and provisional_classification_reason. These fields are intended for lab scenario definitions and must remain metadata only, never raw clipboard text, image bytes, file names, local paths, peer IDs, endpoints, or machine IDs.
+
+File-transfer observations may also include setup_latency_ms, integrity_hash_status, expected_hash_label, received_hash_label, partial_file_status, receive_path_class, cleanup_status, file_count_class, file_count, retry_count, and reconnect_count. These fields must use sanitized labels and classes only. Do not store user file contents, private file names, raw hashes from private files, full local paths, peer IDs, trust secrets, endpoints, or machine IDs.
 
 ## Artifact Contract
 
@@ -71,6 +85,8 @@ Scenario summaries use nearest-rank percentiles over successful latency rows:
 | failure_count | rows with status = failed |
 
 Clipboard lab summaries also include payload byte min/max and provisional classification counts. The only accepted provisional classifications are no-op, acceptable, warning, and fail. They are labels for organizing lab artifacts before real measurements; they are not product guarantees or release thresholds.
+
+File-transfer summaries also preserve setup latency percentiles, retry/reconnect totals, direction and variant labels, file-count classes, integrity/hash status counts, cleanup status counts, partial-file status counts, and receive-path class counts when represented by observations.
 
 ## Clipboard And Image Clipboard Lab
 
@@ -114,6 +130,56 @@ Interpretation remains provisional until real two-PC evidence exists:
 - fail: failed scenario row or measured result outside the provisional working band
 
 Use measured p50, p95, max, success/failure/skipped counts, payload bytes, and transport notes to decide the next optimization. Do not claim BND-NEXT-9C readiness, Mouse Without Borders parity, secure desktop, lock-screen, UAC, or elevated-app parity from this clipboard lab.
+
+## File Transfer Lab
+
+The script scripts/dev/perf-file-transfer-lab.ps1 is the BND-NEXT-15 prep slice. It does not read user files, copy user file contents, create large payloads by default, invoke the daemon transfer path, pair devices, reset trust, change firewall rules, or install/uninstall software. It emits metadata-only synthetic observations, then feeds those observations into scripts/dev/perf-two-machine-evidence.ps1 so the JSON and Markdown artifacts match the shared two-machine evidence shape.
+
+Default behavior:
+
+- directions: A-to-B and B-to-A
+- iterations: 3 per preset and direction
+- enabled presets: single small file, many small files, and medium 100 MiB metadata-only row
+- disabled preset: large 1 GiB row as skipped/no-op metadata unless -IncludeLarge is supplied
+- privacy: payload_synthetic=true, payload_contents_recorded=false, and no raw file contents, private file names, local paths, peer IDs, endpoints, trust secrets, or machine IDs in artifacts
+
+Current file-transfer lab presets:
+
+| preset | represented payload | file count class | default behavior |
+| --- | ---: | --- | --- |
+| single-small-file | 4 KiB | single-file | passed synthetic metadata |
+| many-small-files | 128 x 4 KiB | many-small-files | passed synthetic metadata |
+| medium-100mb | 100 MiB | medium-file | passed metadata-only fixture row; no 100 MiB artifact is written |
+| large-1gb-opt-in | 1 GiB | large-file | skipped no-op unless -IncludeLarge is supplied |
+
+The 1 GiB row is intentionally opt-in. Do not remove that guard or convert fixture mode into default large payload generation.
+
+For the later real two-PC lab, use disposable synthetic files whose names do not include private project/customer/user information. Record only sanitized observation rows, then summarize them:
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-two-machine-evidence.ps1 -Mode Capture -Role coordinator -HostLabel pc-a
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-two-machine-evidence.ps1 -Mode Capture -Role peer -HostLabel pc-b
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-two-machine-evidence.ps1 -Mode Summarize -Role coordinator -Scenario file-transfer -ObservationPath .\artifacts\performance\file-transfer-lab\observations.json -ReleaseEvidence
+
+Real lab observation rows should include scenario=file-transfer, scenario_variant, direction, iteration, role, status, setup_latency_ms, latency_ms or duration_ms for end-to-end duration, bytes, throughput source data, payload_kind, payload_label, payload_bytes, payload_synthetic=true, file_count_class, file_count, integrity_hash_status, expected_hash_label, received_hash_label, partial_file_status, receive_path_class, cleanup_status, retry_count, reconnect_count, provisional_classification, and failure_kind when applicable.
+
+Hash and integrity requirements for the real lab:
+
+- compute the expected SHA-256 over the synthetic source payload on the sending PC
+- compute the received SHA-256 over the final received payload on the receiving PC
+- mark integrity_hash_status=matched only when the received hash matches the expected hash
+- mark failed rows with failure_kind=hash-mismatch when hashes differ
+- mark failed rows with partial_file_status=partial-present when a partial received file remains
+- mark failed rows with receive_path_class=unexpected-local-path if the received payload lands outside the designated lab receive root
+- mark cleanup_status=stale-temp-detected if temp or .part files remain after cleanup
+
+Interpretation remains provisional until real two-PC evidence exists:
+
+- no-op: skipped by design, opt-in-only, or metadata-only row
+- acceptable: completed within the lab's provisional working band
+- warning: completed but deserves follow-up before release claims
+- fail: failed scenario row, hash mismatch, partial-file status, unexpected receive path, stale temp cleanup, or measured result outside the provisional working band
+
+Use measured p50, p95, max, throughput, setup latency, success/failure/skipped counts, payload bytes, file-count class, direction, retry/reconnect notes, hash status, receive-path class, and cleanup status to decide the next optimization. Do not claim BND-NEXT-9C readiness, Mouse Without Borders parity, secure desktop, lock-screen, UAC, or elevated-app parity from this file-transfer lab.
 
 ## Evidence Boundary
 
