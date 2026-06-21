@@ -127,6 +127,39 @@ pub fn named_pipe_incoming_for_allowed_user(
     Ok(NamedPipeIncoming { receiver })
 }
 
+pub fn validate_allowed_user_sid_shape(allowed_user_sid: &str) -> bool {
+    let sid = allowed_user_sid.trim();
+    if sid != allowed_user_sid || sid.is_empty() {
+        return false;
+    }
+
+    let mut parts = sid.split('-');
+    if parts.next() != Some("S") || parts.next() != Some("1") {
+        return false;
+    }
+
+    let Some(identifier_authority) = parts.next() else {
+        return false;
+    };
+    if identifier_authority.is_empty()
+        || !identifier_authority
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+
+    let mut sub_authority_count = 0;
+    for part in parts {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        sub_authority_count += 1;
+    }
+
+    sub_authority_count > 0
+}
+
 #[cfg(windows)]
 pub fn current_user_sid_string() -> io::Result<String> {
     let mut token: HANDLE = std::ptr::null_mut();
@@ -162,15 +195,16 @@ pub fn current_user_sid_string() -> io::Result<String> {
 
 #[cfg(windows)]
 pub fn control_pipe_sddl_for_allowed_user(allowed_user_sid: &str) -> io::Result<String> {
-    let sid = allowed_user_sid.trim();
-    if !sid.starts_with("S-1-") || sid.contains(';') || sid.contains(')') || sid.contains('(') {
+    if !validate_allowed_user_sid_shape(allowed_user_sid) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "allowed user SID must be a valid SID string",
         ));
     }
 
-    Ok(format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})"))
+    Ok(format!(
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{allowed_user_sid})"
+    ))
 }
 
 #[cfg(windows)]
@@ -524,6 +558,33 @@ mod tests {
     }
 
     #[test]
+    fn allowed_user_sid_shape_accepts_numeric_sid() {
+        assert!(validate_allowed_user_sid_shape("S-1-5-21-1-2-3-1001"));
+        assert!(validate_allowed_user_sid_shape("S-1-5-18"));
+    }
+
+    #[test]
+    fn allowed_user_sid_shape_rejects_malformed_values() {
+        for sid in [
+            "",
+            " S-1-5-21-1",
+            "S-1-5-21-1 ",
+            "S-1-not-a-sid",
+            "S-1-5-21-1);(A;;GA;;;WD",
+            "S-1-5--21",
+            "S-1-5-21-",
+            "S-1-5-21-abc",
+            "S-2-5-21-1",
+            "S-1-5",
+        ] {
+            assert!(
+                !validate_allowed_user_sid_shape(sid),
+                "expected invalid SID shape to be rejected: {sid}"
+            );
+        }
+    }
+
+    #[test]
     #[cfg(windows)]
     fn control_pipe_sddl_allows_only_system_admins_and_expected_user() {
         let sddl = control_pipe_sddl_for_allowed_user("S-1-5-21-1-2-3-1001").expect("sddl");
@@ -538,6 +599,13 @@ mod tests {
     fn control_pipe_sddl_rejects_sddl_injection() {
         let err =
             control_pipe_sddl_for_allowed_user("S-1-5-21-1);(A;;GA;;;WD").expect_err("must reject");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn control_pipe_sddl_rejects_non_numeric_sid_shape() {
+        let err = control_pipe_sddl_for_allowed_user("S-1-not-a-sid").expect_err("must reject");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

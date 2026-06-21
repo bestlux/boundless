@@ -46,6 +46,31 @@ function Set-MsiSingleRow {
     }
 }
 
+function Get-MsiColumnValues {
+    param(
+        [__ComObject]$Database,
+        [string]$Sql,
+        [int]$Column
+    )
+
+    $view = $Database.OpenView($Sql)
+    try {
+        $view.Execute()
+        $values = @()
+        while ($true) {
+            $record = $view.Fetch()
+            if ($null -eq $record) {
+                break
+            }
+            $values += $record.StringData($Column)
+        }
+        return $values
+    }
+    finally {
+        $view.Close()
+    }
+}
+
 function Assert-Equals {
     param(
         [string]$Actual,
@@ -58,6 +83,45 @@ function Assert-Equals {
     }
 }
 
+function Test-AllowedUserSidShape {
+    param([string]$Sid)
+
+    return $Sid -cmatch '^S-1-\d+(?:-\d+)+$'
+}
+
+function Assert-AllowedUserSidShapeExamples {
+    if (-not (Test-AllowedUserSidShape -Sid "S-1-5-21-1-2-3-1001")) {
+        throw "SID shape validator rejected a valid user SID example."
+    }
+    foreach ($sid in @(
+        "",
+        " S-1-5-21-1",
+        "S-1-5-21-1 ",
+        "S-1-not-a-sid",
+        "S-1-5--21",
+        "S-1-5-21-",
+        "S-1-5-21-abc",
+        "S-1-5-21-1);(A;;GA;;;WD",
+        "S-2-5-21-1"
+    )) {
+        if (Test-AllowedUserSidShape -Sid $sid) {
+            throw "SID shape validator accepted malformed example: $sid"
+        }
+    }
+}
+
+function Assert-LaunchConditionContains {
+    param(
+        [string[]]$Conditions,
+        [string]$Needle
+    )
+
+    $match = $Conditions | Where-Object { $_ -like "*$Needle*" } | Select-Object -First 1
+    if ($null -eq $match) {
+        throw "LaunchCondition table did not contain expected SID validation fragment: $Needle"
+    }
+}
+
 $InstallerPath = (Resolve-Path -LiteralPath $InstallerPath).Path
 $installer = New-Object -ComObject WindowsInstaller.Installer
 $database = $installer.OpenDatabase($InstallerPath, 0)
@@ -67,6 +131,15 @@ $secureCustomProperties = [string]@($secureRow)[1]
 if (($secureCustomProperties -split ';') -notcontains "BOUNDLESS_ALLOWED_USER_SID") {
     throw "SecureCustomProperties does not include BOUNDLESS_ALLOWED_USER_SID. Value=$secureCustomProperties"
 }
+
+Assert-AllowedUserSidShapeExamples
+$launchConditions = Get-MsiColumnValues -Database $database -Sql "SELECT Condition FROM LaunchCondition" -Column 1
+Assert-LaunchConditionContains -Conditions $launchConditions -Needle 'BOUNDLESS_ALLOWED_USER_SID << "S-1-"'
+Assert-LaunchConditionContains -Conditions $launchConditions -Needle 'BOUNDLESS_ALLOWED_USER_SID >< " "'
+Assert-LaunchConditionContains -Conditions $launchConditions -Needle 'BOUNDLESS_ALLOWED_USER_SID >< "--"'
+Assert-LaunchConditionContains -Conditions $launchConditions -Needle 'BOUNDLESS_ALLOWED_USER_SID >> "-"'
+Assert-LaunchConditionContains -Conditions $launchConditions -Needle 'BOUNDLESS_ALLOWED_USER_SID >< "n"'
+Assert-LaunchConditionContains -Conditions $launchConditions -Needle 'BOUNDLESS_ALLOWED_USER_SID >< "-S"'
 
 Set-MsiSingleRow -Database $database -Sql "SELECT Name, DisplayName, ServiceType, StartType, ErrorControl, StartName, Arguments, Component_, Description FROM ServiceInstall WHERE ServiceInstall = 'BoundlessServiceInstall'" -ColumnCount 9 -Label "ServiceInstall" -VariableName "serviceInstall"
 Assert-Equals -Actual $serviceInstall[0] -Expected "BoundlessService" -Label "ServiceInstall.Name"
@@ -115,6 +188,8 @@ $summary = [ordered]@{
     service_control_event = [int]$serviceControl[1]
     service_binary_file = $file[0]
     install_directory_parent = $installDir[0]
+    invalid_sid_examples_rejected = $true
+    sid_launch_condition_count = @($launchConditions | Where-Object { $_ -like "*BOUNDLESS_ALLOWED_USER_SID*" }).Count
     status = "passed"
 }
 

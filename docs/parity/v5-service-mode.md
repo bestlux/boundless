@@ -21,9 +21,9 @@ boundlessctl service stop
 boundlessctl service uninstall
 ```
 
-`install` defaults to a `boundless-service.exe` next to the running `boundlessctl.exe`, but it refuses user-writable source locations such as `%LocalAppData%`, `%AppData%`, `%TEMP%`, and Downloads. The machine-wide MSI now lays down an admin-protected payload under `%ProgramFiles%\Boundless`; MSI-owned service registration and autostart remain future work.
+`install` defaults to a `boundless-service.exe` next to the running `boundlessctl.exe`, but it refuses user-writable source locations such as `%LocalAppData%`, `%AppData%`, `%TEMP%`, and Downloads. The machine-wide MSI is the primary path: it lays down the admin-protected payload under `%ProgramFiles%\Boundless`, registers `BoundlessService`, and sets AutoStart using an explicit `BOUNDLESS_ALLOWED_USER_SID`.
 
-During installation, `boundlessctl` resolves the installing Windows user's SID and passes it to the service. The service hosts the control pipe with an explicit ACL for `SYSTEM`, local Administrators, and that installing user.
+During manual CLI fallback installation, `boundlessctl` resolves the installing Windows user's SID and passes it to the service. During MSI installation, the secure `BOUNDLESS_ALLOWED_USER_SID` property supplies the selected desktop user SID. In both paths, the service validates the SID shape before reporting `Running` and hosts the control pipe with an explicit ACL for `SYSTEM`, local Administrators, and that selected user.
 
 These commands require Windows and administrative permission where SCM requires it. Non-Windows builds report service mode as unsupported.
 
@@ -49,9 +49,9 @@ The v5 readiness packet must classify elevated-app and lock-screen behavior as:
 
 ## Packaging
 
-The Windows packaging manifest, WiX payload, package script, and release signing list include `boundless-service.exe`. The service is not silently registered or started by the machine-wide MSI; service installation remains an explicit admin action until the installer owns a reviewed elevated/service option.
+The Windows packaging manifest, WiX payload, package script, and release signing list include `boundless-service.exe`. The machine-wide MSI owns `BoundlessService` registration, AutoStart, stop/start lifecycle, and uninstall removal from the MSI-owned Program Files payload.
 
-Installer smoke asserts the service payload/signature, service-host version output, and that uninstall leaves no registered Boundless service. The separate service smoke harness proves install/start/status/daemon-health/stop/uninstall when `release-readiness.ps1 -IncludeServiceSmoke` is run from an elevated Windows shell.
+Installer smoke asserts the service payload/signature, service-host version output, registered service path, AutoStart config, selected SID argument, daemon health, and that uninstall leaves no registered Boundless service when run from an elevated Windows shell. The separate service smoke harness remains a manual/developer fallback for the CLI service path.
 
 ## Current Validation Evidence
 
@@ -67,4 +67,4 @@ Milestone V5-3 added:
 - source-path rejection so a LocalSystem service is not registered from a user-writable per-user install directory,
 - compile-time validation of the service host and CLI surface.
 
-Runtime validation still needs an elevated Windows service smoke pass before the matrix row can move beyond `cli-ready`. Elevated-app and lock-screen behavior remain separately gated by Windows runtime evidence.
+Runtime validation still needs elevated Windows install/repair/N-1 evidence before release signoff. Elevated-app and lock-screen behavior remain separately gated by Windows runtime evidence.

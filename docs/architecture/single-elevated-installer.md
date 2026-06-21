@@ -1,6 +1,6 @@
 # Single Elevated Installer Spike
 
-Status: BND-NEXT-9B-2 machine-wide installer skeleton.
+Status: BND-NEXT-9B-3 MSI-owned service lifecycle.
 
 This records the first implementation slice for the Windows one-install,
 full-capability path. It is intentionally not a complete service-mode release
@@ -23,35 +23,41 @@ admin-owned service binary, which is the state BND-NEXT-9B is meant to remove.
 
 ## Current Evidence
 
-`packaging/windows/installer/Package.wxs` now has the 9B-2 machine-wide
-skeleton:
+`packaging/windows/installer/Package.wxs` now has the 9B-3 machine-wide
+service lifecycle path:
 
 - `Scope="perMachine"`.
 - `INSTALLDIR` is under `ProgramFiles64Folder\Boundless`.
-- `boundless-service.exe` is included as payload, but no `ServiceInstall` or
-  `ServiceControl` owns `BoundlessService`.
+- `boundless-service.exe` is in its own component and is registered by
+  `ServiceInstall` as `BoundlessService`.
+- `ServiceControl` starts the service on install, stops it around
+  install/uninstall lifecycle actions, and removes it on uninstall.
+- `BOUNDLESS_ALLOWED_USER_SID` is a secure public MSI property and install/repair
+  fail closed when it is missing or malformed.
 - Tray startup is deferred; the skeleton does not create a Startup-folder
   shortcut because selected desktop-user ownership is unresolved.
 - Component key paths and installer evidence are under HKLM.
 
-`scripts/dev/installer-smoke.ps1` is aligned with the 9B-2 skeleton:
+`scripts/dev/installer-smoke.ps1` is aligned with the 9B-3 service lifecycle:
 
 - install root is `%ProgramFiles%\Boundless`;
 - HKLM uninstall and `HKLM\Software\Boundless\Installer` evidence are
   validated;
-- uninstall is expected to leave no registered `BoundlessService`;
-- service payload version evidence is collected, but service registration is
-  explicitly outside the installer smoke.
+- install is expected to register and start `BoundlessService` from
+  `%ProgramFiles%\Boundless\boundless-service.exe`;
+- service path, LocalSystem account, AutoStart, selected SID argument, daemon
+  API health, and uninstall removal are validated when the smoke runs elevated.
 
-`scripts/dev/service-smoke.ps1` validates a separate admin workflow:
+`scripts/dev/service-smoke.ps1` remains a manual/developer fallback workflow:
 
 - copies `boundless-service.exe` into `%ProgramFiles%\Boundless`;
 - installs `BoundlessService` with the CLI;
 - validates start/status/daemon API health/stop/uninstall.
 
-`docs/user/service-mode.md` and `docs/release/v5-release-hardening.md` honestly
-record the present limit: service mode remains admin/CLI-owned, but the packaged
-service binary is now MSI-owned under Program Files.
+`docs/user/service-mode.md` and `docs/release/v5-release-hardening.md` record
+the present limit: service lifecycle is MSI-owned, while tray sign-in startup,
+automatic intended-user SID selection, deeper N-1/repair evidence, and
+lock-screen/elevated-app parity remain follow-up work.
 
 ## Target Installer Shape
 
@@ -73,8 +79,9 @@ The full-capability MSI should:
 
 ## WiX Delta
 
-9B-2 applied the package scope, directory, payload split, and HKLM evidence
-parts of the WiX delta. The service lifecycle elements remain deferred to 9B-3.
+9B-2 applied the package scope, directory, payload split, and HKLM evidence.
+9B-3 adds MSI-owned `ServiceInstall`/`ServiceControl` rows for
+`BoundlessService`.
 
 Applied package and directory changes:
 
@@ -88,11 +95,14 @@ Applied package and directory changes:
 </StandardDirectory>
 ```
 
-Applied component split:
+Applied component split and service lifecycle:
 
 - `boundless-service.exe` is in its own component;
-- the service executable file is `KeyPath="yes"` so 9B-3 can register the
-  service against the MSI-owned Program Files file;
+- the service executable file is `KeyPath="yes"` so SCM registration resolves
+  to the MSI-owned Program Files file;
+- `BoundlessService` is LocalSystem, AutoStart, and receives exactly one
+  `--allowed-user-sid=[BOUNDLESS_ALLOWED_USER_SID]` argument;
+- `ServiceControl` owns start, stop, and removal for the service component;
 - machine-wide key paths moved to HKLM instead of HKCU;
 - tray/daemon/CLI payloads remain in a separate payload component.
 
@@ -103,7 +113,7 @@ HKLM component key paths and no Startup shortcut. Installer smoke and MSI table
 inspection both keep Startup shortcut creation as a negative assertion until
 selected-user tray startup is implemented separately.
 
-Service registration skeleton:
+Applied service registration:
 
 ```xml
 <Property Id="BOUNDLESS_ALLOWED_USER_SID" Secure="yes" />
@@ -168,28 +178,25 @@ service ACL authorizes only one user SID.
 
 ## Allowed User SID
 
-The blocker for a direct `Package.wxs` conversion is not service registration;
-it is safely identifying the intended desktop user from an elevated install.
+The remaining installer-design blocker is safely identifying the intended
+desktop user from an elevated install without user-supplied MSI properties.
 
-9B-2 should add one explicit SID resolution path:
+9B-3 uses an explicit SID property path:
 
-- if the installer is launched elevated by the same interactive user, set
-  `BOUNDLESS_ALLOWED_USER_SID` from that user's token;
-- if UAC elevation switches to another admin account, fail closed with a clear
-  message or require an explicit MSI property such as
-  `BOUNDLESS_ALLOWED_USER_SID=S-...`;
-- any explicit `BOUNDLESS_ALLOWED_USER_SID` fallback must be a secure public MSI
-  property and survive into the elevated execute context;
-- record the selected SID in installer-smoke evidence without logging unrelated
-  local identities.
+- installers must pass a numeric SID-shaped `BOUNDLESS_ALLOWED_USER_SID=S-...`;
+- the property is secure and survives into the elevated execute context;
+- MSI launch conditions reject missing and obviously malformed SID values;
+- service runtime validates the same SID shape before reporting `Running`;
+- installer-smoke records the selected SID without logging unrelated local
+  identities.
 
 The MSI must not silently authorize the elevation account when it differs from
 the intended desktop user.
 
 ## Validation Plan
 
-9B-2 should introduce a machine-wide skeleton without service registration
-first, then validate:
+9B-2 introduced a machine-wide skeleton without service registration and
+validated:
 
 - `dotnet build packaging/windows/installer/Boundless.Installer.wixproj`;
 - install root under `%ProgramFiles%\Boundless`;
@@ -197,7 +204,7 @@ first, then validate:
 - tray/daemon/CLI/service payload presence;
 - uninstall removes the Program Files install root.
 
-9B-3 should enable service ownership, then validate from an elevated shell:
+9B-3 enables service ownership and should validate from an elevated shell:
 
 - install registers `BoundlessService`;
 - service image path is `%ProgramFiles%\Boundless\boundless-service.exe`;
