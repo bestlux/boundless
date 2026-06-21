@@ -290,10 +290,20 @@ function Get-ServicePathNameParts {
     }
 
     if ($trimmed.StartsWith($ExpectedServiceBinaryPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $remainder = $trimmed.Substring($ExpectedServiceBinaryPath.Length)
+        if ($remainder.Length -gt 0 -and -not [char]::IsWhiteSpace($remainder[0])) {
+            return [pscustomobject]@{
+                ok = $false
+                executable = ""
+                arguments = ""
+                reason = "unquoted PathName had extra characters after the expected service executable path"
+            }
+        }
+
         return [pscustomobject]@{
             ok = $true
             executable = $ExpectedServiceBinaryPath
-            arguments = $trimmed.Substring($ExpectedServiceBinaryPath.Length).Trim()
+            arguments = $remainder.Trim()
             reason = ""
         }
     }
