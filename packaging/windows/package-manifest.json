@@ -5,8 +5,8 @@
   "version": "5.0.0",
   "generated_at_utc": "",
   "package_name": "",
-  "default_install_root": "%LocalAppData%\\Programs\\Boundless",
-  "startup_shortcut_name": "Boundless.lnk",
+  "default_install_root": "%ProgramFiles%\\Boundless",
+  "startup_shortcut_name": "",
   "executables": {
     "tray": "boundlesstray.exe",
     "daemon": "boundlessd.exe",

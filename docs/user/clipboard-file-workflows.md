@@ -18,7 +18,7 @@ Supported v5 surfaces:
 CLI fallback:
 
 ```powershell
-$BoundlessCtl = "$env:LOCALAPPDATA\Programs\Boundless\boundlessctl.exe"
+$BoundlessCtl = "$env:ProgramFiles\Boundless\boundlessctl.exe"
 & $BoundlessCtl transport send-file <peer_id> <path>
 & $BoundlessCtl transport events --limit 100
 ```

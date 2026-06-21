@@ -100,7 +100,7 @@ Profiles:
 ./scripts/dev/test-suite.ps1 -Profile recovery -EndpointA http://127.0.0.1:50051 -EndpointB http://192.0.2.10:50051
 ```
 
-Default validation is unit-focused. Runtime smoke profiles are diagnostics for changes that touch daemon process orchestration, transport reconnect behavior, clipboard runtime delivery, input handoff, or multi-node topology. Release publishing still runs installer validation for MSI install/startup/uninstall behavior.
+Default validation is unit-focused. Runtime smoke profiles are diagnostics for changes that touch daemon process orchestration, transport reconnect behavior, clipboard runtime delivery, input handoff, or multi-node topology. Release publishing still runs installer validation for MSI install/shortcut/uninstall behavior.
 
 `-Profile trace` now also exports matrix artifacts beside the trace log by default:
 - `<trace>.matrix.csv`
@@ -243,10 +243,10 @@ Release signing policy:
 - If signing material is configured while `WINDOWS_SIGN_REQUIRED` is unset, the workflow still signs available Windows artifacts without making signing a release gate.
 
 Install behavior:
-- default per-user install root: `%LocalAppData%\Programs\Boundless`
-- Startup shortcut: `%AppData%\Microsoft\Windows\Start Menu\Programs\Startup\Boundless.lnk`
-- Start Menu shortcut: `%AppData%\Microsoft\Windows\Start Menu\Programs\Boundless.lnk`
-- Desktop shortcut: `%UserProfile%\Desktop\Boundless.lnk`
+- default machine-wide install root: `%ProgramFiles%\Boundless`
+- Startup shortcut: deferred for the machine-wide installer; launch from Start Menu, desktop shortcut, or `boundlesstray.exe`
+- Start Menu shortcut: `%ProgramData%\Microsoft\Windows\Start Menu\Programs\Boundless.lnk`
+- Desktop shortcut: `%Public%\Desktop\Boundless.lnk`
 - installed shortcuts and ARP metadata use the packaged Boundless icon asset
 - tray launch is the primary entrypoint and auto-starts `boundlessd` when needed
 - first MSI releases intentionally block over legacy script-installed layouts; remove the old script-based install before running the MSI
@@ -254,8 +254,8 @@ Install behavior:
 Recovery helpers:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Boundless\Boundless-Reset.ps1" -NetworkOnly
-powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Boundless\Boundless-Reset.ps1" -All
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:ProgramFiles\Boundless\Boundless-Reset.ps1" -NetworkOnly
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:ProgramFiles\Boundless\Boundless-Reset.ps1" -All
 Start-Process msiexec.exe -Wait -ArgumentList @(
   '/x',
   (Resolve-Path .\artifacts\package-validation\Boundless-1.0.0-local-windows-x64.msi),

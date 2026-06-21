@@ -3,8 +3,8 @@
 Start every support case by capturing current state instead of guessing from UI symptoms.
 
 ```powershell
-$BoundlessCtl = "$env:LOCALAPPDATA\Programs\Boundless\boundlessctl.exe"
-$BoundlessDaemon = "$env:LOCALAPPDATA\Programs\Boundless\boundlessd.exe"
+$BoundlessCtl = "$env:ProgramFiles\Boundless\boundlessctl.exe"
+$BoundlessDaemon = "$env:ProgramFiles\Boundless\boundlessd.exe"
 & $BoundlessCtl daemon status
 & $BoundlessCtl diagnostics dump
 ```
@@ -87,7 +87,7 @@ Checks:
 & $BoundlessCtl daemon status
 ```
 
-Service mode is not silently installed by the per-user MSI. Install it only from an elevated shell and an admin-protected `boundless-service.exe` path. The service control pipe is ACL'd to `SYSTEM`, Administrators, and the installing user.
+Service mode is not silently registered or started by the machine-wide MSI. Install it only from an elevated shell and the admin-protected `%ProgramFiles%\Boundless\boundless-service.exe` path. The service control pipe is ACL'd to `SYSTEM`, Administrators, and the installing user.
 
 If the service is running but the CLI cannot connect, stop the normal tray and per-user daemon first so only one process owns the named pipe. Elevated-app and lock-screen claims remain deferred until Windows runtime evidence proves them.
 

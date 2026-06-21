@@ -6,7 +6,7 @@
     <ProductVersion>0.0.0</ProductVersion>
     <PayloadDir>$(MSBuildThisFileDirectory)..\stage</PayloadDir>
     <DefineConstants>PayloadDir=$(PayloadDir);ProductVersion=$(ProductVersion)</DefineConstants>
-    <SuppressIces>ICE64;ICE91</SuppressIces>
+    <SuppressIces>ICE43;ICE57;ICE64;ICE91</SuppressIces>
   </PropertyGroup>
 
   <ItemGroup>

@@ -7,7 +7,7 @@ This guide covers migration from Boundless v4 and from Mouse Without Borders.
 1. Capture current state:
 
    ```powershell
-   $BoundlessCtl = "$env:LOCALAPPDATA\Programs\Boundless\boundlessctl.exe"
+   $BoundlessCtl = "$env:ProgramFiles\Boundless\boundlessctl.exe"
    & $BoundlessCtl daemon status
    & $BoundlessCtl diagnostics dump
    ```
@@ -20,8 +20,8 @@ This guide covers migration from Boundless v4 and from Mouse Without Borders.
 7. Run the reset helper only when you intentionally want to clear local state:
 
    ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Boundless\Boundless-Reset.ps1" -NetworkOnly
-   powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Boundless\Boundless-Reset.ps1" -All
+   powershell -NoProfile -ExecutionPolicy Bypass -File "$env:ProgramFiles\Boundless\Boundless-Reset.ps1" -NetworkOnly
+   powershell -NoProfile -ExecutionPolicy Bypass -File "$env:ProgramFiles\Boundless\Boundless-Reset.ps1" -All
    ```
 
 Release validation for upgrade-while-running requires:

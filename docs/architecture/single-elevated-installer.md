@@ -1,10 +1,10 @@
 # Single Elevated Installer Spike
 
-Status: BND-NEXT-9B-1 spike plan.
+Status: BND-NEXT-9B-2 machine-wide installer skeleton.
 
 This records the first implementation slice for the Windows one-install,
-full-capability path. It is intentionally not a release claim and does not
-change the shipping MSI yet.
+full-capability path. It is intentionally not a complete service-mode release
+claim.
 
 ## Decision
 
@@ -23,19 +23,22 @@ admin-owned service binary, which is the state BND-NEXT-9B is meant to remove.
 
 ## Current Evidence
 
-`packaging/windows/installer/Package.wxs` is a per-user package:
+`packaging/windows/installer/Package.wxs` now has the 9B-2 machine-wide
+skeleton:
 
-- `Scope="perUser"`.
-- `INSTALLDIR` is under `LocalAppDataFolder\Programs\Boundless`.
+- `Scope="perMachine"`.
+- `INSTALLDIR` is under `ProgramFiles64Folder\Boundless`.
 - `boundless-service.exe` is included as payload, but no `ServiceInstall` or
   `ServiceControl` owns `BoundlessService`.
-- Tray startup is a shortcut in `StartupFolder`.
-- Component key paths are HKCU registry values, which match the current per-user
-  install but not a machine-wide service-owning package.
+- Tray startup is deferred; the skeleton does not create a Startup-folder
+  shortcut because selected desktop-user ownership is unresolved.
+- Component key paths and installer evidence are under HKLM.
 
-`scripts/dev/installer-smoke.ps1` is aligned with that current shape:
+`scripts/dev/installer-smoke.ps1` is aligned with the 9B-2 skeleton:
 
-- install root is `%LocalAppData%\Programs\Boundless`;
+- install root is `%ProgramFiles%\Boundless`;
+- HKLM uninstall and `HKLM\Software\Boundless\Installer` evidence are
+  validated;
 - uninstall is expected to leave no registered `BoundlessService`;
 - service payload version evidence is collected, but service registration is
   explicitly outside the installer smoke.
@@ -47,9 +50,8 @@ admin-owned service binary, which is the state BND-NEXT-9B is meant to remove.
 - validates start/status/daemon API health/stop/uninstall.
 
 `docs/user/service-mode.md` and `docs/release/v5-release-hardening.md` honestly
-record the present limit: service mode is admin/CLI-owned, MSI-owned payload
-updates are supported, and the active admin-registered service binary is not yet
-owned by the installer.
+record the present limit: service mode remains admin/CLI-owned, but the packaged
+service binary is now MSI-owned under Program Files.
 
 ## Target Installer Shape
 
@@ -71,11 +73,10 @@ The full-capability MSI should:
 
 ## WiX Delta
 
-The production `Package.wxs` should not be mutated directly until 9B-2 because
-the following changes are coupled and would invalidate the existing installer
-smoke in one step.
+9B-2 applied the package scope, directory, payload split, and HKLM evidence
+parts of the WiX delta. The service lifecycle elements remain deferred to 9B-3.
 
-Required package and directory changes:
+Applied package and directory changes:
 
 ```xml
 <Package ... Scope="perMachine" InstallerVersion="500" Compressed="yes">
@@ -87,14 +88,13 @@ Required package and directory changes:
 </StandardDirectory>
 ```
 
-Required component split:
+Applied component split:
 
-- put `boundless-service.exe` in its own component;
-- mark the service executable file as `KeyPath="yes"` so the registered service
-  image path points at the MSI-owned Program Files file;
-- move machine-wide key paths to HKLM instead of HKCU;
-- keep tray/daemon/CLI payloads in separate components or component groups if
-  needed for repair and future feature ownership.
+- `boundless-service.exe` is in its own component;
+- the service executable file is `KeyPath="yes"` so 9B-3 can register the
+  service against the MSI-owned Program Files file;
+- machine-wide key paths moved to HKLM instead of HKCU;
+- tray/daemon/CLI payloads remain in a separate payload component.
 
 Service registration skeleton:
 

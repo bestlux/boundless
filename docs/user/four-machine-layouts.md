@@ -15,7 +15,7 @@ Boundless v5 is designed to exceed the old one-row/two-by-two Mouse Without Bord
 One row:
 
 ```powershell
-$BoundlessCtl = "$env:LOCALAPPDATA\Programs\Boundless\boundlessctl.exe"
+$BoundlessCtl = "$env:ProgramFiles\Boundless\boundlessctl.exe"
 & $BoundlessCtl layout set "left,self,right"
 ```
 
