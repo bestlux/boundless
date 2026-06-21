@@ -27,6 +27,16 @@ function New-InstallerSmokeSummary {
         [string]$ServiceVersionOutput,
         [string]$UpgradedFrom = "",
         [object]$PreviousInstallExitCode = $null,
+        [string]$InstallPathName = '"C:\Program Files\Boundless\boundless-service.exe" --allowed-user-sid=S-1-5-21-1-2-3-1001',
+        [string]$RepairPathName = '"C:\Program Files\Boundless\boundless-service.exe" --allowed-user-sid=S-1-5-21-1-2-3-1001',
+        [string]$InstallStartMode = "Auto",
+        [string]$RepairStartMode = "Auto",
+        [string]$InstallStartName = "LocalSystem",
+        [string]$RepairStartName = "LocalSystem",
+        [string]$InstallAllowedUserSid = "S-1-5-21-1-2-3-1001",
+        [string]$RepairAllowedUserSid = "S-1-5-21-1-2-3-1001",
+        [switch]$OmitInstallAllowedUserSidEvidence,
+        [switch]$OmitRepairAllowedUserSidEvidence,
         [switch]$OmitServiceLifecycleEvidence,
         [switch]$OmitUpgradeReplacementEvidence
     )
@@ -48,11 +58,13 @@ function New-InstallerSmokeSummary {
     if (-not $OmitServiceLifecycleEvidence) {
         $summary["service_install_config"] = [ordered]@{
             name = "BoundlessService"
-            path_name = '"C:\Program Files\Boundless\boundless-service.exe" --allowed-user-sid=S-1-5-21-1-2-3-1001'
-            start_mode = "Auto"
-            start_name = "LocalSystem"
+            path_name = $InstallPathName
+            start_mode = $InstallStartMode
+            start_name = $InstallStartName
             state = "Running"
-            allowed_user_sid = "S-1-5-21-1-2-3-1001"
+        }
+        if (-not $OmitInstallAllowedUserSidEvidence) {
+            $summary["service_install_config"]["allowed_user_sid"] = $InstallAllowedUserSid
         }
         $summary["service_daemon_status_output"] = "running=true api_transport=named_pipe"
         $summary["service_running_before_uninstall"] = $true
@@ -60,11 +72,13 @@ function New-InstallerSmokeSummary {
         $summary["repair_exit_code"] = 0
         $summary["repair_service_config"] = [ordered]@{
             name = "BoundlessService"
-            path_name = '"C:\Program Files\Boundless\boundless-service.exe" --allowed-user-sid=S-1-5-21-1-2-3-1001'
-            start_mode = "Auto"
-            start_name = "LocalSystem"
+            path_name = $RepairPathName
+            start_mode = $RepairStartMode
+            start_name = $RepairStartName
             state = "Running"
-            allowed_user_sid = "S-1-5-21-1-2-3-1001"
+        }
+        if (-not $OmitRepairAllowedUserSidEvidence) {
+            $summary["repair_service_config"]["allowed_user_sid"] = $RepairAllowedUserSid
         }
         $summary["repair_daemon_status_output"] = "running=true api_transport=named_pipe"
         $summary["service_running_after_repair"] = $true
@@ -130,6 +144,16 @@ function Invoke-Fixture {
         [string]$UpgradedFrom = "",
         [object]$PreviousInstallExitCode = $null,
         [switch]$NoInstallerSummary,
+        [string]$InstallPathName = '"C:\Program Files\Boundless\boundless-service.exe" --allowed-user-sid=S-1-5-21-1-2-3-1001',
+        [string]$RepairPathName = '"C:\Program Files\Boundless\boundless-service.exe" --allowed-user-sid=S-1-5-21-1-2-3-1001',
+        [string]$InstallStartMode = "Auto",
+        [string]$RepairStartMode = "Auto",
+        [string]$InstallStartName = "LocalSystem",
+        [string]$RepairStartName = "LocalSystem",
+        [string]$InstallAllowedUserSid = "S-1-5-21-1-2-3-1001",
+        [string]$RepairAllowedUserSid = "S-1-5-21-1-2-3-1001",
+        [switch]$OmitInstallAllowedUserSidEvidence,
+        [switch]$OmitRepairAllowedUserSidEvidence,
         [switch]$OmitServiceLifecycleEvidence,
         [switch]$OmitUpgradeReplacementEvidence,
         [switch]$RequireReady,
@@ -150,7 +174,25 @@ function Invoke-Fixture {
     New-Item -ItemType Directory -Force -Path $caseRoot | Out-Null
     $summaryPath = Join-Path $caseRoot "installer-smoke.json"
     if (-not $NoInstallerSummary) {
-        New-InstallerSmokeSummary -Path $summaryPath -ServiceVersionOutput $ServiceVersionOutput -UpgradedFrom $UpgradedFrom -PreviousInstallExitCode $PreviousInstallExitCode -OmitServiceLifecycleEvidence:$OmitServiceLifecycleEvidence -OmitUpgradeReplacementEvidence:$OmitUpgradeReplacementEvidence
+        $summaryParams = @{
+            Path = $summaryPath
+            ServiceVersionOutput = $ServiceVersionOutput
+            UpgradedFrom = $UpgradedFrom
+            PreviousInstallExitCode = $PreviousInstallExitCode
+            InstallPathName = $InstallPathName
+            RepairPathName = $RepairPathName
+            InstallStartMode = $InstallStartMode
+            RepairStartMode = $RepairStartMode
+            InstallStartName = $InstallStartName
+            RepairStartName = $RepairStartName
+            InstallAllowedUserSid = $InstallAllowedUserSid
+            RepairAllowedUserSid = $RepairAllowedUserSid
+            OmitInstallAllowedUserSidEvidence = $OmitInstallAllowedUserSidEvidence.IsPresent
+            OmitRepairAllowedUserSidEvidence = $OmitRepairAllowedUserSidEvidence.IsPresent
+            OmitServiceLifecycleEvidence = $OmitServiceLifecycleEvidence.IsPresent
+            OmitUpgradeReplacementEvidence = $OmitUpgradeReplacementEvidence.IsPresent
+        }
+        New-InstallerSmokeSummary @summaryParams
     }
 
     $readinessRoot = Join-Path $caseRoot "packet"
@@ -214,6 +256,15 @@ Invoke-Fixture -Name "empty_previous_install_exit_code_fails" -ServiceVersionOut
 Invoke-Fixture -Name "malformed_previous_install_exit_code_fails" -ServiceVersionOutput "boundless-service 5.0.0" -UpgradedFrom "Boundless-4.0.2-windows-x64.msi" -PreviousInstallExitCode "zero" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedNMinusOneStatus "failed"
 Invoke-Fixture -Name "failed_prior_msi_install_fails" -ServiceVersionOutput "boundless-service 5.0.0" -UpgradedFrom "Boundless-4.0.2-windows-x64.msi" -PreviousInstallExitCode 1603 -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedNMinusOneStatus "failed"
 Invoke-Fixture -Name "missing_service_lifecycle_evidence_fails" -ServiceVersionOutput "boundless-service 5.0.0" -OmitServiceLifecycleEvidence -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "install_localappdata_service_path_fails" -ServiceVersionOutput "boundless-service 5.0.0" -InstallPathName '"C:\Users\example\AppData\Local\Programs\Boundless\boundless-service.exe" --allowed-user-sid=S-1-5-21-1-2-3-1001' -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "repair_temp_service_path_fails" -ServiceVersionOutput "boundless-service 5.0.0" -RepairPathName '"C:\Temp\Boundless\boundless-service.exe" --allowed-user-sid=S-1-5-21-1-2-3-1001' -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "install_filename_only_service_path_fails" -ServiceVersionOutput "boundless-service 5.0.0" -InstallPathName 'boundless-service.exe --allowed-user-sid=S-1-5-21-1-2-3-1001' -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "install_manual_start_mode_fails" -ServiceVersionOutput "boundless-service 5.0.0" -InstallStartMode "Manual" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "repair_manual_start_mode_fails" -ServiceVersionOutput "boundless-service 5.0.0" -RepairStartMode "Manual" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "install_user_account_fails" -ServiceVersionOutput "boundless-service 5.0.0" -InstallStartName "NT AUTHORITY\NetworkService" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "repair_user_account_fails" -ServiceVersionOutput "boundless-service 5.0.0" -RepairStartName "NT AUTHORITY\NetworkService" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "repair_missing_allowed_user_sid_fails" -ServiceVersionOutput "boundless-service 5.0.0" -RepairPathName '"C:\Program Files\Boundless\boundless-service.exe"' -OmitRepairAllowedUserSidEvidence -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "repair_changed_allowed_user_sid_fails" -ServiceVersionOutput "boundless-service 5.0.0" -RepairPathName '"C:\Program Files\Boundless\boundless-service.exe" --allowed-user-sid=S-1-5-21-1-2-3-1002' -RepairAllowedUserSid "S-1-5-21-1-2-3-1002" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "failed" -ExpectedNMinusOneStatus "skipped"
 Invoke-Fixture -Name "missing_upgrade_replacement_evidence_fails" -ServiceVersionOutput "boundless-service 5.0.0" -UpgradedFrom "Boundless-4.0.2-windows-x64.msi" -PreviousInstallExitCode 0 -OmitUpgradeReplacementEvidence -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedNMinusOneStatus "failed"
 Invoke-Fixture -Name "substring_version_fails" -ServiceVersionOutput "boundless-service 15.0.0" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "failed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedNMinusOneStatus "skipped"
 Invoke-Fixture -Name "prerelease_service_version_fails_for_stable_release" -ServiceVersionOutput "boundless-service 5.0.0-rc" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "failed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedNMinusOneStatus "skipped"

@@ -233,6 +233,220 @@ function Test-StrictTrue {
     return [string]::Equals([string]$Value, "true", [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-ExpectedServiceBinaryPath {
+    $programFilesRoot = if ([string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        "C:\Program Files"
+    }
+    else {
+        $env:ProgramFiles
+    }
+
+    return (Join-Path $programFilesRoot "Boundless\boundless-service.exe")
+}
+
+function Normalize-ServicePath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ""
+    }
+
+    $normalized = $Path.Trim().Trim('"')
+    $normalized = $normalized -replace '/', '\'
+    if ($normalized -match '^[A-Za-z]:\\') {
+        return $normalized.TrimEnd('\')
+    }
+    try {
+        return [System.IO.Path]::GetFullPath($normalized).TrimEnd('\')
+    }
+    catch {
+        return $normalized
+    }
+}
+
+function Get-ServicePathNameParts {
+    param(
+        [string]$PathName,
+        [string]$ExpectedServiceBinaryPath
+    )
+
+    $trimmed = $PathName.Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        return [pscustomobject]@{
+            ok = $false
+            executable = ""
+            arguments = ""
+            reason = "PathName was empty"
+        }
+    }
+
+    if ($trimmed -match '^\s*"(?<exe>[^"]+)"\s*(?<args>.*)$') {
+        return [pscustomobject]@{
+            ok = $true
+            executable = $Matches.exe
+            arguments = $Matches.args
+            reason = ""
+        }
+    }
+
+    if ($trimmed.StartsWith($ExpectedServiceBinaryPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{
+            ok = $true
+            executable = $ExpectedServiceBinaryPath
+            arguments = $trimmed.Substring($ExpectedServiceBinaryPath.Length).Trim()
+            reason = ""
+        }
+    }
+
+    return [pscustomobject]@{
+        ok = $false
+        executable = ""
+        arguments = ""
+        reason = "PathName was not quoted and did not begin with the expected Program Files service path"
+    }
+}
+
+function Get-AllowedUserSidFromServiceConfig {
+    param(
+        [object]$Config,
+        [string]$PathArguments
+    )
+
+    $explicitSid = [string](Get-ObjectPropertyValue -Object $Config -Name "allowed_user_sid")
+    $sidPattern = 'S-1-\d+(?:-\d+)+'
+    $argumentMatches = [regex]::Matches($PathArguments, '(?:^|\s)--allowed-user-sid=(?:"(?<quoted>S-1-\d+(?:-\d+)+)"|(?<plain>S-1-\d+(?:-\d+)+))(?=\s|$)')
+    $parsedSid = ""
+    if ($argumentMatches.Count -eq 1) {
+        $parsedSid = if (-not [string]::IsNullOrWhiteSpace($argumentMatches[0].Groups["quoted"].Value)) {
+            $argumentMatches[0].Groups["quoted"].Value
+        }
+        else {
+            $argumentMatches[0].Groups["plain"].Value
+        }
+    }
+    elseif ($argumentMatches.Count -gt 1) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "PathName contained multiple --allowed-user-sid arguments"
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($explicitSid)) {
+        if ($explicitSid -notmatch "^$sidPattern$") {
+            return [pscustomobject]@{
+                ok = $false
+                sid = ""
+                reason = "allowed_user_sid was not a strict SID string"
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($parsedSid) -and $parsedSid -ne $explicitSid) {
+            return [pscustomobject]@{
+                ok = $false
+                sid = ""
+                reason = "allowed_user_sid did not match PathName --allowed-user-sid"
+            }
+        }
+        return [pscustomobject]@{
+            ok = $true
+            sid = $explicitSid
+            reason = ""
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($parsedSid)) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "allowed user SID evidence was missing"
+        }
+    }
+
+    return [pscustomobject]@{
+        ok = $true
+        sid = $parsedSid
+        reason = ""
+    }
+}
+
+function Test-ServiceConfigEvidence {
+    param(
+        [object]$Config,
+        [string]$Label,
+        [string]$ExpectedAllowedUserSid = ""
+    )
+
+    if ($null -eq $Config) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "installer summary missing $Label"
+        }
+    }
+
+    $expectedServiceBinaryPath = Get-ExpectedServiceBinaryPath
+    $pathName = [string](Get-ObjectPropertyValue -Object $Config -Name "path_name")
+    $pathParts = Get-ServicePathNameParts -PathName $pathName -ExpectedServiceBinaryPath $expectedServiceBinaryPath
+    if (-not $pathParts.ok) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "$Label PathName was invalid: $($pathParts.reason)"
+        }
+    }
+
+    $actualServiceBinaryPath = Normalize-ServicePath -Path $pathParts.executable
+    $expectedNormalizedServiceBinaryPath = Normalize-ServicePath -Path $expectedServiceBinaryPath
+    if (-not [string]::Equals($actualServiceBinaryPath, $expectedNormalizedServiceBinaryPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "$Label PathName executable was '$actualServiceBinaryPath', expected '$expectedNormalizedServiceBinaryPath'"
+        }
+    }
+
+    $startMode = [string](Get-ObjectPropertyValue -Object $Config -Name "start_mode")
+    if ($startMode -notin @("Auto", "Automatic")) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "$Label StartMode was '$startMode', expected Auto or Automatic"
+        }
+    }
+
+    $startName = [string](Get-ObjectPropertyValue -Object $Config -Name "start_name")
+    if (-not [string]::Equals($startName, "LocalSystem", [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "$Label StartName was '$startName', expected LocalSystem"
+        }
+    }
+
+    $sidEvidence = Get-AllowedUserSidFromServiceConfig -Config $Config -PathArguments $pathParts.arguments
+    if (-not $sidEvidence.ok) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "$Label $($sidEvidence.reason)"
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedAllowedUserSid) -and $sidEvidence.sid -ne $ExpectedAllowedUserSid) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = $sidEvidence.sid
+            reason = "$Label allowed user SID changed. Expected $ExpectedAllowedUserSid, got $($sidEvidence.sid)"
+        }
+    }
+
+    return [pscustomobject]@{
+        ok = $true
+        sid = $sidEvidence.sid
+        reason = ""
+    }
+}
+
 function Normalize-ReleaseVersion {
     param([string]$Version)
 
@@ -339,24 +553,9 @@ function Add-ServiceLifecycleEvidenceGate {
     }
 
     $serviceInstallConfig = Get-SummaryPropertyValue -Summary $Summary -Name "service_install_config"
-    if ($null -eq $serviceInstallConfig) {
-        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "installer summary missing service_install_config" -Impact "service registration evidence is incomplete"
-        return
-    }
-
-    $installPath = [string](Get-ObjectPropertyValue -Object $serviceInstallConfig -Name "path_name")
-    $startMode = [string](Get-ObjectPropertyValue -Object $serviceInstallConfig -Name "start_mode")
-    $startName = [string](Get-ObjectPropertyValue -Object $serviceInstallConfig -Name "start_name")
-    if ([string]::IsNullOrWhiteSpace($installPath) -or $installPath -notmatch "boundless-service\.exe") {
-        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "service_install_config did not identify the active service binary" -Impact "release readiness cannot prove the MSI-owned service path"
-        return
-    }
-    if ($startMode -ne "Auto") {
-        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "service StartMode was '$startMode', expected Auto" -Impact "service autostart evidence is incomplete"
-        return
-    }
-    if ($startName -ne "LocalSystem") {
-        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "service StartName was '$startName', expected LocalSystem" -Impact "service account evidence is incomplete"
+    $installValidation = Test-ServiceConfigEvidence -Config $serviceInstallConfig -Label "service_install_config"
+    if (-not $installValidation.ok) {
+        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason $installValidation.reason -Impact "service install evidence must prove the MSI-owned Program Files service registration"
         return
     }
 
@@ -384,8 +583,9 @@ function Add-ServiceLifecycleEvidenceGate {
     }
 
     $repairServiceConfig = Get-SummaryPropertyValue -Summary $Summary -Name "repair_service_config"
-    if ($null -eq $repairServiceConfig) {
-        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "installer summary missing repair_service_config" -Impact "repair evidence did not prove service registration recovery"
+    $repairValidation = Test-ServiceConfigEvidence -Config $repairServiceConfig -Label "repair_service_config" -ExpectedAllowedUserSid $installValidation.sid
+    if (-not $repairValidation.ok) {
+        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason $repairValidation.reason -Impact "repair evidence must prove MSI recovery of the same Program Files service registration and allowed user SID"
         return
     }
 
