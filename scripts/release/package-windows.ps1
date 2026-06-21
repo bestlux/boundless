@@ -114,6 +114,7 @@ Copy-Item -LiteralPath $changeLogPath -Destination (Join-Path $stageRoot "CHANGE
 $packageFiles = @(
     "Boundless-Install.ps1"
     "Boundless-Reset.ps1"
+    "Boundless-ConnectivityDiagnostics.ps1"
     "README.txt"
     "package-manifest.json"
 )

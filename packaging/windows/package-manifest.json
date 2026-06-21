@@ -15,7 +15,8 @@
   },
   "scripts": {
     "install": "Boundless-Install.ps1",
-    "reset": "Boundless-Reset.ps1"
+    "reset": "Boundless-Reset.ps1",
+    "connectivity_diagnostics": "Boundless-ConnectivityDiagnostics.ps1"
   },
   "reset_modes": [
     "network",

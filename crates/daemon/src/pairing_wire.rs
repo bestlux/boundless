@@ -432,10 +432,7 @@ async fn send_nearby_pairing_request(
     let mut socket = time::timeout(NEARBY_PAIRING_CONNECT_TIMEOUT, TcpStream::connect(target))
         .await
         .with_context(|| {
-            format!(
-                "connect nearby pairing endpoint {target} timed out after {}s",
-                NEARBY_PAIRING_CONNECT_TIMEOUT.as_secs()
-            )
+            nearby_pairing_connect_timeout_message(target, NEARBY_PAIRING_CONNECT_TIMEOUT.as_secs())
         })?
         .with_context(|| format!("connect nearby pairing endpoint {target}"))?;
     let payload = serde_json::to_string(&request).context("serialize nearby pairing request")?;
@@ -811,6 +808,15 @@ fn extract_port_from_address(address: &str, default_port: u16) -> u16 {
     default_port
 }
 
+fn nearby_pairing_connect_timeout_message(target: &str, timeout_seconds: u64) -> String {
+    let remote_port = parse_port_suffix(target)
+        .map(|port| format!(" remote TCP {port}"))
+        .unwrap_or_else(|| " the remote nearby pairing TCP port".to_string());
+    format!(
+        "connect nearby pairing endpoint {target} timed out after {timeout_seconds}s; likely network/firewall reachability issue for{remote_port}"
+    )
+}
+
 fn parse_port_suffix(address: &str) -> Option<u16> {
     if let Some((_, rest)) = address.rsplit_once(':')
         && let Ok(port) = rest.parse::<u16>()
@@ -833,6 +839,16 @@ mod tests {
         assert_eq!(extract_port_from_address("[fe80::1%4]:30100", 15100), 30100);
         assert_eq!(extract_port_from_address("example", 15100), 15100);
         assert_eq!(extract_port_from_address("", 15100), 15100);
+    }
+
+    #[test]
+    fn nearby_pairing_connect_timeout_names_reachability_and_port() {
+        let message = nearby_pairing_connect_timeout_message("10.10.0.187:15200", 4);
+
+        assert!(message.contains("10.10.0.187:15200"));
+        assert!(message.contains("timed out after 4s"));
+        assert!(message.contains("network/firewall reachability"));
+        assert!(message.contains("remote TCP 15200"));
     }
 
     #[test]

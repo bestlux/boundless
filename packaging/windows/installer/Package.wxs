@@ -126,6 +126,7 @@
         <File Id="IconFile" Source="$(var.PayloadDir)\Boundless.ico" />
         <File Id="InstallHelperScriptFile" Source="$(var.PayloadDir)\Boundless-Install.ps1" />
         <File Id="ResetScriptFile" Source="$(var.PayloadDir)\Boundless-Reset.ps1" />
+        <File Id="ConnectivityDiagnosticsScriptFile" Source="$(var.PayloadDir)\Boundless-ConnectivityDiagnostics.ps1" />
         <File Id="ReadmeFile" Source="$(var.PayloadDir)\README.txt" />
         <File Id="LicenseFile" Source="$(var.PayloadDir)\LICENSE.txt" />
         <File Id="ChangelogFile" Source="$(var.PayloadDir)\CHANGELOG.md" />
