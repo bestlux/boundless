@@ -6,6 +6,8 @@ Status: foundation harness. This is developer test infrastructure until a real t
 
 The script scripts/dev/perf-two-machine-evidence.ps1 creates sanitized JSON and Markdown packets for later Windows two-machine performance and reliability runs. The harness is intentionally non-invasive: it does not pair devices, reset trust, change firewall rules, install or uninstall software, elevate, start or stop services, or read clipboard/file payload contents.
 
+The release interpretation policy lives in [Product Performance Scorecard](product-scorecard.md). Use this harness to produce sanitized evidence packets for that scorecard; do not treat dry-run or fixture output as product readiness.
+
 Use it for these scenario classes:
 
 | scenario | release question it will eventually support |

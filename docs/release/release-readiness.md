@@ -13,6 +13,8 @@ The packet contains:
 - a pointer back to `docs/parity/mouse-without-borders.md`,
 - every passed, failed, or skipped gate with a reason and impact.
 
+The product-performance interpretation layer lives in [docs/performance/product-scorecard.md](../performance/product-scorecard.md). Release-readiness gates answer whether required evidence is present and fresh enough for the selected policy; the scorecard answers what the measured product behavior means for dogfood, beta, and supported claims.
+
 ## Risk Classification
 
 - `ready`: no gate failed and no gate was skipped.
@@ -29,6 +31,16 @@ Skipped gates are never hidden. A release reviewer must either provide the missi
 - Service update evidence is MSI-owned by default with `-ServiceUpdateMode msi-owned`. `service-self-update` and `tray-self-update` are accepted only as explicit unsupported/deferred modes and fail readiness when selected.
 - Full-service installer coverage requires installer-smoke evidence for MSI-owned service registration, repair recovery, and uninstall cleanup. Missing repair or stale-service cleanup evidence blocks readiness.
 - N-1 MSI upgrade coverage requires a prior MSI path passed to installer smoke. The summary must prove both app payload and service payload replacement, Program Files ownership of the current payloads, and the active service path after upgrade. Missing prior-MSI coverage is recorded as skipped evidence, which fails `-Policy stable`.
+
+Physical two-machine performance labs are release evidence, not default PR gates. Keep them out of ordinary PR validation until the scenarios are stable, fast, non-disruptive, and supported by repeated real runs. Fixture packets may validate artifact shape, but real product scorecard thresholds stay provisional until at least two real two-PC runs exist for the scenario.
+
+Release reviewers should classify readiness in three separate levels:
+
+| level | minimum evidence posture |
+| --- | --- |
+| ready for dogfood | Current release-readiness packet plus scorecard evidence for the intended dogfood path, with no fail classifications for install/startup, discovery/pairing, clipboard text, or input handoff. Warnings and unmeasured categories must have written next actions or explicit release-scope deferrals. |
+| ready for beta | Current release-readiness packet plus at least two real two-PC scorecard runs for every category, with no fail classifications and no privacy violations in evidence. Fixture-only rows are not enough. |
+| parity claim supported | Current parity-matrix and release-readiness evidence for the exact claim, plus matching scorecard evidence. The scorecard alone is not claim evidence for desktop security boundaries, elevated contexts, prompts, self-update behavior, or broad third-party behavior. |
 
 ## Common Commands
 
