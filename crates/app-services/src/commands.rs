@@ -146,6 +146,8 @@ pub struct NearbyRequestCodeCommand {
     pub host: String,
     pub port: u16,
     pub alias: Option<String>,
+    #[serde(default)]
+    pub endpoint_candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +158,8 @@ pub struct NearbySubmitCodeCommand {
     pub code: String,
     pub verification_nonce: String,
     pub alias: Option<String>,
+    #[serde(default)]
+    pub endpoint_candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +168,8 @@ pub struct NearbyJoinStartCommand {
     pub port: u16,
     pub code: String,
     pub alias: Option<String>,
+    #[serde(default)]
+    pub endpoint_candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +178,8 @@ pub struct NearbyJoinStatusCommand {
     pub port: u16,
     pub request_id: String,
     pub alias: Option<String>,
+    #[serde(default)]
+    pub endpoint_candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

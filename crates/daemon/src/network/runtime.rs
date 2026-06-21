@@ -7,7 +7,26 @@ use peer_transport::{
 
 use super::*;
 
-pub(super) async fn listener_loop(state: AppState, listener: TcpListener) {
+pub(super) async fn listener_loop(state: AppState, mut listeners: Vec<TcpListener>) {
+    if listeners.is_empty() {
+        warn!("transport listener task started without listeners");
+        return;
+    }
+
+    let first = listeners.remove(0);
+    if listeners.is_empty() {
+        accept_loop(state, first).await;
+        return;
+    }
+
+    let second = listeners.remove(0);
+    tokio::select! {
+        _ = accept_loop(state.clone(), first) => {}
+        _ = accept_loop(state, second) => {}
+    }
+}
+
+async fn accept_loop(state: AppState, listener: TcpListener) {
     let bind = listener
         .local_addr()
         .map(|addr| addr.to_string())
@@ -119,8 +138,8 @@ async fn peer_worker(state: AppState, peer_id: String) {
             return;
         };
 
-        let discovered_endpoint = state.discovered_endpoint(&peer_id).await;
-        let target_candidates = outbound_target_candidates(&peer.address, discovered_endpoint);
+        let discovered_endpoints = state.discovered_endpoint_candidates(&peer_id).await;
+        let target_candidates = outbound_target_candidates(&peer.address, &discovered_endpoints);
         if target_candidates.is_empty() {
             wait_for_reconcile_or_backoff(&reconcile_wake, Duration::from_secs(backoff_secs)).await;
             backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECONDS);
@@ -147,7 +166,7 @@ async fn peer_worker(state: AppState, peer_id: String) {
                 peer_id = %peer_id,
                 configured_address = %peer.address,
                 target_candidates = ?target_candidates,
-                discovered_endpoint = ?discovered_endpoint,
+                discovered_endpoints = ?discovered_endpoints,
                 error = ?last_error,
                 "outbound connect failed"
             );
@@ -170,7 +189,7 @@ pub(super) async fn wait_for_reconcile_or_backoff(
 
 pub(super) fn outbound_target_candidates(
     configured_address: &str,
-    discovered_endpoint: Option<SocketAddr>,
+    discovered_endpoints: &[SocketAddr],
 ) -> Vec<String> {
-    transport_outbound_target_candidates(configured_address, discovered_endpoint)
+    transport_outbound_target_candidates(configured_address, discovered_endpoints)
 }

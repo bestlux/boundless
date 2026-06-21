@@ -551,6 +551,7 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             &command.host,
             command.port,
             command.alias,
+            &command.endpoint_candidates,
         )
         .await?;
 
@@ -587,12 +588,15 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         let request_id = command.request_id.clone();
         let outcome = pairing_wire::submit_nearby_pairing_code(
             &self.state,
-            &command.host,
-            command.port,
-            command.request_id,
-            command.code,
-            command.verification_nonce,
-            command.alias,
+            pairing_wire::NearbySubmitCode {
+                host: command.host,
+                port: command.port,
+                request_id: command.request_id,
+                code: command.code,
+                verification_nonce: command.verification_nonce,
+                alias: command.alias,
+                endpoint_candidates: command.endpoint_candidates,
+            },
         )
         .await?;
 
@@ -617,6 +621,7 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             command.port,
             command.code,
             command.alias,
+            &command.endpoint_candidates,
         )
         .await?;
         Ok(map_nearby_join_status(result))
@@ -632,6 +637,7 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             command.port,
             command.request_id,
             command.alias,
+            &command.endpoint_candidates,
         )
         .await?;
         Ok(map_nearby_join_status(result))
@@ -1124,6 +1130,11 @@ fn build_discovered_peers(
             machine_id,
             display_name: peer.display_name,
             endpoint: peer.endpoint.to_string(),
+            endpoint_candidates: peer
+                .endpoint_candidates
+                .into_iter()
+                .map(|endpoint| endpoint.to_string())
+                .collect(),
         })
         .collect::<Vec<_>>();
 

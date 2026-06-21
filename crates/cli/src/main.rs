@@ -449,7 +449,18 @@ async fn main() -> Result<()> {
                 port,
                 timeout_seconds,
                 alias,
-            } => pair_nearby_join(&cli.endpoint, code, host, port, timeout_seconds, alias).await,
+            } => {
+                pair_nearby_join(
+                    &cli.endpoint,
+                    code,
+                    host,
+                    port,
+                    timeout_seconds,
+                    alias,
+                    Vec::new(),
+                )
+                .await
+            }
             PairCommand::Pending => pair_pending(&cli.endpoint).await,
             PairCommand::Approve { request_id, alias } => {
                 pair_approve(&cli.endpoint, request_id, alias).await
@@ -663,11 +674,13 @@ mod tests {
                     machine_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
                     display_name: "MACHINE-A".to_string(),
                     endpoint: "10.0.0.10:15100".to_string(),
+                    endpoint_candidates: vec!["10.0.0.10:15100".to_string()],
                 },
                 ConsoleDiscoveredPeer {
                     machine_id: "11111111-2222-3333-4444-555555555555".to_string(),
                     display_name: "MACHINE-B".to_string(),
                     endpoint: "10.0.0.11:15100".to_string(),
+                    endpoint_candidates: vec!["10.0.0.11:15100".to_string()],
                 },
             ],
             pending_requests: Vec::new(),

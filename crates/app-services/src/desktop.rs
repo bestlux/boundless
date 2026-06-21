@@ -37,10 +37,6 @@ pub fn host_and_pairing_port_from_endpoint(endpoint: &str) -> Result<(String, u1
         bail!("discovery endpoint is empty");
     }
 
-    if let Ok(socket) = trimmed.parse::<SocketAddr>() {
-        return Ok((socket.ip().to_string(), nearby_pairing_port(socket.port())));
-    }
-
     if let Some(host) = trimmed
         .strip_prefix('[')
         .and_then(|value| value.split_once(']'))
@@ -48,6 +44,10 @@ pub fn host_and_pairing_port_from_endpoint(endpoint: &str) -> Result<(String, u1
     {
         let port = extract_port_from_endpoint(trimmed)?;
         return Ok((host, nearby_pairing_port(port)));
+    }
+
+    if let Ok(socket) = trimmed.parse::<SocketAddr>() {
+        return Ok((socket.ip().to_string(), nearby_pairing_port(socket.port())));
     }
 
     if let Some((host, _)) = trimmed.rsplit_once(':') {
@@ -442,6 +442,15 @@ mod tests {
         )
         .expect("four peers plus local should validate");
         assert_eq!(canonical, ",peer-up,;peer-left,self,peer-right;,peer-down,");
+    }
+
+    #[test]
+    fn host_and_pairing_port_parses_bracketed_ipv6_endpoint() {
+        let (host, port) =
+            host_and_pairing_port_from_endpoint("[fe80::1%4]:15100").expect("parse endpoint");
+
+        assert_eq!(host, "fe80::1%4");
+        assert_eq!(port, 15200);
     }
 
     #[test]

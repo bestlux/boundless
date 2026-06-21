@@ -13,6 +13,7 @@ pub(super) struct ConsoleDiscoveredPeer {
     pub(super) machine_id: String,
     pub(super) display_name: String,
     pub(super) endpoint: String,
+    pub(super) endpoint_candidates: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -122,6 +123,7 @@ async fn fetch_console_snapshot(endpoint: &str) -> Result<ConsoleSnapshot> {
             machine_id: peer.machine_id,
             display_name: peer.display_name,
             endpoint: peer.endpoint,
+            endpoint_candidates: peer.endpoint_candidates,
         })
         .collect::<Vec<_>>();
     let paired_peer_ids = peers
@@ -414,7 +416,16 @@ async fn handle_console_pair_command(
                 pairing_port,
                 short_machine_id(&discovered.machine_id),
             );
-            pair_nearby_join(endpoint, code, host, pairing_port, 120, alias).await
+            pair_nearby_join(
+                endpoint,
+                code,
+                host,
+                pairing_port,
+                120,
+                alias,
+                discovered.endpoint_candidates.clone(),
+            )
+            .await
         }
         "nearby" => {
             if args.len() < 3 {
@@ -440,7 +451,7 @@ async fn handle_console_pair_command(
                     }
                 }
             }
-            pair_nearby_join(endpoint, code, host, port, 120, alias).await
+            pair_nearby_join(endpoint, code, host, port, 120, alias, Vec::new()).await
         }
         _ => bail!("unknown pair command `{}`", args[0]),
     }

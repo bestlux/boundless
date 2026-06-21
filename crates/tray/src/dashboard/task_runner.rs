@@ -98,8 +98,12 @@ impl DashboardTaskRunner {
         egui_ctx: egui::Context,
     ) {
         Self::spawn_with_repaint(egui_ctx, move || {
-            match pair_nearby_request_code_blocking(&endpoint, flow.host.clone(), flow.pairing_port)
-            {
+            match pair_nearby_request_code_blocking(
+                &endpoint,
+                flow.host.clone(),
+                flow.pairing_port,
+                flow.endpoint_candidates.clone(),
+            ) {
                 Ok(NearbyRequestCodeStart::CodeRequired {
                     request_id,
                     verification_nonce,
@@ -146,12 +150,15 @@ impl DashboardTaskRunner {
         Self::spawn_with_repaint(egui_ctx, move || {
             match pair_nearby_submit_code_blocking(
                 &endpoint,
-                challenge.request_id,
-                code,
-                challenge.verification_nonce,
-                flow.host,
-                flow.pairing_port,
-                alias.clone(),
+                NearbySubmitCode {
+                    request_id: challenge.request_id,
+                    code,
+                    verification_nonce: challenge.verification_nonce,
+                    host: flow.host,
+                    port: flow.pairing_port,
+                    alias: alias.clone(),
+                    endpoint_candidates: flow.endpoint_candidates,
+                },
             ) {
                 Ok(submit_result) => {
                     let _ = tx.send(AppMsg::PairingComplete {

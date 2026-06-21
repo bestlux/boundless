@@ -763,6 +763,7 @@ impl ControlPlaneService for ControlPlaneApi {
                 host,
                 port,
                 alias: parse_optional_alias(request.alias),
+                endpoint_candidates: request.endpoint_candidates,
             })
             .await
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -797,6 +798,7 @@ impl ControlPlaneService for ControlPlaneApi {
                 code,
                 verification_nonce,
                 alias: parse_optional_alias(request.alias),
+                endpoint_candidates: request.endpoint_candidates,
             })
             .await
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -826,6 +828,7 @@ impl ControlPlaneService for ControlPlaneApi {
                 port,
                 code,
                 alias: parse_optional_alias(request.alias),
+                endpoint_candidates: request.endpoint_candidates,
             })
             .await
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -852,6 +855,7 @@ impl ControlPlaneService for ControlPlaneApi {
                 port,
                 request_id,
                 alias: parse_optional_alias(request.alias),
+                endpoint_candidates: request.endpoint_candidates,
             })
             .await
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -1131,6 +1135,7 @@ fn map_discovered_peer(peer: UiDiscoveredPeer) -> DiscoveredPeerInfo {
         machine_id: peer.machine_id,
         display_name: peer.display_name,
         endpoint: peer.endpoint,
+        endpoint_candidates: peer.endpoint_candidates,
     }
 }
 

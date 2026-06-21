@@ -198,11 +198,14 @@ pub fn restore_outbound_chunk_credits_for_payloads(
 
 pub fn outbound_target_candidates(
     configured_address: &str,
-    discovered_endpoint: Option<SocketAddr>,
+    discovered_endpoints: &[SocketAddr],
 ) -> Vec<String> {
     let mut targets = Vec::new();
-    if let Some(endpoint) = discovered_endpoint {
-        targets.push(endpoint.to_string());
+    for endpoint in discovered_endpoints {
+        let endpoint = endpoint.to_string();
+        if !targets.iter().any(|target| target == &endpoint) {
+            targets.push(endpoint);
+        }
     }
 
     let manual = configured_address.trim();

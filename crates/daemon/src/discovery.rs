@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tracing::{debug, info, warn};
 
-use core_discovery::{DiscoveryAnnouncement, MDNS_SERVICE_TYPE, mdns_instance_name};
+use core_discovery::{MDNS_SERVICE_TYPE, mdns_instance_name};
 
 use crate::{
     runtime_tasks::{RuntimeTaskOwner, RuntimeTaskShutdown, RuntimeTaskSpec},
@@ -84,18 +84,23 @@ async fn run(state: AppState) -> Result<()> {
                 );
 
                 let previous = state
-                    .set_discovered_endpoint(
+                    .set_discovered_endpoints(
                         &announcement.machine_id,
                         &announcement.display_name,
-                        announcement.endpoint,
+                        announcement.endpoint_candidates.clone(),
                     )
                     .await;
 
-                if previous.as_ref().map(|item| item.endpoint) != Some(announcement.endpoint) {
+                if previous
+                    .as_ref()
+                    .map(|item| item.endpoint_candidates.as_slice())
+                    != Some(announcement.endpoint_candidates.as_slice())
+                {
                     info!(
                         machine_id = %announcement.machine_id,
                         display_name = %announcement.display_name,
-                        endpoint = %announcement.endpoint,
+                        endpoint = %announcement.endpoint(),
+                        endpoint_candidates = ?announcement.endpoint_candidates,
                         "mDNS discovered peer endpoint"
                     );
                 }
@@ -147,7 +152,20 @@ fn build_local_service_info(
     .enable_addr_auto())
 }
 
-fn announcement_from_resolved(resolved: &ResolvedService) -> Option<DiscoveryAnnouncement> {
+#[derive(Debug, Clone)]
+struct ResolvedDiscoveryAnnouncement {
+    machine_id: String,
+    display_name: String,
+    endpoint_candidates: Vec<SocketAddr>,
+}
+
+impl ResolvedDiscoveryAnnouncement {
+    fn endpoint(&self) -> SocketAddr {
+        self.endpoint_candidates[0]
+    }
+}
+
+fn announcement_from_resolved(resolved: &ResolvedService) -> Option<ResolvedDiscoveryAnnouncement> {
     let machine_id = resolved
         .get_property_val_str("machine_id")?
         .trim()
@@ -163,21 +181,25 @@ fn announcement_from_resolved(resolved: &ResolvedService) -> Option<DiscoveryAnn
         .unwrap_or(machine_id.as_str())
         .to_string();
 
-    let endpoint = preferred_endpoint_addr(resolved.get_addresses().iter(), resolved.get_port())?;
+    let endpoint_candidates =
+        endpoint_candidates_from_addrs(resolved.get_addresses().iter(), resolved.get_port());
+    if endpoint_candidates.is_empty() {
+        return None;
+    }
 
-    Some(DiscoveryAnnouncement {
+    Some(ResolvedDiscoveryAnnouncement {
         machine_id,
         display_name,
-        endpoint,
+        endpoint_candidates,
     })
 }
 
-fn preferred_endpoint_addr<'a, I>(addresses: I, port: u16) -> Option<SocketAddr>
+fn endpoint_candidates_from_addrs<'a, I>(addresses: I, port: u16) -> Vec<SocketAddr>
 where
     I: Iterator<Item = &'a ScopedIp>,
 {
-    let mut ipv4: Option<SocketAddr> = None;
-    let mut ipv6: Option<SocketAddr> = None;
+    let mut ipv4 = Vec::<SocketAddr>::new();
+    let mut ipv6 = Vec::<SocketAddr>::new();
 
     for address in addresses {
         if address.is_loopback() {
@@ -185,18 +207,43 @@ where
         }
 
         match address {
-            ScopedIp::V4(v4) if ipv4.is_none() => {
-                ipv4 = Some(SocketAddr::new(IpAddr::V4(*v4.addr()), port));
+            ScopedIp::V4(v4) => {
+                let endpoint = SocketAddr::new(IpAddr::V4(*v4.addr()), port);
+                if !ipv4.contains(&endpoint) {
+                    ipv4.push(endpoint);
+                }
             }
-            ScopedIp::V6(v6) if ipv6.is_none() => {
+            ScopedIp::V6(v6) => {
                 let socket = SocketAddrV6::new(*v6.addr(), port, 0, v6.scope_id().index);
-                ipv6 = Some(SocketAddr::V6(socket));
+                let endpoint = SocketAddr::V6(socket);
+                if !ipv6.contains(&endpoint) {
+                    ipv6.push(endpoint);
+                }
             }
             _ => {}
         }
     }
 
-    ipv4.or(ipv6)
+    interleave_endpoint_families(ipv6, ipv4)
+}
+
+fn interleave_endpoint_families(
+    first_family: Vec<SocketAddr>,
+    second_family: Vec<SocketAddr>,
+) -> Vec<SocketAddr> {
+    let mut candidates = Vec::with_capacity(first_family.len() + second_family.len());
+    let max_len = first_family.len().max(second_family.len());
+    for index in 0..max_len {
+        if let Some(endpoint) = first_family.get(index) {
+            candidates.push(*endpoint);
+        }
+        if let Some(endpoint) = second_family.get(index)
+            && !candidates.contains(endpoint)
+        {
+            candidates.push(*endpoint);
+        }
+    }
+    candidates
 }
 
 #[cfg(test)]
@@ -204,15 +251,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preferred_endpoint_prefers_ipv4() {
+    fn endpoint_candidates_interleave_ipv6_then_ipv4() {
         let addresses: Vec<ScopedIp> = vec![
             "fe80::1".parse::<IpAddr>().expect("ipv6").into(),
             "10.0.0.9".parse::<IpAddr>().expect("ipv4").into(),
+            "fe80::2".parse::<IpAddr>().expect("ipv6").into(),
+            "10.0.0.10".parse::<IpAddr>().expect("ipv4").into(),
         ];
-        let endpoint = preferred_endpoint_addr(addresses.iter(), 15100).expect("endpoint");
+        let endpoints = endpoint_candidates_from_addrs(addresses.iter(), 15100);
         assert_eq!(
-            endpoint,
-            "10.0.0.9:15100".parse::<SocketAddr>().expect("parse")
+            endpoints,
+            vec![
+                "[fe80::1]:15100".parse::<SocketAddr>().expect("parse"),
+                "10.0.0.9:15100".parse::<SocketAddr>().expect("parse"),
+                "[fe80::2]:15100".parse::<SocketAddr>().expect("parse"),
+                "10.0.0.10:15100".parse::<SocketAddr>().expect("parse"),
+            ]
         )
     }
 
@@ -222,19 +276,19 @@ mod tests {
             "127.0.0.1".parse::<IpAddr>().expect("loopback").into(),
             "10.0.0.4".parse::<IpAddr>().expect("ipv4").into(),
         ];
-        let endpoint = preferred_endpoint_addr(addresses.iter(), 15100).expect("endpoint");
+        let endpoints = endpoint_candidates_from_addrs(addresses.iter(), 15100);
         assert_eq!(
-            endpoint,
-            "10.0.0.4:15100".parse::<SocketAddr>().expect("parse")
+            endpoints,
+            vec!["10.0.0.4:15100".parse::<SocketAddr>().expect("parse")]
         )
     }
 
     #[test]
-    fn preferred_endpoint_uses_ipv6_when_ipv4_missing() {
+    fn endpoint_candidates_use_ipv6_when_ipv4_missing() {
         let addresses: Vec<ScopedIp> = vec!["fe80::1".parse::<IpAddr>().expect("ipv6").into()];
-        let endpoint = preferred_endpoint_addr(addresses.iter(), 15100).expect("endpoint");
+        let endpoints = endpoint_candidates_from_addrs(addresses.iter(), 15100);
 
-        match endpoint {
+        match endpoints[0] {
             SocketAddr::V6(v6) => {
                 assert_eq!(
                     v6.ip(),

@@ -5,6 +5,7 @@ use tokio::sync::RwLock;
 pub struct DiscoveredPeerEndpoint {
     pub display_name: String,
     pub endpoint: SocketAddr,
+    pub endpoint_candidates: Vec<SocketAddr>,
 }
 
 #[derive(Debug, Default)]

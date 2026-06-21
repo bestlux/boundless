@@ -14,11 +14,11 @@ use tokio::{
 use tracing::{info, warn};
 
 use crate::{
+    network::bind_dual_stack_tcp_listeners,
     runtime_tasks::{RuntimeTaskOwner, RuntimeTaskShutdown, RuntimeTaskSpec},
     state::{AppState, NearbyPairingStatus},
 };
 
-const PAIRING_BIND_HOST: &str = "0.0.0.0";
 const PAIRING_PORT_OFFSET: u16 = 100;
 const PAIRING_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const NEARBY_CHALLENGE_TTL_SECONDS: u64 = 120;
@@ -26,7 +26,7 @@ const NEARBY_PAIRING_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const NEARBY_PAIRING_IO_TIMEOUT: Duration = Duration::from_secs(6);
 const NEARBY_PAIRING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum PairingWireRequest {
     NearbyRequestCode {
@@ -109,6 +109,16 @@ pub(crate) enum NearbyRequestCodeStart {
     },
 }
 
+pub(crate) struct NearbySubmitCode {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) request_id: String,
+    pub(crate) code: String,
+    pub(crate) verification_nonce: String,
+    pub(crate) alias: Option<String>,
+    pub(crate) endpoint_candidates: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct NearbyJoinStatus {
     pub(crate) request_id: String,
@@ -131,11 +141,12 @@ pub(crate) async fn request_nearby_pairing_code(
     host: &str,
     port: u16,
     alias: Option<String>,
+    endpoint_candidates: &[String],
 ) -> Result<NearbyRequestCodeStart> {
-    let target = format_host_port(host, port);
+    let targets = nearby_pairing_targets(host, port, endpoint_candidates);
     let requester_bundle = state.export_trust_bundle().await?;
-    let response = send_nearby_pairing_request(
-        &target,
+    let (response, _) = send_nearby_pairing_request_to_candidates(
+        &targets,
         PairingWireRequest::NearbyRequestCode {
             requester_bundle,
             requester_alias: normalize_alias(alias),
@@ -178,21 +189,16 @@ pub(crate) async fn request_nearby_pairing_code(
 
 pub(crate) async fn submit_nearby_pairing_code(
     state: &AppState,
-    host: &str,
-    port: u16,
-    request_id: String,
-    code: String,
-    verification_nonce: String,
-    alias: Option<String>,
+    request: NearbySubmitCode,
 ) -> Result<NearbyPairingOutcome> {
-    let target = format_host_port(host, port);
-    let response = send_nearby_pairing_request(
-        &target,
+    let targets = nearby_pairing_targets(&request.host, request.port, &request.endpoint_candidates);
+    let (response, connected_host) = send_nearby_pairing_request_to_candidates(
+        &targets,
         PairingWireRequest::NearbySubmitCode {
-            request_id: request_id.clone(),
-            code,
-            verification_nonce,
-            requester_alias: normalize_alias(alias.clone()),
+            request_id: request.request_id.clone(),
+            code: request.code,
+            verification_nonce: request.verification_nonce,
+            requester_alias: normalize_alias(request.alias.clone()),
         },
     )
     .await?;
@@ -204,7 +210,7 @@ pub(crate) async fn submit_nearby_pairing_code(
             responder_bundle,
             ..
         } => {
-            if approved_request_id != request_id {
+            if approved_request_id != request.request_id {
                 anyhow::bail!("nearby pairing request id mismatch");
             }
             (responder_bundle, message)
@@ -225,7 +231,9 @@ pub(crate) async fn submit_nearby_pairing_code(
         }
     };
 
-    let mut outcome = import_nearby_responder_bundle(state, responder_bundle, host, alias).await?;
+    let mut outcome =
+        import_nearby_responder_bundle(state, responder_bundle, &connected_host, request.alias)
+            .await?;
     if response_message.contains("already trusted") && !outcome.already_committed {
         outcome.message = format!("{response_message}; local {}", outcome.message);
     }
@@ -238,16 +246,17 @@ pub(crate) async fn start_nearby_pairing_join(
     port: u16,
     code: String,
     alias: Option<String>,
+    endpoint_candidates: &[String],
 ) -> Result<NearbyJoinStatus> {
     let normalized_code = code.trim().to_string();
     if normalized_code.is_empty() {
         anyhow::bail!("pairing code must not be empty");
     }
 
-    let target = format_host_port(host, port);
+    let targets = nearby_pairing_targets(host, port, endpoint_candidates);
     let requester_bundle = state.export_trust_bundle().await?;
-    let response = send_nearby_pairing_request(
-        &target,
+    let (response, connected_host) = send_nearby_pairing_request_to_candidates(
+        &targets,
         PairingWireRequest::NearbyJoin {
             code: normalized_code,
             requester_bundle,
@@ -256,7 +265,7 @@ pub(crate) async fn start_nearby_pairing_join(
     )
     .await?;
 
-    map_join_status_response(state, host, response, alias).await
+    map_join_status_response(state, &connected_host, response, alias).await
 }
 
 pub(crate) async fn check_nearby_pairing_join(
@@ -265,22 +274,23 @@ pub(crate) async fn check_nearby_pairing_join(
     port: u16,
     request_id: String,
     alias: Option<String>,
+    endpoint_candidates: &[String],
 ) -> Result<NearbyJoinStatus> {
     let trimmed_request_id = request_id.trim().to_string();
     if trimmed_request_id.is_empty() {
         anyhow::bail!("request_id must not be empty");
     }
 
-    let target = format_host_port(host, port);
-    let response = send_nearby_pairing_request(
-        &target,
+    let targets = nearby_pairing_targets(host, port, endpoint_candidates);
+    let (response, connected_host) = send_nearby_pairing_request_to_candidates(
+        &targets,
         PairingWireRequest::CheckNearbyJoin {
             request_id: trimmed_request_id,
         },
     )
     .await?;
 
-    map_join_status_response(state, host, response, alias).await
+    map_join_status_response(state, &connected_host, response, alias).await
 }
 
 pub fn start(state: AppState) {
@@ -488,6 +498,57 @@ async fn send_nearby_pairing_request(
     serde_json::from_str(&response_line).context("parse nearby pairing response")
 }
 
+async fn send_nearby_pairing_request_to_candidates(
+    targets: &[(String, String)],
+    request: PairingWireRequest,
+) -> Result<(PairingWireResponse, String)> {
+    let mut last_error = None;
+    for (target, host) in targets {
+        match send_nearby_pairing_request(target, request.clone()).await {
+            Ok(response) => return Ok((response, host.clone())),
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    let attempted = targets
+        .iter()
+        .map(|(target, _)| target.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(error) = last_error {
+        anyhow::bail!(
+            "nearby pairing request failed for all endpoint candidates [{attempted}]: {error:#}"
+        );
+    }
+    anyhow::bail!("nearby pairing request has no endpoint candidates")
+}
+
+fn nearby_pairing_targets(
+    host: &str,
+    port: u16,
+    endpoint_candidates: &[String],
+) -> Vec<(String, String)> {
+    let mut targets = Vec::<(String, String)>::new();
+    for endpoint in endpoint_candidates {
+        if let Ok((candidate_host, candidate_port)) =
+            app_services::desktop::host_and_pairing_port_from_endpoint(endpoint)
+        {
+            push_pairing_target(&mut targets, candidate_host, candidate_port);
+        }
+    }
+    push_pairing_target(&mut targets, host.trim().to_string(), port);
+    targets
+}
+
+fn push_pairing_target(targets: &mut Vec<(String, String)>, host: String, port: u16) {
+    let target = format_host_port(&host, port);
+    if !targets.iter().any(|(existing, _)| existing == &target) {
+        targets.push((target, host));
+    }
+}
+
 fn normalize_bundle_address_for_host(bundle: &mut TrustBundle, host: &str) -> Result<()> {
     let port = extract_port_from_network_address(bundle.network_address.trim())?;
     bundle.network_address = format_host_port(host, port);
@@ -546,17 +607,31 @@ fn normalize_alias(alias: Option<String>) -> Option<String> {
 async fn run(state: AppState) -> Result<()> {
     let snapshot = state.snapshot().await;
     let pairing_port = pairing_listener_port(snapshot.network_port);
-    let bind = format!("{PAIRING_BIND_HOST}:{pairing_port}");
-    let listener = TcpListener::bind(&bind)
-        .await
-        .with_context(|| format!("bind pairing listener {bind}"))?;
+    let mut listeners = bind_dual_stack_tcp_listeners(pairing_port)
+        .with_context(|| format!("bind pairing listener on dual-stack TCP port {pairing_port}"))?;
 
     info!(
-        bind = %bind,
+        binds = ?listeners
+            .iter()
+            .filter_map(|listener| listener.local_addr().ok())
+            .collect::<Vec<_>>(),
         network_port = snapshot.network_port,
         "nearby pairing listener started"
     );
 
+    if listeners.len() == 1 {
+        accept_pairing_loop(state, listeners.remove(0)).await
+    } else {
+        let first = listeners.remove(0);
+        let second = listeners.remove(0);
+        tokio::select! {
+            result = accept_pairing_loop(state.clone(), first) => result,
+            result = accept_pairing_loop(state, second) => result,
+        }
+    }
+}
+
+async fn accept_pairing_loop(state: AppState, listener: TcpListener) -> Result<()> {
     loop {
         let (socket, remote) = listener
             .accept()
@@ -839,6 +914,37 @@ mod tests {
         assert_eq!(extract_port_from_address("[fe80::1%4]:30100", 15100), 30100);
         assert_eq!(extract_port_from_address("example", 15100), 15100);
         assert_eq!(extract_port_from_address("", 15100), 15100);
+    }
+
+    #[test]
+    fn nearby_pairing_targets_derive_pairing_ports_from_endpoint_candidates() {
+        let targets = nearby_pairing_targets(
+            "manual-host",
+            15200,
+            &[
+                "[2001:db8::7]:15100".to_string(),
+                "10.0.0.7:15100".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            targets,
+            vec![
+                ("[2001:db8::7]:15200".to_string(), "2001:db8::7".to_string()),
+                ("10.0.0.7:15200".to_string(), "10.0.0.7".to_string()),
+                ("manual-host:15200".to_string(), "manual-host".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn nearby_pairing_targets_deduplicate_manual_candidate() {
+        let targets = nearby_pairing_targets("10.0.0.7", 15200, &["10.0.0.7:15100".to_string()]);
+
+        assert_eq!(
+            targets,
+            vec![("10.0.0.7:15200".to_string(), "10.0.0.7".to_string())]
+        );
     }
 
     #[test]

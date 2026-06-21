@@ -55,6 +55,7 @@ pub(super) fn sample_discovered_peer() -> UiDiscoveredPeer {
         machine_id: "peer-machine-1234".to_string(),
         display_name: "Office Desktop".to_string(),
         endpoint: "10.0.0.25:15100".to_string(),
+        endpoint_candidates: vec!["10.0.0.25:15100".to_string()],
     }
 }
 
@@ -65,6 +66,7 @@ pub(super) fn sample_guided_flow() -> GuidedPairingFlow {
         pairing_port: 15200,
         default_alias: "Office Desktop".to_string(),
         orientation_selector_fallback: "Office Desktop".to_string(),
+        endpoint_candidates: vec!["10.0.0.25:15100".to_string()],
     }
 }
 
