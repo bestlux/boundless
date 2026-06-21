@@ -14,7 +14,7 @@ This document records the release-hardening contract for the Boundless v5 Window
   - and the release-please `extra-files` list.
 - The Windows MSI includes tray, daemon, service host, CLI, reset helper, icon, changelog, license, README, and package manifest payloads.
 - The WiX installer is configured to close tray, daemon, and service executable names during upgrade/uninstall.
-- `installer-smoke.ps1` validates machine-wide install under `%ProgramFiles%\Boundless`, HKLM installer/uninstall evidence, shortcut targets/icons, installed executable signatures including the service host, MSI-owned service registration, AutoStart, service daemon health, optional upgrade-while-running behavior, service stop before uninstall, uninstall cleanup, absence of Boundless processes before harness cleanup, and absence of a registered Boundless service after uninstall.
+- `installer-smoke.ps1` validates machine-wide install under `%ProgramFiles%\Boundless`, HKLM installer/uninstall evidence, shortcut targets/icons, installed executable signatures including the service host, MSI-owned service registration, AutoStart, service daemon health, repair recovery after deleting `BoundlessService`, optional upgrade-while-running behavior, N-1 app and service payload replacement when a previous MSI is supplied, service stop before uninstall, uninstall cleanup, absence of Boundless processes before harness cleanup, absence of a registered Boundless service after uninstall, and removal of the Program Files service binary.
 - MSI-owned packaged-payload updates are the supported update model. The MSI installer owns install, upgrade, repair, and uninstall of tray, daemon, service payloads, and `BoundlessService`; service and tray self-update flows are unsupported/deferred.
 - The release workflow packages the Windows MSI as `Boundless-<version>-windows-x64.msi`, uploads it under the `boundless-windows-x64` workflow artifact, and publishes the same MSI name as a GitHub Release asset.
 - Windows code signing remains policy-driven:
@@ -61,5 +61,7 @@ The release readiness packet must include:
 - matching service-host version evidence from `boundless-service.exe --version`,
 - signing status for each `.exe` and `.msi`,
 - previous installer version used for upgrade validation or explicit skip rationale,
+- repair evidence proving MSI recovery of the service registration and daemon health,
+- N-1 upgrade evidence proving both app payload and service payload replacement,
 - `service_update_ownership=msi-owned` and `n_minus_1_msi_upgrade` gate status,
 - service-mode smoke summary JSON path or deferral rationale.

@@ -12,12 +12,24 @@ This guide covers migration from Boundless v4 and from Mouse Without Borders.
    & $BoundlessCtl diagnostics dump
    ```
 
-2. Check for a legacy script install at `%LocalAppData%\Programs\Boundless`.
-3. If `Boundless-Install.ps1` exists in that directory, remove the old script-based install before running the MSI. The first MSI releases intentionally block over legacy script-installed layouts.
-4. Install the v5 MSI.
-5. Open the tray dashboard.
-6. Confirm paired peers, layout, feature toggles, hotkeys, and file-transfer settings.
-7. Run the reset helper only when you intentionally want to clear local state:
+2. Check for older per-user or manual service state:
+
+   ```powershell
+   Test-Path "$env:LocalAppData\Programs\Boundless"
+   Get-Service BoundlessService -ErrorAction SilentlyContinue
+   ```
+
+3. If `Boundless-Install.ps1` exists under `%LocalAppData%\Programs\Boundless`, remove the old script-based install before running the MSI. The first MSI releases intentionally block over legacy script-installed layouts.
+4. If `BoundlessService` was installed manually from a copied service binary, uninstall that manual service from an elevated shell before using the MSI-owned service path. The v5 MSI is the owner of future service registration, repair, upgrade, and uninstall.
+5. Install the v5 MSI from an elevated shell with the intended desktop user's SID:
+
+   ```powershell
+   msiexec /i .\Boundless-<version>-windows-x64.msi BOUNDLESS_ALLOWED_USER_SID=S-...
+   ```
+
+6. Open the tray dashboard.
+7. Confirm paired peers, layout, feature toggles, hotkeys, and file-transfer settings.
+8. Run the reset helper only when you intentionally want to clear local state:
 
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass -File "$env:ProgramFiles\Boundless\Boundless-Reset.ps1" -NetworkOnly
@@ -33,7 +45,9 @@ Release validation for upgrade-while-running requires:
   -KeepArtifacts
 ```
 
-The MSI is the authoritative updater for packaged Boundless payloads. The service does not self-update, and the tray does not own update application; any future tray notification flow must launch an MSI installer rather than replacing tray, daemon, or service payloads itself.
+Release validation for full-service MSI ownership also requires repair evidence and uninstall cleanup evidence. `installer-smoke.ps1` deletes the service registration, runs MSI repair, verifies service and daemon recovery, then uninstalls and fails if the service registration or Program Files service binary remains.
+
+The MSI is the authoritative updater for packaged Boundless payloads and the `BoundlessService` lifecycle. The service does not self-update, and the tray does not own update application; any future tray notification flow must launch an MSI installer rather than replacing tray, daemon, or service payloads itself.
 
 ## From Mouse Without Borders To Boundless
 

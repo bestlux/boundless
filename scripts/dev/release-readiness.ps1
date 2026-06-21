@@ -208,6 +208,255 @@ function Get-SummaryPropertyValue {
     return $property.Value
 }
 
+function Get-ObjectPropertyValue {
+    param(
+        [object]$Object,
+        [string]$Name
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+    return $property.Value
+}
+
+function Test-StrictTrue {
+    param([object]$Value)
+
+    if ($Value -is [bool]) {
+        return $Value
+    }
+    return [string]::Equals([string]$Value, "true", [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-ExpectedServiceBinaryPath {
+    $programFilesRoot = if ([string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        "C:\Program Files"
+    }
+    else {
+        $env:ProgramFiles
+    }
+
+    return (Join-Path $programFilesRoot "Boundless\boundless-service.exe")
+}
+
+function Normalize-ServicePath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ""
+    }
+
+    $normalized = $Path.Trim().Trim('"')
+    $normalized = $normalized -replace '/', '\'
+    if ($normalized -match '^[A-Za-z]:\\') {
+        return $normalized.TrimEnd('\')
+    }
+    try {
+        return [System.IO.Path]::GetFullPath($normalized).TrimEnd('\')
+    }
+    catch {
+        return $normalized
+    }
+}
+
+function Get-ServicePathNameParts {
+    param(
+        [string]$PathName,
+        [string]$ExpectedServiceBinaryPath
+    )
+
+    $trimmed = $PathName.Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        return [pscustomobject]@{
+            ok = $false
+            executable = ""
+            arguments = ""
+            reason = "PathName was empty"
+        }
+    }
+
+    if ($trimmed -match '^\s*"(?<exe>[^"]+)"\s*(?<args>.*)$') {
+        return [pscustomobject]@{
+            ok = $true
+            executable = $Matches.exe
+            arguments = $Matches.args
+            reason = ""
+        }
+    }
+
+    if ($trimmed.StartsWith($ExpectedServiceBinaryPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $remainder = $trimmed.Substring($ExpectedServiceBinaryPath.Length)
+        if ($remainder.Length -gt 0 -and -not [char]::IsWhiteSpace($remainder[0])) {
+            return [pscustomobject]@{
+                ok = $false
+                executable = ""
+                arguments = ""
+                reason = "unquoted PathName had extra characters after the expected service executable path"
+            }
+        }
+
+        return [pscustomobject]@{
+            ok = $true
+            executable = $ExpectedServiceBinaryPath
+            arguments = $remainder.Trim()
+            reason = ""
+        }
+    }
+
+    return [pscustomobject]@{
+        ok = $false
+        executable = ""
+        arguments = ""
+        reason = "PathName was not quoted and did not begin with the expected Program Files service path"
+    }
+}
+
+function Get-AllowedUserSidFromServiceConfig {
+    param(
+        [object]$Config,
+        [string]$PathArguments
+    )
+
+    $explicitSid = [string](Get-ObjectPropertyValue -Object $Config -Name "allowed_user_sid")
+    $sidPattern = 'S-1-\d+(?:-\d+)+'
+    $argumentMatches = [regex]::Matches($PathArguments, '(?:^|\s)--allowed-user-sid=(?:"(?<quoted>S-1-\d+(?:-\d+)+)"|(?<plain>S-1-\d+(?:-\d+)+))(?=\s|$)')
+    $parsedSid = ""
+    if ($argumentMatches.Count -eq 1) {
+        $parsedSid = if (-not [string]::IsNullOrWhiteSpace($argumentMatches[0].Groups["quoted"].Value)) {
+            $argumentMatches[0].Groups["quoted"].Value
+        }
+        else {
+            $argumentMatches[0].Groups["plain"].Value
+        }
+    }
+    elseif ($argumentMatches.Count -gt 1) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "PathName contained multiple --allowed-user-sid arguments"
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($explicitSid)) {
+        if ($explicitSid -notmatch "^$sidPattern$") {
+            return [pscustomobject]@{
+                ok = $false
+                sid = ""
+                reason = "allowed_user_sid was not a strict SID string"
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($parsedSid) -and $parsedSid -ne $explicitSid) {
+            return [pscustomobject]@{
+                ok = $false
+                sid = ""
+                reason = "allowed_user_sid did not match PathName --allowed-user-sid"
+            }
+        }
+        return [pscustomobject]@{
+            ok = $true
+            sid = $explicitSid
+            reason = ""
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($parsedSid)) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "allowed user SID evidence was missing"
+        }
+    }
+
+    return [pscustomobject]@{
+        ok = $true
+        sid = $parsedSid
+        reason = ""
+    }
+}
+
+function Test-ServiceConfigEvidence {
+    param(
+        [object]$Config,
+        [string]$Label,
+        [string]$ExpectedAllowedUserSid = ""
+    )
+
+    if ($null -eq $Config) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "installer summary missing $Label"
+        }
+    }
+
+    $expectedServiceBinaryPath = Get-ExpectedServiceBinaryPath
+    $pathName = [string](Get-ObjectPropertyValue -Object $Config -Name "path_name")
+    $pathParts = Get-ServicePathNameParts -PathName $pathName -ExpectedServiceBinaryPath $expectedServiceBinaryPath
+    if (-not $pathParts.ok) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "$Label PathName was invalid: $($pathParts.reason)"
+        }
+    }
+
+    $actualServiceBinaryPath = Normalize-ServicePath -Path $pathParts.executable
+    $expectedNormalizedServiceBinaryPath = Normalize-ServicePath -Path $expectedServiceBinaryPath
+    if (-not [string]::Equals($actualServiceBinaryPath, $expectedNormalizedServiceBinaryPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "$Label PathName executable was '$actualServiceBinaryPath', expected '$expectedNormalizedServiceBinaryPath'"
+        }
+    }
+
+    $startMode = [string](Get-ObjectPropertyValue -Object $Config -Name "start_mode")
+    if ($startMode -notin @("Auto", "Automatic")) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "$Label StartMode was '$startMode', expected Auto or Automatic"
+        }
+    }
+
+    $startName = [string](Get-ObjectPropertyValue -Object $Config -Name "start_name")
+    if (-not [string]::Equals($startName, "LocalSystem", [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "$Label StartName was '$startName', expected LocalSystem"
+        }
+    }
+
+    $sidEvidence = Get-AllowedUserSidFromServiceConfig -Config $Config -PathArguments $pathParts.arguments
+    if (-not $sidEvidence.ok) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = ""
+            reason = "$Label $($sidEvidence.reason)"
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedAllowedUserSid) -and $sidEvidence.sid -ne $ExpectedAllowedUserSid) {
+        return [pscustomobject]@{
+            ok = $false
+            sid = $sidEvidence.sid
+            reason = "$Label allowed user SID changed. Expected $ExpectedAllowedUserSid, got $($sidEvidence.sid)"
+        }
+    }
+
+    return [pscustomobject]@{
+        ok = $true
+        sid = $sidEvidence.sid
+        reason = ""
+    }
+}
+
 function Normalize-ReleaseVersion {
     param([string]$Version)
 
@@ -302,6 +551,63 @@ function Add-ServiceUpdateOwnershipGate {
     Add-GateResult -Id "service_update_ownership" -Category "release" -Command "release-readiness -ServiceUpdateMode $Mode" -Status "failed" -Reason "$owner is unsupported/deferred" -Impact "release readiness accepts MSI-owned update evidence only; service and tray self-update modes must not be treated as supported update evidence"
 }
 
+function Add-ServiceLifecycleEvidenceGate {
+    param(
+        [object]$Summary,
+        [string]$Command
+    )
+
+    if ($null -eq $Summary) {
+        Add-SkippedGate -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Reason "installer smoke summary was not provided" -Impact "stable full-service installer readiness requires service install, repair, and uninstall cleanup evidence"
+        return
+    }
+
+    $serviceInstallConfig = Get-SummaryPropertyValue -Summary $Summary -Name "service_install_config"
+    $installValidation = Test-ServiceConfigEvidence -Config $serviceInstallConfig -Label "service_install_config"
+    if (-not $installValidation.ok) {
+        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason $installValidation.reason -Impact "service install evidence must prove the MSI-owned Program Files service registration"
+        return
+    }
+
+    foreach ($field in @(
+        "service_running_before_uninstall",
+        "repair_tested",
+        "service_running_after_repair",
+        "post_uninstall_processes_cleared",
+        "post_uninstall_service_removed",
+        "post_uninstall_program_files_root_removed",
+        "post_uninstall_service_binary_removed"
+    )) {
+        if (-not (Test-StrictTrue -Value (Get-SummaryPropertyValue -Summary $Summary -Name $field))) {
+            Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "installer summary did not prove $field=true" -Impact "service lifecycle evidence is incomplete"
+            return
+        }
+    }
+
+    $repairExitCode = Get-SummaryPropertyValue -Summary $Summary -Name "repair_exit_code"
+    $repairExitCodeText = [string]$repairExitCode
+    $parsedRepairExitCode = 0
+    if ($null -eq $repairExitCode -or [string]::IsNullOrWhiteSpace($repairExitCodeText) -or -not [int]::TryParse($repairExitCodeText, [ref]$parsedRepairExitCode) -or $parsedRepairExitCode -ne 0) {
+        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "repair_exit_code was not a successful MSI repair exit code: $repairExitCodeText" -Impact "repair evidence must prove service registration recovery"
+        return
+    }
+
+    $repairServiceConfig = Get-SummaryPropertyValue -Summary $Summary -Name "repair_service_config"
+    $repairValidation = Test-ServiceConfigEvidence -Config $repairServiceConfig -Label "repair_service_config" -ExpectedAllowedUserSid $installValidation.sid
+    if (-not $repairValidation.ok) {
+        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason $repairValidation.reason -Impact "repair evidence must prove MSI recovery of the same Program Files service registration and allowed user SID"
+        return
+    }
+
+    $repairDaemonStatus = [string](Get-SummaryPropertyValue -Summary $Summary -Name "repair_daemon_status_output")
+    if ([string]::IsNullOrWhiteSpace($repairDaemonStatus)) {
+        Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "failed" -Reason "installer summary missing repair_daemon_status_output" -Impact "repair evidence did not prove daemon health after service recovery"
+        return
+    }
+
+    Add-GateResult -Id "service_lifecycle_evidence" -Category "release" -Command $Command -Status "passed" -Reason "installer smoke proved MSI-owned service install, repair recovery, running state, and uninstall cleanup"
+}
+
 function Add-NMinusOneMsiUpgradeGate {
     param(
         [object]$Summary,
@@ -341,6 +647,25 @@ function Add-NMinusOneMsiUpgradeGate {
     if ($parsedPreviousInstallExitCode -ne 0) {
         Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "previous MSI install exited $parsedPreviousInstallExitCode" -Impact "N-1 MSI upgrade validation is blocked until the prior installer succeeds before current MSI upgrade"
         return
+    }
+
+    $replacement = Get-SummaryPropertyValue -Summary $Summary -Name "upgrade_payload_replacement"
+    if ($null -eq $replacement) {
+        Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "installer summary missing upgrade_payload_replacement" -Impact "N-1 evidence must prove app and service payload replacement, not only that a prior MSI ran"
+        return
+    }
+
+    foreach ($field in @(
+        "app_payload_replaced",
+        "service_payload_replaced",
+        "current_payload_owned_by_program_files",
+        "current_service_payload_owned_by_program_files",
+        "current_active_service_uses_program_files_payload"
+    )) {
+        if (-not (Test-StrictTrue -Value (Get-ObjectPropertyValue -Object $replacement -Name $field))) {
+            Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "failed" -Reason "installer summary did not prove $field=true" -Impact "N-1 MSI upgrade evidence must prove app payload and MSI-owned active service payload replacement"
+            return
+        }
     }
 
     Add-GateResult -Id "n_minus_1_msi_upgrade" -Category "release" -Command $Command -Status "passed" -LogPath $upgradedFrom
@@ -481,6 +806,7 @@ else {
 }
 
 Add-ServiceUpdateOwnershipGate -Mode $ServiceUpdateMode
+Add-ServiceLifecycleEvidenceGate -Summary $installerSmokeSummary -Command "scripts/dev/installer-smoke.ps1"
 Add-NMinusOneMsiUpgradeGate -Summary $installerSmokeSummary -Mode $ServiceUpdateMode -Command $nMinusOneMsiCommand
 
 if ($IncludeServiceSmoke) {
