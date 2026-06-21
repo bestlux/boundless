@@ -172,11 +172,27 @@ impl AppState {
         display_name: &str,
         endpoint: SocketAddr,
     ) -> Option<DiscoveredPeerEndpoint> {
+        self.set_discovered_endpoints(machine_id, display_name, vec![endpoint])
+            .await
+    }
+
+    pub async fn set_discovered_endpoints(
+        &self,
+        machine_id: &str,
+        display_name: &str,
+        mut endpoint_candidates: Vec<SocketAddr>,
+    ) -> Option<DiscoveredPeerEndpoint> {
+        endpoint_candidates.dedup();
+        let endpoint = endpoint_candidates
+            .first()
+            .copied()
+            .expect("discovered endpoint candidates must not be empty");
         let previous = self.discovery.endpoints.write().await.insert(
             machine_id.to_string(),
             DiscoveredPeerEndpoint {
                 display_name: display_name.to_string(),
                 endpoint,
+                endpoint_candidates,
             },
         );
         self.notify_peer_reconcile_wake("discovered_endpoint");
@@ -214,6 +230,16 @@ impl AppState {
             .await
             .get(machine_id)
             .map(|record| record.endpoint)
+    }
+
+    pub async fn discovered_endpoint_candidates(&self, machine_id: &str) -> Vec<SocketAddr> {
+        self.discovery
+            .endpoints
+            .read()
+            .await
+            .get(machine_id)
+            .map(|record| record.endpoint_candidates.clone())
+            .unwrap_or_default()
     }
 
     pub async fn set_mdns_active(&self, active: bool) {

@@ -272,6 +272,7 @@ message DiscoveredPeerInfo {
   string machine_id = 1;
   string display_name = 2;
   string endpoint = 3;
+  repeated string endpoint_candidates = 4;
 }
 
 message DiscoveryPeersReply {
@@ -340,6 +341,7 @@ message NearbyRequestCodeStartRequest {
   string host = 1;
   uint32 port = 2;
   string alias = 3;
+  repeated string endpoint_candidates = 4;
 }
 
 message NearbyRequestCodeStartReply {
@@ -358,6 +360,7 @@ message NearbySubmitCodeRequest {
   string code = 4;
   string verification_nonce = 5;
   string alias = 6;
+  repeated string endpoint_candidates = 7;
 }
 
 message NearbyJoinStartRequest {
@@ -365,6 +368,7 @@ message NearbyJoinStartRequest {
   uint32 port = 2;
   string code = 3;
   string alias = 4;
+  repeated string endpoint_candidates = 5;
 }
 
 message NearbyJoinStatusRequest {
@@ -372,6 +376,7 @@ message NearbyJoinStatusRequest {
   uint32 port = 2;
   string request_id = 3;
   string alias = 4;
+  repeated string endpoint_candidates = 5;
 }
 
 message NearbyJoinStatusReply {

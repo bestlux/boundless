@@ -160,6 +160,8 @@ mod windows_app {
         machine_id: String,
         display_name: String,
         endpoint: String,
+        #[serde(default)]
+        endpoint_candidates: Vec<String>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -209,6 +211,7 @@ mod windows_app {
         pairing_port: u16,
         default_alias: String,
         orientation_selector_fallback: String,
+        endpoint_candidates: Vec<String>,
     }
 
     #[derive(Debug, Clone)]
@@ -229,6 +232,16 @@ mod windows_app {
     struct PairingSubmitResult {
         peer_machine_id: String,
         message: String,
+    }
+
+    struct NearbySubmitCode {
+        request_id: String,
+        code: String,
+        verification_nonce: String,
+        host: String,
+        port: u16,
+        alias: Option<String>,
+        endpoint_candidates: Vec<String>,
     }
 
     include!("dashboard.rs");
@@ -303,6 +316,7 @@ mod windows_app {
                             machine_id: peer.machine_id,
                             display_name: peer.display_name,
                             endpoint: peer.endpoint,
+                            endpoint_candidates: peer.endpoint_candidates,
                         })
                         .collect(),
                     paired_peers: snapshot
@@ -415,28 +429,21 @@ mod windows_app {
         endpoint: &str,
         host: String,
         port: u16,
+        endpoint_candidates: Vec<String>,
     ) -> Result<NearbyRequestCodeStart> {
-        block_on_result(pair_nearby_request_code(endpoint, host, port))
+        block_on_result(pair_nearby_request_code(
+            endpoint,
+            host,
+            port,
+            endpoint_candidates,
+        ))
     }
 
     fn pair_nearby_submit_code_blocking(
         endpoint: &str,
-        request_id: String,
-        code: String,
-        verification_nonce: String,
-        host: String,
-        port: u16,
-        alias: Option<String>,
+        request: NearbySubmitCode,
     ) -> Result<PairingSubmitResult> {
-        block_on_result(pair_nearby_submit_code(
-            endpoint,
-            request_id,
-            code,
-            verification_nonce,
-            host,
-            port,
-            alias,
-        ))
+        block_on_result(pair_nearby_submit_code(endpoint, request))
     }
 
     fn approve_nearby_pairing_request_blocking(endpoint: &str, request_id: &str) -> Result<String> {
@@ -922,6 +929,7 @@ mod windows_app {
         endpoint: &str,
         host: String,
         port: u16,
+        endpoint_candidates: Vec<String>,
     ) -> Result<NearbyRequestCodeStart> {
         let mut client = connect_control_plane(endpoint).await?;
         let response = client
@@ -929,6 +937,7 @@ mod windows_app {
                 host,
                 port: u32::from(port),
                 alias: String::new(),
+                endpoint_candidates,
             })
             .await?
             .into_inner();
@@ -952,22 +961,19 @@ mod windows_app {
 
     async fn pair_nearby_submit_code(
         endpoint: &str,
-        request_id: String,
-        code: String,
-        verification_nonce: String,
-        host: String,
-        port: u16,
-        alias: Option<String>,
+        request: NearbySubmitCode,
     ) -> Result<PairingSubmitResult> {
+        let expected_request_id = request.request_id.clone();
         let mut client = connect_control_plane(endpoint).await?;
         let response = client
             .submit_nearby_pairing_code(NearbySubmitCodeRequest {
-                host,
-                port: u32::from(port),
-                request_id: request_id.clone(),
-                code,
-                verification_nonce,
-                alias: alias.unwrap_or_default(),
+                host: request.host,
+                port: u32::from(request.port),
+                request_id: request.request_id.clone(),
+                code: request.code,
+                verification_nonce: request.verification_nonce,
+                alias: request.alias.unwrap_or_default(),
+                endpoint_candidates: request.endpoint_candidates,
             })
             .await?
             .into_inner();
@@ -975,7 +981,7 @@ mod windows_app {
         if !response.ok {
             bail!("nearby pairing failed: {}", response.message);
         }
-        if response.request_id != request_id {
+        if response.request_id != expected_request_id {
             bail!("nearby pairing request id mismatch");
         }
 
@@ -1233,11 +1239,13 @@ mod windows_app {
                     machine_id: "machine-alpha-1234".to_string(),
                     display_name: "Office Desktop".to_string(),
                     endpoint: "10.10.0.10:15100".to_string(),
+                    endpoint_candidates: vec!["10.10.0.10:15100".to_string()],
                 },
                 UiDiscoveredPeer {
                     machine_id: "machine-bravo-5678".to_string(),
                     display_name: "Living Room".to_string(),
                     endpoint: "10.10.0.11:15100".to_string(),
+                    endpoint_candidates: vec!["10.10.0.11:15100".to_string()],
                 },
             ];
 
@@ -1255,11 +1263,13 @@ mod windows_app {
                     machine_id: "machine-alpha-1234".to_string(),
                     display_name: "Office".to_string(),
                     endpoint: "10.10.0.10:15100".to_string(),
+                    endpoint_candidates: vec!["10.10.0.10:15100".to_string()],
                 },
                 UiDiscoveredPeer {
                     machine_id: "machine-beta-5678".to_string(),
                     display_name: "Office Laptop".to_string(),
                     endpoint: "10.10.0.11:15100".to_string(),
+                    endpoint_candidates: vec!["10.10.0.11:15100".to_string()],
                 },
             ];
 

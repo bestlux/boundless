@@ -197,45 +197,54 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
         alias,
         timeout_seconds,
     } = args;
-    let (host, pairing_port, default_alias, selector_hint, target_label, target_endpoint) =
-        if let Some(host_override) = host_override {
-            let host = host_override.trim().to_string();
-            if host.is_empty() {
-                bail!("--host must not be empty");
-            }
-            let pairing_port = port_override.unwrap_or(15200);
-            (
-                host.clone(),
-                pairing_port,
-                None,
-                selector.clone(),
-                host.clone(),
-                format_host_port(&host, pairing_port),
-            )
-        } else {
-            let discovered = list_discovered_peer_records(endpoint).await?;
-            if discovered.is_empty() {
-                if request_id.is_some() {
-                    bail!(
-                        "no discovered peers available for selector `{selector}`; retry with `--host <target-host-or-ip> --port <pairing-port>`"
-                    );
-                }
+    let (
+        host,
+        pairing_port,
+        default_alias,
+        selector_hint,
+        target_label,
+        target_endpoint,
+        endpoint_candidates,
+    ) = if let Some(host_override) = host_override {
+        let host = host_override.trim().to_string();
+        if host.is_empty() {
+            bail!("--host must not be empty");
+        }
+        let pairing_port = port_override.unwrap_or(15200);
+        (
+            host.clone(),
+            pairing_port,
+            None,
+            selector.clone(),
+            host.clone(),
+            format_host_port(&host, pairing_port),
+            Vec::new(),
+        )
+    } else {
+        let discovered = list_discovered_peer_records(endpoint).await?;
+        if discovered.is_empty() {
+            if request_id.is_some() {
                 bail!(
-                    "no discovered peers available; try `pair nearby-join <code> --host <host> --port <port>`"
+                    "no discovered peers available for selector `{selector}`; retry with `--host <target-host-or-ip> --port <pairing-port>`"
                 );
             }
-            let selected = resolve_discovered_peer_record(&discovered, &selector)?;
-            let (host, pairing_port) = host_and_pairing_port_from_endpoint(&selected.endpoint)
-                .with_context(|| format!("invalid discovered endpoint {}", selected.endpoint))?;
-            (
-                host,
-                pairing_port,
-                Some(selected.display_name.clone()),
-                selected.machine_id.clone(),
-                selected.display_name.clone(),
-                selected.endpoint.clone(),
-            )
-        };
+            bail!(
+                "no discovered peers available; try `pair nearby-join <code> --host <host> --port <port>`"
+            );
+        }
+        let selected = resolve_discovered_peer_record(&discovered, &selector)?;
+        let (host, pairing_port) = host_and_pairing_port_from_endpoint(&selected.endpoint)
+            .with_context(|| format!("invalid discovered endpoint {}", selected.endpoint))?;
+        (
+            host,
+            pairing_port,
+            Some(selected.display_name.clone()),
+            selected.machine_id.clone(),
+            selected.display_name.clone(),
+            selected.endpoint.clone(),
+            selected.endpoint_candidates.clone(),
+        )
+    };
 
     let alias = alias.or(default_alias);
     println!(
@@ -272,6 +281,7 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
                 code,
                 verification_nonce,
                 alias: alias.unwrap_or_default(),
+                endpoint_candidates,
             },
         )
         .await;
@@ -281,10 +291,27 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
         if code.trim().is_empty() {
             bail!("pairing code must not be empty");
         }
-        return pair_nearby_join(endpoint, code, host, pairing_port, timeout_seconds, alias).await;
+        return pair_nearby_join(
+            endpoint,
+            code,
+            host,
+            pairing_port,
+            timeout_seconds,
+            alias,
+            endpoint_candidates,
+        )
+        .await;
     }
 
-    match pair_nearby_request_code(endpoint, host.clone(), pairing_port, alias).await? {
+    match pair_nearby_request_code(
+        endpoint,
+        host.clone(),
+        pairing_port,
+        alias,
+        endpoint_candidates,
+    )
+    .await?
+    {
         NearbyRequestCodeStart::CodeRequired {
             request_id,
             verification_nonce,
@@ -322,11 +349,11 @@ pub(super) async fn setup_wizard(endpoint: &str, start_daemon: bool) -> Result<(
     }
 
     let discovered = list_discovered_peer_records(endpoint).await?;
-    let (host, pairing_port, default_alias) = if discovered.is_empty() {
+    let (host, pairing_port, default_alias, endpoint_candidates) = if discovered.is_empty() {
         println!("No discovered peers yet. Falling back to manual host entry.");
         let host = prompt_required("Peer host/IP")?;
         let port = prompt_u16_with_default("Peer nearby pairing port", 15200)?;
-        (host, port, None)
+        (host, port, None, Vec::new())
     } else {
         println!("Discovered peers:");
         for (index, peer) in discovered.iter().enumerate() {
@@ -343,12 +370,17 @@ pub(super) async fn setup_wizard(endpoint: &str, start_daemon: bool) -> Result<(
         if selector.eq_ignore_ascii_case("manual") {
             let host = prompt_required("Peer host/IP")?;
             let port = prompt_u16_with_default("Peer nearby pairing port", 15200)?;
-            (host, port, None)
+            (host, port, None, Vec::new())
         } else {
             let selected = resolve_discovered_peer_record(&discovered, &selector)?;
             let (host, pairing_port) = host_and_pairing_port_from_endpoint(&selected.endpoint)
                 .with_context(|| format!("invalid discovered endpoint {}", selected.endpoint))?;
-            (host, pairing_port, Some(selected.display_name.clone()))
+            (
+                host,
+                pairing_port,
+                Some(selected.display_name.clone()),
+                selected.endpoint_candidates.clone(),
+            )
         }
     };
 
@@ -359,7 +391,16 @@ pub(super) async fn setup_wizard(endpoint: &str, start_daemon: bool) -> Result<(
     }
 
     let alias = prompt_optional_with_default("Alias for this peer", default_alias.as_deref())?;
-    pair_nearby_join(endpoint, code, host, pairing_port, 120, alias.clone()).await?;
+    pair_nearby_join(
+        endpoint,
+        code,
+        host,
+        pairing_port,
+        120,
+        alias.clone(),
+        endpoint_candidates,
+    )
+    .await?;
 
     let updated_peers = list_peer_records(endpoint).await?;
     let new_peer = find_new_peer_record(&existing_peers, &updated_peers).or_else(|| {
@@ -447,6 +488,7 @@ pub(super) async fn pair_nearby_join(
     port: u16,
     timeout_seconds: u64,
     alias: Option<String>,
+    endpoint_candidates: Vec<String>,
 ) -> Result<()> {
     let alias_value = alias.unwrap_or_default();
     let mut control_plane = connect_control_plane(endpoint).await?;
@@ -456,17 +498,21 @@ pub(super) async fn pair_nearby_join(
             port: u32::from(port),
             code,
             alias: alias_value.clone(),
+            endpoint_candidates: endpoint_candidates.clone(),
         })
         .await?
         .into_inner();
     let peer_machine_id = wait_for_nearby_pairing_approval(
         endpoint,
-        &host,
-        u32::from(port),
-        initial_response,
-        timeout_seconds,
-        "",
-        alias_value,
+        NearbyApprovalPoll {
+            host,
+            port: u32::from(port),
+            initial_response,
+            timeout_seconds,
+            expected_request_id: String::new(),
+            alias: alias_value,
+            endpoint_candidates,
+        },
     )
     .await?;
     println!("accepted=true peer_machine_id={peer_machine_id} message=nearby pairing complete");
@@ -484,11 +530,22 @@ enum NearbyRequestCodeStart {
     },
 }
 
+struct NearbyApprovalPoll {
+    host: String,
+    port: u32,
+    initial_response: ipc_api::boundless::v1::NearbyJoinStatusReply,
+    timeout_seconds: u64,
+    expected_request_id: String,
+    alias: String,
+    endpoint_candidates: Vec<String>,
+}
+
 async fn pair_nearby_request_code(
     endpoint: &str,
     host: String,
     port: u16,
     alias: Option<String>,
+    endpoint_candidates: Vec<String>,
 ) -> Result<NearbyRequestCodeStart> {
     let mut control_plane = connect_control_plane(endpoint).await?;
     let response = control_plane
@@ -496,6 +553,7 @@ async fn pair_nearby_request_code(
             host,
             port: u32::from(port),
             alias: alias.unwrap_or_default(),
+            endpoint_candidates,
         })
         .await?
         .into_inner();
@@ -523,13 +581,17 @@ async fn pair_nearby_request_code(
 
 async fn wait_for_nearby_pairing_approval(
     endpoint: &str,
-    host: &str,
-    port: u32,
-    initial_response: ipc_api::boundless::v1::NearbyJoinStatusReply,
-    timeout_seconds: u64,
-    expected_request_id: &str,
-    alias: String,
+    poll: NearbyApprovalPoll,
 ) -> Result<String> {
+    let NearbyApprovalPoll {
+        host,
+        port,
+        initial_response,
+        timeout_seconds,
+        expected_request_id,
+        alias,
+        endpoint_candidates,
+    } = poll;
     let mut response = initial_response;
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_seconds.max(5));
     let mut poll_count = 0_u64;
@@ -538,7 +600,9 @@ async fn wait_for_nearby_pairing_approval(
         let status = response.status.trim().to_ascii_lowercase();
         match status.as_str() {
             "approved" => {
-                if !expected_request_id.is_empty() && response.request_id != expected_request_id {
+                if !expected_request_id.is_empty()
+                    && response.request_id != expected_request_id.as_str()
+                {
                     bail!("nearby pairing request id mismatch");
                 }
                 if response.peer_machine_id.trim().is_empty() {
@@ -552,7 +616,7 @@ async fn wait_for_nearby_pairing_approval(
                     "pending=true request_id={} message={}",
                     request_id, response.message
                 );
-                if !expected_request_id.is_empty() && request_id != expected_request_id {
+                if !expected_request_id.is_empty() && request_id != expected_request_id.as_str() {
                     bail!("nearby pairing request id mismatch");
                 }
 
@@ -575,10 +639,11 @@ async fn wait_for_nearby_pairing_approval(
                     let mut control_plane = connect_control_plane(endpoint).await?;
                     response = control_plane
                         .check_nearby_pairing_join(NearbyJoinStatusRequest {
-                            host: host.to_string(),
+                            host: host.clone(),
                             port,
                             request_id: request_id.clone(),
                             alias: alias.clone(),
+                            endpoint_candidates: endpoint_candidates.clone(),
                         })
                         .await?
                         .into_inner();
@@ -1915,6 +1980,7 @@ struct UiDiscoveredPeer {
     machine_id: String,
     display_name: String,
     endpoint: String,
+    endpoint_candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1978,6 +2044,7 @@ pub(super) async fn ui_snapshot(endpoint: &str, start_daemon: bool) -> Result<()
                 machine_id: peer.machine_id,
                 display_name: peer.display_name,
                 endpoint: peer.endpoint,
+                endpoint_candidates: peer.endpoint_candidates,
             })
             .collect(),
         paired_peers: snapshot
@@ -2053,6 +2120,7 @@ struct DiscoveredPeerRecord {
     machine_id: String,
     display_name: String,
     endpoint: String,
+    endpoint_candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2078,6 +2146,7 @@ async fn list_discovered_peer_records(endpoint: &str) -> Result<Vec<DiscoveredPe
             machine_id: peer.machine_id,
             display_name: peer.display_name,
             endpoint: peer.endpoint,
+            endpoint_candidates: peer.endpoint_candidates,
         })
         .collect::<Vec<_>>();
     Ok(filter_connectable_discovered_peer_records(
@@ -2579,11 +2648,13 @@ mod tests {
                 machine_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
                 display_name: "office-desktop".to_string(),
                 endpoint: "10.0.0.10:15100".to_string(),
+                endpoint_candidates: Vec::new(),
             },
             DiscoveredPeerRecord {
                 machine_id: "11111111-2222-3333-4444-555555555555".to_string(),
                 display_name: "laptop".to_string(),
                 endpoint: "10.0.0.11:15100".to_string(),
+                endpoint_candidates: Vec::new(),
             },
         ];
 
@@ -2598,16 +2669,19 @@ mod tests {
                 machine_id: "local-machine".to_string(),
                 display_name: "This PC".to_string(),
                 endpoint: "10.0.0.1:15100".to_string(),
+                endpoint_candidates: Vec::new(),
             },
             DiscoveredPeerRecord {
                 machine_id: "paired-machine".to_string(),
                 display_name: "Different Alias".to_string(),
                 endpoint: "10.0.0.2:15100".to_string(),
+                endpoint_candidates: Vec::new(),
             },
             DiscoveredPeerRecord {
                 machine_id: "brand-new-machine".to_string(),
                 display_name: "Office Desktop".to_string(),
                 endpoint: "10.0.0.3:15100".to_string(),
+                endpoint_candidates: Vec::new(),
             },
         ];
         let paired = vec![PeerRecord {

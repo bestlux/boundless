@@ -84,6 +84,7 @@ fn guided_flow_from_discovered_peer(peer: &UiDiscoveredPeer) -> Result<GuidedPai
         pairing_port,
         default_alias: peer.display_name.clone(),
         orientation_selector_fallback: peer.display_name.clone(),
+        endpoint_candidates: peer.endpoint_candidates.clone(),
     })
 }
 
@@ -94,6 +95,7 @@ fn guided_flow_from_manual_input(host: &str, port_text: &str) -> Result<GuidedPa
         pairing_port: parse_pairing_port(port_text)?,
         default_alias: String::new(),
         orientation_selector_fallback: host.to_string(),
+        endpoint_candidates: Vec::new(),
     })
 }
 

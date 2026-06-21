@@ -87,6 +87,8 @@ pub struct UiDiscoveredPeer {
     pub machine_id: String,
     pub display_name: String,
     pub endpoint: String,
+    #[serde(default)]
+    pub endpoint_candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

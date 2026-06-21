@@ -135,16 +135,19 @@ fn filter_connectable_discovered_peers_hides_self_and_existing_pairings() {
             machine_id: "local-machine-1234".to_string(),
             display_name: "This PC".to_string(),
             endpoint: "10.0.0.1:15100".to_string(),
+            endpoint_candidates: vec!["10.0.0.1:15100".to_string()],
         },
         UiDiscoveredPeer {
             machine_id: "peer-machine-1234".to_string(),
             display_name: "Different Alias".to_string(),
             endpoint: "10.0.0.25:15100".to_string(),
+            endpoint_candidates: vec!["10.0.0.25:15100".to_string()],
         },
         UiDiscoveredPeer {
             machine_id: "peer-machine-5678".to_string(),
             display_name: "Office Desktop".to_string(),
             endpoint: "10.0.0.26:15100".to_string(),
+            endpoint_candidates: vec!["10.0.0.26:15100".to_string()],
         },
     ];
     let paired = vec![UiPairedPeer {
