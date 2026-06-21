@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use app_services::desktop::redacted_tcp_endpoint_label;
 use core_security::TrustBundle;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -117,6 +118,19 @@ pub(crate) struct NearbySubmitCode {
     pub(crate) verification_nonce: String,
     pub(crate) alias: Option<String>,
     pub(crate) endpoint_candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PairingTarget {
+    endpoint: String,
+    host: String,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
+struct PairingReachabilityAttempt {
+    label: String,
+    outcome: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -442,9 +456,9 @@ async fn send_nearby_pairing_request(
     let mut socket = time::timeout(NEARBY_PAIRING_CONNECT_TIMEOUT, TcpStream::connect(target))
         .await
         .with_context(|| {
-            nearby_pairing_connect_timeout_message(target, NEARBY_PAIRING_CONNECT_TIMEOUT.as_secs())
+            nearby_pairing_connect_timeout_message(NEARBY_PAIRING_CONNECT_TIMEOUT.as_secs())
         })?
-        .with_context(|| format!("connect nearby pairing endpoint {target}"))?;
+        .context("connect nearby pairing endpoint")?;
     let payload = serde_json::to_string(&request).context("serialize nearby pairing request")?;
     time::timeout(
         NEARBY_PAIRING_IO_TIMEOUT,
@@ -499,28 +513,24 @@ async fn send_nearby_pairing_request(
 }
 
 async fn send_nearby_pairing_request_to_candidates(
-    targets: &[(String, String)],
+    targets: &[PairingTarget],
     request: PairingWireRequest,
 ) -> Result<(PairingWireResponse, String)> {
-    let mut last_error = None;
-    for (target, host) in targets {
-        match send_nearby_pairing_request(target, request.clone()).await {
-            Ok(response) => return Ok((response, host.clone())),
+    let mut attempts = Vec::new();
+    for target in targets {
+        match send_nearby_pairing_request(&target.endpoint, request.clone()).await {
+            Ok(response) => return Ok((response, target.host.clone())),
             Err(error) => {
-                last_error = Some(error);
+                attempts.push(PairingReachabilityAttempt {
+                    label: target.label.clone(),
+                    outcome: classify_pairing_reachability_error(&error),
+                });
             }
         }
     }
 
-    let attempted = targets
-        .iter()
-        .map(|(target, _)| target.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    if let Some(error) = last_error {
-        anyhow::bail!(
-            "nearby pairing request failed for all endpoint candidates [{attempted}]: {error:#}"
-        );
+    if !attempts.is_empty() {
+        anyhow::bail!("{}", pairing_reachability_failure_message(&attempts));
     }
     anyhow::bail!("nearby pairing request has no endpoint candidates")
 }
@@ -529,8 +539,8 @@ fn nearby_pairing_targets(
     host: &str,
     port: u16,
     endpoint_candidates: &[String],
-) -> Vec<(String, String)> {
-    let mut targets = Vec::<(String, String)>::new();
+) -> Vec<PairingTarget> {
+    let mut targets = Vec::<PairingTarget>::new();
     for endpoint in endpoint_candidates {
         if let Ok((candidate_host, candidate_port)) =
             app_services::desktop::host_and_pairing_port_from_endpoint(endpoint)
@@ -542,11 +552,49 @@ fn nearby_pairing_targets(
     targets
 }
 
-fn push_pairing_target(targets: &mut Vec<(String, String)>, host: String, port: u16) {
+fn push_pairing_target(targets: &mut Vec<PairingTarget>, host: String, port: u16) {
     let target = format_host_port(&host, port);
-    if !targets.iter().any(|(existing, _)| existing == &target) {
-        targets.push((target, host));
+    if !targets.iter().any(|existing| existing.endpoint == target) {
+        targets.push(PairingTarget {
+            label: redacted_tcp_endpoint_label(&target),
+            endpoint: target,
+            host,
+        });
     }
+}
+
+fn classify_pairing_reachability_error(error: &anyhow::Error) -> &'static str {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                )
+            })
+    }) {
+        return "refused";
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("timed out") {
+        "timeout"
+    } else {
+        "failed"
+    }
+}
+
+fn pairing_reachability_failure_message(attempts: &[PairingReachabilityAttempt]) -> String {
+    let attempted = attempts
+        .iter()
+        .map(|attempt| format!("{} {}", attempt.label, attempt.outcome))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[{attempted}]; likely firewall/VLAN/asymmetric-route reachability issue before trust/code/daemon pairing could complete; next_action=verify Private network, VLAN routing, and manual admin-approved firewall policy for the listed TCP ports"
+    )
 }
 
 fn normalize_bundle_address_for_host(bundle: &mut TrustBundle, host: &str) -> Result<()> {
@@ -883,13 +931,8 @@ fn extract_port_from_address(address: &str, default_port: u16) -> u16 {
     default_port
 }
 
-fn nearby_pairing_connect_timeout_message(target: &str, timeout_seconds: u64) -> String {
-    let remote_port = parse_port_suffix(target)
-        .map(|port| format!(" remote TCP {port}"))
-        .unwrap_or_else(|| " the remote nearby pairing TCP port".to_string());
-    format!(
-        "connect nearby pairing endpoint {target} timed out after {timeout_seconds}s; likely network/firewall reachability issue for{remote_port}"
-    )
+fn nearby_pairing_connect_timeout_message(timeout_seconds: u64) -> String {
+    format!("connect nearby pairing endpoint timed out after {timeout_seconds}s")
 }
 
 fn parse_port_suffix(address: &str) -> Option<u16> {
@@ -930,9 +973,21 @@ mod tests {
         assert_eq!(
             targets,
             vec![
-                ("[2001:db8::7]:15200".to_string(), "2001:db8::7".to_string()),
-                ("10.0.0.7:15200".to_string(), "10.0.0.7".to_string()),
-                ("manual-host:15200".to_string(), "manual-host".to_string()),
+                PairingTarget {
+                    endpoint: "[2001:db8::7]:15200".to_string(),
+                    host: "2001:db8::7".to_string(),
+                    label: "tcp ipv6 port 15200".to_string(),
+                },
+                PairingTarget {
+                    endpoint: "10.0.0.7:15200".to_string(),
+                    host: "10.0.0.7".to_string(),
+                    label: "tcp ipv4 port 15200".to_string(),
+                },
+                PairingTarget {
+                    endpoint: "manual-host:15200".to_string(),
+                    host: "manual-host".to_string(),
+                    label: "tcp hostname port 15200".to_string(),
+                },
             ]
         );
     }
@@ -943,18 +998,94 @@ mod tests {
 
         assert_eq!(
             targets,
-            vec![("10.0.0.7:15200".to_string(), "10.0.0.7".to_string())]
+            vec![PairingTarget {
+                endpoint: "10.0.0.7:15200".to_string(),
+                host: "10.0.0.7".to_string(),
+                label: "tcp ipv4 port 15200".to_string(),
+            }]
         );
     }
 
     #[test]
-    fn nearby_pairing_connect_timeout_names_reachability_and_port() {
-        let message = nearby_pairing_connect_timeout_message("10.10.0.187:15200", 4);
+    fn nearby_pairing_failure_names_reachability_without_raw_endpoint() {
+        let attempts = vec![
+            PairingReachabilityAttempt {
+                label: "tcp ipv6 port 15200".to_string(),
+                outcome: "timeout",
+            },
+            PairingReachabilityAttempt {
+                label: "tcp ipv4 port 15200".to_string(),
+                outcome: "refused",
+            },
+        ];
+        let message = pairing_reachability_failure_message(&attempts);
 
-        assert!(message.contains("10.10.0.187:15200"));
-        assert!(message.contains("timed out after 4s"));
-        assert!(message.contains("network/firewall reachability"));
-        assert!(message.contains("remote TCP 15200"));
+        assert!(message.contains("mDNS discovery succeeded"));
+        assert!(message.contains("TCP pairing reachability failed"));
+        assert!(message.contains("tcp ipv6 port 15200 timeout"));
+        assert!(message.contains("tcp ipv4 port 15200 refused"));
+        assert!(message.contains("next_action=verify Private network"));
+        assert!(!message.contains("10.10.0.187"));
+    }
+
+    #[tokio::test]
+    async fn nearby_pairing_candidates_continue_until_reachable_endpoint() {
+        let blocked =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve blocked candidate port");
+        let blocked_endpoint = blocked.local_addr().expect("blocked candidate address");
+        drop(blocked);
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("reachable candidate listener");
+        let reachable_addr = listener.local_addr().expect("reachable candidate address");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept pairing probe");
+            let mut reader = BufReader::new(socket);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read pairing request");
+            assert!(line.contains("\"request_id\":\"ready-candidate\""));
+            let mut socket = reader.into_inner();
+            socket
+                .write_all(
+                    br#"{"status":"pending","request_id":"ready-candidate","message":"pending"}"#,
+                )
+                .await
+                .expect("write pairing response");
+            socket
+                .write_all(b"\n")
+                .await
+                .expect("write response newline");
+        });
+
+        let targets = vec![
+            PairingTarget {
+                endpoint: blocked_endpoint.to_string(),
+                host: blocked_endpoint.ip().to_string(),
+                label: redacted_tcp_endpoint_label(&blocked_endpoint.to_string()),
+            },
+            PairingTarget {
+                endpoint: reachable_addr.to_string(),
+                host: reachable_addr.ip().to_string(),
+                label: redacted_tcp_endpoint_label(&reachable_addr.to_string()),
+            },
+        ];
+
+        let (response, connected_host) = send_nearby_pairing_request_to_candidates(
+            &targets,
+            PairingWireRequest::CheckNearbyJoin {
+                request_id: "ready-candidate".to_string(),
+            },
+        )
+        .await
+        .expect("reachable later candidate succeeds");
+
+        assert_eq!(connected_host, reachable_addr.ip().to_string());
+        assert!(matches!(response, PairingWireResponse::Pending { .. }));
+        server.await.expect("server task completes");
     }
 
     #[test]

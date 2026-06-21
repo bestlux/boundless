@@ -162,10 +162,21 @@ async fn peer_worker(state: AppState, peer_id: String) {
         }
 
         if !connected {
+            state.record_transport_event(crate::state::TransportEventRecord {
+                timestamp: chrono::Utc::now(),
+                direction: "outbound".to_string(),
+                kind: "transport_reachability_failed".to_string(),
+                peer_id: peer_id.clone(),
+                detail: transport_reachability_failure_detail(
+                    &target_candidates,
+                    !discovered_endpoints.is_empty(),
+                ),
+                size_bytes: 0,
+            });
             warn!(
                 peer_id = %peer_id,
                 configured_address = %peer.address,
-                target_candidates = ?target_candidates,
+                target_candidates = ?redacted_tcp_endpoint_labels_for_runtime(&target_candidates),
                 discovered_endpoints = ?discovered_endpoints,
                 error = ?last_error,
                 "outbound connect failed"
@@ -192,4 +203,47 @@ pub(super) fn outbound_target_candidates(
     discovered_endpoints: &[SocketAddr],
 ) -> Vec<String> {
     transport_outbound_target_candidates(configured_address, discovered_endpoints)
+}
+
+fn transport_reachability_failure_detail(candidates: &[String], mdns_discovered: bool) -> String {
+    format!(
+        "mdns_discovered={} tcp_transport_reachability=failed attempted=[{}] next_action=verify Private network, VLAN routing, and manual admin-approved firewall policy for the listed TCP ports",
+        mdns_discovered,
+        redacted_tcp_endpoint_labels_for_runtime(candidates)
+    )
+}
+
+fn redacted_tcp_endpoint_labels_for_runtime(candidates: &[String]) -> String {
+    if candidates.is_empty() {
+        return "none".to_string();
+    }
+    candidates
+        .iter()
+        .map(|candidate| app_services::desktop::redacted_tcp_endpoint_label(candidate))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_reachability_failure_detail_redacts_candidates() {
+        let detail = transport_reachability_failure_detail(
+            &[
+                "[fe80::1%4]:15100".to_string(),
+                "10.0.0.9:15100".to_string(),
+            ],
+            true,
+        );
+
+        assert!(detail.contains("mdns_discovered=true"));
+        assert!(detail.contains("tcp_transport_reachability=failed"));
+        assert!(detail.contains("tcp ipv6 port 15100"));
+        assert!(detail.contains("tcp ipv4 port 15100"));
+        assert!(detail.contains("next_action=verify Private network"));
+        assert!(!detail.contains("10.0.0.9"));
+        assert!(!detail.contains("fe80::1"));
+    }
 }

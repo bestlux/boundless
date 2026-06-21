@@ -62,6 +62,54 @@ pub fn host_and_pairing_port_from_endpoint(endpoint: &str) -> Result<(String, u1
     bail!("discovery endpoint must include host and port")
 }
 
+pub fn redacted_tcp_endpoint_label(endpoint: &str) -> String {
+    match parse_endpoint_family_and_port(endpoint) {
+        Some((family, port)) => format!("tcp {family} port {port}"),
+        None => "tcp invalid endpoint".to_string(),
+    }
+}
+
+pub fn redacted_tcp_endpoint_labels(endpoints: &[String]) -> String {
+    if endpoints.is_empty() {
+        return "none".to_string();
+    }
+    endpoints
+        .iter()
+        .map(|endpoint| redacted_tcp_endpoint_label(endpoint))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parse_endpoint_family_and_port(endpoint: &str) -> Option<(&'static str, u16)> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(socket) = trimmed.parse::<SocketAddr>() {
+        let family = if socket.is_ipv4() { "ipv4" } else { "ipv6" };
+        return Some((family, socket.port()));
+    }
+
+    let (host, _) = if let Some(host) = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.split_once(']'))
+    {
+        (host.0.trim(), host.1)
+    } else {
+        trimmed.rsplit_once(':')?
+    };
+    let port = extract_port_from_endpoint(trimmed).ok()?;
+    let family = if host.contains(':') {
+        "ipv6"
+    } else if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        "ipv4"
+    } else {
+        "hostname"
+    };
+    Some((family, port))
+}
+
 pub fn parse_pairing_port(value: &str) -> Result<u16> {
     let pairing_port = value
         .parse::<u16>()
@@ -451,6 +499,23 @@ mod tests {
 
         assert_eq!(host, "fe80::1%4");
         assert_eq!(port, 15200);
+    }
+
+    #[test]
+    fn redacted_tcp_endpoint_labels_preserve_family_and_port_only() {
+        let labels = redacted_tcp_endpoint_labels(&[
+            "10.0.0.9:15100".to_string(),
+            "[fe80::1%4]:15200".to_string(),
+            "office-pc.local:15100".to_string(),
+        ]);
+
+        assert_eq!(
+            labels,
+            "tcp ipv4 port 15100, tcp ipv6 port 15200, tcp hostname port 15100"
+        );
+        assert!(!labels.contains("10.0.0.9"));
+        assert!(!labels.contains("fe80::1"));
+        assert!(!labels.contains("office-pc"));
     }
 
     #[test]
