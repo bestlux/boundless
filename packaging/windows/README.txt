@@ -8,6 +8,7 @@ This installer deploys:
 - boundlessctl.exe
 - Boundless-Install.ps1
 - Boundless-Reset.ps1
+- Boundless-ConnectivityDiagnostics.ps1
 - README.txt
 - LICENSE.txt
 - CHANGELOG.md
@@ -52,6 +53,16 @@ Recovery
 --------
 - Boundless-Reset.ps1 -NetworkOnly
 - Boundless-Reset.ps1 -All
+
+Connectivity diagnostics
+------------------------
+- Boundless-ConnectivityDiagnostics.ps1 is read-only. It checks local listener/process ownership and, when a remote host is supplied, TCP reachability for Boundless transport port 15100 and nearby pairing port 15200.
+- Example:
+
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%ProgramFiles%\Boundless\Boundless-ConnectivityDiagnostics.ps1" -RemoteHost 10.10.0.187
+
+- Boundless does not silently create firewall rules. If you add rules manually, use an elevated shell only after explicit approval, restrict them to the Private profile, and scope them to %ProgramFiles%\Boundless\boundless-service.exe.
+- Do not expose Boundless ports on Public networks or through router port forwarding.
 
 Notes
 -----

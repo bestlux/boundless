@@ -49,9 +49,20 @@ Checks:
 ```powershell
 & $BoundlessCtl transport events --limit 100
 & $BoundlessCtl diagnostics dump
+& "$env:ProgramFiles\Boundless\Boundless-ConnectivityDiagnostics.ps1" -RemoteHost 10.10.0.187
 ```
 
-Boundless v5 does not silently add firewall rules. Firewall rule install/check/remove remains a release follow-up unless a future admin-approved command is used. If manual host pairing works only after local firewall changes, verify inbound TCP `15100` and `15200` reachability for `%ProgramFiles%\Boundless\boundless-service.exe` on the Private network profile.
+The connectivity diagnostics script is read-only. It reports the active Windows network profiles, local listener/process ownership for TCP `15100` and `15200`, and remote TCP reachability for those ports when `-RemoteHost` is supplied. TCP `15200` is the nearby pairing listener; TCP `15100` is the transport listener used after trust is established.
+
+Boundless v5 does not silently add firewall rules. If pairing fails with a message such as `connect nearby pairing endpoint 10.10.0.187:15200 timed out`, treat it as a target reachability or firewall problem for remote TCP `15200` before debugging trust or code entry.
+
+If manual host pairing works only after local firewall changes, verify inbound TCP `15100` and `15200` reachability for `%ProgramFiles%\Boundless\boundless-service.exe` on the Private network profile. Any firewall change should be run from an elevated shell only after explicit approval. Keep rules scoped to the Private profile and the Boundless service executable, for example:
+
+```powershell
+$ServiceExe = "$env:ProgramFiles\Boundless\boundless-service.exe"
+New-NetFirewallRule -DisplayName "Boundless TCP 15100 Private" -Direction Inbound -Action Allow -Profile Private -Protocol TCP -LocalPort 15100 -Program $ServiceExe
+New-NetFirewallRule -DisplayName "Boundless TCP 15200 Private" -Direction Inbound -Action Allow -Profile Private -Protocol TCP -LocalPort 15200 -Program $ServiceExe
+```
 
 If you add firewall rules manually, restrict them to trusted private LAN profiles and known peer IPs. Do not port-forward or expose Boundless control, pairing, or transport ports to the internet or public networks.
 

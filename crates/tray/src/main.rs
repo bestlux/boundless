@@ -1145,8 +1145,11 @@ mod windows_app {
             || lowered.contains("connect nearby pairing endpoint")
             || lowered.contains("send nearby pairing request timed out")
         {
+            let remote_port = extract_pairing_error_remote_port(&message)
+                .map(|port| format!(" TCP {port}"))
+                .unwrap_or_else(|| " the nearby pairing TCP port".to_string());
             return format!(
-                "{message}\n\nThe remote pairing service stalled.\nRetry pairing. If this repeats, restart the target daemon and tray."
+                "{message}\n\nThe remote pairing service was discovered, but{remote_port} was not reachable or did not respond.\nVerify both machines are on a trusted Private network. If a firewall rule is needed, make it a manual, admin-approved Private-profile rule scoped to %ProgramFiles%\\Boundless\\boundless-service.exe. Transport also needs TCP 15100 after trust is established."
             );
         }
 
@@ -1179,6 +1182,14 @@ mod windows_app {
         digits.parse::<u8>().ok()
     }
 
+    fn extract_pairing_error_remote_port(message: &str) -> Option<u16> {
+        let endpoint_marker = "nearby pairing endpoint ";
+        let endpoint_start = message.find(endpoint_marker)? + endpoint_marker.len();
+        let endpoint = message[endpoint_start..].split_whitespace().next()?;
+        let (_, raw_port) = endpoint.rsplit_once(':')?;
+        raw_port.parse::<u16>().ok().filter(|port| *port != 0)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::dashboard_layout::compute_visible_bounds;
@@ -1193,6 +1204,26 @@ mod windows_app {
         #[test]
         fn extract_attempts_remaining_ignores_missing_marker() {
             assert_eq!(extract_attempts_remaining("no attempts here"), None);
+        }
+
+        #[test]
+        fn extract_pairing_error_remote_port_reads_endpoint_port() {
+            let message = "connect nearby pairing endpoint 10.10.0.187:15200 timed out after 4s";
+            assert_eq!(extract_pairing_error_remote_port(message), Some(15200));
+        }
+
+        #[test]
+        fn format_error_for_dialog_names_firewall_and_pairing_port() {
+            let error = anyhow::anyhow!(
+                "connect nearby pairing endpoint 10.10.0.187:15200 timed out after 4s; likely network/firewall reachability issue for remote TCP 15200"
+            );
+            let formatted = format_error_for_dialog(&error);
+
+            assert!(formatted.contains("TCP 15200"));
+            assert!(formatted.contains("Private network"));
+            assert!(formatted.contains("admin-approved"));
+            assert!(formatted.contains("%ProgramFiles%\\Boundless\\boundless-service.exe"));
+            assert!(formatted.contains("TCP 15100"));
         }
 
         #[test]
