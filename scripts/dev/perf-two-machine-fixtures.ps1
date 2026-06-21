@@ -36,6 +36,10 @@ $fileTransferLab = Join-Path $repoRoot "scripts/dev/perf-file-transfer-lab.ps1"
 if (-not (Test-Path -LiteralPath $fileTransferLab)) {
     throw "Missing file-transfer lab script: $fileTransferLab"
 }
+$reconnectInputSoakLab = Join-Path $repoRoot "scripts/dev/perf-reconnect-input-soak-lab.ps1"
+if (-not (Test-Path -LiteralPath $reconnectInputSoakLab)) {
+    throw "Missing reconnect/input/soak lab script: $reconnectInputSoakLab"
+}
 
 function Redact-FixtureLogLine {
     param([object]$Value)
@@ -277,6 +281,43 @@ foreach ($row in $largeRows) {
         throw "File-transfer large-file metadata must preserve a 1 GiB payload size."
     }
 }
+
+$reconnectCaseRoot = Join-Path $OutputRoot "reconnect-input-soak-lab"
+New-Item -ItemType Directory -Force -Path $reconnectCaseRoot | Out-Null
+$reconnectCaptured = & powershell -NoProfile -ExecutionPolicy Bypass -File $reconnectInputSoakLab -Mode Validate -OutputRoot $reconnectCaseRoot *>&1
+$reconnectExitCode = if ($null -eq $global:LASTEXITCODE) { 0 } else { $global:LASTEXITCODE }
+$reconnectCaptured | ForEach-Object { Redact-FixtureLogLine $_ } | Set-Content -LiteralPath (Join-Path $reconnectCaseRoot "reconnect-input-soak-lab.log") -Encoding utf8
+if ($reconnectExitCode -ne 0) {
+    throw "Reconnect/input/soak lab fixture failed with exit code $reconnectExitCode; see generated fixture log"
+}
+
+$reconnectPacketPath = Join-Path $reconnectCaseRoot "two-machine-evidence.json"
+if (-not (Test-Path -LiteralPath $reconnectPacketPath)) {
+    throw "Reconnect/input/soak lab fixture did not produce two-machine-evidence.json."
+}
+$reconnectPacket = Get-Content -LiteralPath $reconnectPacketPath -Raw | ConvertFrom-Json
+$reconnectSummary = @($reconnectPacket.summary.scenario_summaries | Where-Object { $_.scenario -eq "reconnect-input" })[0]
+$soakSummary = @($reconnectPacket.summary.scenario_summaries | Where-Object { $_.scenario -eq "soak" })[0]
+if ($reconnectSummary.success_count -ne 17 -or $reconnectSummary.failure_count -ne 1 -or $reconnectSummary.skipped_count -ne 6) {
+    throw "Reconnect/input lab summary did not preserve expected success/failure/skipped counts."
+}
+if ($reconnectSummary.failure_subsystems.input -ne 1 -or $reconnectSummary.failure_subsystems.network -ne 6) {
+    throw "Reconnect/input lab summary did not preserve input/network subsystem counts."
+}
+if ($reconnectSummary.latency_ms.p50 -le 0 -or $reconnectSummary.latency_ms.p95 -le 0 -or $reconnectSummary.latency_ms.max -le 0) {
+    throw "Reconnect/input lab summary did not compute latency percentiles."
+}
+if ($soakSummary.success_count -ne 1 -or $soakSummary.skipped_count -ne 1) {
+    throw "Soak lab summary did not preserve 30-minute pass plus 2-hour manual skip."
+}
+if ($soakSummary.resource_trend.sample_count -ne 4 -or $soakSummary.resource_trend.cpu_percent.p50 -le 0 -or $soakSummary.resource_trend.memory_mb.p95 -le 0) {
+    throw "Soak lab summary did not preserve bounded CPU/memory trend shape."
+}
+$reconnectObservations = @($reconnectPacket.observations)
+Assert-PacketFieldSet -Observations $reconnectObservations -PropertyName "scenario_variant" -ExpectedValues @("input-edge-handoff", "reconnect-network-loss-manual", "reconnect-service-restart", "reconnect-tray-restart", "soak-30-minute", "soak-2-hour-manual") -Label "reconnect/input/soak scenario variants"
+Assert-PacketFieldSet -Observations $reconnectObservations -PropertyName "failure_subsystem" -ExpectedValues @("input", "network", "unknown") -Label "reconnect/input/soak failure subsystems"
+Assert-PacketFieldSet -Observations $reconnectObservations -PropertyName "active_peer_class" -ExpectedValues @("no-active-peer", "trusted-peer", "unknown") -Label "reconnect/input/soak active peer classes"
+Assert-PacketFieldSet -Observations $reconnectObservations -PropertyName "input_capture_state" -ExpectedValues @("capture-failed", "locked-to-peer", "not-captured", "released", "unavailable", "unknown") -Label "reconnect/input/soak input capture states"
 
 foreach ($artifact in Get-ChildItem -LiteralPath $OutputRoot -File -Recurse -Include "*.json", "*.md", "*.log") {
     $content = Get-Content -LiteralPath $artifact.FullName -Raw

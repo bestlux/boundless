@@ -325,6 +325,14 @@ function New-Observation {
         [Nullable[int]]$FileCount = $null,
         [Nullable[int]]$RetryCount = $null,
         [Nullable[int]]$ReconnectCount = $null,
+        [string]$FailureSubsystem = "",
+        [string]$InputCaptureState = "",
+        [string]$ActivePeerClass = "",
+        [string]$TransportEventSummary = "",
+        [string]$SoakProfile = "",
+        [Nullable[double]]$SoakDurationMinutes = $null,
+        [bool]$ManualDisruptive = $false,
+        [object[]]$ResourceTrendSamples = @(),
         [string]$ProvisionalClassification = "",
         [string]$ProvisionalClassificationReason = ""
     )
@@ -385,6 +393,14 @@ function New-Observation {
         file_count = if ($null -ne $FileCount) { [int]$FileCount } else { $null }
         retry_count = if ($null -ne $RetryCount) { [int]$RetryCount } else { $null }
         reconnect_count = if ($null -ne $ReconnectCount) { [int]$ReconnectCount } else { $null }
+        failure_subsystem = Redact-Text $FailureSubsystem
+        input_capture_state = Redact-Text $InputCaptureState
+        active_peer_class = Redact-Text $ActivePeerClass
+        transport_event_summary = Redact-Text $TransportEventSummary
+        soak_profile = Redact-Text $SoakProfile
+        soak_duration_minutes = if ($null -ne $SoakDurationMinutes) { [Math]::Round($SoakDurationMinutes, 3) } else { $null }
+        manual_disruptive = $ManualDisruptive
+        resource_trend_samples = @(ConvertTo-ResourceTrendSamples -Value $ResourceTrendSamples)
         throughput_mbps = $throughputMbps
         measurement_source = $MeasurementSource
         failure_kind = Redact-Text $FailureKind
@@ -447,6 +463,40 @@ function ConvertTo-ObservationBoolean {
     }
 
     return ([string]$Value).Equals("true", [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function ConvertTo-ResourceTrendSamples {
+    param([object]$Value)
+
+    $items = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Value) {
+        return @()
+    }
+
+    $sourceItems = @($Value)
+    foreach ($sample in $sourceItems) {
+        if ($items.Count -ge 60) {
+            break
+        }
+
+        $sampleIndex = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $sample -Name "sample_index") -Integer
+        $elapsedSeconds = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $sample -Name "elapsed_seconds")
+        $cpuPercent = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $sample -Name "cpu_percent")
+        $memoryMb = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $sample -Name "memory_mb")
+
+        if ($null -eq $sampleIndex -and $null -eq $elapsedSeconds -and $null -eq $cpuPercent -and $null -eq $memoryMb) {
+            continue
+        }
+
+        $items.Add([pscustomobject]@{
+                sample_index = if ($null -ne $sampleIndex) { [int]$sampleIndex } else { $items.Count + 1 }
+                elapsed_seconds = if ($null -ne $elapsedSeconds) { [Math]::Round([double]$elapsedSeconds, 3) } else { $null }
+                cpu_percent = if ($null -ne $cpuPercent) { [Math]::Round([double]$cpuPercent, 3) } else { $null }
+                memory_mb = if ($null -ne $memoryMb) { [Math]::Round([double]$memoryMb, 3) } else { $null }
+            })
+    }
+
+    return @($items.ToArray())
 }
 
 function Normalize-ProvisionalClassification {
@@ -543,6 +593,8 @@ function Read-ObservationFile {
         $fileCount = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "file_count") -Integer
         $retryCount = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "retry_count") -Integer
         $reconnectCount = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "reconnect_count") -Integer
+        $soakDurationMinutes = ConvertTo-ObservationNumber -Value (Get-ObjectProperty -Object $source -Name "soak_duration_minutes")
+        $resourceTrendSamples = @(ConvertTo-ResourceTrendSamples -Value (Get-ObjectProperty -Object $source -Name "resource_trend_samples"))
         $observationArgs = @{
             RunScenario = $scenarioName
             RunIteration = [int]$iteration
@@ -574,6 +626,14 @@ function Read-ObservationFile {
             FileCount = $fileCount
             RetryCount = $retryCount
             ReconnectCount = $reconnectCount
+            FailureSubsystem = Redact-Text (Get-ObjectProperty -Object $source -Name "failure_subsystem")
+            InputCaptureState = Redact-Text (Get-ObjectProperty -Object $source -Name "input_capture_state")
+            ActivePeerClass = Redact-Text (Get-ObjectProperty -Object $source -Name "active_peer_class")
+            TransportEventSummary = Redact-Text (Get-ObjectProperty -Object $source -Name "transport_event_summary")
+            SoakProfile = Redact-Text (Get-ObjectProperty -Object $source -Name "soak_profile")
+            SoakDurationMinutes = $soakDurationMinutes
+            ManualDisruptive = ConvertTo-ObservationBoolean (Get-ObjectProperty -Object $source -Name "manual_disruptive")
+            ResourceTrendSamples = $resourceTrendSamples
             ProvisionalClassification = Normalize-ProvisionalClassification (Get-ObjectProperty -Object $source -Name "provisional_classification")
             ProvisionalClassificationReason = Redact-Text (Get-ObjectProperty -Object $source -Name "provisional_classification_reason")
         }
@@ -647,6 +707,9 @@ function New-ScenarioSummary {
     $bytesTotal = 0L
     $retryCountTotal = 0
     $reconnectCountTotal = 0
+    $resourceSampleCount = 0
+    $cpuValues = New-Object System.Collections.Generic.List[double]
+    $memoryValues = New-Object System.Collections.Generic.List[double]
     foreach ($row in $passed) {
         if ($null -ne $row.bytes) {
             $bytesTotal += [int64]$row.bytes
@@ -656,6 +719,17 @@ function New-ScenarioSummary {
         }
         if ($null -ne $row.reconnect_count) {
             $reconnectCountTotal += [int]$row.reconnect_count
+        }
+    }
+    foreach ($row in $rows) {
+        foreach ($sample in @($row.resource_trend_samples)) {
+            $resourceSampleCount += 1
+            if ($null -ne $sample.cpu_percent) {
+                $cpuValues.Add([double]$sample.cpu_percent)
+            }
+            if ($null -ne $sample.memory_mb) {
+                $memoryValues.Add([double]$sample.memory_mb)
+            }
         }
     }
     $payloadByteValues = @($rows | Where-Object { $null -ne $_.payload_bytes } | ForEach-Object { [int64]$_.payload_bytes })
@@ -701,8 +775,32 @@ function New-ScenarioSummary {
         throughput_mbps = $throughputMbps
         retry_count_total = $retryCountTotal
         reconnect_count_total = $reconnectCountTotal
+        manual_disruptive_count = @($rows | Where-Object { $_.manual_disruptive -eq $true }).Count
+        soak_duration_minutes = [pscustomobject]@{
+            p50 = Get-Percentile -Values @($passed | Where-Object { $null -ne $_.soak_duration_minutes } | ForEach-Object { [double]$_.soak_duration_minutes }) -Percentile 50
+            p95 = Get-Percentile -Values @($passed | Where-Object { $null -ne $_.soak_duration_minutes } | ForEach-Object { [double]$_.soak_duration_minutes }) -Percentile 95
+            max = if (@($passed | Where-Object { $null -ne $_.soak_duration_minutes }).Count -gt 0) { [Math]::Round([double](@($passed | Where-Object { $null -ne $_.soak_duration_minutes } | ForEach-Object { [double]$_.soak_duration_minutes } | Measure-Object -Maximum).Maximum), 3) } else { $null }
+        }
+        resource_trend = [pscustomobject]@{
+            sample_count = $resourceSampleCount
+            cpu_percent = [pscustomobject]@{
+                p50 = Get-Percentile -Values @($cpuValues.ToArray()) -Percentile 50
+                p95 = Get-Percentile -Values @($cpuValues.ToArray()) -Percentile 95
+                max = if ($cpuValues.Count -gt 0) { [Math]::Round([double](@($cpuValues.ToArray()) | Measure-Object -Maximum).Maximum, 3) } else { $null }
+            }
+            memory_mb = [pscustomobject]@{
+                p50 = Get-Percentile -Values @($memoryValues.ToArray()) -Percentile 50
+                p95 = Get-Percentile -Values @($memoryValues.ToArray()) -Percentile 95
+                max = if ($memoryValues.Count -gt 0) { [Math]::Round([double](@($memoryValues.ToArray()) | Measure-Object -Maximum).Maximum, 3) } else { $null }
+            }
+        }
         directions = @($rows | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.direction) } | ForEach-Object { [string]$_.direction } | Sort-Object -Unique)
         scenario_variants = @($rows | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.scenario_variant) } | ForEach-Object { [string]$_.scenario_variant } | Sort-Object -Unique)
+        active_peer_classes = Get-ObservationValueCounts -Rows $rows -PropertyName "active_peer_class"
+        input_capture_states = Get-ObservationValueCounts -Rows $rows -PropertyName "input_capture_state"
+        failure_subsystems = Get-ObservationValueCounts -Rows $rows -PropertyName "failure_subsystem"
+        soak_profiles = Get-ObservationValueCounts -Rows $rows -PropertyName "soak_profile"
+        transport_event_summaries = Get-ObservationValueCounts -Rows $rows -PropertyName "transport_event_summary"
         file_count_classes = Get-ObservationValueCounts -Rows $rows -PropertyName "file_count_class"
         integrity_hash_statuses = Get-ObservationValueCounts -Rows $rows -PropertyName "integrity_hash_status"
         cleanup_statuses = Get-ObservationValueCounts -Rows $rows -PropertyName "cleanup_status"
