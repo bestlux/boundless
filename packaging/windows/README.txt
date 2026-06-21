@@ -13,12 +13,16 @@ This installer deploys:
 
 Recommended flow
 ----------------
-1. Run the MSI installer from an elevated prompt or through Windows elevation.
+1. Run the MSI installer from an elevated prompt with the intended desktop user's SID:
+
+   msiexec /i Boundless-<version>-windows-x64.msi BOUNDLESS_ALLOWED_USER_SID=S-...
+
 2. Launch Boundless from the Start Menu, desktop shortcut, or boundlesstray.exe.
 
 Install behavior
 ----------------
 - Default install root: %ProgramFiles%\Boundless
+- Default service integration: registers and starts BoundlessService as LocalSystem with AutoStart, using the supplied BOUNDLESS_ALLOWED_USER_SID for the control-pipe ACL
 - Default startup integration: deferred; the machine-wide MSI does not create a Startup-folder shortcut yet
 - Default Start Menu entry: machine-wide Start Menu Programs shortcut for Boundless
 - Default desktop entry: machine-wide desktop shortcut for Boundless
@@ -40,6 +44,6 @@ Recovery
 Notes
 -----
 - The MSI blocks over an existing legacy script-installed Boundless layout. Remove the old script-based install first, then rerun the installer.
-- The MSI installs boundless-service.exe as a payload under Program Files, but it does not register or start BoundlessService yet.
+- The MSI fails closed without BOUNDLESS_ALLOWED_USER_SID so elevation does not silently authorize the wrong Windows account.
 - The tray and CLI default to the local named-pipe API endpoint.
 - If your daemon is configured for TCP, launch the tray or CLI with an explicit endpoint.

@@ -40,7 +40,9 @@ mod service_entry {
         host::{HostOverrides, run_with},
         logging, shared_control_plane_app,
     };
-    use platform_windows::runtime::named_pipe_incoming_for_allowed_user;
+    use platform_windows::runtime::{
+        named_pipe_incoming_for_allowed_user, validate_allowed_user_sid_shape,
+    };
 
     const SERVICE_NAME: &str = "BoundlessService";
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
@@ -88,8 +90,10 @@ mod service_entry {
 
         let runtime = tokio::runtime::Runtime::new().map_err(windows_service::Error::Winapi)?;
         let result = runtime.block_on(async move {
-            status_handle.set_service_status(service_status(ServiceState::Running))?;
-            let result = run_daemon(shutdown_rx, allowed_user_sid).await;
+            let result = run_daemon(shutdown_rx, allowed_user_sid, || {
+                status_handle.set_service_status(service_status(ServiceState::Running))
+            })
+            .await;
             status_handle.set_service_status(service_status(ServiceState::StopPending))?;
             result
         });
@@ -112,6 +116,7 @@ mod service_entry {
     async fn run_daemon(
         mut shutdown_rx: watch::Receiver<bool>,
         allowed_user_sid: String,
+        mark_running: impl FnOnce() -> windows_service::Result<()>,
     ) -> Result<()> {
         run_with(
             HostOverrides {
@@ -133,6 +138,7 @@ mod service_entry {
                 .with_context(|| {
                     format!("initialize named pipe {}", runtime.snapshot.api_pipe_name)
                 })?;
+                mark_running().context("report service running after named-pipe bind")?;
 
                 Server::builder()
                     .add_service(control_plane)
@@ -165,12 +171,7 @@ mod service_entry {
                 continue;
             };
             if let Some(sid) = value.strip_prefix("--allowed-user-sid=") {
-                let sid = sid.trim();
-                if sid.starts_with("S-1-")
-                    && !sid.contains(';')
-                    && !sid.contains(')')
-                    && !sid.contains('(')
-                {
+                if validate_allowed_user_sid_shape(sid) {
                     return Ok(sid.to_string());
                 }
                 anyhow::bail!("service allowed user SID argument was invalid");
@@ -232,6 +233,41 @@ mod service_entry {
                 "--allowed-user-sid=S-1-5-21-1);(A;;GA;;;WD",
             )])
             .expect_err("must reject");
+
+            assert!(
+                err.to_string()
+                    .contains("service allowed user SID argument was invalid")
+            );
+        }
+
+        #[test]
+        fn parse_allowed_user_sid_rejects_non_numeric_shape() {
+            let err =
+                parse_allowed_user_sid(vec![OsString::from("--allowed-user-sid=S-1-not-a-sid")])
+                    .expect_err("must reject");
+
+            assert!(
+                err.to_string()
+                    .contains("service allowed user SID argument was invalid")
+            );
+        }
+
+        #[test]
+        fn parse_allowed_user_sid_rejects_empty_segment() {
+            let err = parse_allowed_user_sid(vec![OsString::from("--allowed-user-sid=S-1-5--21")])
+                .expect_err("must reject");
+
+            assert!(
+                err.to_string()
+                    .contains("service allowed user SID argument was invalid")
+            );
+        }
+
+        #[test]
+        fn parse_allowed_user_sid_rejects_surrounding_whitespace() {
+            let err =
+                parse_allowed_user_sid(vec![OsString::from("--allowed-user-sid= S-1-5-21-1")])
+                    .expect_err("must reject");
 
             assert!(
                 err.to_string()

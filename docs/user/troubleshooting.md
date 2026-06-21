@@ -87,7 +87,7 @@ Checks:
 & $BoundlessCtl daemon status
 ```
 
-Service mode is not silently registered or started by the machine-wide MSI. Install it only from an elevated shell and the admin-protected `%ProgramFiles%\Boundless\boundless-service.exe` path. The service control pipe is ACL'd to `SYSTEM`, Administrators, and the installing user.
+The machine-wide MSI registers and starts `BoundlessService` from `%ProgramFiles%\Boundless\boundless-service.exe` when installed with an explicit `BOUNDLESS_ALLOWED_USER_SID=S-...`. Manual `boundlessctl service install` is a developer fallback for unpackaged builds. The service control pipe is ACL'd to `SYSTEM`, Administrators, and the selected user SID.
 
 If the service is running but the CLI cannot connect, stop the normal tray and per-user daemon first so only one process owns the named pipe. Elevated-app and lock-screen claims remain deferred until Windows runtime evidence proves them.
 

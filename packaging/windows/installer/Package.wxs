@@ -19,6 +19,7 @@
     <Property Id="ARPPRODUCTICON" Value="BoundlessIcon.ico" />
     <Property Id="ARPNOMODIFY" Value="1" />
     <Property Id="ARPNOREPAIR" Value="1" />
+    <Property Id="BOUNDLESS_ALLOWED_USER_SID" Secure="yes" />
     <util:CloseApplication
       Id="CloseBoundlessTray"
       Target="boundlesstray.exe"
@@ -47,6 +48,60 @@
     <Launch
       Condition="Installed OR NOT BOUNDLESSLEGACYSCRIPTINSTALL"
       Message="A legacy script-installed Boundless build was detected in %LocalAppData%\Programs\Boundless. Uninstall the script-based package first, then rerun this installer." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (BOUNDLESS_ALLOWED_USER_SID AND BOUNDLESS_ALLOWED_USER_SID &lt;&lt; "S-1-")'
+      Message="BoundlessService requires an explicit numeric SID such as BOUNDLESS_ALLOWED_USER_SID=S-1-5-21-..." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "--") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&gt; "-"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must not contain empty numeric segments." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; " ") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; ";") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "(") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; ")") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "["))'
+      Message="BOUNDLESS_ALLOWED_USER_SID contains invalid SID characters." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "]") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; ".") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "_") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "/") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "\"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID contains invalid SID characters." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "A") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "B") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "C") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "D") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "E"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must contain only S, digits, and dashes." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "F") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "G") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "H") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "I") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "J"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must contain only S, digits, and dashes." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "K") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "L") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "M") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "N") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "O"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must contain only S, digits, and dashes." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "P") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "Q") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "R") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "T") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "U"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must contain only S, digits, and dashes." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "V") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "W") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "X") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "Y") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "Z"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must contain only S, digits, and dashes." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "a") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "b") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "c") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "d") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "e"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must contain only S, digits, and dashes." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "f") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "g") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "h") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "i") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "j"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must contain only S, digits, and dashes." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "k") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "l") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "m") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "n") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "o"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must contain only S, digits, and dashes." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "p") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "q") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "r") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "s") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "t"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must contain only S, digits, and dashes." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "u") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "v") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "w"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must contain only S, digits, and dashes." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "x") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "y") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "z"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must contain only S, digits, and dashes." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "-S") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "-s") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "0S") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "1S"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must contain only one leading S." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "2S") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "3S") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "4S") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "5S"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must contain only one leading S." />
+    <Launch
+      Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "6S") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "7S") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "8S") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "9S"))'
+      Message="BOUNDLESS_ALLOWED_USER_SID must contain only one leading S." />
 
     <Feature Id="MainFeature" Title="Boundless" Level="1">
       <ComponentGroupRef Id="BoundlessPayload" />
@@ -84,6 +139,23 @@
       </Component>
       <Component Id="BoundlessServicePayloadComponent" Guid="84E63D4D-84EE-485D-91CF-A5E04D07EC86">
         <File Id="ServiceBinaryFile" Source="$(var.PayloadDir)\boundless-service.exe" KeyPath="yes" />
+        <ServiceInstall
+          Id="BoundlessServiceInstall"
+          Name="BoundlessService"
+          DisplayName="Boundless Service"
+          Description="Boundless service-mode daemon host."
+          Type="ownProcess"
+          Start="auto"
+          ErrorControl="normal"
+          Account="LocalSystem"
+          Arguments="--allowed-user-sid=[BOUNDLESS_ALLOWED_USER_SID]" />
+        <ServiceControl
+          Id="BoundlessServiceControl"
+          Name="BoundlessService"
+          Start="install"
+          Stop="both"
+          Remove="uninstall"
+          Wait="yes" />
         <RegistryValue
           Root="HKLM"
           Key="Software\Boundless\Installer"

@@ -4,6 +4,7 @@ param(
     [string]$InstallerPath = "",
     [string]$PreviousInstallerPath = "",
     [string]$OutputRoot = "",
+    [string]$AllowedUserSid = "",
     [switch]$RequireSignature,
     [switch]$KeepArtifacts
 )
@@ -191,6 +192,21 @@ function Test-IsAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Get-CurrentUserSid {
+    return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+}
+
+function Assert-AllowedUserSid {
+    param([string]$Sid)
+
+    if ([string]::IsNullOrWhiteSpace($Sid)) {
+        throw "Allowed user SID was empty. Provide -AllowedUserSid with the intended desktop user SID."
+    }
+    if ($Sid -notmatch '^S-1-\d+(?:-\d+)+$') {
+        throw "Allowed user SID was not a strict SID string: $Sid"
+    }
+}
+
 function Get-InstallerEvidence {
     $keyPath = "Registry::HKEY_LOCAL_MACHINE\Software\Boundless\Installer"
     if (-not (Test-Path -LiteralPath $keyPath)) {
@@ -284,6 +300,77 @@ function Get-BoundlessService {
         Select-Object -First 1
 }
 
+function Get-BoundlessServiceConfig {
+    Get-CimInstance -ClassName Win32_Service -Filter "Name='BoundlessService'" -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+}
+
+function Wait-BoundlessServiceStatus {
+    param(
+        [string]$ExpectedStatus,
+        [int]$TimeoutSeconds = 30
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $service = Get-BoundlessService
+        if ($null -ne $service -and $service.Status.ToString() -eq $ExpectedStatus) {
+            return $service
+        }
+
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+
+    if ($null -eq $service) {
+        throw "BoundlessService was not found while waiting for $ExpectedStatus."
+    }
+    throw "BoundlessService did not reach $ExpectedStatus within $($TimeoutSeconds)s; current=$($service.Status)."
+}
+
+function Assert-BoundlessServiceConfig {
+    param(
+        [string]$ExpectedServicePath,
+        [string]$ExpectedAllowedUserSid
+    )
+
+    $service = Get-BoundlessServiceConfig
+    if ($null -eq $service) {
+        throw "BoundlessService was not registered by the installer."
+    }
+
+    if ($service.PathName -notmatch [regex]::Escape($ExpectedServicePath)) {
+        throw "BoundlessService PathName did not point at the Program Files service binary. PathName=$($service.PathName)"
+    }
+    if ($service.PathName -notmatch "(^|\\s)--allowed-user-sid=([^\\s]+)") {
+        throw "BoundlessService PathName did not include --allowed-user-sid. PathName=$($service.PathName)"
+    }
+
+    $sidMatches = [regex]::Matches($service.PathName, "--allowed-user-sid=([^\\s]+)")
+    if ($sidMatches.Count -ne 1) {
+        throw "BoundlessService PathName must include exactly one --allowed-user-sid argument. PathName=$($service.PathName)"
+    }
+    $actualSid = $sidMatches[0].Groups[1].Value.Trim('"')
+    if ($actualSid -ne $ExpectedAllowedUserSid) {
+        throw "BoundlessService allowed user SID mismatch. Expected $ExpectedAllowedUserSid, got $actualSid."
+    }
+
+    if ($service.StartMode -ne "Auto") {
+        throw "BoundlessService StartMode was expected to be Auto, got $($service.StartMode)."
+    }
+    if ($service.StartName -ne "LocalSystem") {
+        throw "BoundlessService StartName was expected to be LocalSystem, got $($service.StartName)."
+    }
+
+    return [ordered]@{
+        name = $service.Name
+        path_name = $service.PathName
+        start_mode = $service.StartMode
+        start_name = $service.StartName
+        state = $service.State
+        allowed_user_sid = $actualSid
+    }
+}
+
 function Wait-ForDaemonReady {
     param(
         [string]$CliPath,
@@ -359,6 +446,14 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
 }
 Ensure-Directory -Path $OutputRoot
 
+$allowedUserSidSource = "explicit"
+if ([string]::IsNullOrWhiteSpace($AllowedUserSid)) {
+    $AllowedUserSid = Get-CurrentUserSid
+    $allowedUserSidSource = "current_process"
+}
+Assert-AllowedUserSid -Sid $AllowedUserSid
+$msiInstallProperties = @("BOUNDLESS_ALLOWED_USER_SID=$AllowedUserSid")
+
 if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
     if ([string]::IsNullOrWhiteSpace($Version)) {
         throw "Provide either -InstallerPath or -Version."
@@ -425,7 +520,7 @@ try {
 
     if (-not [string]::IsNullOrWhiteSpace($PreviousInstallerPath)) {
         $PreviousInstallerPath = (Resolve-Path -LiteralPath $PreviousInstallerPath).Path
-        $upgradeInstallExitCode = Invoke-MsiExec -ArgumentList @("/i", $PreviousInstallerPath, "/qn", "/norestart") -LogPath $upgradeLog
+        $upgradeInstallExitCode = Invoke-MsiExec -ArgumentList (@("/i", $PreviousInstallerPath, "/qn", "/norestart") + $msiInstallProperties) -LogPath $upgradeLog
 
         if ($interactiveDesktopSession) {
             $previousInstallRoot = $legacyInstallRoot
@@ -447,7 +542,7 @@ try {
         }
     }
 
-    $installExitCode = Invoke-MsiExec -ArgumentList @("/i", $InstallerPath, "/qn", "/norestart") -LogPath $installLog
+    $installExitCode = Invoke-MsiExec -ArgumentList (@("/i", $InstallerPath, "/qn", "/norestart") + $msiInstallProperties) -LogPath $installLog
 
     $daemonPath = Join-Path $installRoot "boundlessd.exe"
     $servicePath = Join-Path $installRoot "boundless-service.exe"
@@ -464,9 +559,9 @@ try {
     Assert-PathExists -Path $desktopShortcutPath -Message "Desktop shortcut is missing."
     Assert-PathMissing -Path $currentUserStartupShortcutPath -Message "Installer created a current-user Startup shortcut, but tray startup is deferred in the 9B-2 machine-wide skeleton."
     Assert-PathMissing -Path $commonStartupShortcutPath -Message "Installer created a common Startup shortcut, but tray startup is deferred in the 9B-2 machine-wide skeleton."
-    if ($null -ne (Get-BoundlessService)) {
-        throw "Installer registered BoundlessService during install; 9B-2 must leave service registration deferred."
-    }
+    $serviceInstallConfig = Assert-BoundlessServiceConfig -ExpectedServicePath $servicePath -ExpectedAllowedUserSid $AllowedUserSid
+    Wait-BoundlessServiceStatus -ExpectedStatus "Running" | Out-Null
+    $serviceDaemonStatusOutput = Wait-ForDaemonReady -CliPath $cliPath
 
     foreach ($shortcutPath in @($startMenuShortcutPath, $desktopShortcutPath)) {
         if ((Get-ShortcutTarget -ShortcutPath $shortcutPath) -ne $trayPath) {
@@ -558,6 +653,8 @@ try {
         }
     }
 
+    $serviceRunningBeforeUninstall = (Get-BoundlessService).Status.ToString() -eq "Running"
+
     $uninstallExitCode = Invoke-MsiExec -ArgumentList @("/x", $InstallerPath, "/qn", "/norestart") -LogPath $uninstallLog
 
     Wait-ForNoBoundlessProcesses
@@ -584,6 +681,11 @@ try {
         installer_registry_evidence = $installerEvidence
         uninstall_registry_root = $uninstallEntry.RegistryRoot
         tray_startup_policy = "deferred_no_startup_shortcut"
+        allowed_user_sid = $AllowedUserSid
+        allowed_user_sid_source = $allowedUserSidSource
+        service_install_config = $serviceInstallConfig
+        service_daemon_status_output = $serviceDaemonStatusOutput
+        service_running_before_uninstall = $serviceRunningBeforeUninstall
         installer_signature = $installerSignature
         tray_signature = $traySignature
         daemon_signature = $daemonSignature
