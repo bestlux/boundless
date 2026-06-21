@@ -34,7 +34,7 @@ Checks:
 & $BoundlessCtl daemon status
 ```
 
-Discovery depends on local network behavior. Manual host pairing remains the fallback when mDNS is unavailable or filtered.
+Discovery depends on local network behavior. Manual host pairing remains the fallback when mDNS is unavailable or filtered. Reset Network and Safe Reset keep live mDNS discovery results; if peers still do not appear after reset, mDNS or firewall policy may be blocking discovery or peer reachability.
 
 ## Firewall Or Network Reachability
 
@@ -51,7 +51,7 @@ Checks:
 & $BoundlessCtl diagnostics dump
 ```
 
-Boundless v5 does not silently add firewall rules. Firewall rule install/check/remove remains a release follow-up unless a future admin-approved command is used.
+Boundless v5 does not silently add firewall rules. Firewall rule install/check/remove remains a release follow-up unless a future admin-approved command is used. If manual host pairing works only after local firewall changes, verify inbound TCP `15100` and `15200` reachability for `%ProgramFiles%\Boundless\boundless-service.exe` on the Private network profile.
 
 If you add firewall rules manually, restrict them to trusted private LAN profiles and known peer IPs. Do not port-forward or expose Boundless control, pairing, or transport ports to the internet or public networks.
 
@@ -89,7 +89,7 @@ Checks:
 
 The machine-wide MSI registers and starts `BoundlessService` from `%ProgramFiles%\Boundless\boundless-service.exe` when installed with an explicit `BOUNDLESS_ALLOWED_USER_SID=S-...`. Manual `boundlessctl service install` is a developer fallback for unpackaged builds. The service control pipe is ACL'd to `SYSTEM`, Administrators, and the selected user SID.
 
-If the service is running but the CLI cannot connect, stop the normal tray and per-user daemon first so only one process owns the named pipe. Elevated-app and lock-screen claims remain deferred until Windows runtime evidence proves them.
+When `BoundlessService` is installed, the tray should use the service-owned daemon and must not start a separate per-user `boundlessd.exe`. If the tray or CLI cannot reach the service pipe, restart `BoundlessService` or repair the MSI install, and verify the install selected the intended user SID. Do not start a competing per-user daemon in service mode. Elevated-app and lock-screen claims remain deferred until Windows runtime evidence proves them.
 
 ## Input Capture
 

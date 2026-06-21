@@ -1,4 +1,5 @@
 use super::*;
+use std::net::SocketAddr;
 
 #[tokio::test]
 async fn import_trust_bundle_rejects_invalid_address_without_persisting_trust() {
@@ -312,6 +313,41 @@ async fn diagnostics_dump_reports_nonce_challenge_rejections() {
     let manifest_path = std::path::PathBuf::from(&dump_path).with_extension("redaction.txt");
     let manifest = std::fs::read_to_string(manifest_path).expect("read redaction manifest");
     assert!(manifest.contains("default_redaction=true"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn safe_reset_preserves_active_discovery_cache() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-safe-reset-discovery-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+    let endpoint: SocketAddr = "10.10.0.187:15100".parse().expect("endpoint");
+
+    state.set_mdns_active(true).await;
+    state
+        .set_discovered_endpoint("remote-machine", "remote desktop", endpoint)
+        .await;
+
+    state
+        .safe_reset(true, false)
+        .await
+        .expect("network reset should succeed");
+
+    assert!(
+        state.mdns_active().await,
+        "mDNS active flag should survive reset"
+    );
+    let discovered = state.discovered_endpoints().await;
+    assert_eq!(discovered.len(), 1);
+    assert_eq!(discovered[0].0, "remote-machine");
+    assert_eq!(discovered[0].1.display_name, "remote desktop");
+    assert_eq!(discovered[0].1.endpoint, endpoint);
 
     let _ = std::fs::remove_dir_all(&root);
 }

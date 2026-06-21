@@ -51,7 +51,6 @@ impl AppState {
         self.outbound_file_transfers.write().await.clear();
         self.file_transfer_records.write().await.clear();
         self.clipboard.clear().await;
-        self.discovery.clear().await;
         self.input.reset(input_enabled).await;
         self.pairing.clear().await;
         self.invalidate_cached_layout_matrix().await;
