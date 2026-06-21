@@ -30,6 +30,10 @@ Validate the file-transfer lab scenarios without two machines or large payload w
 
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-file-transfer-lab.ps1 -Mode Validate
 
+Validate the reconnect, input handoff, and soak lab scenarios without two machines or disruptive operations:
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-reconnect-input-soak-lab.ps1 -Mode Validate
+
 Generate deterministic clipboard and image clipboard dry-run artifacts:
 
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-clipboard-lab.ps1 -Mode DryRun -Role coordinator -Iterations 10
@@ -41,6 +45,14 @@ Generate deterministic file-transfer dry-run artifacts:
 Include the 1 GiB large-file row only as an explicit opt-in:
 
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-file-transfer-lab.ps1 -Mode DryRun -Role coordinator -IncludeLarge
+
+Generate deterministic reconnect, input handoff, and soak dry-run artifacts:
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-reconnect-input-soak-lab.ps1 -Mode DryRun -Role coordinator -Iterations 3
+
+Include the 2-hour soak metadata row as a synthetic passed row only as an explicit opt-in:
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-reconnect-input-soak-lab.ps1 -Mode DryRun -Role coordinator -IncludeManualLongSoak
 
 Generate deterministic dry-run artifacts:
 
@@ -60,6 +72,8 @@ Observation files may be a JSON array or a packet with an observations array. Th
 The harness also preserves optional sanitized scenario metadata when present: scenario_variant, direction, payload_kind, payload_label, payload_bytes, policy_limit_bytes, policy_expected, payload_synthetic, provisional_classification, and provisional_classification_reason. These fields are intended for lab scenario definitions and must remain metadata only, never raw clipboard text, image bytes, file names, local paths, peer IDs, endpoints, or machine IDs.
 
 File-transfer observations may also include setup_latency_ms, integrity_hash_status, expected_hash_label, received_hash_label, partial_file_status, receive_path_class, cleanup_status, file_count_class, file_count, retry_count, and reconnect_count. These fields must use sanitized labels and classes only. Do not store user file contents, private file names, raw hashes from private files, full local paths, peer IDs, trust secrets, endpoints, or machine IDs.
+
+Reconnect, input handoff, and soak observations may also include failure_subsystem, input_capture_state, active_peer_class, transport_event_summary, soak_profile, soak_duration_minutes, manual_disruptive, and resource_trend_samples. These are sanitized labels and bounded numeric samples only. Do not store raw peer IDs, machine IDs, endpoints, adapter names, service account names, full local paths, clipboard or file contents, screenshots, secrets, or private host identifiers.
 
 ## Artifact Contract
 
@@ -87,6 +101,8 @@ Scenario summaries use nearest-rank percentiles over successful latency rows:
 Clipboard lab summaries also include payload byte min/max and provisional classification counts. The only accepted provisional classifications are no-op, acceptable, warning, and fail. They are labels for organizing lab artifacts before real measurements; they are not product guarantees or release thresholds.
 
 File-transfer summaries also preserve setup latency percentiles, retry/reconnect totals, direction and variant labels, file-count classes, integrity/hash status counts, cleanup status counts, partial-file status counts, and receive-path class counts when represented by observations.
+
+Reconnect/input/soak summaries also preserve retry/reconnect totals, manual-disruptive row count, soak duration percentiles for successful rows, bounded CPU/memory trend summaries, active-peer class counts, input-capture state counts, failure-subsystem counts, soak-profile counts, and transport-event summary counts when represented by observations.
 
 ## Clipboard And Image Clipboard Lab
 
@@ -180,6 +196,62 @@ Interpretation remains provisional until real two-PC evidence exists:
 - fail: failed scenario row, hash mismatch, partial-file status, unexpected receive path, stale temp cleanup, or measured result outside the provisional working band
 
 Use measured p50, p95, max, throughput, setup latency, success/failure/skipped counts, payload bytes, file-count class, direction, retry/reconnect notes, hash status, receive-path class, and cleanup status to decide the next optimization. Do not claim BND-NEXT-9C readiness, Mouse Without Borders parity, secure desktop, lock-screen, UAC, or elevated-app parity from this file-transfer lab.
+
+## Reconnect, Input Handoff, And Soak Lab
+
+The script scripts/dev/perf-reconnect-input-soak-lab.ps1 is the BND-NEXT-16 prep slice. It does not restart services, restart the tray, disable adapters, interrupt the network, sleep or resume the machine, pair devices, reset trust, change firewall rules, elevate, install/uninstall software, capture screenshots, read the clipboard, or move files. It emits metadata-only synthetic observations, then feeds those observations into scripts/dev/perf-two-machine-evidence.ps1 so the JSON and Markdown artifacts match the shared two-machine evidence shape.
+
+Default behavior:
+
+- directions: A-to-B and B-to-A for reconnect/input rows
+- iterations: 3 per reconnect/input preset and direction
+- reconnect presets: service restart, tray restart, and manual network-loss row
+- input preset: repeated edge handoff attempts with one synthetic classified failure
+- soak presets: 30-minute synthetic metadata row plus 2-hour manual row skipped/no-op by default
+- privacy: payload_synthetic=true, payload_contents_recorded=false, and no raw peer IDs, machine IDs, endpoints, adapter names, paths, clipboard/file contents, screenshots, or secrets in artifacts
+
+Current reconnect/input/soak lab presets:
+
+| preset | scenario | default behavior | manual/disruptive label |
+| --- | --- | --- | --- |
+| reconnect-service-restart | reconnect-input | passed synthetic metadata only | manual-runbook-required |
+| reconnect-tray-restart | reconnect-input | passed synthetic metadata only | manual-runbook-required |
+| reconnect-network-loss-manual | reconnect-input | skipped no-op | manual-disruptive-opt-in |
+| input-edge-handoff | reconnect-input | repeated synthetic handoff rows with latency and one classified input failure | metadata-only-fixture |
+| soak-30-minute | soak | passed synthetic metadata with bounded CPU/memory trend samples | metadata-only-fixture |
+| soak-2-hour-manual | soak | skipped no-op unless -IncludeManualLongSoak is supplied | manual-long-run-required |
+
+For the later real two-PC lab, collect sanitized host metadata on both PCs, perform one manual scenario at a time, record only sanitized observation rows, then summarize them:
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-two-machine-evidence.ps1 -Mode Capture -Role coordinator -HostLabel pc-a
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-two-machine-evidence.ps1 -Mode Capture -Role peer -HostLabel pc-b
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev\perf-two-machine-evidence.ps1 -Mode Summarize -Role coordinator -Scenario reconnect-input,soak -ObservationPath .\artifacts\performance\reconnect-input-soak-lab\observations.json -ReleaseEvidence
+
+Manual scenario order for a real two-PC run:
+
+1. Confirm both PCs are paired/trusted and idle enough for a short manual lab. Record sanitized build, role, and host labels with Capture mode.
+2. Service restart scenario: manually restart only the intended Boundless service on the target PC, then measure time until the peer is reachable and input/transport state is stable again. Record scenario_variant=reconnect-service-restart, latency_ms, duration_ms, retry_count, reconnect_count, active_peer_class, input_capture_state, transport_event_summary, status, and failure_subsystem if failed.
+3. Tray restart scenario: manually close and reopen only the tray on the target PC, then measure time until tray-visible state matches daemon state. Record scenario_variant=reconnect-tray-restart and the same reconnect fields.
+4. Network-loss scenario: run only when the user explicitly chooses the disruptive step. Manually disable/enable the intended adapter, unplug/replug network, or otherwise create a short network interruption. Do not let the script change adapters or firewall rules. Record scenario_variant=reconnect-network-loss-manual and classify likely failure_subsystem as network, firewall, discovery, transport, service, tray, input, clipboard, file-transfer, or unknown.
+5. Input handoff scenario: perform repeated edge transitions in both directions. Record one row per attempt with latency_ms, status, input_capture_state, active_peer_class, retry_count, failure_subsystem, and failure_kind when a handoff fails.
+6. Soak 30-minute scenario: run the paired PCs under the intended idle/clipboard/input background mix for 30 minutes. Record soak_profile=30-minute, soak_duration_minutes, failure counts, retry/reconnect counts, transport_event_summary, and bounded resource_trend_samples.
+7. Soak 2-hour scenario: run only as a manual long-run pass when the user has time. Record soak_profile=2-hour with the same fields. Keep it out of default PR gates.
+8. Optional sleep/resume observation: only when the user explicitly triggers sleep and resume manually. Record it as a reconnect-input observation with a clear scenario_variant such as reconnect-sleep-resume-manual and manual_disruptive=true. The scripts do not put the machine to sleep.
+
+Real lab observation rows should include scenario=reconnect-input or scenario=soak, scenario_variant, direction where meaningful, iteration, role, status, started_at_utc, latency_ms for reconnect or handoff attempts, duration_ms for end-to-end scenario duration, retry_count, reconnect_count, failure_subsystem, failure_kind when applicable, input_capture_state, active_peer_class, transport_event_summary, soak_profile, soak_duration_minutes, resource_trend_samples, manual_disruptive, payload_synthetic=true, provisional_classification, and provisional_classification_reason.
+
+Use only these likely failure_subsystem labels unless a future schema revision expands them: service, discovery, transport, input, clipboard, file-transfer, firewall, network, tray, or unknown.
+
+Resource trend samples must stay bounded. Prefer 4 to 12 rows per soak observation with only sample_index, elapsed_seconds, cpu_percent, and memory_mb. Do not include process paths, command lines, account names, raw host names, raw peer IDs, endpoints, screenshots, clipboard contents, file contents, or secrets.
+
+Interpretation remains provisional until real two-PC evidence exists:
+
+- no-op: skipped by design, manual-only, disruptive-only, or metadata-only row
+- acceptable: completed within the lab's provisional working band
+- warning: completed but deserves follow-up before release claims
+- fail: failed scenario row, unstable reconnect/input state, excessive retries, resource trend concern, or measured result outside the provisional working band
+
+Use measured p50, p95, max, reconnect duration, input handoff latency, success/failure/skipped counts, retry/reconnect totals, input capture state, active peer class, transport event summary, CPU/memory trend, soak duration/profile, and failure subsystem to decide the next reliability fix. Do not claim BND-NEXT-9C readiness, Mouse Without Borders parity, secure desktop, lock-screen, UAC, or elevated-app parity from this lab.
 
 ## Evidence Boundary
 
