@@ -1336,11 +1336,7 @@ mod windows_app {
 
     fn should_offer_role_reversal(error: &anyhow::Error) -> bool {
         let lowered = error.to_string().to_ascii_lowercase();
-        (lowered.contains("tcp pairing reachability failed")
-            || lowered.contains("nearby pairing endpoint closed without a response")
-            || lowered.contains("read nearby pairing response timed out")
-            || lowered.contains("connect nearby pairing endpoint")
-            || lowered.contains("send nearby pairing request timed out"))
+        lowered.contains("tcp pairing reachability failed")
             && !lowered.contains("attempts_remaining=")
             && !lowered.contains("verification code is invalid")
             && !lowered.contains("verification nonce is invalid")
@@ -1359,23 +1355,34 @@ mod windows_app {
 
     fn role_reversal_candidate_labels(flow: &GuidedPairingFlow) -> Vec<String> {
         let mut labels = Vec::new();
+        let mut endpoints = Vec::<String>::new();
         for endpoint in &flow.endpoint_candidates {
             if let Ok((host, port)) = host_and_pairing_port_from_endpoint(endpoint) {
                 let endpoint = format_host_port(&host, port);
+                if endpoints.iter().any(|existing| existing == &endpoint) {
+                    continue;
+                }
+                endpoints.push(endpoint.clone());
                 labels.push(
                     tcp_endpoint_candidate(&endpoint, TcpEndpointSource::Discovery, labels.len())
                         .redacted_provenance_label(),
                 );
             }
         }
-        labels.push(
-            tcp_endpoint_candidate(
-                &format_host_port(&flow.host, flow.pairing_port),
-                TcpEndpointSource::ManualHost,
-                labels.len(),
-            )
-            .redacted_provenance_label(),
-        );
+        let manual_endpoint = format_host_port(&flow.host, flow.pairing_port);
+        if !endpoints
+            .iter()
+            .any(|existing| existing == &manual_endpoint)
+        {
+            labels.push(
+                tcp_endpoint_candidate(
+                    &manual_endpoint,
+                    TcpEndpointSource::ManualHost,
+                    labels.len(),
+                )
+                .redacted_provenance_label(),
+            );
+        }
         labels
     }
 
@@ -1609,6 +1616,18 @@ mod windows_app {
             );
             assert!(should_offer_role_reversal(&blocked));
 
+            for service_error in [
+                "nearby pairing endpoint closed without a response",
+                "read nearby pairing response timed out after 20s",
+                "send nearby pairing request timed out after 4s",
+                "target daemon did not return a nearby pairing response",
+            ] {
+                assert!(
+                    !should_offer_role_reversal(&anyhow::anyhow!(service_error)),
+                    "{service_error} must not offer role reversal"
+                );
+            }
+
             let code_failure =
                 anyhow::anyhow!("verification code is invalid; attempts_remaining=4");
             assert!(!should_offer_role_reversal(&code_failure));
@@ -1639,12 +1658,31 @@ mod windows_app {
                 vec![
                     "source=mdns tcp ipv6 port 15200".to_string(),
                     "source=mdns tcp ipv4 port 15200".to_string(),
-                    "source=manual-host tcp ipv4 port 15200".to_string(),
                 ]
             );
             let rendered = labels.join(", ");
             assert!(!rendered.contains("10.0.0.25"));
             assert!(!rendered.contains("fe80"));
+        }
+
+        #[test]
+        fn role_reversal_candidate_labels_add_manual_host_when_unique() {
+            let flow = GuidedPairingFlow {
+                dialog_title: "Pair with Office Desktop".to_string(),
+                host: "manual-host.local".to_string(),
+                pairing_port: 15200,
+                default_alias: "Office Desktop".to_string(),
+                orientation_selector_fallback: "Office Desktop".to_string(),
+                endpoint_candidates: vec!["10.0.0.25:15100".to_string()],
+            };
+
+            assert_eq!(
+                role_reversal_candidate_labels(&flow),
+                vec![
+                    "source=mdns tcp ipv4 port 15200".to_string(),
+                    "source=manual-host tcp hostname port 15200".to_string(),
+                ]
+            );
         }
 
         #[test]

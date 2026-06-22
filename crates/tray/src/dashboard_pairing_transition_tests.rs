@@ -228,9 +228,39 @@ fn blocked_direct_pairing_failure_offers_redacted_role_reversal_attempt() {
     assert!(message.contains("Direct TCP pairing appears blocked"));
     assert!(message.contains("Start a reverse pairing request") || message.contains("start a reverse pairing request"));
     assert!(message.contains("source=mdns tcp ipv4 port 15200"));
-    assert!(message.contains("source=manual-host tcp ipv4 port 15200"));
+    assert!(
+        !message.contains("source=manual-host tcp ipv4 port 15200"),
+        "duplicate manual host candidate should not be shown when daemon will dedupe it"
+    );
     assert!(!message.contains("10.0.0.25"));
     assert!(!message.contains("peer-machine"));
+}
+
+#[test]
+fn service_and_protocol_stalls_do_not_offer_role_reversal() {
+    for raw_error in [
+        "nearby pairing endpoint closed without a response",
+        "read nearby pairing response timed out after 20s",
+        "send nearby pairing request timed out after 4s",
+        "target daemon did not return a nearby pairing response",
+    ] {
+        let mut app = app_with_code_entry_flow();
+        let attempt_id = app
+            .active_pairing_attempt_id
+            .expect("active flow should have an attempt id");
+
+        app.apply_app_msg(AppMsg::PairingFailed {
+            attempt_id,
+            error: raw_error.to_string(),
+        });
+
+        assert!(
+            !app.pairing_role_reversal_available,
+            "{raw_error} should not offer role reversal"
+        );
+        assert!(app.pairing_role_reversal_attempt_id.is_none());
+        assert!(app.pairing_role_reversal_message.is_none());
+    }
 }
 
 #[test]
