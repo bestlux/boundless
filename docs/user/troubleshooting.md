@@ -54,6 +54,8 @@ Checks:
 
 The connectivity diagnostics script is read-only. It reports the active Windows network profiles, local listener/process ownership for TCP `15100`, `15101`, and `15200`, and remote TCP reachability for those ports when `-RemoteHost` is supplied. TCP `15200` is the nearby pairing listener; TCP `15100` is the transport listener used after trust is established. TCP `15101` is included to make side-by-side dogfood with Mouse Without Borders or other tools easier to diagnose.
 
+In JSON output, `firewall_hint` reports read-only evidence for the expected policy shape: enabled inbound allow rules for `%ProgramFiles%\Boundless\boundless-service.exe`, Private profile, TCP `15100` and `15200`, and `LocalSubnet`-or-narrower remote scope. It also flags broad, Public, or Any-style matching rules. TCP `15101` remains diagnostics-only, not a default firewall requirement.
+
 Boundless v5 does not silently add firewall rules. If pairing fails with a message such as `connect nearby pairing endpoint 10.10.0.187:15200 timed out`, treat it as a target reachability or firewall problem for remote TCP `15200` before debugging trust or code entry.
 
 If manual host pairing works only after local firewall changes, verify inbound TCP `15100` and `15200` reachability for `%ProgramFiles%\Boundless\boundless-service.exe` on the Private network profile. Any firewall change should be run from an elevated shell only after explicit approval. Keep rules scoped to the Private profile and the Boundless service executable, for example:
