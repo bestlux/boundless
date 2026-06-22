@@ -14,10 +14,11 @@ fn main() -> anyhow::Result<()> {
 mod windows_app {
     use anyhow::{Context, Result, bail};
     use app_services::desktop::{
-        CANONICAL_LOCAL_LAYOUT_TOKEN, LayoutPeerToken, host_and_pairing_port_from_endpoint,
-        is_local_layout_token as shared_is_local_layout_token, parse_pairing_port,
-        resolve_boundlessd_candidates, serialize_layout_matrix, spawn_boundlessd_process,
-        terminate_boundlessd_processes, validate_layout_matrix_spec,
+        CANONICAL_LOCAL_LAYOUT_TOKEN, LayoutPeerToken, TcpEndpointSource,
+        host_and_pairing_port_from_endpoint, is_local_layout_token as shared_is_local_layout_token,
+        parse_pairing_port, resolve_boundlessd_candidates, serialize_layout_matrix,
+        spawn_boundlessd_process, tcp_endpoint_candidate, terminate_boundlessd_processes,
+        validate_layout_matrix_spec,
     };
     use clap::Parser;
     use control_plane_client::{
@@ -29,8 +30,9 @@ mod windows_app {
     use ipc_api::boundless::v1::{
         AntiIdleSetRequest, Empty, FeatureSetRequest, FileTransferActionRequest,
         FileTransferSetRequest, HotkeySetRequest, HotkeyTriggerRequest, InputHandoffSetRequest,
-        LayoutSetRequest, NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest,
-        NearbySubmitCodeRequest, RemovePeerRequest, SafeResetRequest, SendFileRequest,
+        LayoutSetRequest, NearbyJoinStartRequest, NearbyJoinStatusRequest,
+        NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
+        RemovePeerRequest, SafeResetRequest, SendFileRequest,
     };
     use serde::Deserialize;
     use std::{
@@ -49,6 +51,7 @@ mod windows_app {
     const BOUNDLESS_SERVICE_NAME: &str = "BoundlessService";
     const ACTION_DASHBOARD: &str = "dashboard";
     const ACTION_QUIT: &str = "quit";
+    const ROLE_REVERSAL_APPROVAL_TIMEOUT_SECS: u64 = 120;
     #[derive(Debug, Parser)]
     #[command(
         name = "boundlesstray",
@@ -236,6 +239,25 @@ mod windows_app {
     struct PairingSubmitResult {
         peer_machine_id: String,
         message: String,
+    }
+
+    struct NearbyRoleReversalRequest {
+        code: String,
+        host: String,
+        port: u16,
+        alias: Option<String>,
+        endpoint_candidates: Vec<String>,
+        attempt_id: String,
+    }
+
+    struct NearbyRoleReversalPoll {
+        host: String,
+        port: u32,
+        alias: String,
+        endpoint_candidates: Vec<String>,
+        role: String,
+        attempt_id: String,
+        initial_response: ipc_api::boundless::v1::NearbyJoinStatusReply,
     }
 
     struct NearbySubmitCode {
@@ -450,6 +472,13 @@ mod windows_app {
         request: NearbySubmitCode,
     ) -> Result<PairingSubmitResult> {
         block_on_result(pair_nearby_submit_code(endpoint, request))
+    }
+
+    fn pair_nearby_role_reversal_blocking(
+        endpoint: &str,
+        request: NearbyRoleReversalRequest,
+    ) -> Result<PairingSubmitResult> {
+        block_on_result(pair_nearby_role_reversal(endpoint, request))
     }
 
     fn approve_nearby_pairing_request_blocking(endpoint: &str, request_id: &str) -> Result<String> {
@@ -997,6 +1026,120 @@ mod windows_app {
         })
     }
 
+    async fn pair_nearby_role_reversal(
+        endpoint: &str,
+        request: NearbyRoleReversalRequest,
+    ) -> Result<PairingSubmitResult> {
+        let NearbyRoleReversalRequest {
+            code,
+            host,
+            port,
+            alias,
+            endpoint_candidates,
+            attempt_id,
+        } = request;
+        let alias = alias.unwrap_or_default();
+        let role = "role-reversal-request".to_string();
+        let mut client = connect_control_plane(endpoint).await?;
+        let initial = client
+            .start_nearby_pairing_join(NearbyJoinStartRequest {
+                host: host.clone(),
+                port: u32::from(port),
+                code,
+                alias: alias.clone(),
+                endpoint_candidates: endpoint_candidates.clone(),
+                role: role.clone(),
+                attempt_id: attempt_id.clone(),
+            })
+            .await?
+            .into_inner();
+
+        wait_for_nearby_role_reversal_approval(
+            endpoint,
+            NearbyRoleReversalPoll {
+                host,
+                port: u32::from(port),
+                alias,
+                endpoint_candidates,
+                role,
+                attempt_id,
+                initial_response: initial,
+            },
+        )
+        .await
+    }
+
+    async fn wait_for_nearby_role_reversal_approval(
+        endpoint: &str,
+        poll: NearbyRoleReversalPoll,
+    ) -> Result<PairingSubmitResult> {
+        let NearbyRoleReversalPoll {
+            host,
+            port,
+            alias,
+            endpoint_candidates,
+            role,
+            attempt_id,
+            initial_response: mut response,
+        } = poll;
+        let deadline =
+            Instant::now() + Duration::from_secs(ROLE_REVERSAL_APPROVAL_TIMEOUT_SECS.max(5));
+        let mut expected_request_id = String::new();
+
+        loop {
+            match response.status.trim().to_ascii_lowercase().as_str() {
+                "approved" => {
+                    if response.peer_machine_id.trim().is_empty() {
+                        bail!(
+                            "role-reversal pairing failed: approved status missing peer machine id"
+                        );
+                    }
+                    return Ok(PairingSubmitResult {
+                        peer_machine_id: response.peer_machine_id,
+                        message: response.message,
+                    });
+                }
+                "pending" => {
+                    if expected_request_id.is_empty() {
+                        expected_request_id = response.request_id.clone();
+                    } else if response.request_id != expected_request_id {
+                        bail!("role-reversal pairing request id mismatch");
+                    }
+                    if Instant::now() >= deadline {
+                        bail!(
+                            "timed out waiting for role-reversal pairing approval attempt_id={attempt_id}"
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let mut client = connect_control_plane(endpoint).await?;
+                    response = client
+                        .check_nearby_pairing_join(NearbyJoinStatusRequest {
+                            host: host.clone(),
+                            port,
+                            request_id: expected_request_id.clone(),
+                            alias: alias.clone(),
+                            endpoint_candidates: endpoint_candidates.clone(),
+                            role: role.clone(),
+                            attempt_id: attempt_id.clone(),
+                        })
+                        .await?
+                        .into_inner();
+                }
+                "rejected" => bail!("role-reversal pairing rejected: {}", response.message),
+                "error" | "code_required" => {
+                    bail!("role-reversal pairing failed: {}", response.message)
+                }
+                _ => {
+                    let message = response.message.trim();
+                    if message.is_empty() {
+                        bail!("role-reversal pairing failed: unknown status");
+                    }
+                    bail!("role-reversal pairing failed: {message}");
+                }
+            }
+        }
+    }
+
     async fn approve_nearby_pairing_request(endpoint: &str, request_id: String) -> Result<String> {
         let mut client = connect_control_plane(endpoint).await?;
         let response = client
@@ -1191,6 +1334,101 @@ mod windows_app {
             || lowered.contains("send nearby pairing request timed out")
     }
 
+    fn should_offer_role_reversal(error: &anyhow::Error) -> bool {
+        let lowered = error.to_string().to_ascii_lowercase();
+        lowered.contains("tcp pairing reachability failed")
+            && reachability_summary_has_connect_blocked_outcome(&lowered)
+            && !lowered.contains("attempts_remaining=")
+            && !lowered.contains("verification code is invalid")
+            && !lowered.contains("verification nonce is invalid")
+            && !lowered.contains("verification temporarily locked")
+            && !lowered.contains("pairing request rejected")
+    }
+
+    fn reachability_summary_has_connect_blocked_outcome(lowered: &str) -> bool {
+        let attempted = lowered
+            .split_once("attempted=[")
+            .and_then(|(_, rest)| rest.split_once(']').map(|(attempted, _)| attempted))
+            .unwrap_or(lowered);
+        attempted.contains(" refused")
+            || attempted.contains("connection refused")
+            || attempted.contains("connect refused")
+            || attempted.contains("connect-timeout")
+            || attempted.contains("connect timeout")
+            || attempted.contains("connect timed out")
+    }
+
+    fn role_reversal_attempt_id(flow: &GuidedPairingFlow, attempt_id: u64) -> String {
+        let source = if flow.endpoint_candidates.is_empty() {
+            "manual"
+        } else {
+            "mdns"
+        };
+        format!("tray-rr-{attempt_id:06}-{source}-p{}", flow.pairing_port)
+    }
+
+    fn role_reversal_candidate_labels(flow: &GuidedPairingFlow) -> Vec<String> {
+        let mut labels = Vec::new();
+        let mut endpoints = Vec::<String>::new();
+        for endpoint in &flow.endpoint_candidates {
+            if let Ok((host, port)) = host_and_pairing_port_from_endpoint(endpoint) {
+                let endpoint = format_host_port(&host, port);
+                if endpoints.iter().any(|existing| existing == &endpoint) {
+                    continue;
+                }
+                endpoints.push(endpoint.clone());
+                labels.push(
+                    tcp_endpoint_candidate(&endpoint, TcpEndpointSource::Discovery, labels.len())
+                        .redacted_provenance_label(),
+                );
+            }
+        }
+        let manual_endpoint = format_host_port(&flow.host, flow.pairing_port);
+        if !endpoints
+            .iter()
+            .any(|existing| existing == &manual_endpoint)
+        {
+            labels.push(
+                tcp_endpoint_candidate(
+                    &manual_endpoint,
+                    TcpEndpointSource::ManualHost,
+                    labels.len(),
+                )
+                .redacted_provenance_label(),
+            );
+        }
+        labels
+    }
+
+    fn role_reversal_next_action_message(
+        flow: &GuidedPairingFlow,
+        attempt_id: Option<&str>,
+        can_start_now: bool,
+    ) -> String {
+        let candidates = role_reversal_candidate_labels(flow).join(", ");
+        let attempt_id = attempt_id.unwrap_or("pending");
+        if can_start_now {
+            format!(
+                "Direct TCP pairing appears blocked. You can start a reverse pairing request with attempt {attempt_id}; candidates=[{candidates}]. Approve the pending role-reversal request on the other PC. This does not change firewall rules."
+            )
+        } else {
+            format!(
+                "Direct TCP pairing appears blocked. Reverse pairing may be available after a fresh code is shown on this PC or the other PC starts a role-reversal join. Attempt {attempt_id}; candidates=[{candidates}]. This does not change firewall rules."
+            )
+        }
+    }
+
+    fn format_host_port(host: &str, port: u16) -> String {
+        let trimmed = host.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            format!("{trimmed}:{port}")
+        } else if trimmed.contains(':') {
+            format!("[{trimmed}]:{port}")
+        } else {
+            format!("{trimmed}:{port}")
+        }
+    }
+
     fn extract_attempts_remaining(message: &str) -> Option<u8> {
         const MARKER: &str = "attempts_remaining=";
         let marker_index = message.find(MARKER)?;
@@ -1382,6 +1620,92 @@ mod windows_app {
             assert!(
                 should_offer_new_request_retry(&response_timeout),
                 "response timeout should offer retry"
+            );
+        }
+
+        #[test]
+        fn should_offer_role_reversal_matches_reachability_not_trust_failures() {
+            let blocked = anyhow::anyhow!(
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 refused]"
+            );
+            assert!(should_offer_role_reversal(&blocked));
+
+            let connect_timeout = anyhow::anyhow!(
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv6 port 15200 connect-timeout]"
+            );
+            assert!(should_offer_role_reversal(&connect_timeout));
+
+            for service_error in [
+                "nearby pairing endpoint closed without a response",
+                "read nearby pairing response timed out after 20s",
+                "send nearby pairing request timed out after 4s",
+                "target daemon did not return a nearby pairing response",
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 endpoint closed without a response]",
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 read response timed out]",
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 send request timed out]",
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 service protocol stall]",
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 timeout]",
+            ] {
+                assert!(
+                    !should_offer_role_reversal(&anyhow::anyhow!(service_error)),
+                    "{service_error} must not offer role reversal"
+                );
+            }
+
+            let code_failure =
+                anyhow::anyhow!("verification code is invalid; attempts_remaining=4");
+            assert!(!should_offer_role_reversal(&code_failure));
+        }
+
+        #[test]
+        fn role_reversal_attempt_id_is_stable_and_redacted() {
+            let flow = GuidedPairingFlow {
+                dialog_title: "Pair with Office Desktop".to_string(),
+                host: "10.0.0.25".to_string(),
+                pairing_port: 15200,
+                default_alias: "Office Desktop".to_string(),
+                orientation_selector_fallback: "Office Desktop".to_string(),
+                endpoint_candidates: vec![
+                    "[fe80::1%4]:15100".to_string(),
+                    "10.0.0.25:15100".to_string(),
+                ],
+            };
+
+            let attempt = role_reversal_attempt_id(&flow, 7);
+            assert_eq!(attempt, "tray-rr-000007-mdns-p15200");
+            assert!(!attempt.contains("10.0.0.25"));
+            assert!(!attempt.contains("fe80"));
+
+            let labels = role_reversal_candidate_labels(&flow);
+            assert_eq!(
+                labels,
+                vec![
+                    "source=mdns tcp ipv6 port 15200".to_string(),
+                    "source=mdns tcp ipv4 port 15200".to_string(),
+                ]
+            );
+            let rendered = labels.join(", ");
+            assert!(!rendered.contains("10.0.0.25"));
+            assert!(!rendered.contains("fe80"));
+        }
+
+        #[test]
+        fn role_reversal_candidate_labels_add_manual_host_when_unique() {
+            let flow = GuidedPairingFlow {
+                dialog_title: "Pair with Office Desktop".to_string(),
+                host: "manual-host.local".to_string(),
+                pairing_port: 15200,
+                default_alias: "Office Desktop".to_string(),
+                orientation_selector_fallback: "Office Desktop".to_string(),
+                endpoint_candidates: vec!["10.0.0.25:15100".to_string()],
+            };
+
+            assert_eq!(
+                role_reversal_candidate_labels(&flow),
+                vec![
+                    "source=mdns tcp ipv4 port 15200".to_string(),
+                    "source=manual-host tcp hostname port 15200".to_string(),
+                ]
             );
         }
 

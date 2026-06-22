@@ -57,6 +57,9 @@ fn begin_pairing_flow_sets_pairing_request_state() {
     app.pairing_code = "123456".to_string();
     app.pairing_alias = "Old Alias".to_string();
     app.pairing_retry_available = true;
+    app.pairing_role_reversal_available = true;
+    app.pairing_role_reversal_attempt_id = Some("tray-rr-stale".to_string());
+    app.pairing_role_reversal_message = Some("stale reverse action".to_string());
     app.pairing_last_error = Some("previous failure".to_string());
 
     app.begin_pairing_flow(flow.clone());
@@ -78,6 +81,9 @@ fn begin_pairing_flow_sets_pairing_request_state() {
     assert!(app.pairing_code.is_empty());
     assert_eq!(app.pairing_alias, "Office Desktop");
     assert!(!app.pairing_retry_available);
+    assert!(!app.pairing_role_reversal_available);
+    assert!(app.pairing_role_reversal_attempt_id.is_none());
+    assert!(app.pairing_role_reversal_message.is_none());
     assert!(app.pairing_last_error.is_none());
 }
 
@@ -88,6 +94,8 @@ fn cancel_pairing_flow_after_request_stage_start_clears_pairing_state() {
     app.begin_pairing_flow(sample_guided_flow());
     app.pairing_challenge = Some(sample_pairing_challenge());
     app.pairing_retry_available = true;
+    app.pairing_role_reversal_available = true;
+    app.pairing_role_reversal_attempt_id = Some("tray-rr-000001-mdns-p15200".to_string());
 
     app.cancel_pairing_flow();
 
@@ -95,6 +103,8 @@ fn cancel_pairing_flow_after_request_stage_start_clears_pairing_state() {
     assert!(app.pairing_flow.is_none());
     assert!(app.pairing_challenge.is_none());
     assert!(!app.pairing_retry_available);
+    assert!(!app.pairing_role_reversal_available);
+    assert!(app.pairing_role_reversal_attempt_id.is_none());
 }
 
 #[test]

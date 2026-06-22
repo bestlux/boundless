@@ -32,7 +32,9 @@ mod dashboard_workflow {
 }
 
 use dashboard_model::{AppMsg, DashboardApp, Tab, TOAST_ERROR_SECS, TOAST_SUCCESS_SECS};
-use dashboard_task_runner::{DashboardTaskRunner, SubmitPairingCodeTask};
+use dashboard_task_runner::{
+    DashboardTaskRunner, StartRoleReversalPairingTask, SubmitPairingCodeTask,
+};
 use dashboard_window::{
     hide_dashboard_window, native_window_handle_from_creation_context, request_dashboard_exit,
     show_dashboard_window,

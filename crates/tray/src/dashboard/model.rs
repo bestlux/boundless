@@ -52,6 +52,9 @@ pub(super) struct DashboardApp {
     // Pairing-specific error state (shown in pairing dialog context)
     pub(super) pairing_last_error: Option<String>,
     pub(super) pairing_retry_available: bool,
+    pub(super) pairing_role_reversal_available: bool,
+    pub(super) pairing_role_reversal_attempt_id: Option<String>,
+    pub(super) pairing_role_reversal_message: Option<String>,
 
     pub(super) selected_tab: Tab,
     pub(super) manual_host: String,
@@ -147,6 +150,9 @@ impl DashboardApp {
             toast_seq,
             pairing_last_error: None,
             pairing_retry_available: false,
+            pairing_role_reversal_available: false,
+            pairing_role_reversal_attempt_id: None,
+            pairing_role_reversal_message: None,
             selected_tab: Tab::Status,
             manual_host: String::new(),
             manual_port: "15200".to_string(),
@@ -190,6 +196,9 @@ impl DashboardApp {
         self.pairing_alias = flow.default_alias;
         self.pairing_last_error = None;
         self.pairing_retry_available = false;
+        self.pairing_role_reversal_available = false;
+        self.pairing_role_reversal_attempt_id = None;
+        self.pairing_role_reversal_message = None;
         self.active_pairing_attempt_id = Some(attempt_id);
         attempt_id
     }
@@ -199,6 +208,9 @@ impl DashboardApp {
         self.pairing_challenge = None;
         self.pairing_flow = None;
         self.pairing_retry_available = false;
+        self.pairing_role_reversal_available = false;
+        self.pairing_role_reversal_attempt_id = None;
+        self.pairing_role_reversal_message = None;
         self.active_pairing_attempt_id = None;
     }
 
@@ -313,6 +325,9 @@ impl DashboardApp {
                     false,
                 );
                 self.pairing_retry_available = false;
+                self.pairing_role_reversal_available = false;
+                self.pairing_role_reversal_attempt_id = None;
+                self.pairing_role_reversal_message = None;
                 self.pairing_last_error = None;
             }
             AppMsg::PairingFailed { attempt_id, error } => {
@@ -323,6 +338,25 @@ impl DashboardApp {
                 let error = anyhow::anyhow!(error);
                 self.pairing_last_error = Some(format_error_for_dialog(&error));
                 self.pairing_retry_available = should_offer_new_request_retry(&error);
+                self.pairing_role_reversal_available = self
+                    .pairing_flow
+                    .as_ref()
+                    .is_some_and(|flow| !flow.host.trim().is_empty())
+                    && should_offer_role_reversal(&error);
+                self.pairing_role_reversal_attempt_id =
+                    self.pairing_flow.as_ref().and_then(|flow| {
+                        self.pairing_role_reversal_available
+                            .then(|| role_reversal_attempt_id(flow, attempt_id))
+                    });
+                self.pairing_role_reversal_message = self.pairing_flow.as_ref().and_then(|flow| {
+                    self.pairing_role_reversal_available.then(|| {
+                        role_reversal_next_action_message(
+                            flow,
+                            self.pairing_role_reversal_attempt_id.as_deref(),
+                            self.pairing_challenge.is_some(),
+                        )
+                    })
+                });
             }
             AppMsg::ActionComplete(msg) => {
                 self.push_toast(msg, false);
