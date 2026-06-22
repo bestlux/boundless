@@ -249,6 +249,8 @@ fn service_and_protocol_stalls_do_not_offer_role_reversal() {
         "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv4 port 15200 service protocol stall]",
         "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv4 port 15200 timeout]",
         "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv4 port 15200 service-timeout]",
+        "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv6 port 15200 connect-timeout, role=initiator source=mdns tcp ipv4 port 15200 service-timeout]",
+        "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv6 port 15200 refused, role=initiator source=mdns tcp ipv4 port 15200 service-timeout]",
     ] {
         let mut app = app_with_code_entry_flow();
         let attempt_id = app
