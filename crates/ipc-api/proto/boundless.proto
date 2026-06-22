@@ -50,6 +50,8 @@ message NearbyPairingRequestInfo {
   string verification_code = 5;
   string verification_expires_at = 6;
   bool requires_verification_code = 7;
+  string role = 8;
+  string attempt_id = 9;
 }
 
 message NearbyPairingRequestsReply {
@@ -369,6 +371,8 @@ message NearbyJoinStartRequest {
   string code = 3;
   string alias = 4;
   repeated string endpoint_candidates = 5;
+  string role = 6;
+  string attempt_id = 7;
 }
 
 message NearbyJoinStatusRequest {
@@ -377,6 +381,8 @@ message NearbyJoinStatusRequest {
   string request_id = 3;
   string alias = 4;
   repeated string endpoint_candidates = 5;
+  string role = 6;
+  string attempt_id = 7;
 }
 
 message NearbyJoinStatusReply {
@@ -384,6 +390,8 @@ message NearbyJoinStatusReply {
   string status = 2;
   string message = 3;
   string peer_machine_id = 4;
+  string role = 5;
+  string attempt_id = 6;
 }
 
 message NearbyPairingCompletionReply {

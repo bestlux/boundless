@@ -829,6 +829,8 @@ impl ControlPlaneService for ControlPlaneApi {
                 code,
                 alias: parse_optional_alias(request.alias),
                 endpoint_candidates: request.endpoint_candidates,
+                role: app_commands::NearbyPairingRole::parse_or_default(&request.role),
+                attempt_id: parse_optional_alias(request.attempt_id),
             })
             .await
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -837,6 +839,8 @@ impl ControlPlaneService for ControlPlaneApi {
             status: reply.status,
             message: reply.message,
             peer_machine_id: reply.peer_machine_id.unwrap_or_default(),
+            role: reply.role,
+            attempt_id: reply.attempt_id,
         }))
     }
 
@@ -856,6 +860,8 @@ impl ControlPlaneService for ControlPlaneApi {
                 request_id,
                 alias: parse_optional_alias(request.alias),
                 endpoint_candidates: request.endpoint_candidates,
+                role: app_commands::NearbyPairingRole::parse_or_default(&request.role),
+                attempt_id: parse_optional_alias(request.attempt_id),
             })
             .await
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -864,6 +870,8 @@ impl ControlPlaneService for ControlPlaneApi {
             status: reply.status,
             message: reply.message,
             peer_machine_id: reply.peer_machine_id.unwrap_or_default(),
+            role: reply.role,
+            attempt_id: reply.attempt_id,
         }))
     }
 
@@ -1148,6 +1156,8 @@ fn map_pending_request(request: UiPendingRequest) -> NearbyPairingRequestInfo {
         verification_code: request.verification_code,
         verification_expires_at: request.verification_expires_at,
         requires_verification_code: request.requires_verification_code,
+        role: request.role,
+        attempt_id: request.attempt_id,
     }
 }
 

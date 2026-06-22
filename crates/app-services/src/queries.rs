@@ -114,6 +114,8 @@ pub struct UiPendingRequest {
     pub verification_code: String,
     pub verification_expires_at: String,
     pub requires_verification_code: bool,
+    pub role: String,
+    pub attempt_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +192,8 @@ pub struct NearbyJoinStatusSnapshot {
     pub status: String,
     pub message: String,
     pub peer_machine_id: Option<String>,
+    pub role: String,
+    pub attempt_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -242,6 +242,16 @@ pub(super) struct PairRequestArgs {
     pub(super) timeout_seconds: u64,
 }
 
+pub(super) struct NearbyJoinCliRequest {
+    pub(super) code: String,
+    pub(super) host: String,
+    pub(super) port: u16,
+    pub(super) timeout_seconds: u64,
+    pub(super) alias: Option<String>,
+    pub(super) endpoint_candidates: Vec<String>,
+    pub(super) role_reversal: bool,
+}
+
 pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Result<()> {
     let PairRequestArgs {
         selector,
@@ -349,12 +359,15 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
         }
         return pair_nearby_join(
             endpoint,
-            code,
-            host,
-            pairing_port,
-            timeout_seconds,
-            alias,
-            endpoint_candidates,
+            NearbyJoinCliRequest {
+                code,
+                host,
+                port: pairing_port,
+                timeout_seconds,
+                alias,
+                endpoint_candidates,
+                role_reversal: false,
+            },
         )
         .await;
     }
@@ -449,12 +462,15 @@ pub(super) async fn setup_wizard(endpoint: &str, start_daemon: bool) -> Result<(
     let alias = prompt_optional_with_default("Alias for this peer", default_alias.as_deref())?;
     pair_nearby_join(
         endpoint,
-        code,
-        host,
-        pairing_port,
-        120,
-        alias.clone(),
-        endpoint_candidates,
+        NearbyJoinCliRequest {
+            code,
+            host,
+            port: pairing_port,
+            timeout_seconds: 120,
+            alias: alias.clone(),
+            endpoint_candidates,
+            role_reversal: false,
+        },
     )
     .await?;
 
@@ -537,15 +553,21 @@ pub(super) async fn pair_join(
     Ok(())
 }
 
-pub(super) async fn pair_nearby_join(
-    endpoint: &str,
-    code: String,
-    host: String,
-    port: u16,
-    timeout_seconds: u64,
-    alias: Option<String>,
-    endpoint_candidates: Vec<String>,
-) -> Result<()> {
+pub(super) async fn pair_nearby_join(endpoint: &str, request: NearbyJoinCliRequest) -> Result<()> {
+    let NearbyJoinCliRequest {
+        code,
+        host,
+        port,
+        timeout_seconds,
+        alias,
+        endpoint_candidates,
+        role_reversal,
+    } = request;
+    let role = if role_reversal {
+        "role-reversal-request".to_string()
+    } else {
+        String::new()
+    };
     let alias_value = alias.unwrap_or_default();
     let mut control_plane = connect_control_plane(endpoint).await?;
     let initial_response = control_plane
@@ -555,6 +577,8 @@ pub(super) async fn pair_nearby_join(
             code,
             alias: alias_value.clone(),
             endpoint_candidates: endpoint_candidates.clone(),
+            role: role.clone(),
+            attempt_id: String::new(),
         })
         .await?
         .into_inner();
@@ -568,6 +592,7 @@ pub(super) async fn pair_nearby_join(
             expected_request_id: String::new(),
             alias: alias_value,
             endpoint_candidates,
+            role,
         },
     )
     .await?;
@@ -594,6 +619,7 @@ struct NearbyApprovalPoll {
     expected_request_id: String,
     alias: String,
     endpoint_candidates: Vec<String>,
+    role: String,
 }
 
 async fn pair_nearby_request_code(
@@ -647,6 +673,7 @@ async fn wait_for_nearby_pairing_approval(
         expected_request_id,
         alias,
         endpoint_candidates,
+        role,
     } = poll;
     let mut response = initial_response;
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_seconds.max(5));
@@ -700,6 +727,8 @@ async fn wait_for_nearby_pairing_approval(
                             request_id: request_id.clone(),
                             alias: alias.clone(),
                             endpoint_candidates: endpoint_candidates.clone(),
+                            role: role.clone(),
+                            attempt_id: String::new(),
                         })
                         .await?
                         .into_inner();
@@ -763,7 +792,7 @@ pub(super) async fn pair_pending(endpoint: &str) -> Result<()> {
         let requires_code = request.requires_verification_code;
         let has_visible_code = requires_code && !request.verification_code.trim().is_empty();
         println!(
-            "request_id={} requester_machine_id={} requester_display_name={} created_at={} flow={} verification_code={} verification_expires_at={}",
+            "request_id={} requester_machine_id={} requester_display_name={} created_at={} flow={} role={} attempt_id={} verification_code={} verification_expires_at={}",
             request.request_id,
             request.requester_machine_id,
             request.requester_display_name,
@@ -772,6 +801,16 @@ pub(super) async fn pair_pending(endpoint: &str) -> Result<()> {
                 "code_confirmation"
             } else {
                 "manual_approval"
+            },
+            if request.role.trim().is_empty() {
+                "initiator"
+            } else {
+                request.role.as_str()
+            },
+            if request.attempt_id.trim().is_empty() {
+                "-"
+            } else {
+                request.attempt_id.as_str()
             },
             if has_visible_code {
                 request.verification_code.as_str()
@@ -2062,6 +2101,8 @@ struct UiPendingRequest {
     verification_code: String,
     verification_expires_at: String,
     requires_verification_code: bool,
+    role: String,
+    attempt_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2130,6 +2171,8 @@ pub(super) async fn ui_snapshot(endpoint: &str, start_daemon: bool) -> Result<()
                 verification_code: request.verification_code,
                 verification_expires_at: request.verification_expires_at,
                 requires_verification_code: request.requires_verification_code,
+                role: request.role,
+                attempt_id: request.attempt_id,
             })
             .collect(),
         anti_idle_config: snapshot

@@ -191,6 +191,10 @@ mod windows_app {
         verification_expires_at: String,
         #[serde(default)]
         requires_verification_code: bool,
+        #[serde(default)]
+        role: String,
+        #[serde(default)]
+        attempt_id: String,
     }
 
     enum NearbyRequestCodeStart {
@@ -346,6 +350,8 @@ mod windows_app {
                             verification_code: request.verification_code,
                             verification_expires_at: request.verification_expires_at,
                             requires_verification_code: request.requires_verification_code,
+                            role: request.role,
+                            attempt_id: request.attempt_id,
                         })
                         .collect(),
                     anti_idle_config: snapshot

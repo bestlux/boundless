@@ -58,6 +58,8 @@ impl AppState {
             requester_bundle,
             requester_alias,
             source_ip,
+            app_services::commands::NearbyPairingRole::Initiator,
+            None,
         )
         .await
     }
@@ -74,6 +76,28 @@ impl AppState {
             requester_bundle,
             requester_alias,
             source_ip,
+            app_services::commands::NearbyPairingRole::Initiator,
+            None,
+        )
+        .await
+    }
+
+    pub async fn queue_nearby_pairing_request_with_code_and_role(
+        &self,
+        code: &str,
+        requester_bundle: TrustBundle,
+        requester_alias: Option<String>,
+        source_ip: IpAddr,
+        role: app_services::commands::NearbyPairingRole,
+        attempt_id: Option<String>,
+    ) -> Result<PendingNearbyPairingRequest> {
+        self.queue_nearby_pairing_request_after_admission(
+            Some(code),
+            requester_bundle,
+            requester_alias,
+            source_ip,
+            role,
+            attempt_id,
         )
         .await
     }
@@ -84,6 +108,8 @@ impl AppState {
         requester_bundle: TrustBundle,
         requester_alias: Option<String>,
         source_ip: IpAddr,
+        role: app_services::commands::NearbyPairingRole,
+        attempt_id: Option<String>,
     ) -> Result<PendingNearbyPairingRequest> {
         self.ensure_trust_rotation_not_pending()?;
         self.expire_nearby_pairing_requests().await;
@@ -95,6 +121,8 @@ impl AppState {
             &requester_machine_id,
             source_ip,
             PendingNearbyPairingAdmissionMode::ManualApproval,
+            role,
+            attempt_id.as_deref(),
         ) {
             return Ok(existing.summary.clone());
         }
@@ -120,6 +148,8 @@ impl AppState {
             verification_code: None,
             verification_nonce: None,
             verification_expires_at: None,
+            role,
+            attempt_id: attempt_id.clone(),
         };
         let request_id = summary.request_id.clone();
 
@@ -153,6 +183,8 @@ impl AppState {
             &requester_machine_id,
             source_ip,
             PendingNearbyPairingAdmissionMode::CodeChallenge,
+            app_services::commands::NearbyPairingRole::Initiator,
+            None,
         ) {
             return Ok(existing.summary.clone());
         }
@@ -173,6 +205,8 @@ impl AppState {
             verification_code: Some(code.value.clone()),
             verification_nonce: Some(verification_nonce.clone()),
             verification_expires_at: Some(code.expires_at),
+            role: app_services::commands::NearbyPairingRole::Initiator,
+            attempt_id: None,
         };
         let request_id = summary.request_id.clone();
 
@@ -689,11 +723,15 @@ fn find_pending_nearby_pairing_request<'a>(
     requester_machine_id: &str,
     source_ip: IpAddr,
     mode: PendingNearbyPairingAdmissionMode,
+    role: app_services::commands::NearbyPairingRole,
+    attempt_id: Option<&str>,
 ) -> Option<&'a PendingNearbyPairingRequestRecord> {
     pending_requests.values().find(|record| {
         record.summary.requester_machine_id == requester_machine_id
             && record.source_ip == source_ip
             && pairing_mode_matches(&record.mode, mode)
+            && record.summary.role == role
+            && record.summary.attempt_id.as_deref() == attempt_id
     })
 }
 
