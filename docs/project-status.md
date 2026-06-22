@@ -82,6 +82,7 @@ These are not hidden release blockers by default; they require explicit release-
 | stale_non_file_evidence | deferred | Current strict freshness enforcement is file-summary based; external workflow/run freshness still depends on release review metadata. | docs/release/release-readiness.md |
 | clipboard_image_spooling | deferred | BND-NEXT-8A bounded the measured outbound/local image allocation path; inbound/apply still materializes full BMP buffers and should become streaming or spooling work only with separate architecture evidence. | docs/performance/clipboard-image-memory.md |
 | product_scorecard_real_lab_runs | open | Scorecard thresholds are provisional until at least two real two-PC runs exist for each category; fixture rows validate artifact shape but do not make product-performance thresholds binding. | docs/performance/product-scorecard.md |
+| local_subnet_firewall_policy | proposed | BND-NEXT-21 defines a human-gated installer-owned Private/local-subnet firewall policy, but no firewall mutation is implemented or approved. Release evidence must prove explicit opt-in, Program Files service-binary scope, TCP 15100/15200 only, fail-closed behavior, repair/uninstall ownership, and real two-PC Private-network success before claiming frictionless MWB-like install connectivity. | docs/architecture/one-sided-reachability.md, docs/release/release-readiness.md |
 
 ## Next Backlog Step
 

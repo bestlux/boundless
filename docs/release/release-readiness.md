@@ -97,6 +97,22 @@ The `service_lifecycle_evidence` gate passes only when installer smoke summary e
 
 The `n_minus_1_msi_upgrade` gate passes only when installer smoke summary evidence includes `upgraded_from`, `previous_install_exit_code = 0`, and `upgrade_payload_replacement` booleans proving app payload replacement, service payload replacement, Program Files ownership, and active service use of the current Program Files service binary. The supported prior artifact source is a GitHub Release MSI asset named `Boundless-<version>-windows-x64.msi`; the release workflow also stages the current Windows MSI under the `boundless-windows-x64` artifact before publish.
 
+## Local-Subnet Firewall Policy Evidence
+
+BND-NEXT-21 is a human-gated policy decision. The current release path must continue to treat Windows Firewall mutation as not implemented unless a later approved implementation supplies matching evidence.
+
+A future installer-owned local-subnet firewall rule can contribute to release readiness only when the evidence packet proves all of the following:
+
+- The rule is created only through an explicit user-visible installer/helper option, not silently during pairing, diagnostics, reset, role reversal, daemon startup, or service startup.
+- The rule is program-scoped to `%ProgramFiles%\Boundless\boundless-service.exe` and fail-closed when that Program Files service binary, service registration, intended user SID, or MSI ownership cannot be verified.
+- The rule is scoped to Private profile plus local-subnet remote scope, or a narrower user-approved remote scope. Evidence must prove no Public-profile rule and no `remoteip=any profile=any` fallback are created.
+- The default approved ports are TCP `15100` and TCP `15200`. TCP `15101` remains a side-by-side diagnostics probe and must not be opened unless a future alternate-port implementation explicitly asks for the selected transport port and derived pairing port.
+- Repair recreates only the MSI-owned approved rule, upgrade preserves ownership for the current Program Files service path, and uninstall removes the MSI-owned Boundless rule without deleting unrelated user-created firewall rules.
+- Static inspection and Windows installer lab evidence both show the expected program path, ports, profile, remote scope, and rollback behavior.
+- Real two-PC Private-network evidence shows pairing and transport success without manual firewall edits, with diagnostics confirming the expected rule shape on both machines.
+
+Until that evidence exists, release packets and parity docs may say Boundless has diagnostics and a proposed firewall policy only. They must not claim frictionless Mouse Without Borders-like install connectivity, automatic firewall setup, lock-screen behavior, secure desktop behavior, UAC prompt behavior, elevated-app behavior, or broad Mouse Without Borders parity.
+
 Run the targeted fixture matrix with:
 
 ```powershell
