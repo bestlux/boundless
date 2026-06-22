@@ -243,6 +243,11 @@ fn service_and_protocol_stalls_do_not_offer_role_reversal() {
         "read nearby pairing response timed out after 20s",
         "send nearby pairing request timed out after 4s",
         "target daemon did not return a nearby pairing response",
+        "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv4 port 15200 endpoint closed without a response]",
+        "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv4 port 15200 read response timed out]",
+        "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv4 port 15200 send request timed out]",
+        "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv4 port 15200 service protocol stall]",
+        "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv4 port 15200 timeout]",
     ] {
         let mut app = app_with_code_entry_flow();
         let attempt_id = app
@@ -265,7 +270,7 @@ fn service_and_protocol_stalls_do_not_offer_role_reversal() {
 
 #[test]
 fn request_stage_blocked_failure_offers_reverse_next_action_without_code() {
-    let raw_error = "manual host TCP pairing reachability failed; attempted=[role=initiator source=manual-host tcp hostname port 15200 timeout]";
+    let raw_error = "manual host TCP pairing reachability failed; attempted=[role=initiator source=manual-host tcp hostname port 15200 refused]";
     let mut app = app_with_active_pairing_flow();
     let attempt_id = app
         .active_pairing_attempt_id

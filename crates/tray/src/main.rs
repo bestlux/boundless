@@ -1337,11 +1337,25 @@ mod windows_app {
     fn should_offer_role_reversal(error: &anyhow::Error) -> bool {
         let lowered = error.to_string().to_ascii_lowercase();
         lowered.contains("tcp pairing reachability failed")
+            && reachability_summary_has_connect_blocked_outcome(&lowered)
             && !lowered.contains("attempts_remaining=")
             && !lowered.contains("verification code is invalid")
             && !lowered.contains("verification nonce is invalid")
             && !lowered.contains("verification temporarily locked")
             && !lowered.contains("pairing request rejected")
+    }
+
+    fn reachability_summary_has_connect_blocked_outcome(lowered: &str) -> bool {
+        let attempted = lowered
+            .split_once("attempted=[")
+            .and_then(|(_, rest)| rest.split_once(']').map(|(attempted, _)| attempted))
+            .unwrap_or(lowered);
+        attempted.contains(" refused")
+            || attempted.contains("connection refused")
+            || attempted.contains("connect refused")
+            || attempted.contains("connect-timeout")
+            || attempted.contains("connect timeout")
+            || attempted.contains("connect timed out")
     }
 
     fn role_reversal_attempt_id(flow: &GuidedPairingFlow, attempt_id: u64) -> String {
@@ -1612,15 +1626,25 @@ mod windows_app {
         #[test]
         fn should_offer_role_reversal_matches_reachability_not_trust_failures() {
             let blocked = anyhow::anyhow!(
-                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 timeout]"
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 refused]"
             );
             assert!(should_offer_role_reversal(&blocked));
+
+            let connect_timeout = anyhow::anyhow!(
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv6 port 15200 connect-timeout]"
+            );
+            assert!(should_offer_role_reversal(&connect_timeout));
 
             for service_error in [
                 "nearby pairing endpoint closed without a response",
                 "read nearby pairing response timed out after 20s",
                 "send nearby pairing request timed out after 4s",
                 "target daemon did not return a nearby pairing response",
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 endpoint closed without a response]",
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 read response timed out]",
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 send request timed out]",
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 service protocol stall]",
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 timeout]",
             ] {
                 assert!(
                     !should_offer_role_reversal(&anyhow::anyhow!(service_error)),
