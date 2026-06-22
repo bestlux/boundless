@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use app_services::desktop::{TcpEndpointCandidate, TcpEndpointSource, tcp_endpoint_candidate};
 use peer_transport::{
     outbound_target_candidates as transport_outbound_target_candidates,
     wait_for_runtime_wake_or_backoff,
@@ -139,7 +140,7 @@ async fn peer_worker(state: AppState, peer_id: String) {
         };
 
         let discovered_endpoints = state.discovered_endpoint_candidates(&peer_id).await;
-        let target_candidates = outbound_target_candidates(&peer.address, &discovered_endpoints);
+        let target_candidates = outbound_transport_candidates(&peer.address, &discovered_endpoints);
         if target_candidates.is_empty() {
             wait_for_reconcile_or_backoff(&reconcile_wake, Duration::from_secs(backoff_secs)).await;
             backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECONDS);
@@ -148,8 +149,8 @@ async fn peer_worker(state: AppState, peer_id: String) {
 
         let mut connected = false;
         let mut last_error: Option<anyhow::Error> = None;
-        for target_address in &target_candidates {
-            match connect_and_run_outbound(state.clone(), &peer_id, target_address).await {
+        for target in &target_candidates {
+            match connect_and_run_outbound(state.clone(), &peer_id, &target.endpoint).await {
                 Ok(()) => {
                     backoff_secs = 1;
                     connected = true;
@@ -167,10 +168,7 @@ async fn peer_worker(state: AppState, peer_id: String) {
                 direction: "outbound".to_string(),
                 kind: "transport_reachability_failed".to_string(),
                 peer_id: peer_id.clone(),
-                detail: transport_reachability_failure_detail(
-                    &target_candidates,
-                    !discovered_endpoints.is_empty(),
-                ),
+                detail: transport_reachability_failure_detail(&target_candidates),
                 size_bytes: 0,
             });
             warn!(
@@ -199,28 +197,57 @@ pub(super) async fn wait_for_reconcile_or_backoff(
     wait_for_runtime_wake_or_backoff(reconcile_wake, backoff).await;
 }
 
+fn outbound_transport_candidates(
+    configured_address: &str,
+    discovered_endpoints: &[SocketAddr],
+) -> Vec<TcpEndpointCandidate> {
+    let target_endpoints =
+        transport_outbound_target_candidates(configured_address, discovered_endpoints);
+    target_endpoints
+        .iter()
+        .enumerate()
+        .map(|(ordinal, endpoint)| {
+            let source = if discovered_endpoints
+                .iter()
+                .any(|discovered| discovered.to_string() == *endpoint)
+            {
+                TcpEndpointSource::Discovery
+            } else {
+                TcpEndpointSource::ConfiguredPeer
+            };
+            tcp_endpoint_candidate(endpoint, source, ordinal)
+        })
+        .collect()
+}
+
+#[cfg(test)]
 pub(super) fn outbound_target_candidates(
     configured_address: &str,
     discovered_endpoints: &[SocketAddr],
 ) -> Vec<String> {
-    transport_outbound_target_candidates(configured_address, discovered_endpoints)
+    outbound_transport_candidates(configured_address, discovered_endpoints)
+        .into_iter()
+        .map(|candidate| candidate.endpoint)
+        .collect()
 }
 
-fn transport_reachability_failure_detail(candidates: &[String], mdns_discovered: bool) -> String {
+fn transport_reachability_failure_detail(candidates: &[TcpEndpointCandidate]) -> String {
     format!(
         "mdns_discovered={} tcp_transport_reachability=failed attempted=[{}] next_action=verify Private network, VLAN routing, and manual admin-approved firewall policy for the listed TCP ports",
-        mdns_discovered,
+        candidates
+            .iter()
+            .any(|candidate| candidate.source == TcpEndpointSource::Discovery),
         redacted_tcp_endpoint_labels_for_runtime(candidates)
     )
 }
 
-fn redacted_tcp_endpoint_labels_for_runtime(candidates: &[String]) -> String {
+fn redacted_tcp_endpoint_labels_for_runtime(candidates: &[TcpEndpointCandidate]) -> String {
     if candidates.is_empty() {
         return "none".to_string();
     }
     candidates
         .iter()
-        .map(|candidate| app_services::desktop::redacted_tcp_endpoint_label(candidate))
+        .map(TcpEndpointCandidate::redacted_provenance_label)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -270,18 +297,16 @@ mod tests {
 
     #[test]
     fn transport_reachability_failure_detail_redacts_candidates() {
-        let detail = transport_reachability_failure_detail(
-            &[
-                "[fe80::1%4]:15100".to_string(),
-                "10.0.0.9:15100".to_string(),
-            ],
-            true,
-        );
+        let candidates = vec![
+            tcp_endpoint_candidate("[fe80::1%4]:15100", TcpEndpointSource::Discovery, 0),
+            tcp_endpoint_candidate("10.0.0.9:15100", TcpEndpointSource::Discovery, 1),
+        ];
+        let detail = transport_reachability_failure_detail(&candidates);
 
         assert!(detail.contains("mdns_discovered=true"));
         assert!(detail.contains("tcp_transport_reachability=failed"));
-        assert!(detail.contains("tcp ipv6 port 15100"));
-        assert!(detail.contains("tcp ipv4 port 15100"));
+        assert!(detail.contains("source=mdns tcp ipv6 port 15100"));
+        assert!(detail.contains("source=mdns tcp ipv4 port 15100"));
         assert!(detail.contains("next_action=verify Private network"));
         assert!(!detail.contains("10.0.0.9"));
         assert!(!detail.contains("fe80::1"));
@@ -295,19 +320,55 @@ mod tests {
             "[2001:db8::7]:15100".parse().expect("ipv6 endpoint"),
         ]);
         let targets = redacted_tcp_endpoint_labels_for_runtime(&[
-            "10.0.0.10:15100".to_string(),
-            "[2001:db8::7]:15100".to_string(),
+            tcp_endpoint_candidate("10.0.0.10:15100", TcpEndpointSource::ConfiguredPeer, 0),
+            tcp_endpoint_candidate("[2001:db8::7]:15100", TcpEndpointSource::Discovery, 1),
         ]);
 
         assert_eq!(configured, "tcp ipv4 port 15100");
         assert!(discovered.contains("tcp ipv4 port 15100"));
         assert!(discovered.contains("tcp ipv6 port 15100"));
-        assert!(targets.contains("tcp ipv4 port 15100"));
-        assert!(targets.contains("tcp ipv6 port 15100"));
+        assert!(targets.contains("source=configured-peer tcp ipv4 port 15100"));
+        assert!(targets.contains("source=mdns tcp ipv6 port 15100"));
         assert!(!discovered.contains("10.0.0.9"));
         assert!(!discovered.contains("2001:db8::7"));
         assert!(!targets.contains("10.0.0.10"));
         assert!(!targets.contains("2001:db8::7"));
+    }
+
+    #[test]
+    fn outbound_transport_candidates_preserve_order_and_provenance() {
+        let discovered = vec![
+            "[2001:db8::7]:15100".parse().expect("ipv6 endpoint"),
+            "10.0.0.9:15100".parse().expect("ipv4 endpoint"),
+        ];
+
+        let candidates = outbound_transport_candidates("peer.example.test:15100", &discovered);
+
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].endpoint, "[2001:db8::7]:15100");
+        assert_eq!(candidates[0].source, TcpEndpointSource::Discovery);
+        assert_eq!(
+            candidates[0].family,
+            app_services::desktop::TcpEndpointFamily::Ipv6
+        );
+        assert_eq!(candidates[0].port, Some(15100));
+        assert_eq!(candidates[0].ordinal, 0);
+        assert_eq!(candidates[1].endpoint, "10.0.0.9:15100");
+        assert_eq!(candidates[1].source, TcpEndpointSource::Discovery);
+        assert_eq!(
+            candidates[1].family,
+            app_services::desktop::TcpEndpointFamily::Ipv4
+        );
+        assert_eq!(candidates[1].port, Some(15100));
+        assert_eq!(candidates[1].ordinal, 1);
+        assert_eq!(candidates[2].endpoint, "peer.example.test:15100");
+        assert_eq!(candidates[2].source, TcpEndpointSource::ConfiguredPeer);
+        assert_eq!(
+            candidates[2].family,
+            app_services::desktop::TcpEndpointFamily::Hostname
+        );
+        assert_eq!(candidates[2].port, Some(15100));
+        assert_eq!(candidates[2].ordinal, 2);
     }
 
     #[test]

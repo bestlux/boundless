@@ -18,6 +18,68 @@ const PAIRING_PORT_OFFSET: u16 = 100;
 pub const CANONICAL_LOCAL_LAYOUT_TOKEN: &str = "self";
 pub const MAX_LAYOUT_REMOTE_PEERS: usize = 4;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpEndpointFamily {
+    Ipv4,
+    Ipv6,
+    Hostname,
+    Unknown,
+}
+
+impl TcpEndpointFamily {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+            Self::Hostname => "hostname",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpEndpointSource {
+    Discovery,
+    ManualHost,
+    ConfiguredPeer,
+    LastSuccess,
+    RoleReversalRequest,
+}
+
+impl TcpEndpointSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovery => "mdns",
+            Self::ManualHost => "manual-host",
+            Self::ConfiguredPeer => "configured-peer",
+            Self::LastSuccess => "last-success",
+            Self::RoleReversalRequest => "role-reversal-request",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpEndpointCandidate {
+    pub endpoint: String,
+    pub family: TcpEndpointFamily,
+    pub port: Option<u16>,
+    pub source: TcpEndpointSource,
+    pub ordinal: usize,
+}
+
+impl TcpEndpointCandidate {
+    pub fn redacted_label(&self) -> String {
+        match self.port {
+            Some(port) => format!("tcp {} port {port}", self.family.as_str()),
+            None => "tcp invalid endpoint".to_string(),
+        }
+    }
+
+    pub fn redacted_provenance_label(&self) -> String {
+        format!("source={} {}", self.source.as_str(), self.redacted_label())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LayoutPeerToken {
     pub peer_id: String,
@@ -64,8 +126,26 @@ pub fn host_and_pairing_port_from_endpoint(endpoint: &str) -> Result<(String, u1
 
 pub fn redacted_tcp_endpoint_label(endpoint: &str) -> String {
     match parse_endpoint_family_and_port(endpoint) {
-        Some((family, port)) => format!("tcp {family} port {port}"),
+        Some((family, port)) => format!("tcp {} port {port}", family.as_str()),
         None => "tcp invalid endpoint".to_string(),
+    }
+}
+
+pub fn tcp_endpoint_candidate(
+    endpoint: &str,
+    source: TcpEndpointSource,
+    ordinal: usize,
+) -> TcpEndpointCandidate {
+    let endpoint = endpoint.trim().to_string();
+    let (family, port) = parse_endpoint_family_and_port(&endpoint)
+        .map(|(family, port)| (family, Some(port)))
+        .unwrap_or((TcpEndpointFamily::Unknown, None));
+    TcpEndpointCandidate {
+        endpoint,
+        family,
+        port,
+        source,
+        ordinal,
     }
 }
 
@@ -80,32 +160,36 @@ pub fn redacted_tcp_endpoint_labels(endpoints: &[String]) -> String {
         .join(", ")
 }
 
-fn parse_endpoint_family_and_port(endpoint: &str) -> Option<(&'static str, u16)> {
+fn parse_endpoint_family_and_port(endpoint: &str) -> Option<(TcpEndpointFamily, u16)> {
     let trimmed = endpoint.trim();
     if trimmed.is_empty() {
         return None;
     }
 
     if let Ok(socket) = trimmed.parse::<SocketAddr>() {
-        let family = if socket.is_ipv4() { "ipv4" } else { "ipv6" };
+        let family = if socket.is_ipv4() {
+            TcpEndpointFamily::Ipv4
+        } else {
+            TcpEndpointFamily::Ipv6
+        };
         return Some((family, socket.port()));
     }
 
-    let (host, _) = if let Some(host) = trimmed
+    let host = if let Some((host, _)) = trimmed
         .strip_prefix('[')
         .and_then(|value| value.split_once(']'))
     {
-        (host.0.trim(), host.1)
+        host.trim()
     } else {
-        trimmed.rsplit_once(':')?
+        trimmed.rsplit_once(':')?.0.trim()
     };
     let port = extract_port_from_endpoint(trimmed).ok()?;
     let family = if host.contains(':') {
-        "ipv6"
+        TcpEndpointFamily::Ipv6
     } else if host.parse::<std::net::Ipv4Addr>().is_ok() {
-        "ipv4"
+        TcpEndpointFamily::Ipv4
     } else {
-        "hostname"
+        TcpEndpointFamily::Hostname
     };
     Some((family, port))
 }
@@ -516,6 +600,32 @@ mod tests {
         assert!(!labels.contains("10.0.0.9"));
         assert!(!labels.contains("fe80::1"));
         assert!(!labels.contains("office-pc"));
+    }
+
+    #[test]
+    fn tcp_endpoint_candidate_preserves_provenance_and_redacts_endpoint() {
+        let ipv6 = tcp_endpoint_candidate("[fe80::1%4]:15100", TcpEndpointSource::Discovery, 0);
+        let manual =
+            tcp_endpoint_candidate("office-pc.local:15200", TcpEndpointSource::ManualHost, 1);
+
+        assert_eq!(ipv6.family, TcpEndpointFamily::Ipv6);
+        assert_eq!(ipv6.port, Some(15100));
+        assert_eq!(ipv6.source, TcpEndpointSource::Discovery);
+        assert_eq!(ipv6.ordinal, 0);
+        assert_eq!(ipv6.redacted_label(), "tcp ipv6 port 15100");
+        assert_eq!(
+            ipv6.redacted_provenance_label(),
+            "source=mdns tcp ipv6 port 15100"
+        );
+        assert_eq!(manual.family, TcpEndpointFamily::Hostname);
+        assert_eq!(manual.port, Some(15200));
+        assert_eq!(manual.source, TcpEndpointSource::ManualHost);
+        assert_eq!(
+            manual.redacted_provenance_label(),
+            "source=manual-host tcp hostname port 15200"
+        );
+        assert!(!ipv6.redacted_provenance_label().contains("fe80::1"));
+        assert!(!manual.redacted_provenance_label().contains("office-pc"));
     }
 
     #[test]
