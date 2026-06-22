@@ -56,11 +56,13 @@ Recovery
 
 Connectivity diagnostics
 ------------------------
-- Boundless-ConnectivityDiagnostics.ps1 is read-only. It checks local listener/process ownership and, when a remote host is supplied, TCP reachability for Boundless transport port 15100 and nearby pairing port 15200.
+- Boundless-ConnectivityDiagnostics.ps1 is read-only. It checks local listener/process ownership for TCP 15100, 15101, and 15200 and, when a remote host is supplied, remote TCP reachability for the same ports.
+- TCP 15100 is the default Boundless transport port. TCP 15200 is the default nearby pairing port. TCP 15101 is included to diagnose Mouse Without Borders / PowerToys side-by-side listener ownership during dogfood.
 - Example:
 
   powershell -NoProfile -ExecutionPolicy Bypass -File "%ProgramFiles%\Boundless\Boundless-ConnectivityDiagnostics.ps1" -RemoteHost 10.10.0.187
 
+- If side-by-side dogfood with Mouse Without Borders is needed, configure the same alternate Boundless network_port on every participating machine before pairing. Nearby pairing uses network_port + 100, so network_port 16100 pairs on TCP 16200.
 - Boundless does not silently create firewall rules. If you add rules manually, use an elevated shell only after explicit approval, restrict them to the Private profile, and scope them to %ProgramFiles%\Boundless\boundless-service.exe.
 - Do not expose Boundless ports on Public networks or through router port forwarding.
 
