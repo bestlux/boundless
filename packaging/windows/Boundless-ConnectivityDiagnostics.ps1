@@ -7,7 +7,9 @@ param(
     [ValidateRange(1, 30)]
     [int]$TimeoutSeconds = 4,
 
-    [switch]$Json
+    [switch]$Json,
+
+    [switch]$SelfTest
 )
 
 Set-StrictMode -Version Latest
@@ -199,31 +201,303 @@ function Get-NetworkProfileReport {
     }
 }
 
-function Get-FirewallRuleHint {
-    param([int[]]$Ports)
+function ConvertTo-StringList {
+    param([object]$Value)
 
-    $serviceExe = Join-Path $env:ProgramFiles "Boundless\boundless-service.exe"
-    try {
-        $rules = @(Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True -Profile Private -ErrorAction Stop |
-            Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue |
-            Where-Object { $_.Program -eq $serviceExe })
-        return [pscustomobject]@{
-            checked = $true
-            service_exe = $serviceExe
-            matching_private_inbound_program_rules = $rules.Count
-            required_ports = $Ports
-            note = "This script is read-only; it does not create or edit firewall rules."
+    if ($null -eq $Value) {
+        return @()
+    }
+    if ($Value -is [array]) {
+        return @($Value | ForEach-Object { "$_" })
+    }
+    return @("$Value")
+}
+
+function Test-ProfileIncludesPrivate {
+    param([object]$Profile)
+
+    $values = @(ConvertTo-StringList -Value $Profile)
+    return @($values | Where-Object { $_ -eq "Private" }).Count -gt 0
+}
+
+function Test-ProfileIsBroadOrPublic {
+    param([object]$Profile)
+
+    $values = @(ConvertTo-StringList -Value $Profile)
+    return @($values | Where-Object { $_ -eq "Any" -or $_ -eq "Public" }).Count -gt 0
+}
+
+function Test-RemoteAddressIsBroad {
+    param([object]$RemoteAddress)
+
+    $values = @(ConvertTo-StringList -Value $RemoteAddress)
+    if ($values.Count -eq 0) {
+        return $true
+    }
+    return @($values | Where-Object { $_ -in @("Any", "*", "0.0.0.0/0", "::/0", "Internet") }).Count -gt 0
+}
+
+function Test-RemoteAddressIsLocalSubnetOrNarrower {
+    param([object]$RemoteAddress)
+
+    $values = @(ConvertTo-StringList -Value $RemoteAddress)
+    if ($values.Count -eq 0 -or (Test-RemoteAddressIsBroad -RemoteAddress $values)) {
+        return $false
+    }
+    return @($values | Where-Object { $_ -eq "LocalSubnet" }).Count -gt 0
+}
+
+function Test-LocalPortIsBroad {
+    param([object]$LocalPort)
+
+    $values = @(ConvertTo-StringList -Value $LocalPort)
+    if ($values.Count -eq 0) {
+        return $true
+    }
+    return @($values | Where-Object { $_ -in @("Any", "*") }).Count -gt 0
+}
+
+function Test-ProtocolIsTcp {
+    param([object]$Protocol)
+
+    $values = @(ConvertTo-StringList -Value $Protocol)
+    return @($values | Where-Object { $_ -eq "TCP" -or $_ -eq "6" }).Count -gt 0
+}
+
+function Test-ProtocolIsBroad {
+    param([object]$Protocol)
+
+    $values = @(ConvertTo-StringList -Value $Protocol)
+    if ($values.Count -eq 0) {
+        return $true
+    }
+    return @($values | Where-Object { $_ -in @("Any", "*") }).Count -gt 0
+}
+
+function Test-PortMatches {
+    param(
+        [object]$LocalPort,
+        [int]$Port
+    )
+
+    foreach ($value in @(ConvertTo-StringList -Value $LocalPort)) {
+        if ($value -match '^\d+$' -and [int]$value -eq $Port) {
+            return $true
         }
-    } catch {
-        return [pscustomobject]@{
-            checked = $false
-            service_exe = $serviceExe
-            matching_private_inbound_program_rules = $null
-            required_ports = $Ports
-            error = $_.Exception.Message
-            note = "This script is read-only; it does not create or edit firewall rules."
+        if ($value -match '^(\d+)-(\d+)$') {
+            $start = [int]$Matches[1]
+            $end = [int]$Matches[2]
+            if ($Port -ge $start -and $Port -le $end) {
+                return $true
+            }
         }
     }
+    return $false
+}
+
+function Test-ProgramMatches {
+    param(
+        [string]$Program,
+        [string]$ExpectedProgram
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Program)) {
+        return $false
+    }
+    return $Program.Trim().Equals($ExpectedProgram, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function New-FirewallRuleEvidence {
+    param(
+        [string]$Name,
+        [string]$DisplayName,
+        [object]$Enabled,
+        [object]$Direction,
+        [object]$Action,
+        [object]$Profile,
+        [string]$Program,
+        [object]$Protocol,
+        [object]$LocalPort,
+        [object]$RemoteAddress,
+        [string]$ExpectedProgram,
+        [int[]]$RequiredPorts
+    )
+
+    $coveredPorts = @($RequiredPorts | Where-Object { Test-PortMatches -LocalPort $LocalPort -Port $_ })
+    $programMatches = Test-ProgramMatches -Program $Program -ExpectedProgram $ExpectedProgram
+    $privateProfile = Test-ProfileIncludesPrivate -Profile $Profile
+    $broadProfile = Test-ProfileIsBroadOrPublic -Profile $Profile
+    $broadPort = Test-LocalPortIsBroad -LocalPort $LocalPort
+    $broadProtocol = Test-ProtocolIsBroad -Protocol $Protocol
+    $broadRemote = Test-RemoteAddressIsBroad -RemoteAddress $RemoteAddress
+    $tcpProtocol = Test-ProtocolIsTcp -Protocol $Protocol
+    $localSubnetOrNarrower = Test-RemoteAddressIsLocalSubnetOrNarrower -RemoteAddress $RemoteAddress
+
+    return [pscustomobject]@{
+        name = $Name
+        display_name = $DisplayName
+        enabled = "$Enabled"
+        direction = "$Direction"
+        action = "$Action"
+        profile = @(ConvertTo-StringList -Value $Profile)
+        program = $Program
+        program_matches_expected = $programMatches
+        protocol = @(ConvertTo-StringList -Value $Protocol)
+        local_port = @(ConvertTo-StringList -Value $LocalPort)
+        remote_address = @(ConvertTo-StringList -Value $RemoteAddress)
+        covers_required_ports = $coveredPorts
+        private_profile = $privateProfile
+        public_or_any_profile = $broadProfile
+        tcp_protocol = $tcpProtocol
+        any_or_unspecified_protocol = $broadProtocol
+        local_subnet_or_narrower = $localSubnetOrNarrower
+        broad_remote_address = $broadRemote
+        broad_local_port = $broadPort
+        expected_policy_match = (
+            $programMatches -and
+            "$Enabled" -eq "True" -and
+            "$Direction" -eq "Inbound" -and
+            "$Action" -eq "Allow" -and
+            $privateProfile -and
+            -not $broadProfile -and
+            $tcpProtocol -and
+            -not $broadProtocol -and
+            $localSubnetOrNarrower -and
+            -not $broadRemote -and
+            -not $broadPort
+        )
+        broad_or_public_pattern = (
+            $programMatches -and
+            ($broadProfile -or $broadProtocol -or $broadPort -or $broadRemote)
+        )
+    }
+}
+
+function Get-FirewallRuleEvidence {
+    param(
+        [string]$ExpectedProgram,
+        [int[]]$RequiredPorts
+    )
+
+    $rules = @(Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True -ErrorAction Stop)
+    $evidence = @()
+    foreach ($rule in $rules) {
+        $applicationFilters = @($rule | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue)
+        $portFilters = @($rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue)
+        $addressFilters = @($rule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue)
+        if ($applicationFilters.Count -eq 0) {
+            $applicationFilters = @([pscustomobject]@{ Program = $null })
+        }
+        if ($portFilters.Count -eq 0) {
+            $portFilters = @([pscustomobject]@{ Protocol = $null; LocalPort = $null })
+        }
+        if ($addressFilters.Count -eq 0) {
+            $addressFilters = @([pscustomobject]@{ RemoteAddress = $null })
+        }
+
+        foreach ($app in $applicationFilters) {
+            foreach ($port in $portFilters) {
+                foreach ($address in $addressFilters) {
+                    if (-not (Test-ProgramMatches -Program $app.Program -ExpectedProgram $ExpectedProgram)) {
+                        continue
+                    }
+                    $evidence += New-FirewallRuleEvidence -Name $rule.Name -DisplayName $rule.DisplayName -Enabled $rule.Enabled -Direction $rule.Direction -Action $rule.Action -Profile $rule.Profile -Program $app.Program -Protocol $port.Protocol -LocalPort $port.LocalPort -RemoteAddress $address.RemoteAddress -ExpectedProgram $ExpectedProgram -RequiredPorts $RequiredPorts
+                }
+            }
+        }
+    }
+    return $evidence
+}
+
+function Get-FirewallPolicyReport {
+    param(
+        [string]$ServiceExe,
+        [object[]]$RuleEvidence,
+        [string]$ErrorMessage
+    )
+
+    $requiredFirewallPorts = @(15100, 15200)
+    $portReports = @(
+        foreach ($port in $requiredFirewallPorts) {
+            $matches = @($RuleEvidence | Where-Object {
+                $_.expected_policy_match -and
+                @($_.covers_required_ports).Contains($port)
+            })
+            [pscustomobject]@{
+                port = $port
+                required = $true
+                covered_by_private_local_subnet_program_rule = $matches.Count -gt 0
+                matching_rules = $matches
+            }
+        }
+    )
+    $broadPatterns = @($RuleEvidence | Where-Object { $_.broad_or_public_pattern })
+
+    return [pscustomobject]@{
+        checked = [string]::IsNullOrWhiteSpace($ErrorMessage)
+        read_only = $true
+        service_exe = $ServiceExe
+        expected_policy = [pscustomobject]@{
+            program = $ServiceExe
+            direction = "Inbound"
+            action = "Allow"
+            enabled = "True"
+            profile = "Private"
+            protocol = "TCP"
+            remote_address = "LocalSubnet or narrower"
+            required_ports = $requiredFirewallPorts
+            diagnostics_only_ports = @(15101)
+        }
+        matching_private_inbound_program_rules = @($RuleEvidence | Where-Object { $_.expected_policy_match }).Count
+        required_ports = $portReports
+        required_ports_covered = @($portReports | Where-Object { -not $_.covered_by_private_local_subnet_program_rule }).Count -eq 0
+        relevant_rules = $RuleEvidence
+        broad_or_public_patterns = $broadPatterns
+        broad_or_public_pattern_detected = $broadPatterns.Count -gt 0
+        error = $ErrorMessage
+        note = "This script is read-only; it does not create or edit firewall rules."
+    }
+}
+
+function Get-FirewallRuleHint {
+    $serviceExe = Join-Path $env:ProgramFiles "Boundless\boundless-service.exe"
+    try {
+        $evidence = @(Get-FirewallRuleEvidence -ExpectedProgram $serviceExe -RequiredPorts @(15100, 15200))
+        return Get-FirewallPolicyReport -ServiceExe $serviceExe -RuleEvidence $evidence -ErrorMessage $null
+    } catch {
+        return Get-FirewallPolicyReport -ServiceExe $serviceExe -RuleEvidence @() -ErrorMessage $_.Exception.Message
+    }
+}
+
+function Invoke-FirewallPolicySelfTest {
+    $serviceExe = Join-Path $env:ProgramFiles "Boundless\boundless-service.exe"
+    $requiredPorts = @(15100, 15200)
+    $evidence = @(
+        New-FirewallRuleEvidence -Name "good" -DisplayName "Boundless private" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile @("Private") -Program $serviceExe -Protocol "TCP" -LocalPort @("15100", "15200") -RemoteAddress "LocalSubnet" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
+        New-FirewallRuleEvidence -Name "broad" -DisplayName "Boundless broad" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile @("Any") -Program $serviceExe -Protocol "Any" -LocalPort "Any" -RemoteAddress "Any" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
+        New-FirewallRuleEvidence -Name "diagnostics-only" -DisplayName "Boundless 15101" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile @("Private") -Program $serviceExe -Protocol "TCP" -LocalPort "15101" -RemoteAddress "LocalSubnet" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
+    )
+    $report = Get-FirewallPolicyReport -ServiceExe $serviceExe -RuleEvidence $evidence -ErrorMessage $null
+
+    if (-not $report.required_ports_covered) {
+        throw "expected TCP 15100 and 15200 coverage"
+    }
+    if (@($report.required_ports | Where-Object { $_.port -eq 15101 }).Count -ne 0) {
+        throw "TCP 15101 must remain diagnostics-only, not a required firewall port"
+    }
+    if (-not $report.broad_or_public_pattern_detected) {
+        throw "expected broad/Public-style pattern detection"
+    }
+    if (@($report.broad_or_public_patterns | Where-Object { $_.name -eq "diagnostics-only" }).Count -ne 0) {
+        throw "diagnostics-only TCP 15101 rule must not be classified as broad"
+    }
+
+    Write-Host "connectivity_diagnostics_firewall_policy_fixtures=passed"
+}
+
+if ($SelfTest) {
+    Invoke-FirewallPolicySelfTest
+    exit 0
 }
 
 $uniquePorts = @($Ports | Sort-Object -Unique)
@@ -245,7 +519,7 @@ $report = [pscustomobject]@{
     local_listeners = $localListeners
     side_by_side_guidance = Get-SideBySideGuidance -LocalListeners $localListeners
     remote_reachability = $remoteReports
-    firewall_hint = Get-FirewallRuleHint -Ports $uniquePorts
+    firewall_hint = Get-FirewallRuleHint
     guidance = [pscustomobject]@{
         pairing_port = 15200
         transport_port = 15100
@@ -309,6 +583,8 @@ if ($RemoteHost) {
 Write-Host ""
 Write-Host "Firewall guidance:"
 Write-Host "- This script did not create or edit firewall rules."
-Write-Host "- Boundless pairing uses TCP 15200; trusted transport uses TCP 15100. TCP 15101 is checked for side-by-side dogfood collisions."
+Write-Host "- Boundless pairing uses TCP 15200; trusted transport uses TCP 15100. TCP 15101 is checked only for side-by-side dogfood collisions."
+Write-Host "- firewall_hint reports whether TCP 15100 and 15200 appear covered by enabled inbound allow rules for %ProgramFiles%\Boundless\boundless-service.exe on Private profile with LocalSubnet-or-narrower remote scope."
+Write-Host "- firewall_hint also reports broad/Public/Any-style matching rules as evidence; it does not change them."
 Write-Host "- If a rule is needed, create it only after explicit approval, only for Private profile, and only for %ProgramFiles%\Boundless\boundless-service.exe."
 Write-Host "- Do not expose Boundless ports on Public networks or through router port forwarding."

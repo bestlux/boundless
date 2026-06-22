@@ -58,6 +58,7 @@ Connectivity diagnostics
 ------------------------
 - Boundless-ConnectivityDiagnostics.ps1 is read-only. It checks local listener/process ownership for TCP 15100, 15101, and 15200 and, when a remote host is supplied, remote TCP reachability for the same ports.
 - TCP 15100 is the default Boundless transport port. TCP 15200 is the default nearby pairing port. TCP 15101 is included to diagnose Mouse Without Borders / PowerToys side-by-side listener ownership during dogfood.
+- In JSON output, firewall_hint reports read-only evidence for the expected policy shape: enabled inbound allow rules for %ProgramFiles%\Boundless\boundless-service.exe, Private profile, TCP 15100 and 15200, and LocalSubnet-or-narrower remote scope. It also flags broad/Public/Any-style matching rules. TCP 15101 remains diagnostics-only, not a default firewall requirement.
 - Example:
 
   powershell -NoProfile -ExecutionPolicy Bypass -File "%ProgramFiles%\Boundless\Boundless-ConnectivityDiagnostics.ps1" -RemoteHost 10.10.0.187
