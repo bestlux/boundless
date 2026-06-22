@@ -481,4 +481,3 @@ fn close_request_hides_to_tray_only_when_tray_exists_and_exit_was_not_requested(
         "without a tray icon, close should not hide the only window"
     );
 }
-
