@@ -1369,6 +1369,7 @@ mod windows_app {
             || attempted.contains("send request timed out")
             || attempted.contains("send nearby pairing request timed out")
             || attempted.contains("service protocol stall")
+            || attempted.contains("service-timeout")
             || attempted.contains("target daemon did not return")
     }
 
@@ -1665,6 +1666,8 @@ mod windows_app {
                 "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 service protocol stall]",
                 "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 timeout]",
                 "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 service-timeout]",
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv6 port 15200 connect-timeout, tcp ipv4 port 15200 service-timeout]",
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv6 port 15200 refused, tcp ipv4 port 15200 service-timeout]",
             ] {
                 assert!(
                     !should_offer_role_reversal(&anyhow::anyhow!(service_error)),
