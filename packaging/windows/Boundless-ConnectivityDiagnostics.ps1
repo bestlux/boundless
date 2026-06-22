@@ -208,9 +208,9 @@ function ConvertTo-StringList {
         return @()
     }
     if ($Value -is [array]) {
-        return @($Value | ForEach-Object { "$_" })
+        return @($Value | ForEach-Object { ConvertTo-StringList -Value $_ })
     }
-    return @("$Value")
+    return @("$Value" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 }
 
 function Test-ProfileIncludesPrivate {
@@ -244,7 +244,7 @@ function Test-RemoteAddressIsLocalSubnetOrNarrower {
     if ($values.Count -eq 0 -or (Test-RemoteAddressIsBroad -RemoteAddress $values)) {
         return $false
     }
-    return @($values | Where-Object { $_ -eq "LocalSubnet" }).Count -gt 0
+    return $true
 }
 
 function Test-LocalPortIsBroad {
@@ -474,7 +474,9 @@ function Invoke-FirewallPolicySelfTest {
     $requiredPorts = @(15100, 15200)
     $evidence = @(
         New-FirewallRuleEvidence -Name "good" -DisplayName "Boundless private" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile @("Private") -Program $serviceExe -Protocol "TCP" -LocalPort @("15100", "15200") -RemoteAddress "LocalSubnet" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
+        New-FirewallRuleEvidence -Name "narrow-cidr" -DisplayName "Boundless narrow" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile "Private" -Program $serviceExe -Protocol "TCP" -LocalPort "15100" -RemoteAddress "10.10.0.12/32" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
         New-FirewallRuleEvidence -Name "broad" -DisplayName "Boundless broad" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile @("Any") -Program $serviceExe -Protocol "Any" -LocalPort "Any" -RemoteAddress "Any" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
+        New-FirewallRuleEvidence -Name "comma-profile" -DisplayName "Boundless comma profile" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile "Private, Public" -Program $serviceExe -Protocol "TCP" -LocalPort "15100, 15200" -RemoteAddress "LocalSubnet" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
         New-FirewallRuleEvidence -Name "diagnostics-only" -DisplayName "Boundless 15101" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile @("Private") -Program $serviceExe -Protocol "TCP" -LocalPort "15101" -RemoteAddress "LocalSubnet" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
     )
     $report = Get-FirewallPolicyReport -ServiceExe $serviceExe -RuleEvidence $evidence -ErrorMessage $null
@@ -490,6 +492,15 @@ function Invoke-FirewallPolicySelfTest {
     }
     if (@($report.broad_or_public_patterns | Where-Object { $_.name -eq "diagnostics-only" }).Count -ne 0) {
         throw "diagnostics-only TCP 15101 rule must not be classified as broad"
+    }
+    if (@($report.relevant_rules | Where-Object { $_.name -eq "narrow-cidr" -and $_.local_subnet_or_narrower -and $_.expected_policy_match }).Count -ne 1) {
+        throw "explicit narrower remote scope must satisfy LocalSubnet-or-narrower policy"
+    }
+    if (@($report.broad_or_public_patterns | Where-Object { $_.name -eq "comma-profile" }).Count -ne 1) {
+        throw "comma-separated Private, Public profile must be classified as broad/Public"
+    }
+    if (@($report.relevant_rules | Where-Object { $_.name -eq "comma-profile" -and @($_.profile).Contains("Private") -and @($_.profile).Contains("Public") -and @($_.local_port).Contains("15100") -and @($_.local_port).Contains("15200") }).Count -ne 1) {
+        throw "comma-separated scalar fields must be normalized into individual values"
     }
 
     Write-Host "connectivity_diagnostics_firewall_policy_fixtures=passed"
