@@ -43,6 +43,44 @@ impl DashboardApp {
         }
     }
 
+    fn start_role_reversal_pairing(&mut self, egui_ctx: egui::Context) {
+        if let Err(error) = validate_pairing_code(&self.pairing_code) {
+            self.pairing_last_error = Some(error.to_string());
+            return;
+        }
+
+        if let (Some(flow), Some(attempt_id), Some(role_reversal_attempt_id)) = (
+            self.pairing_flow.clone(),
+            self.active_pairing_attempt_id,
+            self.pairing_role_reversal_attempt_id.clone(),
+        ) {
+            let code = self.pairing_code.clone();
+            let alias = if self.pairing_alias.trim().is_empty() {
+                None
+            } else {
+                Some(self.pairing_alias.clone())
+            };
+
+            self.pairing_in_progress = true;
+            self.pairing_last_error = Some(role_reversal_next_action_message(
+                &flow,
+                Some(&role_reversal_attempt_id),
+                true,
+            ));
+            self.task_runner()
+                .start_role_reversal_pairing(StartRoleReversalPairingTask {
+                    tx: self.tx.clone(),
+                    endpoint: self.ctx.endpoint.clone(),
+                    attempt_id,
+                    flow,
+                    code,
+                    alias,
+                    role_reversal_attempt_id,
+                    egui_ctx,
+                });
+        }
+    }
+
     pub(super) fn confirm_pairing_code(&mut self, egui_ctx: egui::Context) {
         if let Err(error) = validate_pairing_code(&self.pairing_code) {
             self.pairing_last_error = Some(error.to_string());
@@ -74,6 +112,29 @@ impl DashboardApp {
                     if ui.button("Cancel").clicked() {
                         self.cancel_pairing_flow();
                     }
+                });
+        } else if self.pairing_flow.is_some()
+            && self.pairing_challenge.is_none()
+            && self.pairing_last_error.is_some()
+        {
+            let title = self
+                .pairing_flow
+                .as_ref()
+                .map(|flow| flow.dialog_title.as_str())
+                .unwrap_or("Pairing failed");
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .min_width(420.0)
+                .show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    self.render_pairing_error(ui, ctx);
+                    ui.horizontal(|ui| {
+                        if ui.button("Close").clicked() {
+                            self.cancel_pairing_flow();
+                        }
+                    });
                 });
         } else if let Some(challenge) = self.pairing_challenge.clone() {
             let title = self
@@ -107,7 +168,11 @@ impl DashboardApp {
                     if self.pairing_in_progress {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label("Verifying code...");
+                            if self.pairing_role_reversal_available {
+                                ui.label("Waiting for reverse pairing approval...");
+                            } else {
+                                ui.label("Verifying code...");
+                            }
                         });
                     } else {
                         ui.horizontal(|ui| {
@@ -142,9 +207,25 @@ impl DashboardApp {
                 {
                     self.start_pairing(flow, ctx.clone());
                 }
+                if self.pairing_role_reversal_available && !self.pairing_in_progress {
+                    if let Some(message) = self.pairing_role_reversal_message.clone() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(message)
+                                .color(egui::Color32::LIGHT_YELLOW)
+                                .size(12.0),
+                        );
+                    }
+                    if self.pairing_challenge.is_some()
+                        && ui.button("Start Reverse Pairing Request").clicked()
+                    {
+                        self.start_role_reversal_pairing(ctx.clone());
+                    }
+                }
                 if ui.small_button("Dismiss").clicked() {
                     self.pairing_last_error = None;
                     self.pairing_retry_available = false;
+                    self.pairing_role_reversal_message = None;
                 }
             });
         });

@@ -204,6 +204,77 @@ fn recoverable_pairing_failure_offers_retry() {
 }
 
 #[test]
+fn blocked_direct_pairing_failure_offers_redacted_role_reversal_attempt() {
+    let raw_error = "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv6 port 15200 timeout, role=initiator source=manual-host tcp ipv4 port 15200 refused]";
+    let mut app = app_with_code_entry_flow();
+    let attempt_id = app
+        .active_pairing_attempt_id
+        .expect("active flow should have an attempt id");
+
+    app.apply_app_msg(AppMsg::PairingFailed {
+        attempt_id,
+        error: raw_error.to_string(),
+    });
+
+    assert!(app.pairing_role_reversal_available);
+    assert_eq!(
+        app.pairing_role_reversal_attempt_id.as_deref(),
+        Some("tray-rr-000001-mdns-p15200")
+    );
+    let message = app
+        .pairing_role_reversal_message
+        .as_deref()
+        .expect("role reversal next action should be shown");
+    assert!(message.contains("Direct TCP pairing appears blocked"));
+    assert!(message.contains("Start a reverse pairing request") || message.contains("start a reverse pairing request"));
+    assert!(message.contains("source=mdns tcp ipv4 port 15200"));
+    assert!(message.contains("source=manual-host tcp ipv4 port 15200"));
+    assert!(!message.contains("10.0.0.25"));
+    assert!(!message.contains("peer-machine"));
+}
+
+#[test]
+fn request_stage_blocked_failure_offers_reverse_next_action_without_code() {
+    let raw_error = "manual host TCP pairing reachability failed; attempted=[role=initiator source=manual-host tcp hostname port 15200 timeout]";
+    let mut app = app_with_active_pairing_flow();
+    let attempt_id = app
+        .active_pairing_attempt_id
+        .expect("active flow should have an attempt id");
+
+    app.apply_app_msg(AppMsg::PairingFailed {
+        attempt_id,
+        error: raw_error.to_string(),
+    });
+
+    assert!(app.pairing_challenge.is_none());
+    assert!(app.pairing_role_reversal_available);
+    let message = app
+        .pairing_role_reversal_message
+        .as_deref()
+        .expect("request-stage failure should keep a reverse-path next action");
+    assert!(message.contains("after a fresh code is shown"));
+    assert!(message.contains("This does not change firewall rules"));
+}
+
+#[test]
+fn trust_and_code_failures_do_not_offer_role_reversal() {
+    let raw_error = "verification code is invalid; attempts_remaining=4";
+    let mut app = app_with_code_entry_flow();
+    let attempt_id = app
+        .active_pairing_attempt_id
+        .expect("active flow should have an attempt id");
+
+    app.apply_app_msg(AppMsg::PairingFailed {
+        attempt_id,
+        error: raw_error.to_string(),
+    });
+
+    assert!(!app.pairing_role_reversal_available);
+    assert!(app.pairing_role_reversal_attempt_id.is_none());
+    assert!(app.pairing_role_reversal_message.is_none());
+}
+
+#[test]
 fn pairing_lockout_failure_does_not_offer_retry() {
     let raw_error = "verification temporarily locked after repeated invalid attempts; retry later";
     let mut app = app_with_code_entry_flow();

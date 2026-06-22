@@ -13,6 +13,17 @@ pub(super) struct SubmitPairingCodeTask {
     pub(super) egui_ctx: egui::Context,
 }
 
+pub(super) struct StartRoleReversalPairingTask {
+    pub(super) tx: Sender<AppMsg>,
+    pub(super) endpoint: String,
+    pub(super) attempt_id: u64,
+    pub(super) flow: GuidedPairingFlow,
+    pub(super) code: String,
+    pub(super) alias: Option<String>,
+    pub(super) role_reversal_attempt_id: String,
+    pub(super) egui_ctx: egui::Context,
+}
+
 impl DashboardTaskRunner {
     pub(super) fn new() -> Self {
         Self
@@ -167,6 +178,50 @@ impl DashboardTaskRunner {
                             peer_machine_id: submit_result.peer_machine_id,
                             orientation_selector: alias.unwrap_or(fallback_alias),
                             message: submit_result.message,
+                        },
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(AppMsg::PairingFailed {
+                        attempt_id,
+                        error: error.to_string(),
+                    });
+                }
+            }
+        });
+    }
+
+    pub(super) fn start_role_reversal_pairing(&self, task: StartRoleReversalPairingTask) {
+        let StartRoleReversalPairingTask {
+            tx,
+            endpoint,
+            attempt_id,
+            flow,
+            code,
+            alias,
+            role_reversal_attempt_id,
+            egui_ctx,
+        } = task;
+        let fallback_alias = flow.orientation_selector_fallback.clone();
+        Self::spawn_with_repaint(egui_ctx, move || {
+            match pair_nearby_role_reversal_blocking(
+                &endpoint,
+                NearbyRoleReversalRequest {
+                    code,
+                    host: flow.host,
+                    port: flow.pairing_port,
+                    alias: alias.clone(),
+                    endpoint_candidates: flow.endpoint_candidates,
+                    attempt_id: role_reversal_attempt_id,
+                },
+            ) {
+                Ok(result) => {
+                    let _ = tx.send(AppMsg::PairingComplete {
+                        attempt_id,
+                        result: GuidedPairingResult {
+                            peer_machine_id: result.peer_machine_id,
+                            orientation_selector: alias.unwrap_or(fallback_alias),
+                            message: result.message,
                         },
                     });
                 }
