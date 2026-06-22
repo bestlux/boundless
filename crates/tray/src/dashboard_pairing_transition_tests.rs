@@ -205,7 +205,7 @@ fn recoverable_pairing_failure_offers_retry() {
 
 #[test]
 fn blocked_direct_pairing_failure_offers_redacted_role_reversal_attempt() {
-    let raw_error = "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv6 port 15200 timeout, role=initiator source=manual-host tcp ipv4 port 15200 refused]";
+    let raw_error = "mDNS discovery succeeded but TCP pairing reachability failed; role_reversal_attempted=false; attempted=[role=initiator source=mdns tcp ipv4 port 15200 connect-timeout]; likely firewall/VLAN/asymmetric route reachability issue before trust/code/daemon pairing could complete; next_action=verify Private network, VLAN routing, and local admin-approved firewall policy for listed TCP ports";
     let mut app = app_with_code_entry_flow();
     let attempt_id = app
         .active_pairing_attempt_id
@@ -248,6 +248,9 @@ fn service_and_protocol_stalls_do_not_offer_role_reversal() {
         "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv4 port 15200 send request timed out]",
         "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv4 port 15200 service protocol stall]",
         "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv4 port 15200 timeout]",
+        "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv4 port 15200 service-timeout]",
+        "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv6 port 15200 connect-timeout, role=initiator source=mdns tcp ipv4 port 15200 service-timeout]",
+        "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[role=initiator source=mdns tcp ipv6 port 15200 refused, role=initiator source=mdns tcp ipv4 port 15200 service-timeout]",
     ] {
         let mut app = app_with_code_entry_flow();
         let attempt_id = app
@@ -270,7 +273,7 @@ fn service_and_protocol_stalls_do_not_offer_role_reversal() {
 
 #[test]
 fn request_stage_blocked_failure_offers_reverse_next_action_without_code() {
-    let raw_error = "manual host TCP pairing reachability failed; attempted=[role=initiator source=manual-host tcp hostname port 15200 refused]";
+    let raw_error = "mDNS discovery succeeded but TCP pairing reachability failed; role_reversal_attempted=false; attempted=[role=initiator source=mdns tcp ipv4 port 15200 connect-timeout]; likely firewall/VLAN/asymmetric route reachability issue before trust/code/daemon pairing could complete";
     let mut app = app_with_active_pairing_flow();
     let attempt_id = app
         .active_pairing_attempt_id
