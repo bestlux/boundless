@@ -188,7 +188,7 @@ pub(crate) async fn request_nearby_pairing_code(
     state: &AppState,
     host: &str,
     port: u16,
-    alias: Option<String>,
+    _alias: Option<String>,
     endpoint_candidates: &[String],
 ) -> Result<NearbyRequestCodeStart> {
     let targets = nearby_pairing_targets(
@@ -202,7 +202,7 @@ pub(crate) async fn request_nearby_pairing_code(
         &targets,
         PairingWireRequest::NearbyRequestCode {
             requester_bundle,
-            requester_alias: normalize_alias(alias),
+            requester_alias: None,
         },
     )
     .await?;
@@ -256,7 +256,7 @@ pub(crate) async fn submit_nearby_pairing_code(
             request_id: request.request_id.clone(),
             code: request.code,
             verification_nonce: request.verification_nonce,
-            requester_alias: normalize_alias(request.alias.clone()),
+            requester_alias: None,
         },
     )
     .await?;
@@ -324,7 +324,7 @@ pub(crate) async fn start_nearby_pairing_join_with_role(
         PairingWireRequest::NearbyJoin {
             code: normalized_code,
             requester_bundle,
-            requester_alias: normalize_alias(alias.clone()),
+            requester_alias: None,
             role,
             attempt_id: normalized_attempt_id.clone(),
         },
@@ -1107,6 +1107,44 @@ mod tests {
     use super::*;
 
     use core_security::{SecurityPaths, ensure_device_identity};
+    use tokio::task::JoinHandle;
+
+    fn temp_pairing_state(prefix: &str) -> (AppState, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("test state");
+        (state, root)
+    }
+
+    async fn capture_pairing_wire_request(
+        response: &'static str,
+    ) -> (SocketAddr, JoinHandle<PairingWireRequest>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("capture listener");
+        let addr = listener.local_addr().expect("capture listener address");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept pairing request");
+            let mut reader = BufReader::new(socket);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read pairing request");
+            let request =
+                serde_json::from_str::<PairingWireRequest>(&line).expect("parse pairing request");
+            let mut socket = reader.into_inner();
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            socket.write_all(b"\n").await.expect("write newline");
+            request
+        });
+        (addr, server)
+    }
 
     #[test]
     fn extract_port_from_address_reads_suffix() {
@@ -1246,6 +1284,113 @@ mod tests {
         assert!(message.contains("next_action=verify the host"));
         assert!(!message.contains("mDNS discovery succeeded"));
         assert!(!message.contains(&blocked_endpoint.ip().to_string()));
+    }
+
+    #[tokio::test]
+    async fn request_code_does_not_send_local_target_alias_as_requester_alias() {
+        let (state, root) = temp_pairing_state("boundless-request-code-alias-test");
+        let (addr, server) = capture_pairing_wire_request(
+            r#"{"status":"code_required","request_id":"request-1","message":"code required","verification_nonce":"nonce-1","expires_at":"2026-06-22T00:00:00Z"}"#,
+        )
+        .await;
+
+        let start = request_nearby_pairing_code(
+            &state,
+            &addr.ip().to_string(),
+            addr.port(),
+            Some("Target Alias".to_string()),
+            &[],
+        )
+        .await
+        .expect("request code succeeds");
+        assert!(matches!(start, NearbyRequestCodeStart::CodeRequired { .. }));
+
+        let request = server.await.expect("server task completes");
+        match request {
+            PairingWireRequest::NearbyRequestCode {
+                requester_alias, ..
+            } => assert!(
+                requester_alias.is_none(),
+                "local target alias must not be sent as requester alias"
+            ),
+            other => panic!("expected NearbyRequestCode, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn submit_code_does_not_send_local_target_alias_as_requester_alias() {
+        let (state, root) = temp_pairing_state("boundless-submit-code-alias-test");
+        let (addr, server) = capture_pairing_wire_request(
+            r#"{"status":"rejected","request_id":"request-1","message":"fixture rejection"}"#,
+        )
+        .await;
+
+        let error = submit_nearby_pairing_code(
+            &state,
+            NearbySubmitCode {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+                request_id: "request-1".to_string(),
+                code: "123456".to_string(),
+                verification_nonce: "nonce-1".to_string(),
+                alias: Some("Target Alias".to_string()),
+                endpoint_candidates: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("fixture rejection should fail submit");
+        assert!(error.to_string().contains("fixture rejection"));
+
+        let request = server.await.expect("server task completes");
+        match request {
+            PairingWireRequest::NearbySubmitCode {
+                requester_alias, ..
+            } => assert!(
+                requester_alias.is_none(),
+                "local target alias must not be sent as requester alias"
+            ),
+            other => panic!("expected NearbySubmitCode, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn nearby_join_does_not_send_local_target_alias_as_requester_alias() {
+        let (state, root) = temp_pairing_state("boundless-nearby-join-alias-test");
+        let (addr, server) = capture_pairing_wire_request(
+            r#"{"status":"pending","request_id":"join-1","message":"pending"}"#,
+        )
+        .await;
+        let host = addr.ip().to_string();
+
+        let status = start_nearby_pairing_join_with_role(
+            &state,
+            NearbyJoinAttempt {
+                host: &host,
+                port: addr.port(),
+                code: "123456".to_string(),
+                alias: Some("Target Alias".to_string()),
+                endpoint_candidates: &[],
+                role: NearbyPairingRole::RoleReversalRequest,
+                attempt_id: Some("join-1".to_string()),
+            },
+        )
+        .await
+        .expect("pending join succeeds");
+        assert!(matches!(status.status, NearbyJoinStatusKind::Pending));
+
+        let request = server.await.expect("server task completes");
+        match request {
+            PairingWireRequest::NearbyJoin {
+                requester_alias, ..
+            } => assert!(
+                requester_alias.is_none(),
+                "local target alias must not be sent as requester alias"
+            ),
+            other => panic!("expected NearbyJoin, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

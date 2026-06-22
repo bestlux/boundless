@@ -8,6 +8,8 @@ use peer_transport::{
 
 use super::*;
 
+const OUTBOUND_FAILURE_CONNECTED_GRACE: Duration = Duration::from_secs(10);
+
 pub(super) async fn listener_loop(state: AppState, mut listeners: Vec<TcpListener>) {
     if listeners.is_empty() {
         warn!("transport listener task started without listeners");
@@ -180,7 +182,16 @@ async fn peer_worker(state: AppState, peer_id: String) {
                 error = %transport_error_summary(last_error.as_ref()),
                 "outbound connect failed"
             );
-            if let Err(mark_error) = state.set_peer_connected(&peer_id, false).await {
+            let keep_recent_connected = state
+                .get_peer(&peer_id)
+                .await
+                .is_some_and(|peer| should_preserve_connected_after_outbound_failure(&peer));
+            if keep_recent_connected {
+                info!(
+                    peer_id = %peer_id,
+                    "outbound connect failed but recent connected session state is preserved"
+                );
+            } else if let Err(mark_error) = state.set_peer_connected(&peer_id, false).await {
                 warn!(%mark_error, "failed to mark peer disconnected");
             }
 
@@ -188,6 +199,19 @@ async fn peer_worker(state: AppState, peer_id: String) {
             backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECONDS);
         }
     }
+}
+
+fn should_preserve_connected_after_outbound_failure(peer: &crate::config::PeerConfig) -> bool {
+    if !peer.connected {
+        return false;
+    }
+    let Ok(age) = chrono::Utc::now()
+        .signed_duration_since(peer.last_seen)
+        .to_std()
+    else {
+        return false;
+    };
+    age <= OUTBOUND_FAILURE_CONNECTED_GRACE
 }
 
 pub(super) async fn wait_for_reconcile_or_backoff(
@@ -369,6 +393,37 @@ mod tests {
         );
         assert_eq!(candidates[2].port, Some(15100));
         assert_eq!(candidates[2].ordinal, 2);
+    }
+
+    #[test]
+    fn outbound_failure_preserves_only_recent_connected_session_state() {
+        let recent_connected = crate::config::PeerConfig {
+            peer_id: "peer-a".to_string(),
+            display_name: "Peer A".to_string(),
+            address: "peer-a.example:15100".to_string(),
+            connected: true,
+            last_seen: chrono::Utc::now(),
+        };
+        assert!(should_preserve_connected_after_outbound_failure(
+            &recent_connected
+        ));
+
+        let stale_connected = crate::config::PeerConfig {
+            last_seen: chrono::Utc::now() - chrono::Duration::seconds(60),
+            ..recent_connected.clone()
+        };
+        assert!(!should_preserve_connected_after_outbound_failure(
+            &stale_connected
+        ));
+
+        let recent_disconnected = crate::config::PeerConfig {
+            connected: false,
+            last_seen: chrono::Utc::now(),
+            ..recent_connected
+        };
+        assert!(!should_preserve_connected_after_outbound_failure(
+            &recent_disconnected
+        ));
     }
 
     #[test]

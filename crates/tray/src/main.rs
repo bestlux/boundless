@@ -1350,12 +1350,29 @@ mod windows_app {
             .split_once("attempted=[")
             .and_then(|(_, rest)| rest.split_once(']').map(|(attempted, _)| attempted))
             .unwrap_or(lowered);
+        if reachability_summary_has_service_or_protocol_stall(attempted) {
+            return false;
+        }
+
         attempted.contains(" refused")
             || attempted.contains("connection refused")
             || attempted.contains("connect refused")
             || attempted.contains("connect-timeout")
             || attempted.contains("connect timeout")
             || attempted.contains("connect timed out")
+            || attempted
+                .split(',')
+                .any(|entry| entry.trim().ends_with(" timeout"))
+    }
+
+    fn reachability_summary_has_service_or_protocol_stall(attempted: &str) -> bool {
+        attempted.contains("endpoint closed without a response")
+            || attempted.contains("read response timed out")
+            || attempted.contains("read nearby pairing response timed out")
+            || attempted.contains("send request timed out")
+            || attempted.contains("send nearby pairing request timed out")
+            || attempted.contains("service protocol stall")
+            || attempted.contains("target daemon did not return")
     }
 
     fn role_reversal_attempt_id(flow: &GuidedPairingFlow, attempt_id: u64) -> String {
@@ -1635,6 +1652,11 @@ mod windows_app {
             );
             assert!(should_offer_role_reversal(&connect_timeout));
 
+            let probe_timeout = anyhow::anyhow!(
+                "mDNS discovery succeeded but TCP pairing reachability failed; role_reversal_attempted=false; attempted=[role=initiator source=mdns tcp ipv4 port 15200 timeout]; likely firewall/VLAN/asymmetric route reachability issue before trust/code/daemon pairing could complete"
+            );
+            assert!(should_offer_role_reversal(&probe_timeout));
+
             for service_error in [
                 "nearby pairing endpoint closed without a response",
                 "read nearby pairing response timed out after 20s",
@@ -1644,7 +1666,6 @@ mod windows_app {
                 "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 read response timed out]",
                 "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 send request timed out]",
                 "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 service protocol stall]",
-                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 timeout]",
             ] {
                 assert!(
                     !should_offer_role_reversal(&anyhow::anyhow!(service_error)),
