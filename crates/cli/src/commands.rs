@@ -1,9 +1,9 @@
 use super::*;
 use app_services::desktop::{
-    LayoutPeerToken, build_orientation_matrix, host_and_pairing_port_from_endpoint,
-    is_local_layout_token as is_local_layout_token_shared, parse_layout_matrix,
-    redacted_tcp_endpoint_label, redacted_tcp_endpoint_labels, resolve_boundlessd_candidates,
-    spawn_boundlessd_process, terminate_boundlessd_processes, validate_layout_matrix_spec,
+    LayoutPeerToken, TcpEndpointCandidate, TcpEndpointSource, build_orientation_matrix,
+    host_and_pairing_port_from_endpoint, is_local_layout_token as is_local_layout_token_shared,
+    parse_layout_matrix, resolve_boundlessd_candidates, spawn_boundlessd_process,
+    tcp_endpoint_candidate, terminate_boundlessd_processes, validate_layout_matrix_spec,
 };
 use app_services::diagnostics::{
     DiagnosticExportOptions, ServiceDiagnosticSnapshot, build_offline_bundle,
@@ -156,10 +156,7 @@ pub(super) async fn pair_discover(endpoint: &str) -> Result<()> {
 }
 
 fn redacted_transport_candidates(peer: &DiscoveredPeerRecord) -> String {
-    if peer.endpoint_candidates.is_empty() {
-        return redacted_tcp_endpoint_label(&peer.endpoint);
-    }
-    redacted_tcp_endpoint_labels(&peer.endpoint_candidates)
+    redacted_candidate_labels(&discovery_transport_candidates(peer))
 }
 
 fn redacted_pairing_candidates(peer: &DiscoveredPeerRecord) -> String {
@@ -176,7 +173,40 @@ fn redacted_pairing_candidates(peer: &DiscoveredPeerRecord) -> String {
                 .map(|(host, port)| format_host_port(&host, port))
         })
         .collect::<Vec<_>>();
-    redacted_tcp_endpoint_labels(&pairing_candidates)
+    let candidates = pairing_candidates
+        .iter()
+        .enumerate()
+        .map(|(ordinal, endpoint)| {
+            tcp_endpoint_candidate(endpoint, TcpEndpointSource::Discovery, ordinal)
+        })
+        .collect::<Vec<_>>();
+    redacted_candidate_labels(&candidates)
+}
+
+fn discovery_transport_candidates(peer: &DiscoveredPeerRecord) -> Vec<TcpEndpointCandidate> {
+    let endpoints = if peer.endpoint_candidates.is_empty() {
+        vec![peer.endpoint.clone()]
+    } else {
+        peer.endpoint_candidates.clone()
+    };
+    endpoints
+        .iter()
+        .enumerate()
+        .map(|(ordinal, endpoint)| {
+            tcp_endpoint_candidate(endpoint, TcpEndpointSource::Discovery, ordinal)
+        })
+        .collect()
+}
+
+fn redacted_candidate_labels(candidates: &[TcpEndpointCandidate]) -> String {
+    if candidates.is_empty() {
+        return "none".to_string();
+    }
+    candidates
+        .iter()
+        .map(TcpEndpointCandidate::redacted_provenance_label)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn filter_connectable_discovered_peer_records(
@@ -2703,8 +2733,14 @@ mod tests {
         let transport = redacted_transport_candidates(&peer);
         let pairing = redacted_pairing_candidates(&peer);
 
-        assert_eq!(transport, "tcp ipv6 port 15100, tcp ipv4 port 15100");
-        assert_eq!(pairing, "tcp ipv6 port 15200, tcp ipv4 port 15200");
+        assert_eq!(
+            transport,
+            "source=mdns tcp ipv6 port 15100, source=mdns tcp ipv4 port 15100"
+        );
+        assert_eq!(
+            pairing,
+            "source=mdns tcp ipv6 port 15200, source=mdns tcp ipv4 port 15200"
+        );
         assert!(!transport.contains("10.0.0.10"));
         assert!(!pairing.contains("fe80::1"));
     }

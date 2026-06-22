@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use app_services::desktop::redacted_tcp_endpoint_label;
+use app_services::desktop::{TcpEndpointCandidate, TcpEndpointSource, tcp_endpoint_candidate};
 use core_security::TrustBundle;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -124,21 +124,14 @@ pub(crate) struct NearbySubmitCode {
 struct PairingTarget {
     endpoint: String,
     host: String,
-    label: String,
-    source: PairingCandidateSource,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PairingCandidateSource {
-    Discovery,
-    Manual,
+    candidate: TcpEndpointCandidate,
 }
 
 #[derive(Debug, Clone)]
 struct PairingReachabilityAttempt {
     label: String,
     outcome: &'static str,
-    source: PairingCandidateSource,
+    source: TcpEndpointSource,
 }
 
 #[derive(Debug, Clone)]
@@ -530,9 +523,9 @@ async fn send_nearby_pairing_request_to_candidates(
             Ok(response) => return Ok((response, target.host.clone())),
             Err(error) => {
                 attempts.push(PairingReachabilityAttempt {
-                    label: target.label.clone(),
+                    label: target.candidate.redacted_provenance_label(),
                     outcome: classify_pairing_reachability_error(&error),
-                    source: target.source,
+                    source: target.candidate.source,
                 });
             }
         }
@@ -558,7 +551,7 @@ fn nearby_pairing_targets(
                 &mut targets,
                 candidate_host,
                 candidate_port,
-                PairingCandidateSource::Discovery,
+                TcpEndpointSource::Discovery,
             );
         }
     }
@@ -566,7 +559,7 @@ fn nearby_pairing_targets(
         &mut targets,
         host.trim().to_string(),
         port,
-        PairingCandidateSource::Manual,
+        TcpEndpointSource::ManualHost,
     );
     targets
 }
@@ -575,15 +568,15 @@ fn push_pairing_target(
     targets: &mut Vec<PairingTarget>,
     host: String,
     port: u16,
-    source: PairingCandidateSource,
+    source: TcpEndpointSource,
 ) {
     let target = format_host_port(&host, port);
     if !targets.iter().any(|existing| existing.endpoint == target) {
+        let candidate = tcp_endpoint_candidate(&target, source, targets.len());
         targets.push(PairingTarget {
-            label: redacted_tcp_endpoint_label(&target),
             endpoint: target,
             host,
-            source,
+            candidate,
         });
     }
 }
@@ -619,7 +612,7 @@ fn pairing_reachability_failure_message(attempts: &[PairingReachabilityAttempt])
         .join(", ");
     if attempts
         .iter()
-        .any(|attempt| attempt.source == PairingCandidateSource::Discovery)
+        .any(|attempt| attempt.source == TcpEndpointSource::Discovery)
     {
         format!(
             "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[{attempted}]; likely firewall/VLAN/asymmetric-route reachability issue before trust/code/daemon pairing could complete; next_action=verify Private network, VLAN routing, and manual admin-approved firewall policy for the listed TCP ports"
@@ -1010,20 +1003,29 @@ mod tests {
                 PairingTarget {
                     endpoint: "[2001:db8::7]:15200".to_string(),
                     host: "2001:db8::7".to_string(),
-                    label: "tcp ipv6 port 15200".to_string(),
-                    source: PairingCandidateSource::Discovery,
+                    candidate: tcp_endpoint_candidate(
+                        "[2001:db8::7]:15200",
+                        TcpEndpointSource::Discovery,
+                        0,
+                    ),
                 },
                 PairingTarget {
                     endpoint: "10.0.0.7:15200".to_string(),
                     host: "10.0.0.7".to_string(),
-                    label: "tcp ipv4 port 15200".to_string(),
-                    source: PairingCandidateSource::Discovery,
+                    candidate: tcp_endpoint_candidate(
+                        "10.0.0.7:15200",
+                        TcpEndpointSource::Discovery,
+                        1,
+                    ),
                 },
                 PairingTarget {
                     endpoint: "manual-host:15200".to_string(),
                     host: "manual-host".to_string(),
-                    label: "tcp hostname port 15200".to_string(),
-                    source: PairingCandidateSource::Manual,
+                    candidate: tcp_endpoint_candidate(
+                        "manual-host:15200",
+                        TcpEndpointSource::ManualHost,
+                        2,
+                    ),
                 },
             ]
         );
@@ -1038,8 +1040,11 @@ mod tests {
             vec![PairingTarget {
                 endpoint: "10.0.0.7:15200".to_string(),
                 host: "10.0.0.7".to_string(),
-                label: "tcp ipv4 port 15200".to_string(),
-                source: PairingCandidateSource::Discovery,
+                candidate: tcp_endpoint_candidate(
+                    "10.0.0.7:15200",
+                    TcpEndpointSource::Discovery,
+                    0,
+                ),
             }]
         );
     }
@@ -1048,22 +1053,22 @@ mod tests {
     fn nearby_pairing_failure_names_reachability_without_raw_endpoint() {
         let attempts = vec![
             PairingReachabilityAttempt {
-                label: "tcp ipv6 port 15200".to_string(),
+                label: "source=mdns tcp ipv6 port 15200".to_string(),
                 outcome: "timeout",
-                source: PairingCandidateSource::Discovery,
+                source: TcpEndpointSource::Discovery,
             },
             PairingReachabilityAttempt {
-                label: "tcp ipv4 port 15200".to_string(),
+                label: "source=mdns tcp ipv4 port 15200".to_string(),
                 outcome: "refused",
-                source: PairingCandidateSource::Discovery,
+                source: TcpEndpointSource::Discovery,
             },
         ];
         let message = pairing_reachability_failure_message(&attempts);
 
         assert!(message.contains("mDNS discovery succeeded"));
         assert!(message.contains("TCP pairing reachability failed"));
-        assert!(message.contains("tcp ipv6 port 15200 timeout"));
-        assert!(message.contains("tcp ipv4 port 15200 refused"));
+        assert!(message.contains("source=mdns tcp ipv6 port 15200 timeout"));
+        assert!(message.contains("source=mdns tcp ipv4 port 15200 refused"));
         assert!(message.contains("next_action=verify Private network"));
         assert!(!message.contains("10.10.0.187"));
     }
@@ -1135,14 +1140,20 @@ mod tests {
             PairingTarget {
                 endpoint: blocked_endpoint.to_string(),
                 host: blocked_endpoint.ip().to_string(),
-                label: redacted_tcp_endpoint_label(&blocked_endpoint.to_string()),
-                source: PairingCandidateSource::Discovery,
+                candidate: tcp_endpoint_candidate(
+                    &blocked_endpoint.to_string(),
+                    TcpEndpointSource::Discovery,
+                    0,
+                ),
             },
             PairingTarget {
                 endpoint: reachable_addr.to_string(),
                 host: reachable_addr.ip().to_string(),
-                label: redacted_tcp_endpoint_label(&reachable_addr.to_string()),
-                source: PairingCandidateSource::Discovery,
+                candidate: tcp_endpoint_candidate(
+                    &reachable_addr.to_string(),
+                    TcpEndpointSource::Discovery,
+                    1,
+                ),
             },
         ];
 
