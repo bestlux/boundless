@@ -1360,9 +1360,6 @@ mod windows_app {
             || attempted.contains("connect-timeout")
             || attempted.contains("connect timeout")
             || attempted.contains("connect timed out")
-            || attempted
-                .split(',')
-                .any(|entry| entry.trim().ends_with(" timeout"))
     }
 
     fn reachability_summary_has_service_or_protocol_stall(attempted: &str) -> bool {
@@ -1653,7 +1650,7 @@ mod windows_app {
             assert!(should_offer_role_reversal(&connect_timeout));
 
             let probe_timeout = anyhow::anyhow!(
-                "mDNS discovery succeeded but TCP pairing reachability failed; role_reversal_attempted=false; attempted=[role=initiator source=mdns tcp ipv4 port 15200 timeout]; likely firewall/VLAN/asymmetric route reachability issue before trust/code/daemon pairing could complete"
+                "mDNS discovery succeeded but TCP pairing reachability failed; role_reversal_attempted=false; attempted=[role=initiator source=mdns tcp ipv4 port 15200 connect-timeout]; likely firewall/VLAN/asymmetric route reachability issue before trust/code/daemon pairing could complete"
             );
             assert!(should_offer_role_reversal(&probe_timeout));
 
@@ -1666,6 +1663,8 @@ mod windows_app {
                 "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 read response timed out]",
                 "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 send request timed out]",
                 "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 service protocol stall]",
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 timeout]",
+                "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[tcp ipv4 port 15200 service-timeout]",
             ] {
                 assert!(
                     !should_offer_role_reversal(&anyhow::anyhow!(service_error)),
@@ -1854,3 +1853,4 @@ SERVICE_NAME: BoundlessService
         }
     }
 }
+

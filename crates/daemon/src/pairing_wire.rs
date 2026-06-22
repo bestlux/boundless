@@ -707,8 +707,10 @@ fn classify_pairing_reachability_error(error: &anyhow::Error) -> &'static str {
         return "refused";
     }
     let message = error.to_string().to_ascii_lowercase();
-    if message.contains("timed out") {
-        "timeout"
+    if message.contains("connect nearby pairing endpoint timed out") {
+        "connect-timeout"
+    } else if message.contains("timed out") {
+        "service-timeout"
     } else {
         "failed"
     }
@@ -1232,7 +1234,7 @@ mod tests {
         let attempts = vec![
             PairingReachabilityAttempt {
                 label: "source=mdns tcp ipv6 port 15200".to_string(),
-                outcome: "timeout",
+                outcome: "connect-timeout",
                 source: TcpEndpointSource::Discovery,
                 role: NearbyPairingRole::Initiator,
             },
@@ -1247,10 +1249,31 @@ mod tests {
 
         assert!(message.contains("mDNS discovery succeeded"));
         assert!(message.contains("TCP pairing reachability failed"));
-        assert!(message.contains("source=mdns tcp ipv6 port 15200 timeout"));
+        assert!(message.contains("source=mdns tcp ipv6 port 15200 connect-timeout"));
         assert!(message.contains("source=mdns tcp ipv4 port 15200 refused"));
         assert!(message.contains("next_action=verify Private network"));
         assert!(!message.contains("10.10.0.187"));
+    }
+
+    #[test]
+    fn pairing_reachability_error_classification_preserves_timeout_provenance() {
+        let connect_timeout = anyhow::anyhow!("connect nearby pairing endpoint timed out after 4s");
+        assert_eq!(
+            classify_pairing_reachability_error(&connect_timeout),
+            "connect-timeout"
+        );
+
+        for service_timeout in [
+            "read nearby pairing response timed out after 20s",
+            "send nearby pairing request timed out after 6s",
+            "flush nearby pairing request timed out after 6s",
+        ] {
+            assert_eq!(
+                classify_pairing_reachability_error(&anyhow::anyhow!(service_timeout)),
+                "service-timeout",
+                "{service_timeout} must not look like a connect timeout"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2555,3 +2578,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
