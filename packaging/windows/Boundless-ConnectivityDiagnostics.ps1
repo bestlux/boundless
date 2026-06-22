@@ -2,7 +2,7 @@ param(
     [string]$RemoteHost,
 
     [ValidateRange(1, 65535)]
-    [int[]]$Ports = @(15100, 15200),
+    [int[]]$Ports = @(15100, 15101, 15200),
 
     [ValidateRange(1, 30)]
     [int]$TimeoutSeconds = 4,
@@ -49,10 +49,15 @@ function Get-LocalListenerReport {
     $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
     $owners = @(
         foreach ($listener in $listeners) {
+            $process = Get-ProcessSummary -ProcessId $listener.OwningProcess
             [pscustomobject]@{
                 local_address = $listener.LocalAddress
                 local_port = $listener.LocalPort
-                owning_process = Get-ProcessSummary -ProcessId $listener.OwningProcess
+                address_family = if (($listener.LocalAddress -as [string]).Contains(":")) { "ipv6" } else { "ipv4" }
+                bind_scope = Get-BindScope -LocalAddress $listener.LocalAddress
+                owner_kind = Get-ListenerOwnerKind -Process $process
+                owning_process = $process
+                mitigation = Get-ListenerMitigation -Port $listener.LocalPort -OwnerKind (Get-ListenerOwnerKind -Process $process)
             }
         }
     )
@@ -62,6 +67,77 @@ function Get-LocalListenerReport {
         listening = $owners.Count -gt 0
         listeners = $owners
     }
+}
+
+function Get-BindScope {
+    param([string]$LocalAddress)
+
+    switch ($LocalAddress) {
+        "0.0.0.0" { return "any" }
+        "::" { return "any" }
+        "127.0.0.1" { return "loopback" }
+        "::1" { return "loopback" }
+        "" { return "unknown" }
+        default { return "specific" }
+    }
+}
+
+function Get-ListenerOwnerKind {
+    param([pscustomobject]$Process)
+
+    $name = if ($null -ne $Process.name) { $Process.name.ToLowerInvariant() } else { "" }
+    $path = if ($null -ne $Process.path) { $Process.path.ToLowerInvariant() } else { "" }
+    $combined = "$name $path"
+
+    if ($combined.Contains("mousewithoutborders") -or
+        $combined.Contains("mouse without borders") -or
+        $combined.Contains("powertoys.mousewithoutborders")) {
+        return "mouse-without-borders"
+    }
+    if ($name -eq "boundlessd" -or
+        $name -eq "boundless-service" -or
+        $name -eq "boundless" -or
+        $combined.Contains("boundless-service.exe") -or
+        $combined.Contains("boundlessd.exe")) {
+        return "boundless"
+    }
+    if ([string]::IsNullOrWhiteSpace($name) -and [string]::IsNullOrWhiteSpace($path)) {
+        return "unknown"
+    }
+    return "other"
+}
+
+function Get-ListenerMitigation {
+    param(
+        [int]$Port,
+        [string]$OwnerKind
+    )
+
+    switch ($OwnerKind) {
+        "boundless" { return "TCP $Port is owned by Boundless; this is expected when the daemon is running." }
+        "mouse-without-borders" { return "Mouse Without Borders or PowerToys is listening on TCP $Port; stop MWB during Boundless dogfood or move Boundless to an alternate network_port before pairing." }
+        "other" { return "Another local process is listening on TCP $Port; identify the owner, stop it if appropriate, or move Boundless to an alternate network_port for side-by-side testing." }
+        default { return "TCP $Port has a listener but the owning process could not be resolved; inspect the port owner before changing trust or firewall state." }
+    }
+}
+
+function Get-SideBySideGuidance {
+    param([object[]]$LocalListeners)
+
+    $entries = @($LocalListeners | ForEach-Object { $_.listeners } | Where-Object { $null -ne $_ })
+    $hasMwb = @($entries | Where-Object { $_.owner_kind -eq "mouse-without-borders" }).Count -gt 0
+    $hasOther = @($entries | Where-Object { $_.owner_kind -eq "other" -or $_.owner_kind -eq "unknown" }).Count -gt 0
+    $guidance = @()
+    if ($hasMwb) {
+        $guidance += "Mouse Without Borders/PowerToys listener ownership was detected on a Boundless-related port; stop MWB during Boundless dogfood or configure an alternate Boundless network_port on all participating machines."
+    }
+    if ($hasOther) {
+        $guidance += "A non-Boundless or unresolved listener owns a Boundless-related port; resolve local port ownership before resetting trust or changing firewall policy."
+    }
+    if ($guidance.Count -gt 0) {
+        $guidance += "This script is read-only and did not create firewall rules, elevate, or change network state."
+    }
+    return $guidance
 }
 
 function Test-RemotePort {
@@ -167,11 +243,13 @@ $report = [pscustomobject]@{
     read_only = $true
     local_network_profiles = Get-NetworkProfileReport
     local_listeners = $localListeners
+    side_by_side_guidance = Get-SideBySideGuidance -LocalListeners $localListeners
     remote_reachability = $remoteReports
     firewall_hint = Get-FirewallRuleHint -Ports $uniquePorts
     guidance = [pscustomobject]@{
         pairing_port = 15200
         transport_port = 15100
+        side_by_side_probe_ports = $uniquePorts
         private_profile_only = $true
         service_program = "%ProgramFiles%\Boundless\boundless-service.exe"
         public_network_warning = "Do not expose Boundless ports on Public networks or through router port forwarding."
@@ -201,7 +279,18 @@ foreach ($listener in $report.local_listeners) {
 
     foreach ($entry in $listener.listeners) {
         $owner = $entry.owning_process
-        Write-Host ("- TCP {0}: {1}:{0} pid={2} name={3} path={4}" -f $listener.port, $entry.local_address, $owner.pid, $owner.name, $owner.path)
+        Write-Host ("- TCP {0}: family={1} scope={2} pid={3} name={4} owner={5} path={6}" -f $listener.port, $entry.address_family, $entry.bind_scope, $owner.pid, $owner.name, $entry.owner_kind, $owner.path)
+        if ($entry.owner_kind -ne "boundless") {
+            Write-Host ("  mitigation: {0}" -f $entry.mitigation)
+        }
+    }
+}
+
+if ($report.side_by_side_guidance.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Side-by-side guidance:"
+    foreach ($guidance in $report.side_by_side_guidance) {
+        Write-Host "- $guidance"
     }
 }
 
@@ -220,6 +309,6 @@ if ($RemoteHost) {
 Write-Host ""
 Write-Host "Firewall guidance:"
 Write-Host "- This script did not create or edit firewall rules."
-Write-Host "- Boundless pairing uses TCP 15200; trusted transport uses TCP 15100."
+Write-Host "- Boundless pairing uses TCP 15200; trusted transport uses TCP 15100. TCP 15101 is checked for side-by-side dogfood collisions."
 Write-Host "- If a rule is needed, create it only after explicit approval, only for Private profile, and only for %ProgramFiles%\Boundless\boundless-service.exe."
 Write-Host "- Do not expose Boundless ports on Public networks or through router port forwarding."

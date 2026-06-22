@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use anyhow::{Context, Result};
@@ -15,6 +16,7 @@ const REDACTED_ID: &str = "[redacted-id]";
 const REDACTED_CLIPBOARD_TEXT: &str = "[redacted-clipboard-text]";
 const REDACTED_FILE_NAME: &str = "[redacted-file-name]";
 const REDACTED_PATH: &str = "[redacted-path]";
+const BOUNDLESS_RELATED_TCP_PORTS: &[u16] = &[15100, 15101, 15200];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticExportOptions {
@@ -42,6 +44,44 @@ pub struct ServiceDiagnosticSnapshot {
     pub current_version: String,
     pub version_parity: String,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortListenerDiagnosticSnapshot {
+    pub platform: String,
+    pub ports: Vec<u16>,
+    pub read_only: bool,
+    pub listeners: Vec<PortListenerDiagnostic>,
+    pub summary: Vec<String>,
+    pub mitigation: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortListenerDiagnostic {
+    pub protocol: String,
+    pub address_family: String,
+    pub bind_scope: String,
+    pub port: u16,
+    pub process_id: Option<u32>,
+    pub process_name: Option<String>,
+    pub process_path: Option<String>,
+    pub owner_kind: String,
+    pub suggested_mitigation: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawPortListenerRow {
+    #[serde(rename = "LocalAddress", default)]
+    local_address: String,
+    #[serde(rename = "LocalPort", default)]
+    local_port: u16,
+    #[serde(rename = "OwningProcess", default)]
+    owning_process: Option<u32>,
+    #[serde(rename = "ProcessName", default)]
+    process_name: Option<String>,
+    #[serde(rename = "ProcessPath", default)]
+    process_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -113,6 +153,7 @@ pub fn build_online_bundle(
             "api_pipe_name": snapshot.status.api_pipe_name,
         },
         "service": redact_service(service, include_filenames),
+        "port_listeners": port_listener_diagnostics_snapshot(),
         "component_health": {
             "peer_count": snapshot.status.peer_count,
             "mdns_active": snapshot.mdns_active,
@@ -176,6 +217,7 @@ pub fn build_offline_bundle(
             "control_endpoint": endpoint,
         },
         "service": redact_service(service, include_filenames),
+        "port_listeners": port_listener_diagnostics_snapshot(),
         "component_health": {
             "daemon": "unavailable",
             "reason": reason,
@@ -186,6 +228,298 @@ pub fn build_offline_bundle(
             "Daemon IPC was not used, so in-memory peer health and transfer event history are unavailable."
         ],
     })
+}
+
+pub fn port_listener_diagnostics_snapshot() -> PortListenerDiagnosticSnapshot {
+    let ports = BOUNDLESS_RELATED_TCP_PORTS.to_vec();
+    if !cfg!(windows) {
+        return PortListenerDiagnosticSnapshot {
+            platform: std::env::consts::OS.to_string(),
+            ports,
+            read_only: true,
+            listeners: Vec::new(),
+            summary: vec![
+                "Local TCP listener ownership diagnostics are only available on Windows."
+                    .to_string(),
+            ],
+            mitigation: Vec::new(),
+            error: None,
+        };
+    }
+
+    match collect_windows_port_listener_rows() {
+        Ok(rows) => build_port_listener_diagnostics(rows),
+        Err(error) => PortListenerDiagnosticSnapshot {
+            platform: "windows".to_string(),
+            ports,
+            read_only: true,
+            listeners: Vec::new(),
+            summary: vec![
+                "Could not collect local TCP listener ownership diagnostics.".to_string(),
+            ],
+            mitigation: vec![
+                "Run the packaged Boundless-ConnectivityDiagnostics.ps1 helper locally for a manual read-only check.".to_string(),
+            ],
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn collect_windows_port_listener_rows() -> Result<Vec<RawPortListenerRow>> {
+    let ports = BOUNDLESS_RELATED_TCP_PORTS
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$ports = @({ports})
+$rows = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+    Where-Object {{ $ports -contains [int]$_.LocalPort }} |
+    ForEach-Object {{
+        $proc = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+        [pscustomobject]@{{
+            LocalAddress = [string]$_.LocalAddress
+            LocalPort = [int]$_.LocalPort
+            OwningProcess = if ($null -ne $_.OwningProcess) {{ [int]$_.OwningProcess }} else {{ $null }}
+            ProcessName = if ($null -ne $proc) {{ [string]$proc.ProcessName }} else {{ $null }}
+            ProcessPath = if ($null -ne $proc) {{ try {{ [string]$proc.Path }} catch {{ $null }} }} else {{ $null }}
+        }}
+    }})
+$rows | ConvertTo-Json -Depth 4 -Compress
+"#
+    );
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .output()
+        .context("run read-only Windows TCP listener ownership query")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "Windows TCP listener ownership query failed with status {}: {}",
+            output.status,
+            stderr
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_port_listener_rows(&stdout).context("parse Windows TCP listener ownership query")
+}
+
+fn parse_port_listener_rows(stdout: &str) -> Result<Vec<RawPortListenerRow>> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    match serde_json::from_str::<Vec<RawPortListenerRow>>(trimmed) {
+        Ok(rows) => Ok(rows),
+        Err(array_error) => serde_json::from_str::<RawPortListenerRow>(trimmed)
+            .map(|row| vec![row])
+            .with_context(|| format!("parse listener rows as array or object: {array_error}")),
+    }
+}
+
+fn build_port_listener_diagnostics(
+    rows: Vec<RawPortListenerRow>,
+) -> PortListenerDiagnosticSnapshot {
+    let mut listeners = rows
+        .into_iter()
+        .filter(|row| BOUNDLESS_RELATED_TCP_PORTS.contains(&row.local_port))
+        .map(port_listener_from_row)
+        .collect::<Vec<_>>();
+    listeners.sort_by(|left, right| {
+        (
+            left.port,
+            left.address_family.as_str(),
+            left.bind_scope.as_str(),
+            left.process_id,
+            left.process_name.as_deref().unwrap_or_default(),
+        )
+            .cmp(&(
+                right.port,
+                right.address_family.as_str(),
+                right.bind_scope.as_str(),
+                right.process_id,
+                right.process_name.as_deref().unwrap_or_default(),
+            ))
+    });
+
+    let summary = port_listener_summary(&listeners);
+    let mitigation = port_listener_mitigation_summary(&listeners);
+    PortListenerDiagnosticSnapshot {
+        platform: "windows".to_string(),
+        ports: BOUNDLESS_RELATED_TCP_PORTS.to_vec(),
+        read_only: true,
+        listeners,
+        summary,
+        mitigation,
+        error: None,
+    }
+}
+
+fn port_listener_from_row(row: RawPortListenerRow) -> PortListenerDiagnostic {
+    let owner_kind =
+        classify_listener_owner(row.process_name.as_deref(), row.process_path.as_deref());
+    PortListenerDiagnostic {
+        protocol: "tcp".to_string(),
+        address_family: listener_address_family(&row.local_address).to_string(),
+        bind_scope: listener_bind_scope(&row.local_address).to_string(),
+        port: row.local_port,
+        process_id: row.owning_process,
+        process_name: clean_optional_string(row.process_name),
+        process_path: clean_optional_string(row.process_path),
+        suggested_mitigation: suggested_listener_mitigation(owner_kind, row.local_port),
+        owner_kind: owner_kind.to_string(),
+    }
+}
+
+fn clean_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn listener_address_family(address: &str) -> &'static str {
+    if address.contains(':') {
+        "ipv6"
+    } else {
+        "ipv4"
+    }
+}
+
+fn listener_bind_scope(address: &str) -> &'static str {
+    match address {
+        "0.0.0.0" | "::" | "[::]" => "any",
+        "127.0.0.1" | "::1" | "[::1]" => "loopback",
+        "" => "unknown",
+        _ => "specific",
+    }
+}
+
+fn classify_listener_owner(process_name: Option<&str>, process_path: Option<&str>) -> &'static str {
+    let process_name = process_name.unwrap_or_default().to_ascii_lowercase();
+    let process_path = process_path.unwrap_or_default().to_ascii_lowercase();
+    let combined = format!("{process_name} {process_path}");
+
+    if combined.contains("mousewithoutborders")
+        || combined.contains("mouse without borders")
+        || combined.contains("powertoys.mousewithoutborders")
+    {
+        return "mouse-without-borders";
+    }
+
+    if process_name == "boundlessd"
+        || process_name == "boundless-service"
+        || process_name == "boundless"
+        || combined.contains("boundless-service.exe")
+        || combined.contains("boundlessd.exe")
+    {
+        return "boundless";
+    }
+
+    if process_name.is_empty() && process_path.is_empty() {
+        return "unknown";
+    }
+
+    "other"
+}
+
+fn suggested_listener_mitigation(owner_kind: &str, port: u16) -> String {
+    match owner_kind {
+        "boundless" => format!(
+            "TCP {port} is owned by Boundless; this is expected when the daemon is running."
+        ),
+        "mouse-without-borders" => format!(
+            "Mouse Without Borders or PowerToys is listening on TCP {port}; stop MWB during Boundless dogfood or move Boundless to an alternate network_port before pairing."
+        ),
+        "other" => format!(
+            "Another local process is listening on TCP {port}; identify the owner, stop it if appropriate, or move Boundless to an alternate network_port for side-by-side testing."
+        ),
+        _ => format!(
+            "TCP {port} has a listener but the owning process could not be resolved; rerun diagnostics locally or inspect the port owner before changing trust or firewall state."
+        ),
+    }
+}
+
+fn port_listener_summary(listeners: &[PortListenerDiagnostic]) -> Vec<String> {
+    if listeners.is_empty() {
+        return vec![
+            "No local listeners were found on Boundless-related TCP ports 15100, 15101, or 15200."
+                .to_string(),
+        ];
+    }
+
+    let mut summary = Vec::new();
+    for port in BOUNDLESS_RELATED_TCP_PORTS {
+        let owners = listeners
+            .iter()
+            .filter(|listener| listener.port == *port)
+            .map(|listener| listener.owner_kind.as_str())
+            .collect::<Vec<_>>();
+        if owners.is_empty() {
+            continue;
+        }
+        if owners.contains(&"boundless") && owners.contains(&"mouse-without-borders") {
+            summary.push(format!(
+                "Boundless and Mouse Without Borders/PowerToys both appear on TCP {port}; side-by-side listener ownership can confuse reachability diagnosis."
+            ));
+        } else if owners.contains(&"mouse-without-borders") {
+            summary.push(format!(
+                "Mouse Without Borders/PowerToys is listening on Boundless-related TCP {port}."
+            ));
+        } else if owners.contains(&"other") {
+            summary.push(format!(
+                "A non-Boundless process is listening on Boundless-related TCP {port}."
+            ));
+        } else if owners.contains(&"unknown") {
+            summary.push(format!(
+                "TCP {port} has a listener whose owning process could not be resolved."
+            ));
+        }
+    }
+
+    if summary.is_empty() {
+        summary.push(
+            "Only Boundless-owned listeners were found on Boundless-related TCP ports.".to_string(),
+        );
+    }
+    summary
+}
+
+fn port_listener_mitigation_summary(listeners: &[PortListenerDiagnostic]) -> Vec<String> {
+    let mut mitigation = Vec::new();
+    if listeners
+        .iter()
+        .any(|listener| listener.owner_kind == "mouse-without-borders")
+    {
+        mitigation.push("For side-by-side dogfood, stop Mouse Without Borders/PowerToys before pairing or configure Boundless with an alternate network_port on every participating machine.".to_string());
+    }
+    if listeners
+        .iter()
+        .any(|listener| matches!(listener.owner_kind.as_str(), "other" | "unknown"))
+    {
+        mitigation.push("Resolve local port ownership before resetting trust; a local port collision can look like a remote firewall or VLAN failure.".to_string());
+    }
+    if !mitigation.is_empty() {
+        mitigation.push(
+            "Do not create firewall rules or elevate diagnostics automatically for this check."
+                .to_string(),
+        );
+    }
+    mitigation
 }
 
 pub async fn write_diagnostic_bundle(
@@ -454,6 +788,7 @@ fn privacy_section(include_filenames: bool) -> Value {
             "machine_ids",
             "request_ids",
             "transfer_ids",
+            "raw_endpoints",
             "local_paths"
         ],
         "filename_policy": if include_filenames {
@@ -471,7 +806,7 @@ fn redaction_manifest(include_filenames: bool) -> String {
         "redacted"
     };
     format!(
-        "default_redaction=true\nfilenames_included={include_filenames}\nredacted=clipboard_plaintext,private_keys,trust_secrets,cert_key_material,tokens,auth_material,peer_ids,machine_ids,request_ids,transfer_ids,local_paths\nfilename_policy={filename_policy}\n"
+        "default_redaction=true\nfilenames_included={include_filenames}\nredacted=clipboard_plaintext,private_keys,trust_secrets,cert_key_material,tokens,auth_material,peer_ids,machine_ids,request_ids,transfer_ids,raw_endpoints,local_paths\nfilename_policy={filename_policy}\n"
     )
 }
 
@@ -646,6 +981,117 @@ fn looks_like_clipboard_secret(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_listener_rows_parse_ipv4_ipv6_and_classify_owners() {
+        let rows = parse_port_listener_rows(
+            r#"[
+                {
+                    "LocalAddress": "0.0.0.0",
+                    "LocalPort": 15100,
+                    "OwningProcess": 42,
+                    "ProcessName": "boundless-service",
+                    "ProcessPath": "C:\\Program Files\\Boundless\\boundless-service.exe"
+                },
+                {
+                    "LocalAddress": "::",
+                    "LocalPort": 15200,
+                    "OwningProcess": 43,
+                    "ProcessName": "PowerToys.MouseWithoutBorders",
+                    "ProcessPath": "C:\\Program Files\\PowerToys\\MouseWithoutBorders.exe"
+                },
+                {
+                    "LocalAddress": "127.0.0.1",
+                    "LocalPort": 15101,
+                    "OwningProcess": 44,
+                    "ProcessName": "SomeTool",
+                    "ProcessPath": "C:\\Tools\\SomeTool.exe"
+                }
+            ]"#,
+        )
+        .expect("parse listener rows");
+
+        let snapshot = build_port_listener_diagnostics(rows);
+
+        assert_eq!(snapshot.platform, "windows");
+        assert!(snapshot.read_only);
+        assert_eq!(snapshot.ports, vec![15100, 15101, 15200]);
+        assert_eq!(snapshot.listeners.len(), 3);
+        assert_eq!(snapshot.listeners[0].address_family, "ipv4");
+        assert_eq!(snapshot.listeners[0].bind_scope, "any");
+        assert_eq!(snapshot.listeners[0].owner_kind, "boundless");
+        assert_eq!(snapshot.listeners[1].port, 15101);
+        assert_eq!(snapshot.listeners[1].bind_scope, "loopback");
+        assert_eq!(snapshot.listeners[1].owner_kind, "other");
+        assert_eq!(snapshot.listeners[2].address_family, "ipv6");
+        assert_eq!(snapshot.listeners[2].bind_scope, "any");
+        assert_eq!(snapshot.listeners[2].owner_kind, "mouse-without-borders");
+        assert!(
+            snapshot
+                .summary
+                .iter()
+                .any(|item| item.contains("Mouse Without Borders/PowerToys"))
+        );
+        assert!(
+            snapshot
+                .mitigation
+                .iter()
+                .any(|item| item.contains("alternate network_port"))
+        );
+    }
+
+    #[test]
+    fn port_listener_bundle_redacts_process_paths_without_raw_endpoints() {
+        let snapshot = build_port_listener_diagnostics(vec![RawPortListenerRow {
+            local_address: "10.10.0.5".to_string(),
+            local_port: 15200,
+            owning_process: Some(43),
+            process_name: Some("PowerToys.MouseWithoutBorders".to_string()),
+            process_path: Some("C:\\Users\\Alice\\PowerToys\\MouseWithoutBorders.exe".to_string()),
+        }]);
+        let redacted = redact_sensitive_json(json!({ "port_listeners": snapshot }), false);
+        let rendered = serde_json::to_string(&redacted).expect("serialize redacted listeners");
+
+        assert!(rendered.contains("mouse-without-borders"));
+        assert!(rendered.contains("ipv4"));
+        assert!(rendered.contains("specific"));
+        assert!(rendered.contains("15200"));
+        assert!(rendered.contains(REDACTED_PATH));
+        assert!(!rendered.contains("10.10.0.5"));
+        assert!(!rendered.contains("Alice"));
+        assert!(!rendered.contains("MouseWithoutBorders.exe"));
+    }
+
+    #[test]
+    fn port_listener_summary_reports_side_by_side_collision() {
+        let snapshot = build_port_listener_diagnostics(vec![
+            RawPortListenerRow {
+                local_address: "0.0.0.0".to_string(),
+                local_port: 15100,
+                owning_process: Some(42),
+                process_name: Some("boundless-service".to_string()),
+                process_path: Some(
+                    "C:\\Program Files\\Boundless\\boundless-service.exe".to_string(),
+                ),
+            },
+            RawPortListenerRow {
+                local_address: "::".to_string(),
+                local_port: 15100,
+                owning_process: Some(43),
+                process_name: Some("PowerToys.MouseWithoutBorders".to_string()),
+                process_path: Some(
+                    "C:\\Program Files\\PowerToys\\MouseWithoutBorders.exe".to_string(),
+                ),
+            },
+        ]);
+
+        assert!(
+            snapshot
+                .summary
+                .iter()
+                .any(|item| item.contains("both appear on TCP 15100"))
+        );
+    }
 
     #[test]
     fn redacts_clipboard_secret_event_detail() {
