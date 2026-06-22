@@ -103,6 +103,54 @@ Support bundles and logs should default to `redacted_label`, source, outcome, an
 | rust-libp2p AutoNAT/DCUtR/Circuit Relay style | Mature P2P concepts: reachability probing, hole punching, relays, behavior composition. | Relay and public P2P assumptions do not match a local-first desktop tool by default. | Very high complexity and dependency weight. | Do not adopt now. Borrow concepts only. |
 | Full RFC 8445 ICE | Comprehensive candidate exchange/check/nomination model. | Full STUN/TURN/relay semantics would expand privacy and infrastructure scope. | High complexity for TCP local LAN use. | Use as vocabulary and test inspiration, not full implementation. |
 
+## BND-NEXT-21 Firewall Policy Recommendation
+
+This section is policy-only. It does not approve installer changes, helper changes, firewall mutation, elevation, or a release claim. BND-NEXT-21 should remain human-gated until a follow-up implementation task explicitly approves the installer UX and validation packet.
+
+### MWB Comparison
+
+PowerToys Mouse Without Borders has two relevant firewall paths:
+
+- The installer-owned WiX path creates a `PowerToys.MouseWithoutBorders` firewall exception for the MWB executable with `Scope="localSubnet"` and `IgnoreFailure="yes"`.
+- The module fallback shells out through elevated `cmd.exe` and `netsh advfirewall`, deletes inbound rules for the MWB executable, then adds a TCP allow rule with `remoteip=any profile=any`.
+
+Boundless should translate only the installer-owned, scoped, repairable idea. It should not copy the fallback shape that opens all profiles or any remote address, deletes rules by program as a side effect, or hides elevation inside a connectivity flow.
+
+### Recommended Shape If Later Approved
+
+The recommended Boundless policy is an explicit, user-visible installer/helper option, not silent mutation:
+
+- Ownership: MSI/helper-owned Windows Defender Firewall rule for the installed Program Files service binary only: `%ProgramFiles%\Boundless\boundless-service.exe`.
+- Scope: Private profile plus local-subnet remote scope, or a narrower user-approved remote scope if the implementation can verify it. No Public profile and no router-forwarding guidance.
+- Ports: TCP `15100` for trusted transport and TCP `15200` for nearby pairing. Do not open TCP `15101`; that port is only a side-by-side diagnostic probe today. Alternate `network_port` support must be a separate explicit flow that opens only the selected transport port and derived pairing port.
+- UX: installer/helper copy must say the rule allows inbound Boundless pairing and transport from the local private network. It must be opt-in or an explicit reviewed installer choice; do not make it an invisible side effect of pairing, diagnostics, reset, or role reversal.
+- Repair/update: MSI repair must recreate the exact approved rule when the option is enabled. MSI upgrade must keep ownership tied to the current Program Files service path. Uninstall must remove the MSI-owned Boundless rule and must not delete unrelated user-created firewall rules.
+- Observability: diagnostics should report whether the expected rule exists, its profile, remote scope, program path, and ports using local process/path redaction policy where needed.
+
+### Fail-Closed Requirements
+
+The implementation must fail closed and leave firewall state unchanged when any prerequisite cannot be verified:
+
+- `%ProgramFiles%\Boundless\boundless-service.exe` is missing, not the active installed service binary, not MSI-owned, or resolves outside the expected install root.
+- The intended desktop user SID, service registration, or LocalSystem AutoStart service boundary cannot be verified.
+- The requested profile/scope cannot be represented as Private plus local-subnet or narrower.
+- The implementation cannot prove the rule it will repair/remove is the MSI-owned Boundless rule.
+- The user declines or the installer/helper property is absent.
+
+Failure copy should point users back to diagnostics and manual Private-profile guidance. It must not fall back to `profile=any`, `remoteip=any`, broad `netsh` commands, firewall edits during pairing, or hidden elevation.
+
+### Evidence Before Connectivity Claims
+
+Before Boundless claims frictionless MWB-like install connectivity, release evidence must show:
+
+- Static installer evidence for the rule's program path, TCP ports, profile, remote scope, and remove-on-uninstall behavior.
+- Helper/installer fixture evidence that the option is explicit, fail-closed, and does not infer the wrong user or service path.
+- Windows installer lab evidence that install creates the rule only when approved, repair restores it, upgrade preserves it for the current service binary, and uninstall removes it.
+- Negative evidence that Public-profile and `remoteip=any profile=any` rules are not created.
+- Real two-PC Private-network dogfood evidence showing pairing and transport without manual firewall edits, plus diagnostics proving the expected rule shape on both machines.
+
+Until that evidence exists, Boundless can say it has a proposed local-subnet firewall policy. It must not claim MWB parity, lock-screen/UAC/elevated-app parity, or automatic firewall setup.
+
 ## Security, Trust, and Privacy Requirements
 
 - Both peers must explicitly consent before trust is established.
