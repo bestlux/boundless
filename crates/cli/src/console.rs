@@ -418,12 +418,15 @@ async fn handle_console_pair_command(
             );
             pair_nearby_join(
                 endpoint,
-                code,
-                host,
-                pairing_port,
-                120,
-                alias,
-                discovered.endpoint_candidates.clone(),
+                NearbyJoinCliRequest {
+                    code,
+                    host,
+                    port: pairing_port,
+                    timeout_seconds: 120,
+                    alias,
+                    endpoint_candidates: discovered.endpoint_candidates.clone(),
+                    role_reversal: false,
+                },
             )
             .await
         }
@@ -451,7 +454,19 @@ async fn handle_console_pair_command(
                     }
                 }
             }
-            pair_nearby_join(endpoint, code, host, port, 120, alias, Vec::new()).await
+            pair_nearby_join(
+                endpoint,
+                NearbyJoinCliRequest {
+                    code,
+                    host,
+                    port,
+                    timeout_seconds: 120,
+                    alias,
+                    endpoint_candidates: Vec::new(),
+                    role_reversal: false,
+                },
+            )
+            .await
         }
         _ => bail!("unknown pair command `{}`", args[0]),
     }

@@ -2,6 +2,32 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NearbyPairingRole {
+    #[default]
+    Initiator,
+    RoleReversalRequest,
+}
+
+impl NearbyPairingRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Initiator => "initiator",
+            Self::RoleReversalRequest => "role-reversal-request",
+        }
+    }
+
+    pub fn parse_or_default(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "role-reversal-request" | "role_reversal_request" | "role-reversal" => {
+                Self::RoleReversalRequest
+            }
+            _ => Self::Initiator,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairingCodeRequest {
     pub ttl_seconds: u64,
@@ -170,6 +196,10 @@ pub struct NearbyJoinStartCommand {
     pub alias: Option<String>,
     #[serde(default)]
     pub endpoint_candidates: Vec<String>,
+    #[serde(default)]
+    pub role: NearbyPairingRole,
+    #[serde(default)]
+    pub attempt_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +210,10 @@ pub struct NearbyJoinStatusCommand {
     pub alias: Option<String>,
     #[serde(default)]
     pub endpoint_candidates: Vec<String>,
+    #[serde(default)]
+    pub role: NearbyPairingRole,
+    #[serde(default)]
+    pub attempt_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

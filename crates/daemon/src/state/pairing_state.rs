@@ -3,6 +3,7 @@ use std::{collections::HashMap, net::IpAddr};
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 
+use app_services::commands::NearbyPairingRole;
 use core_security::TrustBundle;
 
 #[derive(Debug, Clone)]
@@ -14,6 +15,8 @@ pub struct PendingNearbyPairingRequest {
     pub verification_code: Option<String>,
     pub verification_nonce: Option<String>,
     pub verification_expires_at: Option<DateTime<Utc>>,
+    pub role: NearbyPairingRole,
+    pub attempt_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]

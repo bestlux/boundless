@@ -184,6 +184,8 @@ enum PairCommand {
         timeout_seconds: u64,
         #[arg(long)]
         alias: Option<String>,
+        #[arg(long, default_value_t = false)]
+        role_reversal: bool,
     },
     Pending,
     Approve {
@@ -449,15 +451,19 @@ async fn main() -> Result<()> {
                 port,
                 timeout_seconds,
                 alias,
+                role_reversal,
             } => {
                 pair_nearby_join(
                     &cli.endpoint,
-                    code,
-                    host,
-                    port,
-                    timeout_seconds,
-                    alias,
-                    Vec::new(),
+                    NearbyJoinCliRequest {
+                        code,
+                        host,
+                        port,
+                        timeout_seconds,
+                        alias,
+                        endpoint_candidates: Vec::new(),
+                        role_reversal,
+                    },
                 )
                 .await
             }

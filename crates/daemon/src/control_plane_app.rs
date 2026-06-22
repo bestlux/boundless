@@ -615,13 +615,17 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         &self,
         command: NearbyJoinStartCommand,
     ) -> Result<NearbyJoinStatusSnapshot> {
-        let result = pairing_wire::start_nearby_pairing_join(
+        let result = pairing_wire::start_nearby_pairing_join_with_role(
             &self.state,
-            &command.host,
-            command.port,
-            command.code,
-            command.alias,
-            &command.endpoint_candidates,
+            pairing_wire::NearbyJoinAttempt {
+                host: &command.host,
+                port: command.port,
+                code: command.code,
+                alias: command.alias,
+                endpoint_candidates: &command.endpoint_candidates,
+                role: command.role,
+                attempt_id: command.attempt_id,
+            },
         )
         .await?;
         Ok(map_nearby_join_status(result))
@@ -631,13 +635,17 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         &self,
         command: NearbyJoinStatusCommand,
     ) -> Result<NearbyJoinStatusSnapshot> {
-        let result = pairing_wire::check_nearby_pairing_join(
+        let result = pairing_wire::check_nearby_pairing_join_with_role(
             &self.state,
-            &command.host,
-            command.port,
-            command.request_id,
-            command.alias,
-            &command.endpoint_candidates,
+            pairing_wire::NearbyJoinStatusAttempt {
+                host: &command.host,
+                port: command.port,
+                request_id: command.request_id,
+                alias: command.alias,
+                endpoint_candidates: &command.endpoint_candidates,
+                role: command.role,
+                attempt_id: command.attempt_id,
+            },
         )
         .await?;
         Ok(map_nearby_join_status(result))
@@ -1167,6 +1175,8 @@ fn build_pending_requests(
                     .map(|value| value.to_rfc3339())
                     .unwrap_or_default(),
                 requires_verification_code,
+                role: request.role.as_str().to_string(),
+                attempt_id: request.attempt_id.unwrap_or_default(),
             }
         })
         .collect::<Vec<_>>();
@@ -1180,6 +1190,8 @@ fn map_nearby_join_status(result: pairing_wire::NearbyJoinStatus) -> NearbyJoinS
         status: result.status.as_str().to_string(),
         message: result.message,
         peer_machine_id: result.peer_machine_id,
+        role: result.role.as_str().to_string(),
+        attempt_id: result.attempt_id.unwrap_or_default(),
     }
 }
 

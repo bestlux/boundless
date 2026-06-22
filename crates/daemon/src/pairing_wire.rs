@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use app_services::commands::NearbyPairingRole;
 use app_services::desktop::{TcpEndpointCandidate, TcpEndpointSource, tcp_endpoint_candidate};
 use core_security::TrustBundle;
 use serde::{Deserialize, Serialize};
@@ -44,9 +45,17 @@ enum PairingWireRequest {
         code: String,
         requester_bundle: TrustBundle,
         requester_alias: Option<String>,
+        #[serde(default)]
+        role: NearbyPairingRole,
+        #[serde(default)]
+        attempt_id: Option<String>,
     },
     CheckNearbyJoin {
         request_id: String,
+        #[serde(default)]
+        role: NearbyPairingRole,
+        #[serde(default)]
+        attempt_id: Option<String>,
     },
 }
 
@@ -120,11 +129,32 @@ pub(crate) struct NearbySubmitCode {
     pub(crate) endpoint_candidates: Vec<String>,
 }
 
+pub(crate) struct NearbyJoinAttempt<'a> {
+    pub(crate) host: &'a str,
+    pub(crate) port: u16,
+    pub(crate) code: String,
+    pub(crate) alias: Option<String>,
+    pub(crate) endpoint_candidates: &'a [String],
+    pub(crate) role: NearbyPairingRole,
+    pub(crate) attempt_id: Option<String>,
+}
+
+pub(crate) struct NearbyJoinStatusAttempt<'a> {
+    pub(crate) host: &'a str,
+    pub(crate) port: u16,
+    pub(crate) request_id: String,
+    pub(crate) alias: Option<String>,
+    pub(crate) endpoint_candidates: &'a [String],
+    pub(crate) role: NearbyPairingRole,
+    pub(crate) attempt_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PairingTarget {
     endpoint: String,
     host: String,
     candidate: TcpEndpointCandidate,
+    role: NearbyPairingRole,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +162,7 @@ struct PairingReachabilityAttempt {
     label: String,
     outcome: &'static str,
     source: TcpEndpointSource,
+    role: NearbyPairingRole,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +171,8 @@ pub(crate) struct NearbyJoinStatus {
     pub(crate) status: NearbyJoinStatusKind,
     pub(crate) message: String,
     pub(crate) peer_machine_id: Option<String>,
+    pub(crate) role: NearbyPairingRole,
+    pub(crate) attempt_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,7 +191,12 @@ pub(crate) async fn request_nearby_pairing_code(
     alias: Option<String>,
     endpoint_candidates: &[String],
 ) -> Result<NearbyRequestCodeStart> {
-    let targets = nearby_pairing_targets(host, port, endpoint_candidates);
+    let targets = nearby_pairing_targets(
+        host,
+        port,
+        endpoint_candidates,
+        NearbyPairingRole::Initiator,
+    );
     let requester_bundle = state.export_trust_bundle().await?;
     let (response, _) = send_nearby_pairing_request_to_candidates(
         &targets,
@@ -206,7 +244,12 @@ pub(crate) async fn submit_nearby_pairing_code(
     state: &AppState,
     request: NearbySubmitCode,
 ) -> Result<NearbyPairingOutcome> {
-    let targets = nearby_pairing_targets(&request.host, request.port, &request.endpoint_candidates);
+    let targets = nearby_pairing_targets(
+        &request.host,
+        request.port,
+        &request.endpoint_candidates,
+        NearbyPairingRole::Initiator,
+    );
     let (response, connected_host) = send_nearby_pairing_request_to_candidates(
         &targets,
         PairingWireRequest::NearbySubmitCode {
@@ -255,20 +298,26 @@ pub(crate) async fn submit_nearby_pairing_code(
     Ok(outcome)
 }
 
-pub(crate) async fn start_nearby_pairing_join(
+pub(crate) async fn start_nearby_pairing_join_with_role(
     state: &AppState,
-    host: &str,
-    port: u16,
-    code: String,
-    alias: Option<String>,
-    endpoint_candidates: &[String],
+    attempt: NearbyJoinAttempt<'_>,
 ) -> Result<NearbyJoinStatus> {
+    let NearbyJoinAttempt {
+        host,
+        port,
+        code,
+        alias,
+        endpoint_candidates,
+        role,
+        attempt_id,
+    } = attempt;
     let normalized_code = code.trim().to_string();
     if normalized_code.is_empty() {
         anyhow::bail!("pairing code must not be empty");
     }
 
-    let targets = nearby_pairing_targets(host, port, endpoint_candidates);
+    let normalized_attempt_id = normalize_attempt_id(attempt_id);
+    let targets = nearby_pairing_targets(host, port, endpoint_candidates, role);
     let requester_bundle = state.export_trust_bundle().await?;
     let (response, connected_host) = send_nearby_pairing_request_to_candidates(
         &targets,
@@ -276,36 +325,62 @@ pub(crate) async fn start_nearby_pairing_join(
             code: normalized_code,
             requester_bundle,
             requester_alias: normalize_alias(alias.clone()),
+            role,
+            attempt_id: normalized_attempt_id.clone(),
         },
     )
     .await?;
 
-    map_join_status_response(state, &connected_host, response, alias).await
+    map_join_status_response(
+        state,
+        &connected_host,
+        response,
+        alias,
+        role,
+        normalized_attempt_id,
+    )
+    .await
 }
 
-pub(crate) async fn check_nearby_pairing_join(
+pub(crate) async fn check_nearby_pairing_join_with_role(
     state: &AppState,
-    host: &str,
-    port: u16,
-    request_id: String,
-    alias: Option<String>,
-    endpoint_candidates: &[String],
+    attempt: NearbyJoinStatusAttempt<'_>,
 ) -> Result<NearbyJoinStatus> {
+    let NearbyJoinStatusAttempt {
+        host,
+        port,
+        request_id,
+        alias,
+        endpoint_candidates,
+        role,
+        attempt_id,
+    } = attempt;
     let trimmed_request_id = request_id.trim().to_string();
     if trimmed_request_id.is_empty() {
         anyhow::bail!("request_id must not be empty");
     }
 
-    let targets = nearby_pairing_targets(host, port, endpoint_candidates);
+    let normalized_attempt_id = normalize_attempt_id(attempt_id);
+    let targets = nearby_pairing_targets(host, port, endpoint_candidates, role);
     let (response, connected_host) = send_nearby_pairing_request_to_candidates(
         &targets,
         PairingWireRequest::CheckNearbyJoin {
             request_id: trimmed_request_id,
+            role,
+            attempt_id: normalized_attempt_id.clone(),
         },
     )
     .await?;
 
-    map_join_status_response(state, &connected_host, response, alias).await
+    map_join_status_response(
+        state,
+        &connected_host,
+        response,
+        alias,
+        role,
+        normalized_attempt_id,
+    )
+    .await
 }
 
 pub fn start(state: AppState) {
@@ -329,6 +404,8 @@ async fn map_join_status_response(
     host: &str,
     response: PairingWireResponse,
     alias: Option<String>,
+    role: NearbyPairingRole,
+    attempt_id: Option<String>,
 ) -> Result<NearbyJoinStatus> {
     match response {
         PairingWireResponse::Pending {
@@ -339,6 +416,8 @@ async fn map_join_status_response(
             status: NearbyJoinStatusKind::Pending,
             message,
             peer_machine_id: None,
+            role,
+            attempt_id,
         }),
         PairingWireResponse::Approved {
             request_id,
@@ -352,6 +431,8 @@ async fn map_join_status_response(
                 status: NearbyJoinStatusKind::Approved,
                 message: format!("{message}; local {}", outcome.message),
                 peer_machine_id: Some(outcome.peer_machine_id),
+                role,
+                attempt_id,
             })
         }
         PairingWireResponse::Rejected {
@@ -362,12 +443,16 @@ async fn map_join_status_response(
             status: NearbyJoinStatusKind::Rejected,
             message,
             peer_machine_id: None,
+            role,
+            attempt_id,
         }),
         PairingWireResponse::Error { message } => Ok(NearbyJoinStatus {
             request_id: String::new(),
             status: NearbyJoinStatusKind::Error,
             message,
             peer_machine_id: None,
+            role,
+            attempt_id,
         }),
         PairingWireResponse::CodeRequired {
             request_id,
@@ -378,6 +463,8 @@ async fn map_join_status_response(
             status: NearbyJoinStatusKind::CodeRequired,
             message,
             peer_machine_id: None,
+            role,
+            attempt_id,
         }),
     }
 }
@@ -523,9 +610,10 @@ async fn send_nearby_pairing_request_to_candidates(
             Ok(response) => return Ok((response, target.host.clone())),
             Err(error) => {
                 attempts.push(PairingReachabilityAttempt {
-                    label: target.candidate.redacted_provenance_label(),
+                    label: pairing_attempt_label(&target.candidate, target.role),
                     outcome: classify_pairing_reachability_error(&error),
                     source: target.candidate.source,
+                    role: target.role,
                 });
             }
         }
@@ -541,6 +629,7 @@ fn nearby_pairing_targets(
     host: &str,
     port: u16,
     endpoint_candidates: &[String],
+    role: NearbyPairingRole,
 ) -> Vec<PairingTarget> {
     let mut targets = Vec::<PairingTarget>::new();
     for endpoint in endpoint_candidates {
@@ -552,6 +641,7 @@ fn nearby_pairing_targets(
                 candidate_host,
                 candidate_port,
                 TcpEndpointSource::Discovery,
+                role,
             );
         }
     }
@@ -560,8 +650,18 @@ fn nearby_pairing_targets(
         host.trim().to_string(),
         port,
         TcpEndpointSource::ManualHost,
+        role,
     );
     targets
+}
+
+fn pairing_pending_message(role: NearbyPairingRole) -> String {
+    match role {
+        NearbyPairingRole::Initiator => "pending approval on target machine".to_string(),
+        NearbyPairingRole::RoleReversalRequest => {
+            "pending role-reversal approval on target machine".to_string()
+        }
+    }
 }
 
 fn push_pairing_target(
@@ -569,6 +669,7 @@ fn push_pairing_target(
     host: String,
     port: u16,
     source: TcpEndpointSource,
+    role: NearbyPairingRole,
 ) {
     let target = format_host_port(&host, port);
     if !targets.iter().any(|existing| existing.endpoint == target) {
@@ -577,8 +678,17 @@ fn push_pairing_target(
             endpoint: target,
             host,
             candidate,
+            role,
         });
     }
+}
+
+fn pairing_attempt_label(candidate: &TcpEndpointCandidate, role: NearbyPairingRole) -> String {
+    format!(
+        "role={} {}",
+        role.as_str(),
+        candidate.redacted_provenance_label()
+    )
 }
 
 fn classify_pairing_reachability_error(error: &anyhow::Error) -> &'static str {
@@ -610,16 +720,19 @@ fn pairing_reachability_failure_message(attempts: &[PairingReachabilityAttempt])
         .map(|attempt| format!("{} {}", attempt.label, attempt.outcome))
         .collect::<Vec<_>>()
         .join(", ");
+    let role_reversal_attempted = attempts
+        .iter()
+        .any(|attempt| attempt.role == NearbyPairingRole::RoleReversalRequest);
     if attempts
         .iter()
         .any(|attempt| attempt.source == TcpEndpointSource::Discovery)
     {
         format!(
-            "mDNS discovery succeeded but TCP pairing reachability failed; attempted=[{attempted}]; likely firewall/VLAN/asymmetric-route reachability issue before trust/code/daemon pairing could complete; next_action=verify Private network, VLAN routing, and manual admin-approved firewall policy for the listed TCP ports"
+            "mDNS discovery succeeded but TCP pairing reachability failed; role_reversal_attempted={role_reversal_attempted}; attempted=[{attempted}]; likely firewall/VLAN/asymmetric-route reachability issue before trust/code/daemon pairing could complete; next_action=verify Private network, VLAN routing, and manual admin-approved firewall policy for the listed TCP ports"
         )
     } else {
         format!(
-            "manual host TCP pairing reachability failed; attempted=[{attempted}]; the host was entered manually and no mDNS endpoint candidate was used; likely firewall/VLAN/asymmetric-route or host/port reachability issue before trust/code/daemon pairing could complete; next_action=verify the host, TCP port, Private network, VLAN routing, and any manual admin-approved firewall policy"
+            "manual host TCP pairing reachability failed; role_reversal_attempted={role_reversal_attempted}; attempted=[{attempted}]; the host was entered manually and no mDNS endpoint candidate was used; likely firewall/VLAN/asymmetric-route or host/port reachability issue before trust/code/daemon pairing could complete; next_action=verify the host, TCP port, Private network, VLAN routing, and any manual admin-approved firewall policy"
         )
     }
 }
@@ -670,6 +783,17 @@ fn format_host_port(host: &str, port: u16) -> String {
 
 fn normalize_alias(alias: Option<String>) -> Option<String> {
     alias.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+fn normalize_attempt_id(attempt_id: Option<String>) -> Option<String> {
+    attempt_id.and_then(|value| {
         let trimmed = value.trim().to_string();
         if trimmed.is_empty() {
             None
@@ -855,6 +979,8 @@ async fn process_pairing_request(
             code,
             mut requester_bundle,
             requester_alias,
+            role,
+            attempt_id,
         } => {
             requester_bundle =
                 rewrite_requester_bundle_for_remote(state, remote_ip, requester_bundle).await;
@@ -862,11 +988,13 @@ async fn process_pairing_request(
             let requester_display_name = requester_bundle.display_name.clone();
             let requester_address = requester_bundle.network_address.clone();
             let pending = state
-                .queue_nearby_pairing_request_with_code(
+                .queue_nearby_pairing_request_with_code_and_role(
                     &code,
                     requester_bundle,
                     requester_alias,
                     remote_ip,
+                    role,
+                    normalize_attempt_id(attempt_id),
                 )
                 .await?;
 
@@ -875,15 +1003,17 @@ async fn process_pairing_request(
                 requester_machine_id = %requester_machine_id,
                 requester_display_name = %requester_display_name,
                 requester_address = %requester_address,
+                role = %pending.role.as_str(),
+                attempt_id = %pending.attempt_id.as_deref().unwrap_or("none"),
                 "nearby pairing request pending local approval"
             );
 
             Ok(PairingWireResponse::Pending {
                 request_id: pending.request_id,
-                message: "pending approval on target machine".to_string(),
+                message: pairing_pending_message(pending.role),
             })
         }
-        PairingWireRequest::CheckNearbyJoin { request_id } => {
+        PairingWireRequest::CheckNearbyJoin { request_id, .. } => {
             match state.nearby_pairing_status(&request_id).await {
                 NearbyPairingStatus::Pending => Ok(PairingWireResponse::Pending {
                     request_id,
@@ -995,6 +1125,7 @@ mod tests {
                 "[2001:db8::7]:15100".to_string(),
                 "10.0.0.7:15100".to_string(),
             ],
+            NearbyPairingRole::Initiator,
         );
 
         assert_eq!(
@@ -1008,6 +1139,7 @@ mod tests {
                         TcpEndpointSource::Discovery,
                         0,
                     ),
+                    role: NearbyPairingRole::Initiator,
                 },
                 PairingTarget {
                     endpoint: "10.0.0.7:15200".to_string(),
@@ -1017,6 +1149,7 @@ mod tests {
                         TcpEndpointSource::Discovery,
                         1,
                     ),
+                    role: NearbyPairingRole::Initiator,
                 },
                 PairingTarget {
                     endpoint: "manual-host:15200".to_string(),
@@ -1026,6 +1159,7 @@ mod tests {
                         TcpEndpointSource::ManualHost,
                         2,
                     ),
+                    role: NearbyPairingRole::Initiator,
                 },
             ]
         );
@@ -1033,7 +1167,12 @@ mod tests {
 
     #[test]
     fn nearby_pairing_targets_deduplicate_manual_candidate() {
-        let targets = nearby_pairing_targets("10.0.0.7", 15200, &["10.0.0.7:15100".to_string()]);
+        let targets = nearby_pairing_targets(
+            "10.0.0.7",
+            15200,
+            &["10.0.0.7:15100".to_string()],
+            NearbyPairingRole::Initiator,
+        );
 
         assert_eq!(
             targets,
@@ -1045,6 +1184,7 @@ mod tests {
                     TcpEndpointSource::Discovery,
                     0,
                 ),
+                role: NearbyPairingRole::Initiator,
             }]
         );
     }
@@ -1056,11 +1196,13 @@ mod tests {
                 label: "source=mdns tcp ipv6 port 15200".to_string(),
                 outcome: "timeout",
                 source: TcpEndpointSource::Discovery,
+                role: NearbyPairingRole::Initiator,
             },
             PairingReachabilityAttempt {
                 label: "source=mdns tcp ipv4 port 15200".to_string(),
                 outcome: "refused",
                 source: TcpEndpointSource::Discovery,
+                role: NearbyPairingRole::Initiator,
             },
         ];
         let message = pairing_reachability_failure_message(&attempts);
@@ -1084,11 +1226,14 @@ mod tests {
             &blocked_endpoint.ip().to_string(),
             blocked_endpoint.port(),
             &[],
+            NearbyPairingRole::Initiator,
         );
         let error = send_nearby_pairing_request_to_candidates(
             &targets,
             PairingWireRequest::CheckNearbyJoin {
                 request_id: "manual-failure".to_string(),
+                role: NearbyPairingRole::Initiator,
+                attempt_id: None,
             },
         )
         .await
@@ -1145,6 +1290,7 @@ mod tests {
                     TcpEndpointSource::Discovery,
                     0,
                 ),
+                role: NearbyPairingRole::Initiator,
             },
             PairingTarget {
                 endpoint: reachable_addr.to_string(),
@@ -1154,6 +1300,7 @@ mod tests {
                     TcpEndpointSource::Discovery,
                     1,
                 ),
+                role: NearbyPairingRole::Initiator,
             },
         ];
 
@@ -1161,10 +1308,83 @@ mod tests {
             &targets,
             PairingWireRequest::CheckNearbyJoin {
                 request_id: "ready-candidate".to_string(),
+                role: NearbyPairingRole::Initiator,
+                attempt_id: None,
             },
         )
         .await
         .expect("reachable later candidate succeeds");
+
+        assert_eq!(connected_host, reachable_addr.ip().to_string());
+        assert!(matches!(response, PairingWireResponse::Pending { .. }));
+        server.await.expect("server task completes");
+    }
+
+    #[tokio::test]
+    async fn role_reversal_pairing_attempt_continues_until_reachable_endpoint() {
+        let blocked =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve blocked candidate port");
+        let blocked_endpoint = blocked.local_addr().expect("blocked candidate address");
+        drop(blocked);
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("reachable role-reversal listener");
+        let reachable_addr = listener.local_addr().expect("reachable candidate address");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept pairing probe");
+            let mut reader = BufReader::new(socket);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read pairing request");
+            assert!(line.contains(r#""role":"role-reversal-request""#));
+            assert!(line.contains(r#""attempt_id":"attempt-1""#));
+            let mut socket = reader.into_inner();
+            socket
+                .write_all(br#"{"status":"pending","request_id":"role-reversal","message":"pending role-reversal approval"}"#)
+                .await
+                .expect("write pairing response");
+            socket
+                .write_all(b"\n")
+                .await
+                .expect("write response newline");
+        });
+
+        let targets = vec![
+            PairingTarget {
+                endpoint: blocked_endpoint.to_string(),
+                host: blocked_endpoint.ip().to_string(),
+                candidate: tcp_endpoint_candidate(
+                    &blocked_endpoint.to_string(),
+                    TcpEndpointSource::Discovery,
+                    0,
+                ),
+                role: NearbyPairingRole::RoleReversalRequest,
+            },
+            PairingTarget {
+                endpoint: reachable_addr.to_string(),
+                host: reachable_addr.ip().to_string(),
+                candidate: tcp_endpoint_candidate(
+                    &reachable_addr.to_string(),
+                    TcpEndpointSource::Discovery,
+                    1,
+                ),
+                role: NearbyPairingRole::RoleReversalRequest,
+            },
+        ];
+
+        let (response, connected_host) = send_nearby_pairing_request_to_candidates(
+            &targets,
+            PairingWireRequest::CheckNearbyJoin {
+                request_id: "role-reversal".to_string(),
+                role: NearbyPairingRole::RoleReversalRequest,
+                attempt_id: Some("attempt-1".to_string()),
+            },
+        )
+        .await
+        .expect("reachable role-reversal candidate succeeds");
 
         assert_eq!(connected_host, reachable_addr.ip().to_string());
         assert!(matches!(response, PairingWireResponse::Pending { .. }));
@@ -1211,6 +1431,8 @@ mod tests {
                     ca_cert_pem: requester_identity.ca_cert_pem,
                 },
                 requester_alias: Some("Requester Alias".to_string()),
+                role: NearbyPairingRole::Initiator,
+                attempt_id: None,
             },
         )
         .await
@@ -1272,6 +1494,8 @@ mod tests {
                 code: code.clone(),
                 requester_bundle: requester_bundle.clone(),
                 requester_alias: None,
+                role: NearbyPairingRole::Initiator,
+                attempt_id: None,
             },
         )
         .await
@@ -1288,10 +1512,94 @@ mod tests {
                 code,
                 requester_bundle,
                 requester_alias: None,
+                role: NearbyPairingRole::Initiator,
+                attempt_id: None,
             },
         )
         .await
         .expect("retry should reuse pending request even after code was consumed");
+        let retry_request_id = match retry {
+            PairingWireResponse::Pending { request_id, .. } => request_id,
+            other => panic!("expected pending retry response, got {other:?}"),
+        };
+
+        assert_eq!(retry_request_id, first_request_id);
+        assert_eq!(state.list_pending_nearby_pairing_requests().await.len(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn process_role_reversal_join_reuses_same_attempt_and_records_role() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-role-reversal-join-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let receiver_config_path = root.join("receiver-config.json");
+        let receiver_security_root = root.join("receiver-security");
+        let state =
+            AppState::load_or_create_with_paths(receiver_config_path, receiver_security_root)
+                .expect("receiver state");
+
+        let requester_paths = SecurityPaths::for_root(root.join("requester-security"));
+        let requester_identity = ensure_device_identity(
+            &requester_paths,
+            "requester-machine",
+            "requester",
+            Some("10.10.0.5"),
+        )
+        .expect("requester identity");
+        let requester_bundle = TrustBundle {
+            machine_id: "requester-machine".to_string(),
+            display_name: "requester".to_string(),
+            network_address: "some-host:17777".to_string(),
+            ca_cert_pem: requester_identity.ca_cert_pem,
+        };
+        let remote_ip = "192.168.1.44".parse().expect("ip");
+        let (code, _) = state.create_pairing_code(120).await;
+
+        let first = process_pairing_request(
+            &state,
+            remote_ip,
+            PairingWireRequest::NearbyJoin {
+                code: code.clone(),
+                requester_bundle: requester_bundle.clone(),
+                requester_alias: None,
+                role: NearbyPairingRole::RoleReversalRequest,
+                attempt_id: Some("attempt-1".to_string()),
+            },
+        )
+        .await
+        .expect("first role-reversal join should queue request");
+        let first_request_id = match first {
+            PairingWireResponse::Pending {
+                request_id,
+                message,
+            } => {
+                assert!(message.contains("role-reversal"));
+                request_id
+            }
+            other => panic!("expected pending response, got {other:?}"),
+        };
+
+        let pending = state.list_pending_nearby_pairing_requests().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].role, NearbyPairingRole::RoleReversalRequest);
+        assert_eq!(pending[0].attempt_id.as_deref(), Some("attempt-1"));
+
+        let retry = process_pairing_request(
+            &state,
+            remote_ip,
+            PairingWireRequest::NearbyJoin {
+                code,
+                requester_bundle,
+                requester_alias: None,
+                role: NearbyPairingRole::RoleReversalRequest,
+                attempt_id: Some("attempt-1".to_string()),
+            },
+        )
+        .await
+        .expect("retry should reuse pending role-reversal request");
         let retry_request_id = match retry {
             PairingWireResponse::Pending { request_id, .. } => request_id,
             other => panic!("expected pending retry response, got {other:?}"),
@@ -1340,6 +1648,8 @@ mod tests {
                 code: first_code,
                 requester_bundle: requester_bundle.clone(),
                 requester_alias: None,
+                role: NearbyPairingRole::Initiator,
+                attempt_id: None,
             },
         )
         .await
@@ -1356,6 +1666,8 @@ mod tests {
                 code: second_code,
                 requester_bundle: requester_bundle.clone(),
                 requester_alias: None,
+                role: NearbyPairingRole::Initiator,
+                attempt_id: None,
             },
         )
         .await
@@ -1368,6 +1680,8 @@ mod tests {
                 code: capacity_rejected_code.clone(),
                 requester_bundle: requester_bundle.clone(),
                 requester_alias: None,
+                role: NearbyPairingRole::Initiator,
+                attempt_id: None,
             },
         )
         .await
@@ -1385,6 +1699,8 @@ mod tests {
                 code: capacity_rejected_code,
                 requester_bundle,
                 requester_alias: None,
+                role: NearbyPairingRole::Initiator,
+                attempt_id: None,
             },
         )
         .await
@@ -1525,6 +1841,8 @@ mod tests {
                     ca_cert_pem: requester_identity.ca_cert_pem,
                 },
                 requester_alias: None,
+                role: NearbyPairingRole::Initiator,
+                attempt_id: None,
             },
         )
         .await
@@ -1539,6 +1857,8 @@ mod tests {
             "192.168.1.44".parse().expect("ip"),
             PairingWireRequest::CheckNearbyJoin {
                 request_id: request_id.clone(),
+                role: NearbyPairingRole::Initiator,
+                attempt_id: None,
             },
         )
         .await
@@ -1574,7 +1894,11 @@ mod tests {
         let approved_status = process_pairing_request(
             &state,
             "192.168.1.44".parse().expect("ip"),
-            PairingWireRequest::CheckNearbyJoin { request_id },
+            PairingWireRequest::CheckNearbyJoin {
+                request_id,
+                role: NearbyPairingRole::Initiator,
+                attempt_id: None,
+            },
         )
         .await
         .expect("check approved status");
@@ -1687,6 +2011,8 @@ mod tests {
             "192.168.1.44".parse().expect("ip"),
             PairingWireRequest::CheckNearbyJoin {
                 request_id: request_id.clone(),
+                role: NearbyPairingRole::Initiator,
+                attempt_id: None,
             },
         )
         .await
@@ -1857,7 +2183,11 @@ mod tests {
         let rejected_status = process_pairing_request(
             &state,
             "192.168.1.44".parse().expect("ip"),
-            PairingWireRequest::CheckNearbyJoin { request_id },
+            PairingWireRequest::CheckNearbyJoin {
+                request_id,
+                role: NearbyPairingRole::Initiator,
+                attempt_id: None,
+            },
         )
         .await
         .expect("check rejected status");
