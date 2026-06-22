@@ -63,7 +63,7 @@ Connectivity diagnostics
 
   powershell -NoProfile -ExecutionPolicy Bypass -File "%ProgramFiles%\Boundless\Boundless-ConnectivityDiagnostics.ps1" -RemoteHost 10.10.0.187
 
-- If side-by-side dogfood with Mouse Without Borders is needed, configure the same alternate Boundless network_port on every participating machine before pairing. Nearby pairing uses network_port + 100, so network_port 16100 pairs on TCP 16200.
+- If Mouse Without Borders or another process owns required Boundless TCP 15100 or 15200 during side-by-side dogfood, configure the same alternate Boundless network_port on every participating machine before pairing. Nearby pairing uses network_port + 100, so network_port 16100 pairs on TCP 16200. Mouse Without Borders on diagnostics-only TCP 15101 is evidence to record, not a Boundless pairing or transport collision by itself.
 - Boundless does not silently create firewall rules. If you add rules manually, use an elevated shell only after explicit approval, restrict them to the Private profile, and scope them to %ProgramFiles%\Boundless\boundless-service.exe.
 - Do not expose Boundless ports on Public networks or through router port forwarding.
 
