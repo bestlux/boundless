@@ -109,6 +109,18 @@ function Get-ListenerOwnerKind {
     return "other"
 }
 
+function Test-RequiredBoundlessPort {
+    param([int]$Port)
+
+    return $Port -in @(15100, 15200)
+}
+
+function Test-DiagnosticsOnlyPort {
+    param([int]$Port)
+
+    return $Port -eq 15101
+}
+
 function Get-ListenerMitigation {
     param(
         [int]$Port,
@@ -117,9 +129,33 @@ function Get-ListenerMitigation {
 
     switch ($OwnerKind) {
         "boundless" { return "TCP $Port is owned by Boundless; this is expected when the daemon is running." }
-        "mouse-without-borders" { return "Mouse Without Borders or PowerToys is listening on TCP $Port; stop MWB during Boundless dogfood or move Boundless to an alternate network_port before pairing." }
-        "other" { return "Another local process is listening on TCP $Port; identify the owner, stop it if appropriate, or move Boundless to an alternate network_port for side-by-side testing." }
-        default { return "TCP $Port has a listener but the owning process could not be resolved; inspect the port owner before changing trust or firewall state." }
+        "mouse-without-borders" {
+            if (Test-RequiredBoundlessPort -Port $Port) {
+                return "Mouse Without Borders or PowerToys is listening on required Boundless TCP $Port; stop MWB during Boundless dogfood or move Boundless to an alternate network_port before pairing."
+            }
+            if (Test-DiagnosticsOnlyPort -Port $Port) {
+                return "Mouse Without Borders or PowerToys is listening on diagnostics-only TCP $Port; this is side-by-side evidence, not a Boundless pairing or transport port collision by itself."
+            }
+            return "Mouse Without Borders or PowerToys is listening on TCP $Port; inspect this only if testing a custom Boundless port plan."
+        }
+        "other" {
+            if (Test-RequiredBoundlessPort -Port $Port) {
+                return "Another local process is listening on required Boundless TCP $Port; identify the owner, stop it if appropriate, or move Boundless to an alternate network_port for side-by-side testing."
+            }
+            if (Test-DiagnosticsOnlyPort -Port $Port) {
+                return "Another local process is listening on diagnostics-only TCP $Port; this is side-by-side evidence, not a Boundless pairing or transport port collision by itself."
+            }
+            return "Another local process is listening on TCP $Port; inspect this only if testing a custom Boundless port plan."
+        }
+        default {
+            if (Test-RequiredBoundlessPort -Port $Port) {
+                return "Required Boundless TCP $Port has a listener but the owning process could not be resolved; inspect the port owner before changing trust or firewall state."
+            }
+            if (Test-DiagnosticsOnlyPort -Port $Port) {
+                return "Diagnostics-only TCP $Port has a listener but the owning process could not be resolved; this is side-by-side evidence, not a Boundless pairing or transport port collision by itself."
+            }
+            return "TCP $Port has a listener but the owning process could not be resolved; inspect the port owner before changing trust or firewall state."
+        }
     }
 }
 
@@ -127,14 +163,21 @@ function Get-SideBySideGuidance {
     param([object[]]$LocalListeners)
 
     $entries = @($LocalListeners | ForEach-Object { $_.listeners } | Where-Object { $null -ne $_ })
-    $hasMwb = @($entries | Where-Object { $_.owner_kind -eq "mouse-without-borders" }).Count -gt 0
-    $hasOther = @($entries | Where-Object { $_.owner_kind -eq "other" -or $_.owner_kind -eq "unknown" }).Count -gt 0
+    $requiredCollisions = @($entries | Where-Object { (Test-RequiredBoundlessPort -Port $_.local_port) -and $_.owner_kind -ne "boundless" })
+    $diagnosticsOnlyMwb = @($entries | Where-Object { (Test-DiagnosticsOnlyPort -Port $_.local_port) -and $_.owner_kind -eq "mouse-without-borders" })
+    $diagnosticsOnlyOther = @($entries | Where-Object { (Test-DiagnosticsOnlyPort -Port $_.local_port) -and ($_.owner_kind -eq "other" -or $_.owner_kind -eq "unknown") })
     $guidance = @()
-    if ($hasMwb) {
-        $guidance += "Mouse Without Borders/PowerToys listener ownership was detected on a Boundless-related port; stop MWB during Boundless dogfood or configure an alternate Boundless network_port on all participating machines."
+    if (@($requiredCollisions | Where-Object { $_.owner_kind -eq "mouse-without-borders" }).Count -gt 0) {
+        $guidance += "Mouse Without Borders/PowerToys listener ownership was detected on required Boundless TCP 15100 or 15200; stop MWB during Boundless dogfood or configure an alternate Boundless network_port on all participating machines."
     }
-    if ($hasOther) {
-        $guidance += "A non-Boundless or unresolved listener owns a Boundless-related port; resolve local port ownership before resetting trust or changing firewall policy."
+    if (@($requiredCollisions | Where-Object { $_.owner_kind -eq "other" -or $_.owner_kind -eq "unknown" }).Count -gt 0) {
+        $guidance += "A non-Boundless or unresolved listener owns required Boundless TCP 15100 or 15200; resolve local port ownership before resetting trust or changing firewall policy."
+    }
+    if ($diagnosticsOnlyMwb.Count -gt 0 -and $requiredCollisions.Count -eq 0) {
+        $guidance += "Mouse Without Borders/PowerToys is listening only on diagnostics-only TCP 15101; record it as side-by-side evidence, but it is not a Boundless pairing or transport port collision by itself."
+    }
+    if ($diagnosticsOnlyOther.Count -gt 0 -and $requiredCollisions.Count -eq 0) {
+        $guidance += "A non-Boundless or unresolved listener owns diagnostics-only TCP 15101; record it as side-by-side evidence, but it is not a Boundless pairing or transport port collision by itself."
     }
     if ($guidance.Count -gt 0) {
         $guidance += "This script is read-only and did not create firewall rules, elevate, or change network state."
@@ -501,6 +544,47 @@ function Invoke-FirewallPolicySelfTest {
     }
     if (@($report.relevant_rules | Where-Object { $_.name -eq "comma-profile" -and @($_.profile).Contains("Private") -and @($_.profile).Contains("Public") -and @($_.local_port).Contains("15100") -and @($_.local_port).Contains("15200") }).Count -ne 1) {
         throw "comma-separated scalar fields must be normalized into individual values"
+    }
+
+    $mwb15101Mitigation = Get-ListenerMitigation -Port 15101 -OwnerKind "mouse-without-borders"
+    if ($mwb15101Mitigation -match "stop MWB|alternate network_port") {
+        throw "MWB on diagnostics-only TCP 15101 must not produce stop-MWB or alternate-port mitigation"
+    }
+    if ($mwb15101Mitigation -notmatch "diagnostics-only TCP 15101") {
+        throw "MWB on TCP 15101 must be labeled as diagnostics-only evidence"
+    }
+
+    $mwb15100Mitigation = Get-ListenerMitigation -Port 15100 -OwnerKind "mouse-without-borders"
+    if ($mwb15100Mitigation -notmatch "required Boundless TCP 15100" -or $mwb15100Mitigation -notmatch "stop MWB") {
+        throw "MWB on required TCP 15100 must keep collision mitigation"
+    }
+    $other15200Mitigation = Get-ListenerMitigation -Port 15200 -OwnerKind "other"
+    if ($other15200Mitigation -notmatch "required Boundless TCP 15200" -or $other15200Mitigation -notmatch "alternate network_port") {
+        throw "other process on required TCP 15200 must keep collision mitigation"
+    }
+    $boundless15100Mitigation = Get-ListenerMitigation -Port 15100 -OwnerKind "boundless"
+    if ($boundless15100Mitigation -notmatch "owned by Boundless" -or $boundless15100Mitigation -notmatch "expected") {
+        throw "Boundless-owned TCP 15100 must remain expected"
+    }
+
+    $mwb15101OnlyGuidance = @(Get-SideBySideGuidance -LocalListeners @(
+        [pscustomobject]@{ port = 15100; listeners = @([pscustomobject]@{ local_port = 15100; owner_kind = "boundless" }) },
+        [pscustomobject]@{ port = 15101; listeners = @([pscustomobject]@{ local_port = 15101; owner_kind = "mouse-without-borders" }) },
+        [pscustomobject]@{ port = 15200; listeners = @([pscustomobject]@{ local_port = 15200; owner_kind = "boundless" }) }
+    ))
+    if (@($mwb15101OnlyGuidance | Where-Object { $_ -match "stop MWB|alternate Boundless network_port" }).Count -ne 0) {
+        throw "MWB only on diagnostics-only TCP 15101 must not produce collision guidance"
+    }
+    if (@($mwb15101OnlyGuidance | Where-Object { $_ -match "diagnostics-only TCP 15101" }).Count -ne 1) {
+        throw "MWB only on diagnostics-only TCP 15101 must produce informational guidance"
+    }
+
+    $requiredCollisionGuidance = @(Get-SideBySideGuidance -LocalListeners @(
+        [pscustomobject]@{ port = 15100; listeners = @([pscustomobject]@{ local_port = 15100; owner_kind = "mouse-without-borders" }) },
+        [pscustomobject]@{ port = 15200; listeners = @([pscustomobject]@{ local_port = 15200; owner_kind = "other" }) }
+    ))
+    if (@($requiredCollisionGuidance | Where-Object { $_ -match "required Boundless TCP 15100 or 15200" }).Count -lt 2) {
+        throw "MWB/other listeners on required ports must produce collision guidance"
     }
 
     Write-Host "connectivity_diagnostics_firewall_policy_fixtures=passed"

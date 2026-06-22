@@ -73,7 +73,7 @@ If you add firewall rules manually, restrict them to trusted private LAN profile
 Symptoms:
 
 - Mouse Without Borders or PowerToys is running during Boundless dogfood,
-- diagnostics show another process listening on TCP `15100`, `15101`, or `15200`,
+- diagnostics show another process listening on required TCP `15100` or `15200`, or diagnostics-only TCP `15101`,
 - pairing or transport failures are ambiguous because both products are installed.
 
 Checks:
@@ -85,7 +85,7 @@ Checks:
 
 The diagnostics bundle reports local listener ownership under `port_listeners` with address family, bind scope, port, process owner, and mitigation text. Support bundles redact endpoint-style addresses and full local paths by default; pass `--include-filenames` only when support explicitly asks for basename-level path context.
 
-Prefer stopping Mouse Without Borders/PowerToys before pairing Boundless machines. If you need side-by-side dogfood, Boundless already supports changing the daemon `network_port`; the nearby pairing listener is derived from that port with an offset of `+100`, so `network_port = 16100` pairs on TCP `16200`. Apply the same alternate port plan to every participating Boundless machine before pairing. Do not reset trust just because a local listener collision is detected.
+Prefer stopping Mouse Without Borders/PowerToys before pairing Boundless machines when it owns required Boundless TCP `15100` or `15200`. MWB/PowerToys on diagnostics-only TCP `15101` is side-by-side evidence, not a Boundless pairing or transport port collision by itself. If you need side-by-side dogfood and a required Boundless port is actually owned by another process, Boundless already supports changing the daemon `network_port`; the nearby pairing listener is derived from that port with an offset of `+100`, so `network_port = 16100` pairs on TCP `16200`. Apply the same alternate port plan to every participating Boundless machine before pairing. Do not reset trust just because a local listener collision is detected.
 
 For installed builds, stop the tray/service, locate the daemon config, edit `network_port`, then restart Boundless:
 
