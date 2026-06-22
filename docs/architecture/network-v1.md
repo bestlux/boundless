@@ -2,6 +2,10 @@
 
 This document defines the canonical transport module boundaries after Slice 1 slimdown.
 
+Related design notes:
+
+- [One-sided reachability pairing design](one-sided-reachability.md) records the BND-NEXT-20 recommendation for asymmetric local-network reachability. It is design-only and does not approve relay/cloud transport, firewall mutation, or runtime behavior changes.
+
 ## Module responsibilities
 
 - `crates/daemon/src/network/session.rs`
