@@ -211,8 +211,10 @@ struct NoopInputBackend;
 #[cfg(not(windows))]
 struct NoopCaptureBackend;
 
+#[cfg(any(test, windows))]
 struct UnsupportedInteractiveInputBackend;
 
+#[cfg(any(test, windows))]
 struct UnsupportedInteractiveCaptureBackend;
 
 #[cfg(windows)]
