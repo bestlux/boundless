@@ -939,6 +939,7 @@ fn peer_health_state(
             "peer_reconnect_requested" | "peers_reconnect_requested" => "reconnecting",
             "transport_trust_error" => "trust_error",
             "transport_protocol_mismatch" => "protocol_mismatch",
+            "transport_reachability_failed" => "reachability_failed",
             "transport_firewall_suspect" => "firewall_suspect",
             "transport_service_issue" => "service_issue",
             _ => "disconnected",
@@ -968,6 +969,9 @@ fn peer_health_reason(
             }
             "transport_trust_error" => "transport reported a trust failure".to_string(),
             "transport_protocol_mismatch" => "transport reported a protocol mismatch".to_string(),
+            "transport_reachability_failed" => {
+                format!("transport reachability failed; {}", event.detail)
+            }
             "transport_firewall_suspect" => {
                 "transport reported a firewall or reachability suspect".to_string()
             }
@@ -992,6 +996,7 @@ fn peer_health_event<'a>(
                     | "peers_reconnect_requested"
                     | "transport_trust_error"
                     | "transport_protocol_mismatch"
+                    | "transport_reachability_failed"
                     | "transport_firewall_suspect"
                     | "transport_service_issue"
             )
@@ -1463,6 +1468,30 @@ mod tests {
         assert!(!peer.trusted_since.is_empty());
         assert!(!peer.trust_fingerprint.is_empty());
         assert_eq!(peer.device_identity, "remote-machine");
+
+        app.state.record_transport_event(crate::state::TransportEventRecord {
+            timestamp: chrono::Utc::now(),
+            direction: "outbound".to_string(),
+            kind: "transport_reachability_failed".to_string(),
+            peer_id: "remote-machine".to_string(),
+            detail: "mdns_discovered=true tcp_transport_reachability=failed attempted=[source=mdns tcp ipv4 port 15100] next_action=verify Private network".to_string(),
+            size_bytes: 0,
+        });
+        let peers = app.list_peers().await.expect("list peers after failure");
+        let peer = peers
+            .iter()
+            .find(|peer| peer.peer_id == "remote-machine")
+            .expect("remote peer after reachability failure");
+        assert_eq!(peer.health_state, "reachability_failed");
+        assert!(
+            peer.health_reason.contains("transport reachability failed"),
+            "reachability failure should be actionable"
+        );
+        assert!(
+            peer.health_reason
+                .contains("next_action=verify Private network"),
+            "safe redacted next action should surface to tray and CLI"
+        );
 
         let restarted =
             AppState::load_or_create_with_paths(config_path, security_root).expect("reload state");
