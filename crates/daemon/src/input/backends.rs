@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(any(test, windows))]
 impl InputBackend for UnsupportedInteractiveInputBackend {
     fn apply(&mut self, _event: &InputEvent) -> Result<()> {
         Err(anyhow::anyhow!(
@@ -8,6 +9,7 @@ impl InputBackend for UnsupportedInteractiveInputBackend {
     }
 }
 
+#[cfg(any(test, windows))]
 impl InputCaptureBackend for UnsupportedInteractiveCaptureBackend {
     fn drain_release_events(&mut self) -> Vec<InputEvent> {
         Vec::new()
