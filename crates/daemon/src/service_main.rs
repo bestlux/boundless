@@ -25,6 +25,7 @@ mod service_entry {
         ffi::OsString,
         fs::{self, OpenOptions},
         io::{self, Write},
+        panic,
         path::PathBuf,
         time::Duration,
     };
@@ -45,8 +46,8 @@ mod service_entry {
     use boundless_daemon::{
         config::ApiTransport,
         host::{
-            HostOverrides, HostRuntimeOptions, prepare_runtime_with_options, shutdown_runtime,
-            start_runtime_tasks,
+            HostOverrides, HostRuntimeOptions, prepare_runtime_with_options,
+            runtime_task_health_json, shutdown_runtime, start_runtime_tasks,
         },
         input::InputRuntimeMode,
         logging, shared_control_plane_app,
@@ -65,6 +66,7 @@ mod service_entry {
     }
 
     fn service_main(arguments: Vec<OsString>) {
+        install_service_panic_hook();
         if let Err(error) = run_service(startup_arguments(arguments)) {
             append_service_startup_diagnostic("service_main_failed", &format!("{error:#}"));
             tracing::error!(%error, "boundless service failed");
@@ -79,7 +81,19 @@ mod service_entry {
         let event_handler = move |control_event| -> ServiceControlHandlerResult {
             match control_event {
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-                ServiceControl::Stop | ServiceControl::Shutdown => {
+                ServiceControl::Stop => {
+                    append_service_startup_diagnostic(
+                        "control_stop_requested",
+                        "SCM stop control received",
+                    );
+                    let _ = shutdown_tx.send(true);
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::Shutdown => {
+                    append_service_startup_diagnostic(
+                        "control_shutdown_requested",
+                        "SCM shutdown control received",
+                    );
                     let _ = shutdown_tx.send(true);
                     ServiceControlHandlerResult::NoError
                 }
@@ -114,6 +128,7 @@ mod service_entry {
                 status_handle.set_service_status(service_status(ServiceState::Running))
             })
             .await;
+            append_service_startup_diagnostic("stop_pending", "service runtime returned");
             status_handle.set_service_status(service_status(ServiceState::StopPending))?;
             result
         });
@@ -130,6 +145,7 @@ mod service_entry {
 
         let stopped_status = service_status(ServiceState::Stopped);
         let _ = status_handle.set_service_status(stopped_status);
+        append_service_startup_diagnostic("stopped", "service stopped cleanly");
 
         Ok(())
     }
@@ -182,6 +198,10 @@ mod service_entry {
             "runtime_tasks_started",
             "background runtime tasks started",
         );
+        append_service_startup_diagnostic(
+            "runtime_tasks_health_started",
+            &runtime_task_health_json(&runtime),
+        );
 
         let result = Server::builder()
             .add_service(control_plane)
@@ -194,11 +214,23 @@ mod service_entry {
             })
             .await
             .context("gRPC named-pipe service failure");
+        match &result {
+            Ok(()) => append_service_startup_diagnostic("serve_exited", "gRPC service exited"),
+            Err(error) => append_service_startup_diagnostic("serve_error", &format!("{error:#}")),
+        }
+        append_service_startup_diagnostic(
+            "runtime_tasks_health_before_shutdown",
+            &runtime_task_health_json(&runtime),
+        );
 
         shutdown_runtime(&runtime).await;
         append_service_startup_diagnostic(
             "runtime_tasks_stopped",
             "background runtime tasks stopped",
+        );
+        append_service_startup_diagnostic(
+            "runtime_tasks_health_stopped",
+            &runtime_task_health_json(&runtime),
         );
 
         result
@@ -275,6 +307,14 @@ mod service_entry {
             std::process::id(),
             detail.replace(['\r', '\n'], " ")
         );
+    }
+
+    fn install_service_panic_hook() {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            append_service_startup_diagnostic("panic", &format!("{info}"));
+            previous(info);
+        }));
     }
 
     fn service_diagnostic_log_dir() -> PathBuf {
