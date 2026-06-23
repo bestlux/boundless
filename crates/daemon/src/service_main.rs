@@ -20,7 +20,14 @@ fn main() {
 
 #[cfg(windows)]
 mod service_entry {
-    use std::{env, ffi::OsString, io, time::Duration};
+    use std::{
+        env,
+        ffi::OsString,
+        fs::{self, OpenOptions},
+        io::{self, Write},
+        path::PathBuf,
+        time::Duration,
+    };
 
     use anyhow::{Context, Result};
     use tokio::sync::watch;
@@ -37,7 +44,9 @@ mod service_entry {
 
     use boundless_daemon::{
         config::ApiTransport,
-        host::{HostOverrides, HostRuntimeOptions, run_with_options},
+        host::{
+            HostOverrides, HostRuntimeOptions, prepare_runtime_with_options, start_runtime_tasks,
+        },
         input::InputRuntimeMode,
         logging, shared_control_plane_app,
     };
@@ -56,12 +65,14 @@ mod service_entry {
 
     fn service_main(arguments: Vec<OsString>) {
         if let Err(error) = run_service(startup_arguments(arguments)) {
+            append_service_startup_diagnostic("service_main_failed", &format!("{error:#}"));
             tracing::error!(%error, "boundless service failed");
         }
     }
 
     fn run_service(arguments: Vec<OsString>) -> windows_service::Result<()> {
         let _logging = logging::init_logging().ok();
+        append_service_startup_diagnostic("starting", "boundless service entrypoint reached");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let event_handler = move |control_event| -> ServiceControlHandlerResult {
@@ -78,8 +89,15 @@ mod service_entry {
         let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
         status_handle.set_service_status(service_status(ServiceState::StartPending))?;
         let allowed_user_sid = match parse_allowed_user_sid(arguments) {
-            Ok(sid) => sid,
+            Ok(sid) => {
+                append_service_startup_diagnostic("allowed_user_sid", &sid);
+                sid
+            }
             Err(error) => {
+                append_service_startup_diagnostic(
+                    "invalid_allowed_user_sid",
+                    &format!("{error:#}"),
+                );
                 let _ = status_handle
                     .set_service_status(service_status_with_exit(ServiceState::Stopped, 1));
                 return Err(windows_service::Error::Winapi(io::Error::new(
@@ -100,6 +118,7 @@ mod service_entry {
         });
 
         if let Err(error) = result {
+            append_service_startup_diagnostic("runtime_error", &format!("{error:#}"));
             tracing::error!(%error, "boundless service runtime stopped with error");
             let _ = status_handle
                 .set_service_status(service_status_with_exit(ServiceState::Stopped, 1));
@@ -119,47 +138,63 @@ mod service_entry {
         allowed_user_sid: String,
         mark_running: impl FnOnce() -> windows_service::Result<()>,
     ) -> Result<()> {
-        run_with_options(
+        let options = HostRuntimeOptions {
+            input_runtime_mode: InputRuntimeMode::ServiceSessionUnsupported,
+        };
+        append_service_startup_diagnostic("prepare_runtime", "loading service control-plane state");
+        let runtime = prepare_runtime_with_options(
             HostOverrides {
                 bind: None,
                 api_transport: Some(ApiTransport::NamedPipe),
                 api_pipe_name: None,
                 network_port: None,
             },
-            HostRuntimeOptions {
-                input_runtime_mode: InputRuntimeMode::ServiceSessionUnsupported,
-            },
-            |runtime| async move {
-                let control_plane = adapter_ipc_grpc::ControlPlaneApi::new(
-                    shared_control_plane_app(runtime.state.clone()),
-                )
-                .into_server();
-
-                let incoming = named_pipe_incoming_for_allowed_user(
-                    &runtime.snapshot.api_pipe_name,
-                    &allowed_user_sid,
-                )
-                .with_context(|| {
-                    format!("initialize named pipe {}", runtime.snapshot.api_pipe_name)
-                })?;
-                mark_running().context("report service running after named-pipe bind")?;
-
-                Server::builder()
-                    .add_service(control_plane)
-                    .serve_with_incoming_shutdown(incoming, async move {
-                        while !*shutdown_rx.borrow() {
-                            if shutdown_rx.changed().await.is_err() {
-                                break;
-                            }
-                        }
-                    })
-                    .await
-                    .context("gRPC named-pipe service failure")?;
-
-                Ok(())
-            },
+            options,
         )
         .await
+        .context("prepare service control-plane runtime")?;
+
+        let control_plane =
+            adapter_ipc_grpc::ControlPlaneApi::new(shared_control_plane_app(runtime.state.clone()))
+                .into_server();
+
+        append_service_startup_diagnostic(
+            "bind_named_pipe",
+            &format!(
+                "pipe={} allowed_user_sid={allowed_user_sid}",
+                runtime.snapshot.api_pipe_name
+            ),
+        );
+        let incoming = named_pipe_incoming_for_allowed_user(
+            &runtime.snapshot.api_pipe_name,
+            &allowed_user_sid,
+        )
+        .with_context(|| format!("initialize named pipe {}", runtime.snapshot.api_pipe_name))?;
+        mark_running().context("report service running after named-pipe bind")?;
+        append_service_startup_diagnostic(
+            "running",
+            "service reported Running after control-pipe bind",
+        );
+
+        start_runtime_tasks(&runtime, options).await;
+        append_service_startup_diagnostic(
+            "runtime_tasks_started",
+            "background runtime tasks started",
+        );
+
+        Server::builder()
+            .add_service(control_plane)
+            .serve_with_incoming_shutdown(incoming, async move {
+                while !*shutdown_rx.borrow() {
+                    if shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .context("gRPC named-pipe service failure")?;
+
+        Ok(())
     }
 
     fn startup_arguments(service_arguments: Vec<OsString>) -> Vec<OsString> {
@@ -214,6 +249,32 @@ mod service_entry {
             wait_hint: Duration::from_secs(10),
             process_id: None,
         }
+    }
+
+    fn append_service_startup_diagnostic(stage: &str, detail: &str) {
+        let log_dir = service_diagnostic_log_dir();
+        if fs::create_dir_all(&log_dir).is_err() {
+            return;
+        }
+        let path = log_dir.join("boundless-service-startup.log");
+        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+            return;
+        };
+        let _ = writeln!(
+            file,
+            "{} stage={} pid={} detail={}",
+            chrono::Utc::now().to_rfc3339(),
+            stage,
+            std::process::id(),
+            detail.replace(['\r', '\n'], " ")
+        );
+    }
+
+    fn service_diagnostic_log_dir() -> PathBuf {
+        let root = env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        root.join("Boundless").join("logs")
     }
 
     #[cfg(test)]
