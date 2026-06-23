@@ -397,6 +397,82 @@ async fn set_layout_rejects_unknown_duplicate_isolated_and_oversized_topologies(
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn local_layout_update_queues_sync_for_connected_peer() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-layout-sync-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+    let (code, _) = state.create_pairing_code(120).await;
+    let peer_id = state
+        .join_peer(
+            code,
+            "127.0.0.1:15100".to_string(),
+            Some("peer".to_string()),
+        )
+        .await
+        .expect("join peer");
+    state
+        .set_peer_connected(&peer_id, true)
+        .await
+        .expect("connect");
+    let _ = state.drain_outgoing(&peer_id).await;
+
+    let queued = state
+        .set_layout_and_queue_sync(format!("{peer_id},self"))
+        .await
+        .expect("set layout");
+    assert_eq!(queued, 1);
+
+    let outgoing = state.drain_outgoing(&peer_id).await;
+    assert!(matches!(
+        outgoing.as_slice(),
+        [OutboundPayload::LayoutMatrix { matrix_spec }]
+            if matrix_spec == &format!("{peer_id},self")
+    ));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn incoming_layout_matrix_is_mirrored_to_local_view_without_rebroadcast() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-layout-mirror-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_path = root.join("config.json");
+    let security_root = root.join("security");
+    let state =
+        AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+    let local_machine_id = state.snapshot().await.machine_id;
+    let (code, _) = state.create_pairing_code(120).await;
+    let peer_id = state
+        .join_peer(
+            code,
+            "127.0.0.1:15100".to_string(),
+            Some("peer".to_string()),
+        )
+        .await
+        .expect("join peer");
+
+    state
+        .apply_remote_layout_matrix(&peer_id, &peer_id, format!("self,{local_machine_id}"))
+        .await
+        .expect("apply remote layout");
+
+    assert_eq!(state.layout().await, format!("{peer_id},self"));
+    assert!(
+        state.drain_outgoing(&peer_id).await.is_empty(),
+        "remote layout application must not echo the layout back to the source peer"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn validate_bind_address_rejects_invalid_input() {
     let err = validate_bind_address("not-an-addr").expect_err("must fail");

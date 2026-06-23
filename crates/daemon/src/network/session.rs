@@ -21,6 +21,7 @@ use super::inbound::{
 };
 use super::inbound_payload::{
     handle_clipboard_image_message, handle_clipboard_text_message, handle_input_frame_message,
+    handle_layout_matrix_message,
 };
 use super::outbound::{
     flush_outgoing_bulk_payloads_with_buffer, flush_outgoing_input_payloads_with_buffer,
@@ -466,6 +467,19 @@ impl SessionRuntime {
                     sequence,
                     timestamp_unix_ms,
                     events,
+                )
+                .await;
+            }
+            WireMessage::LayoutMatrix {
+                machine_id,
+                matrix_spec,
+            } => {
+                handle_layout_matrix_message(
+                    state,
+                    &session.peer_id,
+                    session.remote_peer_id(),
+                    machine_id,
+                    matrix_spec,
                 )
                 .await;
             }

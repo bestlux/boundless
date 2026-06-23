@@ -17,7 +17,9 @@ pub use hook_capture::{
 
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::POINT,
+    Foundation::{CloseHandle, POINT},
+    Security::{GetTokenInformation, TOKEN_QUERY, TokenSessionId},
+    System::Threading::{GetCurrentProcess, OpenProcessToken},
     UI::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
@@ -54,6 +56,40 @@ pub fn cursor_position() -> Result<Option<(i32, i32)>> {
         return Ok(None);
     }
     Ok(Some((point.x, point.y)))
+}
+
+#[cfg(windows)]
+pub fn current_process_session_id() -> Result<u32> {
+    let mut token = std::ptr::null_mut();
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    if opened == 0 {
+        return Err(std::io::Error::last_os_error()).context("OpenProcessToken failed");
+    }
+
+    let mut session_id = 0u32;
+    let mut returned_len = 0u32;
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenSessionId,
+            &mut session_id as *mut u32 as *mut core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            &mut returned_len,
+        )
+    };
+    let close_result = unsafe { CloseHandle(token) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error()).context("GetTokenInformation failed");
+    }
+    if close_result == 0 {
+        return Err(std::io::Error::last_os_error()).context("CloseHandle failed");
+    }
+    Ok(session_id)
+}
+
+#[cfg(windows)]
+pub fn current_process_can_use_interactive_input() -> Result<bool> {
+    Ok(current_process_session_id()? != 0)
 }
 
 #[cfg(windows)]

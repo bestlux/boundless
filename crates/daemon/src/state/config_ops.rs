@@ -1,7 +1,10 @@
 use std::sync::OnceLock;
 
 use super::*;
-use app_services::desktop::{LayoutPeerToken, canonicalize_layout_matrix_spec};
+use app_services::desktop::{
+    CANONICAL_LOCAL_LAYOUT_TOKEN, LayoutPeerToken, canonicalize_layout_matrix_spec,
+    parse_layout_matrix,
+};
 use tokio::sync::Mutex;
 
 static CONFIG_SAVE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -255,6 +258,18 @@ impl AppState {
     }
 
     pub async fn set_layout(&self, matrix: String) -> Result<()> {
+        self.set_layout_canonical(matrix).await?;
+        Ok(())
+    }
+
+    pub async fn set_layout_and_queue_sync(&self, matrix: String) -> Result<usize> {
+        let canonical_matrix = self.set_layout_canonical(matrix).await?;
+        Ok(self
+            .queue_layout_matrix_for_connected_peers(canonical_matrix, None)
+            .await)
+    }
+
+    async fn set_layout_canonical(&self, matrix: String) -> Result<String> {
         self.mutate_config_and_save(|config| {
             let peers = config
                 .peers
@@ -270,13 +285,104 @@ impl AppState {
                 Some(config.device_name.as_str()),
                 &peers,
             )?;
-            config.layout_matrix = canonical_matrix;
-            Ok(((), true))
+            config.layout_matrix = canonical_matrix.clone();
+            Ok((canonical_matrix, true))
         })
         .await?;
         self.invalidate_cached_layout_matrix().await;
         self.notify_input_capture_wake("layout_changed");
+        Ok(self.config.read().await.layout_matrix.clone())
+    }
+
+    pub async fn apply_remote_layout_matrix(
+        &self,
+        source_peer_id: &str,
+        remote_machine_id: &str,
+        matrix: String,
+    ) -> Result<()> {
+        let mirrored = self
+            .mirror_remote_layout_matrix(source_peer_id, remote_machine_id, &matrix)
+            .await?;
+        self.set_layout_canonical(mirrored).await?;
         Ok(())
+    }
+
+    async fn mirror_remote_layout_matrix(
+        &self,
+        source_peer_id: &str,
+        remote_machine_id: &str,
+        matrix: &str,
+    ) -> Result<String> {
+        let config = self.config.read().await;
+        let local_machine_id = config.machine_id.clone();
+        let local_display_name = config.device_name.clone();
+        let peers = config
+            .peers
+            .iter()
+            .map(|peer| LayoutPeerToken {
+                peer_id: peer.peer_id.clone(),
+                display_name: peer.display_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        drop(config);
+
+        let mirrored = parse_layout_matrix(matrix)
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|token| {
+                        let token = token.trim();
+                        if token.is_empty() {
+                            String::new()
+                        } else if token.eq_ignore_ascii_case(CANONICAL_LOCAL_LAYOUT_TOKEN)
+                            || token.eq_ignore_ascii_case(remote_machine_id)
+                        {
+                            source_peer_id.to_string()
+                        } else if token.eq_ignore_ascii_case(&local_machine_id)
+                            || token.eq_ignore_ascii_case(&local_display_name)
+                        {
+                            CANONICAL_LOCAL_LAYOUT_TOKEN.to_string()
+                        } else {
+                            token.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+
+        canonicalize_layout_matrix_spec(
+            &mirrored,
+            &local_machine_id,
+            Some(local_display_name.as_str()),
+            &peers,
+        )
+    }
+
+    pub(crate) async fn queue_layout_matrix_for_connected_peers(
+        &self,
+        matrix_spec: String,
+        except_peer_id: Option<&str>,
+    ) -> usize {
+        let peer_ids = self
+            .connected_peer_ids()
+            .await
+            .into_iter()
+            .filter(|peer_id| except_peer_id != Some(peer_id.as_str()))
+            .collect::<Vec<_>>();
+
+        for peer_id in &peer_ids {
+            self.queue_outgoing_bulk_payload(
+                peer_id,
+                OutboundPayload::LayoutMatrix {
+                    matrix_spec: matrix_spec.clone(),
+                },
+            )
+            .await;
+        }
+
+        peer_ids.len()
     }
 
     pub async fn edge_switch_policy(&self) -> (EasyMouseMode, bool, InputHandoffConfig) {

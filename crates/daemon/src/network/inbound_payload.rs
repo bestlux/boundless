@@ -150,6 +150,57 @@ pub(super) async fn handle_input_frame_message(
     }
 }
 
+pub(super) async fn handle_layout_matrix_message(
+    state: &AppState,
+    authenticated_peer_id: &str,
+    remote_peer_id: Option<&str>,
+    machine_id: String,
+    matrix_spec: String,
+) {
+    if machine_id != authenticated_peer_id {
+        warn!(
+            claimed_machine_id = %machine_id,
+            authenticated_machine_id = %authenticated_peer_id,
+            "dropping layout matrix with mismatched machine_id"
+        );
+        return;
+    }
+
+    let Some(peer_id) = remote_peer_id else {
+        return;
+    };
+
+    match state
+        .apply_remote_layout_matrix(peer_id, &machine_id, matrix_spec.clone())
+        .await
+    {
+        Ok(()) => {
+            state.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: "incoming".to_string(),
+                kind: "layout_matrix".to_string(),
+                peer_id: peer_id.to_string(),
+                detail: "applied=mirrored_trusted_peer".to_string(),
+                size_bytes: matrix_spec.len() as u64,
+            });
+        }
+        Err(error) => {
+            warn!(
+                peer_id = %peer_id,
+                error = ?error,
+                "failed to apply incoming layout matrix"
+            );
+            record_transport_frame_rejected(
+                state,
+                peer_id,
+                "reason=invalid_layout_matrix".to_string(),
+                matrix_spec.len() as u64,
+            )
+            .await;
+        }
+    }
+}
+
 async fn record_transport_frame_rejected(
     state: &AppState,
     peer_id: &str,

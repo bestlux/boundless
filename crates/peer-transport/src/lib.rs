@@ -108,6 +108,9 @@ pub enum OutboundPayload {
         timestamp_unix_ms: i64,
         events: Vec<InputEvent>,
     },
+    LayoutMatrix {
+        matrix_spec: String,
+    },
 }
 
 #[derive(Debug, Default)]
