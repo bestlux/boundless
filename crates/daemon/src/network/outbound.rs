@@ -684,6 +684,26 @@ where
                 .await;
             Ok(SendPayloadOutcome::Sent)
         }
+        OutboundPayload::LayoutMatrix { matrix_spec } => {
+            send_message(
+                writer_ctx.writer,
+                &WireMessage::LayoutMatrix {
+                    machine_id: local_machine_id.to_string(),
+                    matrix_spec: matrix_spec.clone(),
+                },
+                writer_ctx.frame_buffer,
+            )
+            .await?;
+            state.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: "outgoing".to_string(),
+                kind: "layout_matrix".to_string(),
+                peer_id: peer_id.to_string(),
+                detail: "sync=trusted_peer".to_string(),
+                size_bytes: matrix_spec.len() as u64,
+            });
+            Ok(SendPayloadOutcome::Sent)
+        }
     }
 }
 

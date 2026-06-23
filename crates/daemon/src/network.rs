@@ -1247,6 +1247,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flush_sends_layout_matrix_payload() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+
+        state
+            .queue_outgoing_bulk_payload(
+                &peer_id,
+                OutboundPayload::LayoutMatrix {
+                    matrix_spec: "self,peer".to_string(),
+                },
+            )
+            .await;
+
+        let mut writer = CaptureWriter::default();
+        flush_outgoing_payloads(
+            &state,
+            "local-machine",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            &mut writer,
+        )
+        .await
+        .expect("flush layout");
+
+        let frames = decode_written_frames(&writer.bytes);
+        assert!(matches!(
+            frames.as_slice(),
+            [WireMessage::LayoutMatrix {
+                machine_id,
+                matrix_spec
+            }] if machine_id == "local-machine" && matrix_spec == "self,peer"
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn flush_requeues_remaining_payloads_on_mid_flush_failure() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         let large = "x".repeat(16 * 1024);

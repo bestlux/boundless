@@ -753,6 +753,9 @@ impl AppState {
     }
 
     pub async fn active_input_capture_target(&self) -> Option<String> {
+        if self.input_capture_backend_mode().await == "service_session_unsupported" {
+            return None;
+        }
         let target = self.input_capture_target().await?;
         let config = self.config.read().await;
         active_input_capture_target_from_config(&config, &target)

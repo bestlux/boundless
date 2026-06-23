@@ -327,7 +327,11 @@ impl AppState {
         true
     }
 
-    async fn queue_outgoing_bulk_payload(&self, peer_id: &str, payload: OutboundPayload) {
+    pub(crate) async fn queue_outgoing_bulk_payload(
+        &self,
+        peer_id: &str,
+        payload: OutboundPayload,
+    ) {
         {
             let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
             queue_map

@@ -40,9 +40,14 @@ impl AppState {
 
         let (input_locked, input_lock_supported) = input_lock_runtime;
         let (pending_inject_frames, pending_inject_high_water) = pending_inject_stats;
-        let active_input_capture_target_peer_id = input_capture_target_peer_id
-            .as_deref()
-            .and_then(|target| active_input_capture_target_from_config(&config, target));
+        let active_input_capture_target_peer_id =
+            if input_capture_backend_mode == "service_session_unsupported" {
+                None
+            } else {
+                input_capture_target_peer_id
+                    .as_deref()
+                    .and_then(|target| active_input_capture_target_from_config(&config, target))
+            };
 
         ControlPlaneSnapshotBundle {
             config,
@@ -153,6 +158,36 @@ mod tests {
         assert_eq!(
             bundle.active_input_capture_target_peer_id.as_deref(),
             Some(peer_id.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn bundle_clears_active_capture_target_when_service_session_input_is_unsupported() {
+        let (state, peer_id, root) = state_with_target_peer().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect peer");
+        state
+            .set_input_capture_backend_mode("service_session_unsupported")
+            .await;
+
+        let bundle = state.control_plane_snapshot_bundle().await;
+
+        assert_eq!(
+            bundle.input_capture_target_peer_id.as_deref(),
+            Some(peer_id.as_str()),
+            "configured target should remain visible"
+        );
+        assert!(
+            bundle.active_input_capture_target_peer_id.is_none(),
+            "unsupported service-session runtime must not look capture-ready"
+        );
+        assert_eq!(
+            bundle.input_capture_backend_mode,
+            "service_session_unsupported"
         );
 
         let _ = std::fs::remove_dir_all(root);

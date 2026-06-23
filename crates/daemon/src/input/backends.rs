@@ -1,5 +1,43 @@
 use super::*;
 
+#[cfg(any(test, windows))]
+impl InputBackend for UnsupportedInteractiveInputBackend {
+    fn apply(&mut self, _event: &InputEvent) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "interactive input unsupported from Windows service session 0"
+        ))
+    }
+}
+
+#[cfg(any(test, windows))]
+impl InputCaptureBackend for UnsupportedInteractiveCaptureBackend {
+    fn drain_release_events(&mut self) -> Vec<InputEvent> {
+        Vec::new()
+    }
+
+    fn reset(&mut self) {}
+
+    fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
+        Ok(Vec::new())
+    }
+
+    fn drain_control_actions(&mut self) -> Vec<CaptureControlAction> {
+        Vec::new()
+    }
+
+    fn set_lock_active(&mut self, _active: bool) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn lock_supported(&self) -> bool {
+        false
+    }
+
+    fn backend_mode(&self) -> &'static str {
+        "service_session_unsupported"
+    }
+}
+
 #[cfg(not(windows))]
 impl InputBackend for NoopInputBackend {
     fn apply(&mut self, _event: &InputEvent) -> Result<()> {

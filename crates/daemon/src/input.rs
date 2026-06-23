@@ -67,9 +67,9 @@ use platform_windows::input::send_input_records_with_sender;
 #[cfg(windows)]
 use platform_windows::input::{
     CaptureRuntime, HookCaptureEvent, HookControlAction, captured_key_virtual_keys,
-    cursor_position, input_event_kind, input_records_for_event, is_virtual_key_down,
-    mouse_button_from_virtual_key, mouse_button_virtual_keys, send_input_records,
-    virtual_key_for_mouse_button, vk_to_scan_code,
+    current_process_can_use_interactive_input, cursor_position, input_event_kind,
+    input_records_for_event, is_virtual_key_down, mouse_button_from_virtual_key,
+    mouse_button_virtual_keys, send_input_records, virtual_key_for_mouse_button, vk_to_scan_code,
 };
 #[cfg(all(test, not(windows)))]
 use runtime::apply_frame;
@@ -146,6 +146,9 @@ trait InputCaptureBackend: Send {
 fn input_backend() -> Box<dyn InputBackend> {
     #[cfg(windows)]
     {
+        if !windows_interactive_input_supported("input injection") {
+            return Box::new(UnsupportedInteractiveInputBackend);
+        }
         Box::new(WindowsInputBackend)
     }
 
@@ -158,6 +161,9 @@ fn input_backend() -> Box<dyn InputBackend> {
 fn input_capture_backend(state: &AppState) -> Box<dyn InputCaptureBackend> {
     #[cfg(windows)]
     {
+        if !windows_interactive_input_supported("input capture") {
+            return Box::new(UnsupportedInteractiveCaptureBackend);
+        }
         match WindowsHookCaptureBackend::new(state) {
             Ok(backend) => Box::new(backend),
             Err(error) => {
@@ -177,11 +183,39 @@ fn input_capture_backend(state: &AppState) -> Box<dyn InputCaptureBackend> {
     }
 }
 
+#[cfg(windows)]
+fn windows_interactive_input_supported(surface: &str) -> bool {
+    match current_process_can_use_interactive_input() {
+        Ok(true) => true,
+        Ok(false) => {
+            warn!(
+                surface,
+                "Windows service session 0 cannot observe or inject interactive desktop input"
+            );
+            false
+        }
+        Err(error) => {
+            warn!(
+                surface,
+                error = ?error,
+                "failed to verify Windows process session for interactive input"
+            );
+            false
+        }
+    }
+}
+
 #[cfg(not(windows))]
 struct NoopInputBackend;
 
 #[cfg(not(windows))]
 struct NoopCaptureBackend;
+
+#[cfg(any(test, windows))]
+struct UnsupportedInteractiveInputBackend;
+
+#[cfg(any(test, windows))]
+struct UnsupportedInteractiveCaptureBackend;
 
 #[cfg(windows)]
 #[derive(Default)]
@@ -234,6 +268,51 @@ mod tests {
         };
 
         apply_frame(&mut backend, &frame).expect("noop backend should accept events");
+    }
+
+    #[test]
+    fn unsupported_interactive_backend_rejects_injection_with_stable_reason() {
+        let mut backend = UnsupportedInteractiveInputBackend;
+        let frame = PendingInjectInputFrame {
+            peer_id: "peer-a".to_string(),
+            sequence: 1,
+            capture_timestamp_unix_ms: 1,
+            received_timestamp_unix_ms: 2,
+            queued_timestamp_unix_ms: 3,
+            retry_count: 0,
+            next_retry_at: None,
+            events: vec![InputEvent::MouseMove { dx: 1, dy: 0 }],
+        };
+
+        let error = backend
+            .apply_frame(&frame.events)
+            .expect_err("unsupported injection");
+        assert!(
+            error
+                .to_string()
+                .contains("interactive input unsupported from Windows service session 0"),
+            "error should be actionable and stable"
+        );
+    }
+
+    #[test]
+    fn unsupported_interactive_capture_reports_no_lock_or_events() {
+        let mut backend = UnsupportedInteractiveCaptureBackend;
+
+        assert_eq!(backend.backend_mode(), "service_session_unsupported");
+        assert!(!backend.lock_supported());
+        assert!(
+            !backend
+                .set_lock_active(true)
+                .expect("unsupported lock update should be non-fatal"),
+            "unsupported capture must not report an active lock"
+        );
+        assert!(
+            backend
+                .poll_events()
+                .expect("unsupported capture poll")
+                .is_empty()
+        );
     }
 
     struct CountingBackend {

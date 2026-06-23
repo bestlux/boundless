@@ -96,10 +96,13 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
     }
 
     async fn set_layout(&self, command: LayoutSetCommand) -> Result<OperationReply> {
-        self.state.set_layout(command.matrix_spec).await?;
+        let synced_peers = self
+            .state
+            .set_layout_and_queue_sync(command.matrix_spec)
+            .await?;
         Ok(OperationReply {
             ok: true,
-            message: "Layout updated".to_string(),
+            message: format!("Layout updated; synced_peers={synced_peers}"),
         })
     }
 

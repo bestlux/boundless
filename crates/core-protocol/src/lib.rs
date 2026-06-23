@@ -6,7 +6,7 @@ use thiserror::Error;
 pub const PROTOCOL_NAME: &str = "boundless";
 pub const PROTOCOL_CURRENT: ProtocolVersion = ProtocolVersion {
     major: 4,
-    minor: 1,
+    minor: 2,
     patch: 0,
 };
 pub const MAX_WIRE_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -108,6 +108,10 @@ pub enum WireMessage {
         sequence: u64,
         timestamp_unix_ms: i64,
         events: Vec<WireInputEvent>,
+    },
+    LayoutMatrix {
+        machine_id: String,
+        matrix_spec: String,
     },
     Error {
         message: String,
@@ -364,6 +368,18 @@ mod tests {
                     state: WireKeyState::Down,
                 },
             ],
+        };
+
+        let encoded = encode_frame(&original).expect("encode");
+        let decoded = decode_frame(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn wire_message_layout_matrix_round_trip() {
+        let original = WireMessage::LayoutMatrix {
+            machine_id: "machine-a".to_string(),
+            matrix_spec: "peer-b,self".to_string(),
         };
 
         let encoded = encode_frame(&original).expect("encode");
