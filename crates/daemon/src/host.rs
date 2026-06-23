@@ -105,6 +105,10 @@ pub async fn start_runtime_tasks(runtime: &DaemonRuntime, options: HostRuntimeOp
     network::start(state, transport_listener);
 }
 
+pub fn runtime_task_health_json(runtime: &DaemonRuntime) -> String {
+    crate::runtime_tasks::task_health_json(&runtime.state.runtime_task_snapshots()).to_string()
+}
+
 pub async fn shutdown_runtime(runtime: &DaemonRuntime) {
     shutdown_runtime_state(&runtime.state).await;
 }

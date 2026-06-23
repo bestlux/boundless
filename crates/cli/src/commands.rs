@@ -1024,18 +1024,24 @@ fn service_binary_manifest_version(binary_path: &Path) -> (String, &'static str)
 
     let version = std::fs::read_to_string(&manifest_path)
         .ok()
-        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        .and_then(|manifest| {
-            manifest
-                .get("version")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        });
+        .and_then(|contents| parse_package_manifest_version(&contents));
 
     match version {
         Some(version) if !version.trim().is_empty() => (version, "package_manifest"),
         _ => ("unknown".to_string(), "invalid_package_manifest"),
     }
+}
+
+#[cfg(any(windows, test))]
+fn parse_package_manifest_version(contents: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(contents.trim_start_matches('\u{feff}'))
+        .ok()
+        .and_then(|manifest| {
+            manifest
+                .get("version")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
 }
 
 #[cfg(windows)]
@@ -2864,6 +2870,15 @@ mod tests {
         assert_eq!(service_version_parity(Some("v5.0.0"), "5.0.0"), "matched");
         assert_eq!(service_version_parity(Some("4.0.2"), "5.0.0"), "mismatched");
         assert_eq!(service_version_parity(None, "5.0.0"), "unknown");
+    }
+
+    #[test]
+    fn package_manifest_version_accepts_utf8_bom() {
+        assert_eq!(
+            parse_package_manifest_version("\u{feff}{\"version\":\"5.0.4-dogfood-e89e5d0\"}")
+                .as_deref(),
+            Some("5.0.4-dogfood-e89e5d0")
+        );
     }
 
     #[test]
