@@ -15,6 +15,7 @@ use core_transfer::MAX_TRANSFER_BYTES;
 
 const DEFAULT_LAYOUT_MATRIX: &str = "self";
 const RUNTIME_CONFIG_VERSION: &str = "5";
+const MIGRATABLE_PROTOCOL_VERSIONS: &[&str] = &["4.1.0"];
 const DEFAULT_ANTI_IDLE_RECENT_ACTIVITY_WINDOW_SECS: u32 = 300;
 const DEFAULT_ANTI_IDLE_PULSE_INTERVAL_SECS: u32 = 30;
 const DEFAULT_INPUT_CORNER_BLOCK_PX: u32 = 24;
@@ -414,12 +415,14 @@ fn migrate_config_value(path: &Path, value: &mut serde_json::Value) -> Result<()
 
     match config_version {
         RUNTIME_CONFIG_VERSION => {
+            let mut changed = false;
             if !object.contains_key("anti_idle") {
                 object.insert(
                     "anti_idle".to_string(),
                     serde_json::to_value(AntiIdleConfig::default())
                         .context("serialize anti_idle default")?,
                 );
+                changed = true;
             }
             if !object.contains_key("file_transfer") {
                 object.insert(
@@ -427,6 +430,7 @@ fn migrate_config_value(path: &Path, value: &mut serde_json::Value) -> Result<()
                     serde_json::to_value(FileTransferConfig::default())
                         .context("serialize file_transfer default")?,
                 );
+                changed = true;
             }
             if !object.contains_key("input_handoff") {
                 object.insert(
@@ -434,6 +438,25 @@ fn migrate_config_value(path: &Path, value: &mut serde_json::Value) -> Result<()
                     serde_json::to_value(InputHandoffConfig::default())
                         .context("serialize input_handoff default")?,
                 );
+                changed = true;
+            }
+            if let Some(protocol_version) = object
+                .get("protocol_version")
+                .and_then(|entry| entry.as_str())
+                && protocol_version != PROTOCOL_CURRENT.to_string()
+                && MIGRATABLE_PROTOCOL_VERSIONS.contains(&protocol_version)
+            {
+                object.insert(
+                    "protocol_version".to_string(),
+                    serde_json::Value::String(PROTOCOL_CURRENT.to_string()),
+                );
+                changed = true;
+            }
+            if changed {
+                let migrated: RuntimeConfig =
+                    serde_json::from_value(serde_json::Value::Object(object.clone()))
+                        .with_context(|| format!("parse migrated {}", path.display()))?;
+                save_config_at(path, &migrated)?;
             }
             Ok(())
         }
@@ -615,6 +638,31 @@ mod tests {
             error.to_string().contains("regenerate config"),
             "unexpected error: {error:#}"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_or_create_config_migrates_previous_local_protocol_version() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-config-protocol-migrate-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("config.json");
+        std::fs::create_dir_all(&root).expect("create temp root");
+
+        let seed = RuntimeConfig {
+            protocol_version: "4.1.0".to_string(),
+            ..RuntimeConfig::default()
+        };
+        save_config_at(&path, &seed).expect("seed stale local protocol config");
+
+        let config = load_or_create_config_at(&path).expect("migrate local protocol");
+        assert_eq!(config.protocol_version, PROTOCOL_CURRENT.to_string());
+
+        let saved = std::fs::read_to_string(&path).expect("read migrated config");
+        assert!(saved.contains(&format!(r#""protocol_version": "{}""#, PROTOCOL_CURRENT)));
+        assert!(!saved.contains(r#""protocol_version": "4.1.0""#));
 
         let _ = std::fs::remove_dir_all(root);
     }

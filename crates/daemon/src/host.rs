@@ -187,6 +187,7 @@ async fn apply_overrides(state: &AppState, overrides: HostOverrides) -> Result<(
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use crate::config::{RuntimeConfig, save_config_at};
 
     #[tokio::test]
     async fn service_mode_named_pipe_startup_preserves_diagnostic_input_state() {
@@ -246,6 +247,55 @@ mod tests {
         assert!(bundle.active_input_capture_target_peer_id.is_none());
 
         runtime.state.shutdown_runtime_tasks().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn service_mode_runtime_prep_migrates_stale_local_protocol_config() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-service-stale-config-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        std::fs::create_dir_all(&root).expect("create temp root");
+        save_config_at(
+            &config_path,
+            &RuntimeConfig {
+                protocol_version: "4.1.0".to_string(),
+                ..RuntimeConfig::default()
+            },
+        )
+        .expect("seed stale service config");
+
+        let state = AppState::load_or_create_with_paths(config_path.clone(), security_root)
+            .expect("load state should migrate stale local protocol");
+        let runtime = prepare_loaded_state_with_options(
+            state,
+            HostOverrides {
+                bind: None,
+                api_transport: Some(ApiTransport::NamedPipe),
+                api_pipe_name: Some(format!("boundlessd-api-test-{}", uuid::Uuid::new_v4())),
+                network_port: Some(0),
+            },
+            HostRuntimeOptions {
+                input_runtime_mode: input::InputRuntimeMode::ServiceSessionUnsupported,
+            },
+        )
+        .await
+        .expect("prepare service runtime with migrated config");
+
+        assert_eq!(
+            runtime.snapshot.protocol_version,
+            core_protocol::PROTOCOL_CURRENT.to_string()
+        );
+        assert_eq!(runtime.effective_api_transport, ApiTransport::NamedPipe);
+        let saved = std::fs::read_to_string(&config_path).expect("read migrated config");
+        assert!(saved.contains(&format!(
+            r#""protocol_version": "{}""#,
+            core_protocol::PROTOCOL_CURRENT
+        )));
+
         let _ = std::fs::remove_dir_all(root);
     }
 }
