@@ -152,11 +152,10 @@ async fn apply_overrides(state: &AppState, overrides: HostOverrides) -> Result<(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
     #[tokio::test]
     async fn service_mode_named_pipe_startup_preserves_diagnostic_input_state() {
         use platform_windows::runtime::{
