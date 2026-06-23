@@ -105,6 +105,10 @@ pub async fn start_runtime_tasks(runtime: &DaemonRuntime, options: HostRuntimeOp
     network::start(state, transport_listener);
 }
 
+pub async fn shutdown_runtime(runtime: &DaemonRuntime) {
+    shutdown_runtime_state(&runtime.state).await;
+}
+
 async fn run_prepared_runtime_with_options<F, Fut>(
     runtime: DaemonRuntime,
     options: HostRuntimeOptions,
@@ -124,6 +128,11 @@ where
     })
     .await;
 
+    shutdown_runtime_state(&runtime_state).await;
+    result
+}
+
+async fn shutdown_runtime_state(runtime_state: &AppState) {
     runtime_state.begin_transport_session_shutdown();
     runtime_state.shutdown_runtime_tasks().await;
     let aborted_transport_sessions = runtime_state
@@ -135,7 +144,6 @@ where
             "aborted transport sessions during daemon shutdown"
         );
     }
-    result
 }
 
 pub async fn shutdown_signal() {

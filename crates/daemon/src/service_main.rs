@@ -45,7 +45,8 @@ mod service_entry {
     use boundless_daemon::{
         config::ApiTransport,
         host::{
-            HostOverrides, HostRuntimeOptions, prepare_runtime_with_options, start_runtime_tasks,
+            HostOverrides, HostRuntimeOptions, prepare_runtime_with_options, shutdown_runtime,
+            start_runtime_tasks,
         },
         input::InputRuntimeMode,
         logging, shared_control_plane_app,
@@ -182,7 +183,7 @@ mod service_entry {
             "background runtime tasks started",
         );
 
-        Server::builder()
+        let result = Server::builder()
             .add_service(control_plane)
             .serve_with_incoming_shutdown(incoming, async move {
                 while !*shutdown_rx.borrow() {
@@ -192,9 +193,15 @@ mod service_entry {
                 }
             })
             .await
-            .context("gRPC named-pipe service failure")?;
+            .context("gRPC named-pipe service failure");
 
-        Ok(())
+        shutdown_runtime(&runtime).await;
+        append_service_startup_diagnostic(
+            "runtime_tasks_stopped",
+            "background runtime tasks stopped",
+        );
+
+        result
     }
 
     fn startup_arguments(service_arguments: Vec<OsString>) -> Vec<OsString> {
