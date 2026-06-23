@@ -14,6 +14,11 @@ pub struct HostOverrides {
     pub network_port: Option<u16>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HostRuntimeOptions {
+    pub input_runtime_mode: input::InputRuntimeMode,
+}
+
 #[derive(Clone)]
 pub struct DaemonRuntime {
     pub state: AppState,
@@ -26,8 +31,34 @@ where
     F: FnOnce(DaemonRuntime) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
+    run_with_options(overrides, HostRuntimeOptions::default(), serve).await
+}
+
+pub async fn run_with_options<F, Fut>(
+    overrides: HostOverrides,
+    options: HostRuntimeOptions,
+    serve: F,
+) -> Result<()>
+where
+    F: FnOnce(DaemonRuntime) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let state = AppState::load_or_create().context("load app state")?;
+    run_loaded_state_with_options(state, overrides, options, serve).await
+}
+
+async fn run_loaded_state_with_options<F, Fut>(
+    state: AppState,
+    overrides: HostOverrides,
+    options: HostRuntimeOptions,
+    serve: F,
+) -> Result<()>
+where
+    F: FnOnce(DaemonRuntime) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     apply_overrides(&state, overrides).await?;
+    input::apply_startup_mode(&state, options.input_runtime_mode).await;
     let _ = state.reconcile_anti_idle_runtime().await;
 
     let transport_listener = network::prepare_listener(&state).await;
@@ -35,7 +66,7 @@ where
 
     clipboard::start(state.clone());
     discovery::start(state.clone());
-    input::start(state.clone());
+    input::start(state.clone(), options.input_runtime_mode);
     anti_idle::start(state.clone());
     hotkeys::start(state.clone());
     pairing_wire::start(state.clone());
@@ -119,4 +150,65 @@ async fn apply_overrides(state: &AppState, overrides: HostOverrides) -> Result<(
     }
 
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn service_mode_named_pipe_startup_preserves_diagnostic_input_state() {
+        use platform_windows::runtime::{
+            current_user_sid_string, named_pipe_incoming_for_allowed_user,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "boundless-service-startup-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+        let pipe_name = format!("boundlessd-api-test-{}", uuid::Uuid::new_v4());
+        let allowed_user_sid = current_user_sid_string().expect("current user sid");
+
+        let result = run_loaded_state_with_options(
+            state,
+            HostOverrides {
+                bind: None,
+                api_transport: Some(ApiTransport::NamedPipe),
+                api_pipe_name: Some(pipe_name.clone()),
+                network_port: Some(0),
+            },
+            HostRuntimeOptions {
+                input_runtime_mode: input::InputRuntimeMode::ServiceSessionUnsupported,
+            },
+            |runtime| async move {
+                assert_eq!(runtime.effective_api_transport, ApiTransport::NamedPipe);
+                assert_eq!(runtime.snapshot.api_pipe_name, pipe_name);
+
+                let _incoming = named_pipe_incoming_for_allowed_user(
+                    &runtime.snapshot.api_pipe_name,
+                    &allowed_user_sid,
+                )
+                .expect("secure named-pipe bind should succeed");
+
+                let bundle = runtime.state.control_plane_snapshot_bundle().await;
+                assert_eq!(
+                    bundle.input_capture_backend_mode,
+                    "service_session_unsupported"
+                );
+                assert!(!bundle.input_locked);
+                assert!(!bundle.input_lock_supported);
+                assert!(bundle.active_input_capture_target_peer_id.is_none());
+
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

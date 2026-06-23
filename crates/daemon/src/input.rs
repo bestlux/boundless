@@ -99,7 +99,29 @@ struct VirtualScreenBounds {
     bottom: i32,
 }
 
-pub fn start(state: AppState) {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputRuntimeMode {
+    #[default]
+    Auto,
+    ServiceSessionUnsupported,
+}
+
+impl InputRuntimeMode {
+    pub fn is_service_session_unsupported(self) -> bool {
+        matches!(self, Self::ServiceSessionUnsupported)
+    }
+}
+
+pub async fn apply_startup_mode(state: &AppState, mode: InputRuntimeMode) {
+    if mode.is_service_session_unsupported() {
+        state.set_input_lock_runtime(false, false).await;
+        state
+            .set_input_capture_backend_mode("service_session_unsupported")
+            .await;
+    }
+}
+
+pub fn start(state: AppState, mode: InputRuntimeMode) {
     let task_state = state.clone();
     state.spawn_runtime_task(
         RuntimeTaskSpec::new(
@@ -108,7 +130,7 @@ pub fn start(state: AppState) {
             RuntimeTaskShutdown::AbortOnDaemonShutdown,
         ),
         async move {
-            if let Err(error) = run(task_state).await {
+            if let Err(error) = run(task_state, mode).await {
                 warn!(error = ?error, "input runtime stopped");
             }
         },
@@ -143,11 +165,15 @@ trait InputCaptureBackend: Send {
     }
 }
 
-fn input_backend() -> Box<dyn InputBackend> {
+fn input_backend(mode: InputRuntimeMode) -> Box<dyn InputBackend> {
+    if mode.is_service_session_unsupported() {
+        return service_session_unsupported_input_backend();
+    }
+
     #[cfg(windows)]
     {
         if !windows_interactive_input_supported("input injection") {
-            return Box::new(UnsupportedInteractiveInputBackend);
+            return service_session_unsupported_input_backend();
         }
         Box::new(WindowsInputBackend)
     }
@@ -158,11 +184,15 @@ fn input_backend() -> Box<dyn InputBackend> {
     }
 }
 
-fn input_capture_backend(state: &AppState) -> Box<dyn InputCaptureBackend> {
+fn input_capture_backend(state: &AppState, mode: InputRuntimeMode) -> Box<dyn InputCaptureBackend> {
+    if mode.is_service_session_unsupported() {
+        return service_session_unsupported_capture_backend();
+    }
+
     #[cfg(windows)]
     {
         if !windows_interactive_input_supported("input capture") {
-            return Box::new(UnsupportedInteractiveCaptureBackend);
+            return service_session_unsupported_capture_backend();
         }
         match WindowsHookCaptureBackend::new(state) {
             Ok(backend) => Box::new(backend),
@@ -181,6 +211,26 @@ fn input_capture_backend(state: &AppState) -> Box<dyn InputCaptureBackend> {
         let _ = state;
         Box::new(NoopCaptureBackend)
     }
+}
+
+#[cfg(any(test, windows))]
+fn service_session_unsupported_input_backend() -> Box<dyn InputBackend> {
+    Box::new(UnsupportedInteractiveInputBackend)
+}
+
+#[cfg(all(not(test), not(windows)))]
+fn service_session_unsupported_input_backend() -> Box<dyn InputBackend> {
+    Box::new(NoopInputBackend)
+}
+
+#[cfg(any(test, windows))]
+fn service_session_unsupported_capture_backend() -> Box<dyn InputCaptureBackend> {
+    Box::new(UnsupportedInteractiveCaptureBackend)
+}
+
+#[cfg(all(not(test), not(windows)))]
+fn service_session_unsupported_capture_backend() -> Box<dyn InputCaptureBackend> {
+    Box::new(NoopCaptureBackend)
 }
 
 #[cfg(windows)]

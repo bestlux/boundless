@@ -37,7 +37,8 @@ mod service_entry {
 
     use boundless_daemon::{
         config::ApiTransport,
-        host::{HostOverrides, run_with},
+        host::{HostOverrides, HostRuntimeOptions, run_with_options},
+        input::InputRuntimeMode,
         logging, shared_control_plane_app,
     };
     use platform_windows::runtime::{
@@ -118,12 +119,15 @@ mod service_entry {
         allowed_user_sid: String,
         mark_running: impl FnOnce() -> windows_service::Result<()>,
     ) -> Result<()> {
-        run_with(
+        run_with_options(
             HostOverrides {
                 bind: None,
                 api_transport: Some(ApiTransport::NamedPipe),
                 api_pipe_name: None,
                 network_port: None,
+            },
+            HostRuntimeOptions {
+                input_runtime_mode: InputRuntimeMode::ServiceSessionUnsupported,
             },
             |runtime| async move {
                 let control_plane = adapter_ipc_grpc::ControlPlaneApi::new(
