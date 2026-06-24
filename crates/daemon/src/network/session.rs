@@ -594,9 +594,7 @@ pub(super) async fn connect_and_run_outbound(
     peer_id: &str,
     address: &str,
 ) -> Result<()> {
-    let socket = TcpStream::connect(address)
-        .await
-        .with_context(|| format!("tcp connect {address}"))?;
+    let socket = tcp_connect_with_timeout(address).await?;
     configure_low_latency_socket(&socket).context("configure outbound low-latency socket")?;
 
     let connector = build_tls_connector(&state).await?;
@@ -614,6 +612,90 @@ pub(super) async fn connect_and_run_outbound(
         None,
     )
     .await
+}
+
+async fn tcp_connect_with_timeout(address: &str) -> Result<TcpStream> {
+    let timeout = outbound_tcp_connect_timeout();
+    time::timeout(timeout, tcp_connect_future(address))
+        .await
+        .with_context(|| format!("tcp connect timed out after {}ms", timeout.as_millis()))?
+        .with_context(|| format!("tcp connect {address}"))
+}
+
+fn outbound_tcp_connect_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let override_ms =
+            TEST_OUTBOUND_TCP_CONNECT_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if override_ms > 0 {
+            return std::time::Duration::from_millis(override_ms);
+        }
+    }
+
+    OUTBOUND_TCP_CONNECT_TIMEOUT
+}
+
+fn tcp_connect_future(
+    address: &str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<TcpStream>> + Send>> {
+    #[cfg(test)]
+    {
+        if let Some(hook) = TEST_TCP_CONNECT_HOOK
+            .get_or_init(Default::default)
+            .lock()
+            .expect("test tcp connect hook mutex poisoned")
+            .clone()
+        {
+            return hook(address.to_string());
+        }
+    }
+
+    let address = address.to_string();
+    Box::pin(async move { TcpStream::connect(address).await })
+}
+
+#[cfg(test)]
+type TestTcpConnectFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<TcpStream>> + Send>>;
+
+#[cfg(test)]
+type TestTcpConnectHook =
+    std::sync::Arc<dyn Fn(String) -> TestTcpConnectFuture + Send + Sync + 'static>;
+
+#[cfg(test)]
+static TEST_TCP_CONNECT_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<TestTcpConnectHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_OUTBOUND_TCP_CONNECT_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) struct TestTcpConnectHookGuard;
+
+#[cfg(test)]
+impl Drop for TestTcpConnectHookGuard {
+    fn drop(&mut self) {
+        *TEST_TCP_CONNECT_HOOK
+            .get_or_init(Default::default)
+            .lock()
+            .expect("test tcp connect hook mutex poisoned") = None;
+        TEST_OUTBOUND_TCP_CONNECT_TIMEOUT_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_tcp_connect_hook(
+    timeout: std::time::Duration,
+    hook: impl Fn(String) -> TestTcpConnectFuture + Send + Sync + 'static,
+) -> TestTcpConnectHookGuard {
+    let timeout_ms = timeout.as_millis().try_into().unwrap_or(u64::MAX).max(1);
+    TEST_OUTBOUND_TCP_CONNECT_TIMEOUT_MS.store(timeout_ms, std::sync::atomic::Ordering::SeqCst);
+    *TEST_TCP_CONNECT_HOOK
+        .get_or_init(Default::default)
+        .lock()
+        .expect("test tcp connect hook mutex poisoned") = Some(std::sync::Arc::new(hook));
+    TestTcpConnectHookGuard
 }
 
 pub(super) async fn handle_incoming_connection(

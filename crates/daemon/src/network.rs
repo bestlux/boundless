@@ -74,6 +74,7 @@ use tls::{
 };
 
 const SUPERVISOR_TICK: Duration = Duration::from_secs(1);
+const OUTBOUND_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_BACKOFF_SECONDS: u64 = 30;
 const MAX_WIRE_FRAME_BYTES: usize = MAX_WIRE_PAYLOAD_BYTES;
 const LISTEN_BACKLOG: i32 = 1024;

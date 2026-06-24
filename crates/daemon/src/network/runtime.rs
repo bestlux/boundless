@@ -438,4 +438,88 @@ mod tests {
         assert_eq!(transport_error_summary(Some(&error)), "refused");
         assert!(!transport_error_summary(Some(&error)).contains("10.0.0.9"));
     }
+
+    #[tokio::test]
+    async fn peer_worker_bounds_stalled_candidate_and_records_reachability_failure() {
+        let stalled_endpoint = "127.0.0.41:15100";
+        let fallback_endpoint = "127.0.0.42:15100";
+        let attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let hook_attempts = attempts.clone();
+        let _hook = super::session::install_test_tcp_connect_hook(
+            Duration::from_millis(25),
+            move |address| {
+                hook_attempts
+                    .lock()
+                    .expect("attempts mutex poisoned")
+                    .push(address.clone());
+                Box::pin(async move {
+                    if address == stalled_endpoint {
+                        std::future::pending::<std::io::Result<tokio::net::TcpStream>>().await
+                    } else if address == fallback_endpoint {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "fallback candidate refused",
+                        ))
+                    } else {
+                        tokio::net::TcpStream::connect(address).await
+                    }
+                })
+            },
+        );
+        let root = std::env::temp_dir().join(format!(
+            "boundless-peer-worker-timeout-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                fallback_endpoint.to_string(),
+                Some("remote".to_string()),
+            )
+            .await
+            .expect("join peer");
+        state
+            .set_discovered_endpoint(
+                &peer_id,
+                "remote",
+                stalled_endpoint.parse().expect("stalled endpoint"),
+            )
+            .await;
+
+        let worker = tokio::spawn(peer_worker(state.clone(), peer_id.clone()));
+        let event = time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(event) = state.transport_events().await.into_iter().find(|event| {
+                    event.kind == "transport_reachability_failed" && event.peer_id == peer_id
+                }) {
+                    return event;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bounded candidate failure should emit reachability event");
+        worker.abort();
+        let _ = worker.await;
+
+        let attempts = attempts.lock().expect("attempts mutex poisoned");
+        assert!(
+            attempts.starts_with(&[stalled_endpoint.to_string(), fallback_endpoint.to_string()]),
+            "candidate loop should continue past the stalled first candidate before retrying; attempts={attempts:?}"
+        );
+        assert!(event.detail.contains("tcp_transport_reachability=failed"));
+        assert!(event.detail.contains("source=mdns tcp ipv4 port 15100"));
+        assert!(
+            event
+                .detail
+                .contains("source=configured-peer tcp ipv4 port 15100")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
