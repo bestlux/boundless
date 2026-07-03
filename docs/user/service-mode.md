@@ -19,6 +19,26 @@ machine-wide MSI is the primary service installation path.
 - The service does not self-update, and tray-owned update application is unsupported/deferred.
 - Elevated-app and lock-screen input control still need Windows runtime evidence before they are release-grade claims in v5.
 
+## User-Session Input Broker
+
+The LocalSystem service cannot observe or inject interactive desktop input from
+session 0, so mouse/keyboard sharing in service mode is brokered by the tray:
+
+- While no broker is attached, the service truthfully reports
+  `service_session_unsupported` and injects nothing.
+- When the tray runs on the allowed user's normal unlocked desktop and detects a
+  service-mode daemon, it attaches as the input broker over the same
+  ACL-restricted control pipe. Input status then reports
+  `user_session_broker` in the tray Settings tab and `boundlessctl` snapshots.
+- The service remains the trust, routing, and network authority. The broker only
+  captures local input in the user session and injects authenticated incoming
+  frames there; it fails closed for non-interactive sessions and stale/replaced
+  broker tokens, and the service reverts to `service_session_unsupported`
+  within a few seconds if the broker goes silent.
+- Scope is the normal unlocked desktop of the selected allowed user only. Lock
+  screen, secure desktop, UAC prompts, elevated applications, and other users'
+  sessions are not captured or controlled.
+
 ## Commands
 
 Install from the intended desktop user's normal, non-elevated PowerShell session:

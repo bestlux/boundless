@@ -166,6 +166,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "core-input",
  "dirs",
  "serde",
  "serde_json",
@@ -503,10 +504,12 @@ dependencies = [
  "app-services",
  "clap",
  "control-plane-client",
+ "core-input",
  "eframe",
  "egui",
  "image",
  "ipc-api",
+ "platform-windows",
  "raw-window-handle",
  "serde",
  "serde_json",
@@ -2176,6 +2179,7 @@ dependencies = [
 name = "ipc-api"
 version = "5.0.0"
 dependencies = [
+ "core-input",
  "prost",
  "protoc-bin-vendored",
  "tonic",

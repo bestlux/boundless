@@ -18,6 +18,8 @@ use ipc_api::boundless::v1::{
     DiagnosticsDumpReply, DiagnosticsDumpRequest, DiscoveredPeerInfo, Empty, FeatureListReply,
     FeatureSetRequest, FileTransferActionRequest, FileTransferConfigReply, FileTransferInfo,
     FileTransferSetRequest, HotkeySetRequest, HotkeyTriggerRequest, ImportTrustBundleRequest,
+    InputBrokerAttachReply, InputBrokerAttachRequest, InputBrokerDetachRequest,
+    InputBrokerExchangeReply, InputBrokerExchangeRequest, InputBrokerInjectFrame,
     InputCaptureTargetReply, InputCaptureTargetRequest, InputHandoffConfigReply,
     InputHandoffSetRequest, InputOwnerReply, InputOwnerRequest, InputRuntimeStatusReply,
     LayoutReply, LayoutSetRequest, NearbyJoinStartRequest, NearbyJoinStatusReply,
@@ -746,6 +748,92 @@ impl ControlPlaneService for ControlPlaneApi {
         Ok(Response::new(InputCaptureTargetReply {
             ok: reply.ok,
             peer_id: reply.peer_id,
+            message: reply.message,
+        }))
+    }
+
+    async fn attach_input_broker(
+        &self,
+        request: Request<InputBrokerAttachRequest>,
+    ) -> Result<Response<InputBrokerAttachReply>, Status> {
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .attach_input_broker(app_commands::InputBrokerAttachCommand {
+                process_session_id: request.process_session_id,
+                broker_version: request.broker_version,
+                lock_supported: request.lock_supported,
+            })
+            .await
+            .map_err(|error| Status::internal(format!("attach input broker: {error:#}")))?;
+        Ok(Response::new(InputBrokerAttachReply {
+            accepted: reply.accepted,
+            broker_token: reply.broker_token,
+            message: reply.message,
+        }))
+    }
+
+    async fn exchange_input_broker(
+        &self,
+        request: Request<InputBrokerExchangeRequest>,
+    ) -> Result<Response<InputBrokerExchangeReply>, Status> {
+        let request = request.into_inner();
+        let (captured_events, undecodable_events) =
+            ipc_api::broker_events::input_events_from_broker_events(&request.captured_events);
+        let reply = self
+            .app
+            .exchange_input_broker(app_commands::InputBrokerExchangeCommand {
+                broker_token: request.broker_token,
+                captured_events,
+                cursor: request
+                    .cursor_valid
+                    .then_some((request.cursor_x, request.cursor_y)),
+                virtual_bounds: request.bounds_valid.then_some((
+                    request.bounds_left,
+                    request.bounds_top,
+                    request.bounds_right,
+                    request.bounds_bottom,
+                )),
+                escape_unlock_count: request.escape_unlock_count,
+                lock_active: request.lock_active,
+                dropped_event_count: request
+                    .dropped_event_count
+                    .saturating_add(undecodable_events as u64),
+                injected_frame_count: request.injected_frame_count,
+                inject_failure_count: request.inject_failure_count,
+            })
+            .await
+            .map_err(|error| Status::internal(format!("exchange input broker: {error:#}")))?;
+        Ok(Response::new(InputBrokerExchangeReply {
+            accepted: reply.accepted,
+            message: reply.message,
+            inject_frames: reply
+                .inject_frames
+                .into_iter()
+                .map(|frame| InputBrokerInjectFrame {
+                    source_peer_id: frame.source_peer_id,
+                    sequence: frame.sequence,
+                    events: ipc_api::broker_events::broker_events_from_input_events(&frame.events),
+                })
+                .collect(),
+            lock_should_be_active: reply.lock_should_be_active,
+            capture_active: reply.capture_active,
+        }))
+    }
+
+    async fn detach_input_broker(
+        &self,
+        request: Request<InputBrokerDetachRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let reply = self
+            .app
+            .detach_input_broker(app_commands::InputBrokerDetachCommand {
+                broker_token: request.into_inner().broker_token,
+            })
+            .await
+            .map_err(|error| Status::internal(format!("detach input broker: {error:#}")))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
             message: reply.message,
         }))
     }

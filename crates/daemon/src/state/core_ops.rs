@@ -54,6 +54,7 @@ impl AppState {
             transport: Arc::new(TransportState::default()),
             discovery: Arc::new(DiscoveryState::default()),
             input: Arc::new(InputState::new(input_enabled)),
+            input_broker: Arc::new(InputBrokerRelay::default()),
             anti_idle: Arc::new(AntiIdleState::default()),
             outbound_file_transfers: Arc::new(RwLock::new(HashMap::new())),
             file_transfer_records: Arc::new(RwLock::new(VecDeque::new())),

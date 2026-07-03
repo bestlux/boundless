@@ -651,6 +651,26 @@ impl DashboardApp {
                     .size(12.0),
                 );
             }
+            if runtime.capture_backend_mode == "service_session_unsupported" {
+                ui.label(
+                    egui::RichText::new(
+                        "Service session cannot capture or inject desktop input; \
+                         waiting for the tray user-session input broker to attach.",
+                    )
+                    .weak()
+                    .italics(),
+                );
+            } else if runtime.capture_backend_mode == "user_session_broker" {
+                ui.label(
+                    egui::RichText::new(
+                        "Input runs through the tray user-session broker: normal unlocked \
+                         desktop only. Lock screen, UAC prompts, and elevated apps are not \
+                         controlled.",
+                    )
+                    .weak()
+                    .italics(),
+                );
+            }
             if !runtime.lock_supported {
                 ui.label(
                     egui::RichText::new("Input locking is unavailable on this platform")

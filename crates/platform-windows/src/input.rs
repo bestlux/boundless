@@ -7,6 +7,8 @@ use core_input::{KeyState, MouseButton};
 
 #[cfg(windows)]
 mod hook_capture;
+#[cfg(windows)]
+mod hook_pump;
 
 #[cfg(windows)]
 pub use hook_capture::{
@@ -14,6 +16,8 @@ pub use hook_capture::{
     mouse_button_from_virtual_key, mouse_button_virtual_keys, raw_mouse_relative_delta,
     virtual_key_for_mouse_button,
 };
+#[cfg(windows)]
+pub use hook_pump::HookInputPump;
 
 #[cfg(windows)]
 use windows_sys::Win32::{
@@ -29,7 +33,10 @@ use windows_sys::Win32::{
             MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
             MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput,
         },
-        WindowsAndMessaging::GetCursorPos,
+        WindowsAndMessaging::{
+            GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+        },
     },
 };
 
@@ -56,6 +63,27 @@ pub fn cursor_position() -> Result<Option<(i32, i32)>> {
         return Ok(None);
     }
     Ok(Some((point.x, point.y)))
+}
+
+/// Inclusive virtual-screen bounds `(left, top, right, bottom)` for the
+/// calling process's window station, or `None` when metrics are unavailable
+/// (for example from a non-interactive session).
+#[cfg(windows)]
+pub fn virtual_screen_bounds() -> Option<(i32, i32, i32, i32)> {
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    Some((
+        left,
+        top,
+        left.saturating_add(width.saturating_sub(1)),
+        top.saturating_add(height.saturating_sub(1)),
+    ))
 }
 
 #[cfg(windows)]

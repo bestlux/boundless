@@ -394,6 +394,93 @@ message NearbyJoinStatusReply {
   string attempt_id = 6;
 }
 
+// Compact input event encoding for the local user-session input broker
+// exchange. This rides the local control-plane pipe only; peer-to-peer input
+// frames keep their existing transport encoding.
+message BrokerInputEvent {
+  oneof event {
+    BrokerMouseMove mouse_move = 1;
+    BrokerMouseMoveAbsolute mouse_move_absolute = 2;
+    BrokerMouseButton mouse_button = 3;
+    BrokerMouseWheel mouse_wheel = 4;
+    BrokerKey key = 5;
+  }
+}
+
+message BrokerMouseMove {
+  int32 dx = 1;
+  int32 dy = 2;
+}
+
+message BrokerMouseMoveAbsolute {
+  uint32 x_norm = 1;
+  uint32 y_norm = 2;
+}
+
+message BrokerMouseButton {
+  // 0=left 1=right 2=middle 3=x1 4=x2
+  uint32 button = 1;
+  bool down = 2;
+}
+
+message BrokerMouseWheel {
+  int32 delta_x = 1;
+  int32 delta_y = 2;
+}
+
+message BrokerKey {
+  uint32 scan_code = 1;
+  bool down = 2;
+}
+
+message InputBrokerAttachRequest {
+  uint32 process_session_id = 1;
+  string broker_version = 2;
+  bool lock_supported = 3;
+}
+
+message InputBrokerAttachReply {
+  bool accepted = 1;
+  string broker_token = 2;
+  string message = 3;
+}
+
+message InputBrokerExchangeRequest {
+  string broker_token = 1;
+  repeated BrokerInputEvent captured_events = 2;
+  bool cursor_valid = 3;
+  int32 cursor_x = 4;
+  int32 cursor_y = 5;
+  bool bounds_valid = 6;
+  int32 bounds_left = 7;
+  int32 bounds_top = 8;
+  int32 bounds_right = 9;
+  int32 bounds_bottom = 10;
+  uint32 escape_unlock_count = 11;
+  bool lock_active = 12;
+  uint64 dropped_event_count = 13;
+  uint32 injected_frame_count = 14;
+  uint32 inject_failure_count = 15;
+}
+
+message InputBrokerInjectFrame {
+  string source_peer_id = 1;
+  uint64 sequence = 2;
+  repeated BrokerInputEvent events = 3;
+}
+
+message InputBrokerExchangeReply {
+  bool accepted = 1;
+  string message = 2;
+  repeated InputBrokerInjectFrame inject_frames = 3;
+  bool lock_should_be_active = 4;
+  bool capture_active = 5;
+}
+
+message InputBrokerDetachRequest {
+  string broker_token = 1;
+}
+
 message NearbyPairingCompletionReply {
   bool ok = 1;
   string message = 2;
@@ -455,6 +542,9 @@ service ControlPlaneService {
   rpc CheckNearbyPairingJoin(NearbyJoinStatusRequest) returns (NearbyJoinStatusReply);
   rpc ApproveNearbyPairingRequest(NearbyPairingDecisionRequest) returns (OperationReply);
   rpc RejectNearbyPairingRequest(NearbyPairingDecisionRequest) returns (OperationReply);
+  rpc AttachInputBroker(InputBrokerAttachRequest) returns (InputBrokerAttachReply);
+  rpc ExchangeInputBroker(InputBrokerExchangeRequest) returns (InputBrokerExchangeReply);
+  rpc DetachInputBroker(InputBrokerDetachRequest) returns (OperationReply);
 }
 
 service PairingService {

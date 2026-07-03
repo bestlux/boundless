@@ -70,6 +70,8 @@ mod control_plane_snapshot_ops;
 mod core_ops;
 mod diagnostics_ops;
 mod discovery_state;
+mod input_broker;
+mod input_broker_ops;
 mod input_ops;
 mod input_state;
 mod layout_resolver;
@@ -88,6 +90,12 @@ pub(crate) use clipboard_state::PendingRemoteClipboardPayload;
 use clipboard_state::{ClipboardReplayState, ClipboardState, ClipboardSyncState};
 pub(crate) use discovery_state::DiscoveredPeerEndpoint;
 use discovery_state::DiscoveryState;
+pub(crate) use input_broker::{
+    INPUT_BROKER_BACKEND_MODE, InputBrokerRelay, SERVICE_SESSION_UNSUPPORTED_BACKEND_MODE,
+};
+pub use input_broker_ops::{
+    InputBrokerAttachOutcome, InputBrokerExchangeObservations, InputBrokerExchangeOutcome,
+};
 use input_state::InputState;
 #[cfg(test)]
 use layout_resolver::resolve_capture_handoff_target;
@@ -296,6 +304,7 @@ pub struct AppState {
     transport: Arc<TransportState>,
     discovery: Arc<DiscoveryState>,
     input: Arc<InputState>,
+    input_broker: Arc<InputBrokerRelay>,
     anti_idle: Arc<AntiIdleState>,
     outbound_file_transfers: Arc<RwLock<HashMap<String, OutboundFileTransfer>>>,
     file_transfer_records: Arc<RwLock<VecDeque<FileTransferRecord>>>,

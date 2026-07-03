@@ -157,6 +157,31 @@ pub struct SendInputKeyCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputBrokerAttachCommand {
+    pub process_session_id: u32,
+    pub broker_version: String,
+    pub lock_supported: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InputBrokerExchangeCommand {
+    pub broker_token: String,
+    pub captured_events: Vec<core_input::InputEvent>,
+    pub cursor: Option<(i32, i32)>,
+    pub virtual_bounds: Option<(i32, i32, i32, i32)>,
+    pub escape_unlock_count: u32,
+    pub lock_active: bool,
+    pub dropped_event_count: u64,
+    pub injected_frame_count: u32,
+    pub inject_failure_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputBrokerDetachCommand {
+    pub broker_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputOwnerCommand {
     pub peer_id: String,
     pub force: bool,

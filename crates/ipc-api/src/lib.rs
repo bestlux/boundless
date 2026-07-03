@@ -3,3 +3,5 @@ pub mod boundless {
         tonic::include_proto!("boundless.v1");
     }
 }
+
+pub mod broker_events;
