@@ -5,3 +5,4 @@ pub mod boundless {
 }
 
 pub mod broker_events;
+pub mod client_identity;

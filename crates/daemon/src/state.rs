@@ -94,7 +94,8 @@ pub(crate) use input_broker::{
     INPUT_BROKER_BACKEND_MODE, InputBrokerRelay, SERVICE_SESSION_UNSUPPORTED_BACKEND_MODE,
 };
 pub use input_broker_ops::{
-    InputBrokerAttachOutcome, InputBrokerExchangeObservations, InputBrokerExchangeOutcome,
+    InputBrokerAttachOutcome, InputBrokerClientIdentity, InputBrokerExchangeObservations,
+    InputBrokerExchangeOutcome,
 };
 use input_state::InputState;
 #[cfg(test)]

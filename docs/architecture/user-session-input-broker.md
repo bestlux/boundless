@@ -57,13 +57,24 @@ Incoming (peer frame -> local injection):
 
 ## Fail-Closed Rules
 
+- Broker authorization is verified server-side from the actual pipe client:
+  at accept time the named-pipe server resolves the client's account SID
+  (`GetNamedPipeClientProcessId` + process token) and Windows session
+  (`GetNamedPipeClientSessionId`) and attaches them as tonic connect info.
+  Attach, exchange, and detach are gated on that verified identity only — no
+  client-supplied claim exists on the wire.
+- The pipe ACL admits SYSTEM and Administrators for diagnostics, but broker
+  attach/exchange/detach additionally require the verified client SID to equal
+  the configured allowed-user SID (the same SID that scopes the pipe ACL) and
+  the verified session to be interactive (session 0 rejected). Admin-only or
+  SYSTEM callers are rejected and cannot replace a live allowed-user broker.
+- Unverifiable identity (missing connect info, unresolvable SID or session,
+  or no configured allowed-user SID) rejects the call outright.
 - Attach is rejected unless the daemon was started in service-session mode
   (`InputRuntimeMode::ServiceSessionUnsupported`); a user-session daemon owns
   capture directly and a broker would double-capture.
-- Attach is rejected for process session 0 (non-interactive broker).
-- The pipe ACL already limits callers to SYSTEM, Administrators, and the single
-  allowed user SID; the broker adds a per-attachment token, and exchanges with
-  a stale or replaced token are rejected.
+- The broker adds a per-attachment token, and exchanges with a stale or
+  replaced token are rejected.
 - A broker that stops exchanging for ~3 seconds is treated as detached: backend
   mode reverts to `service_session_unsupported`, capture gates close, and
   pending inject frames fall back to the truthful unsupported-drop path.

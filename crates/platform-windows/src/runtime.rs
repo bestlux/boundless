@@ -14,6 +14,8 @@ use anyhow::Context;
 use anyhow::Result;
 
 #[cfg(windows)]
+use ipc_api::client_identity::ControlClientIdentity;
+#[cfg(windows)]
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::windows::named_pipe::{NamedPipeServer, ServerOptions},
@@ -34,12 +36,15 @@ use windows_sys::{
             TOKEN_USER, TokenUser,
         },
         System::{
+            Pipes::{GetNamedPipeClientProcessId, GetNamedPipeClientSessionId},
             Power::{
                 ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, GetSystemPowerStatus,
                 SYSTEM_POWER_STATUS, SetThreadExecutionState,
             },
             Shutdown::LockWorkStation,
-            Threading::{GetCurrentProcess, OpenProcessToken},
+            Threading::{
+                GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+            },
         },
     },
     core::PCWSTR,
@@ -64,13 +69,16 @@ impl Stream for NamedPipeIncoming {
 #[derive(Debug)]
 pub struct NamedPipeIo {
     inner: NamedPipeServer,
+    client_identity: ControlClientIdentity,
 }
 
 #[cfg(windows)]
 impl Connected for NamedPipeIo {
-    type ConnectInfo = ();
+    type ConnectInfo = ControlClientIdentity;
 
-    fn connect_info(&self) -> Self::ConnectInfo {}
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.client_identity.clone()
+    }
 }
 
 #[cfg(windows)]
@@ -162,8 +170,13 @@ pub fn validate_allowed_user_sid_shape(allowed_user_sid: &str) -> bool {
 
 #[cfg(windows)]
 pub fn current_user_sid_string() -> io::Result<String> {
+    process_handle_user_sid_string(unsafe { GetCurrentProcess() })
+}
+
+#[cfg(windows)]
+fn process_handle_user_sid_string(process: HANDLE) -> io::Result<String> {
     let mut token: HANDLE = std::ptr::null_mut();
-    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
     if opened == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -191,6 +204,55 @@ pub fn current_user_sid_string() -> io::Result<String> {
 
     let token_user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
     sid_to_string(token_user.User.Sid)
+}
+
+#[cfg(windows)]
+fn process_id_user_sid_string(process_id: u32) -> io::Result<String> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let _process_guard = HandleGuard(process);
+    process_handle_user_sid_string(process)
+}
+
+/// Resolves the connected pipe client's account SID and Windows session id
+/// from the pipe handle itself. Fields stay `None` when a query fails, so
+/// identity-gated handlers (input broker attach/exchange) fail closed instead
+/// of trusting anything the client reports about itself.
+#[cfg(windows)]
+fn named_pipe_client_identity(server: &NamedPipeServer) -> ControlClientIdentity {
+    use std::os::windows::io::AsRawHandle;
+
+    let handle = server.as_raw_handle() as HANDLE;
+    let mut identity = ControlClientIdentity::default();
+
+    let mut session_id = 0_u32;
+    if unsafe { GetNamedPipeClientSessionId(handle, &mut session_id) } != 0 {
+        identity.session_id = Some(session_id);
+    } else {
+        tracing::warn!(
+            error = %io::Error::last_os_error(),
+            "failed to resolve named-pipe client session id"
+        );
+    }
+
+    let mut process_id = 0_u32;
+    if unsafe { GetNamedPipeClientProcessId(handle, &mut process_id) } != 0 {
+        match process_id_user_sid_string(process_id) {
+            Ok(user_sid) => identity.user_sid = Some(user_sid),
+            Err(error) => {
+                tracing::warn!(%error, "failed to resolve named-pipe client user SID");
+            }
+        }
+    } else {
+        tracing::warn!(
+            error = %io::Error::last_os_error(),
+            "failed to resolve named-pipe client process id"
+        );
+    }
+
+    identity
 }
 
 #[cfg(windows)]
@@ -397,7 +459,10 @@ async fn accept_loop(
             }
         };
 
-        let io = NamedPipeIo { inner: server };
+        let io = NamedPipeIo {
+            client_identity: named_pipe_client_identity(&server),
+            inner: server,
+        };
         if sender.send(Ok(io)).await.is_err() {
             break;
         }

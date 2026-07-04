@@ -756,11 +756,12 @@ impl ControlPlaneService for ControlPlaneApi {
         &self,
         request: Request<InputBrokerAttachRequest>,
     ) -> Result<Response<InputBrokerAttachReply>, Status> {
+        let verified_client = verified_control_client(&request);
         let request = request.into_inner();
         let reply = self
             .app
             .attach_input_broker(app_commands::InputBrokerAttachCommand {
-                process_session_id: request.process_session_id,
+                verified_client,
                 broker_version: request.broker_version,
                 lock_supported: request.lock_supported,
             })
@@ -777,12 +778,14 @@ impl ControlPlaneService for ControlPlaneApi {
         &self,
         request: Request<InputBrokerExchangeRequest>,
     ) -> Result<Response<InputBrokerExchangeReply>, Status> {
+        let verified_client = verified_control_client(&request);
         let request = request.into_inner();
         let (captured_events, undecodable_events) =
             ipc_api::broker_events::input_events_from_broker_events(&request.captured_events);
         let reply = self
             .app
             .exchange_input_broker(app_commands::InputBrokerExchangeCommand {
+                verified_client,
                 broker_token: request.broker_token,
                 captured_events,
                 cursor: request
@@ -825,9 +828,11 @@ impl ControlPlaneService for ControlPlaneApi {
         &self,
         request: Request<InputBrokerDetachRequest>,
     ) -> Result<Response<OperationReply>, Status> {
+        let verified_client = verified_control_client(&request);
         let reply = self
             .app
             .detach_input_broker(app_commands::InputBrokerDetachCommand {
+                verified_client,
                 broker_token: request.into_inner().broker_token,
             })
             .await
@@ -1002,6 +1007,20 @@ impl ControlPlaneService for ControlPlaneApi {
             message: reply.message,
         }))
     }
+}
+
+/// Reads the transport-verified client identity attached by the named-pipe
+/// server as tonic `ConnectInfo`. Returns `None` when the transport supplied
+/// no verified identity (for example TCP), so identity-gated commands fail
+/// closed instead of trusting request payload claims.
+fn verified_control_client<T>(request: &Request<T>) -> Option<app_commands::VerifiedControlClient> {
+    request
+        .extensions()
+        .get::<ipc_api::client_identity::ControlClientIdentity>()
+        .map(|identity| app_commands::VerifiedControlClient {
+            user_sid: identity.user_sid.clone(),
+            session_id: identity.session_id,
+        })
 }
 
 fn parse_host(value: &str) -> Result<String, Status> {
@@ -1257,5 +1276,32 @@ fn map_transport_event(event: TransportEventSnapshot) -> TransportEvent {
         peer_id: event.peer_id,
         detail: event.detail,
         size_bytes: event.size_bytes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ipc_api::client_identity::ControlClientIdentity;
+
+    #[test]
+    fn verified_control_client_reads_transport_connect_info_only() {
+        let mut request = Request::new(InputBrokerAttachRequest {
+            broker_version: "test".to_string(),
+            lock_supported: true,
+        });
+        assert_eq!(
+            verified_control_client(&request),
+            None,
+            "requests without transport-verified identity must yield None"
+        );
+
+        request.extensions_mut().insert(ControlClientIdentity {
+            user_sid: Some("S-1-5-21-1-2-3-1001".to_string()),
+            session_id: Some(2),
+        });
+        let verified = verified_control_client(&request).expect("verified identity");
+        assert_eq!(verified.user_sid.as_deref(), Some("S-1-5-21-1-2-3-1001"));
+        assert_eq!(verified.session_id, Some(2));
     }
 }

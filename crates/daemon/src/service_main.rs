@@ -170,6 +170,12 @@ mod service_entry {
         )
         .await
         .context("prepare service control-plane runtime")?;
+        // Broker attach/exchange authorization compares the verified pipe
+        // client identity against this SID; without it every attach fails
+        // closed even though admins keep pipe access for diagnostics.
+        runtime
+            .state
+            .set_input_broker_allowed_user_sid(&allowed_user_sid);
 
         let control_plane =
             adapter_ipc_grpc::ControlPlaneApi::new(shared_control_plane_app(runtime.state.clone()))

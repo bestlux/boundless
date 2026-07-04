@@ -32,8 +32,15 @@ session 0, so mouse/keyboard sharing in service mode is brokered by the tray:
   `user_session_broker` in the tray Settings tab and `boundlessctl` snapshots.
 - The service remains the trust, routing, and network authority. The broker only
   captures local input in the user session and injects authenticated incoming
-  frames there; it fails closed for non-interactive sessions and stale/replaced
-  broker tokens, and the service reverts to `service_session_unsupported`
+  frames there.
+- Broker authorization is verified by the service against the actual pipe
+  client identity (account SID and Windows session resolved from the pipe
+  handle), never against anything the caller reports about itself.
+  Administrators and SYSTEM keep pipe access for diagnostics, but broker
+  attach/exchange fails closed for them, for non-interactive (session 0)
+  clients, for any account other than the configured allowed user, and for
+  stale/replaced broker tokens; a rejected caller cannot replace a live
+  allowed-user broker. The service reverts to `service_session_unsupported`
   within a few seconds if the broker goes silent.
 - Scope is the normal unlocked desktop of the selected allowed user only. Lock
   screen, secure desktop, UAC prompts, elevated applications, and other users'

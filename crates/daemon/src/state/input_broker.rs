@@ -24,6 +24,7 @@ pub struct InputBrokerAttachment {
 #[derive(Debug, Default)]
 struct InputBrokerRelayInner {
     service_session_input: bool,
+    allowed_user_sid: Option<String>,
     attachment: Option<InputBrokerAttachment>,
     last_exchange_at: Option<Instant>,
     captured_events: VecDeque<InputEvent>,
@@ -58,6 +59,17 @@ impl InputBrokerRelay {
 
     pub(crate) fn service_session_input(&self) -> bool {
         self.lock().service_session_input
+    }
+
+    /// Configures the only account SID whose verified pipe clients may act as
+    /// the user-session input broker. Unset means every broker attach fails
+    /// closed.
+    pub(crate) fn set_allowed_user_sid(&self, allowed_user_sid: String) {
+        self.lock().allowed_user_sid = Some(allowed_user_sid);
+    }
+
+    pub(crate) fn allowed_user_sid(&self) -> Option<String> {
+        self.lock().allowed_user_sid.clone()
     }
 
     pub(crate) fn attach(&self, attachment: InputBrokerAttachment) {

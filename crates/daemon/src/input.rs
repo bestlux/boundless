@@ -1670,10 +1670,18 @@ mod tests {
         assert!(err.to_string().contains("index 1"));
     }
 
+    fn allowed_broker_client() -> Option<crate::state::InputBrokerClientIdentity> {
+        Some(crate::state::InputBrokerClientIdentity {
+            user_sid: Some("S-1-5-21-1000-2000-3000-1001".to_string()),
+            session_id: Some(2),
+        })
+    }
+
     #[tokio::test]
     async fn broker_relay_backend_reports_ready_only_while_attached() {
         let (state, _peer_id, root) = state_with_peer_for_input_test().await;
         apply_startup_mode(&state, InputRuntimeMode::ServiceSessionUnsupported).await;
+        state.set_input_broker_allowed_user_sid("S-1-5-21-1000-2000-3000-1001");
         let mut backend = BrokerRelayCaptureBackend {
             relay: state.input_broker_relay(),
         };
@@ -1682,7 +1690,7 @@ mod tests {
         assert!(!backend.lock_supported());
 
         let attach = state
-            .attach_input_broker(2, "test-broker".to_string(), true)
+            .attach_input_broker(allowed_broker_client(), "test-broker".to_string(), true)
             .await;
         assert!(attach.accepted);
         assert_eq!(
@@ -1715,9 +1723,10 @@ mod tests {
             .await
             .expect("connect");
         apply_startup_mode(&state, InputRuntimeMode::ServiceSessionUnsupported).await;
+        state.set_input_broker_allowed_user_sid("S-1-5-21-1000-2000-3000-1001");
 
         let attach = state
-            .attach_input_broker(2, "test-broker".to_string(), true)
+            .attach_input_broker(allowed_broker_client(), "test-broker".to_string(), true)
             .await;
         assert!(attach.accepted);
         // The runtime loop republishes the backend mode when it flips; mirror
@@ -1747,6 +1756,7 @@ mod tests {
 
         let outcome = state
             .exchange_input_broker(
+                allowed_broker_client(),
                 &attach.broker_token,
                 crate::state::InputBrokerExchangeObservations {
                     captured_events: vec![InputEvent::Key {

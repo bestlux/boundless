@@ -554,7 +554,7 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         let outcome = self
             .state
             .attach_input_broker(
-                command.process_session_id,
+                broker_client_identity(command.verified_client),
                 command.broker_version,
                 command.lock_supported,
             )
@@ -573,6 +573,7 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         let outcome = self
             .state
             .exchange_input_broker(
+                broker_client_identity(command.verified_client),
                 &command.broker_token,
                 crate::state::InputBrokerExchangeObservations {
                     captured_events: command.captured_events,
@@ -607,7 +608,13 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         &self,
         command: InputBrokerDetachCommand,
     ) -> Result<OperationReply> {
-        let detached = self.state.detach_input_broker(&command.broker_token).await;
+        let detached = self
+            .state
+            .detach_input_broker(
+                broker_client_identity(command.verified_client),
+                &command.broker_token,
+            )
+            .await;
         Ok(OperationReply {
             ok: detached,
             message: if detached {
@@ -758,6 +765,15 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             },
         })
     }
+}
+
+fn broker_client_identity(
+    verified_client: Option<app_services::commands::VerifiedControlClient>,
+) -> Option<crate::state::InputBrokerClientIdentity> {
+    verified_client.map(|client| crate::state::InputBrokerClientIdentity {
+        user_sid: client.user_sid,
+        session_id: client.session_id,
+    })
 }
 
 fn insert_runtime_task_health(bundle: &mut Value, snapshots: Vec<RuntimeTaskSnapshot>) {

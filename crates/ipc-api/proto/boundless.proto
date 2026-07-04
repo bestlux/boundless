@@ -433,10 +433,12 @@ message BrokerKey {
   bool down = 2;
 }
 
+// Broker authorization is derived server-side from the verified named-pipe
+// client identity (account SID and Windows session), never from
+// client-supplied claims, so the attach request carries none.
 message InputBrokerAttachRequest {
-  uint32 process_session_id = 1;
-  string broker_version = 2;
-  bool lock_supported = 3;
+  string broker_version = 1;
+  bool lock_supported = 2;
 }
 
 message InputBrokerAttachReply {

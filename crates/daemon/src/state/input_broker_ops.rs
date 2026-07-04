@@ -31,9 +31,26 @@ pub struct InputBrokerExchangeObservations {
     pub inject_failure_count: u32,
 }
 
+/// Identity of the caller as verified by the transport layer (named-pipe
+/// client process token SID and client session id). `None` means the
+/// transport could not verify the caller; broker authorization fails closed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputBrokerClientIdentity {
+    pub user_sid: Option<String>,
+    pub session_id: Option<u32>,
+}
+
 impl AppState {
     pub(crate) fn input_broker_relay(&self) -> Arc<InputBrokerRelay> {
         self.input_broker.clone()
+    }
+
+    /// Configures the only account whose verified pipe clients may act as the
+    /// user-session input broker. Called by the service host with the same
+    /// allowed-user SID that scopes the control pipe ACL.
+    pub fn set_input_broker_allowed_user_sid(&self, allowed_user_sid: &str) {
+        self.input_broker
+            .set_allowed_user_sid(allowed_user_sid.to_string());
     }
 
     /// True when incoming inject frames should be left queued for the
@@ -43,9 +60,49 @@ impl AppState {
             && self.input_broker.is_attached_fresh(Instant::now())
     }
 
+    /// Fail-closed authorization for broker calls, evaluated exclusively
+    /// against the transport-verified caller identity. Admin/SYSTEM callers
+    /// keep pipe access for diagnostics, but only interactive-session clients
+    /// of the configured allowed user pass this gate.
+    fn input_broker_client_rejection(
+        &self,
+        verified_client: &Option<InputBrokerClientIdentity>,
+    ) -> Option<&'static str> {
+        let Some(client) = verified_client else {
+            return Some("unverified_client");
+        };
+        let Some(session_id) = client.session_id else {
+            return Some("unverified_session");
+        };
+        if session_id == 0 {
+            return Some("non_interactive_session");
+        }
+        let Some(user_sid) = client.user_sid.as_deref() else {
+            return Some("unverified_user");
+        };
+        let Some(allowed_user_sid) = self.input_broker.allowed_user_sid() else {
+            return Some("allowed_user_not_configured");
+        };
+        if user_sid != allowed_user_sid {
+            return Some("wrong_user");
+        }
+        None
+    }
+
+    async fn record_input_broker_rejection(&self, surface: &str, reason: &str) {
+        self.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "local".to_string(),
+            kind: format!("input_broker_{surface}_rejected"),
+            peer_id: "none".to_string(),
+            detail: format!("reason={reason}"),
+            size_bytes: 0,
+        });
+    }
+
     pub async fn attach_input_broker(
         &self,
-        process_session_id: u32,
+        verified_client: Option<InputBrokerClientIdentity>,
         broker_version: String,
         lock_supported: bool,
     ) -> InputBrokerAttachOutcome {
@@ -56,21 +113,14 @@ impl AppState {
                 message: "input broker not required: this daemon owns interactive input in its own session".to_string(),
             };
         }
-        if process_session_id == 0 {
-            self.record_transport_event(TransportEventRecord {
-                timestamp: Utc::now(),
-                direction: "local".to_string(),
-                kind: "input_broker_attach_rejected".to_string(),
-                peer_id: "none".to_string(),
-                detail: "reason=non_interactive_session process_session_id=0".to_string(),
-                size_bytes: 0,
-            });
+        if let Some(reason) = self.input_broker_client_rejection(&verified_client) {
+            self.record_input_broker_rejection("attach", reason).await;
             return InputBrokerAttachOutcome {
                 accepted: false,
                 broker_token: String::new(),
-                message:
-                    "input broker must run in an interactive user session (session 0 rejected)"
-                        .to_string(),
+                message: format!(
+                    "input broker attach denied ({reason}): the pipe client must be a verified interactive-session process of the allowed desktop user"
+                ),
             };
         }
 
@@ -86,7 +136,11 @@ impl AppState {
             kind: "input_broker_attached".to_string(),
             peer_id: "none".to_string(),
             detail: format!(
-                "process_session_id={process_session_id} lock_supported={lock_supported} replaced_previous={replaced} broker_version={broker_version}"
+                "client_session_id={} lock_supported={lock_supported} replaced_previous={replaced} broker_version={broker_version}",
+                verified_client
+                    .as_ref()
+                    .and_then(|client| client.session_id)
+                    .unwrap_or_default()
             ),
             size_bytes: 0,
         });
@@ -100,7 +154,16 @@ impl AppState {
         }
     }
 
-    pub async fn detach_input_broker(&self, broker_token: &str) -> bool {
+    pub async fn detach_input_broker(
+        &self,
+        verified_client: Option<InputBrokerClientIdentity>,
+        broker_token: &str,
+    ) -> bool {
+        if let Some(reason) = self.input_broker_client_rejection(&verified_client) {
+            self.record_input_broker_rejection("detach", reason).await;
+            return false;
+        }
+
         let detached = self.input_broker.detach(broker_token);
         if detached {
             self.record_transport_event(TransportEventRecord {
@@ -118,9 +181,20 @@ impl AppState {
 
     pub async fn exchange_input_broker(
         &self,
+        verified_client: Option<InputBrokerClientIdentity>,
         broker_token: &str,
         observations: InputBrokerExchangeObservations,
     ) -> InputBrokerExchangeOutcome {
+        if let Some(reason) = self.input_broker_client_rejection(&verified_client) {
+            self.record_input_broker_rejection("exchange", reason).await;
+            return InputBrokerExchangeOutcome {
+                accepted: false,
+                message: format!(
+                    "input broker exchange denied ({reason}): the pipe client must be a verified interactive-session process of the allowed desktop user"
+                ),
+                ..Default::default()
+            };
+        }
         if !self
             .input_broker
             .validate_and_touch(broker_token, Instant::now())

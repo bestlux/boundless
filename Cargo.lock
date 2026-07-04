@@ -3126,6 +3126,7 @@ dependencies = [
  "clipboard-win",
  "core-clipboard",
  "core-input",
+ "ipc-api",
  "tokio",
  "tonic",
  "tracing",

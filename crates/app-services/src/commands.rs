@@ -156,15 +156,26 @@ pub struct SendInputKeyCommand {
     pub key_down: bool,
 }
 
+/// Transport-verified identity of the control-plane caller, resolved by the
+/// server from the actual connection (named-pipe client process token and
+/// session), never from request payload fields. `None` means the transport
+/// could not verify the caller; identity-gated commands fail closed on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedControlClient {
+    pub user_sid: Option<String>,
+    pub session_id: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputBrokerAttachCommand {
-    pub process_session_id: u32,
+    pub verified_client: Option<VerifiedControlClient>,
     pub broker_version: String,
     pub lock_supported: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InputBrokerExchangeCommand {
+    pub verified_client: Option<VerifiedControlClient>,
     pub broker_token: String,
     pub captured_events: Vec<core_input::InputEvent>,
     pub cursor: Option<(i32, i32)>,
@@ -178,6 +189,7 @@ pub struct InputBrokerExchangeCommand {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputBrokerDetachCommand {
+    pub verified_client: Option<VerifiedControlClient>,
     pub broker_token: String,
 }
 

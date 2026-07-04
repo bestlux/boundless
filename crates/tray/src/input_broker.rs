@@ -16,8 +16,7 @@ use ipc_api::boundless::v1::{
 use ipc_api::broker_events::{broker_events_from_input_events, input_events_from_broker_events};
 use platform_windows::input::{
     HookControlAction, HookInputPump, current_process_can_use_interactive_input,
-    current_process_session_id, input_records_for_event, send_input_records,
-    virtual_screen_bounds,
+    input_records_for_event, send_input_records, virtual_screen_bounds,
 };
 use tonic::transport::Channel;
 
@@ -73,14 +72,13 @@ fn run_input_broker_session(endpoint: &str) -> Result<BrokerSessionEnd> {
             return Ok(BrokerSessionEnd::NotNeeded);
         }
 
-        let process_session_id =
-            current_process_session_id().context("query input broker process session")?;
         let mut pump =
             HookInputPump::start(|_source| {}).context("install user-session capture hooks")?;
 
+        // The daemon authorizes this attach against the verified pipe client
+        // identity (our process token SID and session), not anything we send.
         let attach = client
             .attach_input_broker(InputBrokerAttachRequest {
-                process_session_id,
                 broker_version: env!("CARGO_PKG_VERSION").to_string(),
                 lock_supported: true,
             })
