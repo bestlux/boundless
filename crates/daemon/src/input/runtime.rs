@@ -40,7 +40,13 @@ pub(super) async fn run(state: AppState, mode: InputRuntimeMode) -> Result<()> {
     loop {
         let mut run_capture = capture_wake.take_pending();
         let mut run_inject = inject_wake.take_pending();
-        let next_retry_at = state.next_pending_inject_retry_at().await;
+        let next_retry_at = if state.input_broker_route_active() {
+            // Retry pacing belongs to the broker exchange while it owns the
+            // inject queue; keeping the deadline here would spin the loop.
+            None
+        } else {
+            state.next_pending_inject_retry_at().await
+        };
 
         if !run_capture && !run_inject {
             let capture_notified = capture_wake.notified();
@@ -104,13 +110,9 @@ pub(super) async fn run(state: AppState, mode: InputRuntimeMode) -> Result<()> {
         }
 
         if run_capture {
-            capture_and_queue_outgoing_frames(
-                &state,
-                capture_backend.as_mut(),
-                &mut last_capture_target,
-                &mut edge_switch_state,
-            )
-            .await;
+            // Refresh the reported backend mode before draining events so a
+            // broker attach/detach transition takes effect for the same
+            // capture pass instead of dropping its first event batch.
             let next_mode = capture_backend.backend_mode();
             if next_mode != capture_backend_mode {
                 capture_backend_mode = next_mode;
@@ -125,9 +127,22 @@ pub(super) async fn run(state: AppState, mode: InputRuntimeMode) -> Result<()> {
                 )
                 .await;
             }
+            capture_and_queue_outgoing_frames(
+                &state,
+                capture_backend.as_mut(),
+                &mut last_capture_target,
+                &mut edge_switch_state,
+            )
+            .await;
         }
 
         if run_inject {
+            if state.input_broker_route_active() {
+                // Incoming frames stay queued for the attached user-session
+                // broker, which drains them through the control-plane
+                // exchange and injects in the interactive session.
+                continue;
+            }
             let outcome = drain_pending_inject_frames(&state, inject_backend.as_mut()).await;
             if outcome.continue_immediately {
                 continue;
@@ -339,7 +354,9 @@ pub(super) async fn capture_and_queue_outgoing_frames(
         state.note_real_local_input_activity().await;
     }
     let cursor_position = backend.cursor_position();
-    let screen_bounds = local_virtual_screen_bounds();
+    let screen_bounds = backend
+        .virtual_screen_bounds()
+        .or_else(local_virtual_screen_bounds);
 
     let mut escape_triggered = false;
     for action in backend.drain_control_actions() {

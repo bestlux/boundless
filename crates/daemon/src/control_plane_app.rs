@@ -5,14 +5,15 @@ use app_services::{
     ControlPlaneApp, SharedControlPlaneApp,
     commands::{
         DiagnosticsDumpCommand, DiagnosticsDumpReply, FeatureSetCommand, FileTransferActionCommand,
-        HotkeySetCommand, HotkeyTriggerCommand, ImportTrustBundleCommand,
-        InputCaptureTargetCommand, InputCaptureTargetReply, InputOwnerCommand, InputOwnerReply,
-        LayoutReply, LayoutSetCommand, NearbyJoinStartCommand, NearbyJoinStatusCommand,
-        NearbyPairingDecisionCommand, NearbyRequestCodeCommand, NearbySubmitCodeCommand,
-        OperationReply, PairJoinCommand, PairJoinReply, PairingCodeReply, PairingCodeRequest,
-        RemovePeerCommand, RotateTrustCommand, SafeResetCommand, SendClipboardImageCommand,
-        SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand, SendInputMoveCommand,
-        SetAntiIdleConfigCommand, SetFileTransferConfigCommand, SetInputHandoffConfigCommand,
+        HotkeySetCommand, HotkeyTriggerCommand, ImportTrustBundleCommand, InputBrokerAttachCommand,
+        InputBrokerDetachCommand, InputBrokerExchangeCommand, InputCaptureTargetCommand,
+        InputCaptureTargetReply, InputOwnerCommand, InputOwnerReply, LayoutReply, LayoutSetCommand,
+        NearbyJoinStartCommand, NearbyJoinStatusCommand, NearbyPairingDecisionCommand,
+        NearbyRequestCodeCommand, NearbySubmitCodeCommand, OperationReply, PairJoinCommand,
+        PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, RotateTrustCommand,
+        SafeResetCommand, SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand,
+        SendInputKeyCommand, SendInputMoveCommand, SetAntiIdleConfigCommand,
+        SetFileTransferConfigCommand, SetInputHandoffConfigCommand,
     },
     diagnostics::{
         DiagnosticExportOptions, ServiceDiagnosticSnapshot, build_online_bundle,
@@ -20,7 +21,8 @@ use app_services::{
     },
     queries::{
         AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
-        FileTransferConfigSnapshot, FileTransferSnapshot, InputHandoffConfigSnapshot,
+        FileTransferConfigSnapshot, FileTransferSnapshot, InputBrokerAttachSnapshot,
+        InputBrokerExchangeSnapshot, InputBrokerInjectFrameSnapshot, InputHandoffConfigSnapshot,
         InputRuntimeSnapshot, NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot,
         NearbyRequestCodeStartSnapshot, StatusSnapshot, TransportEventSnapshot,
         TrustBundleSnapshot, UiDiscoveredPeer, UiPairedPeer, UiPendingRequest, UiSnapshot,
@@ -545,6 +547,84 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         })
     }
 
+    async fn attach_input_broker(
+        &self,
+        command: InputBrokerAttachCommand,
+    ) -> Result<InputBrokerAttachSnapshot> {
+        let outcome = self
+            .state
+            .attach_input_broker(
+                broker_client_identity(command.verified_client),
+                command.broker_version,
+                command.lock_supported,
+            )
+            .await;
+        Ok(InputBrokerAttachSnapshot {
+            accepted: outcome.accepted,
+            broker_token: outcome.broker_token,
+            message: outcome.message,
+        })
+    }
+
+    async fn exchange_input_broker(
+        &self,
+        command: InputBrokerExchangeCommand,
+    ) -> Result<InputBrokerExchangeSnapshot> {
+        let outcome = self
+            .state
+            .exchange_input_broker(
+                broker_client_identity(command.verified_client),
+                &command.broker_token,
+                crate::state::InputBrokerExchangeObservations {
+                    captured_events: command.captured_events,
+                    cursor: command.cursor,
+                    virtual_bounds: command.virtual_bounds,
+                    escape_unlock_count: command.escape_unlock_count,
+                    lock_active: command.lock_active,
+                    dropped_event_count: command.dropped_event_count,
+                    injected_frame_count: command.injected_frame_count,
+                    inject_failure_count: command.inject_failure_count,
+                },
+            )
+            .await;
+        Ok(InputBrokerExchangeSnapshot {
+            accepted: outcome.accepted,
+            message: outcome.message,
+            inject_frames: outcome
+                .inject_frames
+                .into_iter()
+                .map(|frame| InputBrokerInjectFrameSnapshot {
+                    source_peer_id: frame.peer_id,
+                    sequence: frame.sequence,
+                    events: frame.events,
+                })
+                .collect(),
+            lock_should_be_active: outcome.lock_should_be_active,
+            capture_active: outcome.capture_active,
+        })
+    }
+
+    async fn detach_input_broker(
+        &self,
+        command: InputBrokerDetachCommand,
+    ) -> Result<OperationReply> {
+        let detached = self
+            .state
+            .detach_input_broker(
+                broker_client_identity(command.verified_client),
+                &command.broker_token,
+            )
+            .await;
+        Ok(OperationReply {
+            ok: detached,
+            message: if detached {
+                "input broker detached".to_string()
+            } else {
+                "input broker token was not attached".to_string()
+            },
+        })
+    }
+
     async fn request_nearby_pairing_code(
         &self,
         command: NearbyRequestCodeCommand,
@@ -685,6 +765,15 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             },
         })
     }
+}
+
+fn broker_client_identity(
+    verified_client: Option<app_services::commands::VerifiedControlClient>,
+) -> Option<crate::state::InputBrokerClientIdentity> {
+    verified_client.map(|client| crate::state::InputBrokerClientIdentity {
+        user_sid: client.user_sid,
+        session_id: client.session_id,
+    })
 }
 
 fn insert_runtime_task_health(bundle: &mut Value, snapshots: Vec<RuntimeTaskSnapshot>) {

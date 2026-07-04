@@ -1,9 +1,6 @@
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
-use std::collections::VecDeque;
-
-#[cfg(windows)]
 use std::collections::HashMap;
 #[cfg(all(windows, test))]
 use std::sync::mpsc;
@@ -60,16 +57,20 @@ use edge_switch::{
     maybe_handoff_capture_target_from_motion,
 };
 #[cfg(all(windows, test))]
+use platform_windows::input::CaptureRuntime;
+#[cfg(all(windows, test))]
+use platform_windows::input::HookCaptureEvent;
+#[cfg(all(windows, test))]
 use platform_windows::input::raw_mouse_relative_delta;
 #[cfg(test)]
 #[cfg(windows)]
 use platform_windows::input::send_input_records_with_sender;
 #[cfg(windows)]
 use platform_windows::input::{
-    CaptureRuntime, HookCaptureEvent, HookControlAction, captured_key_virtual_keys,
+    HookControlAction, HookInputPump, captured_key_virtual_keys,
     current_process_can_use_interactive_input, cursor_position, input_event_kind,
     input_records_for_event, is_virtual_key_down, mouse_button_from_virtual_key,
-    mouse_button_virtual_keys, send_input_records, virtual_key_for_mouse_button, vk_to_scan_code,
+    mouse_button_virtual_keys, send_input_records, vk_to_scan_code,
 };
 #[cfg(all(test, not(windows)))]
 use runtime::apply_frame;
@@ -114,9 +115,10 @@ impl InputRuntimeMode {
 
 pub async fn apply_startup_mode(state: &AppState, mode: InputRuntimeMode) {
     if mode.is_service_session_unsupported() {
+        state.input_broker_relay().mark_service_session_input();
         state.set_input_lock_runtime(false, false).await;
         state
-            .set_input_capture_backend_mode("service_session_unsupported")
+            .set_input_capture_backend_mode(crate::state::SERVICE_SESSION_UNSUPPORTED_BACKEND_MODE)
             .await;
     }
 }
@@ -160,6 +162,12 @@ trait InputCaptureBackend: Send {
         None
     }
 
+    /// Bounds of the session that produced the captured events; `None` means
+    /// fall back to this process's own virtual-screen metrics.
+    fn virtual_screen_bounds(&self) -> Option<VirtualScreenBounds> {
+        None
+    }
+
     fn take_dropped_event_count(&mut self) -> u64 {
         0
     }
@@ -186,7 +194,9 @@ fn input_backend(mode: InputRuntimeMode) -> Box<dyn InputBackend> {
 
 fn input_capture_backend(state: &AppState, mode: InputRuntimeMode) -> Box<dyn InputCaptureBackend> {
     if mode.is_service_session_unsupported() {
-        return service_session_unsupported_capture_backend();
+        return Box::new(BrokerRelayCaptureBackend {
+            relay: state.input_broker_relay(),
+        });
     }
 
     #[cfg(windows)]
@@ -223,14 +233,9 @@ fn service_session_unsupported_input_backend() -> Box<dyn InputBackend> {
     Box::new(NoopInputBackend)
 }
 
-#[cfg(any(test, windows))]
+#[cfg(windows)]
 fn service_session_unsupported_capture_backend() -> Box<dyn InputCaptureBackend> {
     Box::new(UnsupportedInteractiveCaptureBackend)
-}
-
-#[cfg(all(not(test), not(windows)))]
-fn service_session_unsupported_capture_backend() -> Box<dyn InputCaptureBackend> {
-    Box::new(NoopCaptureBackend)
 }
 
 #[cfg(windows)]
@@ -267,6 +272,13 @@ struct UnsupportedInteractiveInputBackend;
 #[cfg(any(test, windows))]
 struct UnsupportedInteractiveCaptureBackend;
 
+/// Capture backend for service mode: relays events pushed by the attached
+/// user-session input broker and reports `service_session_unsupported`
+/// whenever no fresh broker is attached.
+struct BrokerRelayCaptureBackend {
+    relay: std::sync::Arc<crate::state::InputBrokerRelay>,
+}
+
 #[cfg(windows)]
 #[derive(Default)]
 struct WindowsInputBackend;
@@ -281,11 +293,7 @@ struct WindowsPollingCaptureBackend {
 
 #[cfg(windows)]
 struct WindowsHookCaptureBackend {
-    capture_runtime: CaptureRuntime,
-    control_actions: VecDeque<CaptureControlAction>,
-    last_cursor: Option<(i32, i32)>,
-    last_key_down: HashMap<u16, bool>,
-    last_button_down: HashMap<u16, bool>,
+    pump: HookInputPump,
 }
 
 #[cfg(test)]
@@ -1662,16 +1670,136 @@ mod tests {
         assert!(err.to_string().contains("index 1"));
     }
 
+    fn allowed_broker_client() -> Option<crate::state::InputBrokerClientIdentity> {
+        Some(crate::state::InputBrokerClientIdentity {
+            user_sid: Some("S-1-5-21-1000-2000-3000-1001".to_string()),
+            session_id: Some(2),
+        })
+    }
+
+    #[tokio::test]
+    async fn broker_relay_backend_reports_ready_only_while_attached() {
+        let (state, _peer_id, root) = state_with_peer_for_input_test().await;
+        apply_startup_mode(&state, InputRuntimeMode::ServiceSessionUnsupported).await;
+        state.set_input_broker_allowed_user_sid("S-1-5-21-1000-2000-3000-1001");
+        let mut backend = BrokerRelayCaptureBackend {
+            relay: state.input_broker_relay(),
+        };
+
+        assert_eq!(backend.backend_mode(), "service_session_unsupported");
+        assert!(!backend.lock_supported());
+
+        let attach = state
+            .attach_input_broker(allowed_broker_client(), "test-broker".to_string(), true)
+            .await;
+        assert!(attach.accepted);
+        assert_eq!(
+            backend.backend_mode(),
+            "user_session_broker",
+            "broker-ready state must appear only after a broker attaches"
+        );
+        assert!(backend.lock_supported());
+
+        state.input_broker_relay().expire_attachment_for_test();
+        assert_eq!(
+            backend.backend_mode(),
+            "service_session_unsupported",
+            "a stale broker must revert to the truthful unsupported state"
+        );
+        assert!(!backend.lock_supported());
+        assert!(
+            backend.poll_events().expect("poll").is_empty(),
+            "stale broker events must not leak into the capture path"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn broker_relayed_events_route_to_connected_capture_target() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        apply_startup_mode(&state, InputRuntimeMode::ServiceSessionUnsupported).await;
+        state.set_input_broker_allowed_user_sid("S-1-5-21-1000-2000-3000-1001");
+
+        let attach = state
+            .attach_input_broker(allowed_broker_client(), "test-broker".to_string(), true)
+            .await;
+        assert!(attach.accepted);
+        // The runtime loop republishes the backend mode when it flips; mirror
+        // that transition before the capture pass.
+        state
+            .set_input_capture_backend_mode(crate::state::INPUT_BROKER_BACKEND_MODE)
+            .await;
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set target");
+
+        let mut backend = BrokerRelayCaptureBackend {
+            relay: state.input_broker_relay(),
+        };
+        let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
+        // First pass latches the new capture target (and resets the relay
+        // stream, as any backend reset does on a target change).
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+
+        let outcome = state
+            .exchange_input_broker(
+                allowed_broker_client(),
+                &attach.broker_token,
+                crate::state::InputBrokerExchangeObservations {
+                    captured_events: vec![InputEvent::Key {
+                        scan_code: 30,
+                        state: KeyState::Down,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(outcome.accepted);
+
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+
+        let outgoing = state.drain_outgoing(&peer_id).await;
+        assert_eq!(
+            outgoing.len(),
+            1,
+            "broker-relayed events must flow through the trusted per-peer queue"
+        );
+        assert!(matches!(
+            outgoing.first(),
+            Some(crate::state::OutboundPayload::InputFrame { events, .. }) if matches!(
+                events.as_slice(),
+                [InputEvent::Key { scan_code: 30, state: KeyState::Down }]
+            )
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(windows)]
     #[test]
     fn hook_backend_flushes_mouse_move_before_button_event() {
         let (tx, rx) = mpsc::channel();
         let mut backend = WindowsHookCaptureBackend {
-            capture_runtime: CaptureRuntime::from_test_parts(rx, true),
-            control_actions: VecDeque::new(),
-            last_cursor: None,
-            last_key_down: HashMap::new(),
-            last_button_down: HashMap::new(),
+            pump: HookInputPump::from_capture_runtime(CaptureRuntime::from_test_parts(rx, true)),
         };
 
         tx.send(HookCaptureEvent::MouseDelta { dx: 9, dy: -4 })
@@ -1720,11 +1848,7 @@ mod tests {
     fn hook_backend_uses_mouse_position_when_unlocked_with_raw_mode() {
         let (tx, rx) = mpsc::channel();
         let mut backend = WindowsHookCaptureBackend {
-            capture_runtime: CaptureRuntime::from_test_parts(rx, true),
-            control_actions: VecDeque::new(),
-            last_cursor: None,
-            last_key_down: HashMap::new(),
-            last_button_down: HashMap::new(),
+            pump: HookInputPump::from_capture_runtime(CaptureRuntime::from_test_parts(rx, true)),
         };
 
         tx.send(HookCaptureEvent::MousePosition { x: 100, y: 100 })
@@ -1744,11 +1868,7 @@ mod tests {
     fn hook_backend_preserves_repeated_key_down_events() {
         let (tx, rx) = mpsc::channel();
         let mut backend = WindowsHookCaptureBackend {
-            capture_runtime: CaptureRuntime::from_test_parts(rx, false),
-            control_actions: VecDeque::new(),
-            last_cursor: None,
-            last_key_down: HashMap::new(),
-            last_button_down: HashMap::new(),
+            pump: HookInputPump::from_capture_runtime(CaptureRuntime::from_test_parts(rx, false)),
         };
 
         tx.send(HookCaptureEvent::Input(InputEvent::Key {

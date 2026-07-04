@@ -48,6 +48,8 @@ pub(super) fn run() -> Result<()> {
         daemon_candidates: resolve_boundlessd_candidates(std::env::current_exe().ok()),
     });
 
+    spawn_input_broker_supervisor(ctx.endpoint.clone());
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_visible(false)

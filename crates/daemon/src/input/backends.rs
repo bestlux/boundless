@@ -38,6 +38,61 @@ impl InputCaptureBackend for UnsupportedInteractiveCaptureBackend {
     }
 }
 
+impl InputCaptureBackend for BrokerRelayCaptureBackend {
+    fn drain_release_events(&mut self) -> Vec<InputEvent> {
+        self.relay.drain_release_events()
+    }
+
+    fn reset(&mut self) {
+        self.relay.reset_capture_stream();
+    }
+
+    fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
+        Ok(self.relay.drain_captured_events())
+    }
+
+    fn drain_control_actions(&mut self) -> Vec<CaptureControlAction> {
+        (0..self.relay.take_escape_unlock_count())
+            .map(|_| CaptureControlAction::EscapeUnlock)
+            .collect()
+    }
+
+    fn set_lock_active(&mut self, active: bool) -> Result<bool> {
+        Ok(self.relay.set_desired_lock_active(active))
+    }
+
+    fn lock_supported(&self) -> bool {
+        self.relay.lock_supported()
+    }
+
+    fn backend_mode(&self) -> &'static str {
+        if self.relay.is_attached_fresh(Instant::now()) {
+            crate::state::INPUT_BROKER_BACKEND_MODE
+        } else {
+            crate::state::SERVICE_SESSION_UNSUPPORTED_BACKEND_MODE
+        }
+    }
+
+    fn cursor_position(&self) -> Option<(i32, i32)> {
+        self.relay.cursor_position()
+    }
+
+    fn virtual_screen_bounds(&self) -> Option<VirtualScreenBounds> {
+        self.relay
+            .virtual_bounds()
+            .map(|(left, top, right, bottom)| VirtualScreenBounds {
+                left,
+                top,
+                right,
+                bottom,
+            })
+    }
+
+    fn take_dropped_event_count(&mut self) -> u64 {
+        self.relay.take_dropped_event_count()
+    }
+}
+
 #[cfg(not(windows))]
 impl InputBackend for NoopInputBackend {
     fn apply(&mut self, _event: &InputEvent) -> Result<()> {

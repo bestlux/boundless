@@ -65,6 +65,29 @@ pub struct InputRuntimeSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputBrokerAttachSnapshot {
+    pub accepted: bool,
+    pub broker_token: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputBrokerInjectFrameSnapshot {
+    pub source_peer_id: String,
+    pub sequence: u64,
+    pub events: Vec<core_input::InputEvent>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InputBrokerExchangeSnapshot {
+    pub accepted: bool,
+    pub message: String,
+    pub inject_frames: Vec<InputBrokerInjectFrameSnapshot>,
+    pub lock_should_be_active: bool,
+    pub capture_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     pub daemon_version: String,
     pub machine_id: String,

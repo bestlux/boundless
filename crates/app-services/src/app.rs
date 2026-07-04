@@ -6,20 +6,21 @@ use async_trait::async_trait;
 use crate::{
     commands::{
         DiagnosticsDumpCommand, DiagnosticsDumpReply, FeatureSetCommand, FileTransferActionCommand,
-        HotkeySetCommand, HotkeyTriggerCommand, ImportTrustBundleCommand,
-        InputCaptureTargetCommand, InputCaptureTargetReply, InputOwnerCommand, InputOwnerReply,
-        LayoutReply, LayoutSetCommand, NearbyJoinStartCommand, NearbyJoinStatusCommand,
-        NearbyPairingDecisionCommand, NearbyRequestCodeCommand, NearbySubmitCodeCommand,
-        OperationReply, PairJoinCommand, PairJoinReply, PairingCodeReply, PairingCodeRequest,
-        RemovePeerCommand, RotateTrustCommand, SafeResetCommand, SendClipboardImageCommand,
-        SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand, SendInputMoveCommand,
-        SetAntiIdleConfigCommand, SetFileTransferConfigCommand, SetInputHandoffConfigCommand,
+        HotkeySetCommand, HotkeyTriggerCommand, ImportTrustBundleCommand, InputBrokerAttachCommand,
+        InputBrokerDetachCommand, InputBrokerExchangeCommand, InputCaptureTargetCommand,
+        InputCaptureTargetReply, InputOwnerCommand, InputOwnerReply, LayoutReply, LayoutSetCommand,
+        NearbyJoinStartCommand, NearbyJoinStatusCommand, NearbyPairingDecisionCommand,
+        NearbyRequestCodeCommand, NearbySubmitCodeCommand, OperationReply, PairJoinCommand,
+        PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, RotateTrustCommand,
+        SafeResetCommand, SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand,
+        SendInputKeyCommand, SendInputMoveCommand, SetAntiIdleConfigCommand,
+        SetFileTransferConfigCommand, SetInputHandoffConfigCommand,
     },
     queries::{
         AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
-        FileTransferConfigSnapshot, NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot,
-        NearbyRequestCodeStartSnapshot, StatusSnapshot, TransportEventSnapshot,
-        TrustBundleSnapshot, UiSnapshot,
+        FileTransferConfigSnapshot, InputBrokerAttachSnapshot, InputBrokerExchangeSnapshot,
+        NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot, NearbyRequestCodeStartSnapshot,
+        StatusSnapshot, TransportEventSnapshot, TrustBundleSnapshot, UiSnapshot,
     },
 };
 
@@ -94,6 +95,18 @@ pub trait ControlPlaneApp: Send + Sync {
         command: InputCaptureTargetCommand,
     ) -> Result<InputCaptureTargetReply>;
     async fn clear_input_capture_target(&self) -> Result<InputCaptureTargetReply>;
+    async fn attach_input_broker(
+        &self,
+        command: InputBrokerAttachCommand,
+    ) -> Result<InputBrokerAttachSnapshot>;
+    async fn exchange_input_broker(
+        &self,
+        command: InputBrokerExchangeCommand,
+    ) -> Result<InputBrokerExchangeSnapshot>;
+    async fn detach_input_broker(
+        &self,
+        command: InputBrokerDetachCommand,
+    ) -> Result<OperationReply>;
     async fn request_nearby_pairing_code(
         &self,
         command: NearbyRequestCodeCommand,

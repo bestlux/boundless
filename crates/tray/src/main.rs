@@ -272,6 +272,8 @@ mod windows_app {
 
     include!("dashboard.rs");
 
+    include!("input_broker.rs");
+
     #[cfg(test)]
     #[allow(dead_code)]
     mod dashboard_test_support {

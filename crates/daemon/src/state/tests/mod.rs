@@ -11,6 +11,7 @@ fn minimal_bmp_payload(red: u8) -> Vec<u8> {
 
 mod clipboard_replay;
 mod input_and_outgoing;
+mod input_broker;
 mod layout_and_validation;
 mod pairing_admission;
 mod peer_and_capture;

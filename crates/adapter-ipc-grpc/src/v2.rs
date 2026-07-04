@@ -18,6 +18,8 @@ use ipc_api::boundless::v1::{
     DiagnosticsDumpReply, DiagnosticsDumpRequest, DiscoveredPeerInfo, Empty, FeatureListReply,
     FeatureSetRequest, FileTransferActionRequest, FileTransferConfigReply, FileTransferInfo,
     FileTransferSetRequest, HotkeySetRequest, HotkeyTriggerRequest, ImportTrustBundleRequest,
+    InputBrokerAttachReply, InputBrokerAttachRequest, InputBrokerDetachRequest,
+    InputBrokerExchangeReply, InputBrokerExchangeRequest, InputBrokerInjectFrame,
     InputCaptureTargetReply, InputCaptureTargetRequest, InputHandoffConfigReply,
     InputHandoffSetRequest, InputOwnerReply, InputOwnerRequest, InputRuntimeStatusReply,
     LayoutReply, LayoutSetRequest, NearbyJoinStartRequest, NearbyJoinStatusReply,
@@ -750,6 +752,97 @@ impl ControlPlaneService for ControlPlaneApi {
         }))
     }
 
+    async fn attach_input_broker(
+        &self,
+        request: Request<InputBrokerAttachRequest>,
+    ) -> Result<Response<InputBrokerAttachReply>, Status> {
+        let verified_client = verified_control_client(&request);
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .attach_input_broker(app_commands::InputBrokerAttachCommand {
+                verified_client,
+                broker_version: request.broker_version,
+                lock_supported: request.lock_supported,
+            })
+            .await
+            .map_err(|error| Status::internal(format!("attach input broker: {error:#}")))?;
+        Ok(Response::new(InputBrokerAttachReply {
+            accepted: reply.accepted,
+            broker_token: reply.broker_token,
+            message: reply.message,
+        }))
+    }
+
+    async fn exchange_input_broker(
+        &self,
+        request: Request<InputBrokerExchangeRequest>,
+    ) -> Result<Response<InputBrokerExchangeReply>, Status> {
+        let verified_client = verified_control_client(&request);
+        let request = request.into_inner();
+        let (captured_events, undecodable_events) =
+            ipc_api::broker_events::input_events_from_broker_events(&request.captured_events);
+        let reply = self
+            .app
+            .exchange_input_broker(app_commands::InputBrokerExchangeCommand {
+                verified_client,
+                broker_token: request.broker_token,
+                captured_events,
+                cursor: request
+                    .cursor_valid
+                    .then_some((request.cursor_x, request.cursor_y)),
+                virtual_bounds: request.bounds_valid.then_some((
+                    request.bounds_left,
+                    request.bounds_top,
+                    request.bounds_right,
+                    request.bounds_bottom,
+                )),
+                escape_unlock_count: request.escape_unlock_count,
+                lock_active: request.lock_active,
+                dropped_event_count: request
+                    .dropped_event_count
+                    .saturating_add(undecodable_events as u64),
+                injected_frame_count: request.injected_frame_count,
+                inject_failure_count: request.inject_failure_count,
+            })
+            .await
+            .map_err(|error| Status::internal(format!("exchange input broker: {error:#}")))?;
+        Ok(Response::new(InputBrokerExchangeReply {
+            accepted: reply.accepted,
+            message: reply.message,
+            inject_frames: reply
+                .inject_frames
+                .into_iter()
+                .map(|frame| InputBrokerInjectFrame {
+                    source_peer_id: frame.source_peer_id,
+                    sequence: frame.sequence,
+                    events: ipc_api::broker_events::broker_events_from_input_events(&frame.events),
+                })
+                .collect(),
+            lock_should_be_active: reply.lock_should_be_active,
+            capture_active: reply.capture_active,
+        }))
+    }
+
+    async fn detach_input_broker(
+        &self,
+        request: Request<InputBrokerDetachRequest>,
+    ) -> Result<Response<OperationReply>, Status> {
+        let verified_client = verified_control_client(&request);
+        let reply = self
+            .app
+            .detach_input_broker(app_commands::InputBrokerDetachCommand {
+                verified_client,
+                broker_token: request.into_inner().broker_token,
+            })
+            .await
+            .map_err(|error| Status::internal(format!("detach input broker: {error:#}")))?;
+        Ok(Response::new(OperationReply {
+            ok: reply.ok,
+            message: reply.message,
+        }))
+    }
+
     async fn request_nearby_pairing_code(
         &self,
         request: Request<NearbyRequestCodeStartRequest>,
@@ -914,6 +1007,20 @@ impl ControlPlaneService for ControlPlaneApi {
             message: reply.message,
         }))
     }
+}
+
+/// Reads the transport-verified client identity attached by the named-pipe
+/// server as tonic `ConnectInfo`. Returns `None` when the transport supplied
+/// no verified identity (for example TCP), so identity-gated commands fail
+/// closed instead of trusting request payload claims.
+fn verified_control_client<T>(request: &Request<T>) -> Option<app_commands::VerifiedControlClient> {
+    request
+        .extensions()
+        .get::<ipc_api::client_identity::ControlClientIdentity>()
+        .map(|identity| app_commands::VerifiedControlClient {
+            user_sid: identity.user_sid.clone(),
+            session_id: identity.session_id,
+        })
 }
 
 fn parse_host(value: &str) -> Result<String, Status> {
@@ -1169,5 +1276,32 @@ fn map_transport_event(event: TransportEventSnapshot) -> TransportEvent {
         peer_id: event.peer_id,
         detail: event.detail,
         size_bytes: event.size_bytes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ipc_api::client_identity::ControlClientIdentity;
+
+    #[test]
+    fn verified_control_client_reads_transport_connect_info_only() {
+        let mut request = Request::new(InputBrokerAttachRequest {
+            broker_version: "test".to_string(),
+            lock_supported: true,
+        });
+        assert_eq!(
+            verified_control_client(&request),
+            None,
+            "requests without transport-verified identity must yield None"
+        );
+
+        request.extensions_mut().insert(ControlClientIdentity {
+            user_sid: Some("S-1-5-21-1-2-3-1001".to_string()),
+            session_id: Some(2),
+        });
+        let verified = verified_control_client(&request).expect("verified identity");
+        assert_eq!(verified.user_sid.as_deref(), Some("S-1-5-21-1-2-3-1001"));
+        assert_eq!(verified.session_id, Some(2));
     }
 }

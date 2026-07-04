@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+core-input = { path = "../core-input" }
 prost.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
