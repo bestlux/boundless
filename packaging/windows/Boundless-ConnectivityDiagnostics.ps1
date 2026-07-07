@@ -612,7 +612,7 @@ $report = [pscustomobject]@{
     read_only = $true
     local_network_profiles = Get-NetworkProfileReport
     local_listeners = $localListeners
-    side_by_side_guidance = Get-SideBySideGuidance -LocalListeners $localListeners
+    side_by_side_guidance = @(Get-SideBySideGuidance -LocalListeners $localListeners)
     remote_reachability = $remoteReports
     firewall_hint = Get-FirewallRuleHint
     guidance = [pscustomobject]@{
@@ -655,10 +655,11 @@ foreach ($listener in $report.local_listeners) {
     }
 }
 
-if ($report.side_by_side_guidance.Count -gt 0) {
+$sideBySideGuidance = @($report.side_by_side_guidance)
+if ($sideBySideGuidance.Count -gt 0) {
     Write-Host ""
     Write-Host "Side-by-side guidance:"
-    foreach ($guidance in $report.side_by_side_guidance) {
+    foreach ($guidance in $sideBySideGuidance) {
         Write-Host "- $guidance"
     }
 }
