@@ -3,6 +3,7 @@ param(
     [string]$ServiceBinaryPath = "",
     [string]$ServiceInstallRoot = "",
     [string]$OutputRoot = "",
+    [int]$StopThresholdSeconds = 10,
     [switch]$KeepServiceInstalled
 )
 
@@ -185,9 +186,16 @@ try {
         throw "daemon status did not report named-pipe service health: $daemonStatusOutput"
     }
 
+    $stopWatch = [System.Diagnostics.Stopwatch]::StartNew()
     $stopOutput = Invoke-Cli -Label "service stop" -Arguments @("service", "stop")
-    $started = $false
     Wait-ServiceState -Name "BoundlessService" -ExpectedStatus "Stopped" | Out-Null
+    $stopWatch.Stop()
+    $stopDurationMs = [int][Math]::Round($stopWatch.Elapsed.TotalMilliseconds)
+    Write-Host "[service-smoke] service stop duration ${stopDurationMs}ms threshold=${StopThresholdSeconds}s"
+    if ($stopWatch.Elapsed.TotalSeconds -gt $StopThresholdSeconds) {
+        throw "service stop exceeded ${StopThresholdSeconds}s threshold: ${stopDurationMs}ms"
+    }
+    $started = $false
     $stoppedStatusOutput = Invoke-Cli -Label "service status stopped" -Arguments @("service", "status")
     if ($stoppedStatusOutput -notmatch "Stopped") {
         throw "service status did not report Stopped after stop: $stoppedStatusOutput"
@@ -210,6 +218,8 @@ try {
         running_status_output = $statusOutput
         daemon_status_output = $daemonStatusOutput
         stop_output = $stopOutput
+        stop_duration_ms = $stopDurationMs
+        stop_threshold_seconds = $StopThresholdSeconds
         stopped_status_output = $stoppedStatusOutput
         uninstall_output = $uninstallOutput
         kept_service_installed = $KeepServiceInstalled.IsPresent

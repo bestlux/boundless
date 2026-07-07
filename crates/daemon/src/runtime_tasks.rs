@@ -273,7 +273,10 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
-    use tokio::sync::oneshot;
+    use tokio::{
+        sync::oneshot,
+        time::{self, Duration},
+    };
 
     use super::*;
 
@@ -351,5 +354,49 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst));
         let snapshots = registry.snapshots();
         assert_eq!(snapshots[0].status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_pending_input_broker_exchange_task() {
+        let registry = RuntimeTaskRegistry::default();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_for_task = dropped.clone();
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let (_exchange_tx, exchange_rx) = oneshot::channel::<()>();
+
+        registry.spawn(
+            RuntimeTaskSpec::new(
+                "input.broker_exchange",
+                RuntimeTaskOwner::Input,
+                RuntimeTaskShutdown::AbortOnDaemonShutdown,
+            ),
+            async move {
+                struct DropMarker(Arc<AtomicBool>);
+                impl Drop for DropMarker {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+
+                let _marker = DropMarker(dropped_for_task);
+                let _ = started_tx.send(());
+                let _ = exchange_rx.await;
+            },
+        );
+        started_rx.await.expect("task started");
+
+        time::timeout(Duration::from_secs(1), registry.shutdown())
+            .await
+            .expect("shutdown must not wait on a pending broker exchange future");
+
+        assert!(dropped.load(Ordering::SeqCst));
+        let snapshot = registry
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.name == "input.broker_exchange")
+            .expect("broker exchange task snapshot");
+        assert_eq!(snapshot.owner, "input");
+        assert_eq!(snapshot.shutdown, "abort_on_daemon_shutdown");
+        assert_eq!(snapshot.status, "cancelled");
     }
 }

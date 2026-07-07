@@ -27,11 +27,12 @@ mod service_entry {
         io::{self, Write},
         panic,
         path::PathBuf,
+        sync::{Arc, Mutex},
         time::Duration,
     };
 
     use anyhow::{Context, Result};
-    use tokio::sync::watch;
+    use tokio::{sync::watch, time};
     use tonic::transport::Server;
     use windows_service::{
         define_windows_service,
@@ -39,7 +40,7 @@ mod service_entry {
             ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
             ServiceType,
         },
-        service_control_handler::{self, ServiceControlHandlerResult},
+        service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle},
         service_dispatcher,
     };
 
@@ -58,6 +59,11 @@ mod service_entry {
 
     const SERVICE_NAME: &str = "BoundlessService";
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+    const SERVICE_START_WAIT_HINT: Duration = Duration::from_secs(10);
+    const SERVICE_STOP_WAIT_HINT: Duration = Duration::from_secs(5);
+    const SERVICE_CONTROL_PLANE_STOP_GRACE: Duration = Duration::from_secs(2);
+    const SERVICE_RUNTIME_TASK_STOP_GRACE: Duration = Duration::from_secs(1);
+    const TOKIO_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
     define_windows_service!(ffi_service_main, service_main);
 
@@ -77,24 +83,29 @@ mod service_entry {
         let _logging = logging::init_logging().ok();
         append_service_startup_diagnostic("starting", "boundless service entrypoint reached");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let status_handle_slot: Arc<Mutex<Option<ServiceStatusHandle>>> =
+            Arc::new(Mutex::new(None));
+        let status_handle_for_handler = status_handle_slot.clone();
 
         let event_handler = move |control_event| -> ServiceControlHandlerResult {
             match control_event {
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
                 ServiceControl::Stop => {
-                    append_service_startup_diagnostic(
+                    request_service_shutdown(
+                        &shutdown_tx,
+                        &status_handle_for_handler,
                         "control_stop_requested",
                         "SCM stop control received",
                     );
-                    let _ = shutdown_tx.send(true);
                     ServiceControlHandlerResult::NoError
                 }
                 ServiceControl::Shutdown => {
-                    append_service_startup_diagnostic(
+                    request_service_shutdown(
+                        &shutdown_tx,
+                        &status_handle_for_handler,
                         "control_shutdown_requested",
                         "SCM shutdown control received",
                     );
-                    let _ = shutdown_tx.send(true);
                     ServiceControlHandlerResult::NoError
                 }
                 _ => ServiceControlHandlerResult::NotImplemented,
@@ -102,7 +113,17 @@ mod service_entry {
         };
 
         let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
-        status_handle.set_service_status(service_status(ServiceState::StartPending))?;
+        {
+            let mut slot = status_handle_slot
+                .lock()
+                .expect("service status handle slot");
+            *slot = Some(status_handle);
+        }
+        if *shutdown_rx.borrow() {
+            status_handle.set_service_status(service_status(ServiceState::StopPending))?;
+        } else {
+            status_handle.set_service_status(service_status(ServiceState::StartPending))?;
+        }
         let allowed_user_sid = match parse_allowed_user_sid(arguments) {
             Ok(sid) => {
                 append_service_startup_diagnostic("allowed_user_sid", &sid);
@@ -124,14 +145,21 @@ mod service_entry {
 
         let runtime = tokio::runtime::Runtime::new().map_err(windows_service::Error::Winapi)?;
         let result = runtime.block_on(async move {
+            let shutdown_status_rx = shutdown_rx.clone();
             let result = run_daemon(shutdown_rx, allowed_user_sid, || {
                 status_handle.set_service_status(service_status(ServiceState::Running))
             })
             .await;
-            append_service_startup_diagnostic("stop_pending", "service runtime returned");
-            status_handle.set_service_status(service_status(ServiceState::StopPending))?;
+            if *shutdown_status_rx.borrow() {
+                append_service_startup_diagnostic(
+                    "stop_pending",
+                    "service runtime returned after shutdown request",
+                );
+                status_handle.set_service_status(service_status(ServiceState::StopPending))?;
+            }
             result
         });
+        runtime.shutdown_timeout(TOKIO_RUNTIME_SHUTDOWN_TIMEOUT);
 
         if let Err(error) = result {
             append_service_startup_diagnostic("runtime_error", &format!("{error:#}"));
@@ -150,8 +178,45 @@ mod service_entry {
         Ok(())
     }
 
+    fn request_service_shutdown(
+        shutdown_tx: &watch::Sender<bool>,
+        status_handle_slot: &Arc<Mutex<Option<ServiceStatusHandle>>>,
+        stage: &str,
+        detail: &str,
+    ) {
+        report_stop_pending(status_handle_slot);
+        let _ = shutdown_tx.send(true);
+        append_service_startup_diagnostic(stage, detail);
+    }
+
+    fn report_stop_pending(status_handle_slot: &Arc<Mutex<Option<ServiceStatusHandle>>>) {
+        let status_handle = {
+            let slot = status_handle_slot
+                .lock()
+                .expect("service status handle slot");
+            *slot
+        };
+        let Some(status_handle) = status_handle else {
+            append_service_startup_diagnostic(
+                "stop_pending_skipped",
+                "service status handle not registered yet",
+            );
+            return;
+        };
+        match status_handle.set_service_status(service_status(ServiceState::StopPending)) {
+            Ok(()) => append_service_startup_diagnostic(
+                "stop_pending",
+                "service control handler reported StopPending",
+            ),
+            Err(error) => append_service_startup_diagnostic(
+                "stop_pending_failed",
+                &format!("failed to report StopPending: {error:#}"),
+            ),
+        }
+    }
+
     async fn run_daemon(
-        mut shutdown_rx: watch::Receiver<bool>,
+        shutdown_rx: watch::Receiver<bool>,
         allowed_user_sid: String,
         mark_running: impl FnOnce() -> windows_service::Result<()>,
     ) -> Result<()> {
@@ -209,17 +274,30 @@ mod service_entry {
             &runtime_task_health_json(&runtime),
         );
 
-        let result = Server::builder()
+        let shutdown_monitor = shutdown_rx.clone();
+        let serve = Server::builder()
             .add_service(control_plane)
-            .serve_with_incoming_shutdown(incoming, async move {
-                while !*shutdown_rx.borrow() {
-                    if shutdown_rx.changed().await.is_err() {
-                        break;
+            .serve_with_incoming_shutdown(incoming, wait_for_shutdown_request(shutdown_rx));
+        tokio::pin!(serve);
+        let result = tokio::select! {
+            result = &mut serve => result.context("gRPC named-pipe service failure"),
+            _ = wait_for_shutdown_request(shutdown_monitor) => {
+                append_service_startup_diagnostic(
+                    "serve_shutdown_requested",
+                    "shutdown requested; waiting briefly for gRPC control-plane drain",
+                );
+                match time::timeout(SERVICE_CONTROL_PLANE_STOP_GRACE, &mut serve).await {
+                    Ok(result) => result.context("gRPC named-pipe service failure"),
+                    Err(_) => {
+                        append_service_startup_diagnostic(
+                            "serve_shutdown_timeout",
+                            "gRPC control-plane drain exceeded stop grace; aborting service runtime",
+                        );
+                        Ok(())
                     }
                 }
-            })
-            .await
-            .context("gRPC named-pipe service failure");
+            }
+        };
         match &result {
             Ok(()) => append_service_startup_diagnostic("serve_exited", "gRPC service exited"),
             Err(error) => append_service_startup_diagnostic("serve_error", &format!("{error:#}")),
@@ -229,17 +307,33 @@ mod service_entry {
             &runtime_task_health_json(&runtime),
         );
 
-        shutdown_runtime(&runtime).await;
-        append_service_startup_diagnostic(
-            "runtime_tasks_stopped",
-            "background runtime tasks stopped",
-        );
+        match time::timeout(SERVICE_RUNTIME_TASK_STOP_GRACE, shutdown_runtime(&runtime)).await {
+            Ok(()) => append_service_startup_diagnostic(
+                "runtime_tasks_stopped",
+                "background runtime tasks stopped",
+            ),
+            Err(_) => append_service_startup_diagnostic(
+                "runtime_tasks_shutdown_timeout",
+                "runtime task shutdown exceeded stop grace; service process will exit",
+            ),
+        }
         append_service_startup_diagnostic(
             "runtime_tasks_health_stopped",
             &runtime_task_health_json(&runtime),
         );
 
         result
+    }
+
+    async fn wait_for_shutdown_request(mut shutdown_rx: watch::Receiver<bool>) {
+        loop {
+            if *shutdown_rx.borrow_and_update() {
+                break;
+            }
+            if shutdown_rx.changed().await.is_err() {
+                break;
+            }
+        }
     }
 
     fn startup_arguments(service_arguments: Vec<OsString>) -> Vec<OsString> {
@@ -291,8 +385,16 @@ mod service_entry {
             controls_accepted,
             exit_code,
             checkpoint: 0,
-            wait_hint: Duration::from_secs(10),
+            wait_hint: service_wait_hint(current_state),
             process_id: None,
+        }
+    }
+
+    fn service_wait_hint(current_state: ServiceState) -> Duration {
+        match current_state {
+            ServiceState::StartPending => SERVICE_START_WAIT_HINT,
+            ServiceState::StopPending => SERVICE_STOP_WAIT_HINT,
+            _ => Duration::ZERO,
         }
     }
 
@@ -391,6 +493,15 @@ mod service_entry {
                 err.to_string()
                     .contains("service allowed user SID argument was invalid")
             );
+        }
+
+        #[test]
+        fn stop_pending_status_uses_short_wait_hint_and_accepts_no_controls() {
+            let status = service_status(ServiceState::StopPending);
+
+            assert_eq!(status.current_state, ServiceState::StopPending);
+            assert_eq!(status.controls_accepted, ServiceControlAccept::empty());
+            assert_eq!(status.wait_hint, SERVICE_STOP_WAIT_HINT);
         }
     }
 }
