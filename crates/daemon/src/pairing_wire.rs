@@ -27,6 +27,7 @@ const NEARBY_CHALLENGE_TTL_SECONDS: u64 = 120;
 const NEARBY_PAIRING_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const NEARBY_PAIRING_IO_TIMEOUT: Duration = Duration::from_secs(6);
 const NEARBY_PAIRING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
+const NEARBY_PAIRING_CANDIDATE_STAGGER: Duration = Duration::from_millis(75);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -604,25 +605,61 @@ async fn send_nearby_pairing_request_to_candidates(
     targets: &[PairingTarget],
     request: PairingWireRequest,
 ) -> Result<(PairingWireResponse, String)> {
+    if targets.is_empty() {
+        anyhow::bail!("nearby pairing request has no endpoint candidates");
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(targets.len());
+    let mut handles = Vec::with_capacity(targets.len());
+    for (ordinal, target) in targets.iter().cloned().enumerate() {
+        let tx = tx.clone();
+        let request = request.clone();
+        handles.push(tokio::spawn(async move {
+            if ordinal > 0 {
+                time::sleep(stagger_delay(NEARBY_PAIRING_CANDIDATE_STAGGER, ordinal)).await;
+            }
+            let result = send_nearby_pairing_request(&target.endpoint, request).await;
+            let _ = tx.send((ordinal, target, result)).await;
+        }));
+    }
+    drop(tx);
+
     let mut attempts = Vec::new();
-    for target in targets {
-        match send_nearby_pairing_request(&target.endpoint, request.clone()).await {
-            Ok(response) => return Ok((response, target.host.clone())),
+    while let Some((ordinal, target, result)) = rx.recv().await {
+        match result {
+            Ok(response) => {
+                for handle in handles {
+                    handle.abort();
+                }
+                return Ok((response, target.host));
+            }
             Err(error) => {
-                attempts.push(PairingReachabilityAttempt {
-                    label: pairing_attempt_label(&target.candidate, target.role),
-                    outcome: classify_pairing_reachability_error(&error),
-                    source: target.candidate.source,
-                    role: target.role,
-                });
+                attempts.push((
+                    ordinal,
+                    PairingReachabilityAttempt {
+                        label: pairing_attempt_label(&target.candidate, target.role),
+                        outcome: classify_pairing_reachability_error(&error),
+                        source: target.candidate.source,
+                        role: target.role,
+                    },
+                ));
             }
         }
     }
 
     if !attempts.is_empty() {
+        attempts.sort_by_key(|(ordinal, _)| *ordinal);
+        let attempts = attempts
+            .into_iter()
+            .map(|(_, attempt)| attempt)
+            .collect::<Vec<_>>();
         anyhow::bail!("{}", pairing_reachability_failure_message(&attempts));
     }
     anyhow::bail!("nearby pairing request has no endpoint candidates")
+}
+
+fn stagger_delay(base: Duration, ordinal: usize) -> Duration {
+    base.saturating_mul(ordinal.try_into().unwrap_or(u32::MAX))
 }
 
 fn nearby_pairing_targets(
@@ -1009,6 +1046,23 @@ async fn process_pairing_request(
                 attempt_id = %pending.attempt_id.as_deref().unwrap_or("none"),
                 "nearby pairing request pending local approval"
             );
+            if role == NearbyPairingRole::RoleReversalRequest {
+                state.record_transport_event(crate::state::TransportEventRecord {
+                    timestamp: chrono::Utc::now(),
+                    direction: "incoming".to_string(),
+                    kind: "pairing_role_reversal_requested".to_string(),
+                    peer_id: requester_machine_id,
+                    detail: format!(
+                        "role_reversal=requested attempt_id={}",
+                        pending
+                            .attempt_id
+                            .as_deref()
+                            .map(|_| "present")
+                            .unwrap_or("missing")
+                    ),
+                    size_bytes: 0,
+                });
+            }
 
             Ok(PairingWireResponse::Pending {
                 request_id: pending.request_id,
@@ -1754,6 +1808,12 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].role, NearbyPairingRole::RoleReversalRequest);
         assert_eq!(pending[0].attempt_id.as_deref(), Some("attempt-1"));
+        assert!(state.transport_events().await.iter().any(|event| {
+            event.kind == "pairing_role_reversal_requested"
+                && event.peer_id == "requester-machine"
+                && event.detail.contains("role_reversal=requested")
+                && event.detail.contains("attempt_id=present")
+        }));
 
         let retry = process_pairing_request(
             &state,

@@ -6,9 +6,11 @@ use peer_transport::{
     wait_for_runtime_wake_or_backoff,
 };
 
+use super::session::{connect_outbound_authenticated, run_authenticated_outbound_session};
 use super::*;
 
 const OUTBOUND_FAILURE_CONNECTED_GRACE: Duration = Duration::from_secs(10);
+const TRANSPORT_CANDIDATE_STAGGER: Duration = Duration::from_millis(75);
 
 pub(super) async fn listener_loop(state: AppState, mut listeners: Vec<TcpListener>) {
     if listeners.is_empty() {
@@ -141,6 +143,12 @@ async fn peer_worker(state: AppState, peer_id: String) {
             return;
         };
 
+        if state.has_active_transport_session(&peer_id) {
+            wait_for_reconcile_or_backoff(&reconcile_wake, Duration::from_secs(1)).await;
+            backoff_secs = 1;
+            continue;
+        }
+
         let discovered_endpoints = state.discovered_endpoint_candidates(&peer_id).await;
         let target_candidates = outbound_transport_candidates(&peer.address, &discovered_endpoints);
         if target_candidates.is_empty() {
@@ -149,22 +157,10 @@ async fn peer_worker(state: AppState, peer_id: String) {
             continue;
         }
 
-        let mut connected = false;
-        let mut last_error: Option<anyhow::Error> = None;
-        for target in &target_candidates {
-            match connect_and_run_outbound(state.clone(), &peer_id, &target.endpoint).await {
-                Ok(()) => {
-                    backoff_secs = 1;
-                    connected = true;
-                    break;
-                }
-                Err(error) => {
-                    last_error = Some(error);
-                }
-            }
-        }
-
-        if !connected {
+        if let Err(error) =
+            connect_and_run_outbound_to_candidates(state.clone(), &peer_id, &target_candidates)
+                .await
+        {
             state.record_transport_event(crate::state::TransportEventRecord {
                 timestamp: chrono::Utc::now(),
                 direction: "outbound".to_string(),
@@ -179,7 +175,7 @@ async fn peer_worker(state: AppState, peer_id: String) {
                 target_candidates = %redacted_tcp_endpoint_labels_for_runtime(&target_candidates),
                 discovered_endpoint_count = discovered_endpoints.len(),
                 discovered_endpoints = %redacted_tcp_socketaddr_labels_for_runtime(&discovered_endpoints),
-                error = %transport_error_summary(last_error.as_ref()),
+                error = %transport_error_summary(Some(&error)),
                 "outbound connect failed"
             );
             let keep_recent_connected = state
@@ -197,8 +193,95 @@ async fn peer_worker(state: AppState, peer_id: String) {
 
             wait_for_reconcile_or_backoff(&reconcile_wake, Duration::from_secs(backoff_secs)).await;
             backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECONDS);
+        } else {
+            backoff_secs = 1;
         }
     }
+}
+
+async fn connect_and_run_outbound_to_candidates(
+    state: AppState,
+    peer_id: &str,
+    target_candidates: &[TcpEndpointCandidate],
+) -> Result<()> {
+    let (stream, selected) =
+        connect_first_authenticated_outbound_candidate(state.clone(), peer_id, target_candidates)
+            .await?;
+    state.record_transport_event(crate::state::TransportEventRecord {
+        timestamp: chrono::Utc::now(),
+        direction: "outbound".to_string(),
+        kind: "transport_candidate_selected".to_string(),
+        peer_id: peer_id.to_string(),
+        detail: format!(
+            "transport=direct_initiated selected=[{}]",
+            selected.redacted_provenance_label()
+        ),
+        size_bytes: 0,
+    });
+    run_authenticated_outbound_session(state, peer_id.to_string(), stream).await
+}
+
+async fn connect_first_authenticated_outbound_candidate(
+    state: AppState,
+    peer_id: &str,
+    target_candidates: &[TcpEndpointCandidate],
+) -> Result<(tokio_rustls::TlsStream<TcpStream>, TcpEndpointCandidate)> {
+    if target_candidates.is_empty() {
+        anyhow::bail!("transport has no endpoint candidates");
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(target_candidates.len());
+    let mut handles = Vec::with_capacity(target_candidates.len());
+    for (ordinal, candidate) in target_candidates.iter().cloned().enumerate() {
+        let tx = tx.clone();
+        let peer_id = peer_id.to_string();
+        let state = state.clone();
+        handles.push(tokio::spawn(async move {
+            if ordinal > 0 {
+                time::sleep(stagger_delay(TRANSPORT_CANDIDATE_STAGGER, ordinal)).await;
+            }
+            let result = connect_outbound_authenticated(state, &peer_id, &candidate.endpoint).await;
+            let _ = tx.send((ordinal, candidate, result)).await;
+        }));
+    }
+    drop(tx);
+
+    let mut failures = Vec::new();
+    while let Some((ordinal, candidate, result)) = rx.recv().await {
+        match result {
+            Ok(stream) => {
+                for handle in handles {
+                    handle.abort();
+                }
+                return Ok((stream, candidate));
+            }
+            Err(error) => failures.push((ordinal, candidate, error)),
+        }
+    }
+
+    for handle in handles {
+        if !handle.is_finished() {
+            handle.abort();
+        }
+    }
+
+    failures.sort_by_key(|(ordinal, _, _)| *ordinal);
+    let attempted = failures
+        .iter()
+        .map(|(_, candidate, error)| {
+            format!(
+                "{} {}",
+                candidate.redacted_provenance_label(),
+                transport_error_summary(Some(error))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!("transport candidate racing failed; attempted=[{attempted}]")
+}
+
+fn stagger_delay(base: Duration, ordinal: usize) -> Duration {
+    base.saturating_mul(ordinal.try_into().unwrap_or(u32::MAX))
 }
 
 fn should_preserve_connected_after_outbound_failure(peer: &crate::config::PeerConfig) -> bool {

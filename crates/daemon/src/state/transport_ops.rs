@@ -80,6 +80,23 @@ impl AppState {
             .bind_pending_transport_session_to_peer(session_id, peer_id)
     }
 
+    pub fn allocate_transport_session_id(&self) -> u64 {
+        self.transport.allocate_transport_session_id()
+    }
+
+    pub fn claim_transport_session(&self, peer_id: &str, session_id: u64) -> TransportSessionClaim {
+        self.transport.claim_transport_session(peer_id, session_id)
+    }
+
+    pub fn clear_active_transport_session(&self, peer_id: &str, session_id: u64) -> bool {
+        self.transport
+            .clear_active_transport_session(peer_id, session_id)
+    }
+
+    pub fn has_active_transport_session(&self, peer_id: &str) -> bool {
+        self.transport.has_active_transport_session(peer_id)
+    }
+
     pub async fn clear_transport_session_registration(&self, session_id: u64) {
         self.transport
             .clear_transport_session_registration(session_id)

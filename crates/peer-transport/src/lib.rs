@@ -325,6 +325,14 @@ pub struct TransportSessionRegistry {
     closed: bool,
     pending_abort_handles: HashMap<u64, AbortHandle>,
     abort_handles_by_peer: HashMap<String, HashMap<u64, AbortHandle>>,
+    active_session_by_peer: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportSessionClaim {
+    Claimed,
+    Duplicate { active_session_id: u64 },
+    Closed,
 }
 
 impl Default for TransportRuntimeState {
@@ -368,6 +376,7 @@ impl TransportRuntimeState {
                     .drain()
                     .flat_map(|(_, sessions)| sessions.into_values())
                     .collect::<Vec<_>>();
+                registry.active_session_by_peer.clear();
                 (pending_sessions, peer_sessions)
             } else {
                 (Vec::new(), Vec::new())
@@ -466,6 +475,43 @@ impl TransportRuntimeState {
         session_id
     }
 
+    pub fn claim_transport_session(&self, peer_id: &str, session_id: u64) -> TransportSessionClaim {
+        let Ok(mut registry) = self.transport_session_registry.lock() else {
+            return TransportSessionClaim::Closed;
+        };
+        if registry.closed {
+            return TransportSessionClaim::Closed;
+        }
+        if let Some(active_session_id) = registry.active_session_by_peer.get(peer_id).copied() {
+            return TransportSessionClaim::Duplicate { active_session_id };
+        }
+        registry
+            .active_session_by_peer
+            .insert(peer_id.to_string(), session_id);
+        TransportSessionClaim::Claimed
+    }
+
+    pub fn clear_active_transport_session(&self, peer_id: &str, session_id: u64) -> bool {
+        let Ok(mut registry) = self.transport_session_registry.lock() else {
+            return false;
+        };
+        if registry
+            .active_session_by_peer
+            .get(peer_id)
+            .is_some_and(|active_session_id| *active_session_id == session_id)
+        {
+            registry.active_session_by_peer.remove(peer_id);
+            return true;
+        }
+        false
+    }
+
+    pub fn has_active_transport_session(&self, peer_id: &str) -> bool {
+        self.transport_session_registry
+            .lock()
+            .is_ok_and(|registry| registry.active_session_by_peer.contains_key(peer_id))
+    }
+
     pub fn register_transport_session_for_peer(
         &self,
         peer_id: &str,
@@ -528,6 +574,9 @@ impl TransportRuntimeState {
         for peer_id in empty_peers {
             registry.abort_handles_by_peer.remove(&peer_id);
         }
+        registry
+            .active_session_by_peer
+            .retain(|_, active_session_id| *active_session_id != session_id);
     }
 
     pub async fn abort_transport_sessions_for_peer(&self, peer_id: &str) -> usize {
@@ -535,7 +584,13 @@ impl TransportRuntimeState {
             .transport_session_registry
             .lock()
             .ok()
-            .and_then(|mut registry| registry.abort_handles_by_peer.remove(peer_id))
+            .map(|mut registry| {
+                registry.active_session_by_peer.remove(peer_id);
+                registry
+                    .abort_handles_by_peer
+                    .remove(peer_id)
+                    .unwrap_or_default()
+            })
             .unwrap_or_default();
         let aborted = sessions.len();
         for handle in sessions.into_values() {
@@ -563,6 +618,7 @@ impl TransportRuntimeState {
                     .drain()
                     .flat_map(|(_, sessions)| sessions.into_values())
                     .collect::<Vec<_>>();
+                registry.active_session_by_peer.clear();
                 (pending_sessions, peer_sessions)
             } else {
                 (Vec::new(), Vec::new())
@@ -602,5 +658,50 @@ mod tests {
             0,
             "refused registration must not leave a drainable session behind"
         );
+    }
+
+    #[test]
+    fn first_transport_session_claim_wins_until_cleared() {
+        let state = TransportRuntimeState::default();
+
+        assert_eq!(
+            state.claim_transport_session("peer-a", 10),
+            TransportSessionClaim::Claimed
+        );
+        assert!(state.has_active_transport_session("peer-a"));
+        assert_eq!(
+            state.claim_transport_session("peer-a", 11),
+            TransportSessionClaim::Duplicate {
+                active_session_id: 10
+            }
+        );
+        assert!(
+            !state.clear_active_transport_session("peer-a", 11),
+            "non-owner session must not clear the active claim"
+        );
+        assert!(state.clear_active_transport_session("peer-a", 10));
+        assert!(!state.has_active_transport_session("peer-a"));
+        assert_eq!(
+            state.claim_transport_session("peer-a", 12),
+            TransportSessionClaim::Claimed
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_peer_sessions_clears_active_claim() {
+        let state = TransportRuntimeState::default();
+        let child = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let session_id = state.register_transport_session_for_peer("peer-a", child.abort_handle());
+        assert_eq!(
+            state.claim_transport_session("peer-a", session_id),
+            TransportSessionClaim::Claimed
+        );
+
+        assert_eq!(state.abort_transport_sessions_for_peer("peer-a").await, 1);
+        assert!(!state.has_active_transport_session("peer-a"));
+        let join_error = child.await.expect_err("registered child should be aborted");
+        assert!(join_error.is_cancelled());
     }
 }

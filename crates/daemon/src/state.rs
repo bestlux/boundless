@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 pub use peer_transport::{
     MAX_TRANSPORT_EVENTS, OutboundPayload, OutgoingPeerQueues, RuntimeWakeSignal,
-    TransportEventRecord,
+    TransportEventRecord, TransportSessionClaim,
 };
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio::sync::{RwLock, watch};

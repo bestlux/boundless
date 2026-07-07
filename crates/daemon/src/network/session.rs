@@ -62,6 +62,29 @@ impl AuthenticatedSession {
     }
 }
 
+struct ActiveTransportSessionGuard {
+    state: AppState,
+    peer_id: String,
+    session_id: u64,
+}
+
+impl ActiveTransportSessionGuard {
+    fn new(state: AppState, peer_id: String, session_id: u64) -> Self {
+        Self {
+            state,
+            peer_id,
+            session_id,
+        }
+    }
+}
+
+impl Drop for ActiveTransportSessionGuard {
+    fn drop(&mut self) {
+        self.state
+            .clear_active_transport_session(&self.peer_id, self.session_id);
+    }
+}
+
 enum SessionExitReason {
     ReconnectRequested,
     StateDropped,
@@ -589,11 +612,11 @@ impl SessionRuntime {
     }
 }
 
-pub(super) async fn connect_and_run_outbound(
+pub(super) async fn connect_outbound_authenticated(
     state: AppState,
     peer_id: &str,
     address: &str,
-) -> Result<()> {
+) -> Result<tokio_rustls::TlsStream<TcpStream>> {
     let socket = tcp_connect_with_timeout(address).await?;
     configure_low_latency_socket(&socket).context("configure outbound low-latency socket")?;
 
@@ -603,15 +626,25 @@ pub(super) async fn connect_and_run_outbound(
         .connect(server_name, socket)
         .await
         .with_context(|| format!("tls connect {address}"))?;
+    let stream = tokio_rustls::TlsStream::Client(stream);
+    let authenticated_peer_id = authenticated_peer_machine_id(&state, &stream).await?;
+    if peer_id != authenticated_peer_id {
+        bail!(
+            "peer identity mismatch: expected {} from topology, authenticated {} from TLS",
+            peer_id,
+            authenticated_peer_id
+        );
+    }
 
-    run_session(
-        state,
-        Some(peer_id.to_string()),
-        tokio_rustls::TlsStream::Client(stream),
-        true,
-        None,
-    )
-    .await
+    Ok(stream)
+}
+
+pub(super) async fn run_authenticated_outbound_session(
+    state: AppState,
+    peer_id: String,
+    stream: tokio_rustls::TlsStream<TcpStream>,
+) -> Result<()> {
+    run_authenticated_session(state, peer_id, stream, true, None).await
 }
 
 async fn tcp_connect_with_timeout(address: &str) -> Result<TcpStream> {
@@ -768,9 +801,49 @@ pub(super) async fn run_authenticated_session<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    if let Some(session_id) = session_registration_id {
+    if let Some(session_id) = session_registration_id.filter(|session_id| *session_id != 0) {
         state.bind_pending_transport_session_to_peer(session_id, &authenticated_peer_id);
     }
+    let ownership_session_id = session_registration_id
+        .filter(|session_id| *session_id != 0)
+        .unwrap_or_else(|| state.allocate_transport_session_id());
+    match state.claim_transport_session(&authenticated_peer_id, ownership_session_id) {
+        crate::state::TransportSessionClaim::Claimed => {
+            state.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: transport_session_direction(is_outbound).to_string(),
+                kind: "transport_session_authenticated".to_string(),
+                peer_id: authenticated_peer_id.clone(),
+                detail: format!(
+                    "transport={} ownership=claimed",
+                    transport_initiation_label(is_outbound)
+                ),
+                size_bytes: 0,
+            });
+        }
+        crate::state::TransportSessionClaim::Duplicate { .. } => {
+            state.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: transport_session_direction(is_outbound).to_string(),
+                kind: "transport_session_duplicate".to_string(),
+                peer_id: authenticated_peer_id,
+                detail: format!(
+                    "transport={} ownership=duplicate active_session=present",
+                    transport_initiation_label(is_outbound)
+                ),
+                size_bytes: 0,
+            });
+            return Ok(());
+        }
+        crate::state::TransportSessionClaim::Closed => {
+            bail!("transport session registry closed");
+        }
+    }
+    let _active_session_guard = ActiveTransportSessionGuard::new(
+        state.clone(),
+        authenticated_peer_id.clone(),
+        ownership_session_id,
+    );
 
     let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -856,6 +929,18 @@ where
     }
 
     session_result.map(|_| ())
+}
+
+fn transport_session_direction(is_outbound: bool) -> &'static str {
+    if is_outbound { "outbound" } else { "incoming" }
+}
+
+fn transport_initiation_label(is_outbound: bool) -> &'static str {
+    if is_outbound {
+        "direct_initiated"
+    } else {
+        "reverse_initiated"
+    }
 }
 
 pub(super) async fn reconnect_requested_for_peer(

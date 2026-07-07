@@ -61,11 +61,11 @@ use outbound::flush_outgoing_payloads;
 use runtime::{listener_loop, supervisor_loop};
 #[cfg(test)]
 use runtime::{outbound_target_candidates, wait_for_reconcile_or_backoff};
+use session::handle_incoming_connection;
 #[cfg(test)]
 use session::{
     configure_low_latency_socket, reconnect_requested_for_peer, run_authenticated_session,
 };
-use session::{connect_and_run_outbound, handle_incoming_connection};
 #[cfg(test)]
 use tls::parse_server_name;
 use tls::{
@@ -1042,6 +1042,66 @@ mod tests {
                 .iter()
                 .any(|peer| peer.peer_id == peer_id && peer.connected),
             "session close should mark the peer disconnected"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn authenticated_duplicate_session_is_recorded_and_rejected() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let (first_stream, mut first_remote) = TransportFaultHarness::pair();
+
+        let first_session = tokio::spawn(run_authenticated_session(
+            state.clone(),
+            peer_id.clone(),
+            first_stream,
+            false,
+            None,
+        ));
+        first_remote
+            .read_until("first local hello", |frame| {
+                matches!(frame, WireMessage::Hello { .. })
+            })
+            .await;
+        assert!(
+            state.has_active_transport_session(&peer_id),
+            "first authenticated session should own the peer"
+        );
+
+        let (duplicate_stream, _duplicate_remote) = TransportFaultHarness::pair();
+        run_authenticated_session(
+            state.clone(),
+            peer_id.clone(),
+            duplicate_stream,
+            false,
+            None,
+        )
+        .await
+        .expect("duplicate session should be closed without failing caller");
+
+        let events = state.transport_events().await;
+        assert!(events.iter().any(|event| {
+            event.kind == "transport_session_authenticated"
+                && event.peer_id == peer_id
+                && event.detail.contains("transport=reverse_initiated")
+                && event.detail.contains("ownership=claimed")
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == "transport_session_duplicate"
+                && event.peer_id == peer_id
+                && event.detail.contains("transport=reverse_initiated")
+                && event.detail.contains("ownership=duplicate")
+        }));
+
+        first_remote.disconnect().await;
+        first_session
+            .await
+            .expect("first session task joins")
+            .expect("disconnect closes first session cleanly");
+        assert!(
+            !state.has_active_transport_session(&peer_id),
+            "first session exit should clear active ownership"
         );
 
         let _ = std::fs::remove_dir_all(root);
