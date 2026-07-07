@@ -8,6 +8,7 @@ param(
 
     [switch]$ForceLocalCleanup,
     [switch]$IncludeServiceProfile,
+    [switch]$SelfTest,
 
     [string]$Endpoint = "npipe://./pipe/boundlessd-api",
     [string]$InstallRoot = "",
@@ -85,6 +86,19 @@ function Invoke-LocalFullReset {
     Remove-IfExists -Path $TargetDataRoot
 }
 
+function Get-MachineIdFromStatusOutput {
+    param([object[]]$StatusOutput)
+
+    foreach ($line in $StatusOutput) {
+        # daemon status emits key=value pairs on a single space-separated line.
+        if ($line -match '(?:^|\s)machine_id=(\S+)') {
+            return $Matches[1].Trim()
+        }
+    }
+
+    return $null
+}
+
 function Get-DaemonMachineId {
     param(
         [string]$BoundlessCtl,
@@ -97,13 +111,30 @@ function Get-DaemonMachineId {
         throw "boundlessctl daemon status exited with $($LASTEXITCODE): $statusOutput"
     }
 
-    foreach ($line in $statusOutput) {
-        if ($line -match '^machine_id=(.+)$') {
-            return $Matches[1].Trim()
-        }
+    $machineId = Get-MachineIdFromStatusOutput -StatusOutput $statusOutput
+    if ($null -ne $machineId) {
+        return $machineId
     }
 
     throw "boundlessctl daemon status did not report machine_id"
+}
+
+function Invoke-ResetSelfTest {
+    $singleLine = "running=true daemon_version=5.0.0 machine_id=4f0c6bce-6c10-4df9-b8b5-3a9a3fbb5da1 peers=1 protocol=4.2.0"
+    if ((Get-MachineIdFromStatusOutput -StatusOutput @($singleLine)) -ne "4f0c6bce-6c10-4df9-b8b5-3a9a3fbb5da1") {
+        throw "machine_id must parse from single-line daemon status output"
+    }
+
+    $multiLine = @("running=true", "machine_id=abc-123", "peers=0")
+    if ((Get-MachineIdFromStatusOutput -StatusOutput $multiLine) -ne "abc-123") {
+        throw "machine_id must parse from line-per-field daemon status output"
+    }
+
+    if ($null -ne (Get-MachineIdFromStatusOutput -StatusOutput @("running=true peers=0"))) {
+        throw "missing machine_id must return null"
+    }
+
+    Write-Host "self_test=pass"
 }
 
 function Invoke-DaemonReset {
@@ -140,6 +171,11 @@ function Invoke-LocalResetTarget {
     } else {
         Invoke-LocalFullReset -TargetConfigPath $TargetConfigPath -TargetDataRoot $TargetDataRoot -TargetSecurityRoot $TargetSecurityRoot
     }
+}
+
+if ($SelfTest) {
+    Invoke-ResetSelfTest
+    return
 }
 
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
