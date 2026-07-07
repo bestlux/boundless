@@ -33,6 +33,7 @@ version = "5.0.0"
 dependencies = [
  "anyhow",
  "app-services",
+ "core-clipboard",
  "ipc-api",
  "tokio",
  "tokio-stream",
@@ -166,6 +167,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "core-clipboard",
  "core-input",
  "dirs",
  "serde",
@@ -504,6 +506,7 @@ dependencies = [
  "app-services",
  "clap",
  "control-plane-client",
+ "core-clipboard",
  "core-input",
  "eframe",
  "egui",

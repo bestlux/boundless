@@ -538,3 +538,86 @@ async fn broker_observations_feed_capture_state_and_release_synthesis() {
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[tokio::test]
+async fn clipboard_broker_exchange_routes_local_payloads_to_connected_peers() {
+    let (state, root) = service_mode_broker_state("boundless-broker-clipboard-local-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+
+    let outcome = state
+        .exchange_clipboard_broker(
+            allowed_client(),
+            &attach.broker_token,
+            Some(ClipboardPayload::Text("broker-local".to_string())),
+            None,
+        )
+        .await;
+
+    assert!(outcome.accepted);
+    assert!(outcome.remote_payload.is_none());
+    let outgoing = state.drain_outgoing(&peer_id).await;
+    assert!(matches!(
+        outgoing.as_slice(),
+        [OutboundPayload::ClipboardText { text }] if text == "broker-local"
+    ));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn clipboard_broker_remote_payload_waits_for_apply_report_before_echo_suppression() {
+    let (state, root) = service_mode_broker_state("boundless-broker-clipboard-remote-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+    state
+        .enqueue_remote_clipboard_text(&peer_id, "remote".to_string())
+        .await
+        .expect("enqueue remote clipboard");
+
+    let staged = state
+        .exchange_clipboard_broker(allowed_client(), &attach.broker_token, None, None)
+        .await;
+    assert!(staged.accepted);
+    let remote = staged
+        .remote_payload
+        .as_ref()
+        .expect("remote payload should be staged for broker");
+    assert!(matches!(
+        &remote.payload,
+        ClipboardPayload::Text(text) if text == "remote"
+    ));
+    assert_eq!(remote.retry_count, 0);
+    assert!(
+        state.dequeue_remote_clipboard_payload().await.is_none(),
+        "staged remote payload should be broker-inflight, not still queued"
+    );
+
+    let reported = state
+        .exchange_clipboard_broker(
+            allowed_client(),
+            &attach.broker_token,
+            Some(ClipboardPayload::Text("remote".to_string())),
+            Some(ClipboardBrokerApplyReport {
+                source_peer_id: remote.peer_id.clone(),
+                hash: remote.hash.clone(),
+                applied: true,
+                message: String::new(),
+            }),
+        )
+        .await;
+    assert!(reported.accepted);
+    let outgoing = state.drain_outgoing(&peer_id).await;
+    assert!(
+        outgoing.is_empty(),
+        "broker echo after remote apply must be suppressed"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}

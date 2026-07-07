@@ -3,33 +3,36 @@ use std::{path::PathBuf, time::Duration};
 use app_services::{
     SharedControlPlaneApp, commands as app_commands,
     queries::{
-        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
+        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ClipboardRuntimeSnapshot, ConsoleSnapshot,
         FileTransferConfigSnapshot, FileTransferSnapshot, InputHandoffConfigSnapshot,
         InputRuntimeSnapshot, StatusSnapshot, TransportEventSnapshot, UiDiscoveredPeer,
         UiPairedPeer, UiPendingRequest, UiSnapshot,
     },
 };
+use core_clipboard::ClipboardPayload;
 use tokio::{sync::mpsc, time};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use ipc_api::boundless::v1::{
-    AntiIdleConfigReply, AntiIdleSetRequest, AntiIdleStatusReply, ConsoleSnapshotReply,
-    DiagnosticsDumpReply, DiagnosticsDumpRequest, DiscoveredPeerInfo, Empty, FeatureListReply,
-    FeatureSetRequest, FileTransferActionRequest, FileTransferConfigReply, FileTransferInfo,
-    FileTransferSetRequest, HotkeySetRequest, HotkeyTriggerRequest, ImportTrustBundleRequest,
-    InputBrokerAttachReply, InputBrokerAttachRequest, InputBrokerDetachRequest,
-    InputBrokerExchangeReply, InputBrokerExchangeRequest, InputBrokerInjectFrame,
-    InputCaptureTargetReply, InputCaptureTargetRequest, InputHandoffConfigReply,
-    InputHandoffSetRequest, InputOwnerReply, InputOwnerRequest, InputRuntimeStatusReply,
-    LayoutReply, LayoutSetRequest, NearbyJoinStartRequest, NearbyJoinStatusReply,
-    NearbyJoinStatusRequest, NearbyPairingCompletionReply, NearbyPairingDecisionRequest,
-    NearbyPairingRequestInfo, NearbyRequestCodeStartReply, NearbyRequestCodeStartRequest,
-    NearbySubmitCodeRequest, OperationReply, PairCreateCodeReply, PairCreateCodeRequest,
-    PairJoinReply, PairJoinRequest, PeerInfo, PeerListReply, RemovePeerRequest, RotateTrustRequest,
-    SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest,
-    SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest, TransportEvent,
-    TransportEventsReply, TrustBundleReply, UiSnapshotReply,
+    AntiIdleConfigReply, AntiIdleSetRequest, AntiIdleStatusReply, ClipboardBrokerExchangeReply,
+    ClipboardBrokerExchangeRequest, ClipboardBrokerPayload, ClipboardRuntimeStatusReply,
+    ConsoleSnapshotReply, DiagnosticsDumpReply, DiagnosticsDumpRequest, DiscoveredPeerInfo, Empty,
+    FeatureListReply, FeatureSetRequest, FileTransferActionRequest, FileTransferConfigReply,
+    FileTransferInfo, FileTransferSetRequest, HotkeySetRequest, HotkeyTriggerRequest,
+    ImportTrustBundleRequest, InputBrokerAttachReply, InputBrokerAttachRequest,
+    InputBrokerDetachRequest, InputBrokerExchangeReply, InputBrokerExchangeRequest,
+    InputBrokerInjectFrame, InputCaptureTargetReply, InputCaptureTargetRequest,
+    InputHandoffConfigReply, InputHandoffSetRequest, InputOwnerReply, InputOwnerRequest,
+    InputRuntimeStatusReply, LayoutReply, LayoutSetRequest, NearbyJoinStartRequest,
+    NearbyJoinStatusReply, NearbyJoinStatusRequest, NearbyPairingCompletionReply,
+    NearbyPairingDecisionRequest, NearbyPairingRequestInfo, NearbyRequestCodeStartReply,
+    NearbyRequestCodeStartRequest, NearbySubmitCodeRequest, OperationReply, PairCreateCodeReply,
+    PairCreateCodeRequest, PairJoinReply, PairJoinRequest, PeerInfo, PeerListReply,
+    RemovePeerRequest, RotateTrustRequest, SafeResetRequest, SendClipboardImageRequest,
+    SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest, SendInputMoveRequest,
+    StatusReply, StatusRequest, TransportEvent, TransportEventsReply, TrustBundleReply,
+    UiSnapshotReply, clipboard_broker_payload,
     control_plane_service_server::{ControlPlaneService, ControlPlaneServiceServer},
 };
 
@@ -824,6 +827,38 @@ impl ControlPlaneService for ControlPlaneApi {
         }))
     }
 
+    async fn exchange_clipboard_broker(
+        &self,
+        request: Request<ClipboardBrokerExchangeRequest>,
+    ) -> Result<Response<ClipboardBrokerExchangeReply>, Status> {
+        let verified_client = verified_control_client(&request);
+        let request = request.into_inner();
+        let reply = self
+            .app
+            .exchange_clipboard_broker(app_commands::ClipboardBrokerExchangeCommand {
+                verified_client,
+                broker_token: request.broker_token,
+                local_payload: clipboard_payload_from_proto(request.local_payload),
+                apply_report: request.apply_report.map(|report| {
+                    app_commands::ClipboardBrokerApplyReportCommand {
+                        source_peer_id: report.source_peer_id,
+                        hash: report.hash,
+                        applied: report.applied,
+                        message: report.message,
+                    }
+                }),
+            })
+            .await
+            .map_err(|error| Status::internal(format!("exchange clipboard broker: {error:#}")))?;
+        Ok(Response::new(ClipboardBrokerExchangeReply {
+            accepted: reply.accepted,
+            message: reply.message,
+            remote_payload: reply.remote_payload.map(clipboard_payload_to_proto),
+            remote_source_peer_id: reply.remote_source_peer_id,
+            remote_hash: reply.remote_hash,
+        }))
+    }
+
     async fn detach_input_broker(
         &self,
         request: Request<InputBrokerDetachRequest>,
@@ -1097,6 +1132,7 @@ fn map_ui_snapshot(snapshot: UiSnapshot) -> UiSnapshotReply {
         file_transfer_config: Some(map_file_transfer_config(snapshot.file_transfer_config)),
         input_handoff_config: Some(map_input_handoff_config(snapshot.input_handoff_config)),
         input_runtime: Some(map_input_runtime(snapshot.input_runtime)),
+        clipboard_runtime: Some(map_clipboard_runtime(snapshot.clipboard_runtime)),
         features: snapshot.features.into_iter().collect(),
         hotkeys: snapshot.hotkeys.into_iter().collect(),
         file_transfers: snapshot
@@ -1131,6 +1167,7 @@ fn map_console_snapshot(snapshot: ConsoleSnapshot) -> ConsoleSnapshotReply {
         file_transfer_config: Some(map_file_transfer_config(snapshot.file_transfer_config)),
         input_handoff_config: Some(map_input_handoff_config(snapshot.input_handoff_config)),
         input_runtime: Some(map_input_runtime(snapshot.input_runtime)),
+        clipboard_runtime: Some(map_clipboard_runtime(snapshot.clipboard_runtime)),
         file_transfers: snapshot
             .file_transfers
             .into_iter()
@@ -1227,6 +1264,34 @@ fn map_input_runtime(snapshot: InputRuntimeSnapshot) -> InputRuntimeStatusReply 
         capture_backend_mode: snapshot.capture_backend_mode,
         pending_inject_frames: snapshot.pending_inject_frames as u32,
         pending_inject_high_water: snapshot.pending_inject_high_water as u32,
+    }
+}
+
+fn map_clipboard_runtime(snapshot: ClipboardRuntimeSnapshot) -> ClipboardRuntimeStatusReply {
+    ClipboardRuntimeStatusReply {
+        backend_mode: snapshot.backend_mode,
+    }
+}
+
+fn clipboard_payload_from_proto(
+    payload: Option<ClipboardBrokerPayload>,
+) -> Option<ClipboardPayload> {
+    match payload?.payload? {
+        clipboard_broker_payload::Payload::Text(text) => Some(ClipboardPayload::Text(text)),
+        clipboard_broker_payload::Payload::ImageBmp(image_bmp) => {
+            Some(ClipboardPayload::Image(image_bmp))
+        }
+    }
+}
+
+fn clipboard_payload_to_proto(payload: ClipboardPayload) -> ClipboardBrokerPayload {
+    ClipboardBrokerPayload {
+        payload: Some(match payload {
+            ClipboardPayload::Text(text) => clipboard_broker_payload::Payload::Text(text),
+            ClipboardPayload::Image(image_bmp) => {
+                clipboard_broker_payload::Payload::ImageBmp(image_bmp)
+            }
+        }),
     }
 }
 

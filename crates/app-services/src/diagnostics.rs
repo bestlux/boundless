@@ -170,6 +170,9 @@ pub fn build_online_bundle(
                 "pending_inject_frames": snapshot.input_runtime.pending_inject_frames,
                 "pending_inject_high_water": snapshot.input_runtime.pending_inject_high_water,
             },
+            "clipboard_runtime": {
+                "backend_mode": snapshot.clipboard_runtime.backend_mode,
+            },
         },
         "configuration": {
             "layout_matrix": layout_matrix,

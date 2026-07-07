@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use core_clipboard::ClipboardPayload;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AntiIdleConfigSnapshot {
     pub enabled: bool,
@@ -65,6 +67,11 @@ pub struct InputRuntimeSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardRuntimeSnapshot {
+    pub backend_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputBrokerAttachSnapshot {
     pub accepted: bool,
     pub broker_token: String,
@@ -85,6 +92,15 @@ pub struct InputBrokerExchangeSnapshot {
     pub inject_frames: Vec<InputBrokerInjectFrameSnapshot>,
     pub lock_should_be_active: bool,
     pub capture_active: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClipboardBrokerExchangeSnapshot {
+    pub accepted: bool,
+    pub message: String,
+    pub remote_payload: Option<ClipboardPayload>,
+    pub remote_source_peer_id: String,
+    pub remote_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +174,7 @@ pub struct UiSnapshot {
     pub file_transfers: Vec<FileTransferSnapshot>,
     pub input_handoff_config: InputHandoffConfigSnapshot,
     pub input_runtime: InputRuntimeSnapshot,
+    pub clipboard_runtime: ClipboardRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +196,7 @@ pub struct ConsoleSnapshot {
     pub file_transfers: Vec<FileTransferSnapshot>,
     pub input_handoff_config: InputHandoffConfigSnapshot,
     pub input_runtime: InputRuntimeSnapshot,
+    pub clipboard_runtime: ClipboardRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

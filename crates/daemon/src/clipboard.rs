@@ -14,7 +14,7 @@ use crate::{
 };
 
 const CLIPBOARD_TICK: Duration = Duration::from_millis(200);
-const MAX_REMOTE_CLIPBOARD_APPLY_RETRIES: u8 = 3;
+pub(crate) const MAX_REMOTE_CLIPBOARD_APPLY_RETRIES: u8 = 3;
 
 enum RemoteApplyOutcome {
     Applied,
@@ -22,7 +22,19 @@ enum RemoteApplyOutcome {
     Dropped,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ClipboardRuntimeMode {
+    #[default]
+    Direct,
+    Brokered,
+    BrokerUnavailable,
+}
+
 trait ClipboardRuntimeState {
+    fn clipboard_runtime_mode(&self) -> ClipboardRuntimeMode {
+        ClipboardRuntimeMode::Direct
+    }
+
     async fn dequeue_remote_clipboard_payload(&self) -> Option<PendingRemoteClipboardPayload>;
     async fn requeue_remote_clipboard_payload_front(&self, item: PendingRemoteClipboardPayload);
     async fn mark_remote_clipboard_applied(
@@ -38,6 +50,14 @@ trait ClipboardRuntimeState {
 }
 
 impl ClipboardRuntimeState for AppState {
+    fn clipboard_runtime_mode(&self) -> ClipboardRuntimeMode {
+        match self.clipboard_backend_mode() {
+            crate::state::CLIPBOARD_DIRECT_BACKEND_MODE => ClipboardRuntimeMode::Direct,
+            crate::state::CLIPBOARD_USER_SESSION_BROKER_MODE => ClipboardRuntimeMode::Brokered,
+            _ => ClipboardRuntimeMode::BrokerUnavailable,
+        }
+    }
+
     async fn dequeue_remote_clipboard_payload(&self) -> Option<PendingRemoteClipboardPayload> {
         AppState::dequeue_remote_clipboard_payload(self).await
     }
@@ -104,6 +124,9 @@ async fn tick_clipboard_runtime<S: ClipboardRuntimeState>(
     backend: &mut dyn ClipboardBackend,
     last_sequence: &mut Option<u64>,
 ) {
+    if state.clipboard_runtime_mode() != ClipboardRuntimeMode::Direct {
+        return;
+    }
     drain_remote_queue(state, backend).await;
     poll_local_clipboard(state, backend, last_sequence).await;
 }
@@ -278,6 +301,7 @@ mod tests {
     #[derive(Default)]
     struct FakeRuntimeState {
         log: Arc<Mutex<Vec<String>>>,
+        runtime_mode: ClipboardRuntimeMode,
         remote_queue: Mutex<VecDeque<PendingRemoteClipboardPayload>>,
         remote_applied_hashes: Mutex<Vec<String>>,
         local_payloads: Mutex<Vec<ClipboardPayload>>,
@@ -289,6 +313,11 @@ mod tests {
                 log,
                 ..Self::default()
             }
+        }
+
+        fn with_runtime_mode(mut self, runtime_mode: ClipboardRuntimeMode) -> Self {
+            self.runtime_mode = runtime_mode;
+            self
         }
 
         fn push_remote(&self, item: PendingRemoteClipboardPayload) {
@@ -316,6 +345,10 @@ mod tests {
     }
 
     impl ClipboardRuntimeState for FakeRuntimeState {
+        fn clipboard_runtime_mode(&self) -> ClipboardRuntimeMode {
+            self.runtime_mode
+        }
+
         async fn dequeue_remote_clipboard_payload(&self) -> Option<PendingRemoteClipboardPayload> {
             self.log
                 .lock()
@@ -581,6 +614,68 @@ mod tests {
             state.remote_applied_hashes(),
             vec![next.hash],
             "only the later payload should remain after the exhausted head item is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_mode_without_broker_does_not_touch_direct_clipboard_backend() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let state = FakeRuntimeState::with_log(log.clone())
+            .with_runtime_mode(ClipboardRuntimeMode::BrokerUnavailable);
+        state.push_remote(PendingRemoteClipboardPayload {
+            peer_id: "peer-a".to_string(),
+            payload: ClipboardPayload::Text("remote".to_string()),
+            hash: "hash-remote".to_string(),
+            retry_count: 0,
+        });
+        let mut backend = FakeClipboardBackend::new(log.clone())
+            .with_sequence_values([Some(10)])
+            .with_read_results([Ok(Some(ClipboardPayload::Text("local".to_string())))]);
+        let mut last_sequence = Some(8);
+
+        tick_clipboard_runtime(&state, &mut backend, &mut last_sequence).await;
+
+        assert_eq!(
+            state.remote_queue_snapshot().len(),
+            1,
+            "no-broker service mode must leave remote payloads queued for the broker path"
+        );
+        assert_eq!(
+            backend.read_calls, 0,
+            "session-0 clipboard must not be polled"
+        );
+        assert!(
+            backend.writes.is_empty(),
+            "session-0 clipboard must not receive remote payloads"
+        );
+        assert!(
+            !log.lock()
+                .expect("log")
+                .iter()
+                .any(|entry| entry.starts_with("backend.")),
+            "direct backend should remain untouched while broker is unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_mode_with_broker_leaves_clipboard_io_to_broker_exchange() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let state =
+            FakeRuntimeState::with_log(log).with_runtime_mode(ClipboardRuntimeMode::Brokered);
+        let mut backend = FakeClipboardBackend::new(Arc::new(Mutex::new(Vec::new())))
+            .with_sequence_values([Some(11)])
+            .with_read_results([Ok(Some(ClipboardPayload::Text("local".to_string())))]);
+        let mut last_sequence = Some(10);
+
+        tick_clipboard_runtime(&state, &mut backend, &mut last_sequence).await;
+
+        assert_eq!(
+            backend.read_calls, 0,
+            "brokered service mode must not double-poll the direct clipboard backend"
+        );
+        assert!(
+            state.remote_applied_hashes().is_empty(),
+            "brokered applies must be acknowledged by the broker exchange before marking applied"
         );
     }
 }

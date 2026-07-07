@@ -14,6 +14,9 @@ const MAX_BROKER_CAPTURED_EVENTS: usize = 4096;
 
 pub(crate) const INPUT_BROKER_BACKEND_MODE: &str = "user_session_broker";
 pub(crate) const SERVICE_SESSION_UNSUPPORTED_BACKEND_MODE: &str = "service_session_unsupported";
+pub(crate) const CLIPBOARD_DIRECT_BACKEND_MODE: &str = "direct";
+pub(crate) const CLIPBOARD_USER_SESSION_BROKER_MODE: &str = "user_session_broker";
+pub(crate) const CLIPBOARD_BROKER_UNAVAILABLE_MODE: &str = "broker_unavailable";
 
 #[derive(Debug, Clone)]
 pub struct InputBrokerAttachment {

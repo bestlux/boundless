@@ -4,28 +4,30 @@ use anyhow::Result;
 use app_services::{
     ControlPlaneApp, SharedControlPlaneApp,
     commands::{
-        DiagnosticsDumpCommand, DiagnosticsDumpReply, FeatureSetCommand, FileTransferActionCommand,
-        HotkeySetCommand, HotkeyTriggerCommand, ImportTrustBundleCommand, InputBrokerAttachCommand,
-        InputBrokerDetachCommand, InputBrokerExchangeCommand, InputCaptureTargetCommand,
-        InputCaptureTargetReply, InputOwnerCommand, InputOwnerReply, LayoutReply, LayoutSetCommand,
-        NearbyJoinStartCommand, NearbyJoinStatusCommand, NearbyPairingDecisionCommand,
-        NearbyRequestCodeCommand, NearbySubmitCodeCommand, OperationReply, PairJoinCommand,
-        PairJoinReply, PairingCodeReply, PairingCodeRequest, RemovePeerCommand, RotateTrustCommand,
-        SafeResetCommand, SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand,
-        SendInputKeyCommand, SendInputMoveCommand, SetAntiIdleConfigCommand,
-        SetFileTransferConfigCommand, SetInputHandoffConfigCommand,
+        ClipboardBrokerExchangeCommand, DiagnosticsDumpCommand, DiagnosticsDumpReply,
+        FeatureSetCommand, FileTransferActionCommand, HotkeySetCommand, HotkeyTriggerCommand,
+        ImportTrustBundleCommand, InputBrokerAttachCommand, InputBrokerDetachCommand,
+        InputBrokerExchangeCommand, InputCaptureTargetCommand, InputCaptureTargetReply,
+        InputOwnerCommand, InputOwnerReply, LayoutReply, LayoutSetCommand, NearbyJoinStartCommand,
+        NearbyJoinStatusCommand, NearbyPairingDecisionCommand, NearbyRequestCodeCommand,
+        NearbySubmitCodeCommand, OperationReply, PairJoinCommand, PairJoinReply, PairingCodeReply,
+        PairingCodeRequest, RemovePeerCommand, RotateTrustCommand, SafeResetCommand,
+        SendClipboardImageCommand, SendClipboardTextCommand, SendFileCommand, SendInputKeyCommand,
+        SendInputMoveCommand, SetAntiIdleConfigCommand, SetFileTransferConfigCommand,
+        SetInputHandoffConfigCommand,
     },
     diagnostics::{
         DiagnosticExportOptions, ServiceDiagnosticSnapshot, build_online_bundle,
         write_diagnostic_bundle,
     },
     queries::{
-        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ConsoleSnapshot,
-        FileTransferConfigSnapshot, FileTransferSnapshot, InputBrokerAttachSnapshot,
-        InputBrokerExchangeSnapshot, InputBrokerInjectFrameSnapshot, InputHandoffConfigSnapshot,
-        InputRuntimeSnapshot, NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot,
-        NearbyRequestCodeStartSnapshot, StatusSnapshot, TransportEventSnapshot,
-        TrustBundleSnapshot, UiDiscoveredPeer, UiPairedPeer, UiPendingRequest, UiSnapshot,
+        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ClipboardBrokerExchangeSnapshot,
+        ClipboardRuntimeSnapshot, ConsoleSnapshot, FileTransferConfigSnapshot,
+        FileTransferSnapshot, InputBrokerAttachSnapshot, InputBrokerExchangeSnapshot,
+        InputBrokerInjectFrameSnapshot, InputHandoffConfigSnapshot, InputRuntimeSnapshot,
+        NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot, NearbyRequestCodeStartSnapshot,
+        StatusSnapshot, TransportEventSnapshot, TrustBundleSnapshot, UiDiscoveredPeer,
+        UiPairedPeer, UiPendingRequest, UiSnapshot,
     },
 };
 use async_trait::async_trait;
@@ -604,6 +606,43 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         })
     }
 
+    async fn exchange_clipboard_broker(
+        &self,
+        command: ClipboardBrokerExchangeCommand,
+    ) -> Result<ClipboardBrokerExchangeSnapshot> {
+        let outcome = self
+            .state
+            .exchange_clipboard_broker(
+                broker_client_identity(command.verified_client),
+                &command.broker_token,
+                command.local_payload,
+                command
+                    .apply_report
+                    .map(|report| crate::state::ClipboardBrokerApplyReport {
+                        source_peer_id: report.source_peer_id,
+                        hash: report.hash,
+                        applied: report.applied,
+                        message: report.message,
+                    }),
+            )
+            .await;
+
+        let (remote_payload, remote_source_peer_id, remote_hash) =
+            if let Some(remote) = outcome.remote_payload {
+                (Some(remote.payload), remote.peer_id, remote.hash)
+            } else {
+                (None, String::new(), String::new())
+            };
+
+        Ok(ClipboardBrokerExchangeSnapshot {
+            accepted: outcome.accepted,
+            message: outcome.message,
+            remote_payload,
+            remote_source_peer_id,
+            remote_hash,
+        })
+    }
+
     async fn detach_input_broker(
         &self,
         command: InputBrokerDetachCommand,
@@ -826,6 +865,7 @@ async fn build_ui_snapshot(state: &AppState) -> Result<UiSnapshot> {
     let discovered_peers = build_discovered_peers(&bundle, &paired_peers);
     let pending_requests = build_pending_requests(&bundle);
     let input_runtime = build_input_runtime_snapshot(&bundle);
+    let clipboard_runtime = build_clipboard_runtime_snapshot(&bundle);
 
     Ok(UiSnapshot {
         generated_at: chrono::Utc::now().to_rfc3339(),
@@ -843,6 +883,7 @@ async fn build_ui_snapshot(state: &AppState) -> Result<UiSnapshot> {
             bundle.input_handoff_config.clone(),
         ),
         input_runtime,
+        clipboard_runtime,
         file_transfer_config: build_file_transfer_config_snapshot(bundle.config.file_transfer),
         file_transfers: build_file_transfer_snapshots(bundle.file_transfers),
     })
@@ -862,6 +903,7 @@ fn build_console_snapshot_from_bundle(
     let pending_requests = build_pending_requests(&bundle);
     let features = bundle.features.clone();
     let input_runtime = build_input_runtime_snapshot(&bundle);
+    let clipboard_runtime = build_clipboard_runtime_snapshot(&bundle);
 
     ConsoleSnapshot {
         status,
@@ -892,6 +934,7 @@ fn build_console_snapshot_from_bundle(
             bundle.input_handoff_config.clone(),
         ),
         input_runtime,
+        clipboard_runtime,
         file_transfer_config: build_file_transfer_config_snapshot(bundle.config.file_transfer),
         file_transfers: build_file_transfer_snapshots(bundle.file_transfers),
     }
@@ -978,6 +1021,14 @@ fn build_input_runtime_snapshot(
         capture_backend_mode: bundle.input_capture_backend_mode.clone(),
         pending_inject_frames: bundle.pending_inject_frames,
         pending_inject_high_water: bundle.pending_inject_high_water,
+    }
+}
+
+fn build_clipboard_runtime_snapshot(
+    bundle: &crate::state::ControlPlaneSnapshotBundle,
+) -> ClipboardRuntimeSnapshot {
+    ClipboardRuntimeSnapshot {
+        backend_mode: bundle.clipboard_backend_mode.clone(),
     }
 }
 
@@ -1442,6 +1493,8 @@ mod tests {
         assert!(content.contains("[redacted-file-name]"));
         assert!(content.contains(r#""peer_id": "peer-1""#));
         assert!(content.contains(r#""runtime_tasks""#));
+        assert!(content.contains(r#""clipboard_runtime""#));
+        assert!(content.contains(r#""backend_mode": "direct""#));
         assert!(content.contains(r#""name": "network.supervisor""#));
         assert!(content.contains(r#""owner": "network""#));
         assert!(content.contains(r#""shutdown": "abort_on_daemon_shutdown""#));

@@ -19,6 +19,21 @@ pub struct InputBrokerExchangeOutcome {
     pub capture_active: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ClipboardBrokerApplyReport {
+    pub source_peer_id: String,
+    pub hash: String,
+    pub applied: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Default)]
+pub struct ClipboardBrokerExchangeOutcome {
+    pub accepted: bool,
+    pub message: String,
+    pub remote_payload: Option<PendingRemoteClipboardPayload>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InputBrokerExchangeObservations {
     pub captured_events: Vec<InputEvent>,
@@ -58,6 +73,21 @@ impl AppState {
     pub(crate) fn input_broker_route_active(&self) -> bool {
         self.input_broker.service_session_input()
             && self.input_broker.is_attached_fresh(Instant::now())
+    }
+
+    pub(crate) fn clipboard_uses_broker(&self) -> bool {
+        self.input_broker.service_session_input()
+    }
+
+    pub(crate) fn clipboard_backend_mode(&self) -> &'static str {
+        if !self.clipboard_uses_broker() {
+            return CLIPBOARD_DIRECT_BACKEND_MODE;
+        }
+        if self.input_broker.is_attached_fresh(Instant::now()) {
+            CLIPBOARD_USER_SESSION_BROKER_MODE
+        } else {
+            CLIPBOARD_BROKER_UNAVAILABLE_MODE
+        }
     }
 
     /// Fail-closed authorization for broker calls, evaluated exclusively
@@ -126,6 +156,9 @@ impl AppState {
 
         let broker_token = uuid::Uuid::new_v4().to_string();
         let replaced = self.input_broker.attachment().is_some();
+        if replaced {
+            self.requeue_broker_clipboard_inflight().await;
+        }
         self.input_broker.attach(InputBrokerAttachment {
             broker_token: broker_token.clone(),
             lock_supported,
@@ -166,6 +199,7 @@ impl AppState {
 
         let detached = self.input_broker.detach(broker_token);
         if detached {
+            self.requeue_broker_clipboard_inflight().await;
             self.record_transport_event(TransportEventRecord {
                 timestamp: Utc::now(),
                 direction: "local".to_string(),
@@ -177,6 +211,81 @@ impl AppState {
             self.notify_input_capture_wake("input_broker_detached");
         }
         detached
+    }
+
+    pub async fn exchange_clipboard_broker(
+        &self,
+        verified_client: Option<InputBrokerClientIdentity>,
+        broker_token: &str,
+        local_payload: Option<ClipboardPayload>,
+        apply_report: Option<ClipboardBrokerApplyReport>,
+    ) -> ClipboardBrokerExchangeOutcome {
+        if let Some(reason) = self.input_broker_client_rejection(&verified_client) {
+            self.record_input_broker_rejection("clipboard_exchange", reason)
+                .await;
+            return ClipboardBrokerExchangeOutcome {
+                accepted: false,
+                message: format!(
+                    "clipboard broker exchange denied ({reason}): the pipe client must be a verified interactive-session process of the allowed desktop user"
+                ),
+                ..Default::default()
+            };
+        }
+        if !self
+            .input_broker
+            .validate_and_touch(broker_token, Instant::now())
+        {
+            return ClipboardBrokerExchangeOutcome {
+                accepted: false,
+                message: "input broker token is not attached (stale or replaced); re-attach"
+                    .to_string(),
+                ..Default::default()
+            };
+        }
+
+        if let Some(report) = apply_report {
+            let matched = self
+                .report_broker_remote_clipboard_apply(
+                    &report.source_peer_id,
+                    &report.hash,
+                    report.applied,
+                    &report.message,
+                )
+                .await;
+            if !matched {
+                self.record_transport_event(TransportEventRecord {
+                    timestamp: Utc::now(),
+                    direction: "local".to_string(),
+                    kind: "clipboard_broker_apply_report_unmatched".to_string(),
+                    peer_id: report.source_peer_id,
+                    detail: format!("hash={} applied={}", report.hash, report.applied),
+                    size_bytes: 0,
+                });
+            }
+        }
+
+        let mut message = String::new();
+        if let Some(payload) = local_payload
+            && let Err(error) = self
+                .queue_local_clipboard_payload_for_connected_peers(payload)
+                .await
+        {
+            message = format!("clipboard broker local payload rejected: {error:#}");
+            self.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: "local".to_string(),
+                kind: "clipboard_broker_local_rejected".to_string(),
+                peer_id: "none".to_string(),
+                detail: message.clone(),
+                size_bytes: 0,
+            });
+        }
+
+        ClipboardBrokerExchangeOutcome {
+            accepted: true,
+            message,
+            remote_payload: self.stage_remote_clipboard_payload_for_broker().await,
+        }
     }
 
     pub async fn exchange_input_broker(

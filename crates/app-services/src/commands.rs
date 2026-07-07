@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use core_clipboard::ClipboardPayload;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -185,6 +186,22 @@ pub struct InputBrokerExchangeCommand {
     pub dropped_event_count: u64,
     pub injected_frame_count: u32,
     pub inject_failure_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardBrokerApplyReportCommand {
+    pub source_peer_id: String,
+    pub hash: String,
+    pub applied: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClipboardBrokerExchangeCommand {
+    pub verified_client: Option<VerifiedControlClient>,
+    pub broker_token: String,
+    pub local_payload: Option<ClipboardPayload>,
+    pub apply_report: Option<ClipboardBrokerApplyReportCommand>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

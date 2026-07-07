@@ -205,6 +205,10 @@ message InputRuntimeStatusReply {
   uint32 pending_inject_high_water = 8;
 }
 
+message ClipboardRuntimeStatusReply {
+  string backend_mode = 1;
+}
+
 message HotkeySetRequest {
   string action = 1;
   string combo = 2;
@@ -319,6 +323,7 @@ message UiSnapshotReply {
   map<string, bool> features = 13;
   map<string, string> hotkeys = 14;
   repeated FileTransferInfo file_transfers = 15;
+  ClipboardRuntimeStatusReply clipboard_runtime = 16;
 }
 
 message ConsoleSnapshotReply {
@@ -337,6 +342,7 @@ message ConsoleSnapshotReply {
   InputHandoffConfigReply input_handoff_config = 13;
   InputRuntimeStatusReply input_runtime = 14;
   repeated FileTransferInfo file_transfers = 15;
+  ClipboardRuntimeStatusReply clipboard_runtime = 16;
 }
 
 message NearbyRequestCodeStartRequest {
@@ -479,6 +485,34 @@ message InputBrokerExchangeReply {
   bool capture_active = 5;
 }
 
+message ClipboardBrokerPayload {
+  oneof payload {
+    string text = 1;
+    bytes image_bmp = 2;
+  }
+}
+
+message ClipboardBrokerApplyReport {
+  string source_peer_id = 1;
+  string hash = 2;
+  bool applied = 3;
+  string message = 4;
+}
+
+message ClipboardBrokerExchangeRequest {
+  string broker_token = 1;
+  ClipboardBrokerPayload local_payload = 2;
+  ClipboardBrokerApplyReport apply_report = 3;
+}
+
+message ClipboardBrokerExchangeReply {
+  bool accepted = 1;
+  string message = 2;
+  ClipboardBrokerPayload remote_payload = 3;
+  string remote_source_peer_id = 4;
+  string remote_hash = 5;
+}
+
 message InputBrokerDetachRequest {
   string broker_token = 1;
 }
@@ -546,6 +580,7 @@ service ControlPlaneService {
   rpc RejectNearbyPairingRequest(NearbyPairingDecisionRequest) returns (OperationReply);
   rpc AttachInputBroker(InputBrokerAttachRequest) returns (InputBrokerAttachReply);
   rpc ExchangeInputBroker(InputBrokerExchangeRequest) returns (InputBrokerExchangeReply);
+  rpc ExchangeClipboardBroker(ClipboardBrokerExchangeRequest) returns (ClipboardBrokerExchangeReply);
   rpc DetachInputBroker(InputBrokerDetachRequest) returns (OperationReply);
 }
 

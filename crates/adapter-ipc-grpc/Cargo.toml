@@ -11,4 +11,5 @@ tokio-stream = "0.1"
 tonic.workspace = true
 
 app-services = { path = "../app-services" }
+core-clipboard = { path = "../core-clipboard" }
 ipc-api = { path = "../ipc-api" }

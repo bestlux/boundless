@@ -26,6 +26,7 @@ pub(super) struct ClipboardSyncState {
     pub(super) last_observed_hash: Option<String>,
     pub(super) suppress_echo_hash: Option<String>,
     pub(super) pending_remote: VecDeque<PendingRemoteClipboardPayload>,
+    pub(super) broker_inflight_remote: Option<PendingRemoteClipboardPayload>,
     pub(super) pending_replay: Option<ClipboardReplayState>,
     pub(super) obsolete_inflight_replay_hashes_by_peer: HashMap<String, HashSet<String>>,
 }

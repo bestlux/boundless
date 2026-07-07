@@ -10,10 +10,12 @@
 // UAC prompts, or elevated apps).
 
 use ipc_api::boundless::v1::{
+    ClipboardBrokerApplyReport, ClipboardBrokerExchangeRequest, ClipboardBrokerPayload,
     InputBrokerAttachRequest, InputBrokerDetachRequest, InputBrokerExchangeRequest,
-    control_plane_service_client::ControlPlaneServiceClient,
+    clipboard_broker_payload, control_plane_service_client::ControlPlaneServiceClient,
 };
 use ipc_api::broker_events::{broker_events_from_input_events, input_events_from_broker_events};
+use platform_windows::clipboard_backend::WindowsClipboardBackend;
 use platform_windows::input::{
     HookControlAction, HookInputPump, current_process_can_use_interactive_input,
     input_records_for_event, send_input_records, virtual_screen_bounds,
@@ -24,6 +26,7 @@ const INPUT_BROKER_SERVICE_UNSUPPORTED_MODE: &str = "service_session_unsupported
 const INPUT_BROKER_SUPERVISOR_RETRY: Duration = Duration::from_secs(3);
 const INPUT_BROKER_ACTIVE_POLL: Duration = Duration::from_millis(8);
 const INPUT_BROKER_IDLE_POLL: Duration = Duration::from_millis(40);
+const CLIPBOARD_BROKER_POLL: Duration = Duration::from_millis(200);
 
 enum BrokerSessionEnd {
     NotNeeded,
@@ -90,8 +93,12 @@ fn run_input_broker_session(endpoint: &str) -> Result<BrokerSessionEnd> {
         }
         let broker_token = attach.broker_token;
 
-        let loop_result =
-            input_broker_exchange_loop(&mut client, &broker_token, &mut pump).await;
+        let mut input_client = client.clone();
+        let mut clipboard_client = client.clone();
+        let loop_result = tokio::select! {
+            result = input_broker_exchange_loop(&mut input_client, &broker_token, &mut pump) => result,
+            result = clipboard_broker_exchange_loop(&mut clipboard_client, &broker_token) => result,
+        };
 
         // Best-effort cleanup: release the local lock, flush synthetic
         // release events for anything still held, and detach explicitly.
@@ -195,4 +202,105 @@ fn inject_input_events(events: &[core_input::InputEvent]) -> Result<()> {
         records.extend(input_records_for_event(event));
     }
     send_input_records(&records)
+}
+
+async fn clipboard_broker_exchange_loop(
+    client: &mut ControlPlaneServiceClient<Channel>,
+    broker_token: &str,
+) -> Result<()> {
+    let mut last_sequence: Option<u64> = None;
+    let mut apply_report: Option<ClipboardBrokerApplyReport> = None;
+
+    loop {
+        let local_payload = read_clipboard_payload_if_changed(&mut last_sequence).await;
+        let reply = client
+            .exchange_clipboard_broker(ClipboardBrokerExchangeRequest {
+                broker_token: broker_token.to_string(),
+                local_payload: local_payload.map(clipboard_payload_to_proto),
+                apply_report: apply_report.take(),
+            })
+            .await?
+            .into_inner();
+        if !reply.accepted {
+            bail!("clipboard broker exchange rejected: {}", reply.message);
+        }
+        if !reply.message.is_empty() {
+            eprintln!("boundless clipboard broker: {}", reply.message);
+        }
+
+        if let Some(remote_payload) = reply.remote_payload {
+            let result = write_clipboard_payload(remote_payload).await;
+            apply_report = Some(ClipboardBrokerApplyReport {
+                source_peer_id: reply.remote_source_peer_id,
+                hash: reply.remote_hash,
+                applied: result.is_ok(),
+                message: result.err().map(|error| format!("{error:#}")).unwrap_or_default(),
+            });
+        }
+
+        tokio::time::sleep(CLIPBOARD_BROKER_POLL).await;
+    }
+}
+
+async fn read_clipboard_payload_if_changed(
+    last_sequence: &mut Option<u64>,
+) -> Option<core_clipboard::ClipboardPayload> {
+    let sequence = tokio::task::spawn_blocking(|| {
+        let mut backend = WindowsClipboardBackend;
+        backend.sequence_number()
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(sequence) = sequence {
+        if *last_sequence == Some(sequence) {
+            return None;
+        }
+        *last_sequence = Some(sequence);
+    }
+
+    tokio::task::spawn_blocking(|| {
+        let mut backend = WindowsClipboardBackend;
+        backend.read_payload()
+    })
+    .await
+    .ok()
+    .and_then(|result| result.ok())
+    .flatten()
+}
+
+async fn write_clipboard_payload(payload: ClipboardBrokerPayload) -> Result<()> {
+    let payload = clipboard_payload_from_proto(payload).context("clipboard broker payload empty")?;
+    tokio::task::spawn_blocking(move || {
+        let mut backend = WindowsClipboardBackend;
+        backend.write_payload(&payload)
+    })
+    .await
+    .context("clipboard write task panicked")?
+}
+
+fn clipboard_payload_from_proto(
+    payload: ClipboardBrokerPayload,
+) -> Option<core_clipboard::ClipboardPayload> {
+    match payload.payload? {
+        clipboard_broker_payload::Payload::Text(text) => {
+            Some(core_clipboard::ClipboardPayload::Text(text))
+        }
+        clipboard_broker_payload::Payload::ImageBmp(image_bmp) => {
+            Some(core_clipboard::ClipboardPayload::Image(image_bmp))
+        }
+    }
+}
+
+fn clipboard_payload_to_proto(payload: core_clipboard::ClipboardPayload) -> ClipboardBrokerPayload {
+    ClipboardBrokerPayload {
+        payload: Some(match payload {
+            core_clipboard::ClipboardPayload::Text(text) => {
+                clipboard_broker_payload::Payload::Text(text)
+            }
+            core_clipboard::ClipboardPayload::Image(image_bmp) => {
+                clipboard_broker_payload::Payload::ImageBmp(image_bmp)
+            }
+        }),
+    }
 }

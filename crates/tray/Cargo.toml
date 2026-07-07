@@ -13,6 +13,7 @@ anyhow.workspace = true
 app-services = { path = "../app-services" }
 clap.workspace = true
 control-plane-client = { path = "../control-plane-client" }
+core-clipboard = { path = "../core-clipboard" }
 core-input = { path = "../core-input" }
 ipc-api = { path = "../ipc-api" }
 serde.workspace = true

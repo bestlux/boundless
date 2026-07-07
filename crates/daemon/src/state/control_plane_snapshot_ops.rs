@@ -21,6 +21,7 @@ impl AppState {
             mdns_active,
             anti_idle_runtime,
             input_capture_backend_mode,
+            clipboard_backend_mode,
             pending_inject_stats,
             file_transfers,
         ) = tokio::join!(
@@ -34,6 +35,7 @@ impl AppState {
             self.mdns_active(),
             self.async_anti_idle_runtime_state(),
             self.input_capture_backend_mode(),
+            async { self.clipboard_backend_mode() },
             self.pending_inject_frame_stats(),
             self.file_transfer_records(),
         );
@@ -68,6 +70,7 @@ impl AppState {
             anti_idle_runtime,
             input_handoff_config,
             input_capture_backend_mode,
+            clipboard_backend_mode: clipboard_backend_mode.to_string(),
             pending_inject_frames,
             pending_inject_high_water,
             file_transfers,

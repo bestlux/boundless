@@ -465,7 +465,7 @@ impl AppState {
             .await
     }
 
-    async fn queue_local_clipboard_payload_for_connected_peers(
+    pub(crate) async fn queue_local_clipboard_payload_for_connected_peers(
         &self,
         payload: ClipboardPayload,
     ) -> Result<bool> {
@@ -605,6 +605,16 @@ impl AppState {
         self.clipboard.sync.write().await.pending_remote.pop_front()
     }
 
+    pub(crate) async fn stage_remote_clipboard_payload_for_broker(
+        &self,
+    ) -> Option<PendingRemoteClipboardPayload> {
+        let mut sync = self.clipboard.sync.write().await;
+        if sync.broker_inflight_remote.is_none() {
+            sync.broker_inflight_remote = sync.pending_remote.pop_front();
+        }
+        sync.broker_inflight_remote.clone()
+    }
+
     pub async fn requeue_remote_clipboard_payload_front(
         &self,
         item: PendingRemoteClipboardPayload,
@@ -614,6 +624,67 @@ impl AppState {
             sync.pending_remote.pop_back();
         }
         sync.pending_remote.push_front(item);
+    }
+
+    pub(crate) async fn requeue_broker_clipboard_inflight(&self) {
+        let mut sync = self.clipboard.sync.write().await;
+        let Some(item) = sync.broker_inflight_remote.take() else {
+            return;
+        };
+        if sync.pending_remote.len() >= MAX_PENDING_REMOTE_CLIPBOARD_ITEMS {
+            sync.pending_remote.pop_back();
+        }
+        sync.pending_remote.push_front(item);
+    }
+
+    pub(crate) async fn report_broker_remote_clipboard_apply(
+        &self,
+        source_peer_id: &str,
+        hash: &str,
+        applied: bool,
+        error_message: &str,
+    ) -> bool {
+        let item = {
+            let mut sync = self.clipboard.sync.write().await;
+            let matches = sync
+                .broker_inflight_remote
+                .as_ref()
+                .is_some_and(|item| item.peer_id == source_peer_id && item.hash == hash);
+            if matches {
+                sync.broker_inflight_remote.take()
+            } else {
+                None
+            }
+        };
+        let Some(mut item) = item else {
+            return false;
+        };
+
+        if applied {
+            self.mark_remote_clipboard_applied(&item.peer_id, &item.payload, &item.hash)
+                .await;
+            return true;
+        }
+
+        item.retry_count = item.retry_count.saturating_add(1);
+        if item.retry_count > crate::clipboard::MAX_REMOTE_CLIPBOARD_APPLY_RETRIES {
+            tracing::warn!(
+                peer_id = %item.peer_id,
+                retry_count = item.retry_count,
+                error = error_message,
+                "dropping brokered remote clipboard payload after bounded retries"
+            );
+            return true;
+        }
+
+        tracing::warn!(
+            peer_id = %item.peer_id,
+            retry_count = item.retry_count,
+            error = error_message,
+            "broker failed to apply remote clipboard payload; requeueing for retry"
+        );
+        self.requeue_remote_clipboard_payload_front(item).await;
+        true
     }
 
     pub async fn mark_remote_clipboard_applied(

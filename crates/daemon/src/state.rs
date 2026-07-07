@@ -91,11 +91,13 @@ use clipboard_state::{ClipboardReplayState, ClipboardState, ClipboardSyncState};
 pub(crate) use discovery_state::DiscoveredPeerEndpoint;
 use discovery_state::DiscoveryState;
 pub(crate) use input_broker::{
-    INPUT_BROKER_BACKEND_MODE, InputBrokerRelay, SERVICE_SESSION_UNSUPPORTED_BACKEND_MODE,
+    CLIPBOARD_BROKER_UNAVAILABLE_MODE, CLIPBOARD_DIRECT_BACKEND_MODE,
+    CLIPBOARD_USER_SESSION_BROKER_MODE, INPUT_BROKER_BACKEND_MODE, InputBrokerRelay,
+    SERVICE_SESSION_UNSUPPORTED_BACKEND_MODE,
 };
 pub use input_broker_ops::{
-    InputBrokerAttachOutcome, InputBrokerClientIdentity, InputBrokerExchangeObservations,
-    InputBrokerExchangeOutcome,
+    ClipboardBrokerApplyReport, ClipboardBrokerExchangeOutcome, InputBrokerAttachOutcome,
+    InputBrokerClientIdentity, InputBrokerExchangeObservations, InputBrokerExchangeOutcome,
 };
 use input_state::InputState;
 #[cfg(test)]
@@ -246,6 +248,7 @@ pub(crate) struct ControlPlaneSnapshotBundle {
     pub(crate) anti_idle_runtime: AntiIdleRuntimeState,
     pub(crate) input_handoff_config: InputHandoffConfig,
     pub(crate) input_capture_backend_mode: String,
+    pub(crate) clipboard_backend_mode: String,
     pub(crate) pending_inject_frames: usize,
     pub(crate) pending_inject_high_water: usize,
     pub(crate) file_transfers: Vec<FileTransferRecord>,
