@@ -83,13 +83,15 @@ These are not hidden release blockers by default; they require explicit release-
 | clipboard_image_spooling | deferred | BND-NEXT-8A bounded the measured outbound/local image allocation path; inbound/apply still materializes full BMP buffers and should become streaming or spooling work only with separate architecture evidence. | docs/performance/clipboard-image-memory.md |
 | product_scorecard_real_lab_runs | open | Scorecard thresholds are provisional until at least two real two-PC runs exist for each category; fixture rows validate artifact shape but do not make product-performance thresholds binding. | docs/performance/product-scorecard.md |
 | local_subnet_firewall_policy | proposed | BND-NEXT-21 defines a human-gated installer-owned Private/local-subnet firewall policy, but no firewall mutation is implemented or approved. Release evidence must prove explicit opt-in, Program Files service-binary scope, TCP 15100/15200 only, fail-closed behavior, repair/uninstall ownership, and real two-PC Private-network success before claiming frictionless MWB-like install connectivity. | docs/architecture/one-sided-reachability.md, docs/release/release-readiness.md |
+| clipboard_service_mode_broker | open | Clipboard share is non-functional in service mode: the daemon-side clipboard runtime polls the isolated session-0 window-station clipboard. Confirmed on real two-PC dogfood 2026-07-07. Requires user-session broker routing (BND-NEXT-24). | docs/backlog.md, docs/release/launch-ledger.md |
+| service_scm_stop | open | BoundlessService does not honor SCM stop (never reports StopPending), which stalls or wedges MSI install/upgrade/uninstall and hangs Restart-Service. Confirmed on real install 2026-07-07. | docs/backlog.md (BND-NEXT-23), docs/release/launch-ledger.md |
 
 ## Next Backlog Step
 
-- BND-NEXT-7 is complete at the behavior-neutral post-auth session reactor cleanup level. PRs #90-#93 landed the code and earlier docs boundaries; [docs/architecture/network-v1.md](architecture/network-v1.md) records the final architecture state.
-- BND-NEXT-8A profiled clipboard image memory pressure and applies a bounded allocation fix for local/outbound large image paths; [docs/performance/clipboard-image-memory.md](performance/clipboard-image-memory.md) records the command, path map, evidence, and recommendation.
-- BND-NEXT-9A makes MSI-owned service update readiness explicit in release-readiness evidence. Actual N-1 validation still requires current and prior MSI artifacts in a Windows installer lab.
-- Full `SessionEvent`/`SessionPhase` machinery, broader multi-peer/runtime fault coverage, graceful per-session join lifecycle, clipboard image streaming/spooling, tray update notification UX, and feature/product behavior remain deferred.
+- Canonical prioritized backlog: [docs/backlog.md](backlog.md). Dogfood-observed blockers, flows, and nits: [docs/release/launch-ledger.md](release/launch-ledger.md).
+- BND-NEXT-20 (direct TCP with role reversal for one-sided reachability) has real two-PC evidence as of 2026-07-07: pairing, trusted transport, layout propagation, and input handoff all passed on asymmetric-reachability hardware (5.0.10-dogfood-c2e1509). The historic connect blocker was stale service trust, fixed by daemon-API trust rotation (reset-script fix in c2e1509).
+- Current P0 stories: BND-NEXT-23 (service SCM stop) and BND-NEXT-24 (broker-routed clipboard for service mode). See the backlog for full briefs.
+- Full `SessionEvent`/`SessionPhase` machinery, broader multi-peer/runtime fault coverage, graceful per-session join lifecycle, clipboard image streaming/spooling, tray update notification UX remain deferred.
 
 ## Pro Oversight Item Accounting
 
