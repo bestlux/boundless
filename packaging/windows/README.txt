@@ -44,15 +44,17 @@ Install behavior
 
 State roots
 -----------
-- Config: %LocalAppData%\Boundless\config.json
-- Data:   %LocalAppData%\Boundless
-- Logs:   %LocalAppData%\Boundless\logs
-- Security: %LocalAppData%\Boundless\security
+- Interactive user fallback config: %LocalAppData%\Boundless\config.json
+- Interactive user fallback data:   %LocalAppData%\Boundless
+- Installed service state: %WINDIR%\System32\config\systemprofile\AppData\Local\Boundless
+- Installed service logs:  %WINDIR%\System32\config\systemprofile\AppData\Local\Boundless\logs
 
 Recovery
 --------
 - Boundless-Reset.ps1 -NetworkOnly
 - Boundless-Reset.ps1 -All
+- With the installed service running, -NetworkOnly uses the daemon API to clear peers; -All rotates local trust/identity, clears peers, and requires a service restart before pairing again.
+- If the daemon API is unavailable and you need to remove installed service state manually, run from an elevated PowerShell: Boundless-Reset.ps1 -All -ForceLocalCleanup -IncludeServiceProfile
 
 Connectivity diagnostics
 ------------------------

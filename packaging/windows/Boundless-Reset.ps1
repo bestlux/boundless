@@ -7,6 +7,7 @@ param(
     [switch]$All,
 
     [switch]$ForceLocalCleanup,
+    [switch]$IncludeServiceProfile,
 
     [string]$Endpoint = "npipe://./pipe/boundlessd-api",
     [string]$InstallRoot = "",
@@ -20,6 +21,16 @@ $ErrorActionPreference = "Stop"
 
 function Get-LocalAppDataPath {
     return [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+}
+
+function Get-ServiceLocalAppDataPath {
+    return Join-Path $env:WINDIR "System32\config\systemprofile\AppData\Local"
+}
+
+function Test-Administrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 function Get-DefaultConfigPath {
@@ -74,6 +85,63 @@ function Invoke-LocalFullReset {
     Remove-IfExists -Path $TargetDataRoot
 }
 
+function Get-DaemonMachineId {
+    param(
+        [string]$BoundlessCtl,
+        [string]$TargetEndpoint
+    )
+
+    $statusArguments = @("--endpoint", $TargetEndpoint, "daemon", "status")
+    $statusOutput = & $BoundlessCtl @statusArguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "boundlessctl daemon status exited with $($LASTEXITCODE): $statusOutput"
+    }
+
+    foreach ($line in $statusOutput) {
+        if ($line -match '^machine_id=(.+)$') {
+            return $Matches[1].Trim()
+        }
+    }
+
+    throw "boundlessctl daemon status did not report machine_id"
+}
+
+function Invoke-DaemonReset {
+    param(
+        [string]$BoundlessCtl,
+        [string]$TargetEndpoint,
+        [string]$Mode
+    )
+
+    $machineId = Get-DaemonMachineId -BoundlessCtl $BoundlessCtl -TargetEndpoint $TargetEndpoint
+    if ($Mode -eq "network") {
+        $confirm = "safe-reset-network:$machineId"
+        $arguments = @("--endpoint", $TargetEndpoint, "safe-reset", "--network", "--confirm", $confirm)
+    } else {
+        $confirm = "rotate-trust:$machineId"
+        $arguments = @("--endpoint", $TargetEndpoint, "pair", "rotate-trust", "--confirm", $confirm)
+    }
+
+    & $BoundlessCtl @arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "boundlessctl reset exited with $LASTEXITCODE"
+    }
+}
+
+function Invoke-LocalResetTarget {
+    param(
+        [string]$TargetConfigPath,
+        [string]$TargetDataRoot,
+        [string]$TargetSecurityRoot
+    )
+
+    if ($NetworkOnly) {
+        Invoke-LocalNetworkReset -TargetConfigPath $TargetConfigPath
+    } else {
+        Invoke-LocalFullReset -TargetConfigPath $TargetConfigPath -TargetDataRoot $TargetDataRoot -TargetSecurityRoot $TargetSecurityRoot
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Get-DefaultConfigPath
 }
@@ -92,35 +160,38 @@ $boundlessCtl = Join-Path $InstallRoot "boundlessctl.exe"
 $attemptedRemoteReset = $false
 
 if (-not $ForceLocalCleanup -and (Test-Path -LiteralPath $boundlessCtl)) {
-    $arguments = @("--endpoint", $Endpoint, "safe-reset")
-    if ($NetworkOnly) {
-        $arguments += "--network"
-    } else {
-        $arguments += "--all"
-    }
-
     try {
         $attemptedRemoteReset = $true
-        & $boundlessCtl @arguments
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "reset_mode=$modeName"
-            Write-Host "reset_method=daemon_api"
-            return
+        Invoke-DaemonReset -BoundlessCtl $boundlessCtl -TargetEndpoint $Endpoint -Mode $modeName
+        Write-Host "reset_mode=$modeName"
+        if ($NetworkOnly) {
+            Write-Host "reset_method=daemon_api_safe_reset"
+            Write-Host "restart_required=false"
+        } else {
+            Write-Host "reset_method=daemon_api_rotate_trust"
+            Write-Host "restart_required=true"
         }
-
-        Write-Warning "boundlessctl safe-reset exited with $LASTEXITCODE; falling back to local cleanup."
+        return
     }
     catch {
-        Write-Warning "boundlessctl safe-reset failed: $($_.Exception.Message). Falling back to local cleanup."
+        Write-Warning "boundlessctl daemon reset failed: $($_.Exception.Message). Falling back to local cleanup."
     }
 }
 
-if ($NetworkOnly) {
-    Invoke-LocalNetworkReset -TargetConfigPath $ConfigPath
-} else {
-    Invoke-LocalFullReset -TargetConfigPath $ConfigPath -TargetDataRoot $DataRoot -TargetSecurityRoot $SecurityRoot
+Invoke-LocalResetTarget -TargetConfigPath $ConfigPath -TargetDataRoot $DataRoot -TargetSecurityRoot $SecurityRoot
+
+if ($IncludeServiceProfile) {
+    if (-not (Test-Administrator)) {
+        throw "-IncludeServiceProfile requires an elevated PowerShell session."
+    }
+
+    $serviceDataRoot = Join-Path (Get-ServiceLocalAppDataPath) "Boundless"
+    $serviceConfigPath = Join-Path $serviceDataRoot "config.json"
+    $serviceSecurityRoot = Join-Path $serviceDataRoot "security"
+    Invoke-LocalResetTarget -TargetConfigPath $serviceConfigPath -TargetDataRoot $serviceDataRoot -TargetSecurityRoot $serviceSecurityRoot
 }
 
 Write-Host "reset_mode=$modeName"
 Write-Host "reset_method=local_cleanup"
 Write-Host "attempted_remote_reset=$attemptedRemoteReset"
+Write-Host "service_profile_cleanup=$IncludeServiceProfile"

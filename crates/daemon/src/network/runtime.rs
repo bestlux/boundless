@@ -166,7 +166,7 @@ async fn peer_worker(state: AppState, peer_id: String) {
                 direction: "outbound".to_string(),
                 kind: "transport_reachability_failed".to_string(),
                 peer_id: peer_id.clone(),
-                detail: transport_reachability_failure_detail(&target_candidates),
+                detail: transport_reachability_failure_detail(&target_candidates, Some(&error)),
                 size_bytes: 0,
             });
             warn!(
@@ -338,12 +338,16 @@ pub(super) fn outbound_target_candidates(
         .collect()
 }
 
-fn transport_reachability_failure_detail(candidates: &[TcpEndpointCandidate]) -> String {
+fn transport_reachability_failure_detail(
+    candidates: &[TcpEndpointCandidate],
+    error: Option<&anyhow::Error>,
+) -> String {
     format!(
-        "mdns_discovered={} tcp_transport_reachability=failed attempted=[{}] next_action=verify Private network, VLAN routing, and manual admin-approved firewall policy for the listed TCP ports",
+        "mdns_discovered={} tcp_transport_reachability=failed failure_reason={} attempted=[{}] next_action=verify Private network, VLAN routing, and manual admin-approved firewall policy for the listed TCP ports",
         candidates
             .iter()
             .any(|candidate| candidate.source == TcpEndpointSource::Discovery),
+        transport_error_summary(error),
         redacted_tcp_endpoint_labels_for_runtime(candidates)
     )
 }
@@ -389,10 +393,17 @@ fn transport_error_summary(error: Option<&anyhow::Error>) -> &'static str {
         return "refused";
     }
     let message = error.to_string().to_ascii_lowercase();
-    if message.contains("tcp connect") {
-        "tcp_connect_failed"
-    } else if message.contains("tls connect") {
+    if message.contains("peer identity mismatch") {
+        "peer_identity_mismatch"
+    } else if message.contains("tls_connect_failed") || message.contains("tls connect") {
         "tls_connect_failed"
+    } else if message.contains("refused") {
+        "refused"
+    } else if message.contains("tcp_connect_failed")
+        || message.contains("tcp connect")
+        || message.contains("timed out")
+    {
+        "tcp_connect_failed"
     } else {
         "failed"
     }
@@ -408,10 +419,11 @@ mod tests {
             tcp_endpoint_candidate("[fe80::1%4]:15100", TcpEndpointSource::Discovery, 0),
             tcp_endpoint_candidate("10.0.0.9:15100", TcpEndpointSource::Discovery, 1),
         ];
-        let detail = transport_reachability_failure_detail(&candidates);
+        let detail = transport_reachability_failure_detail(&candidates, None);
 
         assert!(detail.contains("mdns_discovered=true"));
         assert!(detail.contains("tcp_transport_reachability=failed"));
+        assert!(detail.contains("failure_reason=none"));
         assert!(detail.contains("source=mdns tcp ipv6 port 15100"));
         assert!(detail.contains("source=mdns tcp ipv4 port 15100"));
         assert!(detail.contains("next_action=verify Private network"));
@@ -522,6 +534,15 @@ mod tests {
         assert!(!transport_error_summary(Some(&error)).contains("10.0.0.9"));
     }
 
+    #[test]
+    fn transport_error_summary_preserves_redacted_racing_category() {
+        let error = anyhow::anyhow!(
+            "transport candidate racing failed; attempted=[source=mdns tcp ipv4 port 15100 tls_connect_failed]"
+        );
+
+        assert_eq!(transport_error_summary(Some(&error)), "tls_connect_failed");
+    }
+
     #[tokio::test]
     async fn peer_worker_bounds_stalled_candidate_and_records_reachability_failure() {
         let stalled_endpoint = "127.0.0.41:15100";
@@ -596,6 +617,7 @@ mod tests {
             "candidate loop should continue past the stalled first candidate before retrying; attempts={attempts:?}"
         );
         assert!(event.detail.contains("tcp_transport_reachability=failed"));
+        assert!(event.detail.contains("failure_reason=refused"));
         assert!(event.detail.contains("source=mdns tcp ipv4 port 15100"));
         assert!(
             event
