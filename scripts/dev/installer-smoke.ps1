@@ -713,7 +713,7 @@ try {
     }
 
     $repairServiceDeleteOutput = Remove-BoundlessServiceRegistrationForRepair
-    $repairExitCode = Invoke-MsiExec -ArgumentList (@("/fa", $InstallerPath, "/qn", "/norestart") + $msiInstallProperties) -LogPath $repairLog
+    $repairExitCode = Invoke-MsiExec -ArgumentList (@("/famus", $InstallerPath, "/qn", "/norestart") + $msiInstallProperties) -LogPath $repairLog
     $repairServiceConfig = Assert-BoundlessServiceConfig -ExpectedServicePath $servicePath -ExpectedAllowedUserSid $AllowedUserSid
     Wait-BoundlessServiceStatus -ExpectedStatus "Running" | Out-Null
     $repairDaemonStatusOutput = Wait-ForDaemonReady -CliPath $cliPath

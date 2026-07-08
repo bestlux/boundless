@@ -335,6 +335,13 @@ jobs:
             -InstallerSmokeSummaryPath (Join-Path (Resolve-Path .).Path "artifacts/installer-validation/installer-smoke.json") `
             -ReleaseVersion "${{ needs.release-context.outputs.tag_name }}"
 
+      - name: Upload installer validation logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: installer-validation
+          path: artifacts/installer-validation
+
       - name: Upload release readiness packet
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
