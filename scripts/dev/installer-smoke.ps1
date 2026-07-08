@@ -130,7 +130,7 @@ function Test-ExpectedShortcutIconLocation {
         return $true
     }
 
-    return $resolvedLocation -imatch '[\\/]Microsoft[\\/]Installer[\\/]\{[^\\/]+\}[\\/]BoundlessIcon\.ico$'
+    return $resolvedLocation -imatch '[\\/](?:Microsoft|Windows)[\\/]Installer[\\/]\{[^\\/]+\}[\\/]BoundlessIcon\.ico$'
 }
 
 function Assert-Authenticode {
@@ -427,11 +427,11 @@ function Assert-BoundlessServiceConfig {
     if ($service.PathName -notmatch [regex]::Escape($ExpectedServicePath)) {
         throw "BoundlessService PathName did not point at the Program Files service binary. PathName=$($service.PathName)"
     }
-    if ($service.PathName -notmatch "(^|\\s)--allowed-user-sid=([^\\s]+)") {
+    if ($service.PathName -notmatch "(^|\s)--allowed-user-sid=([^\s]+)") {
         throw "BoundlessService PathName did not include --allowed-user-sid. PathName=$($service.PathName)"
     }
 
-    $sidMatches = [regex]::Matches($service.PathName, "--allowed-user-sid=([^\\s]+)")
+    $sidMatches = [regex]::Matches($service.PathName, "--allowed-user-sid=([^\s]+)")
     if ($sidMatches.Count -ne 1) {
         throw "BoundlessService PathName must include exactly one --allowed-user-sid argument. PathName=$($service.PathName)"
     }
@@ -713,7 +713,7 @@ try {
     }
 
     $repairServiceDeleteOutput = Remove-BoundlessServiceRegistrationForRepair
-    $repairExitCode = Invoke-MsiExec -ArgumentList (@("/fa", $InstallerPath, "/qn", "/norestart") + $msiInstallProperties) -LogPath $repairLog
+    $repairExitCode = Invoke-MsiExec -ArgumentList (@("/i", $InstallerPath) + $msiInstallProperties + @("REINSTALL=ALL", "REINSTALLMODE=amus", "/qn", "/norestart")) -LogPath $repairLog
     $repairServiceConfig = Assert-BoundlessServiceConfig -ExpectedServicePath $servicePath -ExpectedAllowedUserSid $AllowedUserSid
     Wait-BoundlessServiceStatus -ExpectedStatus "Running" | Out-Null
     $repairDaemonStatusOutput = Wait-ForDaemonReady -CliPath $cliPath

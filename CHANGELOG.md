@@ -1,5 +1,20 @@
 # Changelog
 
+## [5.0.11](https://github.com/bestlux/boundless/compare/v5.0.0...v5.0.11) (2026-07-08)
+
+
+### Bug Fixes
+
+* broker clipboard access through the user-session tray broker when the daemon runs as a Windows service, so service-mode copy/paste reaches the interactive desktop clipboard
+* honor Windows SCM stop requests promptly and abort daemon runtime work instead of wedging MSI install or upgrade sessions
+* keep transport diagnostics readable by dropping periodic safety-tick wake events from the transport event ring and adding boundlessctl transport events --kind/--exclude-kind
+* repair reset and connectivity helper paths used by two-PC dogfood smoke, including daemon-status parser coverage and packaging-script CI self-tests
+* preserve asymmetric LAN pairing and trusted transport behavior for one-sided reachability dogfood scenarios
+
+### CI
+
+* run Windows packaging-script self-tests and the CLI daemon-status output contract in CI and release validation
+
 ## [5.0.0](https://github.com/bestlux/boundless/compare/v4.0.2...v5.0.0) (2026-06-19)
 
 
