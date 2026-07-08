@@ -94,7 +94,12 @@ fn resolve_boundless_service_binary() -> Result<PathBuf> {
 pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let status = client.get_status(StatusRequest {}).await?.into_inner();
-    println!(
+    println!("{}", format_daemon_status_line(&status));
+    Ok(())
+}
+
+fn format_daemon_status_line(status: &StatusReply) -> String {
+    format!(
         "running={} daemon_version={} machine_id={} peers={} protocol={} api_transport={} api_bind={} api_pipe_name={} input_locked={} input_lock_supported={} active_capture_target={} anti_idle_supported={} anti_idle_enabled={} anti_idle_active={} anti_idle_display_required={}",
         status.running,
         status.daemon_version,
@@ -115,8 +120,7 @@ pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
         status.anti_idle_enabled,
         status.anti_idle_active,
         status.anti_idle_display_required
-    );
-    Ok(())
+    )
 }
 
 pub(super) async fn pair_create_code(endpoint: &str, ttl: u32) -> Result<()> {
@@ -2733,6 +2737,32 @@ mod tests {
             machine_id: "local-machine".to_string(),
             display_name: "local-device".to_string(),
         }
+    }
+
+    #[test]
+    fn daemon_status_output_matches_packaging_fixture() {
+        let status = StatusReply {
+            running: true,
+            daemon_version: "5.0.0".to_string(),
+            machine_id: "4f0c6bce-6c10-4df9-b8b5-3a9a3fbb5da1".to_string(),
+            peer_count: 1,
+            protocol_version: "4.2.0".to_string(),
+            api_transport: "npipe".to_string(),
+            api_bind: String::new(),
+            api_pipe_name: "boundlessd-api".to_string(),
+            input_locked: false,
+            input_lock_supported: true,
+            capture_target_peer_id: String::new(),
+            anti_idle_supported: true,
+            anti_idle_enabled: true,
+            anti_idle_active: false,
+            anti_idle_display_required: false,
+        };
+        let fixture =
+            include_str!("../../../packaging/windows/fixtures/daemon-status-single-line.txt")
+                .trim();
+
+        assert_eq!(format_daemon_status_line(&status), fixture);
     }
 
     #[test]

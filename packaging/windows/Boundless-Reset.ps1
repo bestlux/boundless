@@ -19,6 +19,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$script:PackagingScriptRoot = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+    (Resolve-Path ".").Path
+}
+else {
+    $PSScriptRoot
+}
 
 function Get-LocalAppDataPath {
     return [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
@@ -99,6 +105,15 @@ function Get-MachineIdFromStatusOutput {
     return $null
 }
 
+function Get-CanonicalDaemonStatusFixture {
+    $fixturePath = Join-Path (Join-Path $script:PackagingScriptRoot "fixtures") "daemon-status-single-line.txt"
+    if (-not (Test-Path -LiteralPath $fixturePath)) {
+        throw "daemon status fixture was not found: $fixturePath"
+    }
+
+    return (Get-Content -LiteralPath $fixturePath -Raw).Trim()
+}
+
 function Get-DaemonMachineId {
     param(
         [string]$BoundlessCtl,
@@ -120,9 +135,9 @@ function Get-DaemonMachineId {
 }
 
 function Invoke-ResetSelfTest {
-    $singleLine = "running=true daemon_version=5.0.0 machine_id=4f0c6bce-6c10-4df9-b8b5-3a9a3fbb5da1 peers=1 protocol=4.2.0"
+    $singleLine = Get-CanonicalDaemonStatusFixture
     if ((Get-MachineIdFromStatusOutput -StatusOutput @($singleLine)) -ne "4f0c6bce-6c10-4df9-b8b5-3a9a3fbb5da1") {
-        throw "machine_id must parse from single-line daemon status output"
+        throw "machine_id must parse from canonical single-line daemon status output"
     }
 
     $multiLine = @("running=true", "machine_id=abc-123", "peers=0")

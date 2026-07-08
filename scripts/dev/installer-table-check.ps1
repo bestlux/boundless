@@ -178,10 +178,26 @@ if ($installHelperFile[0] -notmatch '(^|[|])Boundless-Install\.ps1$') {
 }
 Assert-Equals -Actual $installHelperFile[1] -Expected "BoundlessPayloadComponent" -Label "InstallHelperScriptFile.Component_"
 
+Set-MsiSingleRow -Database $database -Sql "SELECT Directory_, KeyPath FROM Component WHERE Component = 'BoundlessStatusFixtureComponent'" -ColumnCount 2 -Label "status fixture Component" -VariableName "statusFixtureComponent"
+Assert-Equals -Actual $statusFixtureComponent[0] -Expected "BoundlessFixturesDirectory" -Label "StatusFixture.Component.Directory_"
+Assert-Equals -Actual $statusFixtureComponent[1] -Expected "DaemonStatusFixtureFile" -Label "StatusFixture.Component.KeyPath"
+
+Set-MsiSingleRow -Database $database -Sql "SELECT FileName, Component_ FROM File WHERE File = 'DaemonStatusFixtureFile'" -ColumnCount 2 -Label "daemon status fixture File" -VariableName "statusFixtureFile"
+if ($statusFixtureFile[0] -notmatch '(^|[|])daemon-status-single-line\.txt$') {
+    throw "DaemonStatusFixtureFile does not install daemon-status-single-line.txt: $($statusFixtureFile[0])"
+}
+Assert-Equals -Actual $statusFixtureFile[1] -Expected "BoundlessStatusFixtureComponent" -Label "DaemonStatusFixtureFile.Component_"
+
 Set-MsiSingleRow -Database $database -Sql "SELECT Directory_Parent, DefaultDir FROM Directory WHERE Directory = 'INSTALLDIR'" -ColumnCount 2 -Label "INSTALLDIR Directory" -VariableName "installDir"
 Assert-Equals -Actual $installDir[0] -Expected "ProgramFiles64Folder" -Label "INSTALLDIR.Directory_Parent"
 if ($installDir[1] -notmatch '(^|[|])Boundless$') {
     throw "INSTALLDIR.DefaultDir was unexpected. Expected long name Boundless, got '$($installDir[1])'."
+}
+
+Set-MsiSingleRow -Database $database -Sql "SELECT Directory_Parent, DefaultDir FROM Directory WHERE Directory = 'BoundlessFixturesDirectory'" -ColumnCount 2 -Label "fixtures Directory" -VariableName "fixturesDir"
+Assert-Equals -Actual $fixturesDir[0] -Expected "INSTALLDIR" -Label "FixturesDirectory.Directory_Parent"
+if ($fixturesDir[1] -notmatch '(^|[|])fixtures$') {
+    throw "BoundlessFixturesDirectory.DefaultDir was unexpected. Expected long name fixtures, got '$($fixturesDir[1])'."
 }
 
 $summary = [ordered]@{
@@ -194,7 +210,9 @@ $summary = [ordered]@{
     service_control_event = [int]$serviceControl[1]
     service_binary_file = $file[0]
     install_helper_file = $installHelperFile[0]
+    daemon_status_fixture_file = $statusFixtureFile[0]
     install_directory_parent = $installDir[0]
+    fixture_directory_parent = $fixturesDir[0]
     invalid_sid_examples_rejected = $true
     sid_launch_condition_count = @($launchConditions | Where-Object { $_ -like "*BOUNDLESS_ALLOWED_USER_SID*" }).Count
     status = "passed"

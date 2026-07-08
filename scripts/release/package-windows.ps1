@@ -123,6 +123,11 @@ foreach ($file in $packageFiles) {
     Copy-Item -LiteralPath (Join-Path $packageAssetRoot $file) -Destination (Join-Path $stageRoot $file)
 }
 
+$packageFixturesRoot = Join-Path $packageAssetRoot "fixtures"
+if (Test-Path -LiteralPath $packageFixturesRoot) {
+    Copy-Item -LiteralPath $packageFixturesRoot -Destination (Join-Path $stageRoot "fixtures") -Recurse
+}
+
 $manifestPath = Join-Path $stageRoot "package-manifest.json"
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 $manifest.version = $Version
