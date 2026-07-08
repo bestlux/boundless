@@ -373,6 +373,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn safety_tick_wake_events_are_not_recorded_as_transport_events() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-input-runtime-wake-noise-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let state =
+            AppState::load_or_create_with_paths(config_path, security_root).expect("load state");
+
+        record_local_input_runtime_event(
+            &state,
+            "input_runtime_wake",
+            "channel=all source=safety_tick",
+            "none",
+        )
+        .await;
+        record_local_input_runtime_event(
+            &state,
+            "input_runtime_wake",
+            "channel=input_inject source=retry_deadline",
+            "none",
+        )
+        .await;
+
+        let events = state.transport_events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "input_runtime_wake");
+        assert_eq!(
+            events[0].detail,
+            "channel=input_inject source=retry_deadline"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     struct CountingBackend {
         applied: usize,
     }

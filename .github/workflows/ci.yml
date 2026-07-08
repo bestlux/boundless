@@ -13,6 +13,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  packaging-scripts:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      CARGO_INCREMENTAL: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Run packaging script self-tests
+        shell: pwsh
+        run: ./scripts/dev/packaging-script-smoke.ps1
+
+      - name: Test CLI daemon status output contract
+        shell: pwsh
+        run: cargo test -p boundless-cli commands::tests::daemon_status_output_matches_packaging_fixture
+
   verify:
     strategy:
       fail-fast: false

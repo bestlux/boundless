@@ -139,6 +139,7 @@
           Value="1"
           KeyPath="yes" />
       </Component>
+      <ComponentRef Id="BoundlessStatusFixtureComponent" />
       <Component Id="BoundlessServicePayloadComponent" Guid="84E63D4D-84EE-485D-91CF-A5E04D07EC86">
         <File Id="ServiceBinaryFile" Source="$(var.PayloadDir)\boundless-service.exe" KeyPath="yes" />
         <ServiceInstall
@@ -167,6 +168,16 @@
           KeyPath="no" />
       </Component>
     </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <DirectoryRef Id="INSTALLDIR">
+      <Directory Id="BoundlessFixturesDirectory" Name="fixtures">
+        <Component Id="BoundlessStatusFixtureComponent" Guid="AF6609AC-DAC6-42CC-B294-6AC0D46BA571">
+          <File Id="DaemonStatusFixtureFile" Source="$(var.PayloadDir)\fixtures\daemon-status-single-line.txt" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </DirectoryRef>
   </Fragment>
 
   <Fragment>

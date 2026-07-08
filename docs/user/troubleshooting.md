@@ -52,6 +52,8 @@ Checks:
 & "$env:ProgramFiles\Boundless\Boundless-ConnectivityDiagnostics.ps1" -RemoteHost 10.10.0.187
 ```
 
+Transport events are a bounded in-memory ring that retains the newest 512 events, not durable history. Use `--limit 0` to print the full retained ring and compare the first and last timestamps to estimate how much wall-clock history is still diagnosable. Use `--kind <substring>` and `--exclude-kind <substring>` to keep noisy local runtime events out of a focused view, for example `transport events --limit 100 --exclude-kind input_runtime`.
+
 The connectivity diagnostics script is read-only. It reports the active Windows network profiles, local listener/process ownership for TCP `15100`, `15101`, and `15200`, and remote TCP reachability for those ports when `-RemoteHost` is supplied. TCP `15200` is the nearby pairing listener; TCP `15100` is the transport listener used after trust is established. TCP `15101` is included to make side-by-side dogfood with Mouse Without Borders or other tools easier to diagnose.
 
 In JSON output, `firewall_hint` reports read-only evidence for the expected policy shape: enabled inbound allow rules for `%ProgramFiles%\Boundless\boundless-service.exe`, Private profile, TCP `15100` and `15200`, and `LocalSubnet`-or-narrower remote scope. It also flags broad, Public, or Any-style matching rules. TCP `15101` remains diagnostics-only, not a default firewall requirement.

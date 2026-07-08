@@ -20,7 +20,7 @@ use ipc_api::boundless::v1::{
     NearbySubmitCodeRequest, PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest,
     RotateTrustRequest, SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest,
     SendFileRequest, SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest,
-    UiSnapshotReply,
+    TransportEvent, UiSnapshotReply,
 };
 
 mod cli_helpers;
@@ -293,6 +293,10 @@ enum TransportCommand {
     Events {
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        exclude_kind: Option<String>,
     },
 }
 
@@ -546,7 +550,19 @@ async fn main() -> Result<()> {
             TransportCommand::SendFile { peer_id, paths } => {
                 transport_send_files(&cli.endpoint, peer_id, paths).await
             }
-            TransportCommand::Events { limit } => transport_events(&cli.endpoint, limit).await,
+            TransportCommand::Events {
+                limit,
+                kind,
+                exclude_kind,
+            } => {
+                transport_events(
+                    &cli.endpoint,
+                    limit,
+                    kind.as_deref(),
+                    exclude_kind.as_deref(),
+                )
+                .await
+            }
         },
         Command::Input { command } => match command {
             InputCommand::Status => input_status(&cli.endpoint).await,

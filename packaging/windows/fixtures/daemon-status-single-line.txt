@@ -1,0 +1,1 @@
+running=true daemon_version=5.0.0 machine_id=4f0c6bce-6c10-4df9-b8b5-3a9a3fbb5da1 peers=1 protocol=4.2.0 api_transport=npipe api_bind= api_pipe_name=boundlessd-api input_locked=false input_lock_supported=true active_capture_target=none anti_idle_supported=true anti_idle_enabled=true anti_idle_active=false anti_idle_display_required=false

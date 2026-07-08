@@ -94,7 +94,12 @@ fn resolve_boundless_service_binary() -> Result<PathBuf> {
 pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let status = client.get_status(StatusRequest {}).await?.into_inner();
-    println!(
+    println!("{}", format_daemon_status_line(&status));
+    Ok(())
+}
+
+fn format_daemon_status_line(status: &StatusReply) -> String {
+    format!(
         "running={} daemon_version={} machine_id={} peers={} protocol={} api_transport={} api_bind={} api_pipe_name={} input_locked={} input_lock_supported={} active_capture_target={} anti_idle_supported={} anti_idle_enabled={} anti_idle_active={} anti_idle_display_required={}",
         status.running,
         status.daemon_version,
@@ -115,8 +120,7 @@ pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
         status.anti_idle_enabled,
         status.anti_idle_active,
         status.anti_idle_display_required
-    );
-    Ok(())
+    )
 }
 
 pub(super) async fn pair_create_code(endpoint: &str, ttl: u32) -> Result<()> {
@@ -1694,17 +1698,19 @@ pub(super) async fn transport_send_files(
     Ok(())
 }
 
-pub(super) async fn transport_events(endpoint: &str, limit: usize) -> Result<()> {
+pub(super) async fn transport_events(
+    endpoint: &str,
+    limit: usize,
+    kind: Option<&str>,
+    exclude_kind: Option<&str>,
+) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let mut events = client
         .list_transport_events(Empty {})
         .await?
         .into_inner()
         .events;
-
-    if limit > 0 && events.len() > limit {
-        events = events.split_off(events.len() - limit);
-    }
+    events = select_transport_events(events, limit, kind, exclude_kind);
 
     if events.is_empty() {
         println!("no transport events");
@@ -1724,6 +1730,35 @@ pub(super) async fn transport_events(endpoint: &str, limit: usize) -> Result<()>
     }
 
     Ok(())
+}
+
+fn select_transport_events(
+    events: Vec<TransportEvent>,
+    limit: usize,
+    kind: Option<&str>,
+    exclude_kind: Option<&str>,
+) -> Vec<TransportEvent> {
+    let mut events = filter_transport_events(events, kind, exclude_kind);
+    if limit > 0 && events.len() > limit {
+        events = events.split_off(events.len() - limit);
+    }
+    events
+}
+
+fn filter_transport_events(
+    events: Vec<TransportEvent>,
+    kind: Option<&str>,
+    exclude_kind: Option<&str>,
+) -> Vec<TransportEvent> {
+    let kind = kind.filter(|value| !value.is_empty());
+    let exclude_kind = exclude_kind.filter(|value| !value.is_empty());
+    events
+        .into_iter()
+        .filter(|event| {
+            kind.is_none_or(|needle| event.kind.contains(needle))
+                && !exclude_kind.is_some_and(|needle| event.kind.contains(needle))
+        })
+        .collect()
 }
 
 fn escape_event_field(value: &str) -> String {
@@ -2733,6 +2768,71 @@ mod tests {
             machine_id: "local-machine".to_string(),
             display_name: "local-device".to_string(),
         }
+    }
+
+    #[test]
+    fn daemon_status_output_matches_packaging_fixture() {
+        let status = StatusReply {
+            running: true,
+            daemon_version: "5.0.0".to_string(),
+            machine_id: "4f0c6bce-6c10-4df9-b8b5-3a9a3fbb5da1".to_string(),
+            peer_count: 1,
+            protocol_version: "4.2.0".to_string(),
+            api_transport: "npipe".to_string(),
+            api_bind: String::new(),
+            api_pipe_name: "boundlessd-api".to_string(),
+            input_locked: false,
+            input_lock_supported: true,
+            capture_target_peer_id: String::new(),
+            anti_idle_supported: true,
+            anti_idle_enabled: true,
+            anti_idle_active: false,
+            anti_idle_display_required: false,
+        };
+        let fixture =
+            include_str!("../../../packaging/windows/fixtures/daemon-status-single-line.txt")
+                .trim();
+
+        assert_eq!(format_daemon_status_line(&status), fixture);
+    }
+
+    fn test_transport_event(kind: &str, detail: &str) -> TransportEvent {
+        TransportEvent {
+            timestamp: "2026-07-08T00:00:00Z".to_string(),
+            direction: "local".to_string(),
+            kind: kind.to_string(),
+            peer_id: "peer-a".to_string(),
+            detail: detail.to_string(),
+            size_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn transport_event_filters_match_kind_substrings() {
+        let events = vec![
+            test_transport_event("input_runtime_wake", "source=retry_deadline"),
+            test_transport_event("clipboard_text", "payload"),
+            test_transport_event("anti_idle_local_state", "active=true"),
+        ];
+
+        let selected = select_transport_events(events, 0, Some("clipboard"), None);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].kind, "clipboard_text");
+    }
+
+    #[test]
+    fn transport_event_filters_exclude_kind_substrings_before_limit() {
+        let events = vec![
+            test_transport_event("clipboard_text", "retained"),
+            test_transport_event("input_runtime_wake", "source=retry_deadline"),
+        ];
+
+        let selected = select_transport_events(events, 1, None, Some("input_runtime"));
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].kind, "clipboard_text");
+        assert_eq!(selected[0].detail, "retained");
     }
 
     #[test]
