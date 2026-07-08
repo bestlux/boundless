@@ -1,6 +1,6 @@
 [package]
 name = "core-discovery"
-version = "5.0.0"
+version = "5.0.11"
 edition.workspace = true
 license.workspace = true
 
