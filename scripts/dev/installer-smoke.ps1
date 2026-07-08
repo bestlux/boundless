@@ -130,7 +130,7 @@ function Test-ExpectedShortcutIconLocation {
         return $true
     }
 
-    return $resolvedLocation -imatch '[\\/]Microsoft[\\/]Installer[\\/]\{[^\\/]+\}[\\/]BoundlessIcon\.ico$'
+    return $resolvedLocation -imatch '[\\/](?:Microsoft|Windows)[\\/]Installer[\\/]\{[^\\/]+\}[\\/]BoundlessIcon\.ico$'
 }
 
 function Assert-Authenticode {
