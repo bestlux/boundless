@@ -1698,17 +1698,19 @@ pub(super) async fn transport_send_files(
     Ok(())
 }
 
-pub(super) async fn transport_events(endpoint: &str, limit: usize) -> Result<()> {
+pub(super) async fn transport_events(
+    endpoint: &str,
+    limit: usize,
+    kind: Option<&str>,
+    exclude_kind: Option<&str>,
+) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let mut events = client
         .list_transport_events(Empty {})
         .await?
         .into_inner()
         .events;
-
-    if limit > 0 && events.len() > limit {
-        events = events.split_off(events.len() - limit);
-    }
+    events = select_transport_events(events, limit, kind, exclude_kind);
 
     if events.is_empty() {
         println!("no transport events");
@@ -1728,6 +1730,35 @@ pub(super) async fn transport_events(endpoint: &str, limit: usize) -> Result<()>
     }
 
     Ok(())
+}
+
+fn select_transport_events(
+    events: Vec<TransportEvent>,
+    limit: usize,
+    kind: Option<&str>,
+    exclude_kind: Option<&str>,
+) -> Vec<TransportEvent> {
+    let mut events = filter_transport_events(events, kind, exclude_kind);
+    if limit > 0 && events.len() > limit {
+        events = events.split_off(events.len() - limit);
+    }
+    events
+}
+
+fn filter_transport_events(
+    events: Vec<TransportEvent>,
+    kind: Option<&str>,
+    exclude_kind: Option<&str>,
+) -> Vec<TransportEvent> {
+    let kind = kind.filter(|value| !value.is_empty());
+    let exclude_kind = exclude_kind.filter(|value| !value.is_empty());
+    events
+        .into_iter()
+        .filter(|event| {
+            kind.is_none_or(|needle| event.kind.contains(needle))
+                && !exclude_kind.is_some_and(|needle| event.kind.contains(needle))
+        })
+        .collect()
 }
 
 fn escape_event_field(value: &str) -> String {
@@ -2763,6 +2794,45 @@ mod tests {
                 .trim();
 
         assert_eq!(format_daemon_status_line(&status), fixture);
+    }
+
+    fn test_transport_event(kind: &str, detail: &str) -> TransportEvent {
+        TransportEvent {
+            timestamp: "2026-07-08T00:00:00Z".to_string(),
+            direction: "local".to_string(),
+            kind: kind.to_string(),
+            peer_id: "peer-a".to_string(),
+            detail: detail.to_string(),
+            size_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn transport_event_filters_match_kind_substrings() {
+        let events = vec![
+            test_transport_event("input_runtime_wake", "source=retry_deadline"),
+            test_transport_event("clipboard_text", "payload"),
+            test_transport_event("anti_idle_local_state", "active=true"),
+        ];
+
+        let selected = select_transport_events(events, 0, Some("clipboard"), None);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].kind, "clipboard_text");
+    }
+
+    #[test]
+    fn transport_event_filters_exclude_kind_substrings_before_limit() {
+        let events = vec![
+            test_transport_event("clipboard_text", "retained"),
+            test_transport_event("input_runtime_wake", "source=retry_deadline"),
+        ];
+
+        let selected = select_transport_events(events, 1, None, Some("input_runtime"));
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].kind, "clipboard_text");
+        assert_eq!(selected[0].detail, "retained");
     }
 
     #[test]

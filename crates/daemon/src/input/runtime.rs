@@ -483,6 +483,10 @@ pub(super) async fn record_local_input_runtime_event(
     detail: &str,
     peer_id: &str,
 ) {
+    if !should_record_local_input_runtime_event(kind, detail) {
+        return;
+    }
+
     state.record_transport_event(TransportEventRecord {
         timestamp: Utc::now(),
         direction: "local".to_string(),
@@ -491,4 +495,11 @@ pub(super) async fn record_local_input_runtime_event(
         detail: detail.to_string(),
         size_bytes: 0,
     });
+}
+
+pub(super) fn should_record_local_input_runtime_event(kind: &str, detail: &str) -> bool {
+    !(kind == "input_runtime_wake"
+        && detail
+            .split_whitespace()
+            .any(|part| part == "source=safety_tick"))
 }
