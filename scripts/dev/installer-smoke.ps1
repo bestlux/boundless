@@ -427,11 +427,11 @@ function Assert-BoundlessServiceConfig {
     if ($service.PathName -notmatch [regex]::Escape($ExpectedServicePath)) {
         throw "BoundlessService PathName did not point at the Program Files service binary. PathName=$($service.PathName)"
     }
-    if ($service.PathName -notmatch "(^|\\s)--allowed-user-sid=([^\\s]+)") {
+    if ($service.PathName -notmatch "(^|\s)--allowed-user-sid=([^\s]+)") {
         throw "BoundlessService PathName did not include --allowed-user-sid. PathName=$($service.PathName)"
     }
 
-    $sidMatches = [regex]::Matches($service.PathName, "--allowed-user-sid=([^\\s]+)")
+    $sidMatches = [regex]::Matches($service.PathName, "--allowed-user-sid=([^\s]+)")
     if ($sidMatches.Count -ne 1) {
         throw "BoundlessService PathName must include exactly one --allowed-user-sid argument. PathName=$($service.PathName)"
     }
