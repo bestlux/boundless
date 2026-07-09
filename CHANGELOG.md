@@ -1,5 +1,18 @@
 # Changelog
 
+## [5.0.12](https://github.com/bestlux/boundless/compare/v5.0.11...v5.0.12) (2026-07-09)
+
+
+### Bug Fixes
+
+* enforce one Boundless tray dashboard per Windows user session and activate the existing dashboard on subsequent launches
+* preserve single-instance behavior when upgrading from the legacy 5.0.11 tray and recover ownership after a crashed tray process
+
+### CI
+
+* validate duplicate tray launches during interactive Windows installer smoke
+* keep hosted Windows Clippy compatible with explicit egui stroke-width types
+
 ## [5.0.11](https://github.com/bestlux/boundless/compare/v5.0.0...v5.0.11) (2026-07-08)
 
 

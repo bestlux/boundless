@@ -1,6 +1,6 @@
 [package]
 name = "peer-transport"
-version = "5.0.11"
+version = "5.0.12"
 edition.workspace = true
 license.workspace = true
 
