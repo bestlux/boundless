@@ -92,9 +92,146 @@ Independent small items, one PR each or one sweep; all observed 2026-07-07:
 2. `scripts/release/package-windows.ps1` must clean `packaging/windows/installer/obj` and `bin` before `dotnet build` (stale obj + renamed output ⇒ MSB3030). Still open as of 0305022 (that commit only added fixture staging).
 3. Same-version dogfood upgrades silently no-op (`MajorUpgrade` without `AllowSameVersionUpgrades`). Either add `AllowSameVersionUpgrades="yes"` or make the packaging script refuse to build an MSI whose version equals an already-published dogfood artifact. Decide and document in `packaging/windows/README.txt`.
 4. `boundlessctl daemon status` reported `daemon_version=5.0.0` on 5.0.10 installs. The workspace version bump in v5.0.11 (55c5f6b) likely resolves this — verify on the installed 5.0.11 build, and if the value still lags, wire the real package version through.
-5. `boundlesstray` allows multiple instances in one session (two observed live); add a single-instance guard (named mutex) with focus-existing behavior.
 
-Acceptance: each item has a targeted test or self-test where the surface allows (1, 2, 5 are testable; 3 is a policy + doc change; 4 is verify-then-fix).
+Tray single-instance ownership moved to standalone story BND-NEXT-31 because duplicate trays interfere with the backend connection and need their own runtime acceptance criteria.
+
+Acceptance: each item has a targeted test or self-test where the surface allows (1 and 2 are testable; 3 is a policy + doc change; 4 is verify-then-fix).
+
+---
+
+## BND-NEXT-31 (P1): Enforce one tray instance per Windows user session
+
+### Context and evidence
+
+Dogfood can launch any number of `boundlesstray.exe` processes in the same desktop session. Duplicate trays each start their own dashboard and broker activity, then compete for or lose access to the same backend service. The resulting connection failures look like daemon, named-pipe, or service instability even though the initiating defect is duplicate UI ownership. Installer smoke detects an unexpected tray count after upgrade, but normal application launch has no single-instance guard.
+
+### Scope
+
+- Acquire a per-user, per-session Windows single-instance primitive before starting the dashboard, input broker, clipboard broker, or backend polling.
+- When a second launch is attempted, activate or focus the existing dashboard and exit the new process successfully. If activation is temporarily unavailable, exit with a clear diagnostic instead of starting another broker owner.
+- Do not use a machine-global lock that prevents a different interactive Windows session or user from running its own tray.
+- Keep lifecycle behavior correct across normal exit, crash recovery, sign-out, MSI upgrade, and tray restart.
+- Record enough local diagnostics to distinguish "existing tray activated" from daemon or IPC connection failure without exposing sensitive state.
+
+### Likely files
+
+- `crates/tray/src/main.rs`, `crates/tray/src/dashboard.rs`, `crates/platform-windows/src/`, `scripts/dev/installer-smoke.ps1`
+
+### Acceptance criteria
+
+- Repeated Start Menu, shortcut, and direct executable launches leave exactly one tray process in the current user session.
+- A second launch focuses or opens the existing dashboard and does not start another input/clipboard broker.
+- Different Windows users or interactive sessions do not block one another.
+- After clean exit or forced termination, the tray can be launched again without manual cleanup or reboot.
+- Upgrade-while-running and installer smoke still finish with exactly one tray process and a healthy daemon API connection.
+- Focused tests cover lock acquisition, second-launch behavior, stale-owner recovery, and session scoping; a Windows runtime check proves the process-count behavior.
+
+### Validation
+
+Targeted tray/platform tests; `scripts/dev/installer-smoke.ps1` process-count coverage; manual repeated-launch smoke from shortcut, Start Menu, and executable in one session.
+
+---
+
+## BND-NEXT-32 (P1): Simplify CI/CD for one-user dogfood iteration
+
+### Context and evidence
+
+Boundless currently has one active user and is iterating through private two-PC dogfood rather than supporting a broad public release population. CI and release work have accumulated multiple workflows, release paths, PowerShell harnesses, platform-specific gates, and recovery fixes. Recent releases succeeded, but repeated workflow and installer-validation hiccups made routine iteration expensive and obscured which checks protect a real product risk versus historical process complexity. The desired outcome is not maximum automation; it is a small, legible system that gives fast feedback during development and preserves the few Windows/release proofs that matter.
+
+### Scope
+
+This is an analysis and migration-design story before workflow changes:
+
+1. Inventory `.github/workflows/`, reusable actions, `scripts/dev/`, and `scripts/release/`: triggers, dependencies, duplicated checks, secrets, artifacts, typical duration, recent failure causes, and whether each gate protects PR correctness, dogfood evidence, or public release mechanics.
+2. Review the latest meaningful CI and release runs, including failures that required follow-up commits, and separate product failures from flaky, stale-assumption, environment, and orchestration failures.
+3. Record the operating model explicitly: one maintainer/user, Windows-first runtime, Linux compile/test coverage, rapid dogfood builds, rare deliberate releases, optional signing, and physical two-PC evidence that cannot honestly be replaced by hosted CI.
+4. Propose a target flow with the fewest useful lanes. Evaluate a fast required PR/main lane, manual or scheduled extended Windows validation, an explicit dogfood-package lane, and a deliberate release-promotion lane. Recommend exact triggers and ownership rather than preserving every current workflow by default.
+5. Define target feedback times, required versus advisory checks, cancellation/concurrency policy, artifact retention, failure messages, rerun policy, release rollback/recovery, and the minimum branch-protection rules appropriate for a single maintainer.
+6. Produce a staged, reversible migration plan that deletes or consolidates redundant paths, preserves evidence contracts, and can be validated before old workflows are removed.
+
+### Likely files and outputs
+
+- Inputs: `.github/workflows/*.yml`, `.github/actions/`, `scripts/dev/`, `scripts/release/`, `docs/release/`, recent GitHub Actions runs and release history.
+- Output: a short CI/CD current-state report plus an ADR or implementation plan under `docs/` that includes the proposed workflow diagram, gate matrix, migration slices, and explicit non-goals.
+
+### Acceptance criteria
+
+- Every current workflow and release entry point has an owner, purpose, trigger, cost/duration estimate, evidence output, and keep/change/remove recommendation.
+- The proposal is tailored to current one-user dogfooding and identifies what must change if external contributors or users materially increase.
+- Required PR feedback is narrow and fast; physical Windows dogfood, installer, and release evidence remain visible but are not misrepresented as routine unit CI.
+- The release path has one documented source of truth for versioning, packaging, validation, and publication, with no ambiguous automatic/manual overlap.
+- The plan names which current checks become required, advisory, manual, scheduled, consolidated, or deleted and explains the risk tradeoff.
+- Implementation is broken into independently reversible PRs with success metrics such as median feedback time, avoidable reruns, and failure-diagnosis time.
+
+### Validation
+
+Review the proposal against at least the last 30 relevant CI/release runs and the v5.0.11 release incident history; dry-run or branch-test each proposed workflow slice before removing its predecessor.
+
+---
+
+## BND-NEXT-33 (P1 epic): Tray and PC-layout experience refresh
+
+### Product intent
+
+Replace the weakest parts of the current tray dashboard—especially PC layout—with an interface that is quick to understand, calm during normal operation, and mostly unnecessary for common one- and two-computer setups. Preserve the settings view as the strongest existing baseline: its information density and grouping are broadly useful, so this epic should refine it only where research finds concrete friction rather than redesigning it for visual consistency alone.
+
+The default experience should infer a sensible shared topology when computers connect. A user should not have to manually place the first peer every time. Manual layout editing remains available for unusual physical arrangements and must produce one canonical layout that converges across connected peers.
+
+### Child stories
+
+#### BND-NEXT-33A: Audit the current tray and generate design directions
+
+- Map the current Status & Pairing, layout, transfer, diagnostics, and settings journeys using screenshots and code-backed state descriptions.
+- Identify duplicated information, hidden state, backend-dependent failure states, and actions that are too easy to invoke repeatedly.
+- Generate several substantially different UI directions for the dashboard and PC-layout view, including compact normal-operation and degraded/recovery states. Use realistic one-, two-, three-, and four-PC data rather than empty mockups.
+- Evaluate the concepts against time-to-understand, common-task click count, layout legibility, accessibility, keyboard use, resize behavior, and honest representation of disconnected or partially synchronized peers.
+- Select a direction and record the rationale before production implementation. Settings should remain recognizable unless a proposed change has a specific usability benefit.
+
+Done when a review packet contains the current-state audit, task flows, multiple visual concepts, edge-state variants, evaluation matrix, and one approved implementation direction.
+
+#### BND-NEXT-33B: Define zero-configuration layout policy for one to three PCs
+
+- Define a deterministic cluster-wide concept of the main/anchor PC and stable peer ordering; do not independently center "self" on every machine.
+- One PC: self-only layout, with layout editing visually de-emphasized.
+- Two PCs: choose a predictable left/right default using the main PC and first peer, while allowing a one-action swap.
+- Three PCs: default the main PC to the middle and place the first two peers left/right in stable order.
+- Decide how reconnect, replacement, renamed peers, removed trust, and a newly selected main PC affect the inferred layout.
+- Never overwrite a layout the user has explicitly edited without a visible confirmation or reset-to-automatic action.
+
+Done when the policy is documented with state-transition examples and deterministic tests for one-, two-, and three-PC clusters, reconnect ordering, and manual overrides.
+
+#### BND-NEXT-33C: Auto-apply and converge the canonical layout
+
+- Represent whether a layout is automatic or manually overridden and identify its authoritative revision/source.
+- On pair/connect, derive the default layout once, persist it, and propagate the same canonical matrix to all participating peers.
+- Make updates idempotent and resilient to reconnects, duplicate sessions, temporarily offline peers, and competing stale revisions.
+- Surface pending, applied, conflict, and failed synchronization states without requiring raw diagnostics.
+- Provide "Use automatic layout," "Swap sides," and "Edit layout" paths appropriate to cluster size.
+
+Done when two connected PCs reach the same usable left/right layout without opening the editor, a three-PC cluster consistently anchors the main PC in the middle, and reconnect does not require re-placement or erase manual overrides.
+
+#### BND-NEXT-33D: Implement the selected dashboard and layout editor
+
+- Build the approved visual direction on existing shared app-service/query models; do not move daemon workflow logic into the tray.
+- Make normal connected state compact and obvious, with deeper diagnostics and configuration available through progressive disclosure.
+- Replace ambiguous free-form placement interactions with clear spatial affordances, snap/adjacency feedback, undo/reset, and a visible distinction between automatic and custom layout.
+- Design explicit loading, empty, disconnected, backend-unavailable, partial-sync, and destructive-confirmation states.
+- Preserve the settings view's current grouping and information coverage unless the approved design documents a measured improvement.
+
+Done when the implementation matches the approved responsive states, keyboard and pointer flows work, automated state/model tests pass, and rendered Windows screenshots are reviewed at common display scales.
+
+### Epic acceptance criteria
+
+- A first-time one- or two-PC user can pair and begin edge handoff without manually opening the layout editor.
+- All connected peers display and enforce the same canonical topology after connect/reconnect.
+- The tray prevents duplicate-instance ambiguity through BND-NEXT-31 before the refreshed UX relies on a single local UI owner.
+- Backend unavailable, stale layout, offline peer, and synchronization failure states explain the next action without raw log inspection.
+- The chosen UI direction is reviewed visually before implementation, and the implemented Windows UI is rendered and inspected rather than accepted from unit tests alone.
+
+### Likely files and validation
+
+- `crates/tray/src/dashboard/`, `crates/tray/src/dashboard.rs`, `crates/app-services/`, `crates/ipc-api/`, `crates/adapter-ipc-grpc/`, daemon layout/state operations, and focused topology/layout tests.
+- Validate incrementally with model/workflow tests, deterministic multi-daemon topology tests, rendered Windows screenshots, and real two-PC dogfood. Use three-/four-node smoke only for slices that change multi-peer convergence.
 
 ---
 
