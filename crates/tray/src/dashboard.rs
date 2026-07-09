@@ -314,7 +314,7 @@ impl DashboardApp {
                         .fill(bg)
                         .corner_radius(8.0)
                         .inner_margin(10.0)
-                        .stroke(egui::Stroke::new(1.0, border))
+                        .stroke(egui::Stroke::new(1.0_f32, border))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.add(
