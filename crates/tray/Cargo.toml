@@ -1,6 +1,6 @@
 [package]
 name = "boundless-tray"
-version = "5.0.11"
+version = "5.0.12"
 edition.workspace = true
 license.workspace = true
 

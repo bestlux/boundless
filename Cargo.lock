@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-ipc-grpc"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "anyhow",
  "app-services",
@@ -162,7 +162,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app-services"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "boundless-cli"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "anyhow",
  "app-services",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "boundless-daemon"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "adapter-ipc-grpc",
  "anyhow",
@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "boundless-tray"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "anyhow",
  "app-services",
@@ -812,7 +812,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "control-plane-client"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "anyhow",
  "hyper-util",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "core-clipboard"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "serde",
  "sha2",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "core-discovery"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "serde",
 ]
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "core-input"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "core-protocol"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "bincode",
  "serde",
@@ -906,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "core-security"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "anyhow",
  "base64",
@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "core-transfer"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "tempfile",
  "thiserror 2.0.18",
@@ -984,7 +984,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "daemon-host"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "boundless-daemon",
 ]
@@ -2180,7 +2180,7 @@ dependencies = [
 
 [[package]]
 name = "ipc-api"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "core-input",
  "prost",
@@ -3034,7 +3034,7 @@ dependencies = [
 
 [[package]]
 name = "peer-transport"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "chrono",
  "core-input",
@@ -3123,7 +3123,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "platform-windows"
-version = "5.0.11"
+version = "5.0.12"
 dependencies = [
  "anyhow",
  "clipboard-win",
