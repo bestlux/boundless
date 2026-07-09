@@ -503,6 +503,11 @@ function Get-BoundlessProcessCountForSession {
     return @($procs).Count
 }
 
+function Get-BoundlessDaemonRuntimeCount {
+    return (Get-BoundlessProcessCount -Name "boundlessd") +
+        (Get-BoundlessProcessCount -Name "boundless-service")
+}
+
 function Test-BoundlessPipePresent {
     return $null -ne (Get-ChildItem \\.\pipe\ -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -eq "boundlessd-api" } |
@@ -515,7 +520,7 @@ function Wait-ForRuntimePresence {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         $trayCount = Get-BoundlessProcessCount -Name "boundlesstray"
-        $daemonCount = Get-BoundlessProcessCount -Name "boundlessd"
+        $daemonCount = Get-BoundlessDaemonRuntimeCount
         $pipePresent = Test-BoundlessPipePresent
         if ($trayCount -ge 1 -and $daemonCount -ge 1 -and $pipePresent) {
             return [pscustomobject]@{
@@ -613,6 +618,7 @@ try {
 
     $upgradeWhileRunningTested = $false
     $upgradeWhileRunningSkippedReason = $null
+    $postUpgradeTrayRelaunched = $false
     $upgradeDaemonStatus = $null
     $postUpgradeTrayCount = $null
     $postUpgradeDaemonCount = $null
@@ -730,13 +736,6 @@ try {
         }
     }
 
-    $repairServiceDeleteOutput = Remove-BoundlessServiceRegistrationForRepair
-    $repairExitCode = Invoke-MsiExec -ArgumentList (@("/i", $InstallerPath) + $msiInstallProperties + @("REINSTALL=ALL", "REINSTALLMODE=amus", "/qn", "/norestart")) -LogPath $repairLog
-    $repairServiceConfig = Assert-BoundlessServiceConfig -ExpectedServicePath $servicePath -ExpectedAllowedUserSid $AllowedUserSid
-    Wait-BoundlessServiceStatus -ExpectedStatus "Running" | Out-Null
-    $repairDaemonStatusOutput = Wait-ForDaemonReady -CliPath $cliPath
-    $serviceRunningAfterRepair = ((Get-BoundlessService).Status.ToString() -eq "Running")
-
     foreach ($shortcutPath in @($startMenuShortcutPath, $desktopShortcutPath)) {
         if ((Get-ShortcutTarget -ShortcutPath $shortcutPath) -ne $trayPath) {
             throw "Shortcut target was unexpected: $shortcutPath"
@@ -803,16 +802,29 @@ try {
     $daemonReadyOutput = $null
     if (-not [string]::IsNullOrWhiteSpace($PreviousInstallerPath) -and $interactiveDesktopSession) {
         $upgradeWhileRunningTested = $true
+        $currentSessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+        $postUpgradeTrayCount = Get-BoundlessProcessCountForSession -Name "boundlesstray" -SessionId $currentSessionId
+        if ($postUpgradeTrayCount -eq 0) {
+            $postUpgradeTrayProcess = Start-Process -FilePath $trayPath -WorkingDirectory $installRoot -PassThru
+            Start-Sleep -Seconds 3
+            if ($postUpgradeTrayProcess.HasExited) {
+                throw "Current tray exited before post-upgrade smoke could begin. Exit code: $($postUpgradeTrayProcess.ExitCode)"
+            }
+            $postUpgradeTrayRelaunched = $true
+        }
+        elseif ($postUpgradeTrayCount -gt 1) {
+            throw "Expected at most one boundlesstray.exe immediately after upgrade, found $postUpgradeTrayCount."
+        }
         $runtimePresence = Wait-ForRuntimePresence
         $upgradeDaemonStatus = "tray_count=$($runtimePresence.TrayCount) daemon_count=$($runtimePresence.DaemonCount) pipe_present=$($runtimePresence.PipePresent)"
         Start-Sleep -Seconds 3
         $postUpgradeTrayCount = Get-BoundlessProcessCount -Name "boundlesstray"
-        $postUpgradeDaemonCount = Get-BoundlessProcessCount -Name "boundlessd"
+        $postUpgradeDaemonCount = Get-BoundlessDaemonRuntimeCount
         if ($postUpgradeTrayCount -ne 1) {
             throw "Expected exactly one boundlesstray.exe after upgrade-while-running smoke, found $postUpgradeTrayCount."
         }
         if ($postUpgradeDaemonCount -ne 1) {
-            throw "Expected exactly one boundlessd.exe after upgrade-while-running smoke, found $postUpgradeDaemonCount."
+            throw "Expected exactly one Boundless daemon runtime after upgrade-while-running smoke, found $postUpgradeDaemonCount."
         }
     }
     else {
@@ -851,6 +863,13 @@ try {
         $null = Wait-ForDaemonReady -CliPath $cliPath
         $traySingleInstanceTested = $true
     }
+
+    $repairServiceDeleteOutput = Remove-BoundlessServiceRegistrationForRepair
+    $repairExitCode = Invoke-MsiExec -ArgumentList (@("/i", $InstallerPath) + $msiInstallProperties + @("REINSTALL=ALL", "REINSTALLMODE=amus", "/qn", "/norestart")) -LogPath $repairLog
+    $repairServiceConfig = Assert-BoundlessServiceConfig -ExpectedServicePath $servicePath -ExpectedAllowedUserSid $AllowedUserSid
+    Wait-BoundlessServiceStatus -ExpectedStatus "Running" | Out-Null
+    $repairDaemonStatusOutput = Wait-ForDaemonReady -CliPath $cliPath
+    $serviceRunningAfterRepair = ((Get-BoundlessService).Status.ToString() -eq "Running")
 
     $serviceRunningBeforeUninstall = (Get-BoundlessService).Status.ToString() -eq "Running"
 
@@ -924,6 +943,7 @@ try {
         uninstall_exit_code = $uninstallExitCode
         upgrade_while_running_tested = $upgradeWhileRunningTested
         upgrade_while_running_skipped_reason = $upgradeWhileRunningSkippedReason
+        post_upgrade_tray_relaunched = $postUpgradeTrayRelaunched
         upgrade_daemon_status = $upgradeDaemonStatus
         post_upgrade_tray_count = $postUpgradeTrayCount
         post_upgrade_daemon_count = $postUpgradeDaemonCount
