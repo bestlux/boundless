@@ -207,7 +207,7 @@ fn process_handle_user_sid_string(process: HANDLE) -> io::Result<String> {
 }
 
 #[cfg(windows)]
-fn process_id_user_sid_string(process_id: u32) -> io::Result<String> {
+pub fn process_id_user_sid_string(process_id: u32) -> io::Result<String> {
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
     if process.is_null() {
         return Err(io::Error::last_os_error());

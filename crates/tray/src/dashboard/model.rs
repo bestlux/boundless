@@ -72,6 +72,8 @@ pub(super) struct DashboardApp {
     pub(super) exit_requested: bool,
     pub(super) exit_requested_signal: Arc<AtomicBool>,
     pub(super) native_window_handle: Option<isize>,
+    pub(super) activation_requested: Arc<AtomicBool>,
+    pub(super) _single_instance_guard: Option<SingleInstanceGuard>,
 
     pub(super) layout_grid: HashMap<(i32, i32), String>,
     pub(super) layout_unassigned: Vec<String>,
@@ -95,10 +97,21 @@ pub(super) struct DashboardApp {
 }
 
 impl DashboardApp {
-    pub(super) fn new(cc: &eframe::CreationContext<'_>, app_ctx: Arc<AppContext>) -> Self {
+    pub(super) fn new(
+        cc: &eframe::CreationContext<'_>,
+        app_ctx: Arc<AppContext>,
+        mut single_instance_guard: SingleInstanceGuard,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let exit_requested_signal = Arc::new(AtomicBool::new(false));
         let native_window_handle = native_window_handle_from_creation_context(cc);
+        let activation_requested = Arc::new(AtomicBool::new(false));
+        let activation_requested_signal = activation_requested.clone();
+        let activation_ctx = cc.egui_ctx.clone();
+        single_instance_guard.start_activation_listener(move || {
+            activation_requested_signal.store(true, Ordering::SeqCst);
+            activation_ctx.request_repaint();
+        })?;
 
         DashboardTaskRunner::spawn_snapshot_watch(
             app_ctx.clone(),
@@ -140,7 +153,7 @@ impl DashboardApp {
             });
         }
 
-        Self {
+        Ok(Self {
             ctx: app_ctx,
             _tray_icon: tray_icon,
             snapshot: UiSnapshot::default(),
@@ -168,6 +181,8 @@ impl DashboardApp {
             exit_requested: false,
             exit_requested_signal,
             native_window_handle,
+            activation_requested,
+            _single_instance_guard: Some(single_instance_guard),
             layout_grid: HashMap::new(),
             layout_unassigned: Vec::new(),
             layout_initialized: false,
@@ -183,7 +198,7 @@ impl DashboardApp {
             confirm_apply_pending: false,
             confirm_network_reset_pending: false,
             confirm_safe_reset_pending: false,
-        }
+        })
     }
 
     pub(super) fn begin_pairing_flow(&mut self, flow: GuidedPairingFlow) -> u64 {

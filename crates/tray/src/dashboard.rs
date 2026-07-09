@@ -6,10 +6,21 @@ use std::sync::mpsc::{self, Receiver, Sender};
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
+#[cfg(windows)]
+use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
+#[cfg(windows)]
+use windows_sys::core::BOOL;
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    PostMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow, WM_CLOSE,
+    EnumWindows, FLASHWINFO, FLASHW_TIMERNOFG, FLASHW_TRAY, FlashWindowEx, GetForegroundWindow,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, MB_ICONERROR,
+    MB_OK, MB_SETFOREGROUND, MessageBoxW, PostMessageW, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SetForegroundWindow, ShowWindow, WM_CLOSE,
 };
 
 mod dashboard_layout {
@@ -36,12 +47,52 @@ use dashboard_task_runner::{
     DashboardTaskRunner, StartRoleReversalPairingTask, SubmitPairingCodeTask,
 };
 use dashboard_window::{
+    DASHBOARD_WINDOW_TITLE, activate_existing_dashboard_window, find_existing_dashboard_window,
     hide_dashboard_window, native_window_handle_from_creation_context, request_dashboard_exit,
-    show_dashboard_window,
+    show_dashboard_window, show_tray_startup_error,
 };
 
 pub(super) fn run() -> Result<()> {
     let cli = Cli::parse();
+    let session_id = current_process_session_id().context("failed to resolve tray session id")?;
+    let user_sid = current_user_sid_string().context("failed to resolve tray user SID")?;
+    if let Some(hwnd) = find_existing_dashboard_window(session_id, &user_sid)? {
+        if !activate_existing_dashboard_window(hwnd) {
+            show_tray_startup_error("The existing Boundless tray could not be brought forward. Close it from Task Manager, then launch Boundless again.");
+            anyhow::bail!("existing legacy tray dashboard could not be shown");
+        }
+        eprintln!("boundless_tray_single_instance=legacy_existing_activated");
+        return Ok(());
+    }
+    let event_name = tray_single_instance_event_name(&user_sid, session_id);
+    let acquisition = match SingleInstanceGuard::acquire(&event_name, &user_sid) {
+        Ok(acquisition) => acquisition,
+        Err(error) => {
+            show_tray_startup_error(
+                "Boundless could not establish tray ownership for this Windows session. Close any existing boundlesstray.exe process, then launch Boundless again.",
+            );
+            return Err(error);
+        }
+    };
+    let single_instance_guard = match acquisition {
+        SingleInstanceAcquire::Primary(guard) => guard,
+        SingleInstanceAcquire::ExistingSignaled => {
+            let Some(hwnd) = find_existing_dashboard_window_with_retry(
+                session_id,
+                &user_sid,
+                Duration::from_secs(3),
+            )? else {
+                show_tray_startup_error("Boundless is already starting or running, but its dashboard did not become available. Close boundlesstray.exe from Task Manager, then launch Boundless again.");
+                anyhow::bail!("existing tray accepted activation but its dashboard window was unavailable");
+            };
+            if !activate_existing_dashboard_window(hwnd) {
+                show_tray_startup_error("The existing Boundless dashboard could not be brought forward. Close it from Task Manager, then launch Boundless again.");
+                anyhow::bail!("existing tray dashboard could not be shown");
+            }
+            eprintln!("boundless_tray_single_instance=existing_activated");
+            return Ok(());
+        }
+    };
     let ctx = Arc::new(AppContext {
         endpoint: cli.endpoint,
         start_daemon: cli.start_daemon,
@@ -56,19 +107,46 @@ pub(super) fn run() -> Result<()> {
             .with_inner_size([800.0, 600.0])
             .with_resizable(false)
             .with_icon(make_window_icon()?)
-            .with_title("Boundless Dashboard"),
+            .with_title(DASHBOARD_WINDOW_TITLE),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Boundless Dashboard",
+        DASHBOARD_WINDOW_TITLE,
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            Ok(Box::new(DashboardApp::new(cc, ctx)))
+            Ok(Box::new(DashboardApp::new(
+                cc,
+                ctx,
+                single_instance_guard,
+            )?))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {:?}", e))
+}
+
+fn find_existing_dashboard_window_with_retry(
+    session_id: u32,
+    user_sid: &str,
+    timeout: Duration,
+) -> Result<Option<HWND>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(hwnd) = find_existing_dashboard_window(session_id, user_sid)? {
+            return Ok(Some(hwnd));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn tray_single_instance_event_name(user_sid: &str, session_id: u32) -> String {
+    format!(
+        "{TRAY_SINGLE_INSTANCE_EVENT_PREFIX}.{user_sid}.{session_id}"
+    )
 }
 
 fn validate_pairing_code(code: &str) -> Result<()> {
@@ -118,6 +196,10 @@ fn should_hide_on_close(exit_requested: bool, tray_available: bool) -> bool {
 impl eframe::App for DashboardApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.exit_requested |= self.exit_requested_signal.load(Ordering::SeqCst);
+
+        if self.activation_requested.swap(false, Ordering::SeqCst) {
+            show_dashboard_window(self.native_window_handle, ctx);
+        }
 
         if ctx.input(|input| input.viewport().close_requested()) {
             if should_hide_on_close(self.exit_requested, self._tray_icon.is_some()) {

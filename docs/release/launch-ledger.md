@@ -38,7 +38,7 @@ Each of these should work first-try, with a clear next step printed when it can'
 - `input_lock_supported` reported `false` until the service was restarted after install — startup ordering between daemon and service-mode input leaves a degraded state that looks like a capability gap.
 - Fresh-install service state observed `Stopped` with `StartType=Automatic` after an earlier session (2026-07-07 morning, likely fallout of the wedged install rather than a distinct bug — recheck after P0 #1).
 - Smoke-zip hash in handoff notes was hand-transcribed and garbled (61 chars); handoffs should paste from `HANDOFF-SHA256SUMS.txt`, never retype.
-- Two `boundlesstray` processes observed in session 1 after install/restart churn (2026-07-07); tray should enforce single-instance.
+- Two `boundlesstray` processes observed in session 1 after install/restart churn (2026-07-07). BND-NEXT-31 now has a per-user/session ownership guard and existing-window activation path; installed-build and MSI upgrade evidence remain pending.
 
 ## Session log
 

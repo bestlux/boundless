@@ -488,6 +488,21 @@ function Get-BoundlessProcessCount {
     return @($procs).Count
 }
 
+function Get-BoundlessProcessCountForSession {
+    param(
+        [string]$Name,
+        [int]$SessionId
+    )
+
+    $procs = Get-Process -Name $Name -ErrorAction SilentlyContinue |
+        Where-Object { $_.SessionId -eq $SessionId }
+    if ($null -eq $procs) {
+        return 0
+    }
+
+    return @($procs).Count
+}
+
 function Test-BoundlessPipePresent {
     return $null -ne (Get-ChildItem \\.\pipe\ -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -eq "boundlessd-api" } |
@@ -601,6 +616,9 @@ try {
     $upgradeDaemonStatus = $null
     $postUpgradeTrayCount = $null
     $postUpgradeDaemonCount = $null
+    $traySingleInstanceTested = $false
+    $traySecondLaunchExitCode = $null
+    $trayCurrentSessionCount = $null
     $upgradeInstallExitCode = $null
     $installExitCode = $null
     $repairExitCode = $null
@@ -809,6 +827,31 @@ try {
         }
     }
 
+    if ($interactiveDesktopSession) {
+        $currentSessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+        $trayCurrentSessionCount = Get-BoundlessProcessCountForSession -Name "boundlesstray" -SessionId $currentSessionId
+        if ($trayCurrentSessionCount -ne 1) {
+            throw "Expected one boundlesstray.exe before single-instance smoke in session $currentSessionId, found $trayCurrentSessionCount."
+        }
+
+        $secondTrayProcess = Start-Process -FilePath $trayPath -WorkingDirectory $installRoot -PassThru
+        if (-not $secondTrayProcess.WaitForExit(10000)) {
+            throw "Second tray launch did not exit within 10 seconds. PID: $($secondTrayProcess.Id)"
+        }
+        $traySecondLaunchExitCode = $secondTrayProcess.ExitCode
+        if ($traySecondLaunchExitCode -ne 0) {
+            throw "Second tray launch failed instead of activating the existing tray. Exit code: $traySecondLaunchExitCode"
+        }
+
+        Start-Sleep -Milliseconds 500
+        $trayCurrentSessionCount = Get-BoundlessProcessCountForSession -Name "boundlesstray" -SessionId $currentSessionId
+        if ($trayCurrentSessionCount -ne 1) {
+            throw "Expected exactly one boundlesstray.exe after repeated launch in session $currentSessionId, found $trayCurrentSessionCount."
+        }
+        $null = Wait-ForDaemonReady -CliPath $cliPath
+        $traySingleInstanceTested = $true
+    }
+
     $serviceRunningBeforeUninstall = (Get-BoundlessService).Status.ToString() -eq "Running"
 
     $uninstallExitCode = Invoke-MsiExec -ArgumentList @("/x", $InstallerPath, "/qn", "/norestart") -LogPath $uninstallLog
@@ -863,6 +906,9 @@ try {
         tray_launch_mode = $trayLaunchMode
         tray_exited_early = $trayExitedEarly
         tray_exit_code = $trayExitCode
+        tray_single_instance_tested = $traySingleInstanceTested
+        tray_second_launch_exit_code = $traySecondLaunchExitCode
+        tray_current_session_count = $trayCurrentSessionCount
         daemon_ready_output = $daemonReadyOutput
         upgraded_from = $PreviousInstallerPath
         previous_install_root = $previousInstallRoot

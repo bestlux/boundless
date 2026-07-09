@@ -101,6 +101,8 @@ Acceptance: each item has a targeted test or self-test where the surface allows 
 
 ## BND-NEXT-31 (P1): Enforce one tray instance per Windows user session
 
+Status: code complete; installed-build and MSI upgrade evidence pending.
+
 ### Context and evidence
 
 Dogfood can launch any number of `boundlesstray.exe` processes in the same desktop session. Duplicate trays each start their own dashboard and broker activity, then compete for or lose access to the same backend service. The resulting connection failures look like daemon, named-pipe, or service instability even though the initiating defect is duplicate UI ownership. Installer smoke detects an unexpected tray count after upgrade, but normal application launch has no single-instance guard.

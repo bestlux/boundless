@@ -34,6 +34,11 @@ mod windows_app {
         NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
         RemovePeerRequest, SafeResetRequest, SendFileRequest,
     };
+    use platform_windows::{
+        input::current_process_session_id,
+        runtime::{current_user_sid_string, process_id_user_sid_string},
+        single_instance::{SingleInstanceAcquire, SingleInstanceGuard},
+    };
     use serde::Deserialize;
     use std::{
         collections::BTreeMap,
@@ -51,6 +56,7 @@ mod windows_app {
     const BOUNDLESS_SERVICE_NAME: &str = "BoundlessService";
     const ACTION_DASHBOARD: &str = "dashboard";
     const ACTION_QUIT: &str = "quit";
+    const TRAY_SINGLE_INSTANCE_EVENT_PREFIX: &str = "Local\\Boundless.Tray.SingleInstance.v1";
     const ROLE_REVERSAL_APPROVAL_TIMEOUT_SECS: u64 = 120;
     #[derive(Debug, Parser)]
     #[command(
@@ -1855,6 +1861,17 @@ SERVICE_NAME: BoundlessService
         #[test]
         fn window_icon_asset_decodes() {
             make_window_icon().expect("window icon asset should decode");
+        }
+
+        #[test]
+        fn tray_single_instance_name_is_local_and_scoped_by_user_and_session() {
+            let first = tray_single_instance_event_name("S-1-5-21-1-2-3-1001", 1);
+            let other_session = tray_single_instance_event_name("S-1-5-21-1-2-3-1001", 2);
+            let other_user = tray_single_instance_event_name("S-1-5-21-1-2-3-1002", 1);
+
+            assert!(first.starts_with("Local\\Boundless.Tray.SingleInstance.v1."));
+            assert_ne!(first, other_session);
+            assert_ne!(first, other_user);
         }
     }
 }
