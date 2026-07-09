@@ -190,7 +190,7 @@ impl DashboardApp {
                             painter.rect_stroke(
                                 rect.shrink(4.0),
                                 8.0,
-                                egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 90, 100)),
+                                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(80, 90, 100)),
                                 egui::StrokeKind::Inside,
                             );
                             let text = get_display_name(peer_id);
@@ -317,7 +317,7 @@ impl DashboardApp {
                                             rect.shrink(2.0),
                                             6.0,
                                             egui::Stroke::new(
-                                                2.0,
+                                                2.0_f32,
                                                 egui::Color32::from_rgb(80, 160, 240),
                                             ),
                                             egui::StrokeKind::Inside,
@@ -346,7 +346,7 @@ impl DashboardApp {
                                             painter.rect_stroke(
                                                 rect.shrink(4.0),
                                                 8.0,
-                                                egui::Stroke::new(1.5, border),
+                                                egui::Stroke::new(1.5_f32, border),
                                                 egui::StrokeKind::Inside,
                                             );
 
@@ -387,7 +387,7 @@ impl DashboardApp {
                                             rect.shrink(3.0),
                                             6.0,
                                             egui::Stroke::new(
-                                                1.0,
+                                                1.0_f32,
                                                 egui::Color32::from_rgb(50, 58, 66),
                                             ),
                                             egui::StrokeKind::Inside,
@@ -538,7 +538,7 @@ impl DashboardApp {
             painter.rect_stroke(
                 rect.shrink(4.0),
                 8.0,
-                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
                 egui::StrokeKind::Inside,
             );
             let text = get_display_name(peer_id);
