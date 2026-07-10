@@ -266,24 +266,20 @@ impl InputBrokerRelay {
     /// strand held input on the previous target.
     pub(crate) fn drain_release_events(&self) -> Vec<InputEvent> {
         let mut inner = self.lock();
-        let mut events = Vec::new();
-        let mut buttons = std::mem::take(&mut inner.pressed_buttons);
-        buttons.sort_by_key(|button| mouse_button_order(*button));
-        for button in buttons {
-            events.push(InputEvent::MouseButton {
-                button,
-                state: KeyState::Up,
-            });
-        }
-        let mut scan_codes = std::mem::take(&mut inner.pressed_key_scan_codes);
-        scan_codes.sort_unstable();
-        for scan_code in scan_codes {
-            events.push(InputEvent::Key {
-                scan_code,
-                state: KeyState::Up,
-            });
-        }
+        let events = release_events_for_pressed_state(&inner);
+        inner.pressed_buttons.clear();
+        inner.pressed_key_scan_codes.clear();
         events
+    }
+
+    pub(crate) fn release_events_snapshot(&self) -> Vec<InputEvent> {
+        release_events_for_pressed_state(&self.lock())
+    }
+
+    pub(crate) fn clear_pressed_state(&self) {
+        let mut inner = self.lock();
+        inner.pressed_buttons.clear();
+        inner.pressed_key_scan_codes.clear();
     }
 
     pub(crate) fn reset_capture_stream(&self) {
@@ -357,6 +353,27 @@ fn mouse_button_order(button: MouseButton) -> u8 {
         MouseButton::X1 => 3,
         MouseButton::X2 => 4,
     }
+}
+
+fn release_events_for_pressed_state(inner: &InputBrokerRelayInner) -> Vec<InputEvent> {
+    let mut events = Vec::new();
+    let mut buttons = inner.pressed_buttons.clone();
+    buttons.sort_by_key(|button| mouse_button_order(*button));
+    for button in buttons {
+        events.push(InputEvent::MouseButton {
+            button,
+            state: KeyState::Up,
+        });
+    }
+    let mut scan_codes = inner.pressed_key_scan_codes.clone();
+    scan_codes.sort_unstable();
+    for scan_code in scan_codes {
+        events.push(InputEvent::Key {
+            scan_code,
+            state: KeyState::Up,
+        });
+    }
+    events
 }
 
 #[cfg(test)]

@@ -514,6 +514,58 @@ async fn replacement_attach_queues_final_release_after_prior_captured_down() {
 }
 
 #[tokio::test]
+async fn replacement_attach_queue_failure_preserves_prior_broker_and_pressed_state() {
+    let (state, root) =
+        service_mode_broker_state("boundless-broker-replace-queue-failure-test").await;
+    let first = state
+        .attach_input_broker(allowed_client(), "first-broker".to_string(), true)
+        .await;
+    assert!(first.accepted);
+    let observed = state
+        .exchange_input_broker(
+            allowed_client(),
+            &first.broker_token,
+            InputBrokerExchangeObservations {
+                captured_events: vec![InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Down,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(observed.accepted);
+
+    // Force queue_input_events to fail after replacement has identified a
+    // target, without mutating the old attachment itself.
+    *state.input.control.capture_target_peer_id.write().await = Some("missing-peer".to_string());
+    let replacement = state
+        .attach_input_broker(allowed_client(), "replacement-broker".to_string(), true)
+        .await;
+    assert!(!replacement.accepted);
+    assert!(replacement.broker_token.is_empty());
+
+    let old_token_still_valid = state
+        .exchange_input_broker(
+            allowed_client(),
+            &first.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert!(old_token_still_valid.accepted);
+    assert_eq!(
+        state.input_broker_relay().release_events_snapshot(),
+        vec![InputEvent::Key {
+            scan_code: 30,
+            state: KeyState::Up,
+        }],
+        "failed replacement must preserve authoritative pressed state for retry"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn stale_broker_fails_closed_until_reattach() {
     let (state, root) = service_mode_broker_state("boundless-broker-stale-test").await;
 
