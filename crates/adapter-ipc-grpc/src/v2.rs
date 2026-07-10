@@ -845,6 +845,9 @@ impl ControlPlaneService for ControlPlaneApi {
                 verified_client,
                 broker_token: request.broker_token,
                 local_payload: clipboard_payload_from_proto(request.local_payload),
+                local_sequence: request
+                    .local_sequence_valid
+                    .then_some(request.local_sequence),
                 apply_report: request.apply_report.map(|report| {
                     app_commands::ClipboardBrokerApplyReportCommand {
                         source_peer_id: report.source_peer_id,

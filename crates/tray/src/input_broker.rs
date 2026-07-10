@@ -191,6 +191,15 @@ impl ClipboardBrokerState {
             .map(|pending| pending.payload.clone())
     }
 
+    fn local_sequence_for_request(&self) -> Option<u64> {
+        if self.unread_newer_sequence.is_some() {
+            return None;
+        }
+        self.pending_local_payload
+            .as_ref()
+            .map(|pending| pending.sequence)
+    }
+
     fn apply_report_for_request(&self) -> Option<ClipboardBrokerApplyReport> {
         self.apply_report.clone()
     }
@@ -621,9 +630,11 @@ mod input_broker_tests {
             )),
             "a transport failure must leave the same payload pending"
         );
+        assert_eq!(state.local_sequence_for_request(), Some(41));
 
         state.mark_local_payload_consumed();
         assert!(state.local_payload_for_request().is_none());
+        assert!(state.local_sequence_for_request().is_none());
         assert!(
             !state.should_read_sequence(41),
             "only an accepted app reply consumes a staged payload sequence"
@@ -678,6 +689,7 @@ mod input_broker_tests {
             .stage_local_read_result(71, Err(anyhow::anyhow!("clipboard temporarily busy")))
             .expect_err("newer sequence read should remain pending");
         assert!(state.local_payload_for_request().is_none());
+        assert!(state.local_sequence_for_request().is_none());
         assert!(should_defer_remote_payload(
             &ClipboardPollOutcome {
                 suppress_remote_apply: true,
@@ -706,6 +718,7 @@ mod input_broker_tests {
             )),
             "the request must carry the newest user copy, never the stale retry"
         );
+        assert_eq!(state.local_sequence_for_request(), Some(71));
     }
 
     #[test]
@@ -867,12 +880,15 @@ async fn clipboard_broker_exchange_once(
     // local error so the supervisor uses its bounded retry delay.
     let poll = stage_clipboard_payload_if_changed(state).await;
     let local_payload = state.local_payload_for_request();
+    let local_sequence = state.local_sequence_for_request();
     let local_payload_submitted = local_payload.is_some();
     let reply = client
         .exchange_clipboard_broker(ClipboardBrokerExchangeRequest {
             broker_token: broker_token.to_string(),
             local_payload: local_payload.map(clipboard_payload_to_proto),
             apply_report: state.apply_report_for_request(),
+            local_sequence_valid: local_sequence.is_some(),
+            local_sequence: local_sequence.unwrap_or_default(),
         })
         .await?
         .into_inner();

@@ -506,6 +506,8 @@ message ClipboardBrokerExchangeRequest {
   string broker_token = 1;
   ClipboardBrokerPayload local_payload = 2;
   ClipboardBrokerApplyReport apply_report = 3;
+  bool local_sequence_valid = 4;
+  uint64 local_sequence = 5;
 }
 
 enum ClipboardBrokerLocalPayloadDisposition {

@@ -34,6 +34,8 @@ mod tests {
             broker_token: "00000000-0000-0000-0000-000000000000".to_string(),
             local_payload: Some(payload.clone()),
             apply_report: None,
+            local_sequence_valid: true,
+            local_sequence: 1,
         };
         let reply = ClipboardBrokerExchangeReply {
             accepted: true,

@@ -280,6 +280,7 @@ impl AppState {
         verified_client: Option<InputBrokerClientIdentity>,
         broker_token: &str,
         local_payload: Option<ClipboardPayload>,
+        local_sequence: Option<u64>,
         apply_report: Option<ClipboardBrokerApplyReport>,
     ) -> ClipboardBrokerExchangeOutcome {
         if let Some(reason) = self.input_broker_client_rejection(&verified_client) {
@@ -330,34 +331,50 @@ impl AppState {
         }
 
         let mut message = String::new();
-        let (local_payload_disposition, local_update_supersedes_remote) = match local_payload {
-            None => (ClipboardBrokerLocalPayloadDisposition::NotSubmitted, false),
-            Some(payload) => match self
-                .queue_local_clipboard_payload_for_connected_peers(payload)
-                .await
-            {
-                Ok(updated) => (ClipboardBrokerLocalPayloadDisposition::Accepted, updated),
-                Err(error) => {
-                    let disposition = classify_clipboard_local_payload_error(&error);
-                    message = format!("clipboard broker local payload rejected: {error:#}");
-                    let reason = match disposition {
-                        ClipboardBrokerLocalPayloadDisposition::DeterministicRejected => {
-                            "policy_or_validation"
-                        }
-                        _ => "unknown",
-                    };
-                    self.record_transport_event(TransportEventRecord {
-                        timestamp: Utc::now(),
-                        direction: "local".to_string(),
-                        kind: "clipboard_broker_local_rejected".to_string(),
-                        peer_id: "none".to_string(),
-                        detail: format!("disposition=rejected reason={reason}"),
-                        size_bytes: 0,
-                    });
-                    (disposition, false)
+        let (local_payload_disposition, local_update_supersedes_remote) =
+            match (local_payload, local_sequence) {
+                (None, _) => (ClipboardBrokerLocalPayloadDisposition::NotSubmitted, false),
+                (Some(_), None) => {
+                    message =
+                        "clipboard broker local payload rejected: sequence missing".to_string();
+                    (
+                        ClipboardBrokerLocalPayloadDisposition::TransientRejected,
+                        false,
+                    )
                 }
-            },
-        };
+                (Some(payload), Some(sequence)) => match self
+                    .queue_local_clipboard_payload_for_connected_peers(payload)
+                    .await
+                {
+                    Ok(outcome) => {
+                        let first_observation =
+                            self.input_broker.accept_local_clipboard_sequence(sequence);
+                        (
+                            ClipboardBrokerLocalPayloadDisposition::Accepted,
+                            first_observation && outcome.supersedes_remote(),
+                        )
+                    }
+                    Err(error) => {
+                        let disposition = classify_clipboard_local_payload_error(&error);
+                        message = format!("clipboard broker local payload rejected: {error:#}");
+                        let reason = match disposition {
+                            ClipboardBrokerLocalPayloadDisposition::DeterministicRejected => {
+                                "policy_or_validation"
+                            }
+                            _ => "unknown",
+                        };
+                        self.record_transport_event(TransportEventRecord {
+                            timestamp: Utc::now(),
+                            direction: "local".to_string(),
+                            kind: "clipboard_broker_local_rejected".to_string(),
+                            peer_id: "none".to_string(),
+                            detail: format!("disposition=rejected reason={reason}"),
+                            size_bytes: 0,
+                        });
+                        (disposition, false)
+                    }
+                },
+            };
 
         if local_update_supersedes_remote {
             let discarded = self
