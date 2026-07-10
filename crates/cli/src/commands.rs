@@ -9,6 +9,7 @@ use app_services::diagnostics::{
     DiagnosticExportOptions, ServiceDiagnosticSnapshot, build_offline_bundle,
     write_diagnostic_bundle,
 };
+use core_clipboard::sanitize_clipboard_event_detail;
 #[cfg(any(windows, test))]
 use std::path::PathBuf as StdPathBuf;
 #[cfg(windows)]
@@ -1718,6 +1719,7 @@ pub(super) async fn transport_events(
     }
 
     for event in events {
+        let detail = protected_transport_event_detail(&event);
         println!(
             "{} direction={} kind={} peer_id={} size_bytes={} detail={}",
             event.timestamp,
@@ -1725,11 +1727,15 @@ pub(super) async fn transport_events(
             escape_event_field(&event.kind),
             escape_event_field(&event.peer_id),
             event.size_bytes,
-            escape_event_field(&event.detail)
+            escape_event_field(&detail)
         );
     }
 
     Ok(())
+}
+
+fn protected_transport_event_detail(event: &TransportEvent) -> String {
+    sanitize_clipboard_event_detail(&event.kind, &event.detail)
 }
 
 fn select_transport_events(
@@ -2833,6 +2839,20 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].kind, "clipboard_text");
         assert_eq!(selected[0].detail, "retained");
+    }
+
+    #[test]
+    fn clipboard_event_cli_detail_fails_closed() {
+        const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_77c3c7ea";
+        let event = test_transport_event(
+            "clipboard_text",
+            &format!("payload_type=text disposition=sent preview={SECRET} {SECRET}"),
+        );
+
+        let detail = protected_transport_event_detail(&event);
+
+        assert_eq!(detail, "payload_type=text disposition=sent");
+        assert!(!detail.contains(SECRET));
     }
 
     #[test]

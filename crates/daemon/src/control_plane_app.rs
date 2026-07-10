@@ -31,6 +31,7 @@ use app_services::{
     },
 };
 use async_trait::async_trait;
+use core_clipboard::sanitize_clipboard_event_detail;
 use core_security::{TrustBundle, fingerprint};
 use serde_json::Value;
 
@@ -463,13 +464,16 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             .transport_events()
             .await
             .into_iter()
-            .map(|event| TransportEventSnapshot {
-                timestamp: event.timestamp.to_rfc3339(),
-                direction: event.direction,
-                kind: event.kind,
-                peer_id: event.peer_id,
-                detail: event.detail,
-                size_bytes: event.size_bytes,
+            .map(|event| {
+                let detail = sanitize_clipboard_event_detail(&event.kind, &event.detail);
+                TransportEventSnapshot {
+                    timestamp: event.timestamp.to_rfc3339(),
+                    direction: event.direction,
+                    kind: event.kind,
+                    peer_id: event.peer_id,
+                    detail,
+                    size_bytes: event.size_bytes,
+                }
             })
             .collect())
     }
@@ -915,13 +919,16 @@ fn build_console_snapshot_from_bundle(
         transport_events: bundle
             .transport_events
             .into_iter()
-            .map(|event| TransportEventSnapshot {
-                timestamp: event.timestamp.to_rfc3339(),
-                direction: event.direction,
-                kind: event.kind,
-                peer_id: event.peer_id,
-                detail: event.detail,
-                size_bytes: event.size_bytes,
+            .map(|event| {
+                let detail = sanitize_clipboard_event_detail(&event.kind, &event.detail);
+                TransportEventSnapshot {
+                    timestamp: event.timestamp.to_rfc3339(),
+                    direction: event.direction,
+                    kind: event.kind,
+                    peer_id: event.peer_id,
+                    detail,
+                    size_bytes: event.size_bytes,
+                }
             })
             .collect(),
         input_owner_peer_id: bundle.input_owner_peer_id,
@@ -1489,7 +1496,7 @@ mod tests {
 
         assert!(content.contains(r#""mode": "online""#));
         assert!(content.contains(r#""layout_matrix": "self,peer-2""#));
-        assert!(content.contains("[redacted-clipboard-text]"));
+        assert!(content.contains("metadata_only=true"));
         assert!(content.contains("[redacted-file-name]"));
         assert!(content.contains(r#""peer_id": "peer-1""#));
         assert!(content.contains(r#""runtime_tasks""#));

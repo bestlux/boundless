@@ -258,7 +258,10 @@ impl AppState {
                     direction: "local".to_string(),
                     kind: "clipboard_broker_apply_report_unmatched".to_string(),
                     peer_id: report.source_peer_id,
-                    detail: format!("hash={} applied={}", report.hash, report.applied),
+                    detail: format!(
+                        "disposition=unmatched_apply_report applied={}",
+                        report.applied
+                    ),
                     size_bytes: 0,
                 });
             }
@@ -276,7 +279,7 @@ impl AppState {
                 direction: "local".to_string(),
                 kind: "clipboard_broker_local_rejected".to_string(),
                 peer_id: "none".to_string(),
-                detail: message.clone(),
+                detail: "disposition=rejected reason=policy_or_validation".to_string(),
                 size_bytes: 0,
             });
         }

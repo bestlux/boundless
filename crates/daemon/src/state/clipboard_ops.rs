@@ -1249,25 +1249,23 @@ impl AppState {
     }
 
     pub async fn record_incoming_clipboard_text(&self, peer_id: &str, text: &str) {
-        let preview = text.chars().take(80).collect::<String>();
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
             direction: "incoming".to_string(),
             kind: "clipboard_text".to_string(),
             peer_id: peer_id.to_string(),
-            detail: preview,
+            detail: "payload_type=text disposition=received".to_string(),
             size_bytes: text.len() as u64,
         });
     }
 
     pub async fn record_outgoing_clipboard_text(&self, peer_id: &str, text: &str) {
-        let preview = text.chars().take(80).collect::<String>();
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
             direction: "outgoing".to_string(),
             kind: "clipboard_text".to_string(),
             peer_id: peer_id.to_string(),
-            detail: preview,
+            detail: "payload_type=text disposition=sent".to_string(),
             size_bytes: text.len() as u64,
         });
     }
@@ -1278,7 +1276,7 @@ impl AppState {
             direction: "incoming".to_string(),
             kind: "clipboard_image".to_string(),
             peer_id: peer_id.to_string(),
-            detail: format!("bmp image {} bytes", size_bytes),
+            detail: "payload_type=bmp disposition=received".to_string(),
             size_bytes: size_bytes as u64,
         });
     }
@@ -1289,7 +1287,7 @@ impl AppState {
             direction: "outgoing".to_string(),
             kind: "clipboard_image".to_string(),
             peer_id: peer_id.to_string(),
-            detail: format!("bmp image {} bytes", size_bytes),
+            detail: "payload_type=bmp disposition=sent".to_string(),
             size_bytes: size_bytes as u64,
         });
     }

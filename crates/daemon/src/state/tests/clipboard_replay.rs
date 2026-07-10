@@ -1,6 +1,35 @@
 use super::*;
 
 #[tokio::test]
+async fn clipboard_event_producers_retain_metadata_without_content() {
+    const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_3800edc7";
+    let root = std::env::temp_dir().join(format!(
+        "boundless-clipboard-event-privacy-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let state =
+        AppState::load_or_create_with_paths(root.join("config.json"), root.join("security"))
+            .expect("load state");
+
+    state.record_incoming_clipboard_text("peer-a", SECRET).await;
+    state.record_outgoing_clipboard_text("peer-a", SECRET).await;
+    state.record_incoming_clipboard_image("peer-a", 128).await;
+    state.record_outgoing_clipboard_image("peer-a", 256).await;
+
+    let events = state.transport_events().await;
+    let rendered = format!("{events:?}");
+    assert!(!rendered.contains(SECRET));
+    assert_eq!(events[0].detail, "payload_type=text disposition=received");
+    assert_eq!(events[1].detail, "payload_type=text disposition=sent");
+    assert_eq!(events[2].detail, "payload_type=bmp disposition=received");
+    assert_eq!(events[3].detail, "payload_type=bmp disposition=sent");
+    assert_eq!(events[0].size_bytes, SECRET.len() as u64);
+    assert_eq!(events[2].size_bytes, 128);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn clipboard_sync_dedupes_and_suppresses_remote_echo() {
     let root =
         std::env::temp_dir().join(format!("boundless-clipboard-test-{}", uuid::Uuid::new_v4()));

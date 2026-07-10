@@ -3037,6 +3037,7 @@ name = "peer-transport"
 version = "5.0.12"
 dependencies = [
  "chrono",
+ "core-clipboard",
  "core-input",
  "serde",
  "thiserror 2.0.18",
