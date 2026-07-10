@@ -1,5 +1,37 @@
 # Changelog
 
+## [5.0.13](https://github.com/bestlux/boundless/compare/v5.0.12...v5.0.13) (2026-07-10)
+
+
+### Bug Fixes
+
+* **ci:** gate Windows-only lock lease ([123e1ab](https://github.com/bestlux/boundless/commit/123e1aba9b649e8f161d271e57f80c3b4e290376))
+* **clipboard:** isolate broker failures from input ([0235d25](https://github.com/bestlux/boundless/commit/0235d2508f45d1af3e7d53476ed4b9755fdb8e27))
+* **clipboard:** order brokered local updates ([a6d76f4](https://github.com/bestlux/boundless/commit/a6d76f4a6bbd4d6f05712356e260be13ac4d07c9))
+* **clipboard:** preserve newest broker payload ([4593fea](https://github.com/bestlux/boundless/commit/4593fea1a9e9a77252dc922aaf27ffbedd5b3386))
+* **clipboard:** retry transient broker reads ([106d289](https://github.com/bestlux/boundless/commit/106d2896e9d8fcf096a593fd226692293e778dd1))
+* **diagnostics:** bound failure aggregates accurately ([b3c64d9](https://github.com/bestlux/boundless/commit/b3c64d924609a6372364077b34d2b3dc143d6579))
+* **diagnostics:** canonicalize activity aggregation ([77ec135](https://github.com/bestlux/boundless/commit/77ec1356be61d389536b58f7972d293e4f6ace7c))
+* **diagnostics:** harden failure retention and clipboard telemetry ([b1f38a1](https://github.com/bestlux/boundless/commit/b1f38a1ff5414554f942aa7dc00c46ab75505c3b))
+* **diagnostics:** preserve causal runtime events ([e3f1752](https://github.com/bestlux/boundless/commit/e3f1752b3ab4a102c4d3853a06875a871e671f11))
+* **input:** capture raw touchpad wheel deltas ([06facb7](https://github.com/bestlux/boundless/commit/06facb70cdc8f7dae1147c87df7e9844ff6fa3e6))
+* **input:** close broker shutdown races ([28d66dc](https://github.com/bestlux/boundless/commit/28d66dc8a0ef123b2b2194656d751b0a36773d42))
+* **input:** fail open direct capture locks ([10ef0ed](https://github.com/bestlux/boundless/commit/10ef0ed2a8017c9ce7d3788d1624d612e47bd7c0))
+* **input:** harden broker capture lifecycle ([6f1bd28](https://github.com/bestlux/boundless/commit/6f1bd2828e2730c19d5a52d7ec061ad7d1126044))
+* **input:** make emergency unlock fail open ([be32484](https://github.com/bestlux/boundless/commit/be32484b79e9a2ca84c40752d2ca7e55c4a9797b))
+* **input:** preserve releases when broker replacement defers ([3c43e79](https://github.com/bestlux/boundless/commit/3c43e792a9d53fa94d1e932388405b1beedf68d3))
+* **input:** preserve stale broker cleanup identity ([68f42f1](https://github.com/bestlux/boundless/commit/68f42f18affb6ce2bce6d565323e6f8ed0edba79))
+* **input:** release held state on broker replacement ([a13be17](https://github.com/bestlux/boundless/commit/a13be17d86d6786f759fc10f789cde2b0cec4c5b))
+* **input:** suppress late wheel source duplicates ([dfeba9c](https://github.com/bestlux/boundless/commit/dfeba9cc79ce8b2fd8ebf9f8b2677980186fc55c))
+* **input:** widen emergency gesture timing ([6cdb326](https://github.com/bestlux/boundless/commit/6cdb32656d77978624e9d24471574cfa6555e109))
+* **installer:** reject stale runtime verification ([7a39d66](https://github.com/bestlux/boundless/commit/7a39d66311e3e35f997c6e5b3d6a66a6ae141b74))
+* **installer:** verify packaged installation ([5dc1521](https://github.com/bestlux/boundless/commit/5dc152178ceb829a2cfcb16ab2698926d4e09511))
+* **privacy:** redact clipboard image rejection hashes ([6115c6b](https://github.com/bestlux/boundless/commit/6115c6b47d2828fe38cd8ffd93b9c59562d90b47))
+* **privacy:** remove clipboard content from runtime events ([42a31ad](https://github.com/bestlux/boundless/commit/42a31adaf26659c3c75e0fb34f7c4f2bdcfa55ab))
+* **smoke:** validate aggregated redacted events ([25da249](https://github.com/bestlux/boundless/commit/25da24960138d5b1b6dd5f8ca932e00a97b2c01f))
+* **tray:** recover stopped Windows service ([d516728](https://github.com/bestlux/boundless/commit/d516728c669cdc6e4ea6cd3bd5ec306df014adab))
+* **tray:** shut down input broker safely ([dacfad8](https://github.com/bestlux/boundless/commit/dacfad87d7cce7efaa4770f42f99a3f883f6873e))
+
 ## [5.0.12](https://github.com/bestlux/boundless/compare/v5.0.11...v5.0.12) (2026-07-09)
 
 
