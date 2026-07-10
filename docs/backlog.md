@@ -16,12 +16,31 @@ Full implementation briefs live in git history (`git show ac4d4d0:docs/backlog.m
 | --- | --- | --- |
 | BND-NEXT-23 (P0) — service honors SCM stop | 0828513 | The 5.0.11 install over a running 5.0.10 service is the first real-binary upgrade this fix will face. Capture a verbose msiexec log showing no multi-minute `ServiceControl` stall, and `Stop-Service` completing in seconds with a broker attached and a peer connected. |
 | BND-NEXT-24 (P0) — broker-routed clipboard | 9bd45dd | Reopened after live partial pass: text passed both directions in 5.0.12 service mode, but a policy-valid 6.29 MB bitmap exceeded the broker RPC limit, detached the shared input/clipboard broker, and disabled input. See the active brief below. |
-| BND-NEXT-25 (P1) — transport events readable | a96613b | Reopened by BND-NEXT-34 evidence: safety ticks are filtered and CLI filters work, but broker wakes and per-frame input records can still evict the causal transition or failure within seconds. |
+| BND-NEXT-25 (P1) — transport events readable | a96613b | Reopened by 5.0.12 BND-NEXT-34 evidence. The v5.0.13 candidate now bounds repeated activity/failures and prioritizes causal records; full per-stage counters and the installed sustained-input trace remain pending under BND-NEXT-34. |
 | BND-NEXT-26 (P1) — packaging-script CI | 0305022 | Done — self-tests + CLI daemon-status output contract wired into `ci.yml` and release validation, green on main. Optional: demonstrate a deliberate `^machine_id=` regression fails CI locally. |
 
 ---
 
-## BND-NEXT-24 (P0, reopened): Isolate service-mode clipboard failures and carry policy-valid images
+## v5.0.13 fix train (2026-07-10) — engineering status, not dogfood proof
+
+These commits are integrated on the candidate branch. `Code complete` means the scoped implementation and automated coverage exist; `needs installed evidence` means the behavior has not yet passed the two-PC, UAC, or physical-device acceptance checks below.
+
+| story | candidate status | primary commits | remaining gap |
+| --- | --- | --- | --- |
+| BND-NEXT-24 | in progress | 83745fa, 163992b, 7e21f46 | Broker fault isolation, the symmetric 9 MiB control-plane limit, transient retry, failed-sequence suppression, and newest-payload preservation are implemented. Explicit tray/CLI `clipboard-degraded` versus `input-degraded` UX is still missing, and the installed Paint size/fault matrix has not run. |
+| BND-NEXT-29 items 1, 2, and 5 | code complete; needs installed evidence | 6cf425f, 59ec987 | The helper verifies package/runtime postconditions and packaging removes stale WiX output. A real helper-driven 5.0.12→5.0.13 upgrade remains pending; item 3 is open and item 4 still needs installed version verification. |
+| BND-NEXT-31 | code complete; needs installed evidence | 5172126, 81b1a4b, c5c52e1 | Bounded shutdown, fail-open cleanup, held-input release, replacement, and stale-owner ordering have automated coverage. Quit/relaunch during active capture, first post-relaunch handoff/escape, and upgrade-while-running still need installed proof. |
+| BND-NEXT-34 | in progress | 5245b77, 84e5378, e7182fc, 474a8f7 | Priority retention and bounded activity/failure aggregation are implemented. The complete per-stage counter vocabulary and a 60-second installed two-PC trace remain acceptance gaps. |
+| BND-NEXT-35 | code complete; needs installed evidence | 2ea9e4b | Native SCM recovery, the explicit action, bounded polling, and UAC fallback have automated coverage; stopped-to-running recovery still needs standard-user validation on both PCs. |
+| BND-NEXT-37 | code complete; needs installed evidence | ebeebab, fcf53e7, 474a8f7 | Event creation and raw-output sanitization retain metadata only in automated tests. An installed unique-sentinel sweep across API, CLI, logs, and diagnostic bundles remains pending. |
+| BND-NEXT-38 | code complete; needs installed evidence | d711bf9, f6ad795, 97940e7 | Local fail-open escape, lease expiry, reconciliation, and direct-capture unlock have deterministic coverage. Installed stalled-IPC/daemon-loss/UI-hang fault smoke and the next-handoff check remain pending. |
+| BND-NEXT-39 | implementation candidate; needs physical evidence | d9a66bd, 6560fd9 | Raw Input vertical/horizontal high-resolution wheel capture and cross-source deduplication are implemented. The EliteBook source path is still unknown; pointer-input fallback is evidence-gated, and trackpad plus conventional-wheel proof has not run. |
+
+---
+
+## BND-NEXT-24 (P0, in progress): Isolate service-mode clipboard failures and carry policy-valid images
+
+Status: the broker-isolation and policy-valid IPC path are implemented on the v5.0.13 candidate, but the explicit degraded-state tray/CLI UX and installed service-mode Paint matrix remain open.
 
 ### Context and evidence
 
@@ -56,7 +75,9 @@ Focused broker/IPC fault tests; installed service-mode Paint copy/paste at small
 
 ---
 
-## BND-NEXT-35 (P0, ready for agent): Start a stopped installed service from the tray without console flashes
+## BND-NEXT-35 (P0, needs installed evidence): Start a stopped installed service from the tray without console flashes
+
+Status: code complete in 2ea9e4b; automated state/offer tests pass, but standard-user stopped-to-running recovery has not run on either dogfood PC.
 
 ### Context and evidence
 
@@ -83,7 +104,9 @@ None. Preserve BND-NEXT-11’s service-ownership rule rather than reverting to a
 
 ---
 
-## BND-NEXT-38 (P0, ready for agent): Make emergency input unlock local and IPC-independent
+## BND-NEXT-38 (P0, needs installed evidence): Make emergency input unlock local and IPC-independent
+
+Status: code complete in d711bf9, f6ad795, and 97940e7; deterministic fault-path coverage exists, but installed fault injection and post-recovery handoff remain unproven.
 
 ### Context and evidence
 
@@ -112,7 +135,9 @@ Coordinate with BND-NEXT-24’s independent broker supervision. This story owns 
 
 ---
 
-## BND-NEXT-39 (P0, ready for agent): Carry laptop two-finger scrolling through remote input
+## BND-NEXT-39 (P0, implementation candidate needs evidence): Carry laptop two-finger scrolling through remote input
+
+Status: d9a66bd and 6560fd9 implement and deduplicate Raw Input wheel data. The implementation remains evidence-gated until the EliteBook identifies that as its source path; add pointer input only if the physical trace requires it.
 
 ### Context and evidence
 
@@ -236,11 +261,11 @@ Machine-readable output (`--json`) for `daemon status`, `peer list`, `transport 
 
 Independent small items, one PR each or one sweep; all observed 2026-07-07:
 
-1. `Boundless-Install.ps1` printed `boundless_install_exit_code=0` on a run where nothing was installed (wedged-mutex session). After msiexec returns, verify Windows Installer product registration and `package-manifest.json` version match the MSI being installed; exit nonzero with a clear message otherwise.
-2. `scripts/release/package-windows.ps1` must clean `packaging/windows/installer/obj` and `bin` before `dotnet build` (stale obj + renamed output ⇒ MSB3030). Still open as of 0305022 (that commit only added fixture staging).
-3. Same-version dogfood upgrades silently no-op (`MajorUpgrade` without `AllowSameVersionUpgrades`). Either add `AllowSameVersionUpgrades="yes"` or make the packaging script refuse to build an MSI whose version equals an already-published dogfood artifact. Decide and document in `packaging/windows/README.txt`.
-4. `boundlessctl daemon status` reported `daemon_version=5.0.0` on 5.0.10 installs. The workspace version bump in v5.0.11 (55c5f6b) likely resolves this — verify on the installed 5.0.11 build, and if the value still lags, wire the real package version through.
-5. Double-clicking the released 5.0.12 MSI failed with Windows Installer error 1603 because `BOUNDLESS_ALLOWED_USER_SID` was absent; a later helper/property-driven install succeeded. Make the intended release entry point unmistakable and directly usable, then verify product/version registration, the service command’s allowed-user SID, service Running, daemon API health, and exactly one tray rather than trusting `msiexec` exit alone. Any bootstrapper/MSI-UI/helper-as-primary choice must preserve explicit user selection and fail closed rather than inferring the wrong elevated account.
+1. **Code complete; installed validation pending (6cf425f, 59ec987).** `Boundless-Install.ps1` printed `boundless_install_exit_code=0` on a run where nothing was installed (wedged-mutex session). The helper now verifies Windows Installer registration, manifest/runtime versions, service identity/state, API health, and tray postconditions, and rejects stale evidence; prove those checks during the real 5.0.12→5.0.13 helper-driven upgrade.
+2. **Code complete (6cf425f).** `scripts/release/package-windows.ps1` removes `packaging/windows/installer/obj` and `bin` before `dotnet build`, preventing the stale-output MSB3030 failure. Keep the packaging-script smoke in the release gate.
+3. **Open.** Same-version dogfood upgrades silently no-op (`MajorUpgrade` without `AllowSameVersionUpgrades`). Either add `AllowSameVersionUpgrades="yes"` or make the packaging script refuse to build an MSI whose version equals an already-published dogfood artifact. Decide and document in `packaging/windows/README.txt`.
+4. **Needs installed verification.** `boundlessctl daemon status` reported `daemon_version=5.0.0` on 5.0.10 installs. The workspace version bump in v5.0.11 (55c5f6b) likely resolves this — verify against the installed v5.0.13 package, and if the value still lags, wire the real package version through.
+5. **Code complete; installed validation pending (6cf425f, 59ec987).** Double-clicking the released 5.0.12 MSI failed with Windows Installer error 1603 because `BOUNDLESS_ALLOWED_USER_SID` was absent; a later helper/property-driven install succeeded. The helper is now the documented primary entry point and verifies product/version registration, the service command’s allowed-user SID, service Running, daemon API health, and one responsive tray. Prove the UAC/helper path on both PCs; direct raw-MSI launch is not the supported entry point.
 
 Tray single-instance ownership moved to standalone story BND-NEXT-31 because duplicate trays interfere with the backend connection and need their own runtime acceptance criteria.
 
@@ -248,9 +273,9 @@ Acceptance: each item has a targeted test or self-test where the surface allows;
 
 ---
 
-## BND-NEXT-31 (P1, reopened): Enforce one tray instance and a safe broker lifecycle per Windows user session
+## BND-NEXT-31 (P1, needs installed evidence): Enforce one tray instance and a safe broker lifecycle per Windows user session
 
-Status: single-instance ownership passed installed dogfood; Quit/relaunch broker lifecycle failed and remains open.
+Status: single-instance ownership passed installed 5.0.12 dogfood. The v5.0.13 candidate implements bounded Quit/relaunch cleanup and broker replacement/stale-owner ordering (5172126, 81b1a4b, c5c52e1); installed active-capture lifecycle and upgrade evidence remain pending.
 
 ### Context and evidence
 
@@ -390,9 +415,11 @@ Done when the implementation matches the approved responsive states, keyboard an
 
 ---
 
-## BND-NEXT-34 (P1, ready for agent): Keep high-rate runtime telemetry from evicting diagnostic events
+## BND-NEXT-34 (P1, in progress): Keep high-rate runtime telemetry from evicting diagnostic events
 
 **Category:** bug
+
+Status: 5245b77, 84e5378, e7182fc, and 474a8f7 implement priority retention plus bounded activity/failure aggregation. Full per-stage counters and the installed 60-second causal trace are still open.
 
 ### Context and evidence
 
@@ -431,7 +458,9 @@ Focused event-store/runtime tests with a synthetic high-rate broker stream; CLI 
 
 ---
 
-## BND-NEXT-37 (P1, ready for agent): Never retain clipboard content in runtime events
+## BND-NEXT-37 (P1, needs installed evidence): Never retain clipboard content in runtime events
+
+Status: code complete in ebeebab, fcf53e7, and 474a8f7 with metadata-only event creation and output sanitization; the installed unique-sentinel sweep remains pending.
 
 ### Context and evidence
 
