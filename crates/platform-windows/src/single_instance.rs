@@ -39,6 +39,29 @@ pub struct SingleInstanceGuard {
 }
 
 impl SingleInstanceGuard {
+    /// Reports whether a named local mutex already exists without acquiring it.
+    ///
+    /// Upgrade helpers use this to publish a quiescence sentinel. A tray must
+    /// fail closed on every error other than a genuinely missing sentinel so a
+    /// replacement process cannot join an in-progress MSI transaction.
+    pub fn local_mutex_exists(name: &str) -> Result<bool> {
+        if name.is_empty() || !name.starts_with("Local\\") {
+            bail!("single-instance mutex name must use the Local namespace");
+        }
+
+        let mutex_name = wide_null(name);
+        let mutex = unsafe { OpenMutexW(MUTEX_MODIFY_STATE, 0, mutex_name.as_ptr()) };
+        if mutex.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+                return Ok(false);
+            }
+            return Err(error).context("failed to open local single-instance mutex");
+        }
+        let _mutex = OwnedHandle(mutex);
+        Ok(true)
+    }
+
     pub fn acquire(name: &str, user_sid: &str) -> Result<SingleInstanceAcquire> {
         if name.is_empty() || !name.starts_with("Local\\") {
             bail!("single-instance event name must use the Local namespace");
@@ -528,6 +551,34 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("Local namespace"));
+    }
+
+    #[test]
+    fn local_mutex_presence_probe_opens_existing_without_acquiring_it() {
+        let name = unique_name("presence");
+        assert!(
+            !SingleInstanceGuard::local_mutex_exists(&name)
+                .expect("missing local mutex probe should succeed")
+        );
+
+        let sid = current_sid();
+        let security = KernelObjectSecurityDescriptor::for_user(&sid, IntegrityLevel::Low)
+            .expect("presence mutex security should build");
+        let attributes = security.attributes();
+        let wide_name = wide_null(&name);
+        let mutex = unsafe { CreateMutexW(&attributes, 1, wide_name.as_ptr()) };
+        assert!(!mutex.is_null(), "presence mutex should be created");
+        let mutex = OwnedHandle(mutex);
+
+        assert!(
+            SingleInstanceGuard::local_mutex_exists(&name)
+                .expect("existing local mutex probe should succeed")
+        );
+        drop(mutex);
+        assert!(
+            !SingleInstanceGuard::local_mutex_exists(&name)
+                .expect("closed local mutex probe should succeed")
+        );
     }
 
     #[test]

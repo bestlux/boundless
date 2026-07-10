@@ -68,6 +68,11 @@ pub(super) fn run() -> Result<()> {
         );
         return Ok(());
     }
+    let upgrade_quiescence_name = tray_upgrade_quiescence_sentinel_name(&user_sid, session_id);
+    if SingleInstanceGuard::local_mutex_exists(&upgrade_quiescence_name)? {
+        eprintln!("boundless_tray_startup=upgrade_quiescence");
+        return Ok(());
+    }
     if let Some(hwnd) = find_existing_dashboard_window(session_id, &user_sid)? {
         if !activate_existing_dashboard_window(hwnd) {
             show_tray_startup_error("The existing Boundless tray could not be brought forward. Close it from Task Manager, then launch Boundless again.");
@@ -156,6 +161,10 @@ fn tray_single_instance_event_name(user_sid: &str, session_id: u32) -> String {
     format!(
         "{TRAY_SINGLE_INSTANCE_EVENT_PREFIX}.{user_sid}.{session_id}"
     )
+}
+
+fn tray_upgrade_quiescence_sentinel_name(user_sid: &str, session_id: u32) -> String {
+    format!("Local\\Boundless.Tray.UpgradeQuiescence.v1.{user_sid}.{session_id}")
 }
 
 fn validate_pairing_code(code: &str) -> Result<()> {

@@ -57,6 +57,36 @@ if (-not (Test-Path -LiteralPath $packagingRoot)) {
     throw "Packaging root was not found: $packagingRoot"
 }
 
+function Get-PowerShellFunctionSource {
+    param(
+        [string]$Path,
+        [string]$Name
+    )
+
+    $tokens = $null
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile(
+        $Path,
+        [ref]$tokens,
+        [ref]$errors
+    )
+    if ($errors.Count -ne 0) {
+        throw "$Path did not parse while inspecting function $Name`: $($errors[0].Message)"
+    }
+    $functionAst = $ast.FindAll(
+        {
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq $Name
+        },
+        $true
+    ) | Select-Object -First 1
+    if ($null -eq $functionAst) {
+        throw "$Path did not define required function $Name."
+    }
+    return $functionAst.Extent.Text.Replace("`r`n", "`n")
+}
+
 $packageWxs = Join-Path $packagingRoot "installer\Package.wxs"
 if (-not (Test-Path -LiteralPath $packageWxs)) {
     throw "WiX package source was not found: $packageWxs"
@@ -85,7 +115,13 @@ foreach ($requiredInstallContract in @(
         'ExpectedInstallerSha256',
         'CommonApplicationData',
         'New-BoundlessSecuredDirectoryAtomic',
-        'staging_child_process_probe_hosts'
+        'staging_child_process_probe_hosts',
+        'BoundlessHelperStartupAnchor',
+        'New-BoundlessInstallerAnchor',
+        'Request-BoundlessTrayShutdownSignal',
+        'UpgradeQuiescence.v1',
+        'Start-BoundlessTrayQuiescenceMonitor',
+        'Get-WindowsCommandExecutablePath'
     )) {
     if ($installScriptText -notmatch [regex]::Escape($requiredInstallContract)) {
         throw "Boundless-Install.ps1 is missing the upgrade safety contract: $requiredInstallContract"
@@ -93,6 +129,21 @@ foreach ($requiredInstallContract in @(
 }
 if ($installScriptText -notmatch 'ExpectedOwnerSid\s*=\s*\$selection\.sid') {
     throw "Boundless-Install.ps1 must key tray quiescence to the selected desktop SID."
+}
+$stopTraySource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Stop-BoundlessTrayForUpgrade'
+if ($stopTraySource -match 'Invoke-BoundedProcess' -or $stopTraySource -match '--quit') {
+    throw "Boundless-Install.ps1 must not execute a tray image discovered from a user process."
+}
+$postInstallSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Invoke-PostInstallVerification'
+if (
+    $postInstallSource -match 'Get-MsiProperty' -or
+    $postInstallSource -match 'ResolvedInstallerPath'
+) {
+    throw "Post-install verification must use the immutable pre-UAC MSI metadata anchor."
 }
 
 $packagingReadme = Join-Path $packagingRoot "README.txt"
@@ -115,10 +166,23 @@ $installerSmokeText = Get-Content -LiteralPath $installerSmoke -Raw
 foreach ($requiredSmokeContract in @(
         'Invoke-BoundlessInstallHelper',
         'install_helper_upgrade_evidence',
-        'boundless_install_tray_quiescence_acquired'
+        'boundless_install_tray_quiescence_acquired',
+        'Get-WindowsCommandExecutablePath',
+        'Assert-WindowsServiceExecutablePathFixtures'
     )) {
     if ($installerSmokeText -notmatch [regex]::Escape($requiredSmokeContract)) {
         throw "installer-smoke.ps1 is missing helper-driven upgrade evidence: $requiredSmokeContract"
+    }
+}
+foreach ($sharedFunction in @(
+        'Test-WindowsPathEqual',
+        'Get-WindowsCommandExecutablePath',
+        'Assert-WindowsServiceExecutablePathFixtures'
+    )) {
+    $helperFunction = Get-PowerShellFunctionSource -Path $installScript -Name $sharedFunction
+    $smokeFunction = Get-PowerShellFunctionSource -Path $installerSmoke -Name $sharedFunction
+    if (-not [string]::Equals($helperFunction, $smokeFunction, [StringComparison]::Ordinal)) {
+        throw "Service executable validation function drifted between helper and smoke: $sharedFunction"
     }
 }
 

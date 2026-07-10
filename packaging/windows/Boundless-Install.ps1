@@ -18,6 +18,48 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Anchor the exact helper PowerShell parsed before any install preflight or UAC
+# handoff. Comparing the loaded AST text to disk closes the small load/startup
+# replacement window; the byte hash and metadata are rechecked again immediately
+# before elevation and the elevated copier accepts only this startup hash.
+if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+    throw "Boundless install helper must run from a script file."
+}
+$startupHelperPath = (Resolve-Path -LiteralPath $PSCommandPath -ErrorAction Stop).Path
+$startupLoadedText = $MyInvocation.MyCommand.ScriptBlock.Ast.Extent.Text
+$startupDiskText = [IO.File]::ReadAllText($startupHelperPath)
+if (-not [string]::Equals($startupLoadedText, $startupDiskText, [StringComparison]::Ordinal)) {
+    throw "Boundless install helper changed between PowerShell load and startup."
+}
+$startupHelperItem = Get-Item -LiteralPath $startupHelperPath -Force -ErrorAction Stop
+$script:BoundlessHelperStartupAnchor = [pscustomobject]@{
+    path = $startupHelperPath
+    sha256 = (Get-FileHash -LiteralPath $startupHelperPath -Algorithm SHA256).Hash
+    length = [int64]$startupHelperItem.Length
+    last_write_utc_ticks = [int64]$startupHelperItem.LastWriteTimeUtc.Ticks
+}
+
+function Assert-BoundlessHelperStartupAnchor {
+    if ($null -eq $script:BoundlessHelperStartupAnchor) {
+        throw "Boundless helper startup identity anchor was unavailable."
+    }
+    $anchor = $script:BoundlessHelperStartupAnchor
+    $currentPath = (Resolve-Path -LiteralPath $PSCommandPath -ErrorAction Stop).Path
+    if (-not $currentPath.Equals($anchor.path, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Boundless helper path changed after startup."
+    }
+    $currentItem = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop
+    $currentHash = (Get-FileHash -LiteralPath $currentPath -Algorithm SHA256).Hash
+    if (
+        [int64]$currentItem.Length -ne [int64]$anchor.length -or
+        [int64]$currentItem.LastWriteTimeUtc.Ticks -ne [int64]$anchor.last_write_utc_ticks -or
+        -not $currentHash.Equals($anchor.sha256, [StringComparison]::OrdinalIgnoreCase)
+    ) {
+        throw "Boundless install helper changed after its startup identity was anchored."
+    }
+    return $anchor
+}
+
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -264,20 +306,303 @@ function New-BoundlessNamedMutex {
     }
 }
 
-function Get-BoundlessTrayOwnerMutexName {
+function Get-BoundlessTrayKernelObjectBaseName {
     param(
         [string]$UserSid,
         [int]$SessionId
     )
 
-    return "Local\Boundless.Tray.SingleInstance.v1.$UserSid.$SessionId.Owner"
+    return "Local\Boundless.Tray.SingleInstance.v1.$UserSid.$SessionId"
+}
+
+function Get-BoundlessTrayOwnerMutexName {
+    param(
+        [string]$UserSid,
+        [int]$SessionId
+    )
+    return "$(Get-BoundlessTrayKernelObjectBaseName -UserSid $UserSid -SessionId $SessionId).Owner"
+}
+
+function Get-BoundlessTrayShutdownEventName {
+    param(
+        [string]$UserSid,
+        [int]$SessionId
+    )
+    return "$(Get-BoundlessTrayKernelObjectBaseName -UserSid $UserSid -SessionId $SessionId).Shutdown"
+}
+
+function Request-BoundlessTrayShutdownSignal {
+    param(
+        [string]$ExpectedOwnerSid,
+        [int]$ExpectedSessionId
+    )
+
+    $eventName = Get-BoundlessTrayShutdownEventName `
+        -UserSid $ExpectedOwnerSid `
+        -SessionId $ExpectedSessionId
+    try {
+        $shutdownEvent = [Threading.EventWaitHandle]::OpenExisting($eventName)
+    }
+    catch {
+        $cause = if ($null -ne $_.Exception.InnerException) {
+            $_.Exception.InnerException
+        }
+        else {
+            $_.Exception
+        }
+        if (
+            $cause -is [Threading.WaitHandleCannotBeOpenedException] -or
+            $cause -is [UnauthorizedAccessException]
+        ) {
+            return $false
+        }
+        throw "Could not open the trusted Boundless tray shutdown event '$eventName'. $($cause.Message)"
+    }
+    try {
+        if (-not $shutdownEvent.Set()) {
+            throw "The trusted Boundless tray shutdown event rejected Set()."
+        }
+        return $true
+    }
+    finally {
+        $shutdownEvent.Dispose()
+    }
+}
+
+function Get-BoundlessTrayQuiescenceSentinelName {
+    param(
+        [string]$UserSid,
+        [int]$SessionId
+    )
+    return "Local\Boundless.Tray.UpgradeQuiescence.v1.$UserSid.$SessionId"
+}
+
+function New-BoundlessTrayQuiescenceMonitorCommand {
+    param(
+        [string]$ExpectedOwnerSid,
+        [int]$ExpectedSessionId,
+        [string]$SentinelName,
+        [string]$ReadyEventName,
+        [int]$StableMilliseconds = 500
+    )
+
+    $payload = [ordered]@{
+        expected_owner_sid = $ExpectedOwnerSid
+        expected_session_id = $ExpectedSessionId
+        sentinel_name = $SentinelName
+        ready_event_name = $ReadyEventName
+        stable_milliseconds = $StableMilliseconds
+    }
+    $payloadBase64 = [Convert]::ToBase64String(
+        [Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Compress))
+    )
+    $source = @'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class BoundlessUpgradeMonitorNativeMethods
+{
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool PostThreadMessage(
+        uint threadId,
+        uint message,
+        UIntPtr wParam,
+        IntPtr lParam);
+}
+"@
+function Test-QuiescenceSentinel {
+    param([string]$Name)
+    try {
+        $sentinel = [Threading.Mutex]::OpenExisting($Name)
+    }
+    catch {
+        $cause = if ($null -ne $_.Exception.InnerException) {
+            $_.Exception.InnerException
+        }
+        else {
+            $_.Exception
+        }
+        if ($cause -is [Threading.WaitHandleCannotBeOpenedException]) {
+            return $false
+        }
+        throw
+    }
+    try {
+        return $true
+    }
+    finally {
+        $sentinel.Dispose()
+    }
+}
+function Get-OwnerSid {
+    param([int]$ProcessId)
+    $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop |
+        Select-Object -First 1
+    if ($null -eq $process) {
+        return ""
+    }
+    $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop
+    if ($owner.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace($owner.Sid)) {
+        throw "Could not prove owner SID for replacement tray PID $ProcessId."
+    }
+    return $owner.Sid
+}
+$payloadJson = [Text.Encoding]::UTF8.GetString(
+    [Convert]::FromBase64String("__PAYLOAD_BASE64__")
+)
+$payload = $payloadJson | ConvertFrom-Json
+$ready = [Threading.EventWaitHandle]::OpenExisting([string]$payload.ready_event_name)
+try {
+    $stableSince = $null
+    $readySignaled = $false
+    while (Test-QuiescenceSentinel -Name $payload.sentinel_name) {
+        $targets = @(
+            Get-Process -Name "boundlesstray" -ErrorAction SilentlyContinue |
+                Where-Object { $_.SessionId -eq [int]$payload.expected_session_id }
+        )
+        if ($targets.Count -gt 0) {
+            $stableSince = $null
+            foreach ($target in $targets) {
+                $ownerSid = Get-OwnerSid -ProcessId $target.Id
+                if ([string]::IsNullOrWhiteSpace($ownerSid)) {
+                    continue
+                }
+                if ($ownerSid -ne [string]$payload.expected_owner_sid) {
+                    throw "Replacement tray PID $($target.Id) belonged to unexpected SID $ownerSid."
+                }
+                foreach ($thread in @($target.Threads)) {
+                    [void][BoundlessUpgradeMonitorNativeMethods]::PostThreadMessage(
+                        [uint32]$thread.Id,
+                        [uint32]0x0012,
+                        [UIntPtr]::Zero,
+                        [IntPtr]::Zero
+                    )
+                }
+            }
+        }
+        else {
+            if ($null -eq $stableSince) {
+                $stableSince = Get-Date
+            }
+            if (
+                -not $readySignaled -and
+                ((Get-Date) - $stableSince).TotalMilliseconds -ge [int]$payload.stable_milliseconds
+            ) {
+                [void]$ready.Set()
+                $readySignaled = $true
+            }
+        }
+        Start-Sleep -Milliseconds 50
+    }
+}
+finally {
+    $ready.Dispose()
+}
+'@
+    $source = $source.Replace("__PAYLOAD_BASE64__", $payloadBase64)
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($source))
+    if ($encodedCommand.Length -gt 30000) {
+        throw "The tray quiescence monitor exceeded the safe Windows command-line budget."
+    }
+    return $encodedCommand
+}
+
+function Start-BoundlessTrayQuiescenceMonitor {
+    param(
+        [string]$ExpectedOwnerSid,
+        [int]$ExpectedSessionId,
+        [string]$SentinelName
+    )
+
+    $readyEventName = "Local\Boundless.Tray.UpgradeMonitorReady.v1.$([guid]::NewGuid().ToString('N'))"
+    $readyCreated = $false
+    $readyEvent = [Threading.EventWaitHandle]::new(
+        $false,
+        [Threading.EventResetMode]::ManualReset,
+        $readyEventName,
+        [ref]$readyCreated
+    )
+    if (-not $readyCreated) {
+        $readyEvent.Dispose()
+        throw "Could not create a unique tray quiescence monitor handshake."
+    }
+    try {
+        $encodedCommand = New-BoundlessTrayQuiescenceMonitorCommand `
+            -ExpectedOwnerSid $ExpectedOwnerSid `
+            -ExpectedSessionId $ExpectedSessionId `
+            -SentinelName $SentinelName `
+            -ReadyEventName $readyEventName
+        $arguments = @("-NoProfile", "-EncodedCommand", $encodedCommand)
+        $process = Start-Process `
+            -FilePath (Resolve-CurrentPowerShellExecutable) `
+            -ArgumentList (@($arguments | ForEach-Object { ConvertTo-ProcessArgument -Value $_ }) -join " ") `
+            -WindowStyle Hidden `
+            -PassThru
+        return [pscustomobject]@{
+            process = $process
+            ready_event = $readyEvent
+            ready_event_name = $readyEventName
+            stable_milliseconds = 500
+        }
+    }
+    catch {
+        $readyEvent.Dispose()
+        throw
+    }
+}
+
+function Wait-BoundlessTrayQuiescenceMonitorReady {
+    param(
+        [object]$Monitor,
+        [int]$TimeoutSeconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        if ($Monitor.ready_event.WaitOne(50)) {
+            return
+        }
+        if ($Monitor.process.HasExited) {
+            throw "Tray quiescence monitor exited before proving a stable-zero tray state; exit=$($Monitor.process.ExitCode)."
+        }
+    } while ((Get-Date) -lt $deadline)
+    throw "Tray quiescence monitor did not prove stable-zero within $($TimeoutSeconds)s."
+}
+
+function Complete-BoundlessTrayQuiescenceMonitor {
+    param(
+        [object]$Monitor,
+        [bool]$ExitedBeforeSentinelRelease
+    )
+
+    try {
+        if (-not $Monitor.process.WaitForExit(5000)) {
+            $Monitor.process.Kill()
+            throw "Tray quiescence monitor did not stop after the sentinel was released."
+        }
+        $exitCode = $Monitor.process.ExitCode
+        if ($ExitedBeforeSentinelRelease -or $exitCode -ne 0) {
+            throw "Tray quiescence monitor did not span the full MSI window; early=$ExitedBeforeSentinelRelease exit=$exitCode."
+        }
+        return [pscustomobject]@{
+            completed = $true
+            exit_code = $exitCode
+        }
+    }
+    finally {
+        $Monitor.ready_event.Dispose()
+        $Monitor.process.Dispose()
+    }
 }
 
 function Enter-BoundlessTrayQuiescence {
     param(
         [string]$ExpectedOwnerSid,
         [int]$ExpectedSessionId,
-        [int]$TimeoutSeconds = 12
+        [int]$TimeoutSeconds = 15
     )
 
     $mutexNameArgs = @{
@@ -285,41 +610,95 @@ function Enter-BoundlessTrayQuiescence {
         SessionId = $ExpectedSessionId
     }
     $mutexName = Get-BoundlessTrayOwnerMutexName @mutexNameArgs
+    $sentinelName = Get-BoundlessTrayQuiescenceSentinelName @mutexNameArgs
+    $sentinelAttempt = New-BoundlessNamedMutex `
+        -Name $sentinelName `
+        -UserSid $ExpectedOwnerSid `
+        -InitiallyOwned $true
+    if (-not $sentinelAttempt.created_new) {
+        $sentinelAttempt.mutex.Dispose()
+        throw "Another Boundless upgrade quiescence sentinel is already active for this user/session."
+    }
+    $monitor = $null
+    $ownerLease = $null
+    $completed = $false
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $attempts = 0
-    do {
-        $attempts += 1
-        $shutdownArgs = @{
-            ExpectedOwnerSid = $ExpectedOwnerSid
-            ExpectedSessionId = $ExpectedSessionId
-            TimeoutSeconds = [Math]::Max(1, [int](($deadline - (Get-Date)).TotalSeconds))
+    try {
+        $monitor = Start-BoundlessTrayQuiescenceMonitor `
+            -ExpectedOwnerSid $ExpectedOwnerSid `
+            -ExpectedSessionId $ExpectedSessionId `
+            -SentinelName $sentinelName
+        do {
+            $attempts += 1
+            $shutdownArgs = @{
+                ExpectedOwnerSid = $ExpectedOwnerSid
+                ExpectedSessionId = $ExpectedSessionId
+                TimeoutSeconds = [Math]::Max(1, [int](($deadline - (Get-Date)).TotalSeconds))
+            }
+            $shutdown = Stop-BoundlessTrayForUpgrade @shutdownArgs
+            $leaseArgs = @{
+                Name = $mutexName
+                UserSid = $ExpectedOwnerSid
+                InitiallyOwned = $true
+            }
+            $leaseAttempt = New-BoundlessNamedMutex @leaseArgs
+            if ($leaseAttempt.created_new) {
+                $ownerLease = $leaseAttempt.mutex
+                break
+            }
+
+            $leaseAttempt.mutex.Dispose()
+            Start-Sleep -Milliseconds 50
+        } while ((Get-Date) -lt $deadline)
+        if ($null -eq $ownerLease) {
+            throw "Could not acquire the Boundless tray quiescence lease within $($TimeoutSeconds)s. The UAC/MSI phase was not started."
         }
-        $shutdown = Stop-BoundlessTrayForUpgrade @shutdownArgs
-        $leaseArgs = @{
-            Name = $mutexName
-            UserSid = $ExpectedOwnerSid
-            InitiallyOwned = $true
-        }
-        $leaseAttempt = New-BoundlessNamedMutex @leaseArgs
-        if ($leaseAttempt.created_new) {
-            return [pscustomobject]@{
-                mutex = $leaseAttempt.mutex
-                evidence = [pscustomobject]@{
-                    name = $mutexName
-                    acquired = $true
-                    attempts = $attempts
-                    shutdown = $shutdown
-                    integrity = "creator_default"
-                    spans_elevation_and_msi = $true
-                }
+        $remainingSeconds = [Math]::Max(1, [int](($deadline - (Get-Date)).TotalSeconds))
+        Wait-BoundlessTrayQuiescenceMonitorReady `
+            -Monitor $monitor `
+            -TimeoutSeconds $remainingSeconds
+        $completed = $true
+        return [pscustomobject]@{
+            mutex = $ownerLease
+            sentinel_mutex = $sentinelAttempt.mutex
+            monitor = $monitor
+            evidence = [pscustomobject]@{
+                name = $mutexName
+                sentinel_name = $sentinelName
+                sentinel_acquired = $true
+                acquired = $true
+                attempts = $attempts
+                shutdown = $shutdown
+                integrity = "creator_default"
+                monitor_process_id = $monitor.process.Id
+                monitor_ready = $true
+                monitor_stable_milliseconds = $monitor.stable_milliseconds
+                monitor_completed = $false
+                monitor_exit_code = $null
+                spans_elevation_and_msi = $true
             }
         }
-
-        $leaseAttempt.mutex.Dispose()
-        Start-Sleep -Milliseconds 50
-    } while ((Get-Date) -lt $deadline)
-
-    throw "Could not acquire the Boundless tray quiescence lease within $($TimeoutSeconds)s. The UAC/MSI phase was not started."
+    }
+    finally {
+        if (-not $completed) {
+            $monitorExitedEarly = $null -ne $monitor -and $monitor.process.HasExited
+            if ($null -ne $ownerLease) {
+                try { $ownerLease.ReleaseMutex() } finally { $ownerLease.Dispose() }
+            }
+            try {
+                $sentinelAttempt.mutex.ReleaseMutex()
+            }
+            finally {
+                $sentinelAttempt.mutex.Dispose()
+            }
+            if ($null -ne $monitor) {
+                Complete-BoundlessTrayQuiescenceMonitor `
+                    -Monitor $monitor `
+                    -ExitedBeforeSentinelRelease $monitorExitedEarly | Out-Null
+            }
+        }
+    }
 }
 
 function Exit-BoundlessTrayQuiescence {
@@ -328,12 +707,25 @@ function Exit-BoundlessTrayQuiescence {
     if ($null -eq $Lease -or $null -eq $Lease.mutex) {
         return
     }
+    $monitorExitedEarly = $Lease.monitor.process.HasExited
     try {
         $Lease.mutex.ReleaseMutex()
     }
     finally {
         $Lease.mutex.Dispose()
     }
+    try {
+        $Lease.sentinel_mutex.ReleaseMutex()
+    }
+    finally {
+        $Lease.sentinel_mutex.Dispose()
+    }
+    $monitorResult = Complete-BoundlessTrayQuiescenceMonitor `
+        -Monitor $Lease.monitor `
+        -ExitedBeforeSentinelRelease $monitorExitedEarly
+    $Lease.evidence.monitor_completed = $monitorResult.completed
+    $Lease.evidence.monitor_exit_code = $monitorResult.exit_code
+    return $monitorResult
 }
 
 function Get-BoundlessAdminOnlyStageSddl {
@@ -724,18 +1116,20 @@ function Invoke-ElevatedInstallPhase {
 function New-BoundlessElevatedInstallCommand {
     param(
         [string]$ResolvedInstallerPath,
-        [string]$Sid
+        [string]$Sid,
+        [object]$InstallerAnchor
     )
 
-    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
-        throw "Could not resolve the install helper path for immutable elevation staging."
-    }
-    $resolvedHelperPath = (Resolve-Path -LiteralPath $PSCommandPath).Path
+    $helperAnchor = Assert-BoundlessHelperStartupAnchor
+    $InstallerAnchor = Assert-BoundlessInstallerAnchor `
+        -Anchor $InstallerAnchor `
+        -ResolvedInstallerPath $ResolvedInstallerPath
+    $resolvedHelperPath = $helperAnchor.path
     $payload = [ordered]@{
         installer_path = $ResolvedInstallerPath
-        installer_sha256 = (Get-FileHash -LiteralPath $ResolvedInstallerPath -Algorithm SHA256).Hash
+        installer_sha256 = $InstallerAnchor.sha256
         helper_path = $resolvedHelperPath
-        helper_sha256 = (Get-FileHash -LiteralPath $resolvedHelperPath -Algorithm SHA256).Hash
+        helper_sha256 = $helperAnchor.sha256
         sid = $Sid
         quiet = [bool]$Quiet
         no_restart = [bool]$NoRestart
@@ -867,18 +1261,21 @@ exit $exitCode
         source = $source
         encoded_command = $encodedCommand
         installer_sha256 = $payload.installer_sha256
+        helper_sha256 = $payload.helper_sha256
     }
 }
 
 function Invoke-BoundlessMsi {
     param(
         [string]$ResolvedInstallerPath,
-        [string]$Sid
+        [string]$Sid,
+        [object]$InstallerAnchor
     )
 
     $elevatedCommandArgs = @{
         ResolvedInstallerPath = $ResolvedInstallerPath
         Sid = $Sid
+        InstallerAnchor = $InstallerAnchor
     }
     $elevatedCommand = New-BoundlessElevatedInstallCommand @elevatedCommandArgs
     $arguments = @(
@@ -967,6 +1364,64 @@ function Get-MsiProperty {
         throw "MSI property '$Property' was not found in $Path"
     }
     return $record.StringData(1)
+}
+
+function New-BoundlessInstallerAnchor {
+    param([string]$ResolvedInstallerPath)
+
+    $resolvedPath = (Resolve-Path -LiteralPath $ResolvedInstallerPath -ErrorAction Stop).Path
+    $before = Get-Item -LiteralPath $resolvedPath -Force -ErrorAction Stop
+    $hashBefore = (Get-FileHash -LiteralPath $resolvedPath -Algorithm SHA256).Hash
+    $productVersion = Get-MsiProperty -Path $resolvedPath -Property "ProductVersion"
+    $productCode = Get-MsiProperty -Path $resolvedPath -Property "ProductCode"
+    $hashAfter = (Get-FileHash -LiteralPath $resolvedPath -Algorithm SHA256).Hash
+    $after = Get-Item -LiteralPath $resolvedPath -Force -ErrorAction Stop
+    if (
+        -not $hashBefore.Equals($hashAfter, [StringComparison]::OrdinalIgnoreCase) -or
+        [int64]$before.Length -ne [int64]$after.Length -or
+        [int64]$before.LastWriteTimeUtc.Ticks -ne [int64]$after.LastWriteTimeUtc.Ticks
+    ) {
+        throw "MSI changed while its pre-UAC identity and metadata were being anchored."
+    }
+    if ($productVersion -notmatch '^\d+\.\d+\.\d+$') {
+        throw "MSI ProductVersion was invalid while anchoring: $productVersion"
+    }
+    if ($productCode -notmatch '^\{[0-9A-Fa-f-]+\}$') {
+        throw "MSI ProductCode was invalid while anchoring: $productCode"
+    }
+    return [pscustomobject]@{
+        path = $resolvedPath
+        sha256 = $hashBefore
+        length = [int64]$before.Length
+        last_write_utc_ticks = [int64]$before.LastWriteTimeUtc.Ticks
+        product_version = $productVersion
+        product_code = $productCode
+    }
+}
+
+function Assert-BoundlessInstallerAnchor {
+    param(
+        [object]$Anchor,
+        [string]$ResolvedInstallerPath
+    )
+
+    if ($null -eq $Anchor) {
+        throw "MSI pre-UAC identity anchor was unavailable."
+    }
+    $resolvedPath = (Resolve-Path -LiteralPath $ResolvedInstallerPath -ErrorAction Stop).Path
+    if (-not $resolvedPath.Equals($Anchor.path, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "MSI path changed after its pre-UAC identity was anchored."
+    }
+    $item = Get-Item -LiteralPath $resolvedPath -Force -ErrorAction Stop
+    $hash = (Get-FileHash -LiteralPath $resolvedPath -Algorithm SHA256).Hash
+    if (
+        [int64]$item.Length -ne [int64]$Anchor.length -or
+        [int64]$item.LastWriteTimeUtc.Ticks -ne [int64]$Anchor.last_write_utc_ticks -or
+        -not $hash.Equals($Anchor.sha256, [StringComparison]::OrdinalIgnoreCase)
+    ) {
+        throw "MSI changed after its pre-UAC identity was anchored."
+    }
+    return $Anchor
 }
 
 function Get-BoundlessUninstallEntry {
@@ -1245,21 +1700,18 @@ function Stop-BoundlessTrayForUpgrade {
 
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     $processIds = @($targets | Select-Object -ExpandProperty id)
-    $controlRequests = 0
-    foreach ($path in @($targets.path | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)) {
-        try {
-            $result = Invoke-BoundedProcess -FilePath $path -ArgumentList @("--quit") -TimeoutSeconds 3
-            if ($result.exit_code -eq 0) {
-                $controlRequests += 1
-            }
-        }
-        catch {
-            # The v5.0.13 tray does not recognize --quit. Its bounded WM_QUIT
-            # bridge below is the only supported compatibility path.
-        }
-    }
-
-    if (Wait-BoundlessTrayProcessIdsExited -ProcessIds $processIds -TimeoutMilliseconds 2000) {
+    # Never execute an image path discovered from a user-owned process while
+    # this helper may already be elevated. New trays expose a trusted named
+    # shutdown event; v5.0.13 and cross-credential UAC fall back to same-user,
+    # same-session WM_QUIT after the target identity proof above.
+    $shutdownSignaled = Request-BoundlessTrayShutdownSignal `
+        -ExpectedOwnerSid $ExpectedOwnerSid `
+        -ExpectedSessionId $ExpectedSessionId
+    $controlRequests = if ($shutdownSignaled) { 1 } else { 0 }
+    if (
+        $shutdownSignaled -and
+        (Wait-BoundlessTrayProcessIdsExited -ProcessIds $processIds -TimeoutMilliseconds 750)
+    ) {
         $stopwatch.Stop()
         return [pscustomobject]@{
             initial_count = $targets.Count
@@ -1432,6 +1884,63 @@ function Test-WindowsPathEqual {
     return $leftFull.Equals($rightFull, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-WindowsCommandExecutablePath {
+    param([string]$CommandLine)
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        throw "Windows command line was empty while parsing its executable."
+    }
+    $trimmed = $CommandLine.Trim()
+    if ($trimmed.StartsWith('"')) {
+        $match = [regex]::Match($trimmed, '^"(?<path>[^\"]+)"(?=\s|$)')
+    }
+    else {
+        $match = [regex]::Match(
+            $trimmed,
+            '^(?<path>.+?\.exe)(?=\s|$)',
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+    }
+    if (-not $match.Success) {
+        throw "Could not parse an executable token from Windows command line: $CommandLine"
+    }
+    try {
+        return [IO.Path]::GetFullPath($match.Groups['path'].Value).TrimEnd('\')
+    }
+    catch {
+        throw "Windows command line executable path was invalid: $($match.Groups['path'].Value)"
+    }
+}
+
+function Assert-WindowsServiceExecutablePathFixtures {
+    $expected = 'C:\Program Files\Boundless\boundless-service.exe'
+    foreach ($commandLine in @(
+        '"C:\Program Files\Boundless\boundless-service.exe" --allowed-user-sid=S-1-5-21-1',
+        'C:\Program Files\Boundless\boundless-service.exe --allowed-user-sid=S-1-5-21-1'
+    )) {
+        $actual = Get-WindowsCommandExecutablePath -CommandLine $commandLine
+        if (-not (Test-WindowsPathEqual -Left $actual -Right $expected)) {
+            throw "Service executable parser fixture did not accept the exact executable token: $commandLine"
+        }
+    }
+    foreach ($commandLine in @(
+        '"C:\Program Files\Boundless\boundless-service.exe.evil" --allowed-user-sid=S-1-5-21-1',
+        'C:\Program Files\Boundless\boundless-service.exe.evil --allowed-user-sid=S-1-5-21-1'
+    )) {
+        $accepted = $false
+        try {
+            $actual = Get-WindowsCommandExecutablePath -CommandLine $commandLine
+            $accepted = Test-WindowsPathEqual -Left $actual -Right $expected
+        }
+        catch {
+            $accepted = $false
+        }
+        if ($accepted) {
+            throw "Service executable parser fixture accepted a suffix-confused executable: $commandLine"
+        }
+    }
+}
+
 function Assert-SoleBoundlessTraySnapshot {
     param(
         [object[]]$Processes,
@@ -1571,13 +2080,16 @@ function Assert-PostInstallEvidence {
 
 function Invoke-PostInstallVerification {
     param(
-        [string]$ResolvedInstallerPath,
+        [object]$InstallerAnchor,
         [string]$ExpectedAllowedUserSid,
         [bool]$LaunchTray
     )
 
-    $msiVersion = Get-MsiProperty -Path $ResolvedInstallerPath -Property "ProductVersion"
-    $productCode = Get-MsiProperty -Path $ResolvedInstallerPath -Property "ProductCode"
+    if ($null -eq $InstallerAnchor) {
+        throw "Post-install verification requires the pre-UAC MSI identity anchor."
+    }
+    $msiVersion = $InstallerAnchor.product_version
+    $productCode = $InstallerAnchor.product_code
     $uninstallEntry = Get-BoundlessUninstallEntry -ProductCode $productCode
     $productRegistered = $null -ne $uninstallEntry
     if (-not $productRegistered) {
@@ -1611,7 +2123,10 @@ function Invoke-PostInstallVerification {
     }
     $serviceAllowedUserSid = $sidMatches[0].Groups[1].Value.Trim('"')
     $expectedServicePath = Join-Path $installRoot "boundless-service.exe"
-    $serviceBinaryPathMatches = $serviceConfig.PathName -match [regex]::Escape($expectedServicePath)
+    $actualServicePath = Get-WindowsCommandExecutablePath -CommandLine $serviceConfig.PathName
+    $serviceBinaryPathMatches = Test-WindowsPathEqual `
+        -Left $actualServicePath `
+        -Right $expectedServicePath
 
     $cliPath = Join-Path $installRoot "boundlessctl.exe"
     $trayPath = Join-Path $installRoot "boundlesstray.exe"
@@ -1677,6 +2192,7 @@ function Invoke-PostInstallVerification {
 }
 
 function Invoke-InstallHelperSelfTest {
+    Assert-WindowsServiceExecutablePathFixtures
     $validSid = "S-1-5-21-1-2-3-1001"
     $valid = [pscustomobject]@{
         product_registered = $true
@@ -1800,6 +2316,47 @@ function Invoke-InstallHelperSelfTest {
         throw "Legacy WM_QUIT bridge native fixture did not expose PostThreadMessage."
     }
 
+    $directSignalSession = 2147483000
+    $directSignalName = Get-BoundlessTrayShutdownEventName `
+        -UserSid $validSid `
+        -SessionId $directSignalSession
+    $directSignalCreated = $false
+    $directSignalEvent = [Threading.EventWaitHandle]::new(
+        $false,
+        [Threading.EventResetMode]::ManualReset,
+        $directSignalName,
+        [ref]$directSignalCreated
+    )
+    if (-not $directSignalCreated) {
+        $directSignalEvent.Dispose()
+        throw "Direct tray shutdown signal fixture collided with an existing event."
+    }
+    try {
+        if (-not (Request-BoundlessTrayShutdownSignal `
+            -ExpectedOwnerSid $validSid `
+            -ExpectedSessionId $directSignalSession)) {
+            throw "Direct tray shutdown signal fixture did not open the trusted named event."
+        }
+        if (-not $directSignalEvent.WaitOne(0)) {
+            throw "Direct tray shutdown signal fixture did not signal the trusted named event."
+        }
+    }
+    finally {
+        $directSignalEvent.Dispose()
+    }
+    if (Request-BoundlessTrayShutdownSignal `
+        -ExpectedOwnerSid $validSid `
+        -ExpectedSessionId $directSignalSession) {
+        throw "Direct tray shutdown signal fixture reported a missing event as present."
+    }
+    $shutdownFunctionDefinition = (Get-Command Stop-BoundlessTrayForUpgrade).Definition
+    if (
+        $shutdownFunctionDefinition -match 'Invoke-BoundedProcess' -or
+        $shutdownFunctionDefinition -match '--quit'
+    ) {
+        throw "Tray shutdown function still executed a user-discovered process image."
+    }
+
     $mutexSecurity = New-BoundlessTrayOwnerMutexSecurity -UserSid $currentIdentitySid
     $mutexSddl = $mutexSecurity.GetSecurityDescriptorSddlForm(
         [Security.AccessControl.AccessControlSections]::All
@@ -1846,6 +2403,78 @@ function Invoke-InstallHelperSelfTest {
             $firstLease.mutex.ReleaseMutex()
         }
         $firstLease.mutex.Dispose()
+    }
+
+    $monitorFixtureSession = 2147483001
+    $monitorFixtureSentinelName = Get-BoundlessTrayQuiescenceSentinelName `
+        -UserSid $currentIdentitySid `
+        -SessionId $monitorFixtureSession
+    $monitorFixtureSentinel = New-BoundlessNamedMutex `
+        -Name $monitorFixtureSentinelName `
+        -UserSid $currentIdentitySid `
+        -InitiallyOwned $true
+    if (-not $monitorFixtureSentinel.created_new) {
+        $monitorFixtureSentinel.mutex.Dispose()
+        throw "Tray quiescence monitor fixture collided with an existing sentinel."
+    }
+    $monitorFixture = $null
+    $monitorFixtureSentinelReleased = $false
+    $monitorFixtureCompleted = $false
+    $monitorFixtureError = $null
+    try {
+        $monitorFixture = Start-BoundlessTrayQuiescenceMonitor `
+            -ExpectedOwnerSid $currentIdentitySid `
+            -ExpectedSessionId $monitorFixtureSession `
+            -SentinelName $monitorFixtureSentinelName
+        Wait-BoundlessTrayQuiescenceMonitorReady -Monitor $monitorFixture -TimeoutSeconds 10
+        if ($monitorFixture.process.HasExited) {
+            throw "Tray quiescence monitor fixture did not remain active after its stable-zero handshake."
+        }
+        $monitorFixtureExitedEarly = $monitorFixture.process.HasExited
+        try {
+            $monitorFixtureSentinel.mutex.ReleaseMutex()
+        }
+        finally {
+            $monitorFixtureSentinel.mutex.Dispose()
+            $monitorFixtureSentinelReleased = $true
+        }
+        $monitorFixtureResult = Complete-BoundlessTrayQuiescenceMonitor `
+            -Monitor $monitorFixture `
+            -ExitedBeforeSentinelRelease $monitorFixtureExitedEarly
+        $monitorFixtureCompleted = $true
+        if (-not $monitorFixtureResult.completed -or $monitorFixtureResult.exit_code -ne 0) {
+            throw "Tray quiescence monitor fixture did not span and close its sentinel window."
+        }
+    }
+    catch {
+        $monitorFixtureError = $_
+    }
+    finally {
+        if (-not $monitorFixtureSentinelReleased) {
+            try {
+                $monitorFixtureSentinel.mutex.ReleaseMutex()
+            }
+            finally {
+                $monitorFixtureSentinel.mutex.Dispose()
+                $monitorFixtureSentinelReleased = $true
+            }
+        }
+        if ($null -ne $monitorFixture -and -not $monitorFixtureCompleted) {
+            try {
+                $monitorFixtureExitedEarly = $monitorFixture.process.HasExited
+                Complete-BoundlessTrayQuiescenceMonitor `
+                    -Monitor $monitorFixture `
+                    -ExitedBeforeSentinelRelease $monitorFixtureExitedEarly | Out-Null
+            }
+            catch {
+                if ($null -eq $monitorFixtureError) {
+                    $monitorFixtureError = $_
+                }
+            }
+        }
+    }
+    if ($null -ne $monitorFixtureError) {
+        throw $monitorFixtureError
     }
 
     $stageSddl = Get-BoundlessAdminOnlyStageSddl
@@ -1923,11 +2552,60 @@ function Invoke-InstallHelperSelfTest {
     if (-not $serviceForceKillRejected) {
         throw "Elevated install fixture accepted a service force-kill."
     }
+    $selfTestInstallerItem = Get-Item -LiteralPath $PSCommandPath -Force
+    $selfTestInstallerAnchor = [pscustomobject]@{
+        path = $PSCommandPath
+        sha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+        length = [int64]$selfTestInstallerItem.Length
+        last_write_utc_ticks = [int64]$selfTestInstallerItem.LastWriteTimeUtc.Ticks
+        product_version = "5.0.13"
+        product_code = "{00000000-0000-0000-0000-000000000013}"
+    }
     $elevatedCommandArgs = @{
         ResolvedInstallerPath = $PSCommandPath
         Sid = $validSid
+        InstallerAnchor = $selfTestInstallerAnchor
     }
     $elevatedCommand = New-BoundlessElevatedInstallCommand @elevatedCommandArgs
+    if (
+        $elevatedCommand.helper_sha256 -ne $script:BoundlessHelperStartupAnchor.sha256 -or
+        $elevatedCommand.installer_sha256 -ne $selfTestInstallerAnchor.sha256
+    ) {
+        throw "Elevated command did not retain startup-anchored helper/MSI hashes."
+    }
+    $assertedStartupAnchor = Assert-BoundlessHelperStartupAnchor
+    if ($assertedStartupAnchor.sha256 -ne $script:BoundlessHelperStartupAnchor.sha256) {
+        throw "Helper startup identity fixture did not preserve its anchored hash."
+    }
+    $installerMutationFixturePath = Join-Path `
+        ([IO.Path]::GetTempPath()) `
+        "Boundless-InstallerAnchor-$([guid]::NewGuid().ToString('N')).bin"
+    Copy-Item -LiteralPath $PSCommandPath -Destination $installerMutationFixturePath -ErrorAction Stop
+    try {
+        $installerMutationItem = Get-Item -LiteralPath $installerMutationFixturePath -Force
+        $installerMutationAnchor = [pscustomobject]@{
+            path = $installerMutationFixturePath
+            sha256 = (Get-FileHash -LiteralPath $installerMutationFixturePath -Algorithm SHA256).Hash
+            length = [int64]$installerMutationItem.Length
+            last_write_utc_ticks = [int64]$installerMutationItem.LastWriteTimeUtc.Ticks
+        }
+        [IO.File]::AppendAllText($installerMutationFixturePath, "changed")
+        $installerMutationRejected = $false
+        try {
+            Assert-BoundlessInstallerAnchor `
+                -Anchor $installerMutationAnchor `
+                -ResolvedInstallerPath $installerMutationFixturePath | Out-Null
+        }
+        catch {
+            $installerMutationRejected = $true
+        }
+        if (-not $installerMutationRejected) {
+            throw "MSI identity anchor fixture accepted a post-anchor mutation."
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $installerMutationFixturePath -Force -ErrorAction SilentlyContinue
+    }
     $decodedElevatedCommand = [Text.Encoding]::Unicode.GetString(
         [Convert]::FromBase64String($elevatedCommand.encoded_command)
     )
@@ -1999,16 +2677,21 @@ function Invoke-InstallHelperSelfTest {
         bounded_process_fixture = "passed"
         daemon_version_fixture = "passed"
         executable_version_fixture = "passed"
+        service_executable_path_fixture = "passed"
         tray_path_fixture = "passed"
         tray_shutdown_identity_fixture = "passed"
         legacy_quit_bridge_fixture = "passed"
+        direct_shutdown_signal_fixture = "passed"
         tray_quiescence_lease_fixture = "passed"
+        tray_quiescence_monitor_fixture = "passed"
         admin_only_stage_fixture = "passed"
         program_data_known_folder_fixture = "passed"
         staging_child_process_probe_hosts = $stagingProbeHosts
         bounded_service_stop_fixture = "passed"
         elevated_install_result_fixture = "passed"
         elevated_in_memory_command_fixture = "passed"
+        helper_startup_anchor_fixture = "passed"
+        installer_anchor_fixture = "passed"
         msi_property_fixture = $msiPropertyFixture
     } | ConvertTo-Json -Depth 3
 }
@@ -2071,7 +2754,9 @@ if ($ResolveOnly) {
 }
 
 $resolvedInstallerPath = Resolve-InstallerPath
+$installerAnchor = New-BoundlessInstallerAnchor -ResolvedInstallerPath $resolvedInstallerPath
 $summary.installer_path = $resolvedInstallerPath
+$summary.installer_anchor = $installerAnchor
 
 Write-Host "boundless_install_selected_user_sid=$($selection.sid)"
 if (-not [string]::IsNullOrWhiteSpace($selection.account)) {
@@ -2094,7 +2779,10 @@ Write-Host "boundless_install_tray_shutdown_count=$($trayShutdown.initial_count)
 Write-Host "boundless_install_tray_shutdown_elapsed_ms=$($trayShutdown.elapsed_milliseconds)"
 Write-Host "boundless_install_tray_quiescence_acquired=$($trayQuiescence.evidence.acquired)"
 try {
-    $installResult = Invoke-BoundlessMsi -ResolvedInstallerPath $resolvedInstallerPath -Sid $selection.sid
+    $installResult = Invoke-BoundlessMsi `
+        -ResolvedInstallerPath $resolvedInstallerPath `
+        -Sid $selection.sid `
+        -InstallerAnchor $installerAnchor
 }
 finally {
     Exit-BoundlessTrayQuiescence -Lease $trayQuiescence
@@ -2107,7 +2795,7 @@ if ($null -ne $installResult.service_shutdown.elapsed_milliseconds) {
     Write-Host "boundless_install_service_stop_elapsed_ms=$($installResult.service_shutdown.elapsed_milliseconds)"
 }
 $verification = Invoke-PostInstallVerification `
-    -ResolvedInstallerPath $resolvedInstallerPath `
+    -InstallerAnchor $installerAnchor `
     -ExpectedAllowedUserSid $selection.sid `
     -LaunchTray:(-not $Quiet -and -not (Test-IsAdministrator))
 $summary.pre_install_tray_shutdown = $trayShutdown

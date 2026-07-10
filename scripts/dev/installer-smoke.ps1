@@ -450,6 +450,77 @@ function Get-BoundlessServiceConfig {
         Select-Object -First 1
 }
 
+function Test-WindowsPathEqual {
+    param(
+        [string]$Left,
+        [string]$Right
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Left) -or [string]::IsNullOrWhiteSpace($Right)) {
+        return $false
+    }
+    $leftFull = [IO.Path]::GetFullPath($Left).TrimEnd('\')
+    $rightFull = [IO.Path]::GetFullPath($Right).TrimEnd('\')
+    return $leftFull.Equals($rightFull, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-WindowsCommandExecutablePath {
+    param([string]$CommandLine)
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        throw "Windows command line was empty while parsing its executable."
+    }
+    $trimmed = $CommandLine.Trim()
+    if ($trimmed.StartsWith('"')) {
+        $match = [regex]::Match($trimmed, '^"(?<path>[^\"]+)"(?=\s|$)')
+    }
+    else {
+        $match = [regex]::Match(
+            $trimmed,
+            '^(?<path>.+?\.exe)(?=\s|$)',
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+    }
+    if (-not $match.Success) {
+        throw "Could not parse an executable token from Windows command line: $CommandLine"
+    }
+    try {
+        return [IO.Path]::GetFullPath($match.Groups['path'].Value).TrimEnd('\')
+    }
+    catch {
+        throw "Windows command line executable path was invalid: $($match.Groups['path'].Value)"
+    }
+}
+
+function Assert-WindowsServiceExecutablePathFixtures {
+    $expected = 'C:\Program Files\Boundless\boundless-service.exe'
+    foreach ($commandLine in @(
+        '"C:\Program Files\Boundless\boundless-service.exe" --allowed-user-sid=S-1-5-21-1',
+        'C:\Program Files\Boundless\boundless-service.exe --allowed-user-sid=S-1-5-21-1'
+    )) {
+        $actual = Get-WindowsCommandExecutablePath -CommandLine $commandLine
+        if (-not (Test-WindowsPathEqual -Left $actual -Right $expected)) {
+            throw "Service executable parser fixture did not accept the exact executable token: $commandLine"
+        }
+    }
+    foreach ($commandLine in @(
+        '"C:\Program Files\Boundless\boundless-service.exe.evil" --allowed-user-sid=S-1-5-21-1',
+        'C:\Program Files\Boundless\boundless-service.exe.evil --allowed-user-sid=S-1-5-21-1'
+    )) {
+        $accepted = $false
+        try {
+            $actual = Get-WindowsCommandExecutablePath -CommandLine $commandLine
+            $accepted = Test-WindowsPathEqual -Left $actual -Right $expected
+        }
+        catch {
+            $accepted = $false
+        }
+        if ($accepted) {
+            throw "Service executable parser fixture accepted a suffix-confused executable: $commandLine"
+        }
+    }
+}
+
 function Wait-BoundlessServiceStatus {
     param(
         [string]$ExpectedStatus,
@@ -518,7 +589,8 @@ function Assert-BoundlessServiceConfig {
         throw "BoundlessService was not registered by the installer."
     }
 
-    if ($service.PathName -notmatch [regex]::Escape($ExpectedServicePath)) {
+    $actualServicePath = Get-WindowsCommandExecutablePath -CommandLine $service.PathName
+    if (-not (Test-WindowsPathEqual -Left $actualServicePath -Right $ExpectedServicePath)) {
         throw "BoundlessService PathName did not point at the Program Files service binary. PathName=$($service.PathName)"
     }
     if ($service.PathName -notmatch "(^|\s)--allowed-user-sid=([^\s]+)") {
@@ -656,6 +728,7 @@ if ((Get-Variable -Name IsWindows -ErrorAction SilentlyContinue) -and (-not $IsW
 if ((-not (Get-Variable -Name IsWindows -ErrorAction SilentlyContinue)) -and ($env:OS -ne "Windows_NT")) {
     throw "installer-smoke.ps1 is supported on Windows only."
 }
+Assert-WindowsServiceExecutablePathFixtures
 if (-not (Test-IsAdministrator)) {
     throw "installer-smoke.ps1 must run from an elevated PowerShell session for machine-wide Program Files MSI validation."
 }

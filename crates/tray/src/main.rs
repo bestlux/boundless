@@ -1800,6 +1800,20 @@ mod windows_app {
         }
 
         #[test]
+        fn tray_upgrade_quiescence_name_matches_installer_contract() {
+            let first = tray_upgrade_quiescence_sentinel_name("S-1-5-21-1-2-3-1001", 1);
+            let other_session = tray_upgrade_quiescence_sentinel_name("S-1-5-21-1-2-3-1001", 2);
+            let other_user = tray_upgrade_quiescence_sentinel_name("S-1-5-21-1-2-3-1002", 1);
+
+            assert_eq!(
+                first,
+                "Local\\Boundless.Tray.UpgradeQuiescence.v1.S-1-5-21-1-2-3-1001.1"
+            );
+            assert_ne!(first, other_session);
+            assert_ne!(first, other_user);
+        }
+
+        #[test]
         fn quit_control_mode_does_not_enable_service_start() {
             let cli = Cli::try_parse_from(["boundlesstray", "--quit"])
                 .expect("quit control mode should parse");
