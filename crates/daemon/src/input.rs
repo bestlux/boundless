@@ -30,6 +30,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Input::{MOUSE_MOVE_ABSOLUTE, RAWMOUSE};
 
 const INPUT_RUNTIME_SAFETY_TICK: Duration = Duration::from_millis(50);
+const DIRECT_INPUT_LOCK_LEASE: Duration = Duration::from_secs(2);
 const INPUT_INJECT_MAX_FRAMES_PER_WAKE: usize = 64;
 const INPUT_INJECT_WORK_QUANTUM: Duration = Duration::from_millis(2);
 const INPUT_INJECT_RETRY_BASE_BACKOFF_MS: u64 = 12;
@@ -156,6 +157,19 @@ trait InputCaptureBackend: Send {
     fn poll_events(&mut self) -> Result<Vec<InputEvent>>;
     fn drain_control_actions(&mut self) -> Vec<CaptureControlAction>;
     fn set_lock_active(&mut self, active: bool) -> Result<bool>;
+    fn safety_unlock_generation(&self) -> u64 {
+        0
+    }
+    fn set_lock_active_if_safety_generation(
+        &mut self,
+        active: bool,
+        _expected_generation: u64,
+    ) -> Result<bool> {
+        self.set_lock_active(active)
+    }
+    fn renew_lock_lease(&self) -> bool {
+        false
+    }
     fn lock_supported(&self) -> bool;
     fn backend_mode(&self) -> &'static str;
     fn cursor_position(&self) -> Option<(i32, i32)> {
@@ -1572,6 +1586,10 @@ mod tests {
         );
         let (locked, _) = state.input_lock_runtime().await;
         assert!(!locked, "escape control action should release lock");
+        assert!(
+            !backend.lock_updates.contains(&true),
+            "a pending safety action must be drained before any relock attempt"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1980,6 +1998,39 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_hook_backend_watchdog_fails_open_after_stalled_capture_cycle() {
+        let (_tx, rx) = mpsc::channel();
+        let mut backend = WindowsHookCaptureBackend {
+            pump: HookInputPump::from_capture_runtime(CaptureRuntime::from_test_parts(rx, true)),
+        };
+        backend
+            .pump
+            .enable_lock_lease(Duration::from_millis(40))
+            .expect("enable direct hook lock lease");
+        let generation = backend.safety_unlock_generation();
+        assert!(
+            backend
+                .set_lock_active_if_safety_generation(true, generation)
+                .expect("engage guarded lock")
+        );
+
+        std::thread::sleep(Duration::from_millis(140));
+
+        assert!(!backend.pump.lock_active(), "stalled cycle must fail open");
+        assert_eq!(
+            backend.drain_control_actions(),
+            vec![CaptureControlAction::EscapeUnlock]
+        );
+        assert!(
+            !backend
+                .set_lock_active_if_safety_generation(true, generation)
+                .expect("stale guarded relock"),
+            "the pre-stall generation must not relock after watchdog expiry"
+        );
     }
 
     #[cfg(windows)]

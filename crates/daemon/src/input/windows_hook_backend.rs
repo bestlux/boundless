@@ -2,10 +2,11 @@ use super::*;
 
 impl WindowsHookCaptureBackend {
     pub(super) fn new(state: &AppState) -> Result<Self> {
-        let pump = HookInputPump::start({
+        let mut pump = HookInputPump::start({
             let state = state.clone();
             move |source| state.notify_input_capture_wake(source)
         })?;
+        enable_direct_input_lock_lease(&mut pump, DIRECT_INPUT_LOCK_LEASE)?;
 
         Ok(Self { pump })
     }
@@ -40,6 +41,23 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
         self.pump.set_lock_active(active)
     }
 
+    fn safety_unlock_generation(&self) -> u64 {
+        self.pump.safety_unlock_generation()
+    }
+
+    fn set_lock_active_if_safety_generation(
+        &mut self,
+        active: bool,
+        expected_generation: u64,
+    ) -> Result<bool> {
+        self.pump
+            .set_lock_active_if_safety_generation(active, expected_generation)
+    }
+
+    fn renew_lock_lease(&self) -> bool {
+        self.pump.renew_lock_lease()
+    }
+
     fn lock_supported(&self) -> bool {
         true
     }
@@ -55,4 +73,8 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
     fn take_dropped_event_count(&mut self) -> u64 {
         self.pump.take_dropped_event_count()
     }
+}
+
+fn enable_direct_input_lock_lease(pump: &mut HookInputPump, timeout: Duration) -> Result<()> {
+    pump.enable_lock_lease(timeout)
 }

@@ -310,8 +310,23 @@ pub(super) async fn capture_and_queue_outgoing_frames(
     // detach that wins this lock clears the relay before polling; a capture
     // pass that wins queues its batch before detach's final releases.
     let _capture_transition = state.input_capture_transition.lock().await;
+    let initial_relock_generation = backend.safety_unlock_generation();
     let mut capture_target = state.active_input_capture_target().await;
-    sync_local_input_lock(state, backend, capture_target.is_some()).await;
+    let mut escape_triggered = drain_capture_control_actions(
+        state,
+        backend,
+        &mut capture_target,
+        edge_switch_state,
+        initial_relock_generation,
+    )
+    .await;
+    sync_local_input_lock(
+        state,
+        backend,
+        capture_target.is_some(),
+        initial_relock_generation,
+    )
+    .await;
 
     if &capture_target != last_capture_target {
         if let Some(previous_target) = last_capture_target.as_deref() {
@@ -362,33 +377,15 @@ pub(super) async fn capture_and_queue_outgoing_frames(
         .virtual_screen_bounds()
         .or_else(local_virtual_screen_bounds);
 
-    let mut escape_triggered = false;
-    for action in backend.drain_control_actions() {
-        if !matches!(action, CaptureControlAction::EscapeUnlock) {
-            continue;
-        }
-
-        if capture_target.is_some() {
-            state.clear_input_capture_target().await;
-            record_local_input_runtime_event(
-                state,
-                "input_escape_triggered",
-                "double_ctrl",
-                "none",
-            )
-            .await;
-            edge_switch_state.last_direction = None;
-            edge_switch_state.x_pressure = 0;
-            edge_switch_state.y_pressure = 0;
-            edge_switch_state.suppress_until_instant = Some(
-                std::time::Instant::now()
-                    + Duration::from_millis(ESCAPE_EDGE_RECAPTURE_SUPPRESS_MS),
-            );
-            capture_target = None;
-            sync_local_input_lock(state, backend, false).await;
-            escape_triggered = true;
-        }
-    }
+    let final_relock_generation = backend.safety_unlock_generation();
+    escape_triggered |= drain_capture_control_actions(
+        state,
+        backend,
+        &mut capture_target,
+        edge_switch_state,
+        final_relock_generation,
+    )
+    .await;
 
     let pre_handoff_target = capture_target;
     if let Some(peer_id) = pre_handoff_target.as_deref()
@@ -419,7 +416,13 @@ pub(super) async fn capture_and_queue_outgoing_frames(
     }
 
     let post_handoff_target = state.active_input_capture_target().await;
-    sync_local_input_lock(state, backend, post_handoff_target.is_some()).await;
+    sync_local_input_lock(
+        state,
+        backend,
+        post_handoff_target.is_some(),
+        final_relock_generation,
+    )
+    .await;
 
     let (Some(peer_id), None) = (
         post_handoff_target.as_deref(),
@@ -448,19 +451,64 @@ pub(super) async fn capture_and_queue_outgoing_frames(
     }
 }
 
+async fn drain_capture_control_actions(
+    state: &AppState,
+    backend: &mut dyn InputCaptureBackend,
+    capture_target: &mut Option<String>,
+    edge_switch_state: &mut EdgeSwitchState,
+    relock_generation: u64,
+) -> bool {
+    let mut escape_triggered = false;
+    for action in backend.drain_control_actions() {
+        if !matches!(action, CaptureControlAction::EscapeUnlock) {
+            continue;
+        }
+
+        if capture_target.is_some() {
+            state.clear_input_capture_target().await;
+            record_local_input_runtime_event(
+                state,
+                "input_escape_triggered",
+                "double_ctrl",
+                "none",
+            )
+            .await;
+        }
+        edge_switch_state.last_direction = None;
+        edge_switch_state.x_pressure = 0;
+        edge_switch_state.y_pressure = 0;
+        edge_switch_state.suppress_until_instant = Some(
+            std::time::Instant::now() + Duration::from_millis(ESCAPE_EDGE_RECAPTURE_SUPPRESS_MS),
+        );
+        *capture_target = None;
+        sync_local_input_lock(state, backend, false, relock_generation).await;
+        escape_triggered = true;
+    }
+    escape_triggered
+}
+
 async fn sync_local_input_lock(
     state: &AppState,
     backend: &mut dyn InputCaptureBackend,
     should_lock: bool,
+    relock_generation: u64,
 ) {
     let supported = backend.lock_supported();
-    let active = match backend.set_lock_active(should_lock) {
+    let result = if should_lock {
+        backend.set_lock_active_if_safety_generation(true, relock_generation)
+    } else {
+        backend.set_lock_active(false)
+    };
+    let active = match result {
         Ok(active) => active,
         Err(error) => {
             warn!(error = ?error, should_lock, "failed to update local input lock state");
             false
         }
     };
+    if active {
+        let _ = backend.renew_lock_lease();
+    }
 
     let (last_active, last_supported) = state.input_lock_runtime().await;
     if last_active != active {
