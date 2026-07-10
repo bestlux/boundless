@@ -145,6 +145,13 @@ if (Test-Path -LiteralPath $outputPathResolved) {
 }
 
 $msiVersion = ConvertTo-MsiVersion -SemanticVersion $Version
+$installerProjectRoot = Split-Path -Parent $installerProject
+foreach ($intermediateDirectoryName in @("obj", "bin")) {
+    $intermediateDirectory = Join-Path $installerProjectRoot $intermediateDirectoryName
+    if (Test-Path -LiteralPath $intermediateDirectory) {
+        Remove-Item -LiteralPath $intermediateDirectory -Recurse -Force
+    }
+}
 $buildArguments = @(
     "build",
     $installerProject,
@@ -183,6 +190,7 @@ Copy-Item -LiteralPath (Join-Path $packageAssetRoot "Boundless-Install.ps1") -De
 Write-Host "package_root=$stageRoot"
 Write-Host "installer_path=$outputPathResolved"
 Write-Host "installer_helper_path=$installHelperOutputPath"
+Write-Host "recommended_install_entrypoint=$installHelperOutputPath"
 Write-Host "msi_version=$msiVersion"
 
 if (-not $KeepWorkingDirectory -and (Test-Path -LiteralPath $WorkingDirectory)) {

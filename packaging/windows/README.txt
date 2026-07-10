@@ -1,6 +1,16 @@
 Boundless for Windows
 =====================
 
+IMPORTANT: Do not double-click the raw MSI. The MSI intentionally fails closed
+without an explicit desktop-user SID. Run the matching
+Boundless-<version>-windows-x64-install.ps1 helper as described below; it captures
+the intended user's SID before UAC and verifies the installed service, API, and
+tray before reporting success.
+
+Quiet installs and helpers launched from an already-elevated shell verify the
+registered product, service, and API but deliberately leave tray launch to the
+intended desktop user's normal session.
+
 This installer deploys:
 - boundlesstray.exe
 - boundlessd.exe

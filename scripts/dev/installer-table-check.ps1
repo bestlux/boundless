@@ -140,6 +140,10 @@ Assert-LaunchConditionContains -Conditions $launchConditions -Needle 'BOUNDLESS_
 Assert-LaunchConditionContains -Conditions $launchConditions -Needle 'BOUNDLESS_ALLOWED_USER_SID >> "-"'
 Assert-LaunchConditionContains -Conditions $launchConditions -Needle 'BOUNDLESS_ALLOWED_USER_SID >< "n"'
 Assert-LaunchConditionContains -Conditions $launchConditions -Needle 'BOUNDLESS_ALLOWED_USER_SID >< "-S"'
+$launchDescriptions = Get-MsiColumnValues -Database $database -Sql "SELECT Description FROM LaunchCondition" -Column 1
+if (-not ($launchDescriptions | Where-Object { $_ -like "*Boundless-*-windows-x64-install.ps1*" } | Select-Object -First 1)) {
+    throw "LaunchCondition table did not direct raw-MSI users to the SID-selecting install helper."
+}
 
 Set-MsiSingleRow -Database $database -Sql "SELECT Name, DisplayName, ServiceType, StartType, ErrorControl, StartName, Arguments, Component_, Description FROM ServiceInstall WHERE ServiceInstall = 'BoundlessServiceInstall'" -ColumnCount 9 -Label "ServiceInstall" -VariableName "serviceInstall"
 Assert-Equals -Actual $serviceInstall[0] -Expected "BoundlessService" -Label "ServiceInstall.Name"
