@@ -44,6 +44,9 @@ pub struct InputBrokerExchangeObservations {
     pub dropped_event_count: u64,
     pub injected_frame_count: u32,
     pub inject_failure_count: u32,
+    pub raw_device_wheel_event_count: u32,
+    pub raw_system_wheel_event_count: u32,
+    pub hook_wheel_event_count: u32,
 }
 
 /// Identity of the caller as verified by the transport layer (named-pipe
@@ -197,6 +200,9 @@ impl AppState {
             return false;
         }
 
+        // Order an in-flight captured batch before the final release frame,
+        // or detach first so the capture pass observes an empty relay.
+        let _capture_transition = self.input_capture_transition.lock().await;
         let capture_target = self.input_capture_target().await;
         let detached = self.input_broker.detach(broker_token);
         if detached {
@@ -347,6 +353,26 @@ impl AppState {
                 detail: format!(
                     "injected_frames={} failed_frames={}",
                     observations.injected_frame_count, observations.inject_failure_count
+                ),
+                size_bytes: 0,
+            });
+        }
+
+        if let Some(mode) = self.input_broker.observe_wheel_source_counts(
+            observations.raw_device_wheel_event_count,
+            observations.raw_system_wheel_event_count,
+            observations.hook_wheel_event_count,
+        ) {
+            self.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: "local".to_string(),
+                kind: "input_broker_wheel_source_changed".to_string(),
+                peer_id: "none".to_string(),
+                detail: format!(
+                    "mode={mode} raw_device_events={} raw_system_events={} hook_events={}",
+                    observations.raw_device_wheel_event_count,
+                    observations.raw_system_wheel_event_count,
+                    observations.hook_wheel_event_count,
                 ),
                 size_bytes: 0,
             });

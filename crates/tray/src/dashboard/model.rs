@@ -85,6 +85,7 @@ pub(super) struct DashboardApp {
     pub(super) native_window_handle: Option<isize>,
     pub(super) activation_requested: Arc<AtomicBool>,
     pub(super) _single_instance_guard: Option<SingleInstanceGuard>,
+    pub(super) _input_broker_supervisor: Option<InputBrokerSupervisor>,
 
     pub(super) layout_grid: HashMap<(i32, i32), String>,
     pub(super) layout_unassigned: Vec<String>,
@@ -112,8 +113,13 @@ impl DashboardApp {
         cc: &eframe::CreationContext<'_>,
         app_ctx: Arc<AppContext>,
         mut single_instance_guard: SingleInstanceGuard,
-        input_broker_shutdown: InputBrokerShutdownSignal,
     ) -> Result<Self> {
+        // eframe has created winit's event loop before invoking the app
+        // creator. Registering Raw Input here ensures the input broker is the
+        // final owner after winit's generic mouse registration.
+        let input_broker_supervisor =
+            spawn_input_broker_supervisor(app_ctx.endpoint.clone())?;
+        let input_broker_shutdown = input_broker_supervisor.shutdown_signal();
         let (tx, rx) = mpsc::channel();
         let exit_requested_signal = Arc::new(AtomicBool::new(false));
         let native_window_handle = native_window_handle_from_creation_context(cc);
@@ -198,6 +204,7 @@ impl DashboardApp {
             native_window_handle,
             activation_requested,
             _single_instance_guard: Some(single_instance_guard),
+            _input_broker_supervisor: Some(input_broker_supervisor),
             layout_grid: HashMap::new(),
             layout_unassigned: Vec::new(),
             layout_initialized: false,

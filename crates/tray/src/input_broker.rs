@@ -405,6 +405,7 @@ async fn input_broker_exchange_loop(
             .cursor_position()
             .or_else(|| platform_windows::input::cursor_position().ok().flatten());
         let bounds = virtual_screen_bounds();
+        let wheel_sources = pump.take_wheel_source_counts();
 
         let reply = client
             .exchange_input_broker(InputBrokerExchangeRequest {
@@ -423,6 +424,9 @@ async fn input_broker_exchange_loop(
                 dropped_event_count: pump.take_dropped_event_count(),
                 injected_frame_count,
                 inject_failure_count,
+                raw_device_wheel_event_count: wheel_sources.raw_device,
+                raw_system_wheel_event_count: wheel_sources.raw_system,
+                hook_wheel_event_count: wheel_sources.hook,
             })
             .await?
             .into_inner();

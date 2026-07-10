@@ -14,9 +14,9 @@ use windows_sys::Win32::{
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
         Input::{
-            GetRawInputData, KeyboardAndMouse::GetDoubleClickTime, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
-            RAWINPUTDEVICE, RAWINPUTHEADER, RAWMOUSE, RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE,
-            RegisterRawInputDevices,
+            GetRawInputData, GetRegisteredRawInputDevices, KeyboardAndMouse::GetDoubleClickTime,
+            MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RAWMOUSE, RID_INPUT,
+            RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
         },
         WindowsAndMessaging::{
             CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW,
@@ -47,6 +47,7 @@ const RAW_INPUT_USAGE_PAGE_GENERIC: u16 = 0x01;
 const RAW_INPUT_USAGE_MOUSE: u16 = 0x02;
 const ESCAPE_DOUBLE_CTRL_MIN_WINDOW_MS: u64 = 800;
 const ESCAPE_DOUBLE_CTRL_MAX_WINDOW_MS: u64 = 1_200;
+const RAW_INPUT_REGISTRATION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const STATIC_WINDOW_CLASS_NAME: [u16; 7] = [83, 84, 65, 84, 73, 67, 0];
 const EMPTY_WINDOW_NAME: [u16; 1] = [0];
 
@@ -58,11 +59,36 @@ pub enum HookControlAction {
     LeaseExpiredUnlock,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelCaptureSource {
+    RawDevice,
+    RawSystem,
+    Hook,
+}
+
+impl WheelCaptureSource {
+    pub fn is_raw(self) -> bool {
+        matches!(self, Self::RawDevice | Self::RawSystem)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CapturedWheelEvent {
+    pub delta_x: i32,
+    pub delta_y: i32,
+    pub source: WheelCaptureSource,
+    /// Win32 message timestamp. Matching raw/hook copies share this value;
+    /// repeated physical wheel inputs remain distinct queue entries.
+    pub message_time_ms: u32,
+    pub observed_at: Instant,
+}
+
 #[derive(Debug, Clone)]
 pub enum HookCaptureEvent {
     MouseDelta { dx: i32, dy: i32 },
     MousePosition { x: i32, y: i32 },
     Input(InputEvent),
+    Wheel(CapturedWheelEvent),
 }
 
 pub struct CaptureRuntime {
@@ -72,6 +98,8 @@ pub struct CaptureRuntime {
     hook_thread: Option<JoinHandle<()>>,
     raw_input_thread_id: Option<u32>,
     raw_input_thread: Option<JoinHandle<()>>,
+    raw_input_hwnd: Option<isize>,
+    raw_input_registration_checked_at: Instant,
     raw_input_enabled: bool,
     lock_watchdog: Option<JoinHandle<()>>,
 }
@@ -85,8 +113,8 @@ struct CaptureRuntimeCore {
     escape_unlock_pending: AtomicU64,
     lease_expired_unlock_pending: AtomicU64,
     safety_unlock_generation: AtomicU64,
+    safety_unlock_in_progress: AtomicU64,
     lock_watchdog_stop: AtomicBool,
-    raw_input_mouse_enabled: AtomicBool,
     dropped_event_count: AtomicU64,
 }
 
@@ -139,8 +167,8 @@ impl CaptureRuntime {
             escape_unlock_pending: AtomicU64::new(0),
             lease_expired_unlock_pending: AtomicU64::new(0),
             safety_unlock_generation: AtomicU64::new(0),
+            safety_unlock_in_progress: AtomicU64::new(0),
             lock_watchdog_stop: AtomicBool::new(false),
-            raw_input_mouse_enabled: AtomicBool::new(false),
             dropped_event_count: AtomicU64::new(0),
         });
 
@@ -183,20 +211,17 @@ impl CaptureRuntime {
                 return Err(error);
             }
         };
-        let (raw_input_thread_id, raw_input_thread, raw_input_enabled) =
+        let (raw_input_thread_id, raw_input_thread, raw_input_hwnd, raw_input_enabled) =
             match spawn_raw_input_thread() {
-                Ok((thread_id, thread)) => (Some(thread_id), Some(thread), true),
+                Ok((thread_id, hwnd, thread)) => (Some(thread_id), Some(thread), Some(hwnd), true),
                 Err(error) => {
                     warn!(
                         error = ?error,
                         "raw input mouse capture unavailable; falling back to mouse hook position deltas"
                     );
-                    (None, None, false)
+                    (None, None, None, false)
                 }
             };
-        core.raw_input_mouse_enabled
-            .store(raw_input_enabled, Ordering::Release);
-
         Ok(Self {
             core,
             event_rx,
@@ -204,6 +229,8 @@ impl CaptureRuntime {
             hook_thread: Some(hook_thread),
             raw_input_thread_id,
             raw_input_thread,
+            raw_input_hwnd,
+            raw_input_registration_checked_at: Instant::now(),
             raw_input_enabled,
             lock_watchdog: None,
         })
@@ -224,8 +251,8 @@ impl CaptureRuntime {
                 escape_unlock_pending: AtomicU64::new(0),
                 lease_expired_unlock_pending: AtomicU64::new(0),
                 safety_unlock_generation: AtomicU64::new(0),
+                safety_unlock_in_progress: AtomicU64::new(0),
                 lock_watchdog_stop: AtomicBool::new(false),
-                raw_input_mouse_enabled: AtomicBool::new(raw_input_enabled),
                 dropped_event_count: AtomicU64::new(0),
             }),
             event_rx,
@@ -233,6 +260,8 @@ impl CaptureRuntime {
             hook_thread: None,
             raw_input_thread_id: None,
             raw_input_thread: None,
+            raw_input_hwnd: None,
+            raw_input_registration_checked_at: Instant::now(),
             raw_input_enabled,
             lock_watchdog: None,
         }
@@ -247,28 +276,51 @@ impl CaptureRuntime {
     }
 
     pub fn refresh(&mut self) -> bool {
-        if !self.raw_input_enabled {
-            return false;
-        }
-
         let finished = self
             .raw_input_thread
             .as_ref()
             .is_some_and(|thread| thread.is_finished());
-        if !finished {
-            return true;
+        if finished {
+            if let Some(thread) = self.raw_input_thread.take() {
+                let _ = thread.join();
+            }
+            self.raw_input_thread_id = None;
+            self.raw_input_hwnd = None;
+            self.raw_input_enabled = false;
+            warn!("raw input capture thread exited; using mouse hook position delta fallback");
+            return false;
         }
 
-        if let Some(thread) = self.raw_input_thread.take() {
-            let _ = thread.join();
+        let Some(hwnd) = self.raw_input_hwnd else {
+            // Test runtimes and platforms without a live raw-input thread keep
+            // their explicitly supplied backend state.
+            return self.raw_input_enabled;
+        };
+        if self.raw_input_registration_checked_at.elapsed() < RAW_INPUT_REGISTRATION_CHECK_INTERVAL
+        {
+            return self.raw_input_enabled;
         }
-        self.raw_input_thread_id = None;
-        self.raw_input_enabled = false;
-        self.core
-            .raw_input_mouse_enabled
-            .store(false, Ordering::Release);
-        warn!("raw input capture thread exited; using mouse hook position delta fallback");
-        false
+        self.raw_input_registration_checked_at = Instant::now();
+
+        let hwnd = hwnd as HWND;
+        match raw_input_mouse_registration_owned(hwnd) {
+            Ok(true) => self.raw_input_enabled = true,
+            Ok(false) => match register_raw_input_mouse_device(hwnd) {
+                Ok(()) => {
+                    self.raw_input_enabled = true;
+                    warn!("raw input mouse registration was replaced and has been reclaimed");
+                }
+                Err(error) => {
+                    self.raw_input_enabled = false;
+                    warn!(error = ?error, "failed to reclaim raw input mouse registration");
+                }
+            },
+            Err(error) => {
+                self.raw_input_enabled = false;
+                warn!(error = ?error, "failed to verify raw input mouse registration ownership");
+            }
+        }
+        self.raw_input_enabled
     }
 
     pub fn raw_input_enabled(&self) -> bool {
@@ -370,10 +422,8 @@ impl Drop for CaptureRuntime {
             let _ = thread.join();
         }
         self.raw_input_thread_id = None;
+        self.raw_input_hwnd = None;
         self.raw_input_enabled = false;
-        self.core
-            .raw_input_mouse_enabled
-            .store(false, Ordering::Release);
         post_thread_quit(self.hook_thread_id);
         if let Some(thread) = self.hook_thread.take() {
             let _ = thread.join();
@@ -460,11 +510,6 @@ pub fn send_hook_event(event: HookCaptureEvent, source: &'static str) {
 
 pub fn is_hook_lock_active() -> bool {
     with_active_capture_runtime(|core| core.lock_active.load(Ordering::Relaxed)).unwrap_or(false)
-}
-
-fn raw_input_mouse_enabled() -> bool {
-    with_active_capture_runtime(|core| core.raw_input_mouse_enabled.load(Ordering::Acquire))
-        .unwrap_or(false)
 }
 
 fn update_escape_state_for_key_at(
@@ -597,7 +642,22 @@ fn renew_hook_lock_lease_for(core: &CaptureRuntimeCore, now: Instant) -> bool {
 }
 
 fn force_unlock_for_arc(core: &CaptureRuntimeCore, cause: Option<SafetyUnlockCause>) -> bool {
+    force_unlock_for_arc_with_hook(core, cause, || {})
+}
+
+fn force_unlock_for_arc_with_hook(
+    core: &CaptureRuntimeCore,
+    cause: Option<SafetyUnlockCause>,
+    after_lock_release: impl FnOnce(),
+) -> bool {
+    // Publish the invalidation before touching the lock. The in-progress
+    // counter prevents a relock from sampling the new generation while this
+    // unlock is still cleaning up its local state.
+    core.safety_unlock_in_progress
+        .fetch_add(1, Ordering::SeqCst);
+    core.safety_unlock_generation.fetch_add(1, Ordering::SeqCst);
     let was_active = core.lock_active.swap(false, Ordering::SeqCst);
+    after_lock_release();
 
     if let Ok(mut state) = core.runtime_state.lock() {
         state.left_ctrl_down = false;
@@ -618,9 +678,6 @@ fn force_unlock_for_arc(core: &CaptureRuntimeCore, cause: Option<SafetyUnlockCau
         }
         _ => {}
     }
-    // Publish this last. A relock guard that missed the pending action must
-    // observe the generation change in its post-store check and fail open.
-    core.safety_unlock_generation.fetch_add(1, Ordering::SeqCst);
     if cause.is_some()
         && was_active
         && let Ok(notifier) = core.wake_notifier.lock()
@@ -628,6 +685,8 @@ fn force_unlock_for_arc(core: &CaptureRuntimeCore, cause: Option<SafetyUnlockCau
     {
         notifier("input_safety_unlock");
     }
+    core.safety_unlock_in_progress
+        .fetch_sub(1, Ordering::SeqCst);
     was_active
 }
 
@@ -640,13 +699,17 @@ fn set_hook_lock_active_if_generation_for(
     if !active {
         return set_hook_lock_active_for(core, false);
     }
-    if core.safety_unlock_generation.load(Ordering::SeqCst) != expected_generation {
+    if core.safety_unlock_generation.load(Ordering::SeqCst) != expected_generation
+        || core.safety_unlock_in_progress.load(Ordering::SeqCst) != 0
+    {
         return Ok(false);
     }
 
     set_hook_lock_active_for(core, true)?;
     after_store();
-    if core.safety_unlock_generation.load(Ordering::SeqCst) != expected_generation {
+    if core.safety_unlock_generation.load(Ordering::SeqCst) != expected_generation
+        || core.safety_unlock_in_progress.load(Ordering::SeqCst) != 0
+    {
         let _ = set_hook_lock_active_for(core, false);
         return Ok(false);
     }
@@ -773,8 +836,8 @@ pub fn post_thread_quit(thread_id: u32) {
     }
 }
 
-pub fn spawn_raw_input_thread() -> Result<(u32, JoinHandle<()>)> {
-    let (startup_tx, startup_rx) = mpsc::channel::<Result<u32>>();
+pub fn spawn_raw_input_thread() -> Result<(u32, isize, JoinHandle<()>)> {
+    let (startup_tx, startup_rx) = mpsc::channel::<Result<(u32, isize)>>();
     let thread = thread::spawn(move || {
         let thread_id = unsafe { GetCurrentThreadId() };
         let hwnd = match create_raw_input_window() {
@@ -793,7 +856,7 @@ pub fn spawn_raw_input_thread() -> Result<(u32, JoinHandle<()>)> {
             return;
         }
 
-        let _ = startup_tx.send(Ok(thread_id));
+        let _ = startup_tx.send(Ok((thread_id, hwnd as isize)));
         unsafe {
             if let Err(error) = run_raw_input_message_loop() {
                 warn!(error = ?error, "raw input message loop exited with error");
@@ -802,8 +865,8 @@ pub fn spawn_raw_input_thread() -> Result<(u32, JoinHandle<()>)> {
         }
     });
 
-    let thread_id = match startup_rx.recv() {
-        Ok(Ok(thread_id)) => thread_id,
+    let (thread_id, hwnd) = match startup_rx.recv() {
+        Ok(Ok(startup)) => startup,
         Ok(Err(error)) => {
             let _ = thread.join();
             return Err(error);
@@ -814,7 +877,7 @@ pub fn spawn_raw_input_thread() -> Result<(u32, JoinHandle<()>)> {
         }
     };
 
-    Ok((thread_id, thread))
+    Ok((thread_id, hwnd, thread))
 }
 
 fn create_raw_input_window() -> Result<HWND> {
@@ -861,6 +924,50 @@ fn register_raw_input_mouse_device(hwnd: HWND) -> Result<()> {
     Ok(())
 }
 
+fn raw_input_mouse_target_owned(devices: &[RAWINPUTDEVICE], hwnd: HWND) -> bool {
+    devices.iter().any(|device| {
+        device.usUsagePage == RAW_INPUT_USAGE_PAGE_GENERIC
+            && device.usUsage == RAW_INPUT_USAGE_MOUSE
+            && device.hwndTarget == hwnd
+    })
+}
+
+fn registered_raw_input_devices() -> Result<Vec<RAWINPUTDEVICE>> {
+    let device_size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
+    let mut count = 0u32;
+    let result = unsafe {
+        GetRegisteredRawInputDevices(std::ptr::null_mut(), &mut count as *mut u32, device_size)
+    };
+    if result == u32::MAX {
+        return Err(std::io::Error::last_os_error())
+            .context("GetRegisteredRawInputDevices query count");
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let empty = RAWINPUTDEVICE {
+        usUsagePage: 0,
+        usUsage: 0,
+        dwFlags: 0,
+        hwndTarget: std::ptr::null_mut(),
+    };
+    let mut devices = vec![empty; count as usize];
+    let result = unsafe {
+        GetRegisteredRawInputDevices(devices.as_mut_ptr(), &mut count as *mut u32, device_size)
+    };
+    if result == u32::MAX {
+        return Err(std::io::Error::last_os_error())
+            .context("GetRegisteredRawInputDevices read registrations");
+    }
+    devices.truncate((result as usize).min(devices.len()));
+    Ok(devices)
+}
+
+fn raw_input_mouse_registration_owned(hwnd: HWND) -> Result<bool> {
+    registered_raw_input_devices().map(|devices| raw_input_mouse_target_owned(&devices, hwnd))
+}
+
 unsafe fn run_raw_input_message_loop() -> Result<()> {
     let mut warned_once = false;
     let mut msg = MSG::default();
@@ -875,7 +982,7 @@ unsafe fn run_raw_input_message_loop() -> Result<()> {
         }
 
         if msg.message == WM_INPUT {
-            match process_raw_input_message(msg.lParam) {
+            match process_raw_input_message(msg.lParam, msg.time) {
                 Ok(()) => warned_once = false,
                 Err(error) => {
                     if !warned_once {
@@ -895,7 +1002,7 @@ unsafe fn run_raw_input_message_loop() -> Result<()> {
     Ok(())
 }
 
-fn process_raw_input_message(lparam: LPARAM) -> Result<()> {
+fn process_raw_input_message(lparam: LPARAM, message_time_ms: u32) -> Result<()> {
     if !is_hook_lock_active() {
         return Ok(());
     }
@@ -945,8 +1052,20 @@ fn process_raw_input_message(lparam: LPARAM) -> Result<()> {
     if let Some((dx, dy)) = raw_mouse_relative_delta(&mouse) {
         send_hook_event(HookCaptureEvent::MouseDelta { dx, dy }, "raw_input");
     }
+    let source = raw_wheel_source_for_device(raw.header.hDevice);
     for event in raw_mouse_wheel_events(&mouse) {
-        send_hook_event(HookCaptureEvent::Input(event), "raw_input");
+        if let InputEvent::MouseWheel { delta_x, delta_y } = event {
+            send_hook_event(
+                HookCaptureEvent::Wheel(CapturedWheelEvent {
+                    delta_x,
+                    delta_y,
+                    source,
+                    message_time_ms,
+                    observed_at: Instant::now(),
+                }),
+                "raw_input",
+            );
+        }
     }
 
     Ok(())
@@ -990,8 +1109,12 @@ pub fn raw_mouse_wheel_events(mouse: &RAWMOUSE) -> Vec<InputEvent> {
     events
 }
 
-fn should_capture_low_level_wheel(raw_input_enabled: bool) -> bool {
-    !raw_input_enabled
+fn raw_wheel_source_for_device(device: *mut core::ffi::c_void) -> WheelCaptureSource {
+    if device.is_null() {
+        WheelCaptureSource::RawSystem
+    } else {
+        WheelCaptureSource::RawDevice
+    }
 }
 
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1107,24 +1230,26 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                         );
                     }
                 }
-                WM_MOUSEWHEEL if should_capture_low_level_wheel(raw_input_mouse_enabled()) => {
-                    send_hook_event(
-                        HookCaptureEvent::Input(InputEvent::MouseWheel {
-                            delta_x: 0,
-                            delta_y: crate::input::signed_high_word(mouse.mouseData),
-                        }),
-                        "mouse_hook",
-                    )
-                }
-                WM_MOUSEHWHEEL if should_capture_low_level_wheel(raw_input_mouse_enabled()) => {
-                    send_hook_event(
-                        HookCaptureEvent::Input(InputEvent::MouseWheel {
-                            delta_x: crate::input::signed_high_word(mouse.mouseData),
-                            delta_y: 0,
-                        }),
-                        "mouse_hook",
-                    )
-                }
+                WM_MOUSEWHEEL => send_hook_event(
+                    HookCaptureEvent::Wheel(CapturedWheelEvent {
+                        delta_x: 0,
+                        delta_y: crate::input::signed_high_word(mouse.mouseData),
+                        source: WheelCaptureSource::Hook,
+                        message_time_ms: mouse.time,
+                        observed_at: Instant::now(),
+                    }),
+                    "mouse_hook",
+                ),
+                WM_MOUSEHWHEEL => send_hook_event(
+                    HookCaptureEvent::Wheel(CapturedWheelEvent {
+                        delta_x: crate::input::signed_high_word(mouse.mouseData),
+                        delta_y: 0,
+                        source: WheelCaptureSource::Hook,
+                        message_time_ms: mouse.time,
+                        observed_at: Instant::now(),
+                    }),
+                    "mouse_hook",
+                ),
                 _ => {}
             }
         }
@@ -1159,8 +1284,8 @@ mod tests {
             escape_unlock_pending: AtomicU64::new(0),
             lease_expired_unlock_pending: AtomicU64::new(0),
             safety_unlock_generation: AtomicU64::new(0),
+            safety_unlock_in_progress: AtomicU64::new(0),
             lock_watchdog_stop: AtomicBool::new(false),
-            raw_input_mouse_enabled: AtomicBool::new(false),
             dropped_event_count: AtomicU64::new(0),
         })
     }
@@ -1247,12 +1372,32 @@ mod tests {
     }
 
     #[test]
-    fn low_level_wheel_is_used_only_when_raw_input_is_unavailable() {
-        assert!(should_capture_low_level_wheel(false));
-        assert!(
-            !should_capture_low_level_wheel(true),
-            "the hook copy must be suppressed when Raw Input owns wheel capture"
-        );
+    fn raw_input_ownership_requires_our_mouse_target() {
+        let our_hwnd = 1usize as HWND;
+        let other_hwnd = 2usize as HWND;
+        let registrations = [
+            RAWINPUTDEVICE {
+                usUsagePage: RAW_INPUT_USAGE_PAGE_GENERIC,
+                usUsage: RAW_INPUT_USAGE_MOUSE,
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: other_hwnd,
+            },
+            RAWINPUTDEVICE {
+                usUsagePage: RAW_INPUT_USAGE_PAGE_GENERIC,
+                usUsage: 0x06,
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: our_hwnd,
+            },
+        ];
+        assert!(!raw_input_mouse_target_owned(&registrations, our_hwnd));
+
+        let registrations = [RAWINPUTDEVICE {
+            usUsagePage: RAW_INPUT_USAGE_PAGE_GENERIC,
+            usUsage: RAW_INPUT_USAGE_MOUSE,
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: our_hwnd,
+        }];
+        assert!(raw_input_mouse_target_owned(&registrations, our_hwnd));
     }
 
     #[test]
@@ -1456,6 +1601,33 @@ mod tests {
             .expect("guarded relock"),
             "an unlock racing after the store must win the post-store guard"
         );
+        assert!(!core.lock_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn relock_is_rejected_while_unlock_cleanup_is_in_progress() {
+        let core = test_runtime_core();
+        set_hook_lock_active_for(&core, true).expect("initial lock");
+        let expected_generation = core.safety_unlock_generation.load(Ordering::SeqCst);
+
+        assert!(force_unlock_for_arc_with_hook(
+            &core,
+            Some(SafetyUnlockCause::Escape),
+            || {
+                assert!(
+                    !set_hook_lock_active_if_generation_for(
+                        &core,
+                        true,
+                        expected_generation,
+                        || {}
+                    )
+                    .expect("guarded relock"),
+                    "a relock racing between lock release and unlock cleanup must fail open"
+                );
+                assert!(!core.lock_active.load(Ordering::Acquire));
+            }
+        ));
+        assert_eq!(core.safety_unlock_in_progress.load(Ordering::SeqCst), 0);
         assert!(!core.lock_active.load(Ordering::Acquire));
     }
 

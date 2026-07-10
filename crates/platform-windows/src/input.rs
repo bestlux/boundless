@@ -17,7 +17,7 @@ pub use hook_capture::{
     raw_mouse_wheel_events, release_active_hook_lock, virtual_key_for_mouse_button,
 };
 #[cfg(windows)]
-pub use hook_pump::HookInputPump;
+pub use hook_pump::{HookInputPump, WheelSourceCounts};
 
 #[cfg(windows)]
 use windows_sys::Win32::{
@@ -287,5 +287,29 @@ pub fn input_event_kind(event: &InputEvent) -> &'static str {
         InputEvent::MouseButton { .. } => "mouse_button",
         InputEvent::MouseWheel { .. } => "mouse_wheel",
         InputEvent::Key { .. } => "key",
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signed_high_resolution_wheel_deltas_reach_send_input_records() {
+        for delta in [1, -1, 40, -40, 120, -120] {
+            let records = input_records_for_event(&InputEvent::MouseWheel {
+                delta_x: delta,
+                delta_y: delta,
+            });
+            assert_eq!(records.len(), 2);
+
+            let vertical = unsafe { records[0].Anonymous.mi };
+            assert_eq!(vertical.mouseData as i32, delta);
+            assert_eq!(vertical.dwFlags, MOUSEEVENTF_WHEEL);
+
+            let horizontal = unsafe { records[1].Anonymous.mi };
+            assert_eq!(horizontal.mouseData as i32, delta);
+            assert_eq!(horizontal.dwFlags, MOUSEEVENTF_HWHEEL);
+        }
     }
 }
