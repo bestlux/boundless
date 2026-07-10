@@ -157,9 +157,29 @@ impl AppState {
             };
         }
 
+        // Serialize replacement with broker exchanges and the capture pass so
+        // every pre-replacement Down is ordered before one authoritative Up.
+        let _capture_transition = self.input_capture_transition.lock().await;
         let broker_token = uuid::Uuid::new_v4().to_string();
         let replaced = self.input_broker.attachment().is_some();
+        let capture_target = self.input_capture_target().await;
+        let mut release_event_count = 0usize;
         if replaced {
+            let release_events = self.input_broker.drain_release_events();
+            release_event_count = release_events.len();
+            if let Some(peer_id) = capture_target.as_deref()
+                && !release_events.is_empty()
+                && let Err(error) = self.queue_input_events(peer_id, release_events).await
+            {
+                self.record_transport_event(TransportEventRecord {
+                    timestamp: Utc::now(),
+                    direction: "local".to_string(),
+                    kind: "input_broker_release_queue_failed".to_string(),
+                    peer_id: peer_id.to_string(),
+                    detail: format!("reason=replacement_attach error={error:#}"),
+                    size_bytes: release_event_count as u64,
+                });
+            }
             self.requeue_broker_clipboard_inflight().await;
         }
         self.input_broker.attach(InputBrokerAttachment {
@@ -172,7 +192,7 @@ impl AppState {
             kind: "input_broker_attached".to_string(),
             peer_id: "none".to_string(),
             detail: format!(
-                "client_session_id={} lock_supported={lock_supported} replaced_previous={replaced} broker_version={broker_version}",
+                "client_session_id={} lock_supported={lock_supported} replaced_previous={replaced} release_events={release_event_count} broker_version={broker_version}",
                 verified_client
                     .as_ref()
                     .and_then(|client| client.session_id)
@@ -332,6 +352,7 @@ impl AppState {
                 ..Default::default()
             };
         }
+        let _capture_transition = self.input_capture_transition.lock().await;
         if !self
             .input_broker
             .validate_and_touch(broker_token, Instant::now())
