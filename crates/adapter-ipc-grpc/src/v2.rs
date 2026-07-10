@@ -1358,17 +1358,21 @@ mod tests {
         let mapped = map_transport_event(TransportEventSnapshot {
             timestamp: "2026-07-10T00:00:00Z".to_string(),
             direction: "incoming".to_string(),
-            kind: "clipboard_text".to_string(),
+            kind: "clipboard_image_rejected".to_string(),
             peer_id: "peer-a".to_string(),
             detail: format!(
-                "payload_type=text disposition=received hash=abc preview={SECRET} {SECRET}"
+                "payload_type=bmp disposition=rejected reason=hash_mismatch expected={SECRET} actual={SECRET}"
             ),
             size_bytes: 32,
         });
 
-        assert_eq!(mapped.detail, "payload_type=text disposition=received");
+        assert_eq!(
+            mapped.detail,
+            "payload_type=bmp disposition=rejected reason=hash_mismatch"
+        );
         assert!(!mapped.detail.contains(SECRET));
-        assert!(!mapped.detail.contains("hash="));
+        assert!(!mapped.detail.contains("expected="));
+        assert!(!mapped.detail.contains("actual="));
     }
 
     #[test]

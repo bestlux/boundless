@@ -117,6 +117,13 @@ fn sanitize_clipboard_metadata_token(token: &str) -> Option<String> {
                 | "replay"
                 | "apply_failed"
                 | "unmatched"
+                | "too_many_transfers"
+                | "duplicate_transfer"
+                | "payload_too_large"
+                | "size_overflow"
+                | "chunk_exceeds_total"
+                | "size_mismatch"
+                | "hash_mismatch"
                 | "unknown"
         ),
         "applied" | "metadata_only" => matches!(value, "true" | "false"),
@@ -309,17 +316,18 @@ mod tests {
     fn clipboard_event_detail_allows_only_explicit_metadata() {
         const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_7b15fce0";
         let detail = format!(
-            "payload_type=text disposition=received applied=true hash=abc preview={SECRET} {SECRET}"
+            "payload_type=bmp disposition=rejected reason=hash_mismatch applied=false expected={SECRET} actual={SECRET}"
         );
 
         let sanitized = sanitize_clipboard_event_detail("clipboard_text", &detail);
 
         assert_eq!(
             sanitized,
-            "payload_type=text disposition=received applied=true"
+            "payload_type=bmp disposition=rejected reason=hash_mismatch applied=false"
         );
         assert!(!sanitized.contains(SECRET));
-        assert!(!sanitized.contains("hash="));
+        assert!(!sanitized.contains("expected="));
+        assert!(!sanitized.contains("actual="));
     }
 
     #[test]

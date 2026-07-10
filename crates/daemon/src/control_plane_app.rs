@@ -1433,6 +1433,7 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostics_dump_writes_redacted_json_bundle() {
+        const CLIPBOARD_HASH_SENTINEL: &str = "BOUNDLESS_SECRET_SENTINEL_clipboard_hash_529c748a";
         let root = std::env::temp_dir().join(format!(
             "boundless-control-plane-diagnostics-bundle-test-{}",
             uuid::Uuid::new_v4()
@@ -1465,6 +1466,16 @@ mod tests {
         });
         state.record_transport_event(crate::state::TransportEventRecord {
             timestamp: chrono::Utc::now(),
+            direction: "incoming".to_string(),
+            kind: "clipboard_image_rejected".to_string(),
+            peer_id: "peer-alpha".to_string(),
+            detail: format!(
+                "payload_type=bmp disposition=rejected reason=hash_mismatch expected={CLIPBOARD_HASH_SENTINEL} actual={CLIPBOARD_HASH_SENTINEL}"
+            ),
+            size_bytes: 64,
+        });
+        state.record_transport_event(crate::state::TransportEventRecord {
+            timestamp: chrono::Utc::now(),
             direction: "outgoing".to_string(),
             kind: "file_transfer_started".to_string(),
             peer_id: "peer-alpha".to_string(),
@@ -1484,6 +1495,11 @@ mod tests {
         );
 
         let app = DaemonControlPlaneApp::new(state);
+        let raw_events = app.transport_events().await.expect("raw transport events");
+        let raw_rendered = format!("{raw_events:?}");
+        assert!(!raw_rendered.contains(CLIPBOARD_HASH_SENTINEL));
+        assert!(raw_rendered.contains("reason=hash_mismatch"));
+
         let reply = app
             .dump_diagnostics(DiagnosticsDumpCommand {
                 output_path: Some(output_dir.to_string_lossy().to_string()),
@@ -1507,6 +1523,8 @@ mod tests {
         assert!(content.contains(r#""shutdown": "abort_on_daemon_shutdown""#));
         assert!(!content.contains("hunter2"));
         assert!(!content.contains("abc123"));
+        assert!(!content.contains(CLIPBOARD_HASH_SENTINEL));
+        assert!(content.contains("reason=hash_mismatch"));
         assert!(!content.contains("peer-alpha"));
         assert!(!content.contains(&layout_peer_id));
         assert!(!content.contains("Office Display"));

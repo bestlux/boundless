@@ -2542,8 +2542,10 @@ mod tests {
 
     #[tokio::test]
     async fn chunked_clipboard_image_transfer_rejects_hash_mismatch() {
+        const PEER_HASH_SENTINEL: &str = "BOUNDLESS_SECRET_SENTINEL_peer_hash_91f6310b";
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         let image = minimal_bmp_payload();
+        let actual_hash = payload_hash_hex(&ClipboardPayload::Image(image.clone()));
         let mut inbound_transfers = HashMap::new();
 
         handle_clipboard_image_start(
@@ -2553,7 +2555,7 @@ mod tests {
             peer_id.clone(),
             "clip-bad".to_string(),
             image.len() as u64,
-            "deadbeef".to_string(),
+            PEER_HASH_SENTINEL.to_string(),
             &mut inbound_transfers,
         )
         .await
@@ -2574,13 +2576,20 @@ mod tests {
             state.dequeue_remote_clipboard_payload().await.is_none(),
             "hash-mismatched chunked clipboard image should be rejected"
         );
-        assert!(
-            state.transport_events().await.into_iter().any(|event| {
-                event.kind == "transport_transfer_rejected"
-                    && event.detail.contains("reason=hash_mismatch")
-            }),
-            "hash mismatch should be recorded as a transport rejection"
+        let events = state.transport_events().await;
+        let rejection = events
+            .iter()
+            .find(|event| event.kind == "clipboard_image_rejected")
+            .expect("hash mismatch should be recorded as clipboard metadata");
+        assert_eq!(
+            rejection.detail,
+            "payload_type=bmp disposition=rejected reason=hash_mismatch"
         );
+        let rendered = format!("{events:?}");
+        assert!(!rendered.contains(PEER_HASH_SENTINEL));
+        assert!(!rendered.contains(&actual_hash));
+        assert!(!rendered.contains("expected="));
+        assert!(!rendered.contains("actual="));
 
         let _ = std::fs::remove_dir_all(root);
     }

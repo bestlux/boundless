@@ -2845,13 +2845,18 @@ mod tests {
     fn clipboard_event_cli_detail_fails_closed() {
         const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_77c3c7ea";
         let event = test_transport_event(
-            "clipboard_text",
-            &format!("payload_type=text disposition=sent preview={SECRET} {SECRET}"),
+            "clipboard_image_rejected",
+            &format!(
+                "payload_type=bmp disposition=rejected reason=hash_mismatch expected={SECRET} actual={SECRET}"
+            ),
         );
 
         let detail = protected_transport_event_detail(&event);
 
-        assert_eq!(detail, "payload_type=text disposition=sent");
+        assert_eq!(
+            detail,
+            "payload_type=bmp disposition=rejected reason=hash_mismatch"
+        );
         assert!(!detail.contains(SECRET));
     }
 
