@@ -61,6 +61,7 @@ pub const HOOK_EVENT_QUEUE_CAP: usize = 4096;
 pub enum HookControlAction {
     EscapeUnlock,
     LeaseExpiredUnlock,
+    DetectorUnavailableUnlock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,14 +112,15 @@ pub struct CaptureRuntime {
 struct CaptureRuntimeCore {
     event_tx: Mutex<Option<SyncSender<HookCaptureEvent>>>,
     wake_notifier: Mutex<Option<HookWakeNotifier>>,
-    runtime_state: Mutex<HookRuntimeState>,
+    escape_detector_state: Mutex<EscapeDetectorState>,
+    keyboard_state: Mutex<KeyboardRuntimeState>,
     lock_lease: Mutex<HookLockLease>,
     lock_active: AtomicBool,
-    raw_keyboard_escape_enabled: AtomicBool,
     keyboard_hook_degraded: AtomicBool,
     last_keyboard_hook_observation: Mutex<Option<KeyboardHookObservation>>,
     escape_unlock_pending: AtomicU64,
     lease_expired_unlock_pending: AtomicU64,
+    detector_unavailable_unlock_pending: AtomicU64,
     safety_unlock_generation: AtomicU64,
     safety_unlock_in_progress: AtomicU64,
     lock_watchdog_stop: AtomicBool,
@@ -131,6 +133,10 @@ struct HookRuntimeState {
     right_ctrl_down_at: Option<Instant>,
     current_ctrl_tap_valid: bool,
     last_ctrl_tap_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct KeyboardRuntimeState {
     num_lock_on: bool,
     num_lock_down: bool,
 }
@@ -156,6 +162,21 @@ impl EscapeDetectorSource {
     }
 }
 
+#[derive(Debug)]
+struct EscapeDetectorState {
+    source: EscapeDetectorSource,
+    gesture: HookRuntimeState,
+}
+
+impl EscapeDetectorState {
+    fn new(source: EscapeDetectorSource) -> Self {
+        Self {
+            source,
+            gesture: HookRuntimeState::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KeyboardHookObservation {
     message_time_ms: u32,
@@ -166,6 +187,7 @@ struct KeyboardHookObservation {
 enum SafetyUnlockCause {
     Escape,
     LeaseExpired,
+    DetectorUnavailable,
 }
 
 type HookWakeNotifier = Arc<dyn Fn(&'static str) + Send + Sync + 'static>;
@@ -192,17 +214,20 @@ impl CaptureRuntime {
         let core = Arc::new(CaptureRuntimeCore {
             event_tx: Mutex::new(Some(event_tx)),
             wake_notifier: Mutex::new(Some(Arc::new(wake_notifier))),
-            runtime_state: Mutex::new(HookRuntimeState {
+            escape_detector_state: Mutex::new(EscapeDetectorState::new(
+                EscapeDetectorSource::KeyboardHook,
+            )),
+            keyboard_state: Mutex::new(KeyboardRuntimeState {
                 num_lock_on: is_num_lock_on(),
-                ..HookRuntimeState::default()
+                ..KeyboardRuntimeState::default()
             }),
             lock_lease: Mutex::new(HookLockLease::default()),
             lock_active: AtomicBool::new(false),
-            raw_keyboard_escape_enabled: AtomicBool::new(false),
             keyboard_hook_degraded: AtomicBool::new(false),
             last_keyboard_hook_observation: Mutex::new(None),
             escape_unlock_pending: AtomicU64::new(0),
             lease_expired_unlock_pending: AtomicU64::new(0),
+            detector_unavailable_unlock_pending: AtomicU64::new(0),
             safety_unlock_generation: AtomicU64::new(0),
             safety_unlock_in_progress: AtomicU64::new(0),
             lock_watchdog_stop: AtomicBool::new(false),
@@ -285,14 +310,19 @@ impl CaptureRuntime {
             core: Arc::new(CaptureRuntimeCore {
                 event_tx: Mutex::new(None),
                 wake_notifier: Mutex::new(None),
-                runtime_state: Mutex::new(HookRuntimeState::default()),
+                escape_detector_state: Mutex::new(EscapeDetectorState::new(if raw_input_enabled {
+                    EscapeDetectorSource::RawKeyboard
+                } else {
+                    EscapeDetectorSource::KeyboardHook
+                })),
+                keyboard_state: Mutex::new(KeyboardRuntimeState::default()),
                 lock_lease: Mutex::new(HookLockLease::default()),
                 lock_active: AtomicBool::new(false),
-                raw_keyboard_escape_enabled: AtomicBool::new(raw_input_enabled),
                 keyboard_hook_degraded: AtomicBool::new(false),
                 last_keyboard_hook_observation: Mutex::new(None),
                 escape_unlock_pending: AtomicU64::new(0),
                 lease_expired_unlock_pending: AtomicU64::new(0),
+                detector_unavailable_unlock_pending: AtomicU64::new(0),
                 safety_unlock_generation: AtomicU64::new(0),
                 safety_unlock_in_progress: AtomicU64::new(0),
                 lock_watchdog_stop: AtomicBool::new(false),
@@ -441,13 +471,21 @@ impl CaptureRuntime {
             .core
             .lease_expired_unlock_pending
             .swap(0, Ordering::AcqRel);
+        let detector_unavailable_count = self
+            .core
+            .detector_unavailable_unlock_pending
+            .swap(0, Ordering::AcqRel);
         let mut actions = Vec::with_capacity(
             escape_count
                 .saturating_add(lease_expired_count)
+                .saturating_add(detector_unavailable_count)
                 .min(usize::MAX as u64) as usize,
         );
         actions.extend((0..escape_count).map(|_| HookControlAction::EscapeUnlock));
         actions.extend((0..lease_expired_count).map(|_| HookControlAction::LeaseExpiredUnlock));
+        actions.extend(
+            (0..detector_unavailable_count).map(|_| HookControlAction::DetectorUnavailableUnlock),
+        );
         actions
     }
 
@@ -567,36 +605,56 @@ pub fn is_hook_lock_active() -> bool {
     with_active_capture_runtime(|core| core.lock_active.load(Ordering::Relaxed)).unwrap_or(false)
 }
 
-fn escape_detector_source(runtime: &CaptureRuntimeCore) -> EscapeDetectorSource {
-    if runtime.raw_keyboard_escape_enabled.load(Ordering::Acquire) {
-        EscapeDetectorSource::RawKeyboard
-    } else {
-        EscapeDetectorSource::KeyboardHook
+fn escape_detector_source(runtime: &CaptureRuntimeCore) -> Option<EscapeDetectorSource> {
+    runtime
+        .escape_detector_state
+        .lock()
+        .ok()
+        .map(|state| state.source)
+}
+
+fn escape_detector_available(runtime: &CaptureRuntimeCore) -> bool {
+    match escape_detector_source(runtime) {
+        Some(EscapeDetectorSource::RawKeyboard) => true,
+        Some(EscapeDetectorSource::KeyboardHook) => {
+            !runtime.keyboard_hook_degraded.load(Ordering::Acquire)
+        }
+        None => false,
+    }
+}
+
+fn fail_open_if_escape_detector_unavailable(runtime: &CaptureRuntimeCore) {
+    if !escape_detector_available(runtime) && runtime.lock_active.load(Ordering::Acquire) {
+        let _ = force_unlock_for_arc(runtime, Some(SafetyUnlockCause::DetectorUnavailable));
     }
 }
 
 fn set_raw_keyboard_escape_enabled_for(runtime: &CaptureRuntimeCore, enabled: bool) {
-    let previous = runtime
-        .raw_keyboard_escape_enabled
-        .swap(enabled, Ordering::AcqRel);
-    if previous == enabled {
-        return;
+    let next_source = if enabled {
+        EscapeDetectorSource::RawKeyboard
+    } else {
+        EscapeDetectorSource::KeyboardHook
+    };
+    let changed = match runtime.escape_detector_state.lock() {
+        Ok(mut state) if state.source != next_source => {
+            state.source = next_source;
+            state.gesture = HookRuntimeState::default();
+            true
+        }
+        Ok(_) => false,
+        Err(_) => true,
+    };
+    if changed {
+        if let Ok(mut observation) = runtime.last_keyboard_hook_observation.lock() {
+            *observation = None;
+        }
+        eprintln!(
+            "boundless_input_escape_detector source={}",
+            next_source.label()
+        );
     }
 
-    if let Ok(mut state) = runtime.runtime_state.lock() {
-        *state = HookRuntimeState::default();
-    }
-    if let Ok(mut observation) = runtime.last_keyboard_hook_observation.lock() {
-        *observation = None;
-    }
-    if !enabled {
-        runtime
-            .keyboard_hook_degraded
-            .store(false, Ordering::Release);
-    }
-
-    let source = escape_detector_source(runtime).label();
-    eprintln!("boundless_input_escape_detector source={source}");
+    fail_open_if_escape_detector_unavailable(runtime);
 }
 
 fn record_keyboard_hook_observation(
@@ -639,6 +697,7 @@ fn observe_raw_keyboard_hook_health(
             "low-level keyboard hook missed physical Control input; Raw Input remains authoritative for emergency unlock"
         );
     }
+    fail_open_if_escape_detector_unavailable(runtime);
 }
 
 fn is_control_virtual_key(vk_code: u16) -> bool {
@@ -647,21 +706,29 @@ fn is_control_virtual_key(vk_code: u16) -> bool {
 
 fn update_escape_state_for_key_at(
     runtime: &CaptureRuntimeCore,
+    source: EscapeDetectorSource,
     vk_code: u16,
     key_state: KeyState,
     now: Instant,
     double_tap_window: Duration,
 ) -> bool {
-    if !is_control_virtual_key(vk_code) {
-        return false;
-    }
     if !runtime.lock_active.load(Ordering::Relaxed) {
         return false;
     }
-    let mut state = match runtime.runtime_state.lock() {
-        Ok(state) => state,
+    let mut detector = match runtime.escape_detector_state.lock() {
+        Ok(state) if state.source == source => state,
+        Ok(_) => return false,
         Err(_) => return false,
     };
+    let state = &mut detector.gesture;
+
+    if !is_control_virtual_key(vk_code) {
+        if matches!(key_state, KeyState::Down) {
+            state.current_ctrl_tap_valid = false;
+            state.last_ctrl_tap_at = None;
+        }
+        return false;
+    }
 
     if state
         .left_ctrl_down_at
@@ -698,13 +765,11 @@ fn update_escape_state_for_key_at(
         *current_down = Some(now);
         if other_down {
             state.current_ctrl_tap_valid = false;
-            return false;
         }
-
-        state.current_ctrl_tap_valid = true;
-        return state
-            .last_ctrl_tap_at
-            .is_some_and(|previous| now.saturating_duration_since(previous) <= double_tap_window);
+        if !other_down {
+            state.current_ctrl_tap_valid = true;
+        }
+        return false;
     }
 
     let Some(down_at) = current_down.take() else {
@@ -712,7 +777,12 @@ fn update_escape_state_for_key_at(
     };
     if !other_down {
         if state.current_ctrl_tap_valid {
-            state.last_ctrl_tap_at = Some(down_at);
+            let triggered = state.last_ctrl_tap_at.is_some_and(|previous| {
+                down_at.saturating_duration_since(previous) <= double_tap_window
+            });
+            state.last_ctrl_tap_at = (!triggered).then_some(down_at);
+            state.current_ctrl_tap_valid = false;
+            return triggered;
         }
         state.current_ctrl_tap_valid = false;
     }
@@ -722,7 +792,7 @@ fn update_escape_state_for_key_at(
 
 fn key_semantics_for_hook_event(vk_code: u16, key_state: KeyState) -> KeySemantics {
     let num_lock_on = with_active_capture_runtime(|runtime| {
-        let Ok(mut state) = runtime.runtime_state.lock() else {
+        let Ok(mut state) = runtime.keyboard_state.lock() else {
             return is_num_lock_on();
         };
         update_num_lock_state_for_key(&mut state, vk_code, key_state)
@@ -736,7 +806,7 @@ fn key_semantics_for_hook_event(vk_code: u16, key_state: KeyState) -> KeySemanti
 }
 
 fn update_num_lock_state_for_key(
-    state: &mut HookRuntimeState,
+    state: &mut KeyboardRuntimeState,
     vk_code: u16,
     key_state: KeyState,
 ) -> bool {
@@ -778,10 +848,8 @@ fn try_escape_unlock_for_key_from_source_at(
     now: Instant,
     double_tap_window: Duration,
 ) -> bool {
-    if escape_detector_source(runtime) != source {
-        return false;
-    }
-    if !update_escape_state_for_key_at(runtime, vk_code, key_state, now, double_tap_window) {
+    if !update_escape_state_for_key_at(runtime, source, vk_code, key_state, now, double_tap_window)
+    {
         return false;
     }
     force_unlock_for_arc(runtime, Some(SafetyUnlockCause::Escape))
@@ -806,27 +874,46 @@ fn set_hook_lock_active_for(core: &Arc<CaptureRuntimeCore>, active: bool) -> Res
 }
 
 fn set_hook_lock_active_for_arc(core: &CaptureRuntimeCore, active: bool) -> Result<bool> {
-    if !active {
-        // Unlock first: local input must fail open even if cleanup state is
-        // poisoned or otherwise unavailable.
+    let mut state = match core.escape_detector_state.lock() {
+        Ok(state) => state,
+        Err(error) => {
+            drop(error);
+            let _ = force_unlock_for_arc(core, Some(SafetyUnlockCause::DetectorUnavailable));
+            return Ok(false);
+        }
+    };
+    let detector_available = state.source == EscapeDetectorSource::RawKeyboard
+        || !core.keyboard_hook_degraded.load(Ordering::Acquire);
+    if active && !detector_available {
         core.lock_active.store(false, Ordering::Release);
+        state.gesture = HookRuntimeState::default();
+        drop(state);
+        if let Ok(mut lease) = core.lock_lease.lock() {
+            lease.last_renewed_at = None;
+        }
+        return Ok(false);
     }
-    let mut state = core
-        .runtime_state
+
+    if !active {
+        // Unlock first: local input must fail open even if later cleanup state
+        // is poisoned or otherwise unavailable.
+        core.lock_active.store(false, Ordering::Release);
+        state.gesture = HookRuntimeState::default();
+    }
+    drop(state);
+
+    let mut keyboard_state = core
+        .keyboard_state
         .lock()
-        .map_err(|_| anyhow::anyhow!("hook runtime state mutex poisoned"))?;
-    state.left_ctrl_down_at = None;
-    state.right_ctrl_down_at = None;
-    state.current_ctrl_tap_valid = false;
-    state.last_ctrl_tap_at = None;
-    state.num_lock_down = false;
+        .map_err(|_| anyhow::anyhow!("keyboard runtime state mutex poisoned"))?;
+    keyboard_state.num_lock_down = false;
     if active {
         // Captured Num Lock is suppressed by the hook, so initialize the
         // logical state from Windows at each handoff and track later toggles
         // locally until capture ends.
-        state.num_lock_on = is_num_lock_on();
+        keyboard_state.num_lock_on = is_num_lock_on();
     }
-    drop(state);
+    drop(keyboard_state);
 
     let mut lease = core
         .lock_lease
@@ -876,11 +963,10 @@ fn force_unlock_for_arc_with_hook(
     let was_active = core.lock_active.swap(false, Ordering::SeqCst);
     after_lock_release();
 
-    if let Ok(mut state) = core.runtime_state.lock() {
-        state.left_ctrl_down_at = None;
-        state.right_ctrl_down_at = None;
-        state.current_ctrl_tap_valid = false;
-        state.last_ctrl_tap_at = None;
+    if let Ok(mut state) = core.escape_detector_state.lock() {
+        state.gesture = HookRuntimeState::default();
+    }
+    if let Ok(mut state) = core.keyboard_state.lock() {
         state.num_lock_down = false;
     }
     if let Ok(mut lease) = core.lock_lease.lock() {
@@ -890,13 +976,20 @@ fn force_unlock_for_arc_with_hook(
     match (cause, was_active) {
         (Some(SafetyUnlockCause::Escape), true) => {
             core.escape_unlock_pending.fetch_add(1, Ordering::AcqRel);
-            let detector = escape_detector_source(core).label();
+            let detector = escape_detector_source(core)
+                .map(EscapeDetectorSource::label)
+                .unwrap_or("unavailable");
             eprintln!("boundless_input_safety_unlock cause=escape detector={detector}");
         }
         (Some(SafetyUnlockCause::LeaseExpired), true) => {
             core.lease_expired_unlock_pending
                 .fetch_add(1, Ordering::AcqRel);
             eprintln!("boundless_input_safety_unlock cause=lease_expired");
+        }
+        (Some(SafetyUnlockCause::DetectorUnavailable), true) => {
+            core.detector_unavailable_unlock_pending
+                .fetch_add(1, Ordering::AcqRel);
+            eprintln!("boundless_input_safety_unlock cause=detector_unavailable");
         }
         _ => {}
     }
@@ -1282,7 +1375,7 @@ fn process_raw_input_message(lparam: LPARAM, message_time_ms: u32) -> Result<()>
     let raw = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<RAWINPUT>()) };
     if raw.header.dwType == RIM_TYPEKEYBOARD {
         let keyboard = unsafe { raw.data.keyboard };
-        if let Some((vk_code, state)) = raw_keyboard_escape_key(&keyboard) {
+        if let Some((vk_code, state)) = raw_keyboard_key(&keyboard) {
             if current_input_message_is_injected() {
                 return Ok(());
             }
@@ -1333,7 +1426,7 @@ fn current_input_message_is_injected() -> bool {
     ok != 0 && source.originId == IMO_INJECTED
 }
 
-fn raw_keyboard_escape_key(keyboard: &RAWKEYBOARD) -> Option<(u16, KeyState)> {
+fn raw_keyboard_key(keyboard: &RAWKEYBOARD) -> Option<(u16, KeyState)> {
     if keyboard.VKey == u8::MAX as u16 {
         return None;
     }
@@ -1342,9 +1435,6 @@ fn raw_keyboard_escape_key(keyboard: &RAWKEYBOARD) -> Option<(u16, KeyState)> {
         VK_CONTROL_CODE => VK_LCONTROL_CODE,
         code => code,
     };
-    if !is_control_virtual_key(vk_code) {
-        return None;
-    }
     let state = if (u32::from(keyboard.Flags) & RI_KEY_BREAK) != 0 {
         KeyState::Up
     } else {
@@ -1563,7 +1653,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::OnceLock;
+    use std::sync::{Barrier, OnceLock};
     use windows_sys::Win32::UI::Input::{RAWMOUSE_0, RAWMOUSE_0_0};
 
     static REGISTRY_TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1576,14 +1666,17 @@ mod tests {
         Arc::new(CaptureRuntimeCore {
             event_tx: Mutex::new(None),
             wake_notifier: Mutex::new(None),
-            runtime_state: Mutex::new(HookRuntimeState::default()),
+            escape_detector_state: Mutex::new(EscapeDetectorState::new(
+                EscapeDetectorSource::KeyboardHook,
+            )),
+            keyboard_state: Mutex::new(KeyboardRuntimeState::default()),
             lock_lease: Mutex::new(HookLockLease::default()),
             lock_active: AtomicBool::new(false),
-            raw_keyboard_escape_enabled: AtomicBool::new(false),
             keyboard_hook_degraded: AtomicBool::new(false),
             last_keyboard_hook_observation: Mutex::new(None),
             escape_unlock_pending: AtomicU64::new(0),
             lease_expired_unlock_pending: AtomicU64::new(0),
+            detector_unavailable_unlock_pending: AtomicU64::new(0),
             safety_unlock_generation: AtomicU64::new(0),
             safety_unlock_in_progress: AtomicU64::new(0),
             lock_watchdog_stop: AtomicBool::new(false),
@@ -1716,26 +1809,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            raw_keyboard_escape_key(&keyboard),
+            raw_keyboard_key(&keyboard),
             Some((VK_LCONTROL_CODE, KeyState::Down))
         );
 
         keyboard.Flags = RI_KEY_E0 as u16;
         assert_eq!(
-            raw_keyboard_escape_key(&keyboard),
+            raw_keyboard_key(&keyboard),
             Some((VK_RCONTROL_CODE, KeyState::Down))
         );
 
         keyboard.Flags = (RI_KEY_E0 | RI_KEY_BREAK) as u16;
         assert_eq!(
-            raw_keyboard_escape_key(&keyboard),
+            raw_keyboard_key(&keyboard),
             Some((VK_RCONTROL_CODE, KeyState::Up))
         );
 
         keyboard.VKey = 0x41;
-        assert_eq!(raw_keyboard_escape_key(&keyboard), None);
+        keyboard.Flags = 0;
+        assert_eq!(raw_keyboard_key(&keyboard), Some((0x41, KeyState::Down)));
         keyboard.VKey = u8::MAX as u16;
-        assert_eq!(raw_keyboard_escape_key(&keyboard), None);
+        assert_eq!(raw_keyboard_key(&keyboard), None);
 
         assert_eq!(
             hook_control_virtual_key(VK_CONTROL_CODE, 0),
@@ -1787,12 +1881,20 @@ mod tests {
             start + Duration::from_millis(20),
             window,
         ));
-        assert!(try_escape_unlock_for_key_from_source_at(
+        assert!(!try_escape_unlock_for_key_from_source_at(
             &core,
             EscapeDetectorSource::RawKeyboard,
             VK_LCONTROL_CODE,
             KeyState::Down,
             start + Duration::from_millis(200),
+            window,
+        ));
+        assert!(try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::RawKeyboard,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + Duration::from_millis(220),
             window,
         ));
         assert!(!try_escape_unlock_for_key_from_source_at(
@@ -1806,6 +1908,59 @@ mod tests {
 
         assert!(!core.lock_active.load(Ordering::Acquire));
         assert_eq!(core.escape_unlock_pending.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn control_chords_and_altgr_do_not_prime_emergency_unlock() {
+        for chord_key in [0x43, 0xA5] {
+            let core = test_runtime_core();
+            set_raw_keyboard_escape_enabled_for(&core, true);
+            set_hook_lock_active_for(&core, true).expect("lock");
+            let start = Instant::now();
+            let window = Duration::from_millis(800);
+
+            for (vk_code, state, offset_ms) in [
+                // Ctrl+C / AltGr chord.
+                (VK_LCONTROL_CODE, KeyState::Down, 0),
+                (chord_key, KeyState::Down, 10),
+                (chord_key, KeyState::Up, 20),
+                (VK_LCONTROL_CODE, KeyState::Up, 30),
+                // A second chord inside the gesture window is still not a tap.
+                (VK_LCONTROL_CODE, KeyState::Down, 100),
+                (chord_key, KeyState::Down, 110),
+                (chord_key, KeyState::Up, 120),
+                (VK_LCONTROL_CODE, KeyState::Up, 130),
+                // A chord after a bare tap invalidates that completed tap too.
+                (VK_LCONTROL_CODE, KeyState::Down, 200),
+                (VK_LCONTROL_CODE, KeyState::Up, 220),
+                (VK_LCONTROL_CODE, KeyState::Down, 300),
+                (chord_key, KeyState::Down, 310),
+                (chord_key, KeyState::Up, 320),
+                (VK_LCONTROL_CODE, KeyState::Up, 330),
+                // Only two final bare taps prime the gesture.
+                (VK_LCONTROL_CODE, KeyState::Down, 400),
+                (VK_LCONTROL_CODE, KeyState::Up, 420),
+                (VK_LCONTROL_CODE, KeyState::Down, 500),
+            ] {
+                assert!(!try_escape_unlock_for_key_from_source_at(
+                    &core,
+                    EscapeDetectorSource::RawKeyboard,
+                    vk_code,
+                    state,
+                    start + Duration::from_millis(offset_ms),
+                    window,
+                ));
+            }
+            assert!(core.lock_active.load(Ordering::Acquire));
+            assert!(try_escape_unlock_for_key_from_source_at(
+                &core,
+                EscapeDetectorSource::RawKeyboard,
+                VK_LCONTROL_CODE,
+                KeyState::Up,
+                start + Duration::from_millis(520),
+                window,
+            ));
+        }
     }
 
     #[test]
@@ -1835,7 +1990,7 @@ mod tests {
                 start + Duration::from_millis(20),
                 window,
             ));
-            assert!(try_escape_unlock_for_key_from_source_at(
+            assert!(!try_escape_unlock_for_key_from_source_at(
                 &core,
                 EscapeDetectorSource::RawKeyboard,
                 vk_code,
@@ -1843,24 +1998,45 @@ mod tests {
                 start + Duration::from_millis(200),
                 window,
             ));
+            assert!(try_escape_unlock_for_key_from_source_at(
+                &core,
+                EscapeDetectorSource::RawKeyboard,
+                vk_code,
+                KeyState::Up,
+                start + Duration::from_millis(220),
+                window,
+            ));
             assert_eq!(core.escape_unlock_pending.load(Ordering::Acquire), 1);
         }
     }
 
     #[test]
-    fn hook_degradation_is_bounded_until_detector_source_resets() {
+    fn losing_raw_after_hook_degradation_fails_open_and_blocks_relock() {
         let core = test_runtime_core();
         set_raw_keyboard_escape_enabled_for(&core, true);
+        assert!(set_hook_lock_active_for(&core, true).expect("lock with raw detector"));
 
         observe_raw_keyboard_hook_health(&core, VK_LCONTROL_CODE, KeyState::Down, 50);
         assert!(core.keyboard_hook_degraded.load(Ordering::Acquire));
-
-        record_keyboard_hook_observation(&core, VK_RCONTROL_CODE, KeyState::Up, 51);
-        observe_raw_keyboard_hook_health(&core, VK_RCONTROL_CODE, KeyState::Up, 51);
-        assert!(core.keyboard_hook_degraded.load(Ordering::Acquire));
+        assert!(core.lock_active.load(Ordering::Acquire));
 
         set_raw_keyboard_escape_enabled_for(&core, false);
-        assert!(!core.keyboard_hook_degraded.load(Ordering::Acquire));
+        assert!(!core.lock_active.load(Ordering::Acquire));
+        assert!(core.keyboard_hook_degraded.load(Ordering::Acquire));
+        assert_eq!(
+            core.detector_unavailable_unlock_pending
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(
+            !set_hook_lock_active_for(&core, true).expect("reject known-dead hook detector"),
+            "capture must remain fail open without a reliable escape detector"
+        );
+        assert!(!core.lock_active.load(Ordering::Acquire));
+
+        set_raw_keyboard_escape_enabled_for(&core, true);
+        assert!(core.keyboard_hook_degraded.load(Ordering::Acquire));
+        assert!(set_hook_lock_active_for(&core, true).expect("raw detector recovered"));
     }
 
     #[test]
@@ -1906,7 +2082,7 @@ mod tests {
             start + Duration::from_millis(120),
             window,
         ));
-        assert!(try_escape_unlock_for_key_from_source_at(
+        assert!(!try_escape_unlock_for_key_from_source_at(
             &core,
             EscapeDetectorSource::KeyboardHook,
             VK_LCONTROL_CODE,
@@ -1914,6 +2090,79 @@ mod tests {
             start + Duration::from_millis(200),
             window,
         ));
+        assert!(try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + Duration::from_millis(220),
+            window,
+        ));
+    }
+
+    #[test]
+    fn source_transition_and_observation_cannot_mix_completed_taps() {
+        let core = test_runtime_core();
+        set_hook_lock_active_for(&core, true).expect("lock");
+        let start = Instant::now();
+        let window = Duration::from_millis(800);
+        assert!(!try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start,
+            window,
+        ));
+        assert!(!try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + Duration::from_millis(20),
+            window,
+        ));
+
+        let held_state = core
+            .escape_detector_state
+            .lock()
+            .expect("hold detector transition boundary");
+        let barrier = Arc::new(Barrier::new(3));
+        let transition_core = Arc::clone(&core);
+        let transition_barrier = Arc::clone(&barrier);
+        let transition = std::thread::spawn(move || {
+            transition_barrier.wait();
+            set_raw_keyboard_escape_enabled_for(&transition_core, true);
+        });
+        let observation_core = Arc::clone(&core);
+        let observation_barrier = Arc::clone(&barrier);
+        let observation = std::thread::spawn(move || {
+            observation_barrier.wait();
+            let down_triggered = try_escape_unlock_for_key_from_source_at(
+                &observation_core,
+                EscapeDetectorSource::RawKeyboard,
+                VK_LCONTROL_CODE,
+                KeyState::Down,
+                start + Duration::from_millis(200),
+                window,
+            );
+            let up_triggered = try_escape_unlock_for_key_from_source_at(
+                &observation_core,
+                EscapeDetectorSource::RawKeyboard,
+                VK_LCONTROL_CODE,
+                KeyState::Up,
+                start + Duration::from_millis(220),
+                window,
+            );
+            down_triggered || up_triggered
+        });
+        barrier.wait();
+        drop(held_state);
+
+        transition.join().expect("source transition");
+        assert!(!observation.join().expect("raw observation"));
+        assert!(core.lock_active.load(Ordering::Acquire));
+        assert_eq!(core.escape_unlock_pending.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1948,7 +2197,7 @@ mod tests {
             start + window + Duration::from_millis(20),
             window,
         ));
-        assert!(try_escape_unlock_for_key_from_source_at(
+        assert!(!try_escape_unlock_for_key_from_source_at(
             &core,
             EscapeDetectorSource::KeyboardHook,
             VK_LCONTROL_CODE,
@@ -1956,13 +2205,21 @@ mod tests {
             start + window + Duration::from_millis(200),
             window,
         ));
+        assert!(try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + window + Duration::from_millis(220),
+            window,
+        ));
     }
 
     #[test]
     fn captured_num_lock_toggles_once_per_physical_press() {
-        let mut state = HookRuntimeState {
+        let mut state = KeyboardRuntimeState {
             num_lock_on: false,
-            ..HookRuntimeState::default()
+            ..KeyboardRuntimeState::default()
         };
 
         assert!(update_num_lock_state_for_key(
@@ -2010,6 +2267,7 @@ mod tests {
 
         assert!(!update_escape_state_for_key_at(
             &core,
+            EscapeDetectorSource::KeyboardHook,
             VK_LCONTROL_CODE,
             KeyState::Down,
             start,
@@ -2017,16 +2275,26 @@ mod tests {
         ));
         assert!(!update_escape_state_for_key_at(
             &core,
+            EscapeDetectorSource::KeyboardHook,
             VK_LCONTROL_CODE,
             KeyState::Up,
             start + Duration::from_millis(20),
             window,
         ));
-        assert!(update_escape_state_for_key_at(
+        assert!(!update_escape_state_for_key_at(
             &core,
+            EscapeDetectorSource::KeyboardHook,
             VK_LCONTROL_CODE,
             KeyState::Down,
             start + Duration::from_millis(200),
+            window,
+        ));
+        assert!(update_escape_state_for_key_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + Duration::from_millis(220),
             window,
         ));
         assert!(force_unlock_for_arc(&core, Some(SafetyUnlockCause::Escape)));
@@ -2045,6 +2313,7 @@ mod tests {
 
         assert!(!update_escape_state_for_key_at(
             &core,
+            EscapeDetectorSource::KeyboardHook,
             VK_RCONTROL_CODE,
             KeyState::Down,
             start,
@@ -2052,6 +2321,7 @@ mod tests {
         ));
         assert!(!update_escape_state_for_key_at(
             &core,
+            EscapeDetectorSource::KeyboardHook,
             VK_RCONTROL_CODE,
             KeyState::Up,
             start + Duration::from_millis(20),
@@ -2059,9 +2329,18 @@ mod tests {
         ));
         assert!(!update_escape_state_for_key_at(
             &core,
+            EscapeDetectorSource::KeyboardHook,
             VK_RCONTROL_CODE,
             KeyState::Down,
             start + window + Duration::from_millis(1),
+            window,
+        ));
+        assert!(!update_escape_state_for_key_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_RCONTROL_CODE,
+            KeyState::Up,
+            start + window + Duration::from_millis(20),
             window,
         ));
         assert!(core.lock_active.load(Ordering::Acquire));
@@ -2085,6 +2364,7 @@ mod tests {
         set_hook_lock_active_for(&core, true).expect("lock");
         assert!(!update_escape_state_for_key_at(
             &core,
+            EscapeDetectorSource::KeyboardHook,
             VK_LCONTROL_CODE,
             KeyState::Down,
             start,
@@ -2092,16 +2372,26 @@ mod tests {
         ));
         assert!(!update_escape_state_for_key_at(
             &core,
+            EscapeDetectorSource::KeyboardHook,
             VK_LCONTROL_CODE,
             KeyState::Up,
             start + Duration::from_millis(10),
             window,
         ));
-        assert!(update_escape_state_for_key_at(
+        assert!(!update_escape_state_for_key_at(
             &core,
+            EscapeDetectorSource::KeyboardHook,
             VK_LCONTROL_CODE,
             KeyState::Down,
             start + window,
+            window,
+        ));
+        assert!(update_escape_state_for_key_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + window + Duration::from_millis(10),
             window,
         ));
 
@@ -2109,6 +2399,7 @@ mod tests {
         set_hook_lock_active_for(&core, true).expect("relock");
         assert!(!update_escape_state_for_key_at(
             &core,
+            EscapeDetectorSource::KeyboardHook,
             VK_LCONTROL_CODE,
             KeyState::Down,
             start,
@@ -2116,6 +2407,7 @@ mod tests {
         ));
         assert!(!update_escape_state_for_key_at(
             &core,
+            EscapeDetectorSource::KeyboardHook,
             VK_LCONTROL_CODE,
             KeyState::Up,
             start + Duration::from_millis(10),
@@ -2123,9 +2415,18 @@ mod tests {
         ));
         assert!(!update_escape_state_for_key_at(
             &core,
+            EscapeDetectorSource::KeyboardHook,
             VK_LCONTROL_CODE,
             KeyState::Down,
             start + window + Duration::from_millis(1),
+            window,
+        ));
+        assert!(!update_escape_state_for_key_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + window + Duration::from_millis(11),
             window,
         ));
     }

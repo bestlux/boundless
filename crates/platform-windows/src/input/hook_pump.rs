@@ -15,6 +15,15 @@ const WHEEL_DEDUPE_HOLD: Duration = Duration::from_millis(20);
 const WHEEL_TOMBSTONE_TTL: Duration = Duration::from_millis(250);
 const WHEEL_TOMBSTONE_CAP: usize = 512;
 
+fn backend_mode_for(raw_input_enabled: bool, keyboard_hook_degraded: bool) -> &'static str {
+    match (raw_input_enabled, keyboard_hook_degraded) {
+        (true, true) => "hook_raw_keyboard_hook_degraded",
+        (true, false) => "hook_raw",
+        (false, true) => "hook_escape_detector_unavailable",
+        (false, false) => "hook",
+    }
+}
+
 #[derive(Debug, Clone)]
 struct EmittedWheelTombstone {
     delta_x: i32,
@@ -375,13 +384,10 @@ impl HookInputPump {
     }
 
     pub fn backend_mode(&self) -> &'static str {
-        if self.capture_runtime.keyboard_hook_degraded() {
-            "hook_raw_keyboard_hook_degraded"
-        } else if self.capture_runtime.raw_input_enabled() {
-            "hook_raw"
-        } else {
-            "hook"
-        }
+        backend_mode_for(
+            self.capture_runtime.raw_input_enabled(),
+            self.capture_runtime.keyboard_hook_degraded(),
+        )
     }
 
     pub fn cursor_position(&self) -> Option<(i32, i32)> {
@@ -401,6 +407,20 @@ impl HookInputPump {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn backend_mode_reports_escape_detector_availability() {
+        assert_eq!(backend_mode_for(true, false), "hook_raw");
+        assert_eq!(
+            backend_mode_for(true, true),
+            "hook_raw_keyboard_hook_degraded"
+        );
+        assert_eq!(
+            backend_mode_for(false, true),
+            "hook_escape_detector_unavailable"
+        );
+        assert_eq!(backend_mode_for(false, false), "hook");
+    }
 
     fn wheel(
         delta_x: i32,
