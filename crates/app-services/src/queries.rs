@@ -92,6 +92,7 @@ pub struct InputBrokerExchangeSnapshot {
     pub inject_frames: Vec<InputBrokerInjectFrameSnapshot>,
     pub lock_should_be_active: bool,
     pub capture_active: bool,
+    pub capture_forwarding_authorized: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -52,6 +52,32 @@ async fn join_connected_peer(state: &AppState) -> String {
     peer_id
 }
 
+async fn request_broker_capture(state: &AppState, peer_id: &str) {
+    state
+        .set_input_capture_backend_mode(INPUT_BROKER_BACKEND_MODE)
+        .await;
+    state
+        .set_input_capture_target(Some(peer_id))
+        .await
+        .expect("set capture target");
+    let _ = state.input_broker_relay().set_desired_lock_active(true);
+}
+
+async fn authorize_broker_capture(state: &AppState, peer_id: &str, broker_token: &str) {
+    request_broker_capture(state, peer_id).await;
+    let outcome = state
+        .exchange_input_broker(
+            allowed_client(),
+            broker_token,
+            InputBrokerExchangeObservations {
+                lock_active: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(outcome.capture_forwarding_authorized);
+}
+
 async fn assert_attach_rejected_event(state: &AppState, reason: &str) {
     let events = state.transport_events().await;
     assert!(
@@ -313,6 +339,104 @@ async fn exchange_rejects_wrong_user_even_with_valid_token() {
 }
 
 #[tokio::test]
+async fn exchange_rejects_captured_events_until_lock_report_is_acknowledged() {
+    let (state, root) = service_mode_broker_state("boundless-broker-lock-handshake-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+    request_broker_capture(&state, &peer_id).await;
+
+    let key = InputEvent::Key {
+        scan_code: 30,
+        state: KeyState::Down,
+        semantics: core_input::KeySemantics::Physical,
+    };
+    let pre_lock = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                captured_events: vec![key.clone()],
+                lock_active: false,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(pre_lock.accepted);
+    assert!(!pre_lock.capture_forwarding_authorized);
+    assert!(
+        state
+            .input_broker_relay()
+            .drain_captured_events()
+            .is_empty()
+    );
+
+    let lock_report = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                lock_active: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(lock_report.capture_forwarding_authorized);
+    assert!(
+        state
+            .input_broker_relay()
+            .drain_captured_events()
+            .is_empty()
+    );
+
+    let authorized = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                captured_events: vec![key.clone()],
+                lock_active: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(authorized.capture_forwarding_authorized);
+    assert_eq!(
+        state.input_broker_relay().drain_captured_events(),
+        vec![key]
+    );
+
+    let safety_report = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                captured_events: vec![InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Up,
+                    semantics: core_input::KeySemantics::Physical,
+                }],
+                escape_unlock_count: 1,
+                lock_active: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(!safety_report.capture_forwarding_authorized);
+    assert!(
+        state
+            .input_broker_relay()
+            .drain_captured_events()
+            .is_empty(),
+        "a safety report must revoke authorization before accepting its batch"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn detach_rejects_wrong_user_and_keeps_broker_attached() {
     let (state, root) = service_mode_broker_state("boundless-broker-detach-wrong-user-test").await;
     let peer_id = join_connected_peer(&state).await;
@@ -321,10 +445,7 @@ async fn detach_rejects_wrong_user_and_keeps_broker_attached() {
         .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
         .await;
     assert!(attach.accepted);
-    state
-        .set_input_capture_target(Some(&peer_id))
-        .await
-        .expect("set capture target");
+    authorize_broker_capture(&state, &peer_id, &attach.broker_token).await;
     assert!(
         state
             .claim_input_owner(&peer_id, false)
@@ -348,6 +469,7 @@ async fn detach_rejects_wrong_user_and_keeps_broker_attached() {
                         state: KeyState::Down,
                     },
                 ],
+                lock_active: true,
                 ..Default::default()
             },
         )
@@ -451,15 +573,12 @@ async fn attach_replaces_previous_broker_token() {
 async fn replacement_attach_queues_final_release_after_prior_captured_down() {
     let (state, root) = service_mode_broker_state("boundless-broker-replace-release-test").await;
     let peer_id = join_connected_peer(&state).await;
-    state
-        .set_input_capture_target(Some(&peer_id))
-        .await
-        .expect("set capture target");
 
     let first = state
         .attach_input_broker(allowed_client(), "first-broker".to_string(), true)
         .await;
     assert!(first.accepted);
+    authorize_broker_capture(&state, &peer_id, &first.broker_token).await;
     let down = InputEvent::Key {
         scan_code: 30,
         state: KeyState::Down,
@@ -471,6 +590,7 @@ async fn replacement_attach_queues_final_release_after_prior_captured_down() {
             &first.broker_token,
             InputBrokerExchangeObservations {
                 captured_events: vec![down.clone()],
+                lock_active: true,
                 ..Default::default()
             },
         )
@@ -521,10 +641,12 @@ async fn replacement_attach_queues_final_release_after_prior_captured_down() {
 async fn replacement_attach_queue_failure_preserves_prior_broker_and_pressed_state() {
     let (state, root) =
         service_mode_broker_state("boundless-broker-replace-queue-failure-test").await;
+    let peer_id = join_connected_peer(&state).await;
     let first = state
         .attach_input_broker(allowed_client(), "first-broker".to_string(), true)
         .await;
     assert!(first.accepted);
+    authorize_broker_capture(&state, &peer_id, &first.broker_token).await;
     let observed = state
         .exchange_input_broker(
             allowed_client(),
@@ -535,6 +657,7 @@ async fn replacement_attach_queue_failure_preserves_prior_broker_and_pressed_sta
                     state: KeyState::Down,
                     semantics: core_input::KeySemantics::Physical,
                 }],
+                lock_active: true,
                 ..Default::default()
             },
         )
@@ -606,14 +729,11 @@ async fn stale_broker_fails_closed_until_reattach() {
 async fn stale_reject_cleanup_and_reattach_preserve_final_release_ordering() {
     let (state, root) = service_mode_broker_state("boundless-broker-stale-release-test").await;
     let peer_id = join_connected_peer(&state).await;
-    state
-        .set_input_capture_target(Some(&peer_id))
-        .await
-        .expect("set capture target");
     let first = state
         .attach_input_broker(allowed_client(), "first-broker".to_string(), true)
         .await;
     assert!(first.accepted);
+    authorize_broker_capture(&state, &peer_id, &first.broker_token).await;
 
     let down = InputEvent::Key {
         scan_code: 30,
@@ -626,6 +746,7 @@ async fn stale_reject_cleanup_and_reattach_preserve_final_release_ordering() {
             &first.broker_token,
             InputBrokerExchangeObservations {
                 captured_events: vec![down.clone()],
+                lock_active: true,
                 ..Default::default()
             },
         )
@@ -774,11 +895,13 @@ async fn exchange_returns_inject_frames_only_for_current_input_owner() {
 #[tokio::test]
 async fn broker_observations_feed_capture_state_and_release_synthesis() {
     let (state, root) = service_mode_broker_state("boundless-broker-observations-test").await;
+    let peer_id = join_connected_peer(&state).await;
 
     let attach = state
         .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
         .await;
     assert!(attach.accepted);
+    authorize_broker_capture(&state, &peer_id, &attach.broker_token).await;
 
     let outcome = state
         .exchange_input_broker(
@@ -795,6 +918,7 @@ async fn broker_observations_feed_capture_state_and_release_synthesis() {
                 ],
                 cursor: Some((100, 200)),
                 virtual_bounds: Some((0, 0, 1919, 1079)),
+                lock_active: true,
                 ..Default::default()
             },
         )

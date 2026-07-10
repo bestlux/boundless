@@ -804,6 +804,10 @@ impl ControlPlaneService for ControlPlaneApi {
                     request.bounds_bottom,
                 )),
                 escape_unlock_count: request.escape_unlock_count,
+                lease_expired_unlock_count: request.lease_expired_unlock_count,
+                detector_unavailable_unlock_count: request.detector_unavailable_unlock_count,
+                handoff_probe: (request.handoff_probe_dx != 0 || request.handoff_probe_dy != 0)
+                    .then_some((request.handoff_probe_dx, request.handoff_probe_dy)),
                 lock_active: request.lock_active,
                 dropped_event_count: request
                     .dropped_event_count
@@ -830,6 +834,7 @@ impl ControlPlaneService for ControlPlaneApi {
                 .collect(),
             lock_should_be_active: reply.lock_should_be_active,
             capture_active: reply.capture_active,
+            capture_forwarding_authorized: reply.capture_forwarding_authorized,
         }))
     }
 

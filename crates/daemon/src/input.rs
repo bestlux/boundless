@@ -87,7 +87,11 @@ use runtime::{record_local_input_runtime_event, run};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureControlAction {
     #[cfg_attr(not(any(windows, test)), allow(dead_code))]
-    EscapeUnlock,
+    Escape,
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    LeaseExpired,
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    DetectorUnavailable,
 }
 
 #[derive(Debug, Default)]
@@ -160,6 +164,9 @@ trait InputCaptureBackend: Send {
     fn drain_release_events(&mut self) -> Vec<InputEvent>;
     fn reset(&mut self);
     fn poll_events(&mut self) -> Result<Vec<InputEvent>>;
+    fn poll_handoff_probe(&mut self) -> Option<InputEvent> {
+        None
+    }
     fn drain_control_actions(&mut self) -> Vec<CaptureControlAction>;
     fn set_lock_active(&mut self, active: bool) -> Result<bool>;
     fn safety_unlock_generation(&self) -> u64 {
@@ -1648,7 +1655,7 @@ mod tests {
             .expect("set target");
 
         let mut backend = ScriptedCaptureBackend::new(vec![Vec::new()], Vec::new())
-            .with_control_actions(vec![CaptureControlAction::EscapeUnlock]);
+            .with_control_actions(vec![CaptureControlAction::Escape]);
         let mut last_target = None;
         let mut edge_switch_state = EdgeSwitchState::default();
 
@@ -1670,6 +1677,55 @@ mod tests {
             !backend.lock_updates.contains(&true),
             "a pending safety action must be drained before any relock attempt"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn capture_safety_unlock_telemetry_preserves_each_cause() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set target");
+
+        let mut backend = ScriptedCaptureBackend::new(vec![Vec::new()], Vec::new())
+            .with_control_actions(vec![
+                CaptureControlAction::Escape,
+                CaptureControlAction::LeaseExpired,
+                CaptureControlAction::DetectorUnavailable,
+            ]);
+        let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
+
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+
+        let events = state.transport_events().await;
+        for (kind, detail) in [
+            ("input_escape_triggered", "cause=double_ctrl"),
+            ("input_lock_lease_expired", "cause=lease_expired"),
+            (
+                "input_escape_detector_unavailable",
+                "cause=detector_unavailable",
+            ),
+        ] {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.kind == kind && event.detail == detail),
+                "missing cause-specific safety telemetry {kind} {detail}: {events:?}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1747,7 +1803,7 @@ mod tests {
             }]],
             Vec::new(),
         )
-        .with_control_actions(vec![CaptureControlAction::EscapeUnlock]);
+        .with_control_actions(vec![CaptureControlAction::Escape]);
         let mut last_target = None;
         let mut edge_switch_state = EdgeSwitchState::default();
 
@@ -2002,6 +2058,18 @@ mod tests {
         )
         .await;
 
+        let lock_report = state
+            .exchange_input_broker(
+                allowed_broker_client(),
+                &attach.broker_token,
+                crate::state::InputBrokerExchangeObservations {
+                    lock_active: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(lock_report.capture_forwarding_authorized);
+
         let outcome = state
             .exchange_input_broker(
                 allowed_broker_client(),
@@ -2012,6 +2080,7 @@ mod tests {
                         state: KeyState::Down,
                         semantics: KeySemantics::Physical,
                     }],
+                    lock_active: true,
                     ..Default::default()
                 },
             )
@@ -2047,6 +2116,125 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn broker_handoff_probe_starts_capture_without_forwarding_prelock_keys() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        state
+            .set_layout(format!("self,{peer_id}"))
+            .await
+            .expect("set layout");
+        apply_startup_mode(&state, InputRuntimeMode::ServiceSessionUnsupported).await;
+        state.set_input_broker_allowed_user_sid("S-1-5-21-1000-2000-3000-1001");
+        let attach = state
+            .attach_input_broker(allowed_broker_client(), "test-broker".to_string(), true)
+            .await;
+        assert!(attach.accepted);
+        state
+            .set_input_capture_backend_mode(crate::state::INPUT_BROKER_BACKEND_MODE)
+            .await;
+
+        let observed = state
+            .exchange_input_broker(
+                allowed_broker_client(),
+                &attach.broker_token,
+                crate::state::InputBrokerExchangeObservations {
+                    captured_events: vec![InputEvent::Key {
+                        scan_code: 30,
+                        state: KeyState::Down,
+                        semantics: KeySemantics::Physical,
+                    }],
+                    cursor: Some((1919, 540)),
+                    virtual_bounds: Some((0, 0, 1919, 1079)),
+                    handoff_probe: Some((8, 0)),
+                    lock_active: false,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(observed.accepted);
+        assert!(!observed.capture_forwarding_authorized);
+
+        let mut backend = BrokerRelayCaptureBackend {
+            relay: state.input_broker_relay(),
+        };
+        let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+
+        assert_eq!(
+            state.input_capture_target().await.as_deref(),
+            Some(peer_id.as_str()),
+            "the unrouteable motion probe must still drive edge handoff"
+        );
+        let outgoing_events = state
+            .drain_outgoing(&peer_id)
+            .await
+            .into_iter()
+            .filter_map(|payload| match payload {
+                crate::state::OutboundPayload::InputFrame { events, .. } => Some(events),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(
+            outgoing_events
+                .iter()
+                .all(|event| !matches!(event, InputEvent::Key { .. })),
+            "pre-lock keys must not share the synthetic handoff path: {outgoing_events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn broker_relay_preserves_each_safety_unlock_cause() {
+        let (state, _peer_id, root) = state_with_peer_for_input_test().await;
+        apply_startup_mode(&state, InputRuntimeMode::ServiceSessionUnsupported).await;
+        state.set_input_broker_allowed_user_sid("S-1-5-21-1000-2000-3000-1001");
+        let attach = state
+            .attach_input_broker(allowed_broker_client(), "test-broker".to_string(), true)
+            .await;
+        assert!(attach.accepted);
+
+        let outcome = state
+            .exchange_input_broker(
+                allowed_broker_client(),
+                &attach.broker_token,
+                crate::state::InputBrokerExchangeObservations {
+                    escape_unlock_count: 1,
+                    lease_expired_unlock_count: 1,
+                    detector_unavailable_unlock_count: 1,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(outcome.accepted);
+
+        let mut backend = BrokerRelayCaptureBackend {
+            relay: state.input_broker_relay(),
+        };
+        assert_eq!(
+            backend.drain_control_actions(),
+            vec![
+                CaptureControlAction::Escape,
+                CaptureControlAction::LeaseExpired,
+                CaptureControlAction::DetectorUnavailable,
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn broker_detach_orders_final_release_after_in_flight_capture_batch() {
         let (state, peer_id, root) = state_with_peer_for_input_test().await;
@@ -2067,7 +2255,20 @@ mod tests {
             .set_input_capture_target(Some(&peer_id))
             .await
             .expect("set target");
+        let _ = state.input_broker_relay().set_desired_lock_active(true);
         let _ = state.drain_outgoing(&peer_id).await;
+
+        let lock_report = state
+            .exchange_input_broker(
+                allowed_broker_client(),
+                &attach.broker_token,
+                crate::state::InputBrokerExchangeObservations {
+                    lock_active: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(lock_report.capture_forwarding_authorized);
 
         let observed = state
             .exchange_input_broker(
@@ -2079,6 +2280,7 @@ mod tests {
                         state: KeyState::Down,
                         semantics: KeySemantics::Physical,
                     }],
+                    lock_active: true,
                     ..Default::default()
                 },
             )
@@ -2185,7 +2387,7 @@ mod tests {
         assert!(!backend.pump.lock_active(), "stalled cycle must fail open");
         assert_eq!(
             backend.drain_control_actions(),
-            vec![CaptureControlAction::EscapeUnlock]
+            vec![CaptureControlAction::LeaseExpired]
         );
         assert!(
             !backend

@@ -478,6 +478,10 @@ message InputBrokerExchangeRequest {
   uint32 raw_device_wheel_event_count = 16;
   uint32 raw_system_wheel_event_count = 17;
   uint32 hook_wheel_event_count = 18;
+  int32 handoff_probe_dx = 19;
+  int32 handoff_probe_dy = 20;
+  uint32 lease_expired_unlock_count = 21;
+  uint32 detector_unavailable_unlock_count = 22;
 }
 
 message InputBrokerInjectFrame {
@@ -492,6 +496,7 @@ message InputBrokerExchangeReply {
   repeated InputBrokerInjectFrame inject_frames = 3;
   bool lock_should_be_active = 4;
   bool capture_active = 5;
+  bool capture_forwarding_authorized = 6;
 }
 
 message ClipboardBrokerPayload {

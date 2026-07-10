@@ -52,9 +52,23 @@ impl InputCaptureBackend for BrokerRelayCaptureBackend {
     }
 
     fn drain_control_actions(&mut self) -> Vec<CaptureControlAction> {
-        (0..self.relay.take_escape_unlock_count())
-            .map(|_| CaptureControlAction::EscapeUnlock)
-            .collect()
+        let counts = self.relay.take_safety_unlock_counts();
+        let mut actions = Vec::with_capacity(
+            counts
+                .escape
+                .saturating_add(counts.lease_expired)
+                .saturating_add(counts.detector_unavailable) as usize,
+        );
+        actions.extend((0..counts.escape).map(|_| CaptureControlAction::Escape));
+        actions.extend((0..counts.lease_expired).map(|_| CaptureControlAction::LeaseExpired));
+        actions.extend(
+            (0..counts.detector_unavailable).map(|_| CaptureControlAction::DetectorUnavailable),
+        );
+        actions
+    }
+
+    fn poll_handoff_probe(&mut self) -> Option<InputEvent> {
+        self.relay.drain_handoff_probe()
     }
 
     fn set_lock_active(&mut self, active: bool) -> Result<bool> {

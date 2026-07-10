@@ -30,10 +30,10 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
             .drain_control_actions()
             .into_iter()
             .map(|action| match action {
-                HookControlAction::EscapeUnlock
-                | HookControlAction::LeaseExpiredUnlock
-                | HookControlAction::DetectorUnavailableUnlock => {
-                    CaptureControlAction::EscapeUnlock
+                HookControlAction::EscapeUnlock => CaptureControlAction::Escape,
+                HookControlAction::LeaseExpiredUnlock => CaptureControlAction::LeaseExpired,
+                HookControlAction::DetectorUnavailableUnlock => {
+                    CaptureControlAction::DetectorUnavailable
                 }
             })
             .collect()

@@ -363,6 +363,7 @@ pub(super) async fn capture_and_queue_outgoing_frames(
             Vec::new()
         }
     };
+    let handoff_probe = backend.poll_handoff_probe();
     let dropped_event_count = backend.take_dropped_event_count();
     if dropped_event_count > 0 {
         record_local_input_runtime_event(
@@ -373,7 +374,7 @@ pub(super) async fn capture_and_queue_outgoing_frames(
         )
         .await;
     }
-    if !events.is_empty() {
+    if !events.is_empty() || handoff_probe.is_some() {
         state.note_real_local_input_activity().await;
     }
     let cursor_position = backend.cursor_position();
@@ -408,9 +409,13 @@ pub(super) async fn capture_and_queue_outgoing_frames(
     }
 
     if !escape_triggered {
+        let handoff_events = handoff_probe
+            .as_ref()
+            .map(std::slice::from_ref)
+            .unwrap_or(&events);
         maybe_handoff_capture_target_from_motion(
             state,
-            &events,
+            handoff_events,
             pre_handoff_target.as_deref(),
             edge_switch_state,
             cursor_position,
@@ -467,20 +472,20 @@ async fn drain_capture_control_actions(
 ) -> bool {
     let mut escape_triggered = false;
     for action in backend.drain_control_actions() {
-        if !matches!(action, CaptureControlAction::EscapeUnlock) {
-            continue;
-        }
-
         if capture_target.is_some() {
             state.clear_input_capture_target().await;
-            record_local_input_runtime_event(
-                state,
-                "input_escape_triggered",
-                "double_ctrl",
-                "none",
-            )
-            .await;
         }
+        let (kind, detail) = match action {
+            CaptureControlAction::Escape => ("input_escape_triggered", "cause=double_ctrl"),
+            CaptureControlAction::LeaseExpired => {
+                ("input_lock_lease_expired", "cause=lease_expired")
+            }
+            CaptureControlAction::DetectorUnavailable => (
+                "input_escape_detector_unavailable",
+                "cause=detector_unavailable",
+            ),
+        };
+        record_local_input_runtime_event(state, kind, detail, "none").await;
         edge_switch_state.last_direction = None;
         edge_switch_state.x_pressure = 0;
         edge_switch_state.y_pressure = 0;

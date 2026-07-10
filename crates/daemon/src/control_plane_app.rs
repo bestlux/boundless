@@ -586,6 +586,9 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
                     cursor: command.cursor,
                     virtual_bounds: command.virtual_bounds,
                     escape_unlock_count: command.escape_unlock_count,
+                    lease_expired_unlock_count: command.lease_expired_unlock_count,
+                    detector_unavailable_unlock_count: command.detector_unavailable_unlock_count,
+                    handoff_probe: command.handoff_probe,
                     lock_active: command.lock_active,
                     dropped_event_count: command.dropped_event_count,
                     injected_frame_count: command.injected_frame_count,
@@ -610,6 +613,7 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
                 .collect(),
             lock_should_be_active: outcome.lock_should_be_active,
             capture_active: outcome.capture_active,
+            capture_forwarding_authorized: outcome.capture_forwarding_authorized,
         })
     }
 

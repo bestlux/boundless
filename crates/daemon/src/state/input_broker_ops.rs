@@ -17,6 +17,7 @@ pub struct InputBrokerExchangeOutcome {
     pub inject_frames: Vec<PendingInjectInputFrame>,
     pub lock_should_be_active: bool,
     pub capture_active: bool,
+    pub capture_forwarding_authorized: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +51,9 @@ pub struct InputBrokerExchangeObservations {
     pub cursor: Option<(i32, i32)>,
     pub virtual_bounds: Option<(i32, i32, i32, i32)>,
     pub escape_unlock_count: u32,
+    pub lease_expired_unlock_count: u32,
+    pub detector_unavailable_unlock_count: u32,
+    pub handoff_probe: Option<(i32, i32)>,
     pub lock_active: bool,
     pub dropped_event_count: u64,
     pub injected_frame_count: u32,
@@ -473,15 +477,46 @@ impl AppState {
             });
         }
 
+        let capture_active = self.active_input_capture_target().await.is_some();
+        let lock_should_be_active = self.input_broker.desired_lock_active();
+        let lock_report_authorizes_next_exchange = capture_active
+            && lock_should_be_active
+            && self.input_broker.lock_supported()
+            && observations.lock_active;
+        let safety_unlock_reported = observations.escape_unlock_count > 0
+            || observations.lease_expired_unlock_count > 0
+            || observations.detector_unavailable_unlock_count > 0;
+        let captured_events = if self.input_broker.capture_forwarding_authorized()
+            && lock_report_authorizes_next_exchange
+            && !safety_unlock_reported
+        {
+            observations.captured_events
+        } else {
+            Vec::new()
+        };
+        let accepted_handoff_probe = if capture_active {
+            None
+        } else {
+            observations.handoff_probe
+        };
+        let handoff_probe_reported =
+            accepted_handoff_probe.is_some_and(|(dx, dy)| dx != 0 || dy != 0);
+        let capture_forwarding_authorized =
+            lock_report_authorizes_next_exchange && !safety_unlock_reported;
         let queued = self.input_broker.push_broker_observations(
-            observations.captured_events,
+            captured_events,
             observations.cursor,
             observations.virtual_bounds,
             observations.escape_unlock_count,
+            observations.lease_expired_unlock_count,
+            observations.detector_unavailable_unlock_count,
+            accepted_handoff_probe,
             observations.lock_active,
             observations.dropped_event_count,
         );
-        if queued > 0 || observations.escape_unlock_count > 0 {
+        self.input_broker
+            .set_capture_forwarding_authorized(capture_forwarding_authorized);
+        if queued > 0 || safety_unlock_reported || handoff_probe_reported {
             self.notify_input_capture_wake("input_broker_exchange");
         }
 
@@ -511,14 +546,13 @@ impl AppState {
             inject_frames.push(frame);
         }
 
-        let capture_active = self.active_input_capture_target().await.is_some();
-
         InputBrokerExchangeOutcome {
             accepted: true,
             message: String::new(),
             inject_frames,
-            lock_should_be_active: self.input_broker.desired_lock_active(),
+            lock_should_be_active,
             capture_active,
+            capture_forwarding_authorized,
         }
     }
 

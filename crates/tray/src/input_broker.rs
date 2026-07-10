@@ -28,13 +28,29 @@ const INPUT_BROKER_SUPERVISOR_RETRY: Duration = Duration::from_secs(3);
 const INPUT_BROKER_ACTIVE_POLL: Duration = Duration::from_millis(8);
 const INPUT_BROKER_IDLE_POLL: Duration = Duration::from_millis(40);
 const INPUT_BROKER_LOCK_LEASE: Duration = Duration::from_secs(2);
+const INPUT_BROKER_CAPTURE_STAGING_CAP: usize = 4096;
 const CLIPBOARD_BROKER_POLL: Duration = Duration::from_millis(200);
 const CLIPBOARD_BROKER_RETRY: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Default)]
 struct SafetyUnlockReconciler {
-    pending_report_count: u32,
+    pending_escape_count: u32,
+    pending_lease_expired_count: u32,
+    pending_detector_unavailable_count: u32,
     waiting_for_daemon_release: bool,
+}
+
+#[derive(Debug, Default)]
+struct BrokerCaptureForwardingGate {
+    daemon_authorized: bool,
+    staged_events: Vec<core_input::InputEvent>,
+    dropped_event_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct BrokerCaptureBatch {
+    captured_events: Vec<core_input::InputEvent>,
+    handoff_probe: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Default)]
@@ -237,8 +253,21 @@ impl ClipboardBrokerState {
 
 impl SafetyUnlockReconciler {
     fn observe(&mut self, actions: Vec<HookControlAction>) {
-        for _ in actions {
-            self.pending_report_count = self.pending_report_count.saturating_add(1);
+        for action in actions {
+            match action {
+                HookControlAction::EscapeUnlock => {
+                    self.pending_escape_count = self.pending_escape_count.saturating_add(1);
+                }
+                HookControlAction::LeaseExpiredUnlock => {
+                    self.pending_lease_expired_count =
+                        self.pending_lease_expired_count.saturating_add(1);
+                }
+                HookControlAction::DetectorUnavailableUnlock => {
+                    self.pending_detector_unavailable_count = self
+                        .pending_detector_unavailable_count
+                        .saturating_add(1);
+                }
+            }
             self.waiting_for_daemon_release = true;
         }
     }
@@ -257,17 +286,24 @@ impl SafetyUnlockReconciler {
             // platform runtime to publish. Synthesize the same reconciliation
             // boundary here and keep local events suppressed until the daemon
             // confirms capture ownership has been cleared.
-            self.pending_report_count = self.pending_report_count.saturating_add(1);
+            self.pending_detector_unavailable_count =
+                self.pending_detector_unavailable_count.saturating_add(1);
             self.waiting_for_daemon_release = true;
         }
     }
 
-    fn report_count(&self) -> u32 {
-        self.pending_report_count
+    fn report_counts(&self) -> (u32, u32, u32) {
+        (
+            self.pending_escape_count,
+            self.pending_lease_expired_count,
+            self.pending_detector_unavailable_count,
+        )
     }
 
     fn mark_report_delivered(&mut self) {
-        self.pending_report_count = 0;
+        self.pending_escape_count = 0;
+        self.pending_lease_expired_count = 0;
+        self.pending_detector_unavailable_count = 0;
     }
 
     fn should_forward_captured_events(&self) -> bool {
@@ -281,7 +317,77 @@ impl SafetyUnlockReconciler {
             }
             return false;
         }
-        daemon_lock
+        daemon_lock && daemon_capture
+    }
+}
+
+impl BrokerCaptureForwardingGate {
+    fn prepare_batch(
+        &mut self,
+        observed_events: Vec<core_input::InputEvent>,
+        lock_active: bool,
+        safety_allows_forwarding: bool,
+    ) -> BrokerCaptureBatch {
+        if !safety_allows_forwarding {
+            self.daemon_authorized = false;
+            self.staged_events.clear();
+            return BrokerCaptureBatch::default();
+        }
+
+        if !lock_active {
+            self.daemon_authorized = false;
+            self.staged_events.clear();
+            let (dx, dy) = observed_events.iter().fold((0i32, 0i32), |(dx, dy), event| {
+                if let core_input::InputEvent::MouseMove {
+                    dx: event_dx,
+                    dy: event_dy,
+                } = event
+                {
+                    (dx.saturating_add(*event_dx), dy.saturating_add(*event_dy))
+                } else {
+                    (dx, dy)
+                }
+            });
+            return BrokerCaptureBatch {
+                captured_events: Vec::new(),
+                handoff_probe: (dx != 0 || dy != 0).then_some((dx, dy)),
+            };
+        }
+
+        let observed_count = observed_events.len();
+        let available = INPUT_BROKER_CAPTURE_STAGING_CAP.saturating_sub(self.staged_events.len());
+        let accepted = observed_count.min(available);
+        self.staged_events
+            .extend(observed_events.into_iter().take(accepted));
+        self.dropped_event_count = self
+            .dropped_event_count
+            .saturating_add((observed_count.saturating_sub(accepted)) as u64);
+
+        if !self.daemon_authorized {
+            return BrokerCaptureBatch::default();
+        }
+
+        BrokerCaptureBatch {
+            captured_events: std::mem::take(&mut self.staged_events),
+            handoff_probe: None,
+        }
+    }
+
+    fn observe_daemon_authorization(
+        &mut self,
+        daemon_authorized: bool,
+        lock_active: bool,
+        safety_allows_forwarding: bool,
+    ) {
+        self.daemon_authorized =
+            daemon_authorized && lock_active && safety_allows_forwarding;
+        if !lock_active || !safety_allows_forwarding {
+            self.staged_events.clear();
+        }
+    }
+
+    fn take_dropped_event_count(&mut self) -> u64 {
+        std::mem::take(&mut self.dropped_event_count)
     }
 }
 
@@ -500,20 +606,29 @@ async fn input_broker_exchange_loop(
     let mut injected_frame_count = 0u32;
     let mut inject_failure_count = 0u32;
     let mut safety_unlock = SafetyUnlockReconciler::default();
+    let mut capture_forwarding = BrokerCaptureForwardingGate::default();
 
     loop {
         safety_unlock.observe(pump.drain_control_actions());
-        let captured = pump.poll_events();
-        let captured = if safety_unlock.should_forward_captured_events() {
-            captured
-        } else {
-            Vec::new()
-        };
+        let observed_events = pump.poll_events();
+        let observed_event_count = observed_events.len();
+        let capture_batch = capture_forwarding.prepare_batch(
+            observed_events,
+            pump.lock_active(),
+            safety_unlock.should_forward_captured_events(),
+        );
+        let captured = capture_batch.captured_events;
+        let handoff_probe = capture_batch.handoff_probe;
         let cursor = pump
             .cursor_position()
             .or_else(|| platform_windows::input::cursor_position().ok().flatten());
         let bounds = virtual_screen_bounds();
         let wheel_sources = pump.take_wheel_source_counts();
+        let (escape_unlock_count, lease_expired_unlock_count, detector_unavailable_unlock_count) =
+            safety_unlock.report_counts();
+        let dropped_event_count = pump
+            .take_dropped_event_count()
+            .saturating_add(capture_forwarding.take_dropped_event_count());
 
         let reply = client
             .exchange_input_broker(InputBrokerExchangeRequest {
@@ -527,9 +642,13 @@ async fn input_broker_exchange_loop(
                 bounds_top: bounds.map(|bounds| bounds.1).unwrap_or_default(),
                 bounds_right: bounds.map(|bounds| bounds.2).unwrap_or_default(),
                 bounds_bottom: bounds.map(|bounds| bounds.3).unwrap_or_default(),
-                escape_unlock_count: safety_unlock.report_count(),
+                escape_unlock_count,
+                lease_expired_unlock_count,
+                detector_unavailable_unlock_count,
+                handoff_probe_dx: handoff_probe.map(|(dx, _)| dx).unwrap_or_default(),
+                handoff_probe_dy: handoff_probe.map(|(_, dy)| dy).unwrap_or_default(),
                 lock_active: pump.lock_active(),
-                dropped_event_count: pump.take_dropped_event_count(),
+                dropped_event_count,
                 injected_frame_count,
                 inject_failure_count,
                 raw_device_wheel_event_count: wheel_sources.raw_device,
@@ -577,6 +696,11 @@ async fn input_broker_exchange_loop(
                 );
             }
         }
+        capture_forwarding.observe_daemon_authorization(
+            reply.capture_forwarding_authorized,
+            pump.lock_active(),
+            safety_unlock.should_forward_captured_events(),
+        );
 
         let had_inject_frames = !reply.inject_frames.is_empty();
         for frame in &reply.inject_frames {
@@ -588,7 +712,7 @@ async fn input_broker_exchange_loop(
             }
         }
 
-        let poll = if reply.capture_active || had_inject_frames || !captured.is_empty() {
+        let poll = if reply.capture_active || had_inject_frames || observed_event_count > 0 {
             INPUT_BROKER_ACTIVE_POLL
         } else {
             INPUT_BROKER_IDLE_POLL
@@ -606,10 +730,10 @@ mod input_broker_tests {
         let mut state = SafetyUnlockReconciler::default();
         state.observe(vec![HookControlAction::EscapeUnlock]);
 
-        assert_eq!(state.report_count(), 1);
+        assert_eq!(state.report_counts(), (1, 0, 0));
         assert!(!state.should_forward_captured_events());
         state.mark_report_delivered();
-        assert_eq!(state.report_count(), 0);
+        assert_eq!(state.report_counts(), (0, 0, 0));
         assert!(
             !state.lock_should_be_active(true, true),
             "the reply racing the escape must not re-lock local input"
@@ -624,12 +748,12 @@ mod input_broker_tests {
     fn safety_unlocks_during_exchange_remain_pending_for_next_report() {
         let mut state = SafetyUnlockReconciler::default();
         state.observe(vec![HookControlAction::EscapeUnlock]);
-        let submitted = state.report_count();
-        assert_eq!(submitted, 1);
+        let submitted = state.report_counts();
+        assert_eq!(submitted, (1, 0, 0));
         state.mark_report_delivered();
 
         state.observe(vec![HookControlAction::LeaseExpiredUnlock]);
-        assert_eq!(state.report_count(), 1);
+        assert_eq!(state.report_counts(), (0, 1, 0));
         assert!(!state.lock_should_be_active(true, true));
     }
 
@@ -640,7 +764,7 @@ mod input_broker_tests {
 
         state.observe_lock_update(true, &result, Vec::new());
 
-        assert_eq!(state.report_count(), 1);
+        assert_eq!(state.report_counts(), (0, 0, 1));
         assert!(!state.should_forward_captured_events());
         assert!(
             !state.lock_should_be_active(true, true),
@@ -649,6 +773,98 @@ mod input_broker_tests {
         state.mark_report_delivered();
         assert!(!state.lock_should_be_active(false, false));
         assert!(state.should_forward_captured_events());
+    }
+
+    #[test]
+    fn safety_unlock_reports_preserve_each_platform_cause() {
+        let mut state = SafetyUnlockReconciler::default();
+        state.observe(vec![
+            HookControlAction::EscapeUnlock,
+            HookControlAction::LeaseExpiredUnlock,
+            HookControlAction::DetectorUnavailableUnlock,
+        ]);
+
+        assert_eq!(state.report_counts(), (1, 1, 1));
+    }
+
+    #[test]
+    fn captured_events_wait_for_lock_and_daemon_authorization() {
+        let mut gate = BrokerCaptureForwardingGate::default();
+        let local_batch = gate.prepare_batch(
+            vec![
+                core_input::InputEvent::MouseMove { dx: 7, dy: -2 },
+                core_input::InputEvent::Key {
+                    scan_code: 30,
+                    state: core_input::KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
+                },
+            ],
+            false,
+            true,
+        );
+        assert!(local_batch.captured_events.is_empty());
+        assert_eq!(local_batch.handoff_probe, Some((7, -2)));
+
+        let awaiting_ack = gate.prepare_batch(
+            vec![core_input::InputEvent::Key {
+                scan_code: 31,
+                state: core_input::KeyState::Down,
+                semantics: core_input::KeySemantics::Physical,
+            }],
+            true,
+            true,
+        );
+        assert!(awaiting_ack.captured_events.is_empty());
+        gate.observe_daemon_authorization(true, true, true);
+
+        let authorized = gate.prepare_batch(
+            vec![core_input::InputEvent::Key {
+                scan_code: 31,
+                state: core_input::KeyState::Up,
+                semantics: core_input::KeySemantics::Physical,
+            }],
+            true,
+            true,
+        );
+        assert_eq!(
+            authorized.captured_events,
+            vec![
+                core_input::InputEvent::Key {
+                    scan_code: 31,
+                    state: core_input::KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
+                },
+                core_input::InputEvent::Key {
+                    scan_code: 31,
+                    state: core_input::KeyState::Up,
+                    semantics: core_input::KeySemantics::Physical,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn lock_refusal_discards_staged_pre_ack_events() {
+        let mut gate = BrokerCaptureForwardingGate::default();
+        let awaiting_ack = gate.prepare_batch(
+            vec![core_input::InputEvent::Key {
+                scan_code: 30,
+                state: core_input::KeyState::Down,
+                semantics: core_input::KeySemantics::Physical,
+            }],
+            true,
+            true,
+        );
+        assert!(awaiting_ack.captured_events.is_empty());
+
+        gate.observe_daemon_authorization(false, false, false);
+        gate.observe_daemon_authorization(true, true, true);
+        let after_recovery = gate.prepare_batch(Vec::new(), true, true);
+
+        assert!(
+            after_recovery.captured_events.is_empty(),
+            "a refused generation must never leak its staged batch after later recovery"
+        );
     }
 
     #[test]

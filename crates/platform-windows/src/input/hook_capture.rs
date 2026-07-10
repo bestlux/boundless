@@ -121,6 +121,7 @@ struct CaptureRuntimeCore {
     lock_lease: Mutex<HookLockLease>,
     lock_active: AtomicBool,
     keyboard_hook_degraded: AtomicBool,
+    keyboard_hook_health_known: AtomicBool,
     last_keyboard_hook_observation: Mutex<Option<KeyboardHookObservation>>,
     escape_unlock_pending: AtomicU64,
     lease_expired_unlock_pending: AtomicU64,
@@ -225,6 +226,7 @@ impl CaptureRuntime {
             lock_lease: Mutex::new(HookLockLease::default()),
             lock_active: AtomicBool::new(false),
             keyboard_hook_degraded: AtomicBool::new(false),
+            keyboard_hook_health_known: AtomicBool::new(true),
             last_keyboard_hook_observation: Mutex::new(None),
             escape_unlock_pending: AtomicU64::new(0),
             lease_expired_unlock_pending: AtomicU64::new(0),
@@ -327,6 +329,7 @@ impl CaptureRuntime {
                 lock_lease: Mutex::new(HookLockLease::default()),
                 lock_active: AtomicBool::new(false),
                 keyboard_hook_degraded: AtomicBool::new(false),
+                keyboard_hook_health_known: AtomicBool::new(true),
                 last_keyboard_hook_observation: Mutex::new(None),
                 escape_unlock_pending: AtomicU64::new(0),
                 lease_expired_unlock_pending: AtomicU64::new(0),
@@ -417,6 +420,7 @@ impl CaptureRuntime {
 
     pub fn keyboard_hook_degraded(&self) -> bool {
         self.core.keyboard_hook_degraded.load(Ordering::Acquire)
+            || !self.core.keyboard_hook_health_known.load(Ordering::Acquire)
     }
 
     pub fn num_lock_state(&self) -> WindowsNumLockState {
@@ -629,7 +633,8 @@ fn escape_detector_available(runtime: &CaptureRuntimeCore) -> bool {
     match escape_detector_source(runtime) {
         Some(EscapeDetectorSource::RawKeyboard) => true,
         Some(EscapeDetectorSource::KeyboardHook) => {
-            !runtime.keyboard_hook_degraded.load(Ordering::Acquire)
+            runtime.keyboard_hook_health_known.load(Ordering::Acquire)
+                && !runtime.keyboard_hook_degraded.load(Ordering::Acquire)
         }
         None => false,
     }
@@ -647,8 +652,10 @@ fn set_raw_keyboard_escape_enabled_for(runtime: &CaptureRuntimeCore, enabled: bo
     } else {
         EscapeDetectorSource::KeyboardHook
     };
+    let mut raw_input_lost = false;
     let changed = match runtime.escape_detector_state.lock() {
         Ok(mut state) if state.source != next_source => {
+            raw_input_lost = !enabled && state.source == EscapeDetectorSource::RawKeyboard;
             state.source = next_source;
             state.gesture = HookRuntimeState::default();
             true
@@ -656,6 +663,12 @@ fn set_raw_keyboard_escape_enabled_for(runtime: &CaptureRuntimeCore, enabled: bo
         Ok(_) => false,
         Err(_) => true,
     };
+    if raw_input_lost {
+        runtime
+            .keyboard_hook_health_known
+            .store(false, Ordering::Release);
+        eprintln!("boundless_input_keyboard_hook state=unknown reason=raw_input_lost");
+    }
     if changed {
         if let Ok(mut observation) = runtime.last_keyboard_hook_observation.lock() {
             *observation = None;
@@ -918,7 +931,8 @@ fn set_hook_lock_active_for_arc(core: &CaptureRuntimeCore, active: bool) -> Resu
         }
     };
     let detector_available = state.source == EscapeDetectorSource::RawKeyboard
-        || !core.keyboard_hook_degraded.load(Ordering::Acquire);
+        || (core.keyboard_hook_health_known.load(Ordering::Acquire)
+            && !core.keyboard_hook_degraded.load(Ordering::Acquire));
     if active && !detector_available {
         core.lock_active.store(false, Ordering::Release);
         state.gesture = HookRuntimeState::default();
@@ -1707,6 +1721,7 @@ mod tests {
             lock_lease: Mutex::new(HookLockLease::default()),
             lock_active: AtomicBool::new(false),
             keyboard_hook_degraded: AtomicBool::new(false),
+            keyboard_hook_health_known: AtomicBool::new(true),
             last_keyboard_hook_observation: Mutex::new(None),
             escape_unlock_pending: AtomicU64::new(0),
             lease_expired_unlock_pending: AtomicU64::new(0),
@@ -2074,16 +2089,43 @@ mod tests {
     }
 
     #[test]
+    fn losing_raw_with_unknown_hook_health_fails_open_until_raw_recovers() {
+        let core = test_runtime_core();
+        set_raw_keyboard_escape_enabled_for(&core, true);
+        assert!(set_hook_lock_active_for(&core, true).expect("lock with raw detector"));
+        assert!(
+            !core.keyboard_hook_degraded.load(Ordering::Acquire),
+            "the scenario must not depend on a previously observed hook miss"
+        );
+
+        set_raw_keyboard_escape_enabled_for(&core, false);
+
+        assert!(!core.lock_active.load(Ordering::Acquire));
+        assert!(!core.keyboard_hook_health_known.load(Ordering::Acquire));
+        assert_eq!(
+            core.detector_unavailable_unlock_pending
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(
+            !set_hook_lock_active_for(&core, true).expect("reject unknown hook detector"),
+            "post-start Raw Input loss must not assume the fallback hook is healthy"
+        );
+
+        set_raw_keyboard_escape_enabled_for(&core, true);
+        assert!(set_hook_lock_active_for(&core, true).expect("raw detector recovered"));
+    }
+
+    #[test]
     fn switching_detector_source_discards_partial_gesture() {
         let core = test_runtime_core();
         set_hook_lock_active_for(&core, true).expect("lock");
-        set_raw_keyboard_escape_enabled_for(&core, true);
         let start = Instant::now();
         let window = Duration::from_millis(800);
 
         assert!(!try_escape_unlock_for_key_from_source_at(
             &core,
-            EscapeDetectorSource::RawKeyboard,
+            EscapeDetectorSource::KeyboardHook,
             VK_LCONTROL_CODE,
             KeyState::Down,
             start,
@@ -2091,17 +2133,17 @@ mod tests {
         ));
         assert!(!try_escape_unlock_for_key_from_source_at(
             &core,
-            EscapeDetectorSource::RawKeyboard,
+            EscapeDetectorSource::KeyboardHook,
             VK_LCONTROL_CODE,
             KeyState::Up,
             start + Duration::from_millis(20),
             window,
         ));
 
-        set_raw_keyboard_escape_enabled_for(&core, false);
+        set_raw_keyboard_escape_enabled_for(&core, true);
         assert!(!try_escape_unlock_for_key_from_source_at(
             &core,
-            EscapeDetectorSource::KeyboardHook,
+            EscapeDetectorSource::RawKeyboard,
             VK_LCONTROL_CODE,
             KeyState::Down,
             start + Duration::from_millis(100),
@@ -2110,7 +2152,7 @@ mod tests {
         assert!(core.lock_active.load(Ordering::Acquire));
         assert!(!try_escape_unlock_for_key_from_source_at(
             &core,
-            EscapeDetectorSource::KeyboardHook,
+            EscapeDetectorSource::RawKeyboard,
             VK_LCONTROL_CODE,
             KeyState::Up,
             start + Duration::from_millis(120),
@@ -2118,7 +2160,7 @@ mod tests {
         ));
         assert!(!try_escape_unlock_for_key_from_source_at(
             &core,
-            EscapeDetectorSource::KeyboardHook,
+            EscapeDetectorSource::RawKeyboard,
             VK_LCONTROL_CODE,
             KeyState::Down,
             start + Duration::from_millis(200),
@@ -2126,7 +2168,7 @@ mod tests {
         ));
         assert!(try_escape_unlock_for_key_from_source_at(
             &core,
-            EscapeDetectorSource::KeyboardHook,
+            EscapeDetectorSource::RawKeyboard,
             VK_LCONTROL_CODE,
             KeyState::Up,
             start + Duration::from_millis(220),

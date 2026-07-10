@@ -11,6 +11,7 @@ use core_input::{InputEvent, KeySemantics, KeyState, MouseButton};
 /// again. Fail-closed: silence means no interactive input path.
 pub(crate) const INPUT_BROKER_STALE_AFTER: Duration = Duration::from_secs(3);
 const MAX_BROKER_CAPTURED_EVENTS: usize = 4096;
+const MAX_PENDING_SAFETY_UNLOCKS_PER_CAUSE: u32 = 64;
 
 pub(crate) const INPUT_BROKER_BACKEND_MODE: &str = "user_session_broker";
 pub(crate) const SERVICE_SESSION_UNSUPPORTED_BACKEND_MODE: &str = "service_session_unsupported";
@@ -24,6 +25,13 @@ pub struct InputBrokerAttachment {
     pub lock_supported: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SafetyUnlockCounts {
+    pub escape: u32,
+    pub lease_expired: u32,
+    pub detector_unavailable: u32,
+}
+
 #[derive(Debug, Default)]
 struct InputBrokerRelayInner {
     service_session_input: bool,
@@ -31,11 +39,14 @@ struct InputBrokerRelayInner {
     attachment: Option<InputBrokerAttachment>,
     last_exchange_at: Option<Instant>,
     captured_events: VecDeque<InputEvent>,
-    escape_unlock_pending: u32,
+    safety_unlock_pending: SafetyUnlockCounts,
+    handoff_probe_dx: i32,
+    handoff_probe_dy: i32,
     cursor: Option<(i32, i32)>,
     virtual_bounds: Option<(i32, i32, i32, i32)>,
     desired_lock_active: bool,
     reported_lock_active: bool,
+    capture_forwarding_authorized: bool,
     dropped_event_count: u64,
     last_wheel_source_mode: Option<&'static str>,
     last_accepted_clipboard_sequence: Option<u64>,
@@ -82,10 +93,13 @@ impl InputBrokerRelay {
         inner.attachment = Some(attachment);
         inner.last_exchange_at = Some(Instant::now());
         inner.captured_events.clear();
-        inner.escape_unlock_pending = 0;
+        inner.safety_unlock_pending = SafetyUnlockCounts::default();
+        inner.handoff_probe_dx = 0;
+        inner.handoff_probe_dy = 0;
         inner.cursor = None;
         inner.virtual_bounds = None;
         inner.reported_lock_active = false;
+        inner.capture_forwarding_authorized = false;
         inner.dropped_event_count = 0;
         inner.last_wheel_source_mode = None;
         inner.last_accepted_clipboard_sequence = None;
@@ -104,6 +118,7 @@ impl InputBrokerRelay {
             inner.last_exchange_at = None;
             inner.desired_lock_active = false;
             inner.reported_lock_active = false;
+            inner.capture_forwarding_authorized = false;
         }
         matches
     }
@@ -113,6 +128,9 @@ impl InputBrokerRelay {
         let was_attached = inner.attachment.is_some();
         inner.attachment = None;
         inner.last_exchange_at = None;
+        inner.desired_lock_active = false;
+        inner.reported_lock_active = false;
+        inner.capture_forwarding_authorized = false;
         was_attached
     }
 
@@ -156,6 +174,9 @@ impl InputBrokerRelay {
         cursor: Option<(i32, i32)>,
         virtual_bounds: Option<(i32, i32, i32, i32)>,
         escape_unlock_count: u32,
+        lease_expired_unlock_count: u32,
+        detector_unavailable_unlock_count: u32,
+        handoff_probe: Option<(i32, i32)>,
         reported_lock_active: bool,
         dropped_event_count: u64,
     ) -> usize {
@@ -166,9 +187,25 @@ impl InputBrokerRelay {
         if virtual_bounds.is_some() {
             inner.virtual_bounds = virtual_bounds;
         }
-        inner.escape_unlock_pending = inner
-            .escape_unlock_pending
-            .saturating_add(escape_unlock_count);
+        inner.safety_unlock_pending.escape = inner
+            .safety_unlock_pending
+            .escape
+            .saturating_add(escape_unlock_count)
+            .min(MAX_PENDING_SAFETY_UNLOCKS_PER_CAUSE);
+        inner.safety_unlock_pending.lease_expired = inner
+            .safety_unlock_pending
+            .lease_expired
+            .saturating_add(lease_expired_unlock_count)
+            .min(MAX_PENDING_SAFETY_UNLOCKS_PER_CAUSE);
+        inner.safety_unlock_pending.detector_unavailable = inner
+            .safety_unlock_pending
+            .detector_unavailable
+            .saturating_add(detector_unavailable_unlock_count)
+            .min(MAX_PENDING_SAFETY_UNLOCKS_PER_CAUSE);
+        if let Some((dx, dy)) = handoff_probe {
+            inner.handoff_probe_dx = inner.handoff_probe_dx.saturating_add(dx);
+            inner.handoff_probe_dy = inner.handoff_probe_dy.saturating_add(dy);
+        }
         inner.reported_lock_active = reported_lock_active;
         inner.dropped_event_count = inner
             .dropped_event_count
@@ -196,8 +233,15 @@ impl InputBrokerRelay {
         inner.captured_events.drain(..).collect()
     }
 
-    pub(crate) fn take_escape_unlock_count(&self) -> u32 {
-        std::mem::take(&mut self.lock().escape_unlock_pending)
+    pub(crate) fn take_safety_unlock_counts(&self) -> SafetyUnlockCounts {
+        std::mem::take(&mut self.lock().safety_unlock_pending)
+    }
+
+    pub(crate) fn drain_handoff_probe(&self) -> Option<InputEvent> {
+        let mut inner = self.lock();
+        let dx = std::mem::take(&mut inner.handoff_probe_dx);
+        let dy = std::mem::take(&mut inner.handoff_probe_dy);
+        (dx != 0 || dy != 0).then_some(InputEvent::MouseMove { dx, dy })
     }
 
     pub(crate) fn cursor_position(&self) -> Option<(i32, i32)> {
@@ -212,6 +256,9 @@ impl InputBrokerRelay {
     /// state the broker reported as actually applied in its session.
     pub(crate) fn set_desired_lock_active(&self, active: bool) -> bool {
         let mut inner = self.lock();
+        if inner.desired_lock_active != active || !active {
+            inner.capture_forwarding_authorized = false;
+        }
         inner.desired_lock_active = active;
         if !Self::attachment_fresh(&inner, Instant::now()) {
             return false;
@@ -221,6 +268,14 @@ impl InputBrokerRelay {
 
     pub(crate) fn desired_lock_active(&self) -> bool {
         self.lock().desired_lock_active
+    }
+
+    pub(crate) fn capture_forwarding_authorized(&self) -> bool {
+        self.lock().capture_forwarding_authorized
+    }
+
+    pub(crate) fn set_capture_forwarding_authorized(&self, authorized: bool) {
+        self.lock().capture_forwarding_authorized = authorized;
     }
 
     pub(crate) fn lock_supported(&self) -> bool {
@@ -299,6 +354,9 @@ impl InputBrokerRelay {
         let mut inner = self.lock();
         inner.captured_events.clear();
         inner.pressed_keys.clear();
+        inner.capture_forwarding_authorized = false;
+        inner.handoff_probe_dx = 0;
+        inner.handoff_probe_dy = 0;
         inner.pressed_buttons.clear();
     }
 }
@@ -464,6 +522,9 @@ mod tests {
             None,
             None,
             0,
+            0,
+            0,
+            None,
             false,
             0,
         );
@@ -481,14 +542,55 @@ mod tests {
     #[test]
     fn capture_stream_reset_preserves_pending_safety_unlock() {
         let relay = InputBrokerRelay::default();
-        relay.push_broker_observations(Vec::new(), None, None, 1, false, 0);
+        relay.push_broker_observations(Vec::new(), None, None, 1, 2, 3, None, false, 0);
 
         relay.reset_capture_stream();
 
         assert_eq!(
-            relay.take_escape_unlock_count(),
-            1,
+            relay.take_safety_unlock_counts(),
+            SafetyUnlockCounts {
+                escape: 1,
+                lease_expired: 2,
+                detector_unavailable: 3,
+            },
             "a target transition must not consume broker safety reconciliation"
+        );
+    }
+
+    #[test]
+    fn handoff_probe_never_enters_captured_event_queue() {
+        let relay = InputBrokerRelay::default();
+        relay.push_broker_observations(Vec::new(), None, None, 0, 0, 0, Some((7, -2)), false, 0);
+
+        assert!(relay.drain_captured_events().is_empty());
+        assert_eq!(
+            relay.drain_handoff_probe(),
+            Some(InputEvent::MouseMove { dx: 7, dy: -2 })
+        );
+    }
+
+    #[test]
+    fn broker_safety_unlock_counts_are_memory_bounded() {
+        let relay = InputBrokerRelay::default();
+        relay.push_broker_observations(
+            Vec::new(),
+            None,
+            None,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX,
+            None,
+            false,
+            0,
+        );
+
+        assert_eq!(
+            relay.take_safety_unlock_counts(),
+            SafetyUnlockCounts {
+                escape: MAX_PENDING_SAFETY_UNLOCKS_PER_CAUSE,
+                lease_expired: MAX_PENDING_SAFETY_UNLOCKS_PER_CAUSE,
+                detector_unavailable: MAX_PENDING_SAFETY_UNLOCKS_PER_CAUSE,
+            }
         );
     }
 }
