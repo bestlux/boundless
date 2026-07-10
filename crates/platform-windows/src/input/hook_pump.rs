@@ -12,6 +12,17 @@ use super::hook_capture::{
 };
 
 const WHEEL_DEDUPE_HOLD: Duration = Duration::from_millis(20);
+const WHEEL_TOMBSTONE_TTL: Duration = Duration::from_millis(250);
+const WHEEL_TOMBSTONE_CAP: usize = 512;
+
+#[derive(Debug, Clone)]
+struct EmittedWheelTombstone {
+    delta_x: i32,
+    delta_y: i32,
+    source: WheelCaptureSource,
+    message_time_ms: u32,
+    expires_at: Instant,
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WheelSourceCounts {
@@ -30,6 +41,7 @@ pub struct HookInputPump {
     last_key_down: HashMap<u16, bool>,
     last_button_down: HashMap<u16, bool>,
     pending_wheels: VecDeque<CapturedWheelEvent>,
+    emitted_wheel_tombstones: VecDeque<EmittedWheelTombstone>,
     wheel_source_counts: WheelSourceCounts,
 }
 
@@ -50,6 +62,7 @@ impl HookInputPump {
             last_key_down: HashMap::new(),
             last_button_down: HashMap::new(),
             pending_wheels: VecDeque::new(),
+            emitted_wheel_tombstones: VecDeque::new(),
             wheel_source_counts: WheelSourceCounts::default(),
         }
     }
@@ -114,6 +127,54 @@ impl HookInputPump {
             && pending.delta_y == incoming.delta_y
     }
 
+    fn matching_emitted_wheel_copy(
+        tombstone: &EmittedWheelTombstone,
+        incoming: &CapturedWheelEvent,
+    ) -> bool {
+        tombstone.source.is_raw() != incoming.source.is_raw()
+            && tombstone.message_time_ms == incoming.message_time_ms
+            && tombstone.delta_x == incoming.delta_x
+            && tombstone.delta_y == incoming.delta_y
+    }
+
+    fn prune_wheel_tombstones(&mut self, now: Instant) {
+        while self
+            .emitted_wheel_tombstones
+            .front()
+            .is_some_and(|tombstone| tombstone.expires_at <= now)
+        {
+            self.emitted_wheel_tombstones.pop_front();
+        }
+    }
+
+    fn consume_emitted_wheel_copy(&mut self, incoming: &CapturedWheelEvent, now: Instant) -> bool {
+        self.prune_wheel_tombstones(now);
+        let Some(index) = self
+            .emitted_wheel_tombstones
+            .iter()
+            .position(|tombstone| Self::matching_emitted_wheel_copy(tombstone, incoming))
+        else {
+            return false;
+        };
+        self.emitted_wheel_tombstones.remove(index);
+        true
+    }
+
+    fn record_emitted_wheel_tombstone(&mut self, wheel: &CapturedWheelEvent, now: Instant) {
+        self.prune_wheel_tombstones(now);
+        if self.emitted_wheel_tombstones.len() >= WHEEL_TOMBSTONE_CAP {
+            self.emitted_wheel_tombstones.pop_front();
+        }
+        self.emitted_wheel_tombstones
+            .push_back(EmittedWheelTombstone {
+                delta_x: wheel.delta_x,
+                delta_y: wheel.delta_y,
+                source: wheel.source,
+                message_time_ms: wheel.message_time_ms,
+                expires_at: now + WHEEL_TOMBSTONE_TTL,
+            });
+    }
+
     fn emit_wheel(&mut self, wheel: CapturedWheelEvent, output: &mut Vec<InputEvent>) {
         match wheel.source {
             WheelCaptureSource::RawDevice => {
@@ -135,6 +196,9 @@ impl HookInputPump {
     }
 
     fn observe_wheel(&mut self, incoming: CapturedWheelEvent, output: &mut Vec<InputEvent>) {
+        if self.consume_emitted_wheel_copy(&incoming, Instant::now()) {
+            return;
+        }
         if let Some(index) = self
             .pending_wheels
             .iter()
@@ -159,6 +223,7 @@ impl HookInputPump {
         let mut retained = VecDeque::with_capacity(self.pending_wheels.len());
         while let Some(wheel) = self.pending_wheels.pop_front() {
             if now.saturating_duration_since(wheel.observed_at) >= WHEEL_DEDUPE_HOLD {
+                self.record_emitted_wheel_tombstone(&wheel, now);
                 self.emit_wheel(wheel, output);
             } else {
                 retained.push_back(wheel);
@@ -206,6 +271,7 @@ impl HookInputPump {
         self.last_key_down.clear();
         self.last_button_down.clear();
         self.pending_wheels.clear();
+        self.emitted_wheel_tombstones.clear();
         let _ = self.capture_runtime.drain_control_actions();
         let _ = self.capture_runtime.drain_events();
     }
@@ -490,6 +556,97 @@ mod tests {
                 raw_system: 0,
                 hook: 1,
             }
+        );
+    }
+
+    #[test]
+    fn late_raw_counterpart_is_suppressed_after_hook_fallback_emits() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let old = Instant::now() - WHEEL_DEDUPE_HOLD - Duration::from_millis(1);
+        tx.send(wheel(0, -40, WheelCaptureSource::Hook, 91, old))
+            .expect("queue hook fallback");
+        let runtime = CaptureRuntime::from_test_parts(rx, true);
+        let mut pump = HookInputPump::from_capture_runtime(runtime);
+        assert_eq!(
+            pump.poll_events(),
+            vec![InputEvent::MouseWheel {
+                delta_x: 0,
+                delta_y: -40,
+            }]
+        );
+
+        tx.send(wheel(0, -40, WheelCaptureSource::RawDevice, 91, old))
+            .expect("queue late raw counterpart");
+        assert!(
+            pump.poll_events().is_empty(),
+            "late raw delivery must not duplicate the emitted hook fallback"
+        );
+    }
+
+    #[test]
+    fn late_counterparts_consume_tombstones_one_to_one_for_repeated_events() {
+        let (tx, rx) = mpsc::sync_channel(8);
+        let old = Instant::now() - WHEEL_DEDUPE_HOLD - Duration::from_millis(1);
+        for _ in 0..2 {
+            tx.send(wheel(0, 1, WheelCaptureSource::Hook, 92, old))
+                .expect("queue repeated hook fallback");
+        }
+        let runtime = CaptureRuntime::from_test_parts(rx, true);
+        let mut pump = HookInputPump::from_capture_runtime(runtime);
+        assert_eq!(pump.poll_events().len(), 2);
+
+        for _ in 0..3 {
+            tx.send(wheel(0, 1, WheelCaptureSource::RawDevice, 92, old))
+                .expect("queue repeated late raw");
+        }
+        assert_eq!(
+            pump.poll_events(),
+            vec![InputEvent::MouseWheel {
+                delta_x: 0,
+                delta_y: 1,
+            }],
+            "two late counterparts consume two tombstones; the extra physical event survives"
+        );
+    }
+
+    #[test]
+    fn emitted_wheel_tombstones_are_memory_bounded() {
+        let event_count = WHEEL_TOMBSTONE_CAP + 20;
+        let (tx, rx) = mpsc::sync_channel(event_count);
+        let old = Instant::now() - WHEEL_DEDUPE_HOLD - Duration::from_millis(1);
+        for index in 0..event_count {
+            tx.send(wheel(0, 1, WheelCaptureSource::Hook, index as u32, old))
+                .expect("queue hook fallback");
+        }
+        let runtime = CaptureRuntime::from_test_parts(rx, true);
+        let mut pump = HookInputPump::from_capture_runtime(runtime);
+        assert_eq!(pump.poll_events().len(), event_count);
+        assert_eq!(pump.emitted_wheel_tombstones.len(), WHEEL_TOMBSTONE_CAP);
+    }
+
+    #[test]
+    fn expired_wheel_tombstone_is_pruned_without_collapsing_later_event() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let old = Instant::now() - WHEEL_DEDUPE_HOLD - Duration::from_millis(1);
+        tx.send(wheel(0, 40, WheelCaptureSource::Hook, 93, old))
+            .expect("queue hook fallback");
+        let runtime = CaptureRuntime::from_test_parts(rx, true);
+        let mut pump = HookInputPump::from_capture_runtime(runtime);
+        assert_eq!(pump.poll_events().len(), 1);
+        pump.emitted_wheel_tombstones
+            .front_mut()
+            .expect("hook tombstone")
+            .expires_at = Instant::now() - Duration::from_millis(1);
+
+        tx.send(wheel(0, 40, WheelCaptureSource::RawDevice, 93, old))
+            .expect("queue raw event after tombstone expiry");
+        assert_eq!(
+            pump.poll_events(),
+            vec![InputEvent::MouseWheel {
+                delta_x: 0,
+                delta_y: 40,
+            }],
+            "an expired signature must not collapse a later physical event"
         );
     }
 
