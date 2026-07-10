@@ -516,6 +516,45 @@ mod tests {
         }
     }
 
+    struct BlockingBrokerCaptureBackend {
+        relay: std::sync::Arc<crate::state::InputBrokerRelay>,
+        poll_entered: std::sync::mpsc::Sender<()>,
+        continue_poll: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl InputCaptureBackend for BlockingBrokerCaptureBackend {
+        fn drain_release_events(&mut self) -> Vec<InputEvent> {
+            self.relay.drain_release_events()
+        }
+
+        fn reset(&mut self) {
+            self.relay.reset_capture_stream();
+        }
+
+        fn poll_events(&mut self) -> Result<Vec<InputEvent>> {
+            let events = self.relay.drain_captured_events();
+            self.poll_entered.send(()).expect("signal captured batch");
+            self.continue_poll.recv().expect("release captured batch");
+            Ok(events)
+        }
+
+        fn drain_control_actions(&mut self) -> Vec<CaptureControlAction> {
+            Vec::new()
+        }
+
+        fn set_lock_active(&mut self, active: bool) -> Result<bool> {
+            Ok(self.relay.set_desired_lock_active(active))
+        }
+
+        fn lock_supported(&self) -> bool {
+            self.relay.lock_supported()
+        }
+
+        fn backend_mode(&self) -> &'static str {
+            crate::state::INPUT_BROKER_BACKEND_MODE
+        }
+    }
+
     async fn state_with_peer_for_input_test() -> (AppState, String, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "boundless-input-runtime-test-{}",
@@ -1827,6 +1866,118 @@ mod tests {
                 [InputEvent::Key { scan_code: 30, state: KeyState::Down }]
             )
         ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broker_detach_orders_final_release_after_in_flight_capture_batch() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        apply_startup_mode(&state, InputRuntimeMode::ServiceSessionUnsupported).await;
+        state.set_input_broker_allowed_user_sid("S-1-5-21-1000-2000-3000-1001");
+        let attach = state
+            .attach_input_broker(allowed_broker_client(), "test-broker".to_string(), true)
+            .await;
+        assert!(attach.accepted);
+        state
+            .set_input_capture_backend_mode(crate::state::INPUT_BROKER_BACKEND_MODE)
+            .await;
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set target");
+        let _ = state.drain_outgoing(&peer_id).await;
+
+        let observed = state
+            .exchange_input_broker(
+                allowed_broker_client(),
+                &attach.broker_token,
+                crate::state::InputBrokerExchangeObservations {
+                    captured_events: vec![InputEvent::Key {
+                        scan_code: 30,
+                        state: KeyState::Down,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(observed.accepted);
+
+        let (poll_entered_tx, poll_entered_rx) = std::sync::mpsc::channel();
+        let (continue_poll_tx, continue_poll_rx) = std::sync::mpsc::channel();
+        let capture_state = state.clone();
+        let capture_peer = peer_id.clone();
+        let capture = tokio::spawn(async move {
+            let mut backend = BlockingBrokerCaptureBackend {
+                relay: capture_state.input_broker_relay(),
+                poll_entered: poll_entered_tx,
+                continue_poll: continue_poll_rx,
+            };
+            let mut last_target = Some(capture_peer);
+            let mut edge_switch_state = EdgeSwitchState::default();
+            capture_and_queue_outgoing_frames(
+                &capture_state,
+                &mut backend,
+                &mut last_target,
+                &mut edge_switch_state,
+            )
+            .await;
+        });
+
+        tokio::task::spawn_blocking(move || {
+            poll_entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capture pass must drain the broker batch")
+        })
+        .await
+        .expect("join poll barrier");
+
+        let detach_state = state.clone();
+        let broker_token = attach.broker_token.clone();
+        let mut detach = tokio::spawn(async move {
+            detach_state
+                .detach_input_broker(allowed_broker_client(), &broker_token)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut detach)
+                .await
+                .is_err(),
+            "detach must wait until the already-drained capture batch is queued"
+        );
+
+        continue_poll_tx.send(()).expect("release capture pass");
+        capture.await.expect("capture pass");
+        assert!(detach.await.expect("detach task"));
+
+        let routed_events = state
+            .drain_outgoing(&peer_id)
+            .await
+            .into_iter()
+            .filter_map(|payload| match payload {
+                crate::state::OutboundPayload::InputFrame { events, .. } => Some(events),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            routed_events,
+            vec![
+                InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Down,
+                },
+                InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Up,
+                },
+            ],
+            "the final release must be ordered after any pre-detach captured down event"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

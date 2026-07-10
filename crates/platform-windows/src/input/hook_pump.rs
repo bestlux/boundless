@@ -1,12 +1,24 @@
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, VecDeque},
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use core_input::{InputEvent, KeyState};
 
 use super::hook_capture::{
-    CaptureRuntime, HookCaptureEvent, HookControlAction, mouse_button_from_virtual_key,
-    virtual_key_for_mouse_button,
+    CaptureRuntime, CapturedWheelEvent, HookCaptureEvent, HookControlAction, WheelCaptureSource,
+    mouse_button_from_virtual_key, virtual_key_for_mouse_button,
 };
+
+const WHEEL_DEDUPE_HOLD: Duration = Duration::from_millis(20);
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WheelSourceCounts {
+    pub raw_device: u32,
+    pub raw_system: u32,
+    pub hook: u32,
+}
 
 /// Translates raw [`CaptureRuntime`] hook events into clean [`InputEvent`]
 /// streams with pressed-state tracking, pending-move coalescing, and
@@ -17,6 +29,8 @@ pub struct HookInputPump {
     last_cursor: Option<(i32, i32)>,
     last_key_down: HashMap<u16, bool>,
     last_button_down: HashMap<u16, bool>,
+    pending_wheels: VecDeque<CapturedWheelEvent>,
+    wheel_source_counts: WheelSourceCounts,
 }
 
 impl HookInputPump {
@@ -35,6 +49,8 @@ impl HookInputPump {
             last_cursor: None,
             last_key_down: HashMap::new(),
             last_button_down: HashMap::new(),
+            pending_wheels: VecDeque::new(),
+            wheel_source_counts: WheelSourceCounts::default(),
         }
     }
 
@@ -91,6 +107,66 @@ impl HookInputPump {
         }
     }
 
+    fn matching_wheel_copy(pending: &CapturedWheelEvent, incoming: &CapturedWheelEvent) -> bool {
+        pending.source.is_raw() != incoming.source.is_raw()
+            && pending.message_time_ms == incoming.message_time_ms
+            && pending.delta_x == incoming.delta_x
+            && pending.delta_y == incoming.delta_y
+    }
+
+    fn emit_wheel(&mut self, wheel: CapturedWheelEvent, output: &mut Vec<InputEvent>) {
+        match wheel.source {
+            WheelCaptureSource::RawDevice => {
+                self.wheel_source_counts.raw_device =
+                    self.wheel_source_counts.raw_device.saturating_add(1);
+            }
+            WheelCaptureSource::RawSystem => {
+                self.wheel_source_counts.raw_system =
+                    self.wheel_source_counts.raw_system.saturating_add(1);
+            }
+            WheelCaptureSource::Hook => {
+                self.wheel_source_counts.hook = self.wheel_source_counts.hook.saturating_add(1);
+            }
+        }
+        output.push(InputEvent::MouseWheel {
+            delta_x: wheel.delta_x,
+            delta_y: wheel.delta_y,
+        });
+    }
+
+    fn observe_wheel(&mut self, incoming: CapturedWheelEvent, output: &mut Vec<InputEvent>) {
+        if let Some(index) = self
+            .pending_wheels
+            .iter()
+            .position(|pending| Self::matching_wheel_copy(pending, &incoming))
+        {
+            let counterpart = self
+                .pending_wheels
+                .remove(index)
+                .expect("matching pending wheel must remain present");
+            let canonical = if incoming.source.is_raw() {
+                incoming
+            } else {
+                counterpart
+            };
+            self.emit_wheel(canonical, output);
+        } else {
+            self.pending_wheels.push_back(incoming);
+        }
+    }
+
+    fn flush_expired_wheels(&mut self, now: Instant, output: &mut Vec<InputEvent>) {
+        let mut retained = VecDeque::with_capacity(self.pending_wheels.len());
+        while let Some(wheel) = self.pending_wheels.pop_front() {
+            if now.saturating_duration_since(wheel.observed_at) >= WHEEL_DEDUPE_HOLD {
+                self.emit_wheel(wheel, output);
+            } else {
+                retained.push_back(wheel);
+            }
+        }
+        self.pending_wheels = retained;
+    }
+
     pub fn drain_release_events(&mut self) -> Vec<InputEvent> {
         let mut events = Vec::new();
 
@@ -129,6 +205,7 @@ impl HookInputPump {
         self.last_cursor = None;
         self.last_key_down.clear();
         self.last_button_down.clear();
+        self.pending_wheels.clear();
         let _ = self.capture_runtime.drain_control_actions();
         let _ = self.capture_runtime.drain_events();
     }
@@ -138,6 +215,7 @@ impl HookInputPump {
 
         let mut output = Vec::new();
         let mut pending_move: Option<(i32, i32)> = None;
+        self.flush_expired_wheels(Instant::now(), &mut output);
 
         for event in self.capture_runtime.drain_events() {
             match event {
@@ -162,10 +240,15 @@ impl HookInputPump {
                     Self::flush_pending_move(&mut output, &mut pending_move);
                     self.update_pressed_state_and_filter(input_event, &mut output);
                 }
+                HookCaptureEvent::Wheel(wheel) => {
+                    Self::flush_pending_move(&mut output, &mut pending_move);
+                    self.observe_wheel(wheel, &mut output);
+                }
             }
         }
 
         Self::flush_pending_move(&mut output, &mut pending_move);
+        self.flush_expired_wheels(Instant::now(), &mut output);
 
         output
     }
@@ -218,6 +301,10 @@ impl HookInputPump {
     pub fn take_dropped_event_count(&mut self) -> u64 {
         self.capture_runtime.take_dropped_event_count()
     }
+
+    pub fn take_wheel_source_counts(&mut self) -> WheelSourceCounts {
+        std::mem::take(&mut self.wheel_source_counts)
+    }
 }
 
 #[cfg(test)]
@@ -225,14 +312,36 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    fn wheel(
+        delta_x: i32,
+        delta_y: i32,
+        source: WheelCaptureSource,
+        message_time_ms: u32,
+        observed_at: Instant,
+    ) -> HookCaptureEvent {
+        HookCaptureEvent::Wheel(CapturedWheelEvent {
+            delta_x,
+            delta_y,
+            source,
+            message_time_ms,
+            observed_at,
+        })
+    }
+
     #[test]
     fn high_resolution_wheel_delta_survives_hook_pump() {
         let (tx, rx) = mpsc::sync_channel(4);
-        tx.send(HookCaptureEvent::Input(InputEvent::MouseWheel {
-            delta_x: -17,
-            delta_y: 30,
-        }))
-        .expect("queue wheel");
+        let observed_at = Instant::now();
+        tx.send(wheel(-17, 30, WheelCaptureSource::Hook, 41, observed_at))
+            .expect("queue hook wheel");
+        tx.send(wheel(
+            -17,
+            30,
+            WheelCaptureSource::RawDevice,
+            41,
+            observed_at,
+        ))
+        .expect("queue raw wheel");
         let runtime = CaptureRuntime::from_test_parts(rx, true);
         let mut pump = HookInputPump::from_capture_runtime(runtime);
 
@@ -243,5 +352,158 @@ mod tests {
                 delta_y: 30,
             }]
         );
+        assert_eq!(
+            pump.take_wheel_source_counts(),
+            WheelSourceCounts {
+                raw_device: 1,
+                raw_system: 0,
+                hook: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn signed_wheel_deltas_dedupe_one_to_one_across_raw_and_hook_sources() {
+        let cases = [1, -1, 40, -40, 120, -120];
+        let (tx, rx) = mpsc::sync_channel(32);
+        let observed_at = Instant::now();
+        for (index, delta) in cases.into_iter().enumerate() {
+            let timestamp = 100 + index as u32;
+            tx.send(wheel(
+                0,
+                delta,
+                WheelCaptureSource::Hook,
+                timestamp,
+                observed_at,
+            ))
+            .expect("queue hook vertical wheel");
+            tx.send(wheel(
+                0,
+                delta,
+                WheelCaptureSource::RawDevice,
+                timestamp,
+                observed_at,
+            ))
+            .expect("queue raw vertical wheel");
+            tx.send(wheel(
+                delta,
+                0,
+                WheelCaptureSource::RawSystem,
+                timestamp + 50,
+                observed_at,
+            ))
+            .expect("queue raw horizontal wheel");
+            tx.send(wheel(
+                delta,
+                0,
+                WheelCaptureSource::Hook,
+                timestamp + 50,
+                observed_at,
+            ))
+            .expect("queue hook horizontal wheel");
+        }
+        let runtime = CaptureRuntime::from_test_parts(rx, true);
+        let mut pump = HookInputPump::from_capture_runtime(runtime);
+
+        let expected = cases
+            .into_iter()
+            .flat_map(|delta| {
+                [
+                    InputEvent::MouseWheel {
+                        delta_x: 0,
+                        delta_y: delta,
+                    },
+                    InputEvent::MouseWheel {
+                        delta_x: delta,
+                        delta_y: 0,
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pump.poll_events(), expected);
+        assert_eq!(
+            pump.take_wheel_source_counts(),
+            WheelSourceCounts {
+                raw_device: 6,
+                raw_system: 6,
+                hook: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn repeated_identical_wheels_with_one_timestamp_remain_distinct() {
+        let (tx, rx) = mpsc::sync_channel(8);
+        let observed_at = Instant::now();
+        for source in [
+            WheelCaptureSource::Hook,
+            WheelCaptureSource::Hook,
+            WheelCaptureSource::RawDevice,
+            WheelCaptureSource::RawDevice,
+        ] {
+            tx.send(wheel(0, 1, source, 55, observed_at))
+                .expect("queue repeated wheel");
+        }
+        let runtime = CaptureRuntime::from_test_parts(rx, true);
+        let mut pump = HookInputPump::from_capture_runtime(runtime);
+
+        assert_eq!(
+            pump.poll_events(),
+            vec![
+                InputEvent::MouseWheel {
+                    delta_x: 0,
+                    delta_y: 1,
+                },
+                InputEvent::MouseWheel {
+                    delta_x: 0,
+                    delta_y: 1,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn hook_only_wheels_fall_back_after_bounded_dedupe_hold() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        tx.send(wheel(
+            0,
+            -40,
+            WheelCaptureSource::Hook,
+            90,
+            Instant::now() - WHEEL_DEDUPE_HOLD - Duration::from_millis(1),
+        ))
+        .expect("queue fallback wheel");
+        let runtime = CaptureRuntime::from_test_parts(rx, true);
+        let mut pump = HookInputPump::from_capture_runtime(runtime);
+
+        assert_eq!(
+            pump.poll_events(),
+            vec![InputEvent::MouseWheel {
+                delta_x: 0,
+                delta_y: -40,
+            }]
+        );
+        assert_eq!(
+            pump.take_wheel_source_counts(),
+            WheelSourceCounts {
+                raw_device: 0,
+                raw_system: 0,
+                hook: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn identical_wheels_with_different_timestamps_are_not_deduped() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let observed_at = Instant::now() - WHEEL_DEDUPE_HOLD - Duration::from_millis(1);
+        tx.send(wheel(0, 1, WheelCaptureSource::Hook, 100, observed_at))
+            .expect("queue first wheel");
+        tx.send(wheel(0, 1, WheelCaptureSource::RawDevice, 101, observed_at))
+            .expect("queue second wheel");
+        let runtime = CaptureRuntime::from_test_parts(rx, true);
+        let mut pump = HookInputPump::from_capture_runtime(runtime);
+
+        assert_eq!(pump.poll_events().len(), 2);
     }
 }

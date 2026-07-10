@@ -306,6 +306,10 @@ pub(super) async fn capture_and_queue_outgoing_frames(
     last_capture_target: &mut Option<String>,
     edge_switch_state: &mut EdgeSwitchState,
 ) {
+    // Serialize one captured batch through routing with broker detach. A
+    // detach that wins this lock clears the relay before polling; a capture
+    // pass that wins queues its batch before detach's final releases.
+    let _capture_transition = state.input_capture_transition.lock().await;
     let mut capture_target = state.active_input_capture_target().await;
     sync_local_input_lock(state, backend, capture_target.is_some()).await;
 

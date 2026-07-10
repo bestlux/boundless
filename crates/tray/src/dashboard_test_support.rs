@@ -39,6 +39,7 @@ pub(super) fn test_app() -> DashboardApp {
         native_window_handle: None,
         activation_requested: Arc::new(AtomicBool::new(false)),
         _single_instance_guard: None,
+        _input_broker_supervisor: None,
         layout_grid: HashMap::new(),
         layout_unassigned: Vec::new(),
         layout_initialized: false,

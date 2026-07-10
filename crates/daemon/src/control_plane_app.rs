@@ -590,6 +590,9 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
                     dropped_event_count: command.dropped_event_count,
                     injected_frame_count: command.injected_frame_count,
                     inject_failure_count: command.inject_failure_count,
+                    raw_device_wheel_event_count: command.raw_device_wheel_event_count,
+                    raw_system_wheel_event_count: command.raw_system_wheel_event_count,
+                    hook_wheel_event_count: command.hook_wheel_event_count,
                 },
             )
             .await;

@@ -166,4 +166,16 @@ mod tests {
         assert!(decoded.is_empty());
         assert_eq!(dropped, 3);
     }
+
+    #[test]
+    fn preserves_signed_high_resolution_wheel_values() {
+        for delta in [1, -1, 40, -40, 120, -120] {
+            let event = InputEvent::MouseWheel {
+                delta_x: delta,
+                delta_y: -delta,
+            };
+            let encoded = broker_event_from_input_event(&event);
+            assert_eq!(input_event_from_broker_event(&encoded), Some(event));
+        }
+    }
 }

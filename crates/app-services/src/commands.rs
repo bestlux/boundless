@@ -186,6 +186,9 @@ pub struct InputBrokerExchangeCommand {
     pub dropped_event_count: u64,
     pub injected_frame_count: u32,
     pub inject_failure_count: u32,
+    pub raw_device_wheel_event_count: u32,
+    pub raw_system_wheel_event_count: u32,
+    pub hook_wheel_event_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

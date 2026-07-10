@@ -809,6 +809,9 @@ impl ControlPlaneService for ControlPlaneApi {
                     .saturating_add(undecodable_events as u64),
                 injected_frame_count: request.injected_frame_count,
                 inject_failure_count: request.inject_failure_count,
+                raw_device_wheel_event_count: request.raw_device_wheel_event_count,
+                raw_system_wheel_event_count: request.raw_system_wheel_event_count,
+                hook_wheel_event_count: request.hook_wheel_event_count,
             })
             .await
             .map_err(|error| Status::internal(format!("exchange input broker: {error:#}")))?;

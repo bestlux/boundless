@@ -37,6 +37,7 @@ struct InputBrokerRelayInner {
     desired_lock_active: bool,
     reported_lock_active: bool,
     dropped_event_count: u64,
+    last_wheel_source_mode: Option<&'static str>,
     pressed_key_scan_codes: Vec<u16>,
     pressed_buttons: Vec<MouseButton>,
 }
@@ -85,6 +86,7 @@ impl InputBrokerRelay {
         inner.virtual_bounds = None;
         inner.reported_lock_active = false;
         inner.dropped_event_count = 0;
+        inner.last_wheel_source_mode = None;
         inner.pressed_key_scan_codes.clear();
         inner.pressed_buttons.clear();
     }
@@ -232,6 +234,33 @@ impl InputBrokerRelay {
         std::mem::take(&mut self.lock().dropped_event_count)
     }
 
+    /// Returns a source mode only when non-empty wheel observations change
+    /// the active mode. Counts are aggregate-only and never expose a Raw
+    /// Input device handle or other hardware identity.
+    pub(crate) fn observe_wheel_source_counts(
+        &self,
+        raw_device: u32,
+        raw_system: u32,
+        hook: u32,
+    ) -> Option<&'static str> {
+        let present = [raw_device > 0, raw_system > 0, hook > 0];
+        let source_count = present.into_iter().filter(|present| *present).count();
+        let mode = match source_count {
+            0 => return None,
+            1 if raw_device > 0 => "raw_device",
+            1 if raw_system > 0 => "raw_system",
+            1 => "hook_fallback",
+            _ => "mixed",
+        };
+
+        let mut inner = self.lock();
+        if inner.last_wheel_source_mode == Some(mode) {
+            return None;
+        }
+        inner.last_wheel_source_mode = Some(mode);
+        Some(mode)
+    }
+
     /// Synthesizes release events for keys/buttons the broker reported as
     /// still pressed, so a capture-target switch or broker loss does not
     /// strand held input on the previous target.
@@ -327,5 +356,45 @@ fn mouse_button_order(button: MouseButton) -> u8 {
         MouseButton::Middle => 2,
         MouseButton::X1 => 3,
         MouseButton::X2 => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wheel_source_diagnostics_emit_only_on_mode_transitions() {
+        let relay = InputBrokerRelay::default();
+
+        assert_eq!(relay.observe_wheel_source_counts(0, 0, 0), None);
+        assert_eq!(
+            relay.observe_wheel_source_counts(3, 0, 0),
+            Some("raw_device")
+        );
+        assert_eq!(relay.observe_wheel_source_counts(1, 0, 0), None);
+        assert_eq!(
+            relay.observe_wheel_source_counts(0, 0, 2),
+            Some("hook_fallback")
+        );
+        assert_eq!(relay.observe_wheel_source_counts(1, 0, 1), Some("mixed"));
+        assert_eq!(relay.observe_wheel_source_counts(0, 4, 1), None);
+    }
+
+    #[test]
+    fn broker_attach_resets_wheel_source_diagnostic_mode() {
+        let relay = InputBrokerRelay::default();
+        assert_eq!(
+            relay.observe_wheel_source_counts(1, 0, 0),
+            Some("raw_device")
+        );
+        relay.attach(InputBrokerAttachment {
+            broker_token: "test".to_string(),
+            lock_supported: true,
+        });
+        assert_eq!(
+            relay.observe_wheel_source_counts(1, 0, 0),
+            Some("raw_device")
+        );
     }
 }

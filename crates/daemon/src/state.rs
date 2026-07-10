@@ -17,7 +17,7 @@ pub use peer_transport::{
     TransportEventRecord, TransportSessionClaim,
 };
 use rustls::pki_types::{CertificateDer, pem::PemObject};
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{Mutex, RwLock, watch};
 use tracing::info;
 
 use core_clipboard::{
@@ -309,6 +309,7 @@ pub struct AppState {
     discovery: Arc<DiscoveryState>,
     input: Arc<InputState>,
     input_broker: Arc<InputBrokerRelay>,
+    pub(crate) input_capture_transition: Arc<Mutex<()>>,
     anti_idle: Arc<AntiIdleState>,
     outbound_file_transfers: Arc<RwLock<HashMap<String, OutboundFileTransfer>>>,
     file_transfer_records: Arc<RwLock<VecDeque<FileTransferRecord>>>,
