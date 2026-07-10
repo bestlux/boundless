@@ -2285,7 +2285,7 @@ mod tests {
 
     #[test]
     fn external_injected_num_lock_updates_authority_but_boundless_input_does_not() {
-        let mut state = HookRuntimeState::default();
+        let mut state = KeyboardRuntimeState::default();
         let num_lock_state = WindowsNumLockState::new(false);
 
         assert!(should_observe_external_injected_num_lock(
