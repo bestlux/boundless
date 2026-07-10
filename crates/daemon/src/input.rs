@@ -1690,6 +1690,7 @@ mod tests {
             vec![vec![InputEvent::Key {
                 scan_code: 30,
                 state: KeyState::Down,
+                semantics: KeySemantics::Physical,
             }]],
             Vec::new(),
         )
