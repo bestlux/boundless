@@ -237,6 +237,46 @@ Done when the implementation matches the approved responsive states, keyboard an
 
 ---
 
+## BND-NEXT-34 (P1, ready for agent): Keep high-rate runtime telemetry from evicting diagnostic events
+
+**Category:** bug
+
+### Context and evidence
+
+BND-NEXT-25 removed retained `input_runtime_wake` safety-tick noise and added CLI kind filters, but 5.0.12 two-PC dogfood exposed a second high-rate path. While the user pushed the cursor through a configured edge, `runtime_wake channel=input_capture source=input_broker_exchange` was retained roughly every 15 milliseconds. The bounded event ring then evicted the useful `input_handoff` transition before a follow-up `transport events` query could retrieve it. Live status proved that the cursor reached the edge and capture briefly selected and locked to the trusted peer, but retained telemetry could not show whether frames were queued, sent, received, injected, skipped, or failed.
+
+### Desired behavior
+
+High-frequency wake/activity signals must remain available as bounded health summaries without displacing state transitions, failures, or causal input-path evidence. Operators should be able to answer, from one bounded query or support bundle, whether an edge handoff was detected and where input stopped: capture, queue, transport, receive, or injection. CLI filtering is useful for presentation, but it is not sufficient if important records have already been evicted from storage.
+
+### Key interfaces
+
+- The bounded runtime/transport event store and its retention policy: distinguish diagnostic state transitions and failures from high-rate activity samples.
+- Runtime wake recording: coalesce, rate-limit, aggregate, or count repeated equivalent wake events while preserving useful totals and last-seen timestamps.
+- Input handoff telemetry: retain a correlated path from edge detection through capture target change, outgoing frame disposition, remote receive, and injection outcome without logging every mouse frame.
+- CLI and diagnostic bundle queries: expose useful filters and summaries over the retained data, with clear event-kind vocabulary and bounded output.
+
+### Acceptance criteria
+
+- During at least 60 seconds of continuous mouse movement and broker exchange, the retained ring still contains the most recent `input_handoff` state transition and any input queue/transport/injection failure.
+- Equivalent high-rate wake events are represented by bounded aggregate or sampled records that include count and time range; retained-event growth is not proportional to mouse polling frequency.
+- A diagnostic query can distinguish: edge never detected, capture activated, outgoing frames queued, transport delivery failed, remote frames received, injection skipped, and injection failed.
+- `--kind` and `--exclude-kind` continue to filter before `--limit`, and filtering behavior has deterministic tests against both aggregate and high-value event kinds.
+- Event retention has explicit priority/budget tests proving low-value activity cannot evict newer state transitions or errors under sustained input, clipboard, anti-idle, and reconnect activity.
+- Default diagnostics remain local, bounded, and redacted; raw per-movement logging is not introduced.
+
+### Out of scope
+
+- Fixing the separate 5.0.12 input-delivery failure observed in the same dogfood session.
+- Building a general remote telemetry or cloud logging service.
+- Retaining every mouse/keyboard event or increasing the ring without a bounded retention policy.
+
+### Validation
+
+Focused event-store/runtime tests with a synthetic high-rate broker stream; CLI filter tests; diagnostics-bundle redaction tests; installed two-PC edge-handoff trace proving useful events remain queryable after sustained movement.
+
+---
+
 ## Post-launch candidates
 
 ### BND-NEXT-30: Remote audio device sharing (mic + output across peers)
