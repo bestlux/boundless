@@ -291,7 +291,7 @@ struct RetainedTransportEvent {
     event: TransportEventRecord,
     first_timestamp: DateTime<Utc>,
     sample_count: u64,
-    total_size_bytes: u64,
+    retained_size_bytes: u64,
     aggregation_key: Option<String>,
     priority: TransportEventPriority,
 }
@@ -300,7 +300,7 @@ impl RetainedTransportEvent {
     fn new(mut event: TransportEventRecord) -> Self {
         event.detail = sanitize_clipboard_event_detail(&event.kind, &event.detail);
         let first_timestamp = event.timestamp;
-        let total_size_bytes = event.size_bytes;
+        let retained_size_bytes = event.size_bytes;
         let priority = transport_event_priority(&event.kind);
         let aggregation_key = transport_event_is_aggregated(&event.kind)
             .then(|| transport_event_aggregation_key(&event));
@@ -308,7 +308,7 @@ impl RetainedTransportEvent {
             event,
             first_timestamp,
             sample_count: 1,
-            total_size_bytes,
+            retained_size_bytes,
             aggregation_key,
             priority,
         }
@@ -317,13 +317,17 @@ impl RetainedTransportEvent {
     fn merge(&mut self, mut event: TransportEventRecord) {
         event.detail = sanitize_clipboard_event_detail(&event.kind, &event.detail);
         self.sample_count = self.sample_count.saturating_add(1);
-        self.total_size_bytes = self.total_size_bytes.saturating_add(event.size_bytes);
+        self.retained_size_bytes = if transport_event_uses_latest_size(&event.kind) {
+            event.size_bytes
+        } else {
+            self.retained_size_bytes.saturating_add(event.size_bytes)
+        };
         self.event = event;
     }
 
     fn snapshot(&self) -> TransportEventRecord {
         let mut event = self.event.clone();
-        event.size_bytes = self.total_size_bytes;
+        event.size_bytes = self.retained_size_bytes;
         if self.sample_count > 1 {
             event.detail = format!(
                 "{} sample_count={} first_seen={} last_seen={}",
@@ -740,6 +744,7 @@ fn transport_event_priority(kind: &str) -> TransportEventPriority {
             | "input_inject_queued"
             | "input_inject_applied"
             | "input_broker_inject_dispatched"
+            | "input_queue_coalesced"
             | "anti_idle_pulse_sent"
             | "anti_idle_pulse_received"
             | "file_transfer_progress"
@@ -770,16 +775,42 @@ fn transport_event_is_aggregated(kind: &str) -> bool {
 }
 
 fn transport_event_aggregation_key(event: &TransportEventRecord) -> String {
-    let dimensions = event
-        .detail
-        .split_whitespace()
-        .filter(|token| !transport_event_token_is_volatile(token))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let dimensions = match event.kind.as_str() {
+        "input_queue_coalesced" => canonical_detail_tokens(&event.detail, &["queue"]),
+        "input_queue_overflow_drop" => canonical_detail_tokens(&event.detail, &["queue", "reason"]),
+        "input_hook_queue_dropped" | "input_broker_inject_report" => String::new(),
+        "file_transfer_progress" => canonical_detail_tokens(&event.detail, &["transfer_id"]),
+        _ => event
+            .detail
+            .split_whitespace()
+            .filter(|token| !transport_event_token_is_volatile(token))
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
     format!(
         "{}\u{1f}{}\u{1f}{}\u{1f}{dimensions}",
         event.direction, event.kind, event.peer_id
     )
+}
+
+fn canonical_detail_tokens(detail: &str, keys: &[&str]) -> String {
+    keys.iter()
+        .filter_map(|expected_key| {
+            detail.split_whitespace().find(|token| {
+                token
+                    .split_once('=')
+                    .is_some_and(|(key, _value)| key == *expected_key)
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn transport_event_uses_latest_size(kind: &str) -> bool {
+    kind == "file_transfer_progress"
+        || kind.ends_with("_failed")
+        || kind.ends_with("_rejected")
+        || kind.ends_with("_dropped")
 }
 
 fn transport_event_token_is_volatile(token: &str) -> bool {
@@ -787,6 +818,8 @@ fn transport_event_token_is_volatile(token: &str) -> bool {
         return false;
     };
     key == "sequence"
+        || key == "older_sequence"
+        || key == "newer_sequence"
         || key == "attempt"
         || key == "attempts"
         || key == "generation"
@@ -795,6 +828,12 @@ fn transport_event_token_is_volatile(token: &str) -> bool {
         || key == "events"
         || key == "injected_frames"
         || key == "failed_frames"
+        || key == "merged_events"
+        || key == "dropped_events"
+        || key == "bytes_received"
+        || key == "total_bytes"
+        || key == "offset_bytes"
+        || key == "length_bytes"
         || key.ends_with("_count")
         || key.ends_with("_ms")
         || key.ends_with("_unix_ms")
@@ -913,6 +952,108 @@ mod tests {
             assert!(summary.detail.contains("first_seen="));
             assert!(summary.detail.contains("last_seen="));
         }
+    }
+
+    #[tokio::test]
+    async fn producer_shaped_activity_uses_canonical_keys_and_size_semantics() {
+        let state = TransportRuntimeState::default();
+        let started = Utc::now();
+        state.record_transport_event(test_event(
+            started,
+            "input_handoff",
+            "local",
+            "peer-a",
+            "direction=left activated=true".to_string(),
+        ));
+
+        let mut expected_merged_events = 0u64;
+        for sample in 0..4_000u64 {
+            let timestamp = started + chrono::Duration::milliseconds((sample * 15) as i64);
+            let merged_events = sample % 4 + 1;
+            expected_merged_events += merged_events;
+
+            let mut coalesced = test_event(
+                timestamp,
+                "input_queue_coalesced",
+                "local",
+                "peer-a",
+                format!(
+                    "queue=outgoing_input older_sequence={sample} newer_sequence={} merged_events={merged_events}",
+                    sample + 1
+                ),
+            );
+            coalesced.size_bytes = merged_events;
+            state.record_transport_event(coalesced);
+
+            let mut hook_drop = test_event(
+                timestamp,
+                "input_hook_queue_dropped",
+                "local",
+                "none",
+                format!("dropped_events={}", sample + 1),
+            );
+            hook_drop.size_bytes = 0;
+            state.record_transport_event(hook_drop);
+
+            let received = (sample + 1) * 64;
+            let mut inbound_progress = test_event(
+                timestamp,
+                "file_transfer_progress",
+                "incoming",
+                "peer-a",
+                format!(
+                    "transfer_id=file-in bytes_received={received} total_bytes={}",
+                    4_000 * 64
+                ),
+            );
+            inbound_progress.size_bytes = received;
+            state.record_transport_event(inbound_progress);
+
+            let mut outbound_progress = test_event(
+                timestamp,
+                "file_transfer_progress",
+                "outgoing",
+                "peer-a",
+                format!(
+                    "transfer_id=file-out offset_bytes={} length_bytes=64",
+                    sample * 64
+                ),
+            );
+            outbound_progress.size_bytes = 64;
+            state.record_transport_event(outbound_progress);
+        }
+
+        let events = state.transport_events_snapshot().await;
+        assert!(events.iter().any(|event| event.kind == "input_handoff"));
+
+        let coalesced = events
+            .iter()
+            .filter(|event| event.kind == "input_queue_coalesced")
+            .collect::<Vec<_>>();
+        assert_eq!(coalesced.len(), 1);
+        assert!(coalesced[0].detail.contains("sample_count=4000"));
+        assert_eq!(coalesced[0].size_bytes, expected_merged_events);
+
+        let hook_drops = events
+            .iter()
+            .filter(|event| event.kind == "input_hook_queue_dropped")
+            .collect::<Vec<_>>();
+        assert_eq!(hook_drops.len(), 1);
+        assert!(hook_drops[0].detail.contains("sample_count=4000"));
+
+        let inbound_progress = events
+            .iter()
+            .find(|event| event.kind == "file_transfer_progress" && event.direction == "incoming")
+            .expect("inbound transfer summary");
+        assert!(inbound_progress.detail.contains("sample_count=4000"));
+        assert_eq!(inbound_progress.size_bytes, 4_000 * 64);
+
+        let outbound_progress = events
+            .iter()
+            .find(|event| event.kind == "file_transfer_progress" && event.direction == "outgoing")
+            .expect("outbound transfer summary");
+        assert!(outbound_progress.detail.contains("sample_count=4000"));
+        assert_eq!(outbound_progress.size_bytes, 64);
     }
 
     #[tokio::test]
