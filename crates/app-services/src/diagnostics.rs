@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use core_clipboard::sanitize_clipboard_event_detail;
+use core_clipboard::sanitize_clipboard_event_output_detail;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -600,7 +600,7 @@ fn redact_event_detail_with_context(
     context: &mut RedactionContext,
 ) -> String {
     if kind.starts_with("clipboard") {
-        return sanitize_clipboard_event_detail(kind, detail);
+        return sanitize_clipboard_event_output_detail(kind, detail);
     }
 
     let mut redacted = detail

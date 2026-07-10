@@ -31,7 +31,7 @@ use app_services::{
     },
 };
 use async_trait::async_trait;
-use core_clipboard::sanitize_clipboard_event_detail;
+use core_clipboard::sanitize_clipboard_event_output_detail;
 use core_security::{TrustBundle, fingerprint};
 use serde_json::Value;
 
@@ -465,7 +465,7 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             .await
             .into_iter()
             .map(|event| {
-                let detail = sanitize_clipboard_event_detail(&event.kind, &event.detail);
+                let detail = sanitize_clipboard_event_output_detail(&event.kind, &event.detail);
                 TransportEventSnapshot {
                     timestamp: event.timestamp.to_rfc3339(),
                     direction: event.direction,
@@ -937,7 +937,7 @@ fn build_console_snapshot_from_bundle(
             .transport_events
             .into_iter()
             .map(|event| {
-                let detail = sanitize_clipboard_event_detail(&event.kind, &event.detail);
+                let detail = sanitize_clipboard_event_output_detail(&event.kind, &event.detail);
                 TransportEventSnapshot {
                     timestamp: event.timestamp.to_rfc3339(),
                     direction: event.direction,
@@ -1481,16 +1481,18 @@ mod tests {
             detail: "password=hunter2 token=abc123".to_string(),
             size_bytes: 29,
         });
-        state.record_transport_event(crate::state::TransportEventRecord {
-            timestamp: chrono::Utc::now(),
-            direction: "incoming".to_string(),
-            kind: "clipboard_image_rejected".to_string(),
-            peer_id: "peer-alpha".to_string(),
-            detail: format!(
-                "payload_type=bmp disposition=rejected reason=hash_mismatch expected={CLIPBOARD_HASH_SENTINEL} actual={CLIPBOARD_HASH_SENTINEL}"
-            ),
-            size_bytes: 64,
-        });
+        for received_bytes in 61..=64 {
+            state.record_transport_event(crate::state::TransportEventRecord {
+                timestamp: chrono::Utc::now(),
+                direction: "incoming".to_string(),
+                kind: "clipboard_image_rejected".to_string(),
+                peer_id: "peer-alpha".to_string(),
+                detail: format!(
+                    "payload_type=bmp disposition=rejected reason=hash_mismatch received_bytes={received_bytes} expected={CLIPBOARD_HASH_SENTINEL} actual={CLIPBOARD_HASH_SENTINEL}"
+                ),
+                size_bytes: received_bytes,
+            });
+        }
         state.record_transport_event(crate::state::TransportEventRecord {
             timestamp: chrono::Utc::now(),
             direction: "outgoing".to_string(),
@@ -1516,6 +1518,7 @@ mod tests {
         let raw_rendered = format!("{raw_events:?}");
         assert!(!raw_rendered.contains(CLIPBOARD_HASH_SENTINEL));
         assert!(raw_rendered.contains("reason=hash_mismatch"));
+        assert!(raw_rendered.contains("sample_count=4"));
 
         let reply = app
             .dump_diagnostics(DiagnosticsDumpCommand {
@@ -1542,6 +1545,7 @@ mod tests {
         assert!(!content.contains("abc123"));
         assert!(!content.contains(CLIPBOARD_HASH_SENTINEL));
         assert!(content.contains("reason=hash_mismatch"));
+        assert!(content.contains("sample_count=4"));
         assert!(!content.contains("peer-alpha"));
         assert!(!content.contains(&layout_peer_id));
         assert!(!content.contains("Office Display"));

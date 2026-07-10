@@ -256,24 +256,34 @@ pub(super) async fn handle_clipboard_image_start(
     inbound_clipboard_transfers: &mut HashMap<String, InboundClipboardImageTransfer>,
 ) -> Result<()> {
     if machine_id != authenticated_peer_id {
-        warn!(
-            claimed_machine_id = %machine_id,
-            authenticated_machine_id = %authenticated_peer_id,
-            transfer_id = %transfer_id,
-            "dropping clipboard image start with mismatched machine_id"
-        );
+        warn!("dropping clipboard image start with mismatched authenticated identity");
         return Ok(());
     }
 
     if inbound_clipboard_transfers.len() >= MAX_INBOUND_TRANSFERS_PER_PEER {
-        record_clipboard_image_rejected(state, authenticated_peer_id, "too_many_transfers", 0)
-            .await;
+        record_clipboard_image_rejected(
+            state,
+            authenticated_peer_id,
+            "too_many_transfers",
+            ClipboardImageRejectionMetrics::ActiveLimit {
+                active_transfers: inbound_clipboard_transfers.len() as u64,
+                transfer_limit: MAX_INBOUND_TRANSFERS_PER_PEER as u64,
+            },
+            0,
+        )
+        .await;
         return Ok(());
     }
 
     if inbound_clipboard_transfers.contains_key(&transfer_id) {
-        record_clipboard_image_rejected(state, authenticated_peer_id, "duplicate_transfer", 0)
-            .await;
+        record_clipboard_image_rejected(
+            state,
+            authenticated_peer_id,
+            "duplicate_transfer",
+            ClipboardImageRejectionMetrics::None,
+            0,
+        )
+        .await;
         return Ok(());
     }
 
@@ -283,6 +293,10 @@ pub(super) async fn handle_clipboard_image_start(
             state,
             authenticated_peer_id,
             "payload_too_large",
+            ClipboardImageRejectionMetrics::AnnouncedLimit {
+                announced_bytes: total_bytes,
+                configured_limit_bytes: max_image_bytes,
+            },
             total_bytes,
         )
         .await;
@@ -290,8 +304,16 @@ pub(super) async fn handle_clipboard_image_start(
     }
 
     let Ok(capacity) = usize::try_from(total_bytes) else {
-        record_clipboard_image_rejected(state, authenticated_peer_id, "size_overflow", total_bytes)
-            .await;
+        record_clipboard_image_rejected(
+            state,
+            authenticated_peer_id,
+            "size_overflow",
+            ClipboardImageRejectionMetrics::Announced {
+                announced_bytes: total_bytes,
+            },
+            total_bytes,
+        )
+        .await;
         return Ok(());
     };
 
@@ -306,12 +328,7 @@ pub(super) async fn handle_clipboard_image_start(
                 data: Vec::with_capacity(capacity),
             },
         );
-        info!(
-            peer_id = %peer_id,
-            transfer_id = %transfer_id,
-            total_bytes,
-            "started inbound clipboard image transfer"
-        );
+        info!(peer_id = %peer_id, total_bytes, "started inbound clipboard image transfer");
     }
 
     Ok(())
@@ -445,25 +462,40 @@ pub(super) async fn handle_clipboard_image_chunk(
     inbound_clipboard_transfers: &mut HashMap<String, InboundClipboardImageTransfer>,
 ) -> Result<()> {
     let Some(mut transfer) = inbound_clipboard_transfers.remove(&transfer_id) else {
-        warn!(
-            transfer_id = %transfer_id,
-            "received clipboard image chunk for unknown transfer"
-        );
+        warn!("received clipboard image chunk for unknown transfer");
         return Ok(());
     };
 
     let next_size = transfer.bytes_received.saturating_add(data.len() as u64);
     if next_size > transfer.total_bytes {
-        record_clipboard_image_rejected(state, &transfer.peer_id, "chunk_exceeds_total", next_size)
-            .await;
+        record_clipboard_image_rejected(
+            state,
+            &transfer.peer_id,
+            "chunk_exceeds_total",
+            ClipboardImageRejectionMetrics::AnnouncedAttempted {
+                announced_bytes: transfer.total_bytes,
+                attempted_bytes: next_size,
+            },
+            next_size,
+        )
+        .await;
         discard_inbound_clipboard_image_transfer(transfer).await;
         return Ok(());
     }
 
     let max_image_bytes = ClipboardPolicy::default().max_image_bytes as u64;
     if next_size > max_image_bytes {
-        record_clipboard_image_rejected(state, &transfer.peer_id, "payload_too_large", next_size)
-            .await;
+        record_clipboard_image_rejected(
+            state,
+            &transfer.peer_id,
+            "payload_too_large",
+            ClipboardImageRejectionMetrics::AttemptedLimit {
+                attempted_bytes: next_size,
+                configured_limit_bytes: max_image_bytes,
+            },
+            next_size,
+        )
+        .await;
         discard_inbound_clipboard_image_transfer(transfer).await;
         return Ok(());
     }
@@ -591,10 +623,7 @@ pub(super) async fn handle_clipboard_image_end(
     inbound_clipboard_transfers: &mut HashMap<String, InboundClipboardImageTransfer>,
 ) -> Result<()> {
     let Some(transfer) = inbound_clipboard_transfers.remove(&transfer_id) else {
-        warn!(
-            transfer_id = %transfer_id,
-            "received clipboard image end for unknown transfer"
-        );
+        warn!("received clipboard image end for unknown transfer");
         return Ok(());
     };
 
@@ -603,6 +632,10 @@ pub(super) async fn handle_clipboard_image_end(
             state,
             &transfer.peer_id,
             "size_mismatch",
+            ClipboardImageRejectionMetrics::ExpectedReceived {
+                expected_bytes: transfer.total_bytes,
+                received_bytes: transfer.bytes_received,
+            },
             transfer.bytes_received,
         )
         .await;
@@ -617,6 +650,7 @@ pub(super) async fn handle_clipboard_image_end(
             state,
             &transfer.peer_id,
             "hash_mismatch",
+            ClipboardImageRejectionMetrics::None,
             transfer.bytes_received,
         )
         .await;
@@ -635,12 +669,7 @@ pub(super) async fn handle_clipboard_image_end(
         "received chunked clipboard image payload",
     )
     .await;
-    info!(
-        peer_id = %peer_id,
-        transfer_id = %transfer_id,
-        total_bytes,
-        "completed inbound clipboard image transfer"
-    );
+    info!(peer_id = %peer_id, total_bytes, "completed inbound clipboard image transfer");
     Ok(())
 }
 
@@ -698,10 +727,75 @@ async fn record_transport_transfer_rejected(
     });
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ClipboardImageRejectionMetrics {
+    None,
+    ActiveLimit {
+        active_transfers: u64,
+        transfer_limit: u64,
+    },
+    AnnouncedLimit {
+        announced_bytes: u64,
+        configured_limit_bytes: u64,
+    },
+    Announced {
+        announced_bytes: u64,
+    },
+    AnnouncedAttempted {
+        announced_bytes: u64,
+        attempted_bytes: u64,
+    },
+    AttemptedLimit {
+        attempted_bytes: u64,
+        configured_limit_bytes: u64,
+    },
+    ExpectedReceived {
+        expected_bytes: u64,
+        received_bytes: u64,
+    },
+}
+
+impl ClipboardImageRejectionMetrics {
+    fn detail(self, reason: &str) -> String {
+        let metadata = match self {
+            Self::None => String::new(),
+            Self::ActiveLimit {
+                active_transfers,
+                transfer_limit,
+            } => format!(" active_transfers={active_transfers} transfer_limit={transfer_limit}"),
+            Self::AnnouncedLimit {
+                announced_bytes,
+                configured_limit_bytes,
+            } => format!(
+                " announced_bytes={announced_bytes} configured_limit_bytes={configured_limit_bytes}"
+            ),
+            Self::Announced { announced_bytes } => {
+                format!(" announced_bytes={announced_bytes}")
+            }
+            Self::AnnouncedAttempted {
+                announced_bytes,
+                attempted_bytes,
+            } => format!(" announced_bytes={announced_bytes} attempted_bytes={attempted_bytes}"),
+            Self::AttemptedLimit {
+                attempted_bytes,
+                configured_limit_bytes,
+            } => format!(
+                " attempted_bytes={attempted_bytes} configured_limit_bytes={configured_limit_bytes}"
+            ),
+            Self::ExpectedReceived {
+                expected_bytes,
+                received_bytes,
+            } => format!(" expected_bytes={expected_bytes} received_bytes={received_bytes}"),
+        };
+        format!("payload_type=bmp disposition=rejected reason={reason}{metadata}")
+    }
+}
+
 async fn record_clipboard_image_rejected(
     state: &AppState,
     peer_id: &str,
     reason: &str,
+    metrics: ClipboardImageRejectionMetrics,
     size_bytes: u64,
 ) {
     state.record_transport_event(TransportEventRecord {
@@ -709,7 +803,7 @@ async fn record_clipboard_image_rejected(
         direction: "incoming".to_string(),
         kind: "clipboard_image_rejected".to_string(),
         peer_id: peer_id.to_string(),
-        detail: format!("payload_type=bmp disposition=rejected reason={reason}"),
+        detail: metrics.detail(reason),
         size_bytes,
     });
 }

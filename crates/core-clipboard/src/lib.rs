@@ -78,13 +78,28 @@ pub fn image_hash_hex(bytes: &[u8]) -> String {
 /// Callers should still construct metadata-only events at the source; this helper is the
 /// defense-in-depth boundary for retained events, APIs, CLIs, and diagnostic exports.
 pub fn sanitize_clipboard_event_detail(kind: &str, detail: &str) -> String {
+    sanitize_clipboard_event_detail_with_policy(kind, detail, false)
+}
+
+/// Applies the clipboard metadata boundary to an event being returned to an operator.
+/// Aggregate count/time fields are accepted here only after the retained-event store has
+/// stripped producer-supplied aggregate fields and generated its own summary metadata.
+pub fn sanitize_clipboard_event_output_detail(kind: &str, detail: &str) -> String {
+    sanitize_clipboard_event_detail_with_policy(kind, detail, true)
+}
+
+fn sanitize_clipboard_event_detail_with_policy(
+    kind: &str,
+    detail: &str,
+    allow_aggregate_metadata: bool,
+) -> String {
     if !kind.starts_with("clipboard") {
         return detail.to_string();
     }
 
     let safe_tokens = detail
         .split_whitespace()
-        .filter_map(sanitize_clipboard_metadata_token)
+        .filter_map(|token| sanitize_clipboard_metadata_token(token, allow_aggregate_metadata))
         .collect::<Vec<_>>();
 
     if safe_tokens.is_empty() {
@@ -94,7 +109,10 @@ pub fn sanitize_clipboard_event_detail(kind: &str, detail: &str) -> String {
     }
 }
 
-fn sanitize_clipboard_metadata_token(token: &str) -> Option<String> {
+fn sanitize_clipboard_metadata_token(
+    token: &str,
+    allow_aggregate_metadata: bool,
+) -> Option<String> {
     let (key, value) = token.split_once('=')?;
     let allowed = match key {
         "payload_type" => matches!(value, "text" | "bmp" | "image" | "unknown"),
@@ -127,10 +145,28 @@ fn sanitize_clipboard_metadata_token(token: &str) -> Option<String> {
                 | "unknown"
         ),
         "applied" | "metadata_only" => matches!(value, "true" | "false"),
+        "active_transfers"
+        | "transfer_limit"
+        | "configured_limit_bytes"
+        | "announced_bytes"
+        | "attempted_bytes"
+        | "expected_bytes"
+        | "received_bytes" => value.parse::<u64>().is_ok(),
+        "sample_count" => allow_aggregate_metadata && value.parse::<u64>().is_ok(),
+        "first_seen" | "last_seen" => allow_aggregate_metadata && is_safe_event_timestamp(value),
         _ => false,
     };
 
     allowed.then(|| format!("{key}={value}"))
+}
+
+fn is_safe_event_timestamp(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 40
+        && value.chars().all(|character| {
+            character.is_ascii_digit()
+                || matches!(character, '-' | ':' | '.' | 'T' | 'Z' | '+' | 't' | 'z')
+        })
 }
 
 fn hash_bytes_hex(kind: u8, bytes: &[u8]) -> String {
@@ -342,5 +378,44 @@ mod tests {
             sanitize_clipboard_event_detail("input_frame", SECRET),
             SECRET
         );
+    }
+
+    #[test]
+    fn clipboard_rejection_numeric_metadata_is_strictly_bounded() {
+        const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_numeric_9dbe7dbd";
+        let detail = format!(
+            "payload_type=bmp disposition=rejected reason=size_mismatch expected_bytes=64 received_bytes=32 announced_bytes={SECRET} attempted_bytes=-1 configured_limit_bytes=8MB"
+        );
+
+        let sanitized = sanitize_clipboard_event_detail("clipboard_image_rejected", &detail);
+
+        assert_eq!(
+            sanitized,
+            "payload_type=bmp disposition=rejected reason=size_mismatch expected_bytes=64 received_bytes=32"
+        );
+        assert!(!sanitized.contains(SECRET));
+    }
+
+    #[test]
+    fn clipboard_output_accepts_only_store_generated_summary_shape() {
+        const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_summary_fea6f173";
+        let producer_detail = format!(
+            "payload_type=bmp disposition=rejected reason=hash_mismatch sample_count=999 first_seen=1999-01-01T00:00:00Z expected_hash={SECRET}"
+        );
+        assert_eq!(
+            sanitize_clipboard_event_detail("clipboard_image_rejected", &producer_detail),
+            "payload_type=bmp disposition=rejected reason=hash_mismatch"
+        );
+
+        let output_detail = format!(
+            "payload_type=bmp disposition=rejected reason=hash_mismatch sample_count=4 first_seen=2026-07-10T00:00:00Z last_seen=2026-07-10T00:00:01Z expected_hash={SECRET}"
+        );
+        let sanitized =
+            sanitize_clipboard_event_output_detail("clipboard_image_rejected", &output_detail);
+
+        assert!(sanitized.contains("sample_count=4"));
+        assert!(sanitized.contains("first_seen=2026-07-10T00:00:00Z"));
+        assert!(sanitized.contains("last_seen=2026-07-10T00:00:01Z"));
+        assert!(!sanitized.contains(SECRET));
     }
 }

@@ -9,7 +9,7 @@ use app_services::diagnostics::{
     DiagnosticExportOptions, ServiceDiagnosticSnapshot, build_offline_bundle,
     write_diagnostic_bundle,
 };
-use core_clipboard::sanitize_clipboard_event_detail;
+use core_clipboard::sanitize_clipboard_event_output_detail;
 #[cfg(any(windows, test))]
 use std::path::PathBuf as StdPathBuf;
 #[cfg(windows)]
@@ -1735,7 +1735,7 @@ pub(super) async fn transport_events(
 }
 
 fn protected_transport_event_detail(event: &TransportEvent) -> String {
-    sanitize_clipboard_event_detail(&event.kind, &event.detail)
+    sanitize_clipboard_event_output_detail(&event.kind, &event.detail)
 }
 
 fn select_transport_events(
@@ -2847,7 +2847,7 @@ mod tests {
         let event = test_transport_event(
             "clipboard_image_rejected",
             &format!(
-                "payload_type=bmp disposition=rejected reason=hash_mismatch expected={SECRET} actual={SECRET}"
+                "payload_type=bmp disposition=rejected reason=hash_mismatch sample_count=4 first_seen=2026-07-10T00:00:00Z last_seen=2026-07-10T00:00:01Z expected={SECRET} actual={SECRET}"
             ),
         );
 
@@ -2855,7 +2855,7 @@ mod tests {
 
         assert_eq!(
             detail,
-            "payload_type=bmp disposition=rejected reason=hash_mismatch"
+            "payload_type=bmp disposition=rejected reason=hash_mismatch sample_count=4 first_seen=2026-07-10T00:00:00Z last_seen=2026-07-10T00:00:01Z"
         );
         assert!(!detail.contains(SECRET));
     }

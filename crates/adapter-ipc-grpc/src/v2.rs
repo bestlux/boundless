@@ -10,7 +10,7 @@ use app_services::{
         UiPairedPeer, UiPendingRequest, UiSnapshot,
     },
 };
-use core_clipboard::{ClipboardPayload, sanitize_clipboard_event_detail};
+use core_clipboard::{ClipboardPayload, sanitize_clipboard_event_output_detail};
 use tokio::{sync::mpsc, time};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -1354,7 +1354,7 @@ fn map_pending_request(request: UiPendingRequest) -> NearbyPairingRequestInfo {
 }
 
 fn map_transport_event(event: TransportEventSnapshot) -> TransportEvent {
-    let detail = sanitize_clipboard_event_detail(&event.kind, &event.detail);
+    let detail = sanitize_clipboard_event_output_detail(&event.kind, &event.detail);
     TransportEvent {
         timestamp: event.timestamp,
         direction: event.direction,
@@ -1379,14 +1379,14 @@ mod tests {
             kind: "clipboard_image_rejected".to_string(),
             peer_id: "peer-a".to_string(),
             detail: format!(
-                "payload_type=bmp disposition=rejected reason=hash_mismatch expected={SECRET} actual={SECRET}"
+                "payload_type=bmp disposition=rejected reason=hash_mismatch sample_count=4 first_seen=2026-07-10T00:00:00Z last_seen=2026-07-10T00:00:01Z expected={SECRET} actual={SECRET}"
             ),
             size_bytes: 32,
         });
 
         assert_eq!(
             mapped.detail,
-            "payload_type=bmp disposition=rejected reason=hash_mismatch"
+            "payload_type=bmp disposition=rejected reason=hash_mismatch sample_count=4 first_seen=2026-07-10T00:00:00Z last_seen=2026-07-10T00:00:01Z"
         );
         assert!(!mapped.detail.contains(SECRET));
         assert!(!mapped.detail.contains("expected="));

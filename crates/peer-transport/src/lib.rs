@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, VecDeque, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -860,6 +861,7 @@ fn transport_event_is_aggregated(kind: &str) -> bool {
     let repeated_failure = transport_event_is_repeated_failure(kind);
     transport_event_priority(kind) == TransportEventPriority::Activity
         || repeated_failure
+        || kind == "clipboard_image_rejected"
         || matches!(
             kind,
             "input_inject_failed"
@@ -880,8 +882,11 @@ fn transport_event_is_repeated_failure(kind: &str) -> bool {
 
 fn sanitize_transport_event_detail_for_retention(kind: &str, detail: &str) -> String {
     let detail = sanitize_clipboard_event_detail(kind, detail);
-    if kind == "transport_transfer_rejected" {
-        canonical_failure_reason(&detail)
+    if matches!(
+        kind,
+        "transport_transfer_rejected" | "file_transfer_rejected"
+    ) {
+        canonical_file_transfer_rejection_reason(&detail)
     } else {
         detail
     }
@@ -889,8 +894,9 @@ fn sanitize_transport_event_detail_for_retention(kind: &str, detail: &str) -> St
 
 fn transport_event_aggregation_key(event: &TransportEventRecord) -> String {
     let repeated_failure = transport_event_is_repeated_failure(&event.kind);
-    let dimensions = if repeated_failure {
-        canonical_failure_reason(&event.detail)
+    let bounded_failure = repeated_failure || event.kind == "clipboard_image_rejected";
+    let dimensions = if bounded_failure {
+        canonical_failure_cause(&event.kind, &event.detail)
     } else {
         match event.kind.as_str() {
             "input_queue_coalesced" => canonical_detail_tokens(&event.detail, &["queue"]),
@@ -907,10 +913,10 @@ fn transport_event_aggregation_key(event: &TransportEventRecord) -> String {
                 .join(" "),
         }
     };
-    let peer_id = if repeated_failure {
-        "all"
+    let peer_id = if bounded_failure {
+        pseudonymous_peer_dimension(&event.peer_id)
     } else {
-        &event.peer_id
+        event.peer_id.clone()
     };
     format!(
         "{}\u{1f}{}\u{1f}{}\u{1f}{dimensions}",
@@ -918,12 +924,107 @@ fn transport_event_aggregation_key(event: &TransportEventRecord) -> String {
     )
 }
 
-fn canonical_failure_reason(detail: &str) -> String {
-    let reason = detail
+fn pseudonymous_peer_dimension(peer_id: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    peer_id.hash(&mut hasher);
+    format!("peer={:016x}", hasher.finish())
+}
+
+fn canonical_failure_cause(kind: &str, detail: &str) -> String {
+    if matches!(
+        kind,
+        "transport_transfer_rejected" | "file_transfer_rejected"
+    ) {
+        return canonical_file_transfer_rejection_reason(detail);
+    }
+
+    if let Some(reason) = detail_token(detail, "reason") {
+        return format!("reason={}", bounded_dimension(reason));
+    }
+
+    let cause = match kind {
+        "input_inject_failed" => classify_input_inject_failure(detail),
+        "pairing_reconnect_failed" => classify_connection_failure(detail),
+        "transport_reachability_failed" => detail_token(detail, "failure_reason")
+            .map(classify_connection_failure)
+            .unwrap_or_else(|| classify_connection_failure(detail)),
+        "input_inject_dropped"
+            if detail
+                .split_whitespace()
+                .any(|token| token == "dropped_oldest") =>
+        {
+            "dropped_oldest"
+        }
+        _ => "unspecified",
+    };
+    format!("cause={cause}")
+}
+
+fn classify_input_inject_failure(detail: &str) -> &'static str {
+    let normalized = detail.to_ascii_lowercase();
+    if normalized.contains("interactive_session")
+        || normalized.contains("interactive session")
+        || normalized.contains("session 0")
+    {
+        "interactive_session"
+    } else if normalized.contains("access_denied")
+        || normalized.contains("access denied")
+        || normalized.contains("os error 5")
+    {
+        "access_denied"
+    } else if normalized.contains("timeout") || normalized.contains("timed out") {
+        "timeout"
+    } else if normalized.contains("transient") {
+        "transient"
+    } else {
+        "inject_error"
+    }
+}
+
+fn classify_connection_failure(detail: &str) -> &'static str {
+    let normalized = detail.to_ascii_lowercase();
+    if normalized.contains("refused") {
+        "refused"
+    } else if normalized.contains("timeout") || normalized.contains("timed out") {
+        "timeout"
+    } else if normalized.contains("unreachable") {
+        "unreachable"
+    } else if normalized.contains("dns") || normalized.contains("resolve") {
+        "resolution"
+    } else if normalized.contains("tls") || normalized.contains("certificate") {
+        "tls"
+    } else {
+        "connection_error"
+    }
+}
+
+fn canonical_file_transfer_rejection_reason(detail: &str) -> String {
+    let reason = detail_token(detail, "reason").unwrap_or("other");
+    let reason = match reason {
+        "too_many_transfers"
+        | "duplicate_transfer_id"
+        | "receive_policy_denied"
+        | "invalid_total_size"
+        | "temp_reserve_failed"
+        | "chunk_size_invalid"
+        | "chunk_exceeds_total"
+        | "temp_write_failed"
+        | "size_mismatch"
+        | "temp_flush_failed"
+        | "temp_sync_failed" => reason,
+        _ => "other",
+    };
+    format!("reason={reason}")
+}
+
+fn detail_token<'a>(detail: &'a str, key: &str) -> Option<&'a str> {
+    detail
         .split_whitespace()
-        .find_map(|token| token.strip_prefix("reason="))
-        .unwrap_or("unspecified");
-    let bounded = reason
+        .find_map(|token| token.strip_prefix(&format!("{key}=")))
+}
+
+fn bounded_dimension(value: &str) -> String {
+    let bounded = value
         .chars()
         .take(48)
         .filter(|character| {
@@ -931,9 +1032,9 @@ fn canonical_failure_reason(detail: &str) -> String {
         })
         .collect::<String>();
     if bounded.is_empty() {
-        "reason=other".to_string()
+        "other".to_string()
     } else {
-        format!("reason={bounded}")
+        bounded
     }
 }
 
@@ -951,7 +1052,8 @@ fn canonical_detail_tokens(detail: &str, keys: &[&str]) -> String {
 }
 
 fn transport_event_uses_latest_size(kind: &str, direction: &str) -> bool {
-    kind == "file_transfer_progress" && direction == "incoming"
+    (kind == "file_transfer_progress" && direction == "incoming")
+        || kind == "clipboard_image_rejected"
 }
 
 fn detail_u64(detail: &str, expected_key: &str) -> Option<u64> {
@@ -1173,7 +1275,7 @@ mod tests {
                 timestamp,
                 "input_inject_failed",
                 "local",
-                &format!("peer-{sample}"),
+                "peer-a",
                 format!(
                     "sequence={sample} queue_wait_ms=1 capture_to_fail_ms=2 receive_to_fail_ms=1 transient_inject_failure_{sample}"
                 ),
@@ -1289,7 +1391,7 @@ mod tests {
                 started + chrono::Duration::milliseconds(sample as i64),
                 "transport_transfer_rejected",
                 "incoming",
-                &format!("remote-{sample}"),
+                "remote-peer",
                 format!(
                     "reason=invalid_total_size transfer_id=remote-transfer-{sample} error=remote-error-{sample}"
                 ),
@@ -1309,6 +1411,204 @@ mod tests {
         assert!(rejections[0].detail.contains("reason=invalid_total_size"));
         assert!(!rejections[0].detail.contains("remote-transfer-"));
         assert!(!rejections[0].detail.contains("remote-error-"));
+        assert_eq!(rejections[0].size_bytes, 4_000);
+    }
+
+    #[tokio::test]
+    async fn clipboard_image_rejections_are_bounded_and_keep_safe_causal_metadata() {
+        const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_clipboard_reject_878bfb34";
+        let state = TransportRuntimeState::default();
+        let started = Utc::now();
+        state.record_transport_event(test_event(
+            started,
+            "input_handoff",
+            "local",
+            "trusted-peer",
+            "direction=left activated=true".to_string(),
+        ));
+
+        for sample in 0..4_000u64 {
+            let mut rejection = test_event(
+                started + chrono::Duration::milliseconds(sample as i64),
+                "clipboard_image_rejected",
+                "incoming",
+                "remote-peer",
+                format!(
+                    "payload_type=bmp disposition=rejected reason=size_mismatch expected_bytes=4000 received_bytes={sample} expected_hash={SECRET} sample_count=999 first_seen=1999-01-01T00:00:00Z"
+                ),
+            );
+            rejection.size_bytes = sample;
+            state.record_transport_event(rejection);
+        }
+
+        let events = state.transport_events_snapshot().await;
+        assert!(events.iter().any(|event| event.kind == "input_handoff"));
+        let rejections = events
+            .iter()
+            .filter(|event| event.kind == "clipboard_image_rejected")
+            .collect::<Vec<_>>();
+        assert_eq!(rejections.len(), 1);
+        assert!(rejections[0].detail.contains("sample_count=4000"));
+        assert!(rejections[0].detail.contains("expected_bytes=4000"));
+        assert!(rejections[0].detail.contains("received_bytes=3999"));
+        assert!(!rejections[0].detail.contains("sample_count=999"));
+        assert!(!rejections[0].detail.contains("1999-01-01"));
+        assert!(!rejections[0].detail.contains(SECRET));
+        assert_eq!(rejections[0].size_bytes, 3_999);
+    }
+
+    #[test]
+    fn failure_aggregation_keys_preserve_peer_and_bounded_cause_dimensions() {
+        let started = Utc::now();
+        let key = |kind: &str, peer_id: &str, detail: &str| {
+            transport_event_aggregation_key(&test_event(
+                started,
+                kind,
+                "local",
+                peer_id,
+                detail.to_string(),
+            ))
+        };
+
+        assert_ne!(
+            key(
+                "input_inject_failed",
+                "peer-a",
+                "sequence=1 interactive_session_unavailable"
+            ),
+            key(
+                "input_inject_failed",
+                "peer-b",
+                "sequence=1 interactive_session_unavailable"
+            )
+        );
+        assert_ne!(
+            key(
+                "input_inject_failed",
+                "peer-a",
+                "sequence=1 interactive_session_unavailable"
+            ),
+            key(
+                "input_inject_failed",
+                "peer-a",
+                "sequence=2 access denied (os error 5)"
+            )
+        );
+        assert_ne!(
+            key(
+                "pairing_reconnect_failed",
+                "peer-a",
+                "trust_committed=true error=connection refused"
+            ),
+            key(
+                "pairing_reconnect_failed",
+                "peer-a",
+                "trust_committed=true error=operation timed out"
+            )
+        );
+        assert_ne!(
+            key(
+                "transport_reachability_failed",
+                "peer-a",
+                "tcp_transport_reachability=failed failure_reason=refused"
+            ),
+            key(
+                "transport_reachability_failed",
+                "peer-a",
+                "tcp_transport_reachability=failed failure_reason=timeout"
+            )
+        );
+        assert_ne!(
+            key(
+                "input_inject_dropped",
+                "peer-a",
+                "sequence=1 dropped_oldest capture_age_ms=10"
+            ),
+            key(
+                "input_inject_dropped",
+                "peer-a",
+                "sequence=2 reason=queue_full capture_age_ms=20"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_failures_do_not_attribute_one_peers_cause_to_another() {
+        let state = TransportRuntimeState::default();
+        let started = Utc::now();
+        for sample in 0..4u64 {
+            state.record_transport_event(test_event(
+                started + chrono::Duration::milliseconds(sample as i64),
+                "input_inject_failed",
+                "local",
+                "peer-interactive",
+                format!("sequence={sample} interactive_session_unavailable"),
+            ));
+            state.record_transport_event(test_event(
+                started + chrono::Duration::milliseconds(sample as i64),
+                "input_inject_failed",
+                "local",
+                "peer-denied",
+                format!("sequence={sample} access denied (os error 5)"),
+            ));
+        }
+
+        let failures = state
+            .transport_events_snapshot()
+            .await
+            .into_iter()
+            .filter(|event| event.kind == "input_inject_failed")
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 2);
+        let interactive = failures
+            .iter()
+            .find(|event| event.peer_id == "peer-interactive")
+            .expect("interactive peer failure summary");
+        assert!(
+            interactive
+                .detail
+                .contains("interactive_session_unavailable")
+        );
+        assert!(!interactive.detail.contains("access denied"));
+        assert!(interactive.detail.contains("sample_count=4"));
+        let denied = failures
+            .iter()
+            .find(|event| event.peer_id == "peer-denied")
+            .expect("access-denied peer failure summary");
+        assert!(denied.detail.contains("access denied"));
+        assert!(!denied.detail.contains("interactive_session_unavailable"));
+        assert!(denied.detail.contains("sample_count=4"));
+    }
+
+    #[tokio::test]
+    async fn remote_file_transfer_rejection_detail_is_bounded_before_retention() {
+        const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_remote_transfer_50d281a4";
+        let state = TransportRuntimeState::default();
+        let started = Utc::now();
+
+        for sample in 0..4_000u64 {
+            let mut rejection = test_event(
+                started + chrono::Duration::milliseconds(sample as i64),
+                "file_transfer_rejected",
+                "outgoing",
+                "remote-peer",
+                format!("transfer_id={SECRET}-{sample} reason={SECRET}-{sample} trailing={SECRET}"),
+            );
+            rejection.size_bytes = 1;
+            state.record_transport_event(rejection);
+        }
+
+        let rejections = state
+            .transport_events_snapshot()
+            .await
+            .into_iter()
+            .filter(|event| event.kind == "file_transfer_rejected")
+            .collect::<Vec<_>>();
+        assert_eq!(rejections.len(), 1);
+        assert!(rejections[0].detail.starts_with("reason=other "));
+        assert!(rejections[0].detail.contains("sample_count=4000"));
+        assert!(!rejections[0].detail.contains(SECRET));
+        assert!(rejections[0].detail.len() <= 192);
         assert_eq!(rejections[0].size_bytes, 4_000);
     }
 
