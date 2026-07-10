@@ -32,6 +32,16 @@ pub struct ClipboardBrokerExchangeOutcome {
     pub accepted: bool,
     pub message: String,
     pub remote_payload: Option<PendingRemoteClipboardPayload>,
+    pub local_payload_disposition: ClipboardBrokerLocalPayloadDisposition,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClipboardBrokerLocalPayloadDisposition {
+    #[default]
+    NotSubmitted,
+    Accepted,
+    TransientRejected,
+    DeterministicRejected,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -313,26 +323,66 @@ impl AppState {
         }
 
         let mut message = String::new();
-        if let Some(payload) = local_payload
-            && let Err(error) = self
+        let (local_payload_disposition, local_update_supersedes_remote) = match local_payload {
+            None => (ClipboardBrokerLocalPayloadDisposition::NotSubmitted, false),
+            Some(payload) => match self
                 .queue_local_clipboard_payload_for_connected_peers(payload)
                 .await
-        {
-            message = format!("clipboard broker local payload rejected: {error:#}");
-            self.record_transport_event(TransportEventRecord {
-                timestamp: Utc::now(),
-                direction: "local".to_string(),
-                kind: "clipboard_broker_local_rejected".to_string(),
-                peer_id: "none".to_string(),
-                detail: "disposition=rejected reason=policy_or_validation".to_string(),
-                size_bytes: 0,
-            });
+            {
+                Ok(updated) => (ClipboardBrokerLocalPayloadDisposition::Accepted, updated),
+                Err(error) => {
+                    let disposition = classify_clipboard_local_payload_error(&error);
+                    message = format!("clipboard broker local payload rejected: {error:#}");
+                    let reason = match disposition {
+                        ClipboardBrokerLocalPayloadDisposition::DeterministicRejected => {
+                            "policy_or_validation"
+                        }
+                        _ => "unknown",
+                    };
+                    self.record_transport_event(TransportEventRecord {
+                        timestamp: Utc::now(),
+                        direction: "local".to_string(),
+                        kind: "clipboard_broker_local_rejected".to_string(),
+                        peer_id: "none".to_string(),
+                        detail: format!("disposition=rejected reason={reason}"),
+                        size_bytes: 0,
+                    });
+                    (disposition, false)
+                }
+            },
+        };
+
+        if local_update_supersedes_remote {
+            let discarded = self
+                .discard_broker_remote_clipboard_for_local_update()
+                .await;
+            if discarded > 0 {
+                self.record_transport_event(TransportEventRecord {
+                    timestamp: Utc::now(),
+                    direction: "local".to_string(),
+                    kind: "clipboard_broker_remote_superseded".to_string(),
+                    peer_id: "none".to_string(),
+                    detail: format!("discarded_remote_payloads={discarded}"),
+                    size_bytes: discarded as u64,
+                });
+            }
         }
+
+        let remote_payload = if matches!(
+            local_payload_disposition,
+            ClipboardBrokerLocalPayloadDisposition::TransientRejected
+        ) || local_update_supersedes_remote
+        {
+            None
+        } else {
+            self.stage_remote_clipboard_payload_for_broker().await
+        };
 
         ClipboardBrokerExchangeOutcome {
             accepted: true,
             message,
-            remote_payload: self.stage_remote_clipboard_payload_for_broker().await,
+            remote_payload,
+            local_payload_disposition,
         }
     }
 
@@ -469,5 +519,38 @@ impl AppState {
             ),
             size_bytes: event_count as u64,
         });
+    }
+}
+
+fn classify_clipboard_local_payload_error(
+    error: &anyhow::Error,
+) -> ClipboardBrokerLocalPayloadDisposition {
+    if error.downcast_ref::<ClipboardPolicyError>().is_some()
+        || error.downcast_ref::<BmpValidationError>().is_some()
+    {
+        ClipboardBrokerLocalPayloadDisposition::DeterministicRejected
+    } else {
+        ClipboardBrokerLocalPayloadDisposition::TransientRejected
+    }
+}
+
+#[cfg(test)]
+mod local_payload_disposition_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_policy_failures_as_deterministic_and_unknown_failures_as_transient() {
+        let deterministic =
+            anyhow::Error::new(ClipboardPolicyError::TextTooLarge { size: 2, limit: 1 });
+        assert_eq!(
+            classify_clipboard_local_payload_error(&deterministic),
+            ClipboardBrokerLocalPayloadDisposition::DeterministicRejected
+        );
+
+        let transient = anyhow::anyhow!("temporary queue failure");
+        assert_eq!(
+            classify_clipboard_local_payload_error(&transient),
+            ClipboardBrokerLocalPayloadDisposition::TransientRejected
+        );
     }
 }

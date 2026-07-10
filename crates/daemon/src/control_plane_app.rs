@@ -22,12 +22,12 @@ use app_services::{
     },
     queries::{
         AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ClipboardBrokerExchangeSnapshot,
-        ClipboardRuntimeSnapshot, ConsoleSnapshot, FileTransferConfigSnapshot,
-        FileTransferSnapshot, InputBrokerAttachSnapshot, InputBrokerExchangeSnapshot,
-        InputBrokerInjectFrameSnapshot, InputHandoffConfigSnapshot, InputRuntimeSnapshot,
-        NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot, NearbyRequestCodeStartSnapshot,
-        StatusSnapshot, TransportEventSnapshot, TrustBundleSnapshot, UiDiscoveredPeer,
-        UiPairedPeer, UiPendingRequest, UiSnapshot,
+        ClipboardBrokerLocalPayloadDispositionSnapshot, ClipboardRuntimeSnapshot, ConsoleSnapshot,
+        FileTransferConfigSnapshot, FileTransferSnapshot, InputBrokerAttachSnapshot,
+        InputBrokerExchangeSnapshot, InputBrokerInjectFrameSnapshot, InputHandoffConfigSnapshot,
+        InputRuntimeSnapshot, NearbyJoinStatusSnapshot, NearbyPairingCompletionSnapshot,
+        NearbyRequestCodeStartSnapshot, StatusSnapshot, TransportEventSnapshot,
+        TrustBundleSnapshot, UiDiscoveredPeer, UiPairedPeer, UiPendingRequest, UiSnapshot,
     },
 };
 use async_trait::async_trait;
@@ -647,6 +647,20 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             remote_payload,
             remote_source_peer_id,
             remote_hash,
+            local_payload_disposition: match outcome.local_payload_disposition {
+                crate::state::ClipboardBrokerLocalPayloadDisposition::NotSubmitted => {
+                    ClipboardBrokerLocalPayloadDispositionSnapshot::NotSubmitted
+                }
+                crate::state::ClipboardBrokerLocalPayloadDisposition::Accepted => {
+                    ClipboardBrokerLocalPayloadDispositionSnapshot::Accepted
+                }
+                crate::state::ClipboardBrokerLocalPayloadDisposition::TransientRejected => {
+                    ClipboardBrokerLocalPayloadDispositionSnapshot::TransientRejected
+                }
+                crate::state::ClipboardBrokerLocalPayloadDisposition::DeterministicRejected => {
+                    ClipboardBrokerLocalPayloadDispositionSnapshot::DeterministicRejected
+                }
+            },
         })
     }
 
