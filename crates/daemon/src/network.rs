@@ -322,7 +322,7 @@ mod tests {
         io,
         pin::Pin,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicBool, Ordering},
         },
         task::{Context, Poll},
@@ -334,6 +334,40 @@ mod tests {
     use core_security::{SecurityPaths, TrustRecord, ensure_device_identity};
     use sha2::{Digest, Sha256};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+
+    #[derive(Clone, Default)]
+    struct TestLogCapture(Arc<Mutex<Vec<u8>>>);
+
+    struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for TestLogWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture log lock")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for TestLogCapture {
+        type Writer = TestLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            TestLogWriter(self.0.clone())
+        }
+    }
+
+    impl TestLogCapture {
+        fn rendered(&self) -> String {
+            String::from_utf8(self.0.lock().expect("read captured logs").clone())
+                .expect("captured logs are utf-8")
+        }
+    }
 
     struct FailAfterCallsWriter {
         calls: usize,
@@ -2590,6 +2624,161 @@ mod tests {
         assert!(!rendered.contains(&actual_hash));
         assert!(!rendered.contains("expected="));
         assert!(!rendered.contains("actual="));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn chunked_clipboard_image_rejections_preserve_safe_numeric_causes() {
+        const TRANSFER_ID_SENTINEL: &str =
+            "BOUNDLESS_SECRET_SENTINEL_clipboard_transfer_id_228337f6";
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let max_image_bytes = core_clipboard::ClipboardPolicy::default().max_image_bytes as u64;
+        let mut inbound_transfers = HashMap::new();
+
+        handle_clipboard_image_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            TRANSFER_ID_SENTINEL.to_string(),
+            max_image_bytes + 1,
+            "unused".to_string(),
+            &mut inbound_transfers,
+        )
+        .await
+        .expect("reject oversized clipboard image start");
+
+        handle_clipboard_image_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            "chunk-overflow".to_string(),
+            1,
+            "unused".to_string(),
+            &mut inbound_transfers,
+        )
+        .await
+        .expect("start chunk overflow transfer");
+        handle_clipboard_image_chunk(
+            &state,
+            "chunk-overflow".to_string(),
+            vec![0, 1],
+            &mut inbound_transfers,
+        )
+        .await
+        .expect("reject chunk beyond announced total");
+
+        handle_clipboard_image_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            "short-transfer".to_string(),
+            2,
+            "unused".to_string(),
+            &mut inbound_transfers,
+        )
+        .await
+        .expect("start short transfer");
+        handle_clipboard_image_chunk(
+            &state,
+            "short-transfer".to_string(),
+            vec![0],
+            &mut inbound_transfers,
+        )
+        .await
+        .expect("append short transfer chunk");
+        handle_clipboard_image_end(&state, "short-transfer".to_string(), &mut inbound_transfers)
+            .await
+            .expect("reject short transfer end");
+
+        let events = state.transport_events().await;
+        let rejection_details = events
+            .iter()
+            .filter(|event| event.kind == "clipboard_image_rejected")
+            .map(|event| event.detail.as_str())
+            .collect::<Vec<_>>();
+        assert!(rejection_details.iter().any(|detail| {
+            detail.contains("reason=payload_too_large")
+                && detail.contains(&format!("announced_bytes={}", max_image_bytes + 1))
+                && detail.contains(&format!("configured_limit_bytes={max_image_bytes}"))
+        }));
+        assert!(rejection_details.iter().any(|detail| {
+            detail.contains("reason=chunk_exceeds_total")
+                && detail.contains("announced_bytes=1")
+                && detail.contains("attempted_bytes=2")
+        }));
+        assert!(rejection_details.iter().any(|detail| {
+            detail.contains("reason=size_mismatch")
+                && detail.contains("expected_bytes=2")
+                && detail.contains("received_bytes=1")
+        }));
+        assert!(!format!("{events:?}").contains(TRANSFER_ID_SENTINEL));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbound_clipboard_image_logs_omit_attacker_transfer_identifiers() {
+        const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_clipboard_log_6d78c298";
+        let capture = TestLogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(capture.clone())
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let mut inbound_transfers = HashMap::new();
+        handle_clipboard_image_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            SECRET.to_string(),
+            SECRET.to_string(),
+            1,
+            SECRET.to_string(),
+            &mut inbound_transfers,
+        )
+        .await
+        .expect("drop mismatched identity start");
+        handle_clipboard_image_chunk(&state, SECRET.to_string(), vec![0], &mut inbound_transfers)
+            .await
+            .expect("drop unknown chunk");
+        handle_clipboard_image_end(&state, SECRET.to_string(), &mut inbound_transfers)
+            .await
+            .expect("drop unknown end");
+
+        let image = minimal_bmp_payload();
+        handle_clipboard_image_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            SECRET.to_string(),
+            image.len() as u64,
+            payload_hash_hex(&ClipboardPayload::Image(image.clone())),
+            &mut inbound_transfers,
+        )
+        .await
+        .expect("start valid transfer with attacker identifier");
+        handle_clipboard_image_chunk(&state, SECRET.to_string(), image, &mut inbound_transfers)
+            .await
+            .expect("append valid transfer");
+        handle_clipboard_image_end(&state, SECRET.to_string(), &mut inbound_transfers)
+            .await
+            .expect("complete valid transfer");
+
+        let rendered = capture.rendered();
+        assert!(rendered.contains("dropping clipboard image start"));
+        assert!(rendered.contains("received clipboard image chunk for unknown transfer"));
+        assert!(rendered.contains("received clipboard image end for unknown transfer"));
+        assert!(rendered.contains("started inbound clipboard image transfer"));
+        assert!(rendered.contains("completed inbound clipboard image transfer"));
+        assert!(!rendered.contains(SECRET));
 
         let _ = std::fs::remove_dir_all(root);
     }
