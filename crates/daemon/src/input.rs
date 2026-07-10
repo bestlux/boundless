@@ -30,6 +30,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Input::{MOUSE_MOVE_ABSOLUTE, RAWMOUSE};
 
 const INPUT_RUNTIME_SAFETY_TICK: Duration = Duration::from_millis(50);
+#[cfg(windows)]
 const DIRECT_INPUT_LOCK_LEASE: Duration = Duration::from_secs(2);
 const INPUT_INJECT_MAX_FRAMES_PER_WAKE: usize = 64;
 const INPUT_INJECT_WORK_QUANTUM: Duration = Duration::from_millis(2);
