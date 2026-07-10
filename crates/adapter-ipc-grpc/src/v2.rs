@@ -54,6 +54,8 @@ impl ControlPlaneApi {
 
     pub fn into_server(self) -> ControlPlaneServer {
         ControlPlaneServiceServer::new(self)
+            .max_decoding_message_size(ipc_api::CONTROL_PLANE_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(ipc_api::CONTROL_PLANE_MAX_MESSAGE_BYTES)
     }
 }
 

@@ -233,7 +233,7 @@ impl AppState {
         }
         if !self
             .input_broker
-            .validate_and_touch(broker_token, Instant::now())
+            .validate_without_touch(broker_token, Instant::now())
         {
             return ClipboardBrokerExchangeOutcome {
                 accepted: false,

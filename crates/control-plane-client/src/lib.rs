@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use ipc_api::CONTROL_PLANE_MAX_MESSAGE_BYTES;
 use ipc_api::boundless::v1::control_plane_service_client::ControlPlaneServiceClient;
 use tonic::transport::{Channel, Endpoint};
 
@@ -25,7 +26,9 @@ pub fn default_endpoint() -> String {
 }
 
 pub async fn connect_control_plane(endpoint: &str) -> Result<ControlPlaneServiceClient<Channel>> {
-    Ok(ControlPlaneServiceClient::new(channel(endpoint).await?))
+    Ok(ControlPlaneServiceClient::new(channel(endpoint).await?)
+        .max_decoding_message_size(CONTROL_PLANE_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(CONTROL_PLANE_MAX_MESSAGE_BYTES))
 }
 
 pub async fn channel(endpoint: &str) -> Result<Channel> {

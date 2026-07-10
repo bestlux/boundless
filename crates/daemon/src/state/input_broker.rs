@@ -129,19 +129,18 @@ impl InputBrokerRelay {
     /// A stale attachment is treated as already detached (fail closed).
     pub(crate) fn validate_and_touch(&self, broker_token: &str, now: Instant) -> bool {
         let mut inner = self.lock();
-        if !Self::attachment_fresh(&inner, now) {
-            inner.attachment = None;
-            inner.last_exchange_at = None;
+        if !validate_attachment_token(&mut inner, broker_token, now) {
             return false;
         }
-        let matches = inner
-            .attachment
-            .as_ref()
-            .is_some_and(|attachment| attachment.broker_token == broker_token);
-        if matches {
-            inner.last_exchange_at = Some(now);
-        }
-        matches
+        inner.last_exchange_at = Some(now);
+        true
+    }
+
+    /// Validates a clipboard exchange without extending input-broker
+    /// liveness. Clipboard activity must never keep a stalled input broker in
+    /// control of the interactive route.
+    pub(crate) fn validate_without_touch(&self, broker_token: &str, now: Instant) -> bool {
+        validate_attachment_token(&mut self.lock(), broker_token, now)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -271,6 +270,26 @@ impl InputBrokerRelay {
         self.lock().last_exchange_at =
             Some(Instant::now() - INPUT_BROKER_STALE_AFTER - Duration::from_millis(1));
     }
+
+    pub(crate) fn last_exchange_at_for_test(&self) -> Option<Instant> {
+        self.lock().last_exchange_at
+    }
+}
+
+fn validate_attachment_token(
+    inner: &mut InputBrokerRelayInner,
+    broker_token: &str,
+    now: Instant,
+) -> bool {
+    if !InputBrokerRelay::attachment_fresh(inner, now) {
+        inner.attachment = None;
+        inner.last_exchange_at = None;
+        return false;
+    }
+    inner
+        .attachment
+        .as_ref()
+        .is_some_and(|attachment| attachment.broker_token == broker_token)
 }
 
 fn track_pressed_state(inner: &mut InputBrokerRelayInner, event: &InputEvent) {
