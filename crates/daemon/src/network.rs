@@ -29,10 +29,10 @@ use crate::{
     runtime_tasks::{RuntimeTaskOwner, RuntimeTaskShutdown, RuntimeTaskSpec},
     state::{AppState, OutboundPayload},
 };
-use core_input::{InputEvent, InputFrame, KeyState, MouseButton};
+use core_input::{InputEvent, InputFrame, KeySemantics, KeyState, MouseButton};
 use core_protocol::{
     MAX_WIRE_PAYLOAD_BYTES, PROTOCOL_CURRENT, ProtocolVersion, WIRE_FRAME_LENGTH_PREFIX_BYTES,
-    WireCodecError, WireInputEvent, WireKeyState, WireMessage, WireMouseButton,
+    WireCodecError, WireInputEvent, WireKeySemantics, WireKeyState, WireMessage, WireMouseButton,
     decode_frame_payload, encode_frame_to_vec,
 };
 #[cfg(test)]
@@ -2382,6 +2382,45 @@ mod tests {
         assert!(matches!(
             frames.first(),
             Some(WireMessage::Error { message }) if message.contains("hello machine_id mismatch")
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn hello_handler_rejects_protocol_4_2_after_keyboard_wire_change() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let mut remote_protocol = None;
+        let mut outbound_transfer_flow = std::collections::HashMap::new();
+        let mut writer = CaptureWriter::default();
+        let mut frame_buffer = Vec::with_capacity(256);
+
+        let handling = handle_hello_message(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            false,
+            "local-machine-id",
+            peer_id.clone(),
+            ProtocolVersion {
+                major: 4,
+                minor: 2,
+                patch: 0,
+            },
+            &mut remote_protocol,
+            &mut outbound_transfer_flow,
+            &mut writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("reject protocol 4.2 hello");
+
+        assert!(matches!(handling, HelloHandling::TerminateSession));
+        assert!(remote_protocol.is_none());
+        assert!(matches!(
+            decode_written_frames(&writer.bytes).as_slice(),
+            [WireMessage::Error { message }]
+                if message.contains("remote=4.2.0") && message.contains("expected=4.3.0")
         ));
 
         let _ = std::fs::remove_dir_all(root);

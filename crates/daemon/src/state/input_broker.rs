@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use core_input::{InputEvent, KeyState, MouseButton};
+use core_input::{InputEvent, KeySemantics, KeyState, MouseButton};
 
 /// How long an attached user-session broker may go without an exchange before
 /// the daemon treats it as gone and reports `service_session_unsupported`
@@ -39,7 +39,7 @@ struct InputBrokerRelayInner {
     dropped_event_count: u64,
     last_wheel_source_mode: Option<&'static str>,
     last_accepted_clipboard_sequence: Option<u64>,
-    pressed_key_scan_codes: Vec<u16>,
+    pressed_keys: Vec<(u16, KeySemantics)>,
     pressed_buttons: Vec<MouseButton>,
 }
 
@@ -89,7 +89,7 @@ impl InputBrokerRelay {
         inner.dropped_event_count = 0;
         inner.last_wheel_source_mode = None;
         inner.last_accepted_clipboard_sequence = None;
-        inner.pressed_key_scan_codes.clear();
+        inner.pressed_keys.clear();
         inner.pressed_buttons.clear();
     }
 
@@ -281,7 +281,7 @@ impl InputBrokerRelay {
         let mut inner = self.lock();
         let events = release_events_for_pressed_state(&inner);
         inner.pressed_buttons.clear();
-        inner.pressed_key_scan_codes.clear();
+        inner.pressed_keys.clear();
         events
     }
 
@@ -292,14 +292,14 @@ impl InputBrokerRelay {
     pub(crate) fn clear_pressed_state(&self) {
         let mut inner = self.lock();
         inner.pressed_buttons.clear();
-        inner.pressed_key_scan_codes.clear();
+        inner.pressed_keys.clear();
     }
 
     pub(crate) fn reset_capture_stream(&self) {
         let mut inner = self.lock();
         inner.captured_events.clear();
         inner.escape_unlock_pending = 0;
-        inner.pressed_key_scan_codes.clear();
+        inner.pressed_keys.clear();
         inner.pressed_buttons.clear();
     }
 }
@@ -335,15 +335,25 @@ fn validate_attachment_token(
 
 fn track_pressed_state(inner: &mut InputBrokerRelayInner, event: &InputEvent) {
     match event {
-        InputEvent::Key { scan_code, state } => match state {
+        InputEvent::Key {
+            scan_code,
+            state,
+            semantics,
+        } => match state {
             KeyState::Down => {
-                if !inner.pressed_key_scan_codes.contains(scan_code) {
-                    inner.pressed_key_scan_codes.push(*scan_code);
+                if let Some((_, pressed_semantics)) = inner
+                    .pressed_keys
+                    .iter_mut()
+                    .find(|(pressed_scan_code, _)| pressed_scan_code == scan_code)
+                {
+                    *pressed_semantics = *semantics;
+                } else {
+                    inner.pressed_keys.push((*scan_code, *semantics));
                 }
             }
             KeyState::Up => inner
-                .pressed_key_scan_codes
-                .retain(|code| code != scan_code),
+                .pressed_keys
+                .retain(|(pressed_scan_code, _)| pressed_scan_code != scan_code),
         },
         InputEvent::MouseButton { button, state } => match state {
             KeyState::Down => {
@@ -379,12 +389,13 @@ fn release_events_for_pressed_state(inner: &InputBrokerRelayInner) -> Vec<InputE
             state: KeyState::Up,
         });
     }
-    let mut scan_codes = inner.pressed_key_scan_codes.clone();
-    scan_codes.sort_unstable();
-    for scan_code in scan_codes {
+    let mut pressed_keys = inner.pressed_keys.clone();
+    pressed_keys.sort_unstable_by_key(|(scan_code, _)| *scan_code);
+    for (scan_code, semantics) in pressed_keys {
         events.push(InputEvent::Key {
             scan_code,
             state: KeyState::Up,
+            semantics,
         });
     }
     events

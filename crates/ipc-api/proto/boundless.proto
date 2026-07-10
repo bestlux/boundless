@@ -437,6 +437,12 @@ message BrokerMouseWheel {
 message BrokerKey {
   uint32 scan_code = 1;
   bool down = 2;
+  BrokerWindowsKeySemantics windows_semantics = 3;
+}
+
+message BrokerWindowsKeySemantics {
+  uint32 virtual_key = 1;
+  bool num_lock_on = 2;
 }
 
 // Broker authorization is derived server-side from the verified named-pipe

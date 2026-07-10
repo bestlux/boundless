@@ -138,10 +138,7 @@ impl InputBackend for WindowsInputBackend {
     }
 
     fn apply_frame(&mut self, events: &[InputEvent]) -> Result<()> {
-        let mut records = Vec::new();
-        for event in events {
-            records.extend(input_records_for_event(event));
-        }
+        let records = input_records_for_events(events);
         send_input_records(&records).context("SendInput failed for frame batch")
     }
 }
@@ -177,6 +174,10 @@ impl InputCaptureBackend for WindowsPollingCaptureBackend {
                 events.push(InputEvent::Key {
                     scan_code,
                     state: core_input::KeyState::Up,
+                    semantics: KeySemantics::Windows {
+                        virtual_key: vk,
+                        num_lock_on: is_num_lock_on(),
+                    },
                 });
             }
         }
@@ -232,6 +233,10 @@ impl InputCaptureBackend for WindowsPollingCaptureBackend {
                         core_input::KeyState::Down
                     } else {
                         core_input::KeyState::Up
+                    },
+                    semantics: KeySemantics::Windows {
+                        virtual_key: vk,
+                        num_lock_on: is_num_lock_on(),
                     },
                 });
             }

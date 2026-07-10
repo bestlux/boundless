@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::Result;
-use core_input::{InputEvent, KeyState};
+use core_input::{InputEvent, KeySemantics, KeyState};
 
 use super::hook_capture::{
     CaptureRuntime, CapturedWheelEvent, HookCaptureEvent, HookControlAction, WheelCaptureSource,
@@ -38,7 +38,7 @@ pub struct WheelSourceCounts {
 pub struct HookInputPump {
     capture_runtime: CaptureRuntime,
     last_cursor: Option<(i32, i32)>,
-    last_key_down: HashMap<u16, bool>,
+    last_key_down: HashMap<u16, (bool, KeySemantics)>,
     last_button_down: HashMap<u16, bool>,
     pending_wheels: VecDeque<CapturedWheelEvent>,
     emitted_wheel_tombstones: VecDeque<EmittedWheelTombstone>,
@@ -77,11 +77,26 @@ impl HookInputPump {
                     output.push(InputEvent::MouseButton { button, state });
                 }
             }
-            InputEvent::Key { scan_code, state } => {
+            InputEvent::Key {
+                scan_code,
+                state,
+                semantics,
+            } => {
                 let is_down = matches!(state, KeyState::Down);
-                let prior = self.last_key_down.insert(scan_code, is_down);
-                if is_down || prior != Some(is_down) {
-                    output.push(InputEvent::Key { scan_code, state });
+                let prior = self.last_key_down.insert(scan_code, (is_down, semantics));
+                if is_down || prior.map(|(down, _)| down) != Some(is_down) {
+                    output.push(InputEvent::Key {
+                        scan_code,
+                        state,
+                        semantics: if is_down {
+                            semantics
+                        } else {
+                            prior
+                                .filter(|(was_down, _)| *was_down)
+                                .map(|(_, pressed_semantics)| pressed_semantics)
+                                .unwrap_or(semantics)
+                        },
+                    });
                 }
             }
             InputEvent::MouseMove { .. }
@@ -253,13 +268,20 @@ impl HookInputPump {
         let mut pressed_keys = self
             .last_key_down
             .iter()
-            .filter_map(|(scan_code, down)| if *down { Some(*scan_code) } else { None })
+            .filter_map(|(scan_code, (down, semantics))| {
+                if *down {
+                    Some((*scan_code, *semantics))
+                } else {
+                    None
+                }
+            })
             .collect::<Vec<_>>();
-        pressed_keys.sort_unstable();
-        for scan_code in pressed_keys {
+        pressed_keys.sort_unstable_by_key(|(scan_code, _)| *scan_code);
+        for (scan_code, semantics) in pressed_keys {
             events.push(InputEvent::Key {
                 scan_code,
                 state: KeyState::Up,
+                semantics,
             });
         }
 
@@ -664,5 +686,61 @@ mod tests {
         let mut pump = HookInputPump::from_capture_runtime(runtime);
 
         assert_eq!(pump.poll_events().len(), 2);
+    }
+
+    #[test]
+    fn key_repeat_survives_and_release_keeps_pressed_semantics() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let pressed_semantics = KeySemantics::Windows {
+            virtual_key: 0x61,
+            num_lock_on: true,
+        };
+        let release_observation = KeySemantics::Windows {
+            virtual_key: 0x23,
+            num_lock_on: false,
+        };
+        for state in [KeyState::Down, KeyState::Down] {
+            tx.send(HookCaptureEvent::Input(InputEvent::Key {
+                scan_code: 0x4F,
+                state,
+                semantics: pressed_semantics,
+            }))
+            .expect("queue keypad down/repeat");
+        }
+        tx.send(HookCaptureEvent::Input(InputEvent::Key {
+            scan_code: 0x4F,
+            state: KeyState::Up,
+            semantics: release_observation,
+        }))
+        .expect("queue keypad up");
+        tx.send(HookCaptureEvent::Input(InputEvent::Key {
+            scan_code: 0x4F,
+            state: KeyState::Up,
+            semantics: release_observation,
+        }))
+        .expect("queue duplicate keypad up");
+
+        let runtime = CaptureRuntime::from_test_parts(rx, true);
+        let mut pump = HookInputPump::from_capture_runtime(runtime);
+        assert_eq!(
+            pump.poll_events(),
+            vec![
+                InputEvent::Key {
+                    scan_code: 0x4F,
+                    state: KeyState::Down,
+                    semantics: pressed_semantics,
+                },
+                InputEvent::Key {
+                    scan_code: 0x4F,
+                    state: KeyState::Down,
+                    semantics: pressed_semantics,
+                },
+                InputEvent::Key {
+                    scan_code: 0x4F,
+                    state: KeyState::Up,
+                    semantics: pressed_semantics,
+                },
+            ]
+        );
     }
 }

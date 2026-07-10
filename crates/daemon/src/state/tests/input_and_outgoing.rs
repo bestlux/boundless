@@ -467,6 +467,7 @@ async fn route_incoming_input_frame_queues_for_injection_when_applied() {
                     InputEvent::Key {
                         scan_code: 30,
                         state: KeyState::Down,
+                        semantics: core_input::KeySemantics::Physical,
                     },
                 ],
             },
@@ -951,6 +952,7 @@ async fn pending_input_injection_queue_drops_new_move_when_full_of_non_move_fram
                     events: vec![InputEvent::Key {
                         scan_code: (sequence % 64) as u16 + 1,
                         state: KeyState::Down,
+                        semantics: core_input::KeySemantics::Physical,
                     }],
                 },
             )
@@ -1041,6 +1043,7 @@ async fn queue_input_events_validates_size_and_increments_sequence() {
                 InputEvent::Key {
                     scan_code: 30,
                     state: KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
                 },
             ],
         )
@@ -1052,6 +1055,7 @@ async fn queue_input_events_validates_size_and_increments_sequence() {
             vec![InputEvent::Key {
                 scan_code: 30,
                 state: KeyState::Up,
+                semantics: core_input::KeySemantics::Physical,
             }],
         )
         .await

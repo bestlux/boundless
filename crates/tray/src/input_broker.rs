@@ -19,7 +19,7 @@ use ipc_api::broker_events::{broker_events_from_input_events, input_events_from_
 use platform_windows::clipboard_backend::WindowsClipboardBackend;
 use platform_windows::input::{
     HookControlAction, HookInputPump, current_process_can_use_interactive_input,
-    input_records_for_event, send_input_records, virtual_screen_bounds,
+    input_records_for_events, send_input_records, virtual_screen_bounds,
 };
 use tonic::transport::Channel;
 
@@ -59,7 +59,7 @@ struct ClipboardPollOutcome {
 
 #[derive(Debug, Default)]
 struct InjectedInputState {
-    pressed_keys: Vec<u16>,
+    pressed_keys: Vec<(u16, core_input::KeySemantics)>,
     pressed_buttons: Vec<core_input::MouseButton>,
 }
 
@@ -67,14 +67,25 @@ impl InjectedInputState {
     fn observe(&mut self, events: &[core_input::InputEvent]) {
         for event in events {
             match event {
-                core_input::InputEvent::Key { scan_code, state } => match state {
+                core_input::InputEvent::Key {
+                    scan_code,
+                    state,
+                    semantics,
+                } => match state {
                     core_input::KeyState::Down => {
-                        if !self.pressed_keys.contains(scan_code) {
-                            self.pressed_keys.push(*scan_code);
+                        if let Some((_, pressed_semantics)) = self
+                            .pressed_keys
+                            .iter_mut()
+                            .find(|(pressed_scan_code, _)| pressed_scan_code == scan_code)
+                        {
+                            *pressed_semantics = *semantics;
+                        } else {
+                            self.pressed_keys.push((*scan_code, *semantics));
                         }
                     }
                     core_input::KeyState::Up => {
-                        self.pressed_keys.retain(|pressed| pressed != scan_code);
+                        self.pressed_keys
+                            .retain(|(pressed_scan_code, _)| pressed_scan_code != scan_code);
                     }
                 },
                 core_input::InputEvent::MouseButton { button, state } => match state {
@@ -102,7 +113,8 @@ impl InjectedInputState {
             core_input::MouseButton::X1 => 3,
             core_input::MouseButton::X2 => 4,
         });
-        self.pressed_keys.sort_unstable();
+        self.pressed_keys
+            .sort_unstable_by_key(|(scan_code, _)| *scan_code);
         let mut releases = self
             .pressed_buttons
             .drain(..)
@@ -114,9 +126,10 @@ impl InjectedInputState {
         releases.extend(
             self.pressed_keys
                 .drain(..)
-                .map(|scan_code| core_input::InputEvent::Key {
+                .map(|(scan_code, semantics)| core_input::InputEvent::Key {
                     scan_code,
                     state: core_input::KeyState::Up,
+                    semantics,
                 }),
         );
         releases
@@ -124,10 +137,7 @@ impl InjectedInputState {
 
     fn release_local(&mut self) -> Result<()> {
         let releases = self.drain_release_events();
-        let records = releases
-            .iter()
-            .flat_map(input_records_for_event)
-            .collect::<Vec<_>>();
+        let records = input_records_for_events(&releases);
         send_input_records(&records)
     }
 }
@@ -787,6 +797,7 @@ mod input_broker_tests {
             core_input::InputEvent::Key {
                 scan_code: 30,
                 state: core_input::KeyState::Down,
+                semantics: core_input::KeySemantics::Physical,
             },
             core_input::InputEvent::MouseButton {
                 button: core_input::MouseButton::Left,
@@ -808,6 +819,7 @@ mod input_broker_tests {
                 core_input::InputEvent::Key {
                     scan_code: 30,
                     state: core_input::KeyState::Up,
+                    semantics: core_input::KeySemantics::Physical,
                 },
             ]
         );
@@ -838,10 +850,7 @@ fn inject_input_events(
     events: &[core_input::InputEvent],
     injected_state: &mut InjectedInputState,
 ) -> Result<()> {
-    let mut records = Vec::new();
-    for event in events {
-        records.extend(input_records_for_event(event));
-    }
+    let records = input_records_for_events(events);
     send_input_records(&records)?;
     injected_state.observe(events);
     Ok(())

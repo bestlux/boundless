@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use core_input::{InputEvent, KeyState, MouseButton};
+use core_input::{InputEvent, KeySemantics, KeyState, MouseButton};
 use tracing::warn;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
@@ -30,6 +30,8 @@ use windows_sys::Win32::{
         },
     },
 };
+
+use super::{VK_NUMLOCK_CODE, is_num_lock_on};
 
 const VK_LBUTTON_CODE: u16 = 0x01;
 const VK_RBUTTON_CODE: u16 = 0x02;
@@ -129,6 +131,8 @@ struct HookRuntimeState {
     right_ctrl_down_at: Option<Instant>,
     current_ctrl_tap_valid: bool,
     last_ctrl_tap_at: Option<Instant>,
+    num_lock_on: bool,
+    num_lock_down: bool,
 }
 
 #[derive(Debug, Default)]
@@ -171,9 +175,9 @@ const CAPTURE_KEY_VIRTUAL_KEYS: &[u16] = &[
     0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
     0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56,
     0x57, 0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
-    0x6A, 0x6B, 0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A,
-    0x7B, 0x90, 0x91, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0,
-    0xDB, 0xDC, 0xDD, 0xDE,
+    0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79,
+    0x7A, 0x7B, 0x90, 0x91, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF,
+    0xC0, 0xDB, 0xDC, 0xDD, 0xDE,
 ];
 
 static ACTIVE_CAPTURE_RUNTIME: OnceLock<Mutex<Option<Weak<CaptureRuntimeCore>>>> = OnceLock::new();
@@ -188,7 +192,10 @@ impl CaptureRuntime {
         let core = Arc::new(CaptureRuntimeCore {
             event_tx: Mutex::new(Some(event_tx)),
             wake_notifier: Mutex::new(Some(Arc::new(wake_notifier))),
-            runtime_state: Mutex::new(HookRuntimeState::default()),
+            runtime_state: Mutex::new(HookRuntimeState {
+                num_lock_on: is_num_lock_on(),
+                ..HookRuntimeState::default()
+            }),
             lock_lease: Mutex::new(HookLockLease::default()),
             lock_active: AtomicBool::new(false),
             raw_keyboard_escape_enabled: AtomicBool::new(false),
@@ -713,6 +720,39 @@ fn update_escape_state_for_key_at(
     false
 }
 
+fn key_semantics_for_hook_event(vk_code: u16, key_state: KeyState) -> KeySemantics {
+    let num_lock_on = with_active_capture_runtime(|runtime| {
+        let Ok(mut state) = runtime.runtime_state.lock() else {
+            return is_num_lock_on();
+        };
+        update_num_lock_state_for_key(&mut state, vk_code, key_state)
+    })
+    .unwrap_or_else(is_num_lock_on);
+
+    KeySemantics::Windows {
+        virtual_key: vk_code,
+        num_lock_on,
+    }
+}
+
+fn update_num_lock_state_for_key(
+    state: &mut HookRuntimeState,
+    vk_code: u16,
+    key_state: KeyState,
+) -> bool {
+    if vk_code == VK_NUMLOCK_CODE {
+        match key_state {
+            KeyState::Down if !state.num_lock_down => {
+                state.num_lock_down = true;
+                state.num_lock_on = !state.num_lock_on;
+            }
+            KeyState::Down => {}
+            KeyState::Up => state.num_lock_down = false,
+        }
+    }
+    state.num_lock_on
+}
+
 /// Detects the emergency gesture and releases the local hook lock before
 /// publishing any reconciliation action. This remains safe when the bounded
 /// hook event queue is full or the daemon/RPC path is stalled.
@@ -766,13 +806,25 @@ fn set_hook_lock_active_for(core: &Arc<CaptureRuntimeCore>, active: bool) -> Res
 }
 
 fn set_hook_lock_active_for_arc(core: &CaptureRuntimeCore, active: bool) -> Result<bool> {
-    core.lock_active.store(active, Ordering::Release);
+    if !active {
+        // Unlock first: local input must fail open even if cleanup state is
+        // poisoned or otherwise unavailable.
+        core.lock_active.store(false, Ordering::Release);
+    }
     let mut state = core
         .runtime_state
         .lock()
         .map_err(|_| anyhow::anyhow!("hook runtime state mutex poisoned"))?;
-    if !active {
-        *state = HookRuntimeState::default();
+    state.left_ctrl_down_at = None;
+    state.right_ctrl_down_at = None;
+    state.current_ctrl_tap_valid = false;
+    state.last_ctrl_tap_at = None;
+    state.num_lock_down = false;
+    if active {
+        // Captured Num Lock is suppressed by the hook, so initialize the
+        // logical state from Windows at each handoff and track later toggles
+        // locally until capture ends.
+        state.num_lock_on = is_num_lock_on();
     }
     drop(state);
 
@@ -781,6 +833,13 @@ fn set_hook_lock_active_for_arc(core: &CaptureRuntimeCore, active: bool) -> Resu
         .lock()
         .map_err(|_| anyhow::anyhow!("hook lock lease mutex poisoned"))?;
     lease.last_renewed_at = (active && lease.timeout.is_some()).then(Instant::now);
+    drop(lease);
+    if active {
+        // Publish capture only after its logical keyboard state and safety
+        // lease are initialized, so the first suppressed key cannot observe
+        // stale Num Lock state.
+        core.lock_active.store(true, Ordering::Release);
+    }
     Ok(active)
 }
 
@@ -818,7 +877,11 @@ fn force_unlock_for_arc_with_hook(
     after_lock_release();
 
     if let Ok(mut state) = core.runtime_state.lock() {
-        *state = HookRuntimeState::default();
+        state.left_ctrl_down_at = None;
+        state.right_ctrl_down_at = None;
+        state.current_ctrl_tap_valid = false;
+        state.last_ctrl_tap_at = None;
+        state.num_lock_down = false;
     }
     if let Ok(mut lease) = core.lock_lease.lock() {
         lease.last_renewed_at = None;
@@ -1369,7 +1432,11 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     scan_code |= 0xE000;
                 }
                 send_hook_event(
-                    HookCaptureEvent::Input(InputEvent::Key { scan_code, state }),
+                    HookCaptureEvent::Input(InputEvent::Key {
+                        scan_code,
+                        state,
+                        semantics: key_semantics_for_hook_event(keyboard.vkCode as u16, state),
+                    }),
                     "keyboard_hook",
                 );
             }
@@ -1889,6 +1956,40 @@ mod tests {
             start + window + Duration::from_millis(200),
             window,
         ));
+    }
+
+    #[test]
+    fn captured_num_lock_toggles_once_per_physical_press() {
+        let mut state = HookRuntimeState {
+            num_lock_on: false,
+            ..HookRuntimeState::default()
+        };
+
+        assert!(update_num_lock_state_for_key(
+            &mut state,
+            VK_NUMLOCK_CODE,
+            KeyState::Down
+        ));
+        assert!(
+            update_num_lock_state_for_key(&mut state, VK_NUMLOCK_CODE, KeyState::Down),
+            "repeat keydown must not toggle again"
+        );
+        assert!(update_num_lock_state_for_key(
+            &mut state,
+            VK_NUMLOCK_CODE,
+            KeyState::Up
+        ));
+        assert!(!update_num_lock_state_for_key(
+            &mut state,
+            VK_NUMLOCK_CODE,
+            KeyState::Down
+        ));
+    }
+
+    #[test]
+    fn polling_key_set_includes_keypad_separator() {
+        const VK_SEPARATOR_CODE: u16 = 0x6C;
+        assert!(captured_key_virtual_keys().contains(&VK_SEPARATOR_CODE));
     }
 
     #[test]

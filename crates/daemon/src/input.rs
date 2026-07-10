@@ -13,6 +13,8 @@ use tracing::warn;
 
 use chrono::Utc;
 
+#[cfg(any(windows, test))]
+use core_input::KeySemantics;
 use core_input::{InputEvent, MAX_EVENTS_PER_FRAME, SwitchDirection};
 
 use crate::{
@@ -71,8 +73,8 @@ use platform_windows::input::send_input_records_with_sender;
 use platform_windows::input::{
     HookControlAction, HookInputPump, captured_key_virtual_keys,
     current_process_can_use_interactive_input, cursor_position, input_event_kind,
-    input_records_for_event, is_virtual_key_down, mouse_button_from_virtual_key,
-    mouse_button_virtual_keys, send_input_records, vk_to_scan_code,
+    input_records_for_event, input_records_for_events, is_num_lock_on, is_virtual_key_down,
+    mouse_button_from_virtual_key, mouse_button_virtual_keys, send_input_records, vk_to_scan_code,
 };
 #[cfg(all(test, not(windows)))]
 use runtime::apply_frame;
@@ -336,6 +338,7 @@ mod tests {
                 InputEvent::Key {
                     scan_code: 30,
                     state: core_input::KeyState::Down,
+                    semantics: KeySemantics::Physical,
                 },
             ],
         };
@@ -619,6 +622,7 @@ mod tests {
                         events: vec![InputEvent::Key {
                             scan_code: sequence as u16,
                             state: KeyState::Down,
+                            semantics: KeySemantics::Physical,
                         }],
                     },
                 )
@@ -665,6 +669,7 @@ mod tests {
                     events: vec![InputEvent::Key {
                         scan_code: 30,
                         state: KeyState::Down,
+                        semantics: KeySemantics::Physical,
                     }],
                 },
             )
@@ -715,6 +720,7 @@ mod tests {
                         events: vec![InputEvent::Key {
                             scan_code: sequence as u16,
                             state: KeyState::Down,
+                            semantics: KeySemantics::Physical,
                         }],
                     },
                 )
@@ -793,6 +799,7 @@ mod tests {
                         events: vec![InputEvent::Key {
                             scan_code: sequence as u16,
                             state: KeyState::Down,
+                            semantics: KeySemantics::Physical,
                         }],
                     },
                 )
@@ -846,6 +853,7 @@ mod tests {
             .map(|index| InputEvent::Key {
                 scan_code: index as u16 + 1,
                 state: KeyState::Down,
+                semantics: KeySemantics::Physical,
             })
             .collect::<Vec<_>>();
         let mut backend = ScriptedCaptureBackend::new(vec![events], Vec::new());
@@ -983,6 +991,7 @@ mod tests {
                 InputEvent::Key {
                     scan_code: 30,
                     state: KeyState::Up,
+                    semantics: KeySemantics::Physical,
                 },
             ],
         );
@@ -1039,6 +1048,7 @@ mod tests {
             vec![InputEvent::Key {
                 scan_code: 42,
                 state: KeyState::Up,
+                semantics: KeySemantics::Physical,
             }],
         );
         let mut last_target = None;
@@ -1066,7 +1076,11 @@ mod tests {
             outgoing.first(),
             Some(crate::state::OutboundPayload::InputFrame { sequence: 1, events, .. }) if matches!(
                 events.as_slice(),
-                [InputEvent::Key { scan_code: 42, state: KeyState::Up }]
+                [InputEvent::Key {
+                    scan_code: 42,
+                    state: KeyState::Up,
+                    ..
+                }]
             )
         ));
 
@@ -1115,6 +1129,7 @@ mod tests {
             vec![InputEvent::Key {
                 scan_code: 30,
                 state: KeyState::Up,
+                semantics: KeySemantics::Physical,
             }],
         );
         let mut last_target = None;
@@ -1160,7 +1175,11 @@ mod tests {
             left_outgoing.get(1),
             Some(crate::state::OutboundPayload::InputFrame { sequence: 2, events, .. }) if matches!(
                 events.as_slice(),
-                [InputEvent::Key { scan_code: 30, state: KeyState::Up }]
+                [InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Up,
+                    ..
+                }]
             )
         ));
         let right_outgoing = state.drain_outgoing(&right_peer).await;
@@ -1646,6 +1665,7 @@ mod tests {
         let records = input_records_for_event(&InputEvent::Key {
             scan_code: 30,
             state: core_input::KeyState::Down,
+            semantics: KeySemantics::Physical,
         });
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].r#type, INPUT_KEYBOARD);
@@ -1662,6 +1682,7 @@ mod tests {
         let records = input_records_for_event(&InputEvent::Key {
             scan_code: 0xE04D,
             state: core_input::KeyState::Down,
+            semantics: KeySemantics::Physical,
         });
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].r#type, INPUT_KEYBOARD);
@@ -1680,6 +1701,7 @@ mod tests {
         let records = input_records_for_event(&InputEvent::Key {
             scan_code: 0xE11D,
             state: core_input::KeyState::Down,
+            semantics: KeySemantics::Physical,
         });
         assert_eq!(records.len(), 1);
 
@@ -1857,6 +1879,7 @@ mod tests {
                     captured_events: vec![InputEvent::Key {
                         scan_code: 30,
                         state: KeyState::Down,
+                        semantics: KeySemantics::Physical,
                     }],
                     ..Default::default()
                 },
@@ -1882,7 +1905,11 @@ mod tests {
             outgoing.first(),
             Some(crate::state::OutboundPayload::InputFrame { events, .. }) if matches!(
                 events.as_slice(),
-                [InputEvent::Key { scan_code: 30, state: KeyState::Down }]
+                [InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Down,
+                    ..
+                }]
             )
         ));
 
@@ -1919,6 +1946,7 @@ mod tests {
                     captured_events: vec![InputEvent::Key {
                         scan_code: 30,
                         state: KeyState::Down,
+                        semantics: KeySemantics::Physical,
                     }],
                     ..Default::default()
                 },
@@ -1989,10 +2017,12 @@ mod tests {
                 InputEvent::Key {
                     scan_code: 30,
                     state: KeyState::Down,
+                    semantics: KeySemantics::Physical,
                 },
                 InputEvent::Key {
                     scan_code: 30,
                     state: KeyState::Up,
+                    semantics: KeySemantics::Physical,
                 },
             ],
             "the final release must be ordered after any pre-detach captured down event"
@@ -2114,21 +2144,25 @@ mod tests {
         tx.send(HookCaptureEvent::Input(InputEvent::Key {
             scan_code: 30,
             state: KeyState::Down,
+            semantics: KeySemantics::Physical,
         }))
         .expect("send key down 1");
         tx.send(HookCaptureEvent::Input(InputEvent::Key {
             scan_code: 30,
             state: KeyState::Down,
+            semantics: KeySemantics::Physical,
         }))
         .expect("send key down 2");
         tx.send(HookCaptureEvent::Input(InputEvent::Key {
             scan_code: 30,
             state: KeyState::Up,
+            semantics: KeySemantics::Physical,
         }))
         .expect("send key up");
         tx.send(HookCaptureEvent::Input(InputEvent::Key {
             scan_code: 30,
             state: KeyState::Up,
+            semantics: KeySemantics::Physical,
         }))
         .expect("send duplicate key up");
 
@@ -2138,15 +2172,18 @@ mod tests {
             [
                 InputEvent::Key {
                     scan_code: 30,
-                    state: KeyState::Down
+                    state: KeyState::Down,
+                    ..
                 },
                 InputEvent::Key {
                     scan_code: 30,
-                    state: KeyState::Down
+                    state: KeyState::Down,
+                    ..
                 },
                 InputEvent::Key {
                     scan_code: 30,
-                    state: KeyState::Up
+                    state: KeyState::Up,
+                    ..
                 }
             ]
         ));

@@ -6,7 +6,7 @@ use thiserror::Error;
 pub const PROTOCOL_NAME: &str = "boundless";
 pub const PROTOCOL_CURRENT: ProtocolVersion = ProtocolVersion {
     major: 4,
-    minor: 2,
+    minor: 3,
     patch: 0,
 };
 pub const MAX_WIRE_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -133,6 +133,12 @@ pub enum WireKeyState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireKeySemantics {
+    Physical,
+    Windows { virtual_key: u16, num_lock_on: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireMouseButton {
     Left,
     Right,
@@ -162,6 +168,7 @@ pub enum WireInputEvent {
     Key {
         scan_code: u16,
         state: WireKeyState,
+        semantics: WireKeySemantics,
     },
 }
 
@@ -366,6 +373,10 @@ mod tests {
                 WireInputEvent::Key {
                     scan_code: 30,
                     state: WireKeyState::Down,
+                    semantics: WireKeySemantics::Windows {
+                        virtual_key: 0x61,
+                        num_lock_on: true,
+                    },
                 },
             ],
         };

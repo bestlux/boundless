@@ -3,7 +3,7 @@ use core_input::InputEvent;
 #[cfg(windows)]
 use anyhow::{Context, Result, bail};
 #[cfg(windows)]
-use core_input::{KeyState, MouseButton};
+use core_input::{KeySemantics, KeyState, MouseButton};
 
 #[cfg(windows)]
 mod hook_capture;
@@ -26,7 +26,7 @@ use windows_sys::Win32::{
     System::Threading::{GetCurrentProcess, OpenProcessToken},
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+            GetAsyncKeyState, GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
             KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX,
             MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
             MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
@@ -45,6 +45,9 @@ const XBUTTON1: u32 = 0x0001;
 
 #[cfg(windows)]
 const XBUTTON2: u32 = 0x0002;
+
+#[cfg(windows)]
+pub const VK_NUMLOCK_CODE: u16 = 0x90;
 
 pub fn high_word(value: u32) -> u16 {
     ((value >> 16) & 0xFFFF) as u16
@@ -127,6 +130,12 @@ pub fn is_virtual_key_down(vk: u16) -> bool {
 }
 
 #[cfg(windows)]
+pub fn is_num_lock_on() -> bool {
+    let state = unsafe { GetKeyState(i32::from(VK_NUMLOCK_CODE)) };
+    (state as u16 & 0x0001) != 0
+}
+
+#[cfg(windows)]
 pub fn vk_to_scan_code(vk: u16) -> Option<u16> {
     let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) } as u16;
     if scan == 0 { None } else { Some(scan) }
@@ -134,21 +143,46 @@ pub fn vk_to_scan_code(vk: u16) -> Option<u16> {
 
 #[cfg(windows)]
 pub fn input_records_for_event(event: &InputEvent) -> Vec<INPUT> {
+    input_records_for_events(std::slice::from_ref(event))
+}
+
+#[cfg(windows)]
+pub fn input_records_for_events(events: &[InputEvent]) -> Vec<INPUT> {
+    input_records_for_events_with_num_lock_state(events, is_num_lock_on())
+}
+
+#[cfg(windows)]
+pub fn input_records_for_events_with_num_lock_state(
+    events: &[InputEvent],
+    initial_num_lock_on: bool,
+) -> Vec<INPUT> {
+    let mut records = Vec::new();
+    let mut destination_num_lock_on = initial_num_lock_on;
+    for event in events {
+        append_input_records_for_event(event, &mut destination_num_lock_on, &mut records);
+    }
+    records
+}
+
+#[cfg(windows)]
+fn append_input_records_for_event(
+    event: &InputEvent,
+    destination_num_lock_on: &mut bool,
+    records: &mut Vec<INPUT>,
+) {
     match event {
         InputEvent::MouseMove { dx, dy } => {
-            if *dx == 0 && *dy == 0 {
-                Vec::new()
-            } else {
-                vec![mouse_input(*dx, *dy, 0, MOUSEEVENTF_MOVE)]
+            if *dx != 0 || *dy != 0 {
+                records.push(mouse_input(*dx, *dy, 0, MOUSEEVENTF_MOVE));
             }
         }
         InputEvent::MouseMoveAbsolute { x_norm, y_norm } => {
-            vec![mouse_input(
+            records.push(mouse_input(
                 i32::from(*x_norm),
                 i32::from(*y_norm),
                 0,
                 MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-            )]
+            ));
         }
         InputEvent::MouseButton { button, state } => {
             let (flags, mouse_data) = match (button, state) {
@@ -164,20 +198,45 @@ pub fn input_records_for_event(event: &InputEvent) -> Vec<INPUT> {
                 (MouseButton::X2, KeyState::Up) => (MOUSEEVENTF_XUP, XBUTTON2),
             };
 
-            vec![mouse_input(0, 0, mouse_data, flags)]
+            records.push(mouse_input(0, 0, mouse_data, flags));
         }
         InputEvent::MouseWheel { delta_x, delta_y } => {
-            let mut records = Vec::with_capacity(2);
             if *delta_y != 0 {
                 records.push(mouse_input(0, 0, *delta_y as u32, MOUSEEVENTF_WHEEL));
             }
             if *delta_x != 0 {
                 records.push(mouse_input(0, 0, *delta_x as u32, MOUSEEVENTF_HWHEEL));
             }
-            records
         }
-        InputEvent::Key { scan_code, state } => {
-            vec![keyboard_input(*scan_code, matches!(state, KeyState::Up))]
+        InputEvent::Key {
+            scan_code,
+            state,
+            semantics,
+        } => {
+            let key_up = matches!(state, KeyState::Up);
+            match semantics {
+                KeySemantics::Physical => records.push(keyboard_input(*scan_code, key_up)),
+                KeySemantics::Windows {
+                    virtual_key,
+                    num_lock_on,
+                } if *virtual_key == VK_NUMLOCK_CODE => {
+                    if !key_up && *destination_num_lock_on != *num_lock_on {
+                        records.push(keyboard_virtual_key_input(VK_NUMLOCK_CODE, false));
+                        records.push(keyboard_virtual_key_input(VK_NUMLOCK_CODE, true));
+                        *destination_num_lock_on = *num_lock_on;
+                    }
+                }
+                KeySemantics::Windows { num_lock_on, .. } => {
+                    if keypad_scan_uses_num_lock(*scan_code)
+                        && *destination_num_lock_on != *num_lock_on
+                    {
+                        records.push(keyboard_virtual_key_input(VK_NUMLOCK_CODE, false));
+                        records.push(keyboard_virtual_key_input(VK_NUMLOCK_CODE, true));
+                        *destination_num_lock_on = *num_lock_on;
+                    }
+                    records.push(keyboard_input(*scan_code, key_up));
+                }
+            }
         }
     }
 }
@@ -218,6 +277,22 @@ fn keyboard_input(scan_code: u16, key_up: bool) -> INPUT {
                 wVk: 0,
                 wScan: normalized_scan_code,
                 dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+#[cfg(windows)]
+fn keyboard_virtual_key_input(virtual_key: u16, key_up: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: virtual_key,
+                wScan: 0,
+                dwFlags: if key_up { KEYEVENTF_KEYUP } else { 0 },
                 time: 0,
                 dwExtraInfo: 0,
             },
@@ -280,6 +355,14 @@ fn is_extended_scan_code(scan_code: u16) -> bool {
     matches!(scan_code & 0xFF00, 0xE000 | 0xE100)
 }
 
+#[cfg(windows)]
+fn keypad_scan_uses_num_lock(scan_code: u16) -> bool {
+    if is_extended_scan_code(scan_code) {
+        return false;
+    }
+    matches!(scan_code & 0x00FF, 0x47..=0x49 | 0x4B..=0x4D | 0x4F..=0x53)
+}
+
 pub fn input_event_kind(event: &InputEvent) -> &'static str {
     match event {
         InputEvent::MouseMove { .. } => "mouse_move",
@@ -293,6 +376,27 @@ pub fn input_event_kind(event: &InputEvent) -> &'static str {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    fn windows_key(
+        scan_code: u16,
+        virtual_key: u16,
+        num_lock_on: bool,
+        state: KeyState,
+    ) -> InputEvent {
+        InputEvent::Key {
+            scan_code,
+            state,
+            semantics: KeySemantics::Windows {
+                virtual_key,
+                num_lock_on,
+            },
+        }
+    }
+
+    fn keyboard_record(input: &INPUT) -> KEYBDINPUT {
+        assert_eq!(input.r#type, INPUT_KEYBOARD);
+        unsafe { input.Anonymous.ki }
+    }
 
     #[test]
     fn signed_high_resolution_wheel_deltas_reach_send_input_records() {
@@ -310,6 +414,107 @@ mod tests {
             let horizontal = unsafe { records[1].Anonymous.mi };
             assert_eq!(horizontal.mouseData as i32, delta);
             assert_eq!(horizontal.dwFlags, MOUSEEVENTF_HWHEEL);
+        }
+    }
+
+    #[test]
+    fn keypad_digit_injection_honors_all_source_destination_num_lock_states() {
+        const VK_NUMPAD7: u16 = 0x67;
+        const NUMPAD7_SCAN: u16 = 0x47;
+
+        for source_num_lock_on in [false, true] {
+            for destination_num_lock_on in [false, true] {
+                let virtual_key = if source_num_lock_on { VK_NUMPAD7 } else { 0x24 };
+                let records = input_records_for_events_with_num_lock_state(
+                    &[windows_key(
+                        NUMPAD7_SCAN,
+                        virtual_key,
+                        source_num_lock_on,
+                        KeyState::Down,
+                    )],
+                    destination_num_lock_on,
+                );
+
+                let keypad = keyboard_record(records.last().expect("keypad record"));
+                assert_eq!(keypad.wScan, NUMPAD7_SCAN);
+                assert_eq!(keypad.dwFlags & KEYEVENTF_SCANCODE, KEYEVENTF_SCANCODE);
+                if source_num_lock_on == destination_num_lock_on {
+                    assert_eq!(records.len(), 1);
+                } else {
+                    assert_eq!(records.len(), 3);
+                    let toggle_down = keyboard_record(&records[0]);
+                    let toggle_up = keyboard_record(&records[1]);
+                    assert_eq!(toggle_down.wVk, VK_NUMLOCK_CODE);
+                    assert_eq!(toggle_down.dwFlags & KEYEVENTF_KEYUP, 0);
+                    assert_eq!(toggle_up.wVk, VK_NUMLOCK_CODE);
+                    assert_eq!(toggle_up.dwFlags & KEYEVENTF_KEYUP, KEYEVENTF_KEYUP);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn captured_num_lock_and_repeated_keypad_events_toggle_destination_once() {
+        const VK_NUMPAD1: u16 = 0x61;
+        let events = [
+            windows_key(0x45, VK_NUMLOCK_CODE, true, KeyState::Down),
+            windows_key(0x45, VK_NUMLOCK_CODE, true, KeyState::Up),
+            windows_key(0x4F, VK_NUMPAD1, true, KeyState::Down),
+            windows_key(0x4F, VK_NUMPAD1, true, KeyState::Down),
+            windows_key(0x4F, VK_NUMPAD1, true, KeyState::Up),
+        ];
+
+        let records = input_records_for_events_with_num_lock_state(&events, false);
+        assert_eq!(records.len(), 5, "one toggle pair plus down/repeat/up");
+        assert_eq!(keyboard_record(&records[0]).wVk, VK_NUMLOCK_CODE);
+        assert_eq!(keyboard_record(&records[1]).wVk, VK_NUMLOCK_CODE);
+        for record in &records[2..] {
+            let key = keyboard_record(record);
+            assert_eq!(key.wScan, 0x4F);
+            assert_ne!(key.dwFlags & KEYEVENTF_SCANCODE, 0);
+        }
+        assert_eq!(
+            keyboard_record(&records[4]).dwFlags & KEYEVENTF_KEYUP,
+            KEYEVENTF_KEYUP
+        );
+    }
+
+    #[test]
+    fn existing_extended_keypad_and_navigation_identity_is_preserved() {
+        const VK_RETURN: u16 = 0x0D;
+        const VK_DIVIDE: u16 = 0x6F;
+        const VK_HOME: u16 = 0x24;
+        let records = input_records_for_events_with_num_lock_state(
+            &[
+                windows_key(0x1C, VK_RETURN, true, KeyState::Down),
+                windows_key(0xE01C, VK_RETURN, true, KeyState::Down),
+                windows_key(0xE035, VK_DIVIDE, true, KeyState::Down),
+                windows_key(0xE047, VK_HOME, true, KeyState::Down),
+            ],
+            false,
+        );
+
+        assert_eq!(
+            records.len(),
+            4,
+            "non-ambiguous keys must not toggle Num Lock"
+        );
+        let main_enter = keyboard_record(&records[0]);
+        let keypad_enter = keyboard_record(&records[1]);
+        let keypad_divide = keyboard_record(&records[2]);
+        let dedicated_home = keyboard_record(&records[3]);
+        assert_eq!(main_enter.wScan, 0x1C);
+        assert_eq!(main_enter.dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+        for (record, scan) in [
+            (keypad_enter, 0x1C),
+            (keypad_divide, 0x35),
+            (dedicated_home, 0x47),
+        ] {
+            assert_eq!(record.wScan, scan);
+            assert_eq!(
+                record.dwFlags & KEYEVENTF_EXTENDEDKEY,
+                KEYEVENTF_EXTENDEDKEY
+            );
         }
     }
 }

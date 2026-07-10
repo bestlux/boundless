@@ -103,6 +103,7 @@ impl AppState {
             vec![InputEvent::Key {
                 scan_code,
                 state: key_state,
+                semantics: core_input::KeySemantics::Physical,
             }],
         )
         .await

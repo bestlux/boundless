@@ -53,6 +53,7 @@ Related design notes:
 - Session-level chunk credit bookkeeping is isolated to `outbound_transfer_flow`.
 - Session-level inbound transfer staging is isolated to `inbound_transfers`.
 - Non-canonical protocol peers are rejected at handshake and guarded again in outbound send paths.
+- Protocol 4.3 keyboard frames retain physical scan/E0 identity plus source Windows virtual-key and effective Num Lock semantics. The clean bincode shape change intentionally rejects 4.2 peers at handshake; local 4.2 runtime config is migrated to 4.3 on upgrade.
 
 ## Slice 1 regression focus
 

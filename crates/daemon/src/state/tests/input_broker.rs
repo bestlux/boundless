@@ -341,6 +341,7 @@ async fn detach_rejects_wrong_user_and_keeps_broker_attached() {
                     InputEvent::Key {
                         scan_code: 30,
                         state: KeyState::Down,
+                        semantics: core_input::KeySemantics::Physical,
                     },
                     InputEvent::MouseButton {
                         button: MouseButton::Left,
@@ -403,6 +404,7 @@ async fn detach_rejects_wrong_user_and_keeps_broker_attached() {
                     InputEvent::Key {
                         scan_code: 30,
                         state: KeyState::Up,
+                        semantics: core_input::KeySemantics::Physical,
                     },
                 ]
         )),
@@ -461,6 +463,7 @@ async fn replacement_attach_queues_final_release_after_prior_captured_down() {
     let down = InputEvent::Key {
         scan_code: 30,
         state: KeyState::Down,
+        semantics: core_input::KeySemantics::Physical,
     };
     let observed = state
         .exchange_input_broker(
@@ -505,6 +508,7 @@ async fn replacement_attach_queues_final_release_after_prior_captured_down() {
             InputEvent::Key {
                 scan_code: 30,
                 state: KeyState::Up,
+                semantics: core_input::KeySemantics::Physical,
             },
         ],
         "replacement attach must order a final release after the prior broker's Down"
@@ -529,6 +533,7 @@ async fn replacement_attach_queue_failure_preserves_prior_broker_and_pressed_sta
                 captured_events: vec![InputEvent::Key {
                     scan_code: 30,
                     state: KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
                 }],
                 ..Default::default()
             },
@@ -558,6 +563,7 @@ async fn replacement_attach_queue_failure_preserves_prior_broker_and_pressed_sta
         vec![InputEvent::Key {
             scan_code: 30,
             state: KeyState::Up,
+            semantics: core_input::KeySemantics::Physical,
         }],
         "failed replacement must preserve authoritative pressed state for retry"
     );
@@ -612,6 +618,7 @@ async fn stale_reject_cleanup_and_reattach_preserve_final_release_ordering() {
     let down = InputEvent::Key {
         scan_code: 30,
         state: KeyState::Down,
+        semantics: core_input::KeySemantics::Physical,
     };
     let observed = state
         .exchange_input_broker(
@@ -667,6 +674,7 @@ async fn stale_reject_cleanup_and_reattach_preserve_final_release_ordering() {
             InputEvent::Key {
                 scan_code: 30,
                 state: KeyState::Up,
+                semantics: core_input::KeySemantics::Physical,
             },
         ]
     );
@@ -700,6 +708,7 @@ async fn exchange_returns_inject_frames_only_for_current_input_owner() {
                 events: vec![InputEvent::Key {
                     scan_code: 30,
                     state: KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
                 }],
             },
         )
@@ -731,6 +740,7 @@ async fn exchange_returns_inject_frames_only_for_current_input_owner() {
                 events: vec![InputEvent::Key {
                     scan_code: 30,
                     state: KeyState::Up,
+                    semantics: core_input::KeySemantics::Physical,
                 }],
             },
         )
@@ -779,6 +789,7 @@ async fn broker_observations_feed_capture_state_and_release_synthesis() {
                     InputEvent::Key {
                         scan_code: 30,
                         state: KeyState::Down,
+                        semantics: core_input::KeySemantics::Physical,
                     },
                     InputEvent::MouseMove { dx: 4, dy: 0 },
                 ],
@@ -799,6 +810,7 @@ async fn broker_observations_feed_capture_state_and_release_synthesis() {
         vec![InputEvent::Key {
             scan_code: 30,
             state: KeyState::Up,
+            semantics: core_input::KeySemantics::Physical,
         }],
         "held keys reported by the broker must synthesize releases"
     );

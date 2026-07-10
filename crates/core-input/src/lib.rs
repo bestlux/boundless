@@ -25,6 +25,24 @@ pub enum KeyState {
     Up,
 }
 
+/// Source-side interpretation metadata for a physical keyboard event.
+///
+/// Windows can map the same non-extended keypad scan code to either a digit or
+/// a navigation virtual key depending on Num Lock. Carrying the source virtual
+/// key and effective toggle state lets the destination reproduce that intent
+/// while retaining the physical scan/E0 identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeySemantics {
+    /// Only the physical scan/E0 identity is known (for example, a diagnostic
+    /// command that supplies a scan code directly).
+    #[default]
+    Physical,
+    Windows {
+        virtual_key: u16,
+        num_lock_on: bool,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MouseButton {
     Left,
@@ -56,6 +74,7 @@ pub enum InputEvent {
     Key {
         scan_code: u16,
         state: KeyState,
+        semantics: KeySemantics,
     },
 }
 
@@ -324,6 +343,7 @@ mod tests {
                 InputEvent::Key {
                     scan_code: 30,
                     state: KeyState::Down,
+                    semantics: KeySemantics::Physical,
                 },
             ],
         }
