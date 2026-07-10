@@ -206,3 +206,29 @@ impl HookInputPump {
         self.capture_runtime.take_dropped_event_count()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn high_resolution_wheel_delta_survives_hook_pump() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        tx.send(HookCaptureEvent::Input(InputEvent::MouseWheel {
+            delta_x: -17,
+            delta_y: 30,
+        }))
+        .expect("queue wheel");
+        let runtime = CaptureRuntime::from_test_parts(rx, true);
+        let mut pump = HookInputPump::from_capture_runtime(runtime);
+
+        assert_eq!(
+            pump.poll_events(),
+            vec![InputEvent::MouseWheel {
+                delta_x: -17,
+                delta_y: 30,
+            }]
+        );
+    }
+}

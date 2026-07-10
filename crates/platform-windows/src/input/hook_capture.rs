@@ -21,11 +21,11 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW,
             HC_ACTION, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-            PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-            WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-            WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-            WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-            WM_XBUTTONDOWN, WM_XBUTTONUP,
+            PostThreadMessageW, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, SetWindowsHookExW,
+            TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT,
+            WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+            WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+            WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
         },
     },
 };
@@ -85,6 +85,7 @@ struct CaptureRuntimeCore {
     escape_unlock_pending: AtomicU64,
     lease_expired_unlock_pending: AtomicU64,
     lock_watchdog_stop: AtomicBool,
+    raw_input_mouse_enabled: AtomicBool,
     dropped_event_count: AtomicU64,
 }
 
@@ -137,6 +138,7 @@ impl CaptureRuntime {
             escape_unlock_pending: AtomicU64::new(0),
             lease_expired_unlock_pending: AtomicU64::new(0),
             lock_watchdog_stop: AtomicBool::new(false),
+            raw_input_mouse_enabled: AtomicBool::new(false),
             dropped_event_count: AtomicU64::new(0),
         });
 
@@ -190,6 +192,8 @@ impl CaptureRuntime {
                     (None, None, false)
                 }
             };
+        core.raw_input_mouse_enabled
+            .store(raw_input_enabled, Ordering::Release);
 
         Ok(Self {
             core,
@@ -218,6 +222,7 @@ impl CaptureRuntime {
                 escape_unlock_pending: AtomicU64::new(0),
                 lease_expired_unlock_pending: AtomicU64::new(0),
                 lock_watchdog_stop: AtomicBool::new(false),
+                raw_input_mouse_enabled: AtomicBool::new(raw_input_enabled),
                 dropped_event_count: AtomicU64::new(0),
             }),
             event_rx,
@@ -256,6 +261,9 @@ impl CaptureRuntime {
         }
         self.raw_input_thread_id = None;
         self.raw_input_enabled = false;
+        self.core
+            .raw_input_mouse_enabled
+            .store(false, Ordering::Release);
         warn!("raw input capture thread exited; using mouse hook position delta fallback");
         false
     }
@@ -345,6 +353,9 @@ impl Drop for CaptureRuntime {
         }
         self.raw_input_thread_id = None;
         self.raw_input_enabled = false;
+        self.core
+            .raw_input_mouse_enabled
+            .store(false, Ordering::Release);
         post_thread_quit(self.hook_thread_id);
         if let Some(thread) = self.hook_thread.take() {
             let _ = thread.join();
@@ -431,6 +442,11 @@ pub fn send_hook_event(event: HookCaptureEvent, source: &'static str) {
 
 pub fn is_hook_lock_active() -> bool {
     with_active_capture_runtime(|core| core.lock_active.load(Ordering::Relaxed)).unwrap_or(false)
+}
+
+fn raw_input_mouse_enabled() -> bool {
+    with_active_capture_runtime(|core| core.raw_input_mouse_enabled.load(Ordering::Acquire))
+        .unwrap_or(false)
 }
 
 fn update_escape_state_for_key_at(
@@ -887,6 +903,9 @@ fn process_raw_input_message(lparam: LPARAM) -> Result<()> {
     if let Some((dx, dy)) = raw_mouse_relative_delta(&mouse) {
         send_hook_event(HookCaptureEvent::MouseDelta { dx, dy }, "raw_input");
     }
+    for event in raw_mouse_wheel_events(&mouse) {
+        send_hook_event(HookCaptureEvent::Input(event), "raw_input");
+    }
 
     Ok(())
 }
@@ -899,6 +918,38 @@ pub fn raw_mouse_relative_delta(mouse: &RAWMOUSE) -> Option<(i32, i32)> {
         return None;
     }
     Some((mouse.lLastX, mouse.lLastY))
+}
+
+/// Extracts signed high-resolution wheel deltas from Raw Input. Values are
+/// intentionally not normalized to WHEEL_DELTA (120): precision touchpads and
+/// high-resolution wheels may emit smaller increments that destination apps
+/// need to accumulate.
+pub fn raw_mouse_wheel_events(mouse: &RAWMOUSE) -> Vec<InputEvent> {
+    let buttons = unsafe { mouse.Anonymous.Anonymous };
+    let flags = u32::from(buttons.usButtonFlags);
+    let delta = i16::from_ne_bytes(buttons.usButtonData.to_ne_bytes()) as i32;
+    if delta == 0 {
+        return Vec::new();
+    }
+
+    let mut events = Vec::with_capacity(2);
+    if (flags & RI_MOUSE_WHEEL) != 0 {
+        events.push(InputEvent::MouseWheel {
+            delta_x: 0,
+            delta_y: delta,
+        });
+    }
+    if (flags & RI_MOUSE_HWHEEL) != 0 {
+        events.push(InputEvent::MouseWheel {
+            delta_x: delta,
+            delta_y: 0,
+        });
+    }
+    events
+}
+
+fn should_capture_low_level_wheel(raw_input_enabled: bool) -> bool {
+    !raw_input_enabled
 }
 
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1014,20 +1065,24 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                         );
                     }
                 }
-                WM_MOUSEWHEEL => send_hook_event(
-                    HookCaptureEvent::Input(InputEvent::MouseWheel {
-                        delta_x: 0,
-                        delta_y: crate::input::signed_high_word(mouse.mouseData),
-                    }),
-                    "mouse_hook",
-                ),
-                WM_MOUSEHWHEEL => send_hook_event(
-                    HookCaptureEvent::Input(InputEvent::MouseWheel {
-                        delta_x: crate::input::signed_high_word(mouse.mouseData),
-                        delta_y: 0,
-                    }),
-                    "mouse_hook",
-                ),
+                WM_MOUSEWHEEL if should_capture_low_level_wheel(raw_input_mouse_enabled()) => {
+                    send_hook_event(
+                        HookCaptureEvent::Input(InputEvent::MouseWheel {
+                            delta_x: 0,
+                            delta_y: crate::input::signed_high_word(mouse.mouseData),
+                        }),
+                        "mouse_hook",
+                    )
+                }
+                WM_MOUSEHWHEEL if should_capture_low_level_wheel(raw_input_mouse_enabled()) => {
+                    send_hook_event(
+                        HookCaptureEvent::Input(InputEvent::MouseWheel {
+                            delta_x: crate::input::signed_high_word(mouse.mouseData),
+                            delta_y: 0,
+                        }),
+                        "mouse_hook",
+                    )
+                }
                 _ => {}
             }
         }
@@ -1044,6 +1099,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 mod tests {
     use super::*;
     use std::sync::OnceLock;
+    use windows_sys::Win32::UI::Input::{RAWMOUSE_0, RAWMOUSE_0_0};
 
     static REGISTRY_TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -1061,6 +1117,7 @@ mod tests {
             escape_unlock_pending: AtomicU64::new(0),
             lease_expired_unlock_pending: AtomicU64::new(0),
             lock_watchdog_stop: AtomicBool::new(false),
+            raw_input_mouse_enabled: AtomicBool::new(false),
             dropped_event_count: AtomicU64::new(0),
         })
     }
@@ -1068,6 +1125,18 @@ mod tests {
     fn reset_active_runtime_for_test() {
         if let Ok(mut guard) = active_capture_runtime_cell().lock() {
             *guard = None;
+        }
+    }
+
+    fn raw_mouse_with_wheel(button_flags: u16, delta: i16) -> RAWMOUSE {
+        RAWMOUSE {
+            Anonymous: RAWMOUSE_0 {
+                Anonymous: RAWMOUSE_0_0 {
+                    usButtonFlags: button_flags,
+                    usButtonData: u16::from_ne_bytes(delta.to_ne_bytes()),
+                },
+            },
+            ..Default::default()
         }
     }
 
@@ -1098,6 +1167,49 @@ mod tests {
         let second = test_runtime_core();
         activate_capture_runtime(&second).expect("second runtime should activate");
         clear_active_capture_runtime(&second).expect("clear second runtime");
+    }
+
+    #[test]
+    fn raw_input_preserves_signed_high_resolution_vertical_wheel_delta() {
+        let mouse = raw_mouse_with_wheel(RI_MOUSE_WHEEL as u16, 30);
+        assert_eq!(
+            raw_mouse_wheel_events(&mouse),
+            vec![InputEvent::MouseWheel {
+                delta_x: 0,
+                delta_y: 30,
+            }]
+        );
+
+        let mouse = raw_mouse_with_wheel(RI_MOUSE_WHEEL as u16, -45);
+        assert_eq!(
+            raw_mouse_wheel_events(&mouse),
+            vec![InputEvent::MouseWheel {
+                delta_x: 0,
+                delta_y: -45,
+            }]
+        );
+    }
+
+    #[test]
+    fn raw_input_extracts_horizontal_wheel_without_normalizing() {
+        let mouse = raw_mouse_with_wheel(RI_MOUSE_HWHEEL as u16, -17);
+        assert_eq!(
+            raw_mouse_wheel_events(&mouse),
+            vec![InputEvent::MouseWheel {
+                delta_x: -17,
+                delta_y: 0,
+            }]
+        );
+        assert!(raw_mouse_wheel_events(&RAWMOUSE::default()).is_empty());
+    }
+
+    #[test]
+    fn low_level_wheel_is_used_only_when_raw_input_is_unavailable() {
+        assert!(should_capture_low_level_wheel(false));
+        assert!(
+            !should_capture_low_level_wheel(true),
+            "the hook copy must be suppressed when Raw Input owns wheel capture"
+        );
     }
 
     #[test]
