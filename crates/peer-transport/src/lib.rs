@@ -77,6 +77,7 @@ pub const MAX_INBOUND_TRANSFERS_PER_PEER: usize = 4;
 pub const CLIPBOARD_IMAGE_CHUNK_BYTES: usize = 128 * 1024;
 pub const MAX_TRANSPORT_EVENTS: usize = 512;
 const MAX_ACTIVITY_EVENT_SUMMARIES: usize = 64;
+const MAX_DIAGNOSTIC_EVENT_SUMMARIES: usize = 128;
 
 #[derive(Debug, Clone)]
 pub enum OutboundPayload {
@@ -292,15 +293,84 @@ struct RetainedTransportEvent {
     first_timestamp: DateTime<Utc>,
     sample_count: u64,
     retained_size_bytes: u64,
+    counter_totals: Option<TransportEventCounterTotals>,
     aggregation_key: Option<String>,
     priority: TransportEventPriority,
 }
 
+#[derive(Debug, Clone)]
+enum TransportEventCounterTotals {
+    HookQueueDropped {
+        dropped_events: u64,
+    },
+    BrokerInjectReport {
+        injected_frames: u64,
+        failed_frames: u64,
+    },
+}
+
+impl TransportEventCounterTotals {
+    fn from_event(event: &TransportEventRecord) -> Option<Self> {
+        match event.kind.as_str() {
+            "input_hook_queue_dropped" => Some(Self::HookQueueDropped {
+                dropped_events: detail_u64(&event.detail, "dropped_events").unwrap_or(0),
+            }),
+            "input_broker_inject_report" => Some(Self::BrokerInjectReport {
+                injected_frames: detail_u64(&event.detail, "injected_frames").unwrap_or(0),
+                failed_frames: detail_u64(&event.detail, "failed_frames").unwrap_or(0),
+            }),
+            _ => None,
+        }
+    }
+
+    fn merge(&mut self, next: Self) {
+        match (self, next) {
+            (
+                Self::HookQueueDropped { dropped_events },
+                Self::HookQueueDropped {
+                    dropped_events: next_dropped_events,
+                },
+            ) => {
+                *dropped_events = dropped_events.saturating_add(next_dropped_events);
+            }
+            (
+                Self::BrokerInjectReport {
+                    injected_frames,
+                    failed_frames,
+                },
+                Self::BrokerInjectReport {
+                    injected_frames: next_injected_frames,
+                    failed_frames: next_failed_frames,
+                },
+            ) => {
+                *injected_frames = injected_frames.saturating_add(next_injected_frames);
+                *failed_frames = failed_frames.saturating_add(next_failed_frames);
+            }
+            _ => {}
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::HookQueueDropped { dropped_events } => {
+                format!("dropped_events_total={dropped_events}")
+            }
+            Self::BrokerInjectReport {
+                injected_frames,
+                failed_frames,
+            } => format!(
+                "injected_frames_total={injected_frames} failed_frames_total={failed_frames}"
+            ),
+        }
+    }
+}
+
 impl RetainedTransportEvent {
     fn new(mut event: TransportEventRecord) -> Self {
-        event.detail = sanitize_clipboard_event_detail(&event.kind, &event.detail);
+        event.detail = sanitize_transport_event_detail_for_retention(&event.kind, &event.detail);
         let first_timestamp = event.timestamp;
         let retained_size_bytes = event.size_bytes;
+        let counter_totals = TransportEventCounterTotals::from_event(&event);
         let priority = transport_event_priority(&event.kind);
         let aggregation_key = transport_event_is_aggregated(&event.kind)
             .then(|| transport_event_aggregation_key(&event));
@@ -309,25 +379,37 @@ impl RetainedTransportEvent {
             first_timestamp,
             sample_count: 1,
             retained_size_bytes,
+            counter_totals,
             aggregation_key,
             priority,
         }
     }
 
     fn merge(&mut self, mut event: TransportEventRecord) {
-        event.detail = sanitize_clipboard_event_detail(&event.kind, &event.detail);
+        event.detail = sanitize_transport_event_detail_for_retention(&event.kind, &event.detail);
         self.sample_count = self.sample_count.saturating_add(1);
-        self.retained_size_bytes = if transport_event_uses_latest_size(&event.kind) {
-            event.size_bytes
-        } else {
-            self.retained_size_bytes.saturating_add(event.size_bytes)
-        };
+        self.retained_size_bytes =
+            if transport_event_uses_latest_size(&event.kind, &event.direction) {
+                event.size_bytes
+            } else {
+                self.retained_size_bytes.saturating_add(event.size_bytes)
+            };
+        if let Some(next_totals) = TransportEventCounterTotals::from_event(&event) {
+            if let Some(counter_totals) = self.counter_totals.as_mut() {
+                counter_totals.merge(next_totals);
+            } else {
+                self.counter_totals = Some(next_totals);
+            }
+        }
         self.event = event;
     }
 
     fn snapshot(&self) -> TransportEventRecord {
         let mut event = self.event.clone();
         event.size_bytes = self.retained_size_bytes;
+        if let Some(counter_totals) = &self.counter_totals {
+            event.detail = counter_totals.detail();
+        }
         if self.sample_count > 1 {
             event.detail = format!(
                 "{} sample_count={} first_seen={} last_seen={}",
@@ -524,6 +606,24 @@ impl TransportRuntimeState {
             && let Some(index) = events
                 .iter()
                 .position(|event| event.priority == TransportEventPriority::Activity)
+        {
+            events.remove(index);
+        }
+
+        if retained.priority == TransportEventPriority::Diagnostic
+            && retained.aggregation_key.is_some()
+            && events
+                .iter()
+                .filter(|event| {
+                    event.priority == TransportEventPriority::Diagnostic
+                        && event.aggregation_key.is_some()
+                })
+                .count()
+                >= MAX_DIAGNOSTIC_EVENT_SUMMARIES
+            && let Some(index) = events.iter().position(|event| {
+                event.priority == TransportEventPriority::Diagnostic
+                    && event.aggregation_key.is_some()
+            })
         {
             events.remove(index);
         }
@@ -757,8 +857,7 @@ fn transport_event_priority(kind: &str) -> TransportEventPriority {
 }
 
 fn transport_event_is_aggregated(kind: &str) -> bool {
-    let repeated_failure = !kind.starts_with("clipboard")
-        && (kind.ends_with("_failed") || kind.ends_with("_rejected") || kind.ends_with("_dropped"));
+    let repeated_failure = transport_event_is_repeated_failure(kind);
     transport_event_priority(kind) == TransportEventPriority::Activity
         || repeated_failure
         || matches!(
@@ -774,23 +873,68 @@ fn transport_event_is_aggregated(kind: &str) -> bool {
         )
 }
 
+fn transport_event_is_repeated_failure(kind: &str) -> bool {
+    !kind.starts_with("clipboard")
+        && (kind.ends_with("_failed") || kind.ends_with("_rejected") || kind.ends_with("_dropped"))
+}
+
+fn sanitize_transport_event_detail_for_retention(kind: &str, detail: &str) -> String {
+    let detail = sanitize_clipboard_event_detail(kind, detail);
+    if kind == "transport_transfer_rejected" {
+        canonical_failure_reason(&detail)
+    } else {
+        detail
+    }
+}
+
 fn transport_event_aggregation_key(event: &TransportEventRecord) -> String {
-    let dimensions = match event.kind.as_str() {
-        "input_queue_coalesced" => canonical_detail_tokens(&event.detail, &["queue"]),
-        "input_queue_overflow_drop" => canonical_detail_tokens(&event.detail, &["queue", "reason"]),
-        "input_hook_queue_dropped" | "input_broker_inject_report" => String::new(),
-        "file_transfer_progress" => canonical_detail_tokens(&event.detail, &["transfer_id"]),
-        _ => event
-            .detail
-            .split_whitespace()
-            .filter(|token| !transport_event_token_is_volatile(token))
-            .collect::<Vec<_>>()
-            .join(" "),
+    let repeated_failure = transport_event_is_repeated_failure(&event.kind);
+    let dimensions = if repeated_failure {
+        canonical_failure_reason(&event.detail)
+    } else {
+        match event.kind.as_str() {
+            "input_queue_coalesced" => canonical_detail_tokens(&event.detail, &["queue"]),
+            "input_queue_overflow_drop" => {
+                canonical_detail_tokens(&event.detail, &["queue", "reason"])
+            }
+            "input_hook_queue_dropped" | "input_broker_inject_report" => String::new(),
+            "file_transfer_progress" => canonical_detail_tokens(&event.detail, &["transfer_id"]),
+            _ => event
+                .detail
+                .split_whitespace()
+                .filter(|token| !transport_event_token_is_volatile(token))
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    };
+    let peer_id = if repeated_failure {
+        "all"
+    } else {
+        &event.peer_id
     };
     format!(
         "{}\u{1f}{}\u{1f}{}\u{1f}{dimensions}",
-        event.direction, event.kind, event.peer_id
+        event.direction, event.kind, peer_id
     )
+}
+
+fn canonical_failure_reason(detail: &str) -> String {
+    let reason = detail
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("reason="))
+        .unwrap_or("unspecified");
+    let bounded = reason
+        .chars()
+        .take(48)
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+        .collect::<String>();
+    if bounded.is_empty() {
+        "reason=other".to_string()
+    } else {
+        format!("reason={bounded}")
+    }
 }
 
 fn canonical_detail_tokens(detail: &str, keys: &[&str]) -> String {
@@ -806,11 +950,19 @@ fn canonical_detail_tokens(detail: &str, keys: &[&str]) -> String {
         .join(" ")
 }
 
-fn transport_event_uses_latest_size(kind: &str) -> bool {
-    kind == "file_transfer_progress"
-        || kind.ends_with("_failed")
-        || kind.ends_with("_rejected")
-        || kind.ends_with("_dropped")
+fn transport_event_uses_latest_size(kind: &str, direction: &str) -> bool {
+    kind == "file_transfer_progress" && direction == "incoming"
+}
+
+fn detail_u64(detail: &str, expected_key: &str) -> Option<u64> {
+    detail.split_whitespace().find_map(|token| {
+        let (key, value) = token.split_once('=')?;
+        if key == expected_key {
+            value.parse::<u64>().ok()
+        } else {
+            None
+        }
+    })
 }
 
 fn transport_event_token_is_volatile(token: &str) -> bool {
@@ -967,6 +1119,10 @@ mod tests {
         ));
 
         let mut expected_merged_events = 0u64;
+        let mut expected_hook_drops = 0u64;
+        let mut expected_injected_frames = 0u64;
+        let mut expected_failed_frames = 0u64;
+        let mut expected_failed_input_events = 0u64;
         for sample in 0..4_000u64 {
             let timestamp = started + chrono::Duration::milliseconds((sample * 15) as i64);
             let merged_events = sample % 4 + 1;
@@ -985,15 +1141,45 @@ mod tests {
             coalesced.size_bytes = merged_events;
             state.record_transport_event(coalesced);
 
+            let dropped_events = sample % 5 + 1;
+            expected_hook_drops += dropped_events;
             let mut hook_drop = test_event(
                 timestamp,
                 "input_hook_queue_dropped",
                 "local",
                 "none",
-                format!("dropped_events={}", sample + 1),
+                format!("dropped_events={dropped_events}"),
             );
             hook_drop.size_bytes = 0;
             state.record_transport_event(hook_drop);
+
+            let injected_frames = sample % 7;
+            let failed_frames = sample % 3 + 1;
+            expected_injected_frames += injected_frames;
+            expected_failed_frames += failed_frames;
+            let mut broker_report = test_event(
+                timestamp,
+                "input_broker_inject_report",
+                "local",
+                "none",
+                format!("injected_frames={injected_frames} failed_frames={failed_frames}"),
+            );
+            broker_report.size_bytes = 0;
+            state.record_transport_event(broker_report);
+
+            let failed_input_events = sample % 4 + 1;
+            expected_failed_input_events += failed_input_events;
+            let mut inject_failed = test_event(
+                timestamp,
+                "input_inject_failed",
+                "local",
+                &format!("peer-{sample}"),
+                format!(
+                    "sequence={sample} queue_wait_ms=1 capture_to_fail_ms=2 receive_to_fail_ms=1 transient_inject_failure_{sample}"
+                ),
+            );
+            inject_failed.size_bytes = failed_input_events;
+            state.record_transport_event(inject_failed);
 
             let received = (sample + 1) * 64;
             let mut inbound_progress = test_event(
@@ -1040,6 +1226,36 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(hook_drops.len(), 1);
         assert!(hook_drops[0].detail.contains("sample_count=4000"));
+        assert!(
+            hook_drops[0]
+                .detail
+                .contains(&format!("dropped_events_total={expected_hook_drops}"))
+        );
+
+        let broker_reports = events
+            .iter()
+            .filter(|event| event.kind == "input_broker_inject_report")
+            .collect::<Vec<_>>();
+        assert_eq!(broker_reports.len(), 1);
+        assert!(broker_reports[0].detail.contains("sample_count=4000"));
+        assert!(
+            broker_reports[0]
+                .detail
+                .contains(&format!("injected_frames_total={expected_injected_frames}"))
+        );
+        assert!(
+            broker_reports[0]
+                .detail
+                .contains(&format!("failed_frames_total={expected_failed_frames}"))
+        );
+
+        let inject_failures = events
+            .iter()
+            .filter(|event| event.kind == "input_inject_failed")
+            .collect::<Vec<_>>();
+        assert_eq!(inject_failures.len(), 1);
+        assert!(inject_failures[0].detail.contains("sample_count=4000"));
+        assert_eq!(inject_failures[0].size_bytes, expected_failed_input_events);
 
         let inbound_progress = events
             .iter()
@@ -1053,7 +1269,81 @@ mod tests {
             .find(|event| event.kind == "file_transfer_progress" && event.direction == "outgoing")
             .expect("outbound transfer summary");
         assert!(outbound_progress.detail.contains("sample_count=4000"));
-        assert_eq!(outbound_progress.size_bytes, 64);
+        assert_eq!(outbound_progress.size_bytes, 4_000 * 64);
+    }
+
+    #[tokio::test]
+    async fn untrusted_failure_identifiers_do_not_create_unbounded_diagnostic_keys() {
+        let state = TransportRuntimeState::default();
+        let started = Utc::now();
+        state.record_transport_event(test_event(
+            started,
+            "input_handoff",
+            "local",
+            "trusted-peer",
+            "direction=left activated=true".to_string(),
+        ));
+
+        for sample in 0..4_000u64 {
+            let mut rejection = test_event(
+                started + chrono::Duration::milliseconds(sample as i64),
+                "transport_transfer_rejected",
+                "incoming",
+                &format!("remote-{sample}"),
+                format!(
+                    "reason=invalid_total_size transfer_id=remote-transfer-{sample} error=remote-error-{sample}"
+                ),
+            );
+            rejection.size_bytes = 1;
+            state.record_transport_event(rejection);
+        }
+
+        let events = state.transport_events_snapshot().await;
+        assert!(events.iter().any(|event| event.kind == "input_handoff"));
+        let rejections = events
+            .iter()
+            .filter(|event| event.kind == "transport_transfer_rejected")
+            .collect::<Vec<_>>();
+        assert_eq!(rejections.len(), 1);
+        assert!(rejections[0].detail.contains("sample_count=4000"));
+        assert!(rejections[0].detail.contains("reason=invalid_total_size"));
+        assert!(!rejections[0].detail.contains("remote-transfer-"));
+        assert!(!rejections[0].detail.contains("remote-error-"));
+        assert_eq!(rejections[0].size_bytes, 4_000);
+    }
+
+    #[tokio::test]
+    async fn unique_failure_reasons_are_capped_below_the_diagnostic_ring_budget() {
+        let state = TransportRuntimeState::default();
+        let started = Utc::now();
+        state.record_transport_event(test_event(
+            started,
+            "input_handoff",
+            "local",
+            "trusted-peer",
+            "direction=left activated=true".to_string(),
+        ));
+
+        for sample in 0..4_000u64 {
+            state.record_transport_event(test_event(
+                started + chrono::Duration::milliseconds(sample as i64),
+                "transport_transfer_rejected",
+                "incoming",
+                &format!("remote-{sample}"),
+                format!("reason=remote_reason_{sample} transfer_id=remote-transfer-{sample}"),
+            ));
+        }
+
+        let events = state.transport_events_snapshot().await;
+        assert!(events.iter().any(|event| event.kind == "input_handoff"));
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.kind == "transport_transfer_rejected")
+                .count()
+                <= MAX_DIAGNOSTIC_EVENT_SUMMARIES
+        );
+        assert!(events.len() < MAX_TRANSPORT_EVENTS);
     }
 
     #[tokio::test]
