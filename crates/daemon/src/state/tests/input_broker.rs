@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::input::{InputRuntimeMode, apply_startup_mode};
+use core_input::MouseButton;
 
 const ALLOWED_USER_SID: &str = "S-1-5-21-1000-2000-3000-1001";
 const OTHER_USER_SID: &str = "S-1-5-21-1000-2000-3000-1002";
@@ -330,6 +331,27 @@ async fn detach_rejects_wrong_user_and_keeps_broker_attached() {
             .await
             .expect("claim input owner")
     );
+    let _ = state.drain_outgoing(&peer_id).await;
+    let observed = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                captured_events: vec![
+                    InputEvent::Key {
+                        scan_code: 30,
+                        state: KeyState::Down,
+                    },
+                    InputEvent::MouseButton {
+                        button: MouseButton::Left,
+                        state: KeyState::Down,
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(observed.accepted);
 
     assert!(
         !state
@@ -367,6 +389,24 @@ async fn detach_rejects_wrong_user_and_keeps_broker_attached() {
     assert!(
         state.input_owner().await.is_none(),
         "detach must release stale incoming owner before tray relaunch"
+    );
+    let outgoing = state.drain_outgoing(&peer_id).await;
+    assert!(
+        outgoing.iter().any(|payload| matches!(
+            payload,
+            OutboundPayload::InputFrame { events, .. }
+                if events == &vec![
+                    InputEvent::MouseButton {
+                        button: MouseButton::Left,
+                        state: KeyState::Up,
+                    },
+                    InputEvent::Key {
+                        scan_code: 30,
+                        state: KeyState::Up,
+                    },
+                ]
+        )),
+        "authorized detach must queue authoritative held-input releases before clearing capture: {outgoing:?}"
     );
 
     let _ = std::fs::remove_dir_all(root);
