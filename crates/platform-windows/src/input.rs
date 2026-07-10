@@ -51,39 +51,78 @@ const XBUTTON2: u32 = 0x0002;
 #[cfg(windows)]
 pub const VK_NUMLOCK_CODE: u16 = 0x90;
 
+/// `dwExtraInfo` marker applied to every Boundless `SendInput` record. The
+/// low-level hook uses it to distinguish our own injected Num Lock records
+/// from OSK/remapper input that must still update local toggle authority.
+#[cfg(windows)]
+pub(crate) const BOUNDLESS_INJECTED_INPUT_MARKER: usize = 0x424E_4453;
+
+#[derive(Debug)]
+struct WindowsNumLockAuthority {
+    on: bool,
+    #[cfg(windows)]
+    boundless_key_down: bool,
+}
+
 /// Process-local Num Lock authority shared by the interactive capture and
 /// injection lanes. The hook message thread seeds and updates physical state;
 /// successful Boundless injection commits synthetic toggle changes.
 #[derive(Debug, Clone)]
 pub struct WindowsNumLockState {
-    on: Arc<Mutex<bool>>,
+    authority: Arc<Mutex<WindowsNumLockAuthority>>,
 }
 
 impl WindowsNumLockState {
     pub fn new(on: bool) -> Self {
         Self {
-            on: Arc::new(Mutex::new(on)),
+            authority: Arc::new(Mutex::new(WindowsNumLockAuthority {
+                on,
+                #[cfg(windows)]
+                boundless_key_down: false,
+            })),
         }
     }
 
     pub fn is_on(&self) -> bool {
-        *self.lock()
+        self.lock().on
     }
 
     pub fn set(&self, on: bool) {
-        *self.lock() = on;
+        self.lock().on = on;
     }
 
     pub fn toggle(&self) -> bool {
-        let mut on = self.lock();
-        *on = !*on;
-        *on
+        let mut authority = self.lock();
+        authority.on = !authority.on;
+        authority.on
     }
 
-    fn lock(&self) -> MutexGuard<'_, bool> {
-        self.on
+    fn lock(&self) -> MutexGuard<'_, WindowsNumLockAuthority> {
+        self.authority
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct PreparedNumLockAuthority {
+    on: bool,
+    boundless_key_down: bool,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct PreparedInputRecords {
+    records: Vec<INPUT>,
+    authority_after_record: Vec<PreparedNumLockAuthority>,
+}
+
+#[cfg(windows)]
+impl PreparedInputRecords {
+    fn push(&mut self, record: INPUT, authority: PreparedNumLockAuthority) {
+        self.records.push(record);
+        self.authority_after_record.push(authority);
     }
 }
 
@@ -100,21 +139,21 @@ impl WindowsInputState {
     }
 
     pub fn send_events(&self, events: &[InputEvent]) -> Result<()> {
-        self.send_events_with(events, send_input_records)
+        self.send_events_with(events, send_input_records_once)
     }
 
-    fn send_events_with<F>(&self, events: &[InputEvent], sender: F) -> Result<()>
+    fn send_events_with<F>(&self, events: &[InputEvent], mut sender: F) -> Result<()>
     where
-        F: FnOnce(&[INPUT]) -> Result<()>,
+        F: FnMut(&[INPUT]) -> Result<u32>,
     {
         // Serialize physical toggle observations with prepare/send/commit so
         // a concurrent local Num Lock press cannot be overwritten by a stale
         // post-SendInput state commit.
-        let mut num_lock_on = self.num_lock.lock();
-        let (records, resulting_num_lock_on) = prepare_input_records(events, *num_lock_on);
-        sender(&records)?;
-        *num_lock_on = resulting_num_lock_on;
-        Ok(())
+        let mut authority = self.num_lock.lock();
+        release_pending_boundless_num_lock(&mut authority, &mut sender)
+            .context("release pending Boundless Num Lock key before input batch")?;
+        let prepared = prepare_input_records(events, authority.on);
+        send_prepared_input_records(&prepared, &mut authority, &mut sender)
     }
 }
 
@@ -217,38 +256,44 @@ pub fn input_records_for_events_with_num_lock_state(
     events: &[InputEvent],
     initial_num_lock_on: bool,
 ) -> Vec<INPUT> {
-    prepare_input_records(events, initial_num_lock_on).0
+    prepare_input_records(events, initial_num_lock_on).records
 }
 
 #[cfg(windows)]
-fn prepare_input_records(events: &[InputEvent], initial_num_lock_on: bool) -> (Vec<INPUT>, bool) {
-    let mut records = Vec::new();
-    let mut destination_num_lock_on = initial_num_lock_on;
+fn prepare_input_records(events: &[InputEvent], initial_num_lock_on: bool) -> PreparedInputRecords {
+    let mut prepared = PreparedInputRecords::default();
+    let mut authority = PreparedNumLockAuthority {
+        on: initial_num_lock_on,
+        boundless_key_down: false,
+    };
     for event in events {
-        append_input_records_for_event(event, &mut destination_num_lock_on, &mut records);
+        append_input_records_for_event(event, &mut authority, &mut prepared);
     }
-    (records, destination_num_lock_on)
+    prepared
 }
 
 #[cfg(windows)]
 fn append_input_records_for_event(
     event: &InputEvent,
-    destination_num_lock_on: &mut bool,
-    records: &mut Vec<INPUT>,
+    authority: &mut PreparedNumLockAuthority,
+    prepared: &mut PreparedInputRecords,
 ) {
     match event {
         InputEvent::MouseMove { dx, dy } => {
             if *dx != 0 || *dy != 0 {
-                records.push(mouse_input(*dx, *dy, 0, MOUSEEVENTF_MOVE));
+                prepared.push(mouse_input(*dx, *dy, 0, MOUSEEVENTF_MOVE), *authority);
             }
         }
         InputEvent::MouseMoveAbsolute { x_norm, y_norm } => {
-            records.push(mouse_input(
-                i32::from(*x_norm),
-                i32::from(*y_norm),
-                0,
-                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-            ));
+            prepared.push(
+                mouse_input(
+                    i32::from(*x_norm),
+                    i32::from(*y_norm),
+                    0,
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                ),
+                *authority,
+            );
         }
         InputEvent::MouseButton { button, state } => {
             let (flags, mouse_data) = match (button, state) {
@@ -264,14 +309,20 @@ fn append_input_records_for_event(
                 (MouseButton::X2, KeyState::Up) => (MOUSEEVENTF_XUP, XBUTTON2),
             };
 
-            records.push(mouse_input(0, 0, mouse_data, flags));
+            prepared.push(mouse_input(0, 0, mouse_data, flags), *authority);
         }
         InputEvent::MouseWheel { delta_x, delta_y } => {
             if *delta_y != 0 {
-                records.push(mouse_input(0, 0, *delta_y as u32, MOUSEEVENTF_WHEEL));
+                prepared.push(
+                    mouse_input(0, 0, *delta_y as u32, MOUSEEVENTF_WHEEL),
+                    *authority,
+                );
             }
             if *delta_x != 0 {
-                records.push(mouse_input(0, 0, *delta_x as u32, MOUSEEVENTF_HWHEEL));
+                prepared.push(
+                    mouse_input(0, 0, *delta_x as u32, MOUSEEVENTF_HWHEEL),
+                    *authority,
+                );
             }
         }
         InputEvent::Key {
@@ -281,30 +332,57 @@ fn append_input_records_for_event(
         } => {
             let key_up = matches!(state, KeyState::Up);
             match semantics {
-                KeySemantics::Physical => records.push(keyboard_input(*scan_code, key_up)),
+                KeySemantics::Physical => {
+                    prepared.push(keyboard_input(*scan_code, key_up), *authority);
+                }
                 KeySemantics::Windows {
                     virtual_key,
                     num_lock_on,
                 } if *virtual_key == VK_NUMLOCK_CODE => {
-                    if !key_up && *destination_num_lock_on != *num_lock_on {
-                        records.push(keyboard_virtual_key_input(VK_NUMLOCK_CODE, false));
-                        records.push(keyboard_virtual_key_input(VK_NUMLOCK_CODE, true));
-                        *destination_num_lock_on = *num_lock_on;
+                    if !key_up && authority.on != *num_lock_on {
+                        append_num_lock_toggle(*num_lock_on, authority, prepared);
                     }
                 }
-                KeySemantics::Windows { num_lock_on, .. } => {
-                    if keypad_scan_uses_num_lock(*scan_code)
-                        && *destination_num_lock_on != *num_lock_on
-                    {
-                        records.push(keyboard_virtual_key_input(VK_NUMLOCK_CODE, false));
-                        records.push(keyboard_virtual_key_input(VK_NUMLOCK_CODE, true));
-                        *destination_num_lock_on = *num_lock_on;
+                KeySemantics::Windows {
+                    virtual_key,
+                    num_lock_on,
+                } => {
+                    let ambiguous_keypad = keypad_scan_uses_num_lock(*scan_code);
+                    if !key_up && ambiguous_keypad && authority.on != *num_lock_on {
+                        append_num_lock_toggle(*num_lock_on, authority, prepared);
                     }
-                    records.push(keyboard_input(*scan_code, key_up));
+                    if key_up && ambiguous_keypad && *virtual_key != 0 {
+                        // Num Lock may have changed while the key was held.
+                        // Release the first-down logical identity directly;
+                        // replaying only the scan code could be remapped to
+                        // the destination's newer keypad/navigation identity.
+                        prepared.push(keyboard_virtual_key_input(*virtual_key, true), *authority);
+                    } else {
+                        prepared.push(keyboard_input(*scan_code, key_up), *authority);
+                    }
                 }
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn append_num_lock_toggle(
+    desired_on: bool,
+    authority: &mut PreparedNumLockAuthority,
+    prepared: &mut PreparedInputRecords,
+) {
+    authority.on = desired_on;
+    authority.boundless_key_down = true;
+    prepared.push(
+        keyboard_virtual_key_input(VK_NUMLOCK_CODE, false),
+        *authority,
+    );
+    authority.boundless_key_down = false;
+    prepared.push(
+        keyboard_virtual_key_input(VK_NUMLOCK_CODE, true),
+        *authority,
+    );
 }
 
 #[cfg(windows)]
@@ -318,7 +396,7 @@ fn mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> INPUT {
                 mouseData: mouse_data,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: BOUNDLESS_INJECTED_INPUT_MARKER,
             },
         },
     }
@@ -344,7 +422,7 @@ fn keyboard_input(scan_code: u16, key_up: bool) -> INPUT {
                 wScan: normalized_scan_code,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: BOUNDLESS_INJECTED_INPUT_MARKER,
             },
         },
     }
@@ -360,31 +438,107 @@ fn keyboard_virtual_key_input(virtual_key: u16, key_up: bool) -> INPUT {
                 wScan: 0,
                 dwFlags: if key_up { KEYEVENTF_KEYUP } else { 0 },
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: BOUNDLESS_INJECTED_INPUT_MARKER,
             },
         },
     }
 }
 
 #[cfg(windows)]
-pub fn send_input_records(inputs: &[INPUT]) -> Result<()> {
-    if inputs.is_empty() {
+fn send_prepared_input_records<F>(
+    prepared: &PreparedInputRecords,
+    authority: &mut WindowsNumLockAuthority,
+    sender: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[INPUT]) -> Result<u32>,
+{
+    let mut offset = 0usize;
+    while offset < prepared.records.len() {
+        let chunk = &prepared.records[offset..];
+        let sent =
+            match sender(chunk).with_context(|| format!("send input record at index {offset}")) {
+                Ok(sent) => sent as usize,
+                Err(error) => return finish_failed_input_send(error, authority, sender),
+            };
+        if sent == 0 {
+            let error = anyhow::anyhow!(
+                "partial send at index {offset}: sent 0 / {} input records",
+                chunk.len()
+            );
+            return finish_failed_input_send(error, authority, sender);
+        }
+        if sent > chunk.len() {
+            let error = anyhow::anyhow!(
+                "invalid send count at index {offset}: sent {sent} / {} input records",
+                chunk.len()
+            );
+            return finish_failed_input_send(error, authority, sender);
+        }
+
+        for next in &prepared.authority_after_record[offset..offset + sent] {
+            authority.on = next.on;
+            authority.boundless_key_down = next.boundless_key_down;
+        }
+        offset += sent;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn finish_failed_input_send<F>(
+    error: anyhow::Error,
+    authority: &mut WindowsNumLockAuthority,
+    sender: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[INPUT]) -> Result<u32>,
+{
+    match release_pending_boundless_num_lock(authority, sender) {
+        Ok(()) => Err(error),
+        Err(cleanup_error) => Err(anyhow::anyhow!(
+            "{error:#}; Boundless Num Lock key-up cleanup failed: {cleanup_error:#}"
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn release_pending_boundless_num_lock<F>(
+    authority: &mut WindowsNumLockAuthority,
+    sender: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[INPUT]) -> Result<u32>,
+{
+    if !authority.boundless_key_down {
         return Ok(());
     }
 
-    send_input_records_with_sender(inputs, |records| {
-        let sent = unsafe {
-            SendInput(
-                records.len() as u32,
-                records.as_ptr(),
-                std::mem::size_of::<INPUT>() as i32,
-            )
-        };
-        if sent == 0 {
-            return Err(std::io::Error::last_os_error()).context("SendInput returned 0");
-        }
-        Ok(sent)
-    })
+    let cleanup = [keyboard_virtual_key_input(VK_NUMLOCK_CODE, true)];
+    let sent = sender(&cleanup).context("send Boundless Num Lock key-up cleanup")? as usize;
+    if sent != cleanup.len() {
+        bail!(
+            "Num Lock key-up cleanup sent {sent} / {} input records",
+            cleanup.len()
+        );
+    }
+    authority.boundless_key_down = false;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn send_input_records_once(records: &[INPUT]) -> Result<u32> {
+    let sent = unsafe {
+        SendInput(
+            records.len() as u32,
+            records.as_ptr(),
+            std::mem::size_of::<INPUT>() as i32,
+        )
+    };
+    if sent == 0 {
+        return Err(std::io::Error::last_os_error()).context("SendInput returned 0");
+    }
+    Ok(sent)
 }
 
 #[cfg(windows)]
@@ -537,15 +691,16 @@ mod tests {
         assert_eq!(records.len(), 5, "one toggle pair plus down/repeat/up");
         assert_eq!(keyboard_record(&records[0]).wVk, VK_NUMLOCK_CODE);
         assert_eq!(keyboard_record(&records[1]).wVk, VK_NUMLOCK_CODE);
-        for record in &records[2..] {
+        for record in &records[2..4] {
             let key = keyboard_record(record);
             assert_eq!(key.wScan, 0x4F);
             assert_ne!(key.dwFlags & KEYEVENTF_SCANCODE, 0);
         }
-        assert_eq!(
-            keyboard_record(&records[4]).dwFlags & KEYEVENTF_KEYUP,
-            KEYEVENTF_KEYUP
-        );
+        let release = keyboard_record(&records[4]);
+        assert_eq!(release.wVk, VK_NUMPAD1);
+        assert_eq!(release.wScan, 0);
+        assert_eq!(release.dwFlags & KEYEVENTF_SCANCODE, 0);
+        assert_eq!(release.dwFlags & KEYEVENTF_KEYUP, KEYEVENTF_KEYUP);
     }
 
     #[test]
@@ -562,7 +717,7 @@ mod tests {
                 ],
                 |records| {
                     assert_eq!(records.len(), 2, "first frame toggles Num Lock once");
-                    Ok(())
+                    Ok(records.len() as u32)
                 },
             )
             .expect("commit first injected frame");
@@ -578,7 +733,7 @@ mod tests {
                         "the next frame reuses committed destination state"
                     );
                     assert_eq!(keyboard_record(&records[0]).wScan, 0x4F);
-                    Ok(())
+                    Ok(records.len() as u32)
                 },
             )
             .expect("inject keypad frame");
@@ -596,8 +751,142 @@ mod tests {
             )
             .expect_err("failed SendInput must surface");
 
-        assert!(error.to_string().contains("injected failure"));
+        assert!(format!("{error:#}").contains("injected failure"));
         assert!(!num_lock.is_on());
+    }
+
+    #[test]
+    fn keypad_hold_toggle_and_release_does_not_revert_new_num_lock_authority() {
+        const VK_NUMPAD1: u16 = 0x61;
+        let num_lock = WindowsNumLockState::new(false);
+        let input = WindowsInputState::new(num_lock.clone());
+
+        input
+            .send_events_with(
+                &[
+                    windows_key(0x4F, VK_NUMPAD1, true, KeyState::Down),
+                    windows_key(0x45, VK_NUMLOCK_CODE, false, KeyState::Down),
+                    windows_key(0x45, VK_NUMLOCK_CODE, false, KeyState::Up),
+                    windows_key(0x4F, VK_NUMPAD1, true, KeyState::Up),
+                ],
+                |records| {
+                    assert_eq!(
+                        records.len(),
+                        6,
+                        "two intentional toggle pairs plus keypad down/up"
+                    );
+                    let release = keyboard_record(records.last().expect("keypad release"));
+                    assert_eq!(release.wVk, VK_NUMPAD1);
+                    assert_eq!(release.wScan, 0);
+                    assert_ne!(release.dwFlags & KEYEVENTF_KEYUP, 0);
+                    assert_eq!(release.dwFlags & KEYEVENTF_SCANCODE, 0);
+                    assert_eq!(release.dwExtraInfo, BOUNDLESS_INJECTED_INPUT_MARKER);
+                    let toggle_down_count = records
+                        .iter()
+                        .map(keyboard_record)
+                        .filter(|key| {
+                            key.wVk == VK_NUMLOCK_CODE && key.dwFlags & KEYEVENTF_KEYUP == 0
+                        })
+                        .count();
+                    assert_eq!(toggle_down_count, 2, "release must not add a third toggle");
+                    Ok(records.len() as u32)
+                },
+            )
+            .expect("inject keypad hold/toggle/release sequence");
+
+        assert!(!num_lock.is_on(), "release must retain current authority");
+    }
+
+    #[test]
+    fn partial_num_lock_toggle_reconciles_prefix_and_cleans_up_before_retry() {
+        const VK_NUMPAD1: u16 = 0x61;
+        let num_lock = WindowsNumLockState::new(false);
+        let input = WindowsInputState::new(num_lock.clone());
+        let event = windows_key(0x4F, VK_NUMPAD1, true, KeyState::Down);
+        let mut calls = 0usize;
+
+        let error = input
+            .send_events_with(std::slice::from_ref(&event), |records| {
+                calls += 1;
+                match calls {
+                    1 => {
+                        assert_eq!(records.len(), 3);
+                        let toggle_down = keyboard_record(&records[0]);
+                        assert_eq!(toggle_down.wVk, VK_NUMLOCK_CODE);
+                        assert_eq!(toggle_down.dwFlags & KEYEVENTF_KEYUP, 0);
+                        Ok(1)
+                    }
+                    2 => Err(anyhow::anyhow!("scripted keypad send failure")),
+                    3 => {
+                        assert_eq!(records.len(), 1, "cleanup is one bounded key-up");
+                        let cleanup = keyboard_record(&records[0]);
+                        assert_eq!(cleanup.wVk, VK_NUMLOCK_CODE);
+                        assert_ne!(cleanup.dwFlags & KEYEVENTF_KEYUP, 0);
+                        assert_eq!(cleanup.dwExtraInfo, BOUNDLESS_INJECTED_INPUT_MARKER);
+                        Ok(1)
+                    }
+                    _ => panic!("unexpected send attempt {calls}"),
+                }
+            })
+            .expect_err("partial frame must remain retryable");
+
+        assert!(error.to_string().contains("index 1"));
+        assert_eq!(calls, 3);
+        assert!(num_lock.is_on(), "sent toggle-down updates authority");
+        assert!(!num_lock.lock().boundless_key_down);
+
+        input
+            .send_events_with(std::slice::from_ref(&event), |records| {
+                assert_eq!(records.len(), 1, "retry must not toggle Num Lock again");
+                assert_eq!(keyboard_record(&records[0]).wScan, 0x4F);
+                Ok(1)
+            })
+            .expect("retry after reconciled prefix");
+    }
+
+    #[test]
+    fn failed_num_lock_cleanup_is_bounded_and_precedes_the_next_batch() {
+        const VK_NUMPAD1: u16 = 0x61;
+        let num_lock = WindowsNumLockState::new(false);
+        let input = WindowsInputState::new(num_lock.clone());
+        let event = windows_key(0x4F, VK_NUMPAD1, true, KeyState::Down);
+        let mut calls = 0usize;
+
+        let error = input
+            .send_events_with(std::slice::from_ref(&event), |_records| {
+                calls += 1;
+                match calls {
+                    1 => Ok(1),
+                    2 => Err(anyhow::anyhow!("scripted frame failure")),
+                    3 => Err(anyhow::anyhow!("scripted cleanup failure")),
+                    _ => panic!("cleanup must be attempted at most once"),
+                }
+            })
+            .expect_err("cleanup failure must surface");
+
+        assert_eq!(calls, 3);
+        assert!(error.to_string().contains("key-up cleanup failed"));
+        assert!(num_lock.lock().boundless_key_down);
+
+        let mut retry_calls = 0usize;
+        input
+            .send_events_with(std::slice::from_ref(&event), |records| {
+                retry_calls += 1;
+                assert_eq!(records.len(), 1);
+                let key = keyboard_record(&records[0]);
+                match retry_calls {
+                    1 => {
+                        assert_eq!(key.wVk, VK_NUMLOCK_CODE);
+                        assert_ne!(key.dwFlags & KEYEVENTF_KEYUP, 0);
+                    }
+                    2 => assert_eq!(key.wScan, 0x4F),
+                    _ => panic!("unexpected retry send attempt {retry_calls}"),
+                }
+                Ok(1)
+            })
+            .expect("next batch cleans up before retrying input");
+        assert_eq!(retry_calls, 2);
+        assert!(!num_lock.lock().boundless_key_down);
     }
 
     #[test]

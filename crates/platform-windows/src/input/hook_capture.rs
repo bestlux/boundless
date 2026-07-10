@@ -32,7 +32,9 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{VK_NUMLOCK_CODE, WindowsNumLockState, is_virtual_key_down};
+use super::{
+    BOUNDLESS_INJECTED_INPUT_MARKER, VK_NUMLOCK_CODE, WindowsNumLockState, is_virtual_key_down,
+};
 
 const VK_LBUTTON_CODE: u16 = 0x01;
 const VK_RBUTTON_CODE: u16 = 0x02;
@@ -815,6 +817,12 @@ fn key_semantics_for_hook_event(vk_code: u16, key_state: KeyState) -> KeySemanti
     }
 }
 
+fn should_observe_external_injected_num_lock(flags: u32, extra_info: usize, vk_code: u16) -> bool {
+    (flags & LLKHF_INJECTED_MASK) != 0
+        && extra_info != BOUNDLESS_INJECTED_INPUT_MARKER
+        && vk_code == VK_NUMLOCK_CODE
+}
+
 fn update_num_lock_state_for_key(
     state: &mut KeyboardRuntimeState,
     num_lock_state: &WindowsNumLockState,
@@ -1516,16 +1524,26 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
     let mut lock_active = false;
     if code == HC_ACTION as i32 {
         let keyboard = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-        if (keyboard.flags & LLKHF_INJECTED_MASK) == 0 {
-            lock_active = is_hook_lock_active();
-            let state = match wparam as u32 {
-                WM_KEYDOWN | WM_SYSKEYDOWN => Some(KeyState::Down),
-                WM_KEYUP | WM_SYSKEYUP => Some(KeyState::Up),
-                _ => None,
-            };
+        let state = match wparam as u32 {
+            WM_KEYDOWN | WM_SYSKEYDOWN => Some(KeyState::Down),
+            WM_KEYUP | WM_SYSKEYUP => Some(KeyState::Up),
+            _ => None,
+        };
 
-            if let Some(state) = state {
-                let control_vk = hook_control_virtual_key(keyboard.vkCode as u16, keyboard.flags);
+        if let Some(state) = state {
+            let vk_code = keyboard.vkCode as u16;
+            if should_observe_external_injected_num_lock(
+                keyboard.flags,
+                keyboard.dwExtraInfo,
+                vk_code,
+            ) {
+                // External OSK/remapper/MWB input is not relayed, preserving
+                // the existing loop guard, but its Num Lock transition still
+                // updates the process-local destination authority.
+                let _ = key_semantics_for_hook_event(vk_code, state);
+            } else if (keyboard.flags & LLKHF_INJECTED_MASK) == 0 {
+                lock_active = is_hook_lock_active();
+                let control_vk = hook_control_virtual_key(vk_code, keyboard.flags);
                 let _ = with_active_capture_runtime(|runtime| {
                     record_keyboard_hook_observation(runtime, control_vk, state, keyboard.time);
                 });
@@ -1540,7 +1558,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     HookCaptureEvent::Input(InputEvent::Key {
                         scan_code,
                         state,
-                        semantics: key_semantics_for_hook_event(keyboard.vkCode as u16, state),
+                        semantics: key_semantics_for_hook_event(vk_code, state),
                     }),
                     "keyboard_hook",
                 );
@@ -2262,6 +2280,43 @@ mod tests {
             &num_lock_state,
             VK_NUMLOCK_CODE,
             KeyState::Down
+        ));
+    }
+
+    #[test]
+    fn external_injected_num_lock_updates_authority_but_boundless_input_does_not() {
+        let mut state = HookRuntimeState::default();
+        let num_lock_state = WindowsNumLockState::new(false);
+
+        assert!(should_observe_external_injected_num_lock(
+            LLKHF_INJECTED_MASK,
+            0,
+            VK_NUMLOCK_CODE,
+        ));
+        if should_observe_external_injected_num_lock(LLKHF_INJECTED_MASK, 0, VK_NUMLOCK_CODE) {
+            update_num_lock_state_for_key(
+                &mut state,
+                &num_lock_state,
+                VK_NUMLOCK_CODE,
+                KeyState::Down,
+            );
+        }
+        assert!(num_lock_state.is_on());
+
+        assert!(!should_observe_external_injected_num_lock(
+            LLKHF_INJECTED_MASK,
+            BOUNDLESS_INJECTED_INPUT_MARKER,
+            VK_NUMLOCK_CODE,
+        ));
+        assert!(!should_observe_external_injected_num_lock(
+            LLKHF_INJECTED_MASK,
+            0,
+            0x61,
+        ));
+        assert!(!should_observe_external_injected_num_lock(
+            0,
+            0,
+            VK_NUMLOCK_CODE,
         ));
     }
 
