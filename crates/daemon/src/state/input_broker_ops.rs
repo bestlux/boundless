@@ -175,7 +175,7 @@ impl AppState {
         let capture_target = self.input_capture_target().await;
         let mut release_event_count = 0usize;
         if replaced {
-            let release_events = self.input_broker.drain_release_events();
+            let release_events = self.input_broker.release_events_snapshot();
             release_event_count = release_events.len();
             if let Some(peer_id) = capture_target.as_deref()
                 && !release_events.is_empty()
@@ -189,7 +189,14 @@ impl AppState {
                     detail: format!("reason=replacement_attach error={error:#}"),
                     size_bytes: release_event_count as u64,
                 });
+                return InputBrokerAttachOutcome {
+                    accepted: false,
+                    broker_token: String::new(),
+                    message: "input broker replacement deferred: authoritative releases could not be queued; retry attach"
+                        .to_string(),
+                };
             }
+            self.input_broker.clear_pressed_state();
             self.requeue_broker_clipboard_inflight().await;
         }
         self.input_broker.attach(InputBrokerAttachment {
