@@ -623,6 +623,7 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
                 broker_client_identity(command.verified_client),
                 &command.broker_token,
                 command.local_payload,
+                command.local_sequence,
                 command
                     .apply_report
                     .map(|report| crate::state::ClipboardBrokerApplyReport {

@@ -204,6 +204,7 @@ pub struct ClipboardBrokerExchangeCommand {
     pub verified_client: Option<VerifiedControlClient>,
     pub broker_token: String,
     pub local_payload: Option<ClipboardPayload>,
+    pub local_sequence: Option<u64>,
     pub apply_report: Option<ClipboardBrokerApplyReportCommand>,
 }
 

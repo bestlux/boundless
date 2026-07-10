@@ -824,6 +824,7 @@ async fn clipboard_broker_exchange_routes_local_payloads_to_connected_peers() {
             allowed_client(),
             &attach.broker_token,
             Some(ClipboardPayload::Text("broker-local".to_string())),
+            Some(1),
             None,
         )
         .await;
@@ -866,15 +867,20 @@ async fn newer_local_clipboard_payload_supersedes_broker_inflight_remote() {
         .expect("enqueue remote clipboard");
 
     let staged = state
-        .exchange_clipboard_broker(allowed_client(), &attach.broker_token, None, None)
+        .exchange_clipboard_broker(allowed_client(), &attach.broker_token, None, None, None)
         .await;
     assert!(staged.remote_payload.is_some());
+    state
+        .set_peer_connected(&peer_id, false)
+        .await
+        .expect("disconnect peer before local update");
 
     let local = state
         .exchange_clipboard_broker(
             allowed_client(),
             &attach.broker_token,
             Some(ClipboardPayload::Text("new local".to_string())),
+            Some(2),
             None,
         )
         .await;
@@ -889,11 +895,93 @@ async fn newer_local_clipboard_payload_supersedes_broker_inflight_remote() {
     );
 
     let next = state
-        .exchange_clipboard_broker(allowed_client(), &attach.broker_token, None, None)
+        .exchange_clipboard_broker(allowed_client(), &attach.broker_token, None, None, None)
         .await;
     assert!(
         next.remote_payload.is_none(),
         "the superseded remote payload must not reappear on the next poll"
+    );
+
+    state
+        .set_peer_connected(&peer_id, true)
+        .await
+        .expect("reconnect peer");
+    let replay = state.drain_outgoing(&peer_id).await;
+    assert!(
+        replay.iter().any(|payload| matches!(
+            payload,
+            OutboundPayload::ClipboardText { text } if text == "new local"
+        )),
+        "accepted disconnected local update must replay after reconnect: {replay:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn same_clipboard_sequence_retry_does_not_discard_newer_remote() {
+    let (state, root) =
+        service_mode_broker_state("boundless-broker-clipboard-sequence-retry-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+
+    let first = state
+        .exchange_clipboard_broker(
+            allowed_client(),
+            &attach.broker_token,
+            Some(ClipboardPayload::Text("local".to_string())),
+            Some(44),
+            None,
+        )
+        .await;
+    assert_eq!(
+        first.local_payload_disposition,
+        ClipboardBrokerLocalPayloadDisposition::Accepted
+    );
+    let _ = state.drain_outgoing(&peer_id).await;
+
+    state
+        .enqueue_remote_clipboard_text(&peer_id, "newer remote".to_string())
+        .await
+        .expect("enqueue newer remote");
+    let staged = state
+        .exchange_clipboard_broker(allowed_client(), &attach.broker_token, None, None, None)
+        .await;
+    assert!(staged.remote_payload.is_some());
+
+    let retry = state
+        .exchange_clipboard_broker(
+            allowed_client(),
+            &attach.broker_token,
+            Some(ClipboardPayload::Text("local".to_string())),
+            Some(44),
+            None,
+        )
+        .await;
+    assert_eq!(
+        retry.local_payload_disposition,
+        ClipboardBrokerLocalPayloadDisposition::Accepted
+    );
+    assert!(
+        retry.remote_payload.is_some(),
+        "same-sequence response-loss retry must not supersede a newer remote value"
+    );
+
+    let explicit_recopy = state
+        .exchange_clipboard_broker(
+            allowed_client(),
+            &attach.broker_token,
+            Some(ClipboardPayload::Text("local".to_string())),
+            Some(45),
+            None,
+        )
+        .await;
+    assert!(
+        explicit_recopy.remote_payload.is_none(),
+        "the same value with a new clipboard sequence is an explicit recopy and must supersede the remote value"
     );
 
     let _ = std::fs::remove_dir_all(root);
@@ -913,6 +1001,7 @@ async fn invalid_local_clipboard_payload_reports_deterministic_rejection() {
             allowed_client(),
             &attach.broker_token,
             Some(ClipboardPayload::Image(vec![0; 64])),
+            Some(3),
             None,
         )
         .await;
@@ -939,7 +1028,7 @@ async fn clipboard_broker_remote_payload_waits_for_apply_report_before_echo_supp
         .expect("enqueue remote clipboard");
 
     let staged = state
-        .exchange_clipboard_broker(allowed_client(), &attach.broker_token, None, None)
+        .exchange_clipboard_broker(allowed_client(), &attach.broker_token, None, None, None)
         .await;
     assert!(staged.accepted);
     let remote = staged
@@ -961,6 +1050,7 @@ async fn clipboard_broker_remote_payload_waits_for_apply_report_before_echo_supp
             allowed_client(),
             &attach.broker_token,
             Some(ClipboardPayload::Text("remote".to_string())),
+            Some(4),
             Some(ClipboardBrokerApplyReport {
                 source_peer_id: remote.peer_id.clone(),
                 hash: remote.hash.clone(),
@@ -974,6 +1064,74 @@ async fn clipboard_broker_remote_payload_waits_for_apply_report_before_echo_supp
     assert!(
         outgoing.is_empty(),
         "broker echo after remote apply must be suppressed"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn remote_apply_echo_does_not_supersede_newer_pending_remote() {
+    let (state, root) =
+        service_mode_broker_state("boundless-broker-clipboard-echo-order-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+    state
+        .enqueue_remote_clipboard_text(&peer_id, "remote-a".to_string())
+        .await
+        .expect("enqueue remote A");
+    let first = state
+        .exchange_clipboard_broker(allowed_client(), &attach.broker_token, None, None, None)
+        .await;
+    let remote_a = first.remote_payload.expect("stage remote A");
+    state
+        .enqueue_remote_clipboard_text(&peer_id, "remote-b".to_string())
+        .await
+        .expect("enqueue newer remote B");
+
+    let echoed = state
+        .exchange_clipboard_broker(
+            allowed_client(),
+            &attach.broker_token,
+            Some(ClipboardPayload::Text("remote-a".to_string())),
+            Some(77),
+            Some(ClipboardBrokerApplyReport {
+                source_peer_id: remote_a.peer_id,
+                hash: remote_a.hash,
+                applied: true,
+                message: String::new(),
+            }),
+        )
+        .await;
+    assert_eq!(
+        echoed.local_payload_disposition,
+        ClipboardBrokerLocalPayloadDisposition::Accepted
+    );
+    assert!(
+        matches!(
+            echoed.remote_payload.as_ref().map(|item| &item.payload),
+            Some(ClipboardPayload::Text(text)) if text == "remote-b"
+        ),
+        "remote echo A must not discard newer pending remote B: {echoed:?}"
+    );
+
+    let echo_retry = state
+        .exchange_clipboard_broker(
+            allowed_client(),
+            &attach.broker_token,
+            Some(ClipboardPayload::Text("remote-a".to_string())),
+            Some(77),
+            None,
+        )
+        .await;
+    assert!(
+        matches!(
+            echo_retry.remote_payload.as_ref().map(|item| &item.payload),
+            Some(ClipboardPayload::Text(text)) if text == "remote-b"
+        ),
+        "a response-loss retry of echo A must preserve staged remote B: {echo_retry:?}"
     );
 
     let _ = std::fs::remove_dir_all(root);

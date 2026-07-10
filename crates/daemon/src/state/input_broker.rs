@@ -38,6 +38,7 @@ struct InputBrokerRelayInner {
     reported_lock_active: bool,
     dropped_event_count: u64,
     last_wheel_source_mode: Option<&'static str>,
+    last_accepted_clipboard_sequence: Option<u64>,
     pressed_key_scan_codes: Vec<u16>,
     pressed_buttons: Vec<MouseButton>,
 }
@@ -87,6 +88,7 @@ impl InputBrokerRelay {
         inner.reported_lock_active = false;
         inner.dropped_event_count = 0;
         inner.last_wheel_source_mode = None;
+        inner.last_accepted_clipboard_sequence = None;
         inner.pressed_key_scan_codes.clear();
         inner.pressed_buttons.clear();
     }
@@ -259,6 +261,17 @@ impl InputBrokerRelay {
         }
         inner.last_wheel_source_mode = Some(mode);
         Some(mode)
+    }
+
+    /// Marks a successfully handled local clipboard sequence and returns
+    /// whether this is the first accepted observation of that sequence for
+    /// the current broker attachment. Same-sequence response-loss retries are
+    /// therefore idempotent.
+    pub(crate) fn accept_local_clipboard_sequence(&self, sequence: u64) -> bool {
+        let mut inner = self.lock();
+        let is_new = inner.last_accepted_clipboard_sequence != Some(sequence);
+        inner.last_accepted_clipboard_sequence = Some(sequence);
+        is_new
     }
 
     /// Synthesizes release events for keys/buttons the broker reported as

@@ -10,6 +10,27 @@ pub(crate) struct ReservedIncomingFile {
     pub(crate) temp_file: tokio::fs::File,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LocalClipboardObservationOutcome {
+    Accepted { delivered: bool },
+    SuppressedEcho,
+    Duplicate,
+    Disabled,
+}
+
+impl LocalClipboardObservationOutcome {
+    fn delivered(self) -> bool {
+        matches!(self, Self::Accepted { delivered: true })
+    }
+
+    pub(super) fn supersedes_remote(self) -> bool {
+        // A same-hash observation with a new broker sequence is an explicit
+        // user recopy. The caller gates this with sequence idempotence, so a
+        // response-loss retry cannot become a false superseding update.
+        matches!(self, Self::Accepted { .. } | Self::Duplicate)
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct OutgoingInputQueueReport {
@@ -455,6 +476,7 @@ impl AppState {
     ) -> Result<bool> {
         self.queue_local_clipboard_payload_for_connected_peers(ClipboardPayload::Text(text))
             .await
+            .map(LocalClipboardObservationOutcome::delivered)
     }
 
     pub async fn queue_local_clipboard_image_for_connected_peers(
@@ -463,16 +485,17 @@ impl AppState {
     ) -> Result<bool> {
         self.queue_local_clipboard_payload_for_connected_peers(ClipboardPayload::Image(image_bmp))
             .await
+            .map(LocalClipboardObservationOutcome::delivered)
     }
 
-    pub(crate) async fn queue_local_clipboard_payload_for_connected_peers(
+    pub(super) async fn queue_local_clipboard_payload_for_connected_peers(
         &self,
         payload: ClipboardPayload,
-    ) -> Result<bool> {
+    ) -> Result<LocalClipboardObservationOutcome> {
         let initially_connected_peer_ids = self.connected_peer_ids().await;
         let hash = match self.validated_clipboard_payload_hash(&payload).await? {
             Some(hash) => hash,
-            None => return Ok(false),
+            None => return Ok(LocalClipboardObservationOutcome::Disabled),
         };
 
         {
@@ -481,14 +504,14 @@ impl AppState {
                 if suppress_hash == hash.as_str() {
                     sync.suppress_echo_hash = None;
                     sync.last_observed_hash = Some(hash);
-                    return Ok(false);
+                    return Ok(LocalClipboardObservationOutcome::SuppressedEcho);
                 }
                 // Clipboard moved on before the echo value was observed; drop stale token.
                 sync.suppress_echo_hash = None;
             }
 
             if sync.last_observed_hash.as_deref() == Some(hash.as_str()) {
-                return Ok(false);
+                return Ok(LocalClipboardObservationOutcome::Duplicate);
             }
         }
 
@@ -524,7 +547,7 @@ impl AppState {
         }
 
         if initially_connected_peer_ids.is_empty() && !scheduled_late_replay {
-            return Ok(false);
+            return Ok(LocalClipboardObservationOutcome::Accepted { delivered: false });
         }
 
         for peer_id in &initially_connected_peer_ids {
@@ -539,7 +562,9 @@ impl AppState {
         }
         self.notify_outgoing_flush_signal();
 
-        Ok(!initially_connected_peer_ids.is_empty() || scheduled_late_replay)
+        Ok(LocalClipboardObservationOutcome::Accepted {
+            delivered: !initially_connected_peer_ids.is_empty() || scheduled_late_replay,
+        })
     }
 
     pub async fn enqueue_remote_clipboard_text(&self, peer_id: &str, text: String) -> Result<()> {
