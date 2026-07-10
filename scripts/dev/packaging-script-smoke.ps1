@@ -74,6 +74,37 @@ if ($wixProjectText -notmatch '<SuppressIces>[^<]*ICE61') {
     throw "The intentional same-version upgrade range must suppress ICE61 package noise."
 }
 
+$installScript = Join-Path $packagingRoot "Boundless-Install.ps1"
+if (-not (Test-Path -LiteralPath $installScript)) {
+    throw "Boundless-Install.ps1 was not found under $packagingRoot"
+}
+$installScriptText = Get-Content -LiteralPath $installScript -Raw
+foreach ($requiredInstallContract in @(
+        'BoundlessInstaller-',
+        'boundless_install_tray_quiescence_acquired',
+        'ExpectedInstallerSha256',
+        'CommonApplicationData'
+    )) {
+    if ($installScriptText -notmatch [regex]::Escape($requiredInstallContract)) {
+        throw "Boundless-Install.ps1 is missing the upgrade safety contract: $requiredInstallContract"
+    }
+}
+
+$installerSmoke = Join-Path $RepoRoot "scripts\dev\installer-smoke.ps1"
+if (-not (Test-Path -LiteralPath $installerSmoke)) {
+    throw "Installer smoke script was not found: $installerSmoke"
+}
+$installerSmokeText = Get-Content -LiteralPath $installerSmoke -Raw
+foreach ($requiredSmokeContract in @(
+        'Invoke-BoundlessInstallHelper',
+        'install_helper_upgrade_evidence',
+        'boundless_install_tray_quiescence_acquired'
+    )) {
+    if ($installerSmokeText -notmatch [regex]::Escape($requiredSmokeContract)) {
+        throw "installer-smoke.ps1 is missing helper-driven upgrade evidence: $requiredSmokeContract"
+    }
+}
+
 $selfTestScripts = @(
     Get-ChildItem -LiteralPath $packagingRoot -Filter "*.ps1" -File |
         Where-Object {
@@ -87,11 +118,6 @@ if ($selfTestScripts.Count -eq 0) {
 
 foreach ($scriptFile in $selfTestScripts) {
     Invoke-PackagingScript -ScriptPath $scriptFile.FullName -Arguments @("-SelfTest") | Out-Null
-}
-
-$installScript = Join-Path $packagingRoot "Boundless-Install.ps1"
-if (-not (Test-Path -LiteralPath $installScript)) {
-    throw "Boundless-Install.ps1 was not found under $packagingRoot"
 }
 
 $smokeSid = "S-1-5-21-1000-1000-1000-1001"
@@ -108,4 +134,4 @@ if ($summary.selected_user_sid -ne $smokeSid) {
     throw "Boundless-Install.ps1 -ResolveOnly resolved unexpected SID: $($summary.selected_user_sid)"
 }
 
-Write-Host "packaging_script_smoke=passed self_tests=$($selfTestScripts.Count) install_resolve_only=passed wix_upgrade_contract=passed"
+Write-Host "packaging_script_smoke=passed self_tests=$($selfTestScripts.Count) install_resolve_only=passed wix_upgrade_contract=passed helper_upgrade_contract=passed"

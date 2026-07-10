@@ -8,7 +8,11 @@ param(
     [switch]$NoRestart,
     [string]$LogPath = "",
     [switch]$ResolveOnly,
-    [switch]$SelfTest
+    [switch]$SelfTest,
+    [Parameter(DontShow = $true)]
+    [switch]$ElevatedInstall,
+    [Parameter(DontShow = $true)]
+    [string]$ExpectedInstallerSha256 = ""
 )
 
 Set-StrictMode -Version Latest
@@ -213,6 +217,195 @@ function Resolve-CurrentPowerShellExecutable {
     throw "Could not resolve the current PowerShell executable for elevation."
 }
 
+function New-BoundlessTrayOwnerMutexSecurity {
+    param([string]$UserSid)
+
+    Assert-AllowedUserSid -Sid $UserSid
+    $security = [Security.AccessControl.MutexSecurity]::new()
+    $security.SetSecurityDescriptorSddlForm(
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;$UserSid)"
+    )
+    return $security
+}
+
+function New-BoundlessNamedMutex {
+    param(
+        [string]$Name,
+        [string]$UserSid,
+        [bool]$InitiallyOwned
+    )
+
+    $security = New-BoundlessTrayOwnerMutexSecurity -UserSid $UserSid
+    $arguments = [object[]]@($InitiallyOwned, $Name, $false, $security)
+    $mutexAclType = "System.Threading.MutexAcl" -as [type]
+    if ($null -ne $mutexAclType) {
+        $createMethod = $mutexAclType.GetMethods() |
+            Where-Object { $_.Name -eq "Create" -and $_.GetParameters().Count -eq 4 } |
+            Select-Object -First 1
+        if ($null -eq $createMethod) {
+            throw "Could not resolve MutexAcl.Create for the tray quiescence lease."
+        }
+        $mutex = $createMethod.Invoke($null, $arguments)
+    }
+    else {
+        $constructor = [Threading.Mutex].GetConstructors() |
+            Where-Object { $_.GetParameters().Count -eq 4 } |
+            Select-Object -First 1
+        if ($null -eq $constructor) {
+            throw "Could not resolve the secured Mutex constructor for the tray quiescence lease."
+        }
+        $mutex = $constructor.Invoke($arguments)
+    }
+
+    return [pscustomobject]@{
+        mutex = $mutex
+        created_new = [bool]$arguments[2]
+        name = $Name
+    }
+}
+
+function Get-BoundlessTrayOwnerMutexName {
+    param(
+        [string]$UserSid,
+        [int]$SessionId
+    )
+
+    return "Local\Boundless.Tray.SingleInstance.v1.$UserSid.$SessionId.Owner"
+}
+
+function Enter-BoundlessTrayQuiescence {
+    param(
+        [string]$ExpectedOwnerSid,
+        [int]$ExpectedSessionId,
+        [int]$TimeoutSeconds = 12
+    )
+
+    $mutexNameArgs = @{
+        UserSid = $ExpectedOwnerSid
+        SessionId = $ExpectedSessionId
+    }
+    $mutexName = Get-BoundlessTrayOwnerMutexName @mutexNameArgs
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $attempts = 0
+    do {
+        $attempts += 1
+        $shutdownArgs = @{
+            ExpectedOwnerSid = $ExpectedOwnerSid
+            ExpectedSessionId = $ExpectedSessionId
+            TimeoutSeconds = [Math]::Max(1, [int](($deadline - (Get-Date)).TotalSeconds))
+        }
+        $shutdown = Stop-BoundlessTrayForUpgrade @shutdownArgs
+        $leaseArgs = @{
+            Name = $mutexName
+            UserSid = $ExpectedOwnerSid
+            InitiallyOwned = $true
+        }
+        $leaseAttempt = New-BoundlessNamedMutex @leaseArgs
+        if ($leaseAttempt.created_new) {
+            return [pscustomobject]@{
+                mutex = $leaseAttempt.mutex
+                evidence = [pscustomobject]@{
+                    name = $mutexName
+                    acquired = $true
+                    attempts = $attempts
+                    shutdown = $shutdown
+                    integrity = "creator_default"
+                    spans_elevation_and_msi = $true
+                }
+            }
+        }
+
+        $leaseAttempt.mutex.Dispose()
+        Start-Sleep -Milliseconds 50
+    } while ((Get-Date) -lt $deadline)
+
+    throw "Could not acquire the Boundless tray quiescence lease within $($TimeoutSeconds)s. The UAC/MSI phase was not started."
+}
+
+function Exit-BoundlessTrayQuiescence {
+    param([object]$Lease)
+
+    if ($null -eq $Lease -or $null -eq $Lease.mutex) {
+        return
+    }
+    try {
+        $Lease.mutex.ReleaseMutex()
+    }
+    finally {
+        $Lease.mutex.Dispose()
+    }
+}
+
+function Get-BoundlessAdminOnlyStageSddl {
+    return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)S:(ML;;NW;;;ME)"
+}
+
+function Get-BoundlessProgramDataRoot {
+    $path = [Environment]::GetFolderPath(
+        [Environment+SpecialFolder]::CommonApplicationData
+    )
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        throw "Could not resolve the Windows CommonApplicationData known folder."
+    }
+    return [IO.Path]::GetFullPath($path).TrimEnd('\')
+}
+
+function Test-BoundlessInstallerStagePath {
+    param(
+        [string]$Path,
+        [string]$ProgramDataRoot = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+    if ([string]::IsNullOrWhiteSpace($ProgramDataRoot)) {
+        $ProgramDataRoot = Get-BoundlessProgramDataRoot
+    }
+    $fullPath = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $fullProgramData = [IO.Path]::GetFullPath($ProgramDataRoot).TrimEnd('\')
+    $parent = [IO.Directory]::GetParent($fullPath)
+    if ($null -eq $parent -or -not $parent.FullName.Equals(
+        $fullProgramData,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        return $false
+    }
+    return [IO.Path]::GetFileName($fullPath) -match '^BoundlessInstaller-[0-9a-f]{32}$'
+}
+
+function Assert-BoundlessAdminOnlyAcl {
+    param(
+        [string]$Path,
+        [bool]$RequireProtected = $false
+    )
+
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    if ($RequireProtected -and -not $acl.AreAccessRulesProtected) {
+        throw "Installer staging ACL inherited permissions: $Path"
+    }
+
+    $allowedSids = @("S-1-5-18", "S-1-5-32-544")
+    $observedAllowedSids = @()
+    foreach ($rule in @($acl.Access)) {
+        $sid = $rule.IdentityReference.Translate(
+            [Security.Principal.SecurityIdentifier]
+        ).Value
+        if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow) {
+            if ($sid -notin $allowedSids) {
+                throw "Installer staging ACL granted access to unexpected SID $sid at $Path"
+            }
+            $observedAllowedSids += $sid
+        }
+    }
+    foreach ($requiredSid in $allowedSids) {
+        if ($requiredSid -notin $observedAllowedSids) {
+            throw "Installer staging ACL omitted required SID $requiredSid at $Path"
+        }
+    }
+    return $acl
+}
+
 function Assert-ElevatedInstallResult {
     param([object]$Result)
 
@@ -231,28 +424,61 @@ function Assert-ElevatedInstallResult {
     if ($Result.service_shutdown.force_kill_used) {
         throw "Elevated Boundless install reported a forbidden service force-kill."
     }
+    if (
+        $null -eq $Result.installer_stage -or
+        -not $Result.installer_stage.admin_only -or
+        -not $Result.installer_stage.hash_verified
+    ) {
+        throw "Elevated Boundless install did not prove an admin-only hash-verified MSI stage."
+    }
     return $Result
 }
 
 function Invoke-ElevatedInstallPhase {
     param(
         [string]$ResolvedInstallerPath,
-        [string]$Sid
+        [string]$Sid,
+        [string]$ExpectedInstallerSha256
     )
 
     if (-not (Test-IsAdministrator)) {
         throw "Internal elevated install phase was not elevated."
     }
 
+    $stageRoot = Split-Path -Parent $ResolvedInstallerPath
+    if (
+        -not (Test-BoundlessInstallerStagePath -Path $stageRoot) -or
+        [IO.Path]::GetFileName($ResolvedInstallerPath) -ne "Boundless.msi"
+    ) {
+        throw "Internal elevated install phase did not receive the expected immutable MSI stage."
+    }
+    Assert-BoundlessAdminOnlyAcl -Path $stageRoot -RequireProtected $true | Out-Null
+    Assert-BoundlessAdminOnlyAcl -Path $ResolvedInstallerPath | Out-Null
+    $stagedHash = (Get-FileHash -LiteralPath $ResolvedInstallerPath -Algorithm SHA256).Hash
+    if (-not $stagedHash.Equals($ExpectedInstallerSha256, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Immutable staged MSI hash verification failed."
+    }
+
     # This stop is sequential and bounded. MSI ServiceControl remains in the
     # package as an idempotent verification/repair contract; it does not race a
     # concurrent helper stop and the helper never force-kills the service.
     $serviceShutdown = Stop-BoundlessServiceForUpgrade
-    $exitCode = Invoke-BoundlessMsiElevated -ResolvedInstallerPath $ResolvedInstallerPath -Sid $Sid
+    $msiArgs = @{
+        ResolvedInstallerPath = $ResolvedInstallerPath
+        Sid = $Sid
+    }
+    $exitCode = Invoke-BoundlessMsiElevated @msiArgs
+
     return [pscustomobject]@{
         status = "passed"
         msi_exit_code = $exitCode
         service_shutdown = $serviceShutdown
+        installer_stage = [pscustomobject]@{
+            admin_only = $true
+            hash_verified = $true
+            staged_copy_used = $true
+            cleaned = $false
+        }
     }
 }
 
@@ -262,56 +488,154 @@ function New-BoundlessElevatedInstallCommand {
         [string]$Sid
     )
 
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        throw "Could not resolve the install helper path for immutable elevation staging."
+    }
+    $resolvedHelperPath = (Resolve-Path -LiteralPath $PSCommandPath).Path
     $payload = [ordered]@{
         installer_path = $ResolvedInstallerPath
         installer_sha256 = (Get-FileHash -LiteralPath $ResolvedInstallerPath -Algorithm SHA256).Hash
+        helper_path = $resolvedHelperPath
+        helper_sha256 = (Get-FileHash -LiteralPath $resolvedHelperPath -Algorithm SHA256).Hash
         sid = $Sid
         quiet = [bool]$Quiet
         no_restart = [bool]$NoRestart
         log_path = $LogPath
+        stage_sddl = Get-BoundlessAdminOnlyStageSddl
     }
     $payloadJson = $payload | ConvertTo-Json -Compress
     $payloadBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payloadJson))
-    $newline = [Environment]::NewLine
-    $parts = @(
-        "Set-StrictMode -Version Latest",
-        '$ErrorActionPreference = "Stop"'
-    )
-    foreach ($functionName in @(
-        "Test-IsAdministrator",
-        "Assert-AllowedUserSid",
-        "ConvertTo-ProcessArgument",
-        "New-BoundlessMsiArguments",
-        "Invoke-BoundlessMsiElevated",
-        "Get-BoundlessServiceStopDecision",
-        "Stop-BoundlessServiceForUpgrade",
-        "Invoke-ElevatedInstallPhase"
-    )) {
-        $definition = (Get-Command $functionName -CommandType Function -ErrorAction Stop).Definition
-        $parts += ('function {0} {{{1}{2}{1}}}' -f $functionName, $newline, $definition)
+    $source = @'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+function Assert-AdminAcl {
+    param([string]$Path, [bool]$RequireProtected = $false)
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    if ($RequireProtected -and -not $acl.AreAccessRulesProtected) {
+        throw "Installer stage inherited permissions."
     }
-    $parts += @(
-        ('$payloadJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("{0}"))' -f $payloadBase64),
-        '$payload = $payloadJson | ConvertFrom-Json',
-        '$Quiet = [bool]$payload.quiet',
-        '$NoRestart = [bool]$payload.no_restart',
-        '$LogPath = [string]$payload.log_path',
-        'try {',
-        '    Assert-AllowedUserSid -Sid $payload.sid',
-        '    $actualHash = (Get-FileHash -LiteralPath $payload.installer_path -Algorithm SHA256).Hash',
-        '    if ($actualHash -ne $payload.installer_sha256) { throw "The MSI changed between preflight and elevation." }',
-        '    $result = Invoke-ElevatedInstallPhase -ResolvedInstallerPath $payload.installer_path -Sid $payload.sid',
-        '    Write-Host "boundless_install_service_stop_initial=$($result.service_shutdown.initial_status)"',
-        '    Write-Host "boundless_install_service_stop_final=$($result.service_shutdown.final_status)"',
-        '    Write-Host "boundless_install_service_stop_elapsed_ms=$($result.service_shutdown.elapsed_milliseconds)"',
-        '    exit [int]$result.msi_exit_code',
-        '}',
-        'catch {',
-        '    Write-Error $_',
-        '    exit 1',
-        '}'
+    $required = @("S-1-5-18", "S-1-5-32-544")
+    $observed = @()
+    foreach ($rule in @($acl.Access)) {
+        $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow) {
+            if ($sid -notin $required) { throw "Installer stage granted unexpected access." }
+            $observed += $sid
+        }
+    }
+    foreach ($sid in $required) {
+        if ($sid -notin $observed) { throw "Installer stage omitted a required principal." }
+    }
+}
+function Quote-Argument {
+    param([string]$Value)
+    if ($Value -notmatch '[\s"]') { return $Value }
+    return '"' + ($Value -replace '"', '\"') + '"'
+}
+$payloadJson = [Text.Encoding]::UTF8.GetString(
+    [Convert]::FromBase64String("__PAYLOAD_BASE64__")
+)
+$payload = $payloadJson | ConvertFrom-Json
+$programDataKnownFolder = [Environment]::GetFolderPath(
+    [Environment+SpecialFolder]::CommonApplicationData
+)
+if ([string]::IsNullOrWhiteSpace($programDataKnownFolder)) {
+    throw "Could not resolve the Windows CommonApplicationData known folder."
+}
+$programData = [IO.Path]::GetFullPath($programDataKnownFolder).TrimEnd('\')
+$stageRoot = Join-Path $programData ("BoundlessInstaller-" + [guid]::NewGuid().ToString("N"))
+$trustedStage = $false
+$exitCode = 1
+try {
+    $security = [Security.AccessControl.DirectorySecurity]::new()
+    $security.SetSecurityDescriptorSddlForm([string]$payload.stage_sddl)
+    $create = [IO.Directory].GetMethods() |
+        Where-Object {
+            $p = $_.GetParameters()
+            $_.Name -eq "CreateDirectory" -and $p.Count -eq 2 -and
+                $p[0].ParameterType -eq [string] -and
+                $p[1].ParameterType -eq [Security.AccessControl.DirectorySecurity]
+        } | Select-Object -First 1
+    if ($null -ne $create) {
+        $null = $create.Invoke($null, [object[]]@($stageRoot, $security))
+    }
+    else {
+        $aclType = "System.IO.FileSystemAclExtensions" -as [type]
+        if ($null -eq $aclType) { throw "No secured directory creation API." }
+        $create = $aclType.GetMethods() |
+            Where-Object {
+                $p = $_.GetParameters()
+                $_.Name -eq "CreateDirectory" -and $p.Count -eq 2 -and
+                    $p[0].ParameterType -eq [Security.AccessControl.DirectorySecurity] -and
+                    $p[1].ParameterType -eq [string]
+            } | Select-Object -First 1
+        if ($null -eq $create) { throw "No FileSystemAclExtensions.CreateDirectory API." }
+        $null = $create.Invoke($null, [object[]]@($security, $stageRoot))
+    }
+    $item = Get-Item -LiteralPath $stageRoot -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Installer stage was a reparse point."
+    }
+    Assert-AdminAcl -Path $stageRoot -RequireProtected $true
+    $trustedStage = $true
+
+    $stagedMsi = Join-Path $stageRoot "Boundless.msi"
+    $stagedHelper = Join-Path $stageRoot "Boundless-Install.ps1"
+    Copy-Item -LiteralPath $payload.installer_path -Destination $stagedMsi -ErrorAction Stop
+    Copy-Item -LiteralPath $payload.helper_path -Destination $stagedHelper -ErrorAction Stop
+    Assert-AdminAcl -Path $stagedMsi
+    Assert-AdminAcl -Path $stagedHelper
+    if ((Get-FileHash -LiteralPath $stagedMsi -Algorithm SHA256).Hash -ne $payload.installer_sha256) {
+        throw "Staged MSI hash mismatch."
+    }
+    if ((Get-FileHash -LiteralPath $stagedHelper -Algorithm SHA256).Hash -ne $payload.helper_sha256) {
+        throw "Staged helper hash mismatch."
+    }
+
+    $arguments = @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $stagedHelper,
+        "-ElevatedInstall", "-InstallerPath", $stagedMsi,
+        "-ExpectedInstallerSha256", $payload.installer_sha256,
+        "-AllowedUserSid", $payload.sid
     )
-    $source = $parts -join ($newline + $newline)
+    if ([bool]$payload.quiet) { $arguments += "-Quiet" }
+    if ([bool]$payload.no_restart) { $arguments += "-NoRestart" }
+    if (-not [string]::IsNullOrWhiteSpace([string]$payload.log_path)) {
+        $arguments += @("-LogPath", [string]$payload.log_path)
+    }
+    $argumentLine = @($arguments | ForEach-Object { Quote-Argument $_ }) -join " "
+    $hostPath = (Get-Process -Id $PID -ErrorAction Stop).Path
+    $child = Start-Process -FilePath $hostPath -ArgumentList $argumentLine -WindowStyle Hidden -Wait -PassThru
+    if ($child.ExitCode -notin @(0, 3010)) {
+        throw "Immutable staged helper failed with exit code $($child.ExitCode)."
+    }
+    $exitCode = $child.ExitCode
+}
+catch {
+    Write-Host "boundless_install_elevated_error=$($_.Exception.Message)"
+    $exitCode = 1
+}
+finally {
+    if ($trustedStage -and (Test-Path -LiteralPath $stageRoot)) {
+        $resolved = (Resolve-Path -LiteralPath $stageRoot).Path
+        $parent = [IO.Directory]::GetParent($resolved)
+        $leaf = [IO.Path]::GetFileName($resolved)
+        $item = Get-Item -LiteralPath $resolved -Force
+        if (
+            $null -eq $parent -or
+            -not $parent.FullName.Equals($programData, [StringComparison]::OrdinalIgnoreCase) -or
+            $leaf -notmatch '^BoundlessInstaller-[0-9a-f]{32}$' -or
+            ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+        ) {
+            throw "Refusing unsafe installer stage cleanup."
+        }
+        Assert-AdminAcl -Path $resolved -RequireProtected $true
+        Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction Stop
+    }
+}
+exit $exitCode
+'@
+    $source = $source.Replace("__PAYLOAD_BASE64__", $payloadBase64)
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($source))
     if ($encodedCommand.Length -gt 30000) {
         throw "The bounded elevated install command exceeded the safe Windows command-line budget."
@@ -329,12 +653,6 @@ function Invoke-BoundlessMsi {
         [string]$Sid
     )
 
-    if (Test-IsAdministrator) {
-        return Assert-ElevatedInstallResult -Result (
-            Invoke-ElevatedInstallPhase -ResolvedInstallerPath $ResolvedInstallerPath -Sid $Sid
-        )
-    }
-
     $elevatedCommandArgs = @{
         ResolvedInstallerPath = $ResolvedInstallerPath
         Sid = $Sid
@@ -351,10 +669,12 @@ function Invoke-BoundlessMsi {
     $startArgs = @{
         FilePath = (Resolve-CurrentPowerShellExecutable)
         ArgumentList = (@($arguments | ForEach-Object { ConvertTo-ProcessArgument -Value $_ }) -join " ")
-        Verb = "RunAs"
         WindowStyle = "Hidden"
         Wait = $true
         PassThru = $true
+    }
+    if (-not (Test-IsAdministrator)) {
+        $startArgs.Verb = "RunAs"
     }
     $process = Start-Process @startArgs
     if ($process.ExitCode -notin @(0, 3010)) {
@@ -374,6 +694,12 @@ function Invoke-BoundlessMsi {
             elapsed_milliseconds = $null
             force_kill_used = $false
             msi_service_control = "idempotent_verification_after_helper_stop"
+        }
+        installer_stage = [pscustomobject]@{
+            admin_only = $true
+            hash_verified = $true
+            staged_copy_used = $true
+            cleaned = $true
         }
     })
 }
@@ -664,14 +990,21 @@ function Wait-BoundlessTrayProcessIdsExited {
 function Stop-BoundlessTrayForUpgrade {
     param(
         [string]$ExpectedOwnerSid,
+        [int]$ExpectedSessionId = -1,
         [int]$TimeoutSeconds = 8
     )
 
-    $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    $currentSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    if ($ExpectedSessionId -lt 0) {
+        $ExpectedSessionId = $currentSessionId
+    }
+    if ($ExpectedSessionId -ne $currentSessionId) {
+        throw "Refusing tray shutdown outside helper session $currentSessionId; requested $ExpectedSessionId."
+    }
     $targets = @(
         Assert-BoundlessTrayShutdownTargets -Processes @(
             Get-BoundlessTrayProcessesForCurrentSession
-        ) -ExpectedOwnerSid $ExpectedOwnerSid -ExpectedSessionId $sessionId
+        ) -ExpectedOwnerSid $ExpectedOwnerSid -ExpectedSessionId $ExpectedSessionId
     )
     if ($targets.Count -eq 0) {
         return [pscustomobject]@{
@@ -1240,6 +1573,84 @@ function Invoke-InstallHelperSelfTest {
         throw "Legacy WM_QUIT bridge native fixture did not expose PostThreadMessage."
     }
 
+    $mutexSecurity = New-BoundlessTrayOwnerMutexSecurity -UserSid $currentIdentitySid
+    $mutexSddl = $mutexSecurity.GetSecurityDescriptorSddlForm(
+        [Security.AccessControl.AccessControlSections]::All
+    )
+    if (
+        $mutexSddl -notmatch '\(A;;GA;;;SY\)' -or
+        $mutexSddl -notmatch '\(A;;GA;;;BA\)' -or
+        $mutexSddl -notmatch [regex]::Escape("(A;;GA;;;$currentIdentitySid)")
+    ) {
+        throw "Tray quiescence mutex fixture did not preserve its ownership DACL."
+    }
+    $quiescenceFixtureName = "Local\Boundless.Test.UpgradeLease.$PID.$([guid]::NewGuid().ToString('N'))"
+    $firstLeaseArgs = @{
+        Name = $quiescenceFixtureName
+        UserSid = $currentIdentitySid
+        InitiallyOwned = $true
+    }
+    $firstLease = New-BoundlessNamedMutex @firstLeaseArgs
+    try {
+        if (-not $firstLease.created_new) {
+            throw "First tray quiescence fixture did not create the owner mutex."
+        }
+        $secondLeaseArgs = @{
+            Name = $quiescenceFixtureName
+            UserSid = $currentIdentitySid
+            InitiallyOwned = $false
+        }
+        $secondLease = New-BoundlessNamedMutex @secondLeaseArgs
+        try {
+            if ($secondLease.created_new) {
+                throw "Second tray quiescence fixture bypassed the held owner mutex."
+            }
+        }
+        finally {
+            $secondLease.mutex.Dispose()
+        }
+    }
+    finally {
+        if ($firstLease.created_new) {
+            $firstLease.mutex.ReleaseMutex()
+        }
+        $firstLease.mutex.Dispose()
+    }
+
+    $stageSddl = Get-BoundlessAdminOnlyStageSddl
+    if (
+        $stageSddl -notmatch '\(A;OICI;FA;;;SY\)' -or
+        $stageSddl -notmatch '\(A;OICI;FA;;;BA\)' -or
+        $stageSddl -match ';;;BU\)' -or
+        $stageSddl -notmatch 'S:\(ML;;NW;;;ME\)'
+    ) {
+        throw "Installer staging security fixture was not admin-only medium-integrity."
+    }
+    $knownProgramData = Get-BoundlessProgramDataRoot
+    $originalProgramDataEnvironment = $env:ProgramData
+    try {
+        $env:ProgramData = "C:\Users\Public\BoundlessProgramDataPoison"
+        $knownProgramDataWithPoisonedEnvironment = Get-BoundlessProgramDataRoot
+    }
+    finally {
+        $env:ProgramData = $originalProgramDataEnvironment
+    }
+    if (-not (Test-WindowsPathEqual -Left $knownProgramData -Right $knownProgramDataWithPoisonedEnvironment)) {
+        throw "Installer staging known-folder fixture trusted the inherited ProgramData environment variable."
+    }
+    $safeStageFixture = Join-Path $knownProgramData (
+        "BoundlessInstaller-" + ("a" * 32)
+    )
+    $nestedStageFixture = Join-Path $knownProgramData (
+        "Boundless\BoundlessInstaller-" + ("a" * 32)
+    )
+    if (
+        -not (Test-BoundlessInstallerStagePath -Path $safeStageFixture) -or
+        (Test-BoundlessInstallerStagePath -Path $nestedStageFixture)
+    ) {
+        throw "Installer staging path fixture accepted an unsafe cleanup boundary."
+    }
+
     if (
         (Get-BoundlessServiceStopDecision -Status "Stopped" -StopRequested $false) -ne "complete" -or
         (Get-BoundlessServiceStopDecision -Status "StopPending" -StopRequested $false) -ne "wait" -or
@@ -1254,6 +1665,10 @@ function Invoke-InstallHelperSelfTest {
         msi_exit_code = 0
         service_shutdown = [pscustomobject]@{
             force_kill_used = $false
+        }
+        installer_stage = [pscustomobject]@{
+            admin_only = $true
+            hash_verified = $true
         }
     }
     Assert-ElevatedInstallResult -Result $validElevatedResult | Out-Null
@@ -1292,8 +1707,13 @@ function Invoke-InstallHelperSelfTest {
     if ($commandErrors.Count -ne 0) {
         throw "Elevated in-memory command fixture did not parse: $($commandErrors[0].Message)"
     }
-    if ($decodedElevatedCommand -match '\$PSCommandPath|-File\s') {
-        throw "Elevated command fixture attempted to reload a user-writable helper script."
+    if (
+        $decodedElevatedCommand -match '\$PSCommandPath' -or
+        $decodedElevatedCommand -match '\$env:ProgramData' -or
+        $decodedElevatedCommand -notmatch 'BoundlessInstaller-' -or
+        $decodedElevatedCommand -notmatch 'Staged helper hash mismatch'
+    ) {
+        throw "Elevated command fixture did not enforce immutable helper/MSI staging."
     }
 
     $msiPropertyFixture = "skipped"
@@ -1346,6 +1766,9 @@ function Invoke-InstallHelperSelfTest {
         tray_path_fixture = "passed"
         tray_shutdown_identity_fixture = "passed"
         legacy_quit_bridge_fixture = "passed"
+        tray_quiescence_lease_fixture = "passed"
+        admin_only_stage_fixture = "passed"
+        program_data_known_folder_fixture = "passed"
         bounded_service_stop_fixture = "passed"
         elevated_install_result_fixture = "passed"
         elevated_in_memory_command_fixture = "passed"
@@ -1356,6 +1779,42 @@ function Invoke-InstallHelperSelfTest {
 if ($SelfTest) {
     Invoke-InstallHelperSelfTest
     return
+}
+
+if ($ElevatedInstall) {
+    try {
+        if (-not (Test-IsAdministrator)) {
+            throw "Internal immutable install phase did not receive an elevated token."
+        }
+        Assert-AllowedUserSid -Sid $AllowedUserSid
+        if ($ExpectedInstallerSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+            throw "Internal immutable install phase received an invalid MSI hash."
+        }
+        $resolvedElevatedInstallerPath = Resolve-InstallerPath
+        $stageRoot = Split-Path -Parent $resolvedElevatedInstallerPath
+        if (
+            [string]::IsNullOrWhiteSpace($PSCommandPath) -or
+            -not (Test-BoundlessInstallerStagePath -Path $stageRoot) -or
+            -not (Test-WindowsPathEqual -Left (Split-Path -Parent $PSCommandPath) -Right $stageRoot)
+        ) {
+            throw "Internal immutable install phase was not running from its verified stage."
+        }
+        Assert-BoundlessAdminOnlyAcl -Path $PSCommandPath | Out-Null
+        $elevatedPhaseArgs = @{
+            ResolvedInstallerPath = $resolvedElevatedInstallerPath
+            Sid = $AllowedUserSid
+            ExpectedInstallerSha256 = $ExpectedInstallerSha256
+        }
+        $elevatedResult = Invoke-ElevatedInstallPhase @elevatedPhaseArgs
+        Write-Host "boundless_install_service_stop_initial=$($elevatedResult.service_shutdown.initial_status)"
+        Write-Host "boundless_install_service_stop_final=$($elevatedResult.service_shutdown.final_status)"
+        Write-Host "boundless_install_service_stop_elapsed_ms=$($elevatedResult.service_shutdown.elapsed_milliseconds)"
+        exit $elevatedResult.msi_exit_code
+    }
+    catch {
+        Write-Error $_
+        exit 1
+    }
 }
 
 $selection = Resolve-AllowedUser
@@ -1384,10 +1843,22 @@ if (-not [string]::IsNullOrWhiteSpace($selection.account)) {
 Write-Host "boundless_install_selected_user_source=$($selection.source)"
 
 $currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-$trayShutdown = Stop-BoundlessTrayForUpgrade -ExpectedOwnerSid $currentUserSid
+$currentSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+$quiescenceArgs = @{
+    ExpectedOwnerSid = $currentUserSid
+    ExpectedSessionId = $currentSessionId
+}
+$trayQuiescence = Enter-BoundlessTrayQuiescence @quiescenceArgs
+$trayShutdown = $trayQuiescence.evidence.shutdown
 Write-Host "boundless_install_tray_shutdown_count=$($trayShutdown.initial_count)"
 Write-Host "boundless_install_tray_shutdown_elapsed_ms=$($trayShutdown.elapsed_milliseconds)"
-$installResult = Invoke-BoundlessMsi -ResolvedInstallerPath $resolvedInstallerPath -Sid $selection.sid
+Write-Host "boundless_install_tray_quiescence_acquired=$($trayQuiescence.evidence.acquired)"
+try {
+    $installResult = Invoke-BoundlessMsi -ResolvedInstallerPath $resolvedInstallerPath -Sid $selection.sid
+}
+finally {
+    Exit-BoundlessTrayQuiescence -Lease $trayQuiescence
+}
 $exitCode = $installResult.msi_exit_code
 Write-Host "boundless_install_exit_code=$exitCode"
 Write-Host "boundless_install_service_stop_initial=$($installResult.service_shutdown.initial_status)"
@@ -1400,6 +1871,7 @@ $verification = Invoke-PostInstallVerification `
     -ExpectedAllowedUserSid $selection.sid `
     -LaunchTray:(-not $Quiet -and -not (Test-IsAdministrator))
 $summary.pre_install_tray_shutdown = $trayShutdown
+$summary.pre_install_tray_quiescence = $trayQuiescence.evidence
 $summary.elevated_install = $installResult
 $summary.post_install_verification = $verification
 $summary.status = if ($verification.tray_verification -eq "passed") {

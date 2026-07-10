@@ -44,8 +44,9 @@ impl SingleInstanceGuard {
             bail!("single-instance user SID must use canonical numeric SID syntax");
         }
 
-        let security = KernelObjectSecurityDescriptor::for_user(user_sid)?;
-        let attributes = security.attributes();
+        let activation_security =
+            KernelObjectSecurityDescriptor::for_user(user_sid, IntegrityLevel::Low)?;
+        let attributes = activation_security.attributes();
 
         let mutex_name = wide_null(&format!("{name}.Owner"));
         unsafe {
@@ -67,9 +68,12 @@ impl SingleInstanceGuard {
         }
 
         let activation_event = Arc::new(OwnedHandle(activation_event));
+        let shutdown_security =
+            KernelObjectSecurityDescriptor::for_user(user_sid, IntegrityLevel::Medium)?;
+        let shutdown_attributes = shutdown_security.attributes();
         let shutdown_event_name = wide_null(&format!("{name}.Shutdown"));
         let shutdown_event =
-            unsafe { CreateEventW(&attributes, 0, 0, shutdown_event_name.as_ptr()) };
+            unsafe { CreateEventW(&shutdown_attributes, 0, 0, shutdown_event_name.as_ptr()) };
         if shutdown_event.is_null() {
             return Err(std::io::Error::last_os_error())
                 .context("failed to create tray shutdown event");
@@ -112,8 +116,9 @@ impl SingleInstanceGuard {
             bail!("single-instance user SID must use canonical numeric SID syntax");
         }
 
-        let security = KernelObjectSecurityDescriptor::for_user(user_sid)?;
-        let attributes = security.attributes();
+        let owner_security =
+            KernelObjectSecurityDescriptor::for_user(user_sid, IntegrityLevel::Low)?;
+        let attributes = owner_security.attributes();
         let mutex_name = wide_null(&format!("{name}.Owner"));
         unsafe {
             SetLastError(0);
@@ -129,9 +134,12 @@ impl SingleInstanceGuard {
             return Ok(false);
         }
 
+        let shutdown_security =
+            KernelObjectSecurityDescriptor::for_user(user_sid, IntegrityLevel::Medium)?;
+        let shutdown_attributes = shutdown_security.attributes();
         let shutdown_event_name = wide_null(&format!("{name}.Shutdown"));
         let shutdown_event =
-            unsafe { CreateEventW(&attributes, 0, 0, shutdown_event_name.as_ptr()) };
+            unsafe { CreateEventW(&shutdown_attributes, 0, 0, shutdown_event_name.as_ptr()) };
         if shutdown_event.is_null() {
             return Err(std::io::Error::last_os_error())
                 .context("failed to open tray shutdown event");
@@ -221,11 +229,23 @@ struct KernelObjectSecurityDescriptor {
     security_descriptor: PSECURITY_DESCRIPTOR,
 }
 
+#[derive(Clone, Copy)]
+enum IntegrityLevel {
+    Low,
+    Medium,
+}
+
+fn kernel_object_sddl(user_sid: &str, integrity: IntegrityLevel) -> String {
+    let integrity_sid = match integrity {
+        IntegrityLevel::Low => "LW",
+        IntegrityLevel::Medium => "ME",
+    };
+    format!("D:P(A;;GA;;;SY)(A;;GA;;;{user_sid})S:(ML;;NW;;;{integrity_sid})")
+}
+
 impl KernelObjectSecurityDescriptor {
-    fn for_user(user_sid: &str) -> Result<Self> {
-        let sddl = wide_null(&format!(
-            "D:P(A;;GA;;;SY)(A;;GA;;;{user_sid})S:(ML;;NW;;;LW)"
-        ));
+    fn for_user(user_sid: &str, integrity: IntegrityLevel) -> Result<Self> {
+        let sddl = wide_null(&kernel_object_sddl(user_sid, integrity));
         let mut security_descriptor = ptr::null_mut();
         let converted = unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -416,6 +436,18 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("canonical numeric SID"));
+    }
+
+    #[test]
+    fn shutdown_signal_requires_medium_integrity_but_activation_remains_low_integrity() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        let activation = kernel_object_sddl(sid, IntegrityLevel::Low);
+        let shutdown = kernel_object_sddl(sid, IntegrityLevel::Medium);
+
+        assert!(activation.ends_with("S:(ML;;NW;;;LW)"));
+        assert!(shutdown.ends_with("S:(ML;;NW;;;ME)"));
+        assert!(activation.contains(&format!("(A;;GA;;;{sid})")));
+        assert!(shutdown.contains(&format!("(A;;GA;;;{sid})")));
     }
 
     #[test]

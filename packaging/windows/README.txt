@@ -35,6 +35,13 @@ Recommended flow
    stop within its safety bound, the helper fails before starting the MSI
    rather than entering a FilesInUse loop or force-killing the service.
 
+   While UAC and MSI are active, the helper owns the tray's existing
+   per-session single-instance mutex so a Start Menu relaunch cannot race the
+   upgrade. The elevated phase copies the matching helper and MSI into a new
+   administrator-only ProgramData staging directory, verifies both hashes,
+   installs only from that immutable staging boundary, and removes it before
+   reporting success.
+
 2. Launch Boundless from the Start Menu, desktop shortcut, or boundlesstray.exe.
 
 Fallback/debug flow
@@ -53,6 +60,12 @@ Install behavior
 - Upgrade shutdown ownership: the elevated helper pre-stops BoundlessService
   once and waits for Stopped; MSI ServiceControl remains an idempotent
   verification/repair contract and never races a concurrent helper stop
+- Upgrade input ownership: the helper holds the intended session's existing
+  tray-owner mutex from preflight through MSI completion, then releases it
+  before post-install tray launch
+- Elevated installer handoff: the helper and MSI are copied into an
+  administrator-only ProgramData staging directory and hash-verified before
+  the service is stopped or msiexec reopens the package
 - Same-version MSI upgrades are enabled for dogfood rebuilds; post-install
   version and runtime checks still have to pass
 - Default startup integration: deferred; the machine-wide MSI does not create a Startup-folder shortcut yet
