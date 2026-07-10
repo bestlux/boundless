@@ -17,6 +17,15 @@ pub(super) enum AppMsg {
     },
     ActionComplete(String),
     ActionFailed(String),
+    ServiceRecoveryRequired(ServiceRecoveryOffer),
+    ServiceRecoveryComplete(String),
+    ServiceRecoveryFailed(String),
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ServiceRecoveryUiState {
+    pub(super) offer: ServiceRecoveryOffer,
+    pub(super) in_progress: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -69,6 +78,8 @@ pub(super) struct DashboardApp {
     pub(super) active_pairing_attempt_id: Option<u64>,
     pub(super) pending_onboarding_focus: bool,
     pub(super) onboarding_focus_shown: bool,
+    pub(super) pending_service_recovery_focus: bool,
+    pub(super) service_recovery: Option<ServiceRecoveryUiState>,
     pub(super) exit_requested: bool,
     pub(super) exit_requested_signal: Arc<AtomicBool>,
     pub(super) native_window_handle: Option<isize>,
@@ -178,6 +189,8 @@ impl DashboardApp {
             active_pairing_attempt_id: None,
             pending_onboarding_focus: false,
             onboarding_focus_shown: false,
+            pending_service_recovery_focus: false,
+            service_recovery: None,
             exit_requested: false,
             exit_requested_signal,
             native_window_handle,
@@ -293,6 +306,7 @@ impl DashboardApp {
                 }
                 self.hotkey_last_snapshot = snap.hotkeys.clone();
                 self.snapshot = snap;
+                self.service_recovery = None;
                 if should_offer_first_run_onboarding(&self.snapshot) && !self.onboarding_focus_shown
                 {
                     self.pending_onboarding_focus = true;
@@ -378,6 +392,35 @@ impl DashboardApp {
             }
             AppMsg::ActionFailed(err) => {
                 self.push_toast(err, true);
+            }
+            AppMsg::ServiceRecoveryRequired(offer) => {
+                let first_offer = self.service_recovery.is_none();
+                if !self
+                    .service_recovery
+                    .as_ref()
+                    .is_some_and(|recovery| recovery.in_progress)
+                {
+                    self.service_recovery = Some(ServiceRecoveryUiState {
+                        offer,
+                        in_progress: false,
+                    });
+                }
+                if first_offer {
+                    self.pending_service_recovery_focus = true;
+                }
+            }
+            AppMsg::ServiceRecoveryComplete(message) => {
+                if let Some(recovery) = self.service_recovery.as_mut() {
+                    recovery.in_progress = false;
+                }
+                self.push_toast(message, false);
+            }
+            AppMsg::ServiceRecoveryFailed(error) => {
+                if let Some(recovery) = self.service_recovery.as_mut() {
+                    recovery.in_progress = false;
+                    recovery.offer.message = error.clone();
+                }
+                self.push_toast(error, true);
             }
         }
     }
