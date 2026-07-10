@@ -307,18 +307,48 @@ function Wait-BoundlessServiceRunning {
     throw "BoundlessService did not reach Running within $($TimeoutSeconds)s; current=$($service.Status)."
 }
 
+function ConvertFrom-BoundlessDaemonStatusOutput {
+    param(
+        [string]$Output,
+        [string]$ExpectedVersion
+    )
+
+    $running = $Output -match '(^|\s)running=true(\s|$)'
+    $versionMatch = [regex]::Match($Output, '(^|\s)daemon_version=(?<version>[^\s]+)(\s|$)')
+    $reportedVersion = if ($versionMatch.Success) {
+        $versionMatch.Groups['version'].Value
+    }
+    else {
+        ""
+    }
+
+    return [pscustomobject]@{
+        running = $running
+        reported_version = $reportedVersion
+        expected_version = $ExpectedVersion
+        healthy = $running -and $reportedVersion -eq $ExpectedVersion
+    }
+}
+
 function Wait-BoundlessDaemonApi {
     param(
         [string]$CliPath,
+        [string]$ExpectedVersion,
         [int]$TimeoutSeconds = 30
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $lastResult = $null
+    $lastStatus = $null
     do {
         $lastResult = Invoke-BoundedProcess -FilePath $CliPath -ArgumentList @("daemon", "status") -TimeoutSeconds 5
-        if ($lastResult.exit_code -eq 0 -and $lastResult.stdout -match '(^|\s)running=true(\s|$)') {
-            return $true
+        if ($lastResult.exit_code -eq 0) {
+            $lastStatus = ConvertFrom-BoundlessDaemonStatusOutput `
+                -Output $lastResult.stdout `
+                -ExpectedVersion $ExpectedVersion
+            if ($lastStatus.healthy) {
+                return $lastStatus
+            }
         }
         Start-Sleep -Milliseconds 500
     } while ((Get-Date) -lt $deadline)
@@ -327,47 +357,154 @@ function Wait-BoundlessDaemonApi {
         "no status attempt completed"
     }
     else {
-        "exit_code=$($lastResult.exit_code) stderr=$($lastResult.stderr)"
+        $reportedVersion = if ($null -eq $lastStatus -or [string]::IsNullOrWhiteSpace($lastStatus.reported_version)) {
+            "missing"
+        }
+        else {
+            $lastStatus.reported_version
+        }
+        "exit_code=$($lastResult.exit_code) reported_version=$reportedVersion expected_version=$ExpectedVersion stderr=$($lastResult.stderr)"
     }
     throw "Boundless daemon API did not become healthy within $($TimeoutSeconds)s; $detail"
 }
 
-function Get-BoundlessTrayCountForCurrentSession {
+function Get-BoundlessVersionFromOutput {
+    param(
+        [string]$Output,
+        [string]$ExecutableName
+    )
+
+    $match = [regex]::Match(
+        $Output,
+        "(?m)^\s*$([regex]::Escape($ExecutableName))\s+(?<version>[^\s]+)\s*$"
+    )
+    if (-not $match.Success) {
+        throw "$ExecutableName --version returned an unexpected value: '$Output'"
+    }
+    return $match.Groups['version'].Value
+}
+
+function Get-BoundlessExecutableVersion {
+    param(
+        [string]$Path,
+        [string]$ExecutableName,
+        [int]$TimeoutSeconds = 10
+    )
+
+    $result = Invoke-BoundedProcess -FilePath $Path -ArgumentList @("--version") -TimeoutSeconds $TimeoutSeconds
+    if ($result.exit_code -ne 0) {
+        throw "$ExecutableName --version failed with exit code $($result.exit_code): $($result.stderr)"
+    }
+    return Get-BoundlessVersionFromOutput -Output $result.stdout -ExecutableName $ExecutableName
+}
+
+function Get-BoundlessTrayProcessesForCurrentSession {
     $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
     return @(
         Get-Process -Name "boundlesstray" -ErrorAction SilentlyContinue |
-            Where-Object { $_.SessionId -eq $sessionId }
-    ).Count
+            Where-Object { $_.SessionId -eq $sessionId } |
+            ForEach-Object {
+                $path = try { $_.Path } catch { "" }
+                $responding = try { $_.Responding } catch { $false }
+                [pscustomobject]@{
+                    id = $_.Id
+                    path = $path
+                    responding = $responding
+                }
+            }
+    )
+}
+
+function Test-WindowsPathEqual {
+    param(
+        [string]$Left,
+        [string]$Right
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Left) -or [string]::IsNullOrWhiteSpace($Right)) {
+        return $false
+    }
+    $leftFull = [IO.Path]::GetFullPath($Left).TrimEnd('\')
+    $rightFull = [IO.Path]::GetFullPath($Right).TrimEnd('\')
+    return $leftFull.Equals($rightFull, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-SoleBoundlessTraySnapshot {
+    param(
+        [object[]]$Processes,
+        [string]$ExpectedTrayPath,
+        [string]$Phase
+    )
+
+    $processes = @($Processes)
+    if ($processes.Count -gt 1) {
+        throw "Expected at most one Boundless tray $Phase, found $($processes.Count) in the current session."
+    }
+    if ($processes.Count -eq 0) {
+        return $null
+    }
+
+    $process = $processes[0]
+    if (-not (Test-WindowsPathEqual -Left $process.path -Right $ExpectedTrayPath)) {
+        throw "Boundless tray $Phase was running from an unexpected path. Expected '$ExpectedTrayPath', got '$($process.path)'. Close the old or portable tray and retry."
+    }
+    return $process
 }
 
 function Ensure-OneBoundlessTray {
     param(
         [string]$TrayPath,
         [string]$InstallRoot,
-        [int]$TimeoutSeconds = 15
+        [int]$TimeoutSeconds = 15,
+        [int]$StableMilliseconds = 2000
     )
 
-    $count = Get-BoundlessTrayCountForCurrentSession
-    if ($count -gt 1) {
-        throw "Expected at most one Boundless tray before launch, found $count in the current session."
-    }
-    if ($count -eq 0) {
-        Start-Process -FilePath $TrayPath -WorkingDirectory $InstallRoot | Out-Null
+    $expectedTrayPath = [IO.Path]::GetFullPath($TrayPath)
+    $existing = Assert-SoleBoundlessTraySnapshot `
+        -Processes @(Get-BoundlessTrayProcessesForCurrentSession) `
+        -ExpectedTrayPath $expectedTrayPath `
+        -Phase "before launch"
+    $launchedProcess = $null
+    if ($null -eq $existing) {
+        $launchedProcess = Start-Process -FilePath $expectedTrayPath -WorkingDirectory $InstallRoot -PassThru
     }
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $stableSince = $null
+    $stableProcessId = $null
     do {
-        $count = Get-BoundlessTrayCountForCurrentSession
-        if ($count -eq 1) {
-            return $count
+        $process = Assert-SoleBoundlessTraySnapshot `
+            -Processes @(Get-BoundlessTrayProcessesForCurrentSession) `
+            -ExpectedTrayPath $expectedTrayPath `
+            -Phase "during readiness verification"
+        if ($null -ne $process -and $process.responding) {
+            if ($stableProcessId -ne $process.id) {
+                $stableProcessId = $process.id
+                $stableSince = Get-Date
+            }
+            $stableFor = [int]((Get-Date) - $stableSince).TotalMilliseconds
+            if ($stableFor -ge $StableMilliseconds) {
+                return [pscustomobject]@{
+                    count = 1
+                    process_id = $process.id
+                    path = $process.path
+                    path_matches = $true
+                    responding = $true
+                    stable_milliseconds = $stableFor
+                }
+            }
         }
-        if ($count -gt 1) {
-            throw "Boundless tray launch produced $count processes in the current session."
+        else {
+            $stableProcessId = $null
+            $stableSince = $null
+            if ($null -ne $launchedProcess -and $launchedProcess.HasExited) {
+                throw "Boundless tray exited before it remained ready for $($StableMilliseconds)ms; exit_code=$($launchedProcess.ExitCode)."
+            }
         }
         Start-Sleep -Milliseconds 250
     } while ((Get-Date) -lt $deadline)
 
-    throw "Boundless tray did not remain running within $($TimeoutSeconds)s."
+    throw "Boundless tray did not remain single, responsive, and path-correct for $($StableMilliseconds)ms within $($TimeoutSeconds)s."
 }
 
 function Test-ManifestVersionMatchesMsi {
@@ -405,8 +542,23 @@ function Assert-PostInstallEvidence {
     if (-not $Evidence.daemon_api_healthy) {
         throw "Boundless daemon API was not healthy after install."
     }
+    if ($Evidence.daemon_runtime_version -ne $Evidence.expected_runtime_version) {
+        throw "Boundless daemon runtime version '$($Evidence.daemon_runtime_version)' did not match installed version '$($Evidence.expected_runtime_version)'."
+    }
+    if (-not $Evidence.executable_versions_match) {
+        throw "One or more installed Boundless executables did not report the installed package version."
+    }
     if ($Evidence.tray_verification -eq "passed" -and $Evidence.tray_count -ne 1) {
         throw "Expected exactly one Boundless tray after install, found $($Evidence.tray_count)."
+    }
+    if ($Evidence.tray_verification -eq "passed" -and -not $Evidence.tray_path_matches) {
+        throw "The sole Boundless tray did not run from the installed Program Files path."
+    }
+    if ($Evidence.tray_verification -eq "passed" -and -not $Evidence.tray_responding) {
+        throw "The sole Boundless tray did not remain responsive during readiness verification."
+    }
+    if ($Evidence.tray_verification -eq "passed" -and $Evidence.tray_stable_milliseconds -lt 2000) {
+        throw "The sole Boundless tray was not stable for the required 2000ms readiness interval."
     }
     if ($Evidence.tray_verification -notin @("passed", "deferred_elevated_or_quiet")) {
         throw "Unexpected tray verification status '$($Evidence.tray_verification)'."
@@ -460,21 +612,40 @@ function Invoke-PostInstallVerification {
 
     $cliPath = Join-Path $installRoot "boundlessctl.exe"
     $trayPath = Join-Path $installRoot "boundlesstray.exe"
-    foreach ($requiredPath in @($cliPath, $trayPath)) {
+    $daemonPath = Join-Path $installRoot "boundlessd.exe"
+    $servicePath = Join-Path $installRoot "boundless-service.exe"
+    foreach ($requiredPath in @($cliPath, $trayPath, $daemonPath, $servicePath)) {
         if (-not (Test-Path -LiteralPath $requiredPath)) {
             throw "Installed Boundless payload was missing: $requiredPath"
         }
     }
-    $daemonApiHealthy = Wait-BoundlessDaemonApi -CliPath $cliPath
+
+    $reportedExecutableVersions = [ordered]@{
+        boundlessctl = Get-BoundlessExecutableVersion -Path $cliPath -ExecutableName "boundlessctl"
+        boundlesstray = Get-BoundlessExecutableVersion -Path $trayPath -ExecutableName "boundlesstray"
+        boundlessd = Get-BoundlessExecutableVersion -Path $daemonPath -ExecutableName "boundlessd"
+        boundless_service = Get-BoundlessExecutableVersion -Path $servicePath -ExecutableName "boundless-service"
+    }
+    $executableVersionsMatch = @($reportedExecutableVersions.Values | Where-Object { $_ -ne $manifestVersion }).Count -eq 0
+
+    $daemonApi = Wait-BoundlessDaemonApi -CliPath $cliPath -ExpectedVersion $manifestVersion
     if ($LaunchTray) {
-        $trayCount = Ensure-OneBoundlessTray -TrayPath $trayPath -InstallRoot $installRoot
+        $trayEvidence = Ensure-OneBoundlessTray -TrayPath $trayPath -InstallRoot $installRoot
+        $trayCount = $trayEvidence.count
+        $trayPathMatches = $trayEvidence.path_matches
+        $trayResponding = $trayEvidence.responding
+        $trayStableMilliseconds = $trayEvidence.stable_milliseconds
         $trayVerification = "passed"
     }
     else {
-        $trayCount = Get-BoundlessTrayCountForCurrentSession
-        if ($trayCount -gt 1) {
-            throw "Expected at most one Boundless tray in the current session, found $trayCount."
-        }
+        $existingTray = Assert-SoleBoundlessTraySnapshot `
+            -Processes @(Get-BoundlessTrayProcessesForCurrentSession) `
+            -ExpectedTrayPath $trayPath `
+            -Phase "during deferred verification"
+        $trayCount = if ($null -eq $existingTray) { 0 } else { 1 }
+        $trayPathMatches = $null -ne $existingTray
+        $trayResponding = $null -ne $existingTray -and $existingTray.responding
+        $trayStableMilliseconds = 0
         $trayVerification = "deferred_elevated_or_quiet"
     }
 
@@ -488,8 +659,15 @@ function Invoke-PostInstallVerification {
         expected_allowed_user_sid = $ExpectedAllowedUserSid
         service_binary_path_matches = $serviceBinaryPathMatches
         service_status = $service.Status.ToString()
-        daemon_api_healthy = $daemonApiHealthy
+        daemon_api_healthy = $daemonApi.healthy
+        daemon_runtime_version = $daemonApi.reported_version
+        expected_runtime_version = $manifestVersion
+        executable_versions_match = $executableVersionsMatch
+        executable_versions = $reportedExecutableVersions
         tray_count = $trayCount
+        tray_path_matches = $trayPathMatches
+        tray_responding = $trayResponding
+        tray_stable_milliseconds = $trayStableMilliseconds
         tray_verification = $trayVerification
     }
     return Assert-PostInstallEvidence -Evidence $evidence
@@ -507,7 +685,13 @@ function Invoke-InstallHelperSelfTest {
         service_binary_path_matches = $true
         service_status = "Running"
         daemon_api_healthy = $true
+        daemon_runtime_version = "5.0.13-dogfood.1"
+        expected_runtime_version = "5.0.13-dogfood.1"
+        executable_versions_match = $true
         tray_count = 1
+        tray_path_matches = $true
+        tray_responding = $true
+        tray_stable_milliseconds = 2000
         tray_verification = "passed"
     }
     Assert-PostInstallEvidence -Evidence $valid | Out-Null
@@ -518,6 +702,54 @@ function Invoke-InstallHelperSelfTest {
         -TimeoutSeconds 5
     if ($boundedProcess.exit_code -ne 0 -or $boundedProcess.stdout -notmatch "running=true") {
         throw "Bounded process fixture did not capture a successful command. exit=$($boundedProcess.exit_code) stdout='$($boundedProcess.stdout)' stderr='$($boundedProcess.stderr)'"
+    }
+
+    $currentDaemon = ConvertFrom-BoundlessDaemonStatusOutput `
+        -Output "running=true daemon_version=5.0.13-dogfood.1 peers=1" `
+        -ExpectedVersion "5.0.13-dogfood.1"
+    $staleDaemon = ConvertFrom-BoundlessDaemonStatusOutput `
+        -Output "running=true daemon_version=5.0.12 peers=1" `
+        -ExpectedVersion "5.0.13-dogfood.1"
+    if (-not $currentDaemon.healthy -or $staleDaemon.healthy) {
+        throw "Daemon status version fixture did not reject a stale running service."
+    }
+
+    $parsedTrayVersion = Get-BoundlessVersionFromOutput `
+        -Output "boundlesstray 5.0.13-dogfood.1" `
+        -ExecutableName "boundlesstray"
+    if ($parsedTrayVersion -ne "5.0.13-dogfood.1") {
+        throw "Executable version fixture parsed '$parsedTrayVersion'."
+    }
+
+    $expectedTrayPath = "C:\Program Files\Boundless\boundlesstray.exe"
+    $correctTray = [pscustomobject]@{
+        id = 123
+        path = $expectedTrayPath
+        responding = $true
+    }
+    $acceptedTray = Assert-SoleBoundlessTraySnapshot `
+        -Processes @($correctTray) `
+        -ExpectedTrayPath $expectedTrayPath `
+        -Phase "in self-test"
+    if ($acceptedTray.id -ne 123) {
+        throw "Tray path fixture did not accept the installed path."
+    }
+    $wrongTrayRejected = $false
+    try {
+        Assert-SoleBoundlessTraySnapshot `
+            -Processes @([pscustomobject]@{
+                id = 456
+                path = "C:\Portable\Boundless\boundlesstray.exe"
+                responding = $true
+            }) `
+            -ExpectedTrayPath $expectedTrayPath `
+            -Phase "in self-test" | Out-Null
+    }
+    catch {
+        $wrongTrayRejected = $true
+    }
+    if (-not $wrongTrayRejected) {
+        throw "Tray path fixture accepted an old or portable executable path."
     }
 
     $msiPropertyFixture = "skipped"
@@ -539,7 +771,12 @@ function Invoke-InstallHelperSelfTest {
         @{ name = "service_path"; property = "service_binary_path_matches"; value = $false },
         @{ name = "service"; property = "service_status"; value = "Stopped" },
         @{ name = "api"; property = "daemon_api_healthy"; value = $false },
-        @{ name = "tray_count"; property = "tray_count"; value = 2 }
+        @{ name = "daemon_runtime_version"; property = "daemon_runtime_version"; value = "5.0.12" },
+        @{ name = "executable_versions"; property = "executable_versions_match"; value = $false },
+        @{ name = "tray_count"; property = "tray_count"; value = 2 },
+        @{ name = "tray_path"; property = "tray_path_matches"; value = $false },
+        @{ name = "tray_responsive"; property = "tray_responding"; value = $false },
+        @{ name = "tray_stability"; property = "tray_stable_milliseconds"; value = 250 }
     )) {
         $fixture = $valid.PSObject.Copy()
         $fixture.($mutation.property) = $mutation.value
@@ -558,8 +795,11 @@ function Invoke-InstallHelperSelfTest {
     [pscustomobject]@{
         status = "passed"
         helper = "Boundless-Install.ps1"
-        post_install_fixtures = 8
+        post_install_fixtures = 13
         bounded_process_fixture = "passed"
+        daemon_version_fixture = "passed"
+        executable_version_fixture = "passed"
+        tray_path_fixture = "passed"
         msi_property_fixture = $msiPropertyFixture
     } | ConvertTo-Json -Depth 3
 }
