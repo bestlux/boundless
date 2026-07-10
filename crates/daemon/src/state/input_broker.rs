@@ -341,13 +341,11 @@ fn track_pressed_state(inner: &mut InputBrokerRelayInner, event: &InputEvent) {
             semantics,
         } => match state {
             KeyState::Down => {
-                if let Some((_, pressed_semantics)) = inner
+                if !inner
                     .pressed_keys
-                    .iter_mut()
-                    .find(|(pressed_scan_code, _)| pressed_scan_code == scan_code)
+                    .iter()
+                    .any(|(pressed_scan_code, _)| pressed_scan_code == scan_code)
                 {
-                    *pressed_semantics = *semantics;
-                } else {
                     inner.pressed_keys.push((*scan_code, *semantics));
                 }
             }
@@ -437,6 +435,47 @@ mod tests {
         assert_eq!(
             relay.observe_wheel_source_counts(1, 0, 0),
             Some("raw_device")
+        );
+    }
+
+    #[test]
+    fn detach_release_keeps_first_down_semantics_across_key_repeat() {
+        let relay = InputBrokerRelay::default();
+        let first_down = KeySemantics::Windows {
+            virtual_key: 0x61,
+            num_lock_on: true,
+        };
+        let repeat_after_toggle = KeySemantics::Windows {
+            virtual_key: 0x23,
+            num_lock_on: false,
+        };
+        relay.push_broker_observations(
+            vec![
+                InputEvent::Key {
+                    scan_code: 0x4F,
+                    state: KeyState::Down,
+                    semantics: first_down,
+                },
+                InputEvent::Key {
+                    scan_code: 0x4F,
+                    state: KeyState::Down,
+                    semantics: repeat_after_toggle,
+                },
+            ],
+            None,
+            None,
+            0,
+            false,
+            0,
+        );
+
+        assert_eq!(
+            relay.drain_release_events(),
+            vec![InputEvent::Key {
+                scan_code: 0x4F,
+                state: KeyState::Up,
+                semantics: first_down,
+            }]
         );
     }
 }

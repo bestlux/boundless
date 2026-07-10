@@ -6,8 +6,8 @@ pub(super) struct InjectDrainOutcome {
 }
 
 pub(super) async fn run(state: AppState, mode: InputRuntimeMode) -> Result<()> {
-    let mut inject_backend = input_backend(mode);
     let mut capture_backend = input_capture_backend(&state, mode);
+    let mut inject_backend = input_backend(mode, capture_backend.windows_num_lock_state());
     state
         .set_input_lock_runtime(false, capture_backend.lock_supported())
         .await;

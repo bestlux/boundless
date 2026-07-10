@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex, MutexGuard};
+
 use core_input::InputEvent;
 
 #[cfg(windows)]
@@ -26,7 +28,7 @@ use windows_sys::Win32::{
     System::Threading::{GetCurrentProcess, OpenProcessToken},
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+            GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
             KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX,
             MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
             MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
@@ -48,6 +50,73 @@ const XBUTTON2: u32 = 0x0002;
 
 #[cfg(windows)]
 pub const VK_NUMLOCK_CODE: u16 = 0x90;
+
+/// Process-local Num Lock authority shared by the interactive capture and
+/// injection lanes. The hook message thread seeds and updates physical state;
+/// successful Boundless injection commits synthetic toggle changes.
+#[derive(Debug, Clone)]
+pub struct WindowsNumLockState {
+    on: Arc<Mutex<bool>>,
+}
+
+impl WindowsNumLockState {
+    pub fn new(on: bool) -> Self {
+        Self {
+            on: Arc::new(Mutex::new(on)),
+        }
+    }
+
+    pub fn is_on(&self) -> bool {
+        *self.lock()
+    }
+
+    pub fn set(&self, on: bool) {
+        *self.lock() = on;
+    }
+
+    pub fn toggle(&self) -> bool {
+        let mut on = self.lock();
+        *on = !*on;
+        *on
+    }
+
+    fn lock(&self) -> MutexGuard<'_, bool> {
+        self.on
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+pub struct WindowsInputState {
+    num_lock: WindowsNumLockState,
+}
+
+#[cfg(windows)]
+impl WindowsInputState {
+    pub fn new(num_lock: WindowsNumLockState) -> Self {
+        Self { num_lock }
+    }
+
+    pub fn send_events(&self, events: &[InputEvent]) -> Result<()> {
+        self.send_events_with(events, send_input_records)
+    }
+
+    fn send_events_with<F>(&self, events: &[InputEvent], sender: F) -> Result<()>
+    where
+        F: FnOnce(&[INPUT]) -> Result<()>,
+    {
+        // Serialize physical toggle observations with prepare/send/commit so
+        // a concurrent local Num Lock press cannot be overwritten by a stale
+        // post-SendInput state commit.
+        let mut num_lock_on = self.num_lock.lock();
+        let (records, resulting_num_lock_on) = prepare_input_records(events, *num_lock_on);
+        sender(&records)?;
+        *num_lock_on = resulting_num_lock_on;
+        Ok(())
+    }
+}
 
 pub fn high_word(value: u32) -> u16 {
     ((value >> 16) & 0xFFFF) as u16
@@ -130,25 +199,17 @@ pub fn is_virtual_key_down(vk: u16) -> bool {
 }
 
 #[cfg(windows)]
-pub fn is_num_lock_on() -> bool {
-    let state = unsafe { GetKeyState(i32::from(VK_NUMLOCK_CODE)) };
-    (state as u16 & 0x0001) != 0
-}
-
-#[cfg(windows)]
 pub fn vk_to_scan_code(vk: u16) -> Option<u16> {
     let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) } as u16;
     if scan == 0 { None } else { Some(scan) }
 }
 
 #[cfg(windows)]
-pub fn input_records_for_event(event: &InputEvent) -> Vec<INPUT> {
-    input_records_for_events(std::slice::from_ref(event))
-}
-
-#[cfg(windows)]
-pub fn input_records_for_events(events: &[InputEvent]) -> Vec<INPUT> {
-    input_records_for_events_with_num_lock_state(events, is_num_lock_on())
+pub fn input_records_for_event_with_num_lock_state(
+    event: &InputEvent,
+    initial_num_lock_on: bool,
+) -> Vec<INPUT> {
+    input_records_for_events_with_num_lock_state(std::slice::from_ref(event), initial_num_lock_on)
 }
 
 #[cfg(windows)]
@@ -156,12 +217,17 @@ pub fn input_records_for_events_with_num_lock_state(
     events: &[InputEvent],
     initial_num_lock_on: bool,
 ) -> Vec<INPUT> {
+    prepare_input_records(events, initial_num_lock_on).0
+}
+
+#[cfg(windows)]
+fn prepare_input_records(events: &[InputEvent], initial_num_lock_on: bool) -> (Vec<INPUT>, bool) {
     let mut records = Vec::new();
     let mut destination_num_lock_on = initial_num_lock_on;
     for event in events {
         append_input_records_for_event(event, &mut destination_num_lock_on, &mut records);
     }
-    records
+    (records, destination_num_lock_on)
 }
 
 #[cfg(windows)]
@@ -401,10 +467,13 @@ mod tests {
     #[test]
     fn signed_high_resolution_wheel_deltas_reach_send_input_records() {
         for delta in [1, -1, 40, -40, 120, -120] {
-            let records = input_records_for_event(&InputEvent::MouseWheel {
-                delta_x: delta,
-                delta_y: delta,
-            });
+            let records = input_records_for_event_with_num_lock_state(
+                &InputEvent::MouseWheel {
+                    delta_x: delta,
+                    delta_y: delta,
+                },
+                false,
+            );
             assert_eq!(records.len(), 2);
 
             let vertical = unsafe { records[0].Anonymous.mi };
@@ -477,6 +546,58 @@ mod tests {
             keyboard_record(&records[4]).dwFlags & KEYEVENTF_KEYUP,
             KEYEVENTF_KEYUP
         );
+    }
+
+    #[test]
+    fn remote_num_lock_state_persists_into_the_next_injected_frame() {
+        const VK_NUMPAD1: u16 = 0x61;
+        let num_lock = WindowsNumLockState::new(false);
+        let input = WindowsInputState::new(num_lock.clone());
+
+        input
+            .send_events_with(
+                &[
+                    windows_key(0x45, VK_NUMLOCK_CODE, true, KeyState::Down),
+                    windows_key(0x45, VK_NUMLOCK_CODE, true, KeyState::Up),
+                ],
+                |records| {
+                    assert_eq!(records.len(), 2, "first frame toggles Num Lock once");
+                    Ok(())
+                },
+            )
+            .expect("commit first injected frame");
+        assert!(num_lock.is_on());
+
+        input
+            .send_events_with(
+                &[windows_key(0x4F, VK_NUMPAD1, true, KeyState::Down)],
+                |records| {
+                    assert_eq!(
+                        records.len(),
+                        1,
+                        "the next frame reuses committed destination state"
+                    );
+                    assert_eq!(keyboard_record(&records[0]).wScan, 0x4F);
+                    Ok(())
+                },
+            )
+            .expect("inject keypad frame");
+    }
+
+    #[test]
+    fn failed_injected_frame_does_not_commit_num_lock_state() {
+        let num_lock = WindowsNumLockState::new(false);
+        let input = WindowsInputState::new(num_lock.clone());
+
+        let error = input
+            .send_events_with(
+                &[windows_key(0x45, VK_NUMLOCK_CODE, true, KeyState::Down)],
+                |_records| Err(anyhow::anyhow!("injected failure")),
+            )
+            .expect_err("failed SendInput must surface");
+
+        assert!(error.to_string().contains("injected failure"));
+        assert!(!num_lock.is_on());
     }
 
     #[test]

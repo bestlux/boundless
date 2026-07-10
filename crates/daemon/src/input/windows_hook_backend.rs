@@ -75,6 +75,10 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
     fn take_dropped_event_count(&mut self) -> u64 {
         self.pump.take_dropped_event_count()
     }
+
+    fn windows_num_lock_state(&self) -> Option<WindowsNumLockState> {
+        Some(self.pump.num_lock_state())
+    }
 }
 
 fn enable_direct_input_lock_lease(pump: &mut HookInputPump, timeout: Duration) -> Result<()> {

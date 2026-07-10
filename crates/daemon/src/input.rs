@@ -64,17 +64,19 @@ use edge_switch::{
 use platform_windows::input::CaptureRuntime;
 #[cfg(all(windows, test))]
 use platform_windows::input::HookCaptureEvent;
+use platform_windows::input::WindowsNumLockState;
 #[cfg(all(windows, test))]
 use platform_windows::input::raw_mouse_relative_delta;
-#[cfg(test)]
-#[cfg(windows)]
-use platform_windows::input::send_input_records_with_sender;
 #[cfg(windows)]
 use platform_windows::input::{
-    HookControlAction, HookInputPump, captured_key_virtual_keys,
-    current_process_can_use_interactive_input, cursor_position, input_event_kind,
-    input_records_for_event, input_records_for_events, is_num_lock_on, is_virtual_key_down,
-    mouse_button_from_virtual_key, mouse_button_virtual_keys, send_input_records, vk_to_scan_code,
+    HookControlAction, HookInputPump, VK_NUMLOCK_CODE, WindowsInputState,
+    captured_key_virtual_keys, current_process_can_use_interactive_input, cursor_position,
+    input_event_kind, is_virtual_key_down, mouse_button_from_virtual_key,
+    mouse_button_virtual_keys, vk_to_scan_code,
+};
+#[cfg(all(test, windows))]
+use platform_windows::input::{
+    input_records_for_event_with_num_lock_state, send_input_records_with_sender,
 };
 #[cfg(all(test, not(windows)))]
 use runtime::apply_frame;
@@ -188,9 +190,16 @@ trait InputCaptureBackend: Send {
     fn take_dropped_event_count(&mut self) -> u64 {
         0
     }
+
+    fn windows_num_lock_state(&self) -> Option<WindowsNumLockState> {
+        None
+    }
 }
 
-fn input_backend(mode: InputRuntimeMode) -> Box<dyn InputBackend> {
+fn input_backend(
+    mode: InputRuntimeMode,
+    num_lock_state: Option<WindowsNumLockState>,
+) -> Box<dyn InputBackend> {
     if mode.is_service_session_unsupported() {
         return service_session_unsupported_input_backend();
     }
@@ -200,11 +209,18 @@ fn input_backend(mode: InputRuntimeMode) -> Box<dyn InputBackend> {
         if !windows_interactive_input_supported("input injection") {
             return service_session_unsupported_input_backend();
         }
-        Box::new(WindowsInputBackend)
+        let Some(num_lock_state) = num_lock_state else {
+            warn!("interactive input injection has no capture-owned Num Lock state");
+            return service_session_unsupported_input_backend();
+        };
+        Box::new(WindowsInputBackend {
+            input: WindowsInputState::new(num_lock_state),
+        })
     }
 
     #[cfg(not(windows))]
     {
+        let _ = num_lock_state;
         Box::new(NoopInputBackend)
     }
 }
@@ -226,9 +242,11 @@ fn input_capture_backend(state: &AppState, mode: InputRuntimeMode) -> Box<dyn In
             Err(error) => {
                 warn!(
                     error = ?error,
-                    "failed to start low-level capture hooks; falling back to polling capture backend"
+                    "failed to start low-level capture hooks; falling back to polling capture backend with reduced Num Lock state seeding"
                 );
-                Box::new(WindowsPollingCaptureBackend::default())
+                Box::new(WindowsPollingCaptureBackend::new(WindowsNumLockState::new(
+                    false,
+                )))
             }
         }
     }
@@ -297,15 +315,28 @@ struct BrokerRelayCaptureBackend {
 }
 
 #[cfg(windows)]
-#[derive(Default)]
-struct WindowsInputBackend;
+struct WindowsInputBackend {
+    input: WindowsInputState,
+}
 
 #[cfg(windows)]
-#[derive(Default)]
 struct WindowsPollingCaptureBackend {
     last_cursor: Option<(i32, i32)>,
-    last_key_down: HashMap<u16, bool>,
+    last_key_down: HashMap<u16, (bool, KeySemantics)>,
     last_button_down: HashMap<u16, bool>,
+    num_lock_state: WindowsNumLockState,
+}
+
+#[cfg(windows)]
+impl WindowsPollingCaptureBackend {
+    fn new(num_lock_state: WindowsNumLockState) -> Self {
+        Self {
+            last_cursor: None,
+            last_key_down: HashMap::new(),
+            last_button_down: HashMap::new(),
+            num_lock_state,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1662,11 +1693,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn maps_key_event_to_scan_code_record() {
-        let records = input_records_for_event(&InputEvent::Key {
-            scan_code: 30,
-            state: core_input::KeyState::Down,
-            semantics: KeySemantics::Physical,
-        });
+        let records = input_records_for_event_with_num_lock_state(
+            &InputEvent::Key {
+                scan_code: 30,
+                state: core_input::KeyState::Down,
+                semantics: KeySemantics::Physical,
+            },
+            false,
+        );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].r#type, INPUT_KEYBOARD);
 
@@ -1679,11 +1713,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn maps_extended_scan_code_with_extended_flag() {
-        let records = input_records_for_event(&InputEvent::Key {
-            scan_code: 0xE04D,
-            state: core_input::KeyState::Down,
-            semantics: KeySemantics::Physical,
-        });
+        let records = input_records_for_event_with_num_lock_state(
+            &InputEvent::Key {
+                scan_code: 0xE04D,
+                state: core_input::KeyState::Down,
+                semantics: KeySemantics::Physical,
+            },
+            false,
+        );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].r#type, INPUT_KEYBOARD);
 
@@ -1698,11 +1735,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn maps_e1_prefixed_scan_code_with_extended_flag() {
-        let records = input_records_for_event(&InputEvent::Key {
-            scan_code: 0xE11D,
-            state: core_input::KeyState::Down,
-            semantics: KeySemantics::Physical,
-        });
+        let records = input_records_for_event_with_num_lock_state(
+            &InputEvent::Key {
+                scan_code: 0xE11D,
+                state: core_input::KeyState::Down,
+                semantics: KeySemantics::Physical,
+            },
+            false,
+        );
         assert_eq!(records.len(), 1);
 
         let record = unsafe { records[0].Anonymous.ki };
@@ -1716,10 +1756,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn maps_wheel_event_to_two_records_when_both_axes_present() {
-        let records = input_records_for_event(&InputEvent::MouseWheel {
-            delta_x: 120,
-            delta_y: -120,
-        });
+        let records = input_records_for_event_with_num_lock_state(
+            &InputEvent::MouseWheel {
+                delta_x: 120,
+                delta_y: -120,
+            },
+            false,
+        );
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].r#type, INPUT_MOUSE);
         assert_eq!(records[1].r#type, INPUT_MOUSE);
@@ -1733,10 +1776,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn maps_absolute_move_event_to_absolute_mouse_record() {
-        let records = input_records_for_event(&InputEvent::MouseMoveAbsolute {
-            x_norm: 1234,
-            y_norm: 5678,
-        });
+        let records = input_records_for_event_with_num_lock_state(
+            &InputEvent::MouseMoveAbsolute {
+                x_norm: 1234,
+                y_norm: 5678,
+            },
+            false,
+        );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].r#type, INPUT_MOUSE);
 
@@ -1752,10 +1798,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn send_input_records_with_sender_batches_records_per_call() {
-        let records = input_records_for_event(&InputEvent::MouseWheel {
-            delta_x: 120,
-            delta_y: -120,
-        });
+        let records = input_records_for_event_with_num_lock_state(
+            &InputEvent::MouseWheel {
+                delta_x: 120,
+                delta_y: -120,
+            },
+            false,
+        );
         let mut call_count = 0usize;
 
         send_input_records_with_sender(&records, |chunk| {
@@ -1771,10 +1820,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn send_input_records_with_sender_stops_after_first_failed_record() {
-        let records = input_records_for_event(&InputEvent::MouseWheel {
-            delta_x: 120,
-            delta_y: -120,
-        });
+        let records = input_records_for_event_with_num_lock_state(
+            &InputEvent::MouseWheel {
+                delta_x: 120,
+                delta_y: -120,
+            },
+            false,
+        );
         let mut call_count = 0usize;
 
         let err = send_input_records_with_sender(&records, |_chunk| {

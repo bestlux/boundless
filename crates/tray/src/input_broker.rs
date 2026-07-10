@@ -18,8 +18,8 @@ use ipc_api::boundless::v1::{
 use ipc_api::broker_events::{broker_events_from_input_events, input_events_from_broker_events};
 use platform_windows::clipboard_backend::WindowsClipboardBackend;
 use platform_windows::input::{
-    HookControlAction, HookInputPump, current_process_can_use_interactive_input,
-    input_records_for_events, send_input_records, virtual_screen_bounds,
+    HookControlAction, HookInputPump, WindowsInputState, WindowsNumLockState,
+    current_process_can_use_interactive_input, virtual_screen_bounds,
 };
 use tonic::transport::Channel;
 
@@ -57,13 +57,22 @@ struct ClipboardPollOutcome {
     error: Option<anyhow::Error>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct InjectedInputState {
+    windows_input: WindowsInputState,
     pressed_keys: Vec<(u16, core_input::KeySemantics)>,
     pressed_buttons: Vec<core_input::MouseButton>,
 }
 
 impl InjectedInputState {
+    fn new(num_lock_state: WindowsNumLockState) -> Self {
+        Self {
+            windows_input: WindowsInputState::new(num_lock_state),
+            pressed_keys: Vec::new(),
+            pressed_buttons: Vec::new(),
+        }
+    }
+
     fn observe(&mut self, events: &[core_input::InputEvent]) {
         for event in events {
             match event {
@@ -73,13 +82,11 @@ impl InjectedInputState {
                     semantics,
                 } => match state {
                     core_input::KeyState::Down => {
-                        if let Some((_, pressed_semantics)) = self
+                        if !self
                             .pressed_keys
-                            .iter_mut()
-                            .find(|(pressed_scan_code, _)| pressed_scan_code == scan_code)
+                            .iter()
+                            .any(|(pressed_scan_code, _)| pressed_scan_code == scan_code)
                         {
-                            *pressed_semantics = *semantics;
-                        } else {
                             self.pressed_keys.push((*scan_code, *semantics));
                         }
                     }
@@ -137,8 +144,7 @@ impl InjectedInputState {
 
     fn release_local(&mut self) -> Result<()> {
         let releases = self.drain_release_events();
-        let records = input_records_for_events(&releases);
-        send_input_records(&records)
+        self.windows_input.send_events(&releases)
     }
 }
 
@@ -430,7 +436,7 @@ async fn run_input_broker_session(
         client.clone(),
         broker_token.clone(),
     ));
-    let mut injected_state = InjectedInputState::default();
+    let mut injected_state = InjectedInputState::new(pump.num_lock_state());
     let (loop_result, session_end) = tokio::select! {
         result = input_broker_exchange_loop(
             &mut input_client,
@@ -792,7 +798,7 @@ mod input_broker_tests {
 
     #[test]
     fn injected_state_synthesizes_releases_for_shutdown() {
-        let mut state = InjectedInputState::default();
+        let mut state = InjectedInputState::new(WindowsNumLockState::new(false));
         state.observe(&[
             core_input::InputEvent::Key {
                 scan_code: 30,
@@ -827,6 +833,40 @@ mod input_broker_tests {
     }
 
     #[test]
+    fn injected_shutdown_release_keeps_first_down_semantics_across_repeat() {
+        let mut state = InjectedInputState::new(WindowsNumLockState::new(false));
+        let first_down = core_input::KeySemantics::Windows {
+            virtual_key: 0x61,
+            num_lock_on: true,
+        };
+        let repeat_after_toggle = core_input::KeySemantics::Windows {
+            virtual_key: 0x23,
+            num_lock_on: false,
+        };
+        state.observe(&[
+            core_input::InputEvent::Key {
+                scan_code: 0x4F,
+                state: core_input::KeyState::Down,
+                semantics: first_down,
+            },
+            core_input::InputEvent::Key {
+                scan_code: 0x4F,
+                state: core_input::KeyState::Down,
+                semantics: repeat_after_toggle,
+            },
+        ]);
+
+        assert_eq!(
+            state.drain_release_events(),
+            vec![core_input::InputEvent::Key {
+                scan_code: 0x4F,
+                state: core_input::KeyState::Up,
+                semantics: first_down,
+            }]
+        );
+    }
+
+    #[test]
     fn supervisor_shutdown_signal_joins_cooperative_worker() {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let thread = std::thread::spawn(move || {
@@ -850,8 +890,7 @@ fn inject_input_events(
     events: &[core_input::InputEvent],
     injected_state: &mut InjectedInputState,
 ) -> Result<()> {
-    let records = input_records_for_events(events);
-    send_input_records(&records)?;
+    injected_state.windows_input.send_events(events)?;
     injected_state.observe(events);
     Ok(())
 }
