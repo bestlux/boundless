@@ -10,6 +10,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use core_clipboard::sanitize_clipboard_event_detail;
 use core_input::InputEvent;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -433,11 +434,12 @@ impl TransportRuntimeState {
         None
     }
 
-    pub fn record_transport_event(&self, event: TransportEventRecord) {
+    pub fn record_transport_event(&self, mut event: TransportEventRecord) {
         let Ok(mut events) = self.transport_events.lock() else {
             return;
         };
 
+        event.detail = sanitize_clipboard_event_detail(&event.kind, &event.detail);
         events.push_back(event);
         while events.len() > MAX_TRANSPORT_EVENTS {
             events.pop_front();
@@ -634,6 +636,43 @@ impl TransportRuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_event(
+        timestamp: DateTime<Utc>,
+        kind: &str,
+        direction: &str,
+        peer_id: &str,
+        detail: String,
+    ) -> TransportEventRecord {
+        TransportEventRecord {
+            timestamp,
+            direction: direction.to_string(),
+            kind: kind.to_string(),
+            peer_id: peer_id.to_string(),
+            detail,
+            size_bytes: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn clipboard_content_is_removed_before_event_retention() {
+        const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_945bbd71";
+        let state = TransportRuntimeState::default();
+
+        state.record_transport_event(test_event(
+            Utc::now(),
+            "clipboard_text",
+            "incoming",
+            "peer-a",
+            format!("payload_type=text disposition=received hash=abc preview={SECRET} {SECRET}"),
+        ));
+
+        let events = state.transport_events_snapshot().await;
+        let rendered = format!("{events:?}");
+        assert!(!rendered.contains(SECRET));
+        assert!(!rendered.contains("hash="));
+        assert_eq!(events[0].detail, "payload_type=text disposition=received");
+    }
 
     #[tokio::test]
     async fn closed_session_registry_aborts_child_spawned_before_registration() {

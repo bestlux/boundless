@@ -9,7 +9,7 @@ use app_services::{
         UiPairedPeer, UiPendingRequest, UiSnapshot,
     },
 };
-use core_clipboard::ClipboardPayload;
+use core_clipboard::{ClipboardPayload, sanitize_clipboard_event_detail};
 use tokio::{sync::mpsc, time};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -1334,12 +1334,13 @@ fn map_pending_request(request: UiPendingRequest) -> NearbyPairingRequestInfo {
 }
 
 fn map_transport_event(event: TransportEventSnapshot) -> TransportEvent {
+    let detail = sanitize_clipboard_event_detail(&event.kind, &event.detail);
     TransportEvent {
         timestamp: event.timestamp,
         direction: event.direction,
         kind: event.kind,
         peer_id: event.peer_id,
-        detail: event.detail,
+        detail,
         size_bytes: event.size_bytes,
     }
 }
@@ -1348,6 +1349,25 @@ fn map_transport_event(event: TransportEventSnapshot) -> TransportEvent {
 mod tests {
     use super::*;
     use ipc_api::client_identity::ControlClientIdentity;
+
+    #[test]
+    fn transport_event_mapping_removes_clipboard_content() {
+        const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_289193a4";
+        let mapped = map_transport_event(TransportEventSnapshot {
+            timestamp: "2026-07-10T00:00:00Z".to_string(),
+            direction: "incoming".to_string(),
+            kind: "clipboard_text".to_string(),
+            peer_id: "peer-a".to_string(),
+            detail: format!(
+                "payload_type=text disposition=received hash=abc preview={SECRET} {SECRET}"
+            ),
+            size_bytes: 32,
+        });
+
+        assert_eq!(mapped.detail, "payload_type=text disposition=received");
+        assert!(!mapped.detail.contains(SECRET));
+        assert!(!mapped.detail.contains("hash="));
+    }
 
     #[test]
     fn verified_control_client_reads_transport_connect_info_only() {

@@ -72,6 +72,60 @@ pub fn image_hash_hex(bytes: &[u8]) -> String {
     hash_bytes_hex(0x02, bytes)
 }
 
+/// Reduces clipboard event detail to a small, explicitly allowed metadata vocabulary.
+///
+/// Clipboard contents and content-derived identifiers must not cross diagnostic boundaries.
+/// Callers should still construct metadata-only events at the source; this helper is the
+/// defense-in-depth boundary for retained events, APIs, CLIs, and diagnostic exports.
+pub fn sanitize_clipboard_event_detail(kind: &str, detail: &str) -> String {
+    if !kind.starts_with("clipboard") {
+        return detail.to_string();
+    }
+
+    let safe_tokens = detail
+        .split_whitespace()
+        .filter_map(sanitize_clipboard_metadata_token)
+        .collect::<Vec<_>>();
+
+    if safe_tokens.is_empty() {
+        "metadata_only=true".to_string()
+    } else {
+        safe_tokens.join(" ")
+    }
+}
+
+fn sanitize_clipboard_metadata_token(token: &str) -> Option<String> {
+    let (key, value) = token.split_once('=')?;
+    let allowed = match key {
+        "payload_type" => matches!(value, "text" | "bmp" | "image" | "unknown"),
+        "disposition" => matches!(
+            value,
+            "sent"
+                | "received"
+                | "rejected"
+                | "disabled"
+                | "deduped"
+                | "replayed"
+                | "apply_failed"
+                | "unmatched_apply_report"
+        ),
+        "reason" => matches!(
+            value,
+            "policy_or_validation"
+                | "feature_disabled"
+                | "duplicate"
+                | "replay"
+                | "apply_failed"
+                | "unmatched"
+                | "unknown"
+        ),
+        "applied" | "metadata_only" => matches!(value, "true" | "false"),
+        _ => false,
+    };
+
+    allowed.then(|| format!("{key}={value}"))
+}
+
 fn hash_bytes_hex(kind: u8, bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update([kind]);
@@ -248,6 +302,37 @@ mod tests {
         assert_eq!(
             image_hash_hex(b"abc"),
             payload_hash_hex(&ClipboardPayload::Image(b"abc".to_vec()))
+        );
+    }
+
+    #[test]
+    fn clipboard_event_detail_allows_only_explicit_metadata() {
+        const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_7b15fce0";
+        let detail = format!(
+            "payload_type=text disposition=received applied=true hash=abc preview={SECRET} {SECRET}"
+        );
+
+        let sanitized = sanitize_clipboard_event_detail("clipboard_text", &detail);
+
+        assert_eq!(
+            sanitized,
+            "payload_type=text disposition=received applied=true"
+        );
+        assert!(!sanitized.contains(SECRET));
+        assert!(!sanitized.contains("hash="));
+    }
+
+    #[test]
+    fn malformed_clipboard_detail_fails_closed() {
+        const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_c9ce0a8e";
+
+        assert_eq!(
+            sanitize_clipboard_event_detail("clipboard_text", SECRET),
+            "metadata_only=true"
+        );
+        assert_eq!(
+            sanitize_clipboard_event_detail("input_frame", SECRET),
+            SECRET
         );
     }
 }

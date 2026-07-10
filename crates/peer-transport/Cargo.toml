@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+core-clipboard = { path = "../core-clipboard" }
 core-input = { path = "../core-input" }
 serde.workspace = true
 thiserror.workspace = true

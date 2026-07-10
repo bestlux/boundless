@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use core_clipboard::sanitize_clipboard_event_detail;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -13,7 +14,6 @@ use crate::queries::{ConsoleSnapshot, TransportEventSnapshot};
 
 const REDACTED_SECRET: &str = "[redacted-secret]";
 const REDACTED_ID: &str = "[redacted-id]";
-const REDACTED_CLIPBOARD_TEXT: &str = "[redacted-clipboard-text]";
 const REDACTED_FILE_NAME: &str = "[redacted-file-name]";
 const REDACTED_PATH: &str = "[redacted-path]";
 const BOUNDLESS_RELATED_TCP_PORTS: &[u16] = &[15100, 15101, 15200];
@@ -599,8 +599,8 @@ fn redact_event_detail_with_context(
     include_filenames: bool,
     context: &mut RedactionContext,
 ) -> String {
-    if kind == "clipboard_text" {
-        return REDACTED_CLIPBOARD_TEXT.to_string();
+    if kind.starts_with("clipboard") {
+        return sanitize_clipboard_event_detail(kind, detail);
     }
 
     let mut redacted = detail
@@ -758,7 +758,7 @@ fn redact_json_value(
                 .unwrap_or(false)
                 && looks_like_clipboard_secret(text) =>
         {
-            *text = REDACTED_CLIPBOARD_TEXT.to_string();
+            *text = "metadata_only=true".to_string();
         }
         Value::String(_) => {}
         _ => {}
@@ -1116,7 +1116,7 @@ mod tests {
         let redacted = redact_transport_event(&event, false, &mut context);
         let rendered = serde_json::to_string(&redacted).expect("serialize redacted event");
 
-        assert!(rendered.contains(REDACTED_CLIPBOARD_TEXT));
+        assert!(rendered.contains("metadata_only=true"));
         assert!(!rendered.contains("hunter2"));
         assert!(!rendered.contains("abc123"));
         assert!(!rendered.contains("peer-machine-secret"));
