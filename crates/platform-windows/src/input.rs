@@ -14,7 +14,7 @@ mod hook_pump;
 pub use hook_capture::{
     CaptureRuntime, HookCaptureEvent, HookControlAction, captured_key_virtual_keys,
     mouse_button_from_virtual_key, mouse_button_virtual_keys, raw_mouse_relative_delta,
-    release_active_hook_lock, virtual_key_for_mouse_button,
+    raw_mouse_wheel_events, release_active_hook_lock, virtual_key_for_mouse_button,
 };
 #[cfg(windows)]
 pub use hook_pump::HookInputPump;
