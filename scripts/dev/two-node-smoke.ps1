@@ -102,7 +102,22 @@ function Get-TransportEventMatchCount {
         throw "Failed to fetch transport events at ${Endpoint}: $output"
     }
 
-    return ([regex]::Matches($output, $Pattern)).Count
+    $sampleCount = 0L
+    foreach ($line in ($output -split "`r?`n")) {
+        if ($line -notmatch $Pattern) {
+            continue
+        }
+
+        $aggregate = [regex]::Match($line, '(?:^|\s)sample_count=(?<count>\d+)(?:\s|$)')
+        if ($aggregate.Success) {
+            $sampleCount += [int64]$aggregate.Groups['count'].Value
+        }
+        else {
+            $sampleCount += 1
+        }
+    }
+
+    return $sampleCount
 }
 
 function Wait-ForTransportEventCount {
@@ -500,7 +515,14 @@ try {
     Wait-ForPeerConnectionState -Endpoint $node1Endpoint -PeerId $node1PeerId -Connected $true -Seconds $TimeoutSeconds
     Wait-ForPeerConnectionState -Endpoint $node2Endpoint -PeerId $node2PeerId -Connected $true -Seconds $TimeoutSeconds
 
-    $postReconnectClipboardText = "smoke-reconnect-live-" + (Get-Date -Format "HHmmss")
+    $postReconnectClipboardText =
+        "smoke-reconnect-live-" + (Get-Date -Format "HHmmss") + ("x" * 137)
+    $postReconnectClipboardBytes =
+        [System.Text.Encoding]::UTF8.GetByteCount($postReconnectClipboardText)
+    $reconnectTextPattern =
+        "direction=incoming kind=clipboard_text peer_id=$node2PeerId size_bytes=$postReconnectClipboardBytes"
+    $reconnectTextCountBeforeSend =
+        Get-TransportEventMatchCount -Endpoint $node2Endpoint -Pattern $reconnectTextPattern
     $reconnectImage = Join-Path $runRoot "reconnect-clipboard.bmp"
     # The large-image path is covered by the opt-in extended smoke step above.
     # Keep reconnect focused on delivery after reconnect, which is the contract
@@ -508,8 +530,11 @@ try {
     $reconnectImageBytes = New-BmpFile -Path $reconnectImage -Width 32 -Height 32 -Blue 0x11 -Green 0x88 -Red 0x33
     Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "send-text", $node1PeerId, $postReconnectClipboardText) | Out-Host
 
-    $escapedPostReconnectClipboardText = [regex]::Escape($postReconnectClipboardText)
-    Wait-ForTransportEvent -Endpoint $node2Endpoint -Pattern "direction=incoming kind=clipboard_text peer_id=$node2PeerId .*detail=$escapedPostReconnectClipboardText" -Seconds $TimeoutSeconds
+    Wait-ForTransportEventCount `
+        -Endpoint $node2Endpoint `
+        -Pattern $reconnectTextPattern `
+        -ExpectedMinCount ($reconnectTextCountBeforeSend + 1) `
+        -Seconds $TimeoutSeconds
     $reconnectImagePattern = "direction=incoming kind=clipboard_image peer_id=$node2PeerId size_bytes=$reconnectImageBytes"
     Send-ClipboardImageUntilObserved -SendEndpoint $node1Endpoint -PeerId $node1PeerId -ImagePath $reconnectImage -ObserveEndpoint $node2Endpoint -ObservePattern $reconnectImagePattern -Attempts 3 -ObserveSeconds ([Math]::Min($TimeoutSeconds, 20)) -RetryLabel "reconnect clipboard image"
 
