@@ -597,6 +597,84 @@ async fn stale_broker_fails_closed_until_reattach() {
 }
 
 #[tokio::test]
+async fn stale_reject_cleanup_and_reattach_preserve_final_release_ordering() {
+    let (state, root) = service_mode_broker_state("boundless-broker-stale-release-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    state
+        .set_input_capture_target(Some(&peer_id))
+        .await
+        .expect("set capture target");
+    let first = state
+        .attach_input_broker(allowed_client(), "first-broker".to_string(), true)
+        .await;
+    assert!(first.accepted);
+
+    let down = InputEvent::Key {
+        scan_code: 30,
+        state: KeyState::Down,
+    };
+    let observed = state
+        .exchange_input_broker(
+            allowed_client(),
+            &first.broker_token,
+            InputBrokerExchangeObservations {
+                captured_events: vec![down.clone()],
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(observed.accepted);
+    let drained = state.input_broker_relay().drain_captured_events();
+    state
+        .queue_input_events(&peer_id, drained)
+        .await
+        .expect("queue captured down");
+
+    state.input_broker_relay().expire_attachment_for_test();
+    let stale = state
+        .exchange_input_broker(
+            allowed_client(),
+            &first.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert!(!stale.accepted);
+    assert!(
+        state
+            .detach_input_broker(allowed_client(), &first.broker_token)
+            .await,
+        "stale rejection must preserve token identity for authoritative cleanup"
+    );
+    let second = state
+        .attach_input_broker(allowed_client(), "replacement-broker".to_string(), true)
+        .await;
+    assert!(second.accepted);
+
+    let routed_events = state
+        .drain_outgoing(&peer_id)
+        .await
+        .into_iter()
+        .filter_map(|payload| match payload {
+            OutboundPayload::InputFrame { events, .. } => Some(events),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        routed_events,
+        vec![
+            down,
+            InputEvent::Key {
+                scan_code: 30,
+                state: KeyState::Up,
+            },
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn exchange_returns_inject_frames_only_for_current_input_owner() {
     let (state, root) = service_mode_broker_state("boundless-broker-inject-owner-test").await;
     let peer_id = join_connected_peer(&state).await;

@@ -309,8 +309,9 @@ fn validate_attachment_token(
     now: Instant,
 ) -> bool {
     if !InputBrokerRelay::attachment_fresh(inner, now) {
-        inner.attachment = None;
-        inner.last_exchange_at = None;
+        // Preserve stale attachment identity and pressed state for an
+        // authorized cleanup detach or replacement attach. Freshness remains
+        // false, so the stale broker cannot regain routing authority.
         return false;
     }
     inner
