@@ -14,8 +14,9 @@ use windows_sys::Win32::{
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
         Input::{
-            GetRawInputData, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
-            RAWMOUSE, RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
+            GetRawInputData, KeyboardAndMouse::GetDoubleClickTime, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
+            RAWINPUTDEVICE, RAWINPUTHEADER, RAWMOUSE, RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE,
+            RegisterRawInputDevices,
         },
         WindowsAndMessaging::{
             CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW,
@@ -44,7 +45,8 @@ const LLKHF_INJECTED_MASK: u32 = 0x10;
 const LLMHF_INJECTED_MASK: u32 = 0x0000_0001;
 const RAW_INPUT_USAGE_PAGE_GENERIC: u16 = 0x01;
 const RAW_INPUT_USAGE_MOUSE: u16 = 0x02;
-const ESCAPE_DOUBLE_CTRL_WINDOW_MS: u64 = 400;
+const ESCAPE_DOUBLE_CTRL_MIN_WINDOW_MS: u64 = 800;
+const ESCAPE_DOUBLE_CTRL_MAX_WINDOW_MS: u64 = 1_200;
 const STATIC_WINDOW_CLASS_NAME: [u16; 7] = [83, 84, 65, 84, 73, 67, 0];
 const EMPTY_WINDOW_NAME: [u16; 1] = [0];
 
@@ -436,6 +438,7 @@ fn update_escape_state_for_key_at(
     vk_code: u16,
     key_state: KeyState,
     now: Instant,
+    double_tap_window: Duration,
 ) -> bool {
     if vk_code != VK_CONTROL_CODE && vk_code != VK_LCONTROL_CODE && vk_code != VK_RCONTROL_CODE {
         return false;
@@ -466,9 +469,9 @@ fn update_escape_state_for_key_at(
         }
 
         if !was_down {
-            let triggered = state.last_ctrl_tap_at.is_some_and(|previous| {
-                now.duration_since(previous) <= Duration::from_millis(ESCAPE_DOUBLE_CTRL_WINDOW_MS)
-            });
+            let triggered = state
+                .last_ctrl_tap_at
+                .is_some_and(|previous| now.duration_since(previous) <= double_tap_window);
             state.last_ctrl_tap_at = Some(now);
             return triggered;
         }
@@ -493,10 +496,23 @@ pub fn try_escape_unlock_for_key(vk_code: u16, key_state: KeyState) -> bool {
     let Some(runtime) = active_capture_runtime() else {
         return false;
     };
-    if !update_escape_state_for_key_at(&runtime, vk_code, key_state, Instant::now()) {
+    if !update_escape_state_for_key_at(
+        &runtime,
+        vk_code,
+        key_state,
+        Instant::now(),
+        escape_double_ctrl_window(unsafe { GetDoubleClickTime() }),
+    ) {
         return false;
     }
     force_unlock_for_arc(&runtime, Some(SafetyUnlockCause::Escape))
+}
+
+fn escape_double_ctrl_window(system_double_click_ms: u32) -> Duration {
+    Duration::from_millis(u64::from(system_double_click_ms).clamp(
+        ESCAPE_DOUBLE_CTRL_MIN_WINDOW_MS,
+        ESCAPE_DOUBLE_CTRL_MAX_WINDOW_MS,
+    ))
 }
 
 fn set_hook_lock_active_for(core: &Arc<CaptureRuntimeCore>, active: bool) -> Result<bool> {
@@ -1091,24 +1107,28 @@ mod tests {
         set_hook_lock_active_for(&core, true).expect("lock");
         activate_capture_runtime(&core).expect("activate");
         let start = Instant::now();
+        let window = Duration::from_millis(800);
 
         assert!(!update_escape_state_for_key_at(
             &core,
             VK_LCONTROL_CODE,
             KeyState::Down,
             start,
+            window,
         ));
         assert!(!update_escape_state_for_key_at(
             &core,
             VK_LCONTROL_CODE,
             KeyState::Up,
             start + Duration::from_millis(20),
+            window,
         ));
         assert!(update_escape_state_for_key_at(
             &core,
             VK_LCONTROL_CODE,
             KeyState::Down,
             start + Duration::from_millis(200),
+            window,
         ));
         assert!(force_unlock_for_arc(&core, Some(SafetyUnlockCause::Escape)));
         assert!(!core.lock_active.load(Ordering::Acquire));
@@ -1122,26 +1142,93 @@ mod tests {
         let core = test_runtime_core();
         set_hook_lock_active_for(&core, true).expect("lock");
         let start = Instant::now();
+        let window = Duration::from_millis(800);
 
         assert!(!update_escape_state_for_key_at(
             &core,
             VK_RCONTROL_CODE,
             KeyState::Down,
             start,
+            window,
         ));
         assert!(!update_escape_state_for_key_at(
             &core,
             VK_RCONTROL_CODE,
             KeyState::Up,
             start + Duration::from_millis(20),
+            window,
         ));
         assert!(!update_escape_state_for_key_at(
             &core,
             VK_RCONTROL_CODE,
             KeyState::Down,
-            start + Duration::from_millis(ESCAPE_DOUBLE_CTRL_WINDOW_MS + 1),
+            start + window + Duration::from_millis(1),
+            window,
         ));
         assert!(core.lock_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn escape_window_honors_system_setting_with_safe_clamps() {
+        assert_eq!(escape_double_ctrl_window(400), Duration::from_millis(800));
+        assert_eq!(escape_double_ctrl_window(900), Duration::from_millis(900));
+        assert_eq!(
+            escape_double_ctrl_window(5_000),
+            Duration::from_millis(1_200)
+        );
+    }
+
+    #[test]
+    fn escape_window_boundary_is_inclusive_but_not_unbounded() {
+        let core = test_runtime_core();
+        let start = Instant::now();
+        let window = Duration::from_millis(800);
+        set_hook_lock_active_for(&core, true).expect("lock");
+        assert!(!update_escape_state_for_key_at(
+            &core,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start,
+            window,
+        ));
+        assert!(!update_escape_state_for_key_at(
+            &core,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + Duration::from_millis(10),
+            window,
+        ));
+        assert!(update_escape_state_for_key_at(
+            &core,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start + window,
+            window,
+        ));
+
+        set_hook_lock_active_for(&core, false).expect("unlock");
+        set_hook_lock_active_for(&core, true).expect("relock");
+        assert!(!update_escape_state_for_key_at(
+            &core,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start,
+            window,
+        ));
+        assert!(!update_escape_state_for_key_at(
+            &core,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + Duration::from_millis(10),
+            window,
+        ));
+        assert!(!update_escape_state_for_key_at(
+            &core,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start + window + Duration::from_millis(1),
+            window,
+        ));
     }
 
     #[test]
