@@ -29,7 +29,9 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
             .drain_control_actions()
             .into_iter()
             .map(|action| match action {
-                HookControlAction::EscapeUnlock => CaptureControlAction::EscapeUnlock,
+                HookControlAction::EscapeUnlock | HookControlAction::LeaseExpiredUnlock => {
+                    CaptureControlAction::EscapeUnlock
+                }
             })
             .collect()
     }

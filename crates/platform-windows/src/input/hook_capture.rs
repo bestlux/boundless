@@ -53,6 +53,7 @@ pub const HOOK_EVENT_QUEUE_CAP: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookControlAction {
     EscapeUnlock,
+    LeaseExpiredUnlock,
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +61,6 @@ pub enum HookCaptureEvent {
     MouseDelta { dx: i32, dy: i32 },
     MousePosition { x: i32, y: i32 },
     Input(InputEvent),
-    Control(HookControlAction),
 }
 
 pub struct CaptureRuntime {
@@ -71,13 +71,18 @@ pub struct CaptureRuntime {
     raw_input_thread_id: Option<u32>,
     raw_input_thread: Option<JoinHandle<()>>,
     raw_input_enabled: bool,
+    lock_watchdog: Option<JoinHandle<()>>,
 }
 
 struct CaptureRuntimeCore {
     event_tx: Mutex<Option<SyncSender<HookCaptureEvent>>>,
     wake_notifier: Mutex<Option<HookWakeNotifier>>,
     runtime_state: Mutex<HookRuntimeState>,
+    lock_lease: Mutex<HookLockLease>,
     lock_active: AtomicBool,
+    escape_unlock_pending: AtomicU64,
+    lease_expired_unlock_pending: AtomicU64,
+    lock_watchdog_stop: AtomicBool,
     dropped_event_count: AtomicU64,
 }
 
@@ -86,6 +91,18 @@ struct HookRuntimeState {
     left_ctrl_down: bool,
     right_ctrl_down: bool,
     last_ctrl_tap_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct HookLockLease {
+    timeout: Option<Duration>,
+    last_renewed_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SafetyUnlockCause {
+    Escape,
+    LeaseExpired,
 }
 
 type HookWakeNotifier = Arc<dyn Fn(&'static str) + Send + Sync + 'static>;
@@ -113,7 +130,11 @@ impl CaptureRuntime {
             event_tx: Mutex::new(Some(event_tx)),
             wake_notifier: Mutex::new(Some(Arc::new(wake_notifier))),
             runtime_state: Mutex::new(HookRuntimeState::default()),
+            lock_lease: Mutex::new(HookLockLease::default()),
             lock_active: AtomicBool::new(false),
+            escape_unlock_pending: AtomicU64::new(0),
+            lease_expired_unlock_pending: AtomicU64::new(0),
+            lock_watchdog_stop: AtomicBool::new(false),
             dropped_event_count: AtomicU64::new(0),
         });
 
@@ -176,6 +197,7 @@ impl CaptureRuntime {
             raw_input_thread_id,
             raw_input_thread,
             raw_input_enabled,
+            lock_watchdog: None,
         })
     }
 
@@ -189,7 +211,11 @@ impl CaptureRuntime {
                 event_tx: Mutex::new(None),
                 wake_notifier: Mutex::new(None),
                 runtime_state: Mutex::new(HookRuntimeState::default()),
+                lock_lease: Mutex::new(HookLockLease::default()),
                 lock_active: AtomicBool::new(false),
+                escape_unlock_pending: AtomicU64::new(0),
+                lease_expired_unlock_pending: AtomicU64::new(0),
+                lock_watchdog_stop: AtomicBool::new(false),
                 dropped_event_count: AtomicU64::new(0),
             }),
             event_rx,
@@ -198,6 +224,7 @@ impl CaptureRuntime {
             raw_input_thread_id: None,
             raw_input_thread: None,
             raw_input_enabled,
+            lock_watchdog: None,
         }
     }
 
@@ -239,6 +266,57 @@ impl CaptureRuntime {
         set_hook_lock_active_for(&self.core, active)
     }
 
+    /// Enables a fail-open lease for the local hook lock. The caller must
+    /// renew the lease after every successful broker exchange; a stalled IPC
+    /// path can therefore never strand local input indefinitely.
+    pub fn enable_lock_lease(&mut self, timeout: Duration) -> Result<()> {
+        if timeout.is_zero() {
+            anyhow::bail!("hook lock lease timeout must be greater than zero");
+        }
+
+        {
+            let mut lease = self
+                .core
+                .lock_lease
+                .lock()
+                .map_err(|_| anyhow::anyhow!("hook lock lease mutex poisoned"))?;
+            lease.timeout = Some(timeout);
+            lease.last_renewed_at = self.lock_active().then(Instant::now);
+        }
+
+        if self.lock_watchdog.is_none() {
+            self.core.lock_watchdog_stop.store(false, Ordering::Release);
+            let core = Arc::clone(&self.core);
+            self.lock_watchdog = Some(
+                thread::Builder::new()
+                    .name("boundless-input-lock-watchdog".to_string())
+                    .spawn(move || run_lock_watchdog(core))
+                    .context("spawn input lock watchdog")?,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn renew_lock_lease(&self) -> bool {
+        renew_hook_lock_lease_for(&self.core, Instant::now())
+    }
+
+    pub fn drain_control_actions(&mut self) -> Vec<HookControlAction> {
+        let escape_count = self.core.escape_unlock_pending.swap(0, Ordering::AcqRel);
+        let lease_expired_count = self
+            .core
+            .lease_expired_unlock_pending
+            .swap(0, Ordering::AcqRel);
+        let mut actions = Vec::with_capacity(
+            escape_count
+                .saturating_add(lease_expired_count)
+                .min(usize::MAX as u64) as usize,
+        );
+        actions.extend((0..escape_count).map(|_| HookControlAction::EscapeUnlock));
+        actions.extend((0..lease_expired_count).map(|_| HookControlAction::LeaseExpiredUnlock));
+        actions
+    }
+
     pub fn lock_active(&self) -> bool {
         self.core.lock_active.load(Ordering::Relaxed)
     }
@@ -252,6 +330,10 @@ impl Drop for CaptureRuntime {
     fn drop(&mut self) {
         if self.lock_active() {
             let _ = set_hook_lock_active_for(&self.core, false);
+        }
+        self.core.lock_watchdog_stop.store(true, Ordering::Release);
+        if let Some(thread) = self.lock_watchdog.take() {
+            let _ = thread.join();
         }
         if let Some(thread_id) = self.raw_input_thread_id {
             post_thread_quit(thread_id);
@@ -349,15 +431,15 @@ pub fn is_hook_lock_active() -> bool {
     with_active_capture_runtime(|core| core.lock_active.load(Ordering::Relaxed)).unwrap_or(false)
 }
 
-pub fn update_escape_state_for_key(vk_code: u16, key_state: KeyState) -> bool {
+fn update_escape_state_for_key_at(
+    runtime: &CaptureRuntimeCore,
+    vk_code: u16,
+    key_state: KeyState,
+    now: Instant,
+) -> bool {
     if vk_code != VK_CONTROL_CODE && vk_code != VK_LCONTROL_CODE && vk_code != VK_RCONTROL_CODE {
         return false;
     }
-
-    let now = Instant::now();
-    let Some(runtime) = active_capture_runtime() else {
-        return false;
-    };
     if !runtime.lock_active.load(Ordering::Relaxed) {
         return false;
     }
@@ -404,12 +486,25 @@ pub fn update_escape_state_for_key(vk_code: u16, key_state: KeyState) -> bool {
     false
 }
 
+/// Detects the emergency gesture and releases the local hook lock before
+/// publishing any reconciliation action. This remains safe when the bounded
+/// hook event queue is full or the daemon/RPC path is stalled.
+pub fn try_escape_unlock_for_key(vk_code: u16, key_state: KeyState) -> bool {
+    let Some(runtime) = active_capture_runtime() else {
+        return false;
+    };
+    if !update_escape_state_for_key_at(&runtime, vk_code, key_state, Instant::now()) {
+        return false;
+    }
+    force_unlock_for_arc(&runtime, Some(SafetyUnlockCause::Escape))
+}
+
 fn set_hook_lock_active_for(core: &Arc<CaptureRuntimeCore>, active: bool) -> Result<bool> {
     set_hook_lock_active_for_arc(core.as_ref(), active)
 }
 
 fn set_hook_lock_active_for_arc(core: &CaptureRuntimeCore, active: bool) -> Result<bool> {
-    core.lock_active.store(active, Ordering::Relaxed);
+    core.lock_active.store(active, Ordering::Release);
     let mut state = core
         .runtime_state
         .lock()
@@ -419,7 +514,87 @@ fn set_hook_lock_active_for_arc(core: &CaptureRuntimeCore, active: bool) -> Resu
         state.right_ctrl_down = false;
         state.last_ctrl_tap_at = None;
     }
+    drop(state);
+
+    let mut lease = core
+        .lock_lease
+        .lock()
+        .map_err(|_| anyhow::anyhow!("hook lock lease mutex poisoned"))?;
+    lease.last_renewed_at = (active && lease.timeout.is_some()).then(Instant::now);
     Ok(active)
+}
+
+fn renew_hook_lock_lease_for(core: &CaptureRuntimeCore, now: Instant) -> bool {
+    if !core.lock_active.load(Ordering::Acquire) {
+        return false;
+    }
+    let Ok(mut lease) = core.lock_lease.lock() else {
+        let _ = force_unlock_for_arc(core, Some(SafetyUnlockCause::LeaseExpired));
+        return false;
+    };
+    if lease.timeout.is_none() {
+        return false;
+    }
+    lease.last_renewed_at = Some(now);
+    true
+}
+
+fn force_unlock_for_arc(core: &CaptureRuntimeCore, cause: Option<SafetyUnlockCause>) -> bool {
+    if !core.lock_active.swap(false, Ordering::AcqRel) {
+        return false;
+    }
+
+    if let Ok(mut state) = core.runtime_state.lock() {
+        state.left_ctrl_down = false;
+        state.right_ctrl_down = false;
+        state.last_ctrl_tap_at = None;
+    }
+    if let Ok(mut lease) = core.lock_lease.lock() {
+        lease.last_renewed_at = None;
+    }
+
+    match cause {
+        Some(SafetyUnlockCause::Escape) => {
+            core.escape_unlock_pending.fetch_add(1, Ordering::AcqRel);
+        }
+        Some(SafetyUnlockCause::LeaseExpired) => {
+            core.lease_expired_unlock_pending
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        None => {}
+    }
+    if cause.is_some()
+        && let Ok(notifier) = core.wake_notifier.lock()
+        && let Some(notifier) = notifier.as_ref()
+    {
+        notifier("input_safety_unlock");
+    }
+    true
+}
+
+fn expire_hook_lock_lease_if_needed(core: &CaptureRuntimeCore, now: Instant) -> bool {
+    if !core.lock_active.load(Ordering::Acquire) {
+        return false;
+    }
+    let expired = match core.lock_lease.lock() {
+        Ok(lease) => match (lease.timeout, lease.last_renewed_at) {
+            (Some(timeout), Some(last_renewed_at)) => {
+                now.saturating_duration_since(last_renewed_at) >= timeout
+            }
+            (Some(_), None) => true,
+            (None, _) => false,
+        },
+        Err(_) => true,
+    };
+    expired && force_unlock_for_arc(core, Some(SafetyUnlockCause::LeaseExpired))
+}
+
+fn run_lock_watchdog(core: Arc<CaptureRuntimeCore>) {
+    const WATCHDOG_POLL: Duration = Duration::from_millis(20);
+    while !core.lock_watchdog_stop.load(Ordering::Acquire) {
+        let _ = expire_hook_lock_lease_if_needed(&core, Instant::now());
+        thread::sleep(WATCHDOG_POLL);
+    }
 }
 
 pub fn mouse_button_virtual_keys() -> [(u16, MouseButton); 5] {
@@ -716,6 +891,9 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             };
 
             if let Some(state) = state {
+                if lock_active && try_escape_unlock_for_key(keyboard.vkCode as u16, state) {
+                    lock_active = false;
+                }
                 let mut scan_code = keyboard.scanCode as u16;
                 if (keyboard.flags & LLKHF_EXTENDED_MASK) != 0 {
                     scan_code |= 0xE000;
@@ -724,13 +902,6 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     HookCaptureEvent::Input(InputEvent::Key { scan_code, state }),
                     "keyboard_hook",
                 );
-
-                if lock_active && update_escape_state_for_key(keyboard.vkCode as u16, state) {
-                    send_hook_event(
-                        HookCaptureEvent::Control(HookControlAction::EscapeUnlock),
-                        "keyboard_hook",
-                    );
-                }
             }
         }
     }
@@ -862,7 +1033,11 @@ mod tests {
             event_tx: Mutex::new(None),
             wake_notifier: Mutex::new(None),
             runtime_state: Mutex::new(HookRuntimeState::default()),
+            lock_lease: Mutex::new(HookLockLease::default()),
             lock_active: AtomicBool::new(false),
+            escape_unlock_pending: AtomicU64::new(0),
+            lease_expired_unlock_pending: AtomicU64::new(0),
+            lock_watchdog_stop: AtomicBool::new(false),
             dropped_event_count: AtomicU64::new(0),
         })
     }
@@ -900,5 +1075,108 @@ mod tests {
         let second = test_runtime_core();
         activate_capture_runtime(&second).expect("second runtime should activate");
         clear_active_capture_runtime(&second).expect("clear second runtime");
+    }
+
+    #[test]
+    fn double_control_unlocks_before_bounded_event_delivery() {
+        let _guard = registry_test_guard().lock().expect("test guard");
+        reset_active_runtime_for_test();
+
+        let core = test_runtime_core();
+        let (event_tx, _event_rx) = mpsc::sync_channel(1);
+        event_tx
+            .send(HookCaptureEvent::MouseDelta { dx: 1, dy: 0 })
+            .expect("fill event queue");
+        *core.event_tx.lock().expect("event sender") = Some(event_tx);
+        set_hook_lock_active_for(&core, true).expect("lock");
+        activate_capture_runtime(&core).expect("activate");
+        let start = Instant::now();
+
+        assert!(!update_escape_state_for_key_at(
+            &core,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start,
+        ));
+        assert!(!update_escape_state_for_key_at(
+            &core,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + Duration::from_millis(20),
+        ));
+        assert!(update_escape_state_for_key_at(
+            &core,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start + Duration::from_millis(200),
+        ));
+        assert!(force_unlock_for_arc(&core, Some(SafetyUnlockCause::Escape)));
+        assert!(!core.lock_active.load(Ordering::Acquire));
+        assert_eq!(core.escape_unlock_pending.load(Ordering::Acquire), 1);
+
+        clear_active_capture_runtime(&core).expect("cleanup");
+    }
+
+    #[test]
+    fn control_taps_outside_window_do_not_unlock() {
+        let core = test_runtime_core();
+        set_hook_lock_active_for(&core, true).expect("lock");
+        let start = Instant::now();
+
+        assert!(!update_escape_state_for_key_at(
+            &core,
+            VK_RCONTROL_CODE,
+            KeyState::Down,
+            start,
+        ));
+        assert!(!update_escape_state_for_key_at(
+            &core,
+            VK_RCONTROL_CODE,
+            KeyState::Up,
+            start + Duration::from_millis(20),
+        ));
+        assert!(!update_escape_state_for_key_at(
+            &core,
+            VK_RCONTROL_CODE,
+            KeyState::Down,
+            start + Duration::from_millis(ESCAPE_DOUBLE_CTRL_WINDOW_MS + 1),
+        ));
+        assert!(core.lock_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn expired_lock_lease_fails_open_and_records_one_action() {
+        let core = test_runtime_core();
+        {
+            let mut lease = core.lock_lease.lock().expect("lease");
+            lease.timeout = Some(Duration::from_secs(2));
+        }
+        let start = Instant::now();
+        set_hook_lock_active_for_arc(&core, true).expect("lock");
+        {
+            let mut lease = core.lock_lease.lock().expect("lease");
+            lease.last_renewed_at = Some(start);
+        }
+
+        assert!(!expire_hook_lock_lease_if_needed(
+            &core,
+            start + Duration::from_millis(1_999)
+        ));
+        assert!(core.lock_active.load(Ordering::Acquire));
+        assert!(expire_hook_lock_lease_if_needed(
+            &core,
+            start + Duration::from_secs(2)
+        ));
+        assert!(!core.lock_active.load(Ordering::Acquire));
+        assert_eq!(core.lease_expired_unlock_pending.load(Ordering::Acquire), 1);
+        assert!(!expire_hook_lock_lease_if_needed(
+            &core,
+            start + Duration::from_secs(3)
+        ));
+        assert_eq!(
+            core.lease_expired_unlock_pending.load(Ordering::Acquire),
+            1,
+            "one lease transition must produce one bounded action"
+        );
     }
 }

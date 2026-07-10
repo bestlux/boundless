@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use anyhow::Result;
 use core_input::{InputEvent, KeyState};
@@ -14,7 +14,6 @@ use super::hook_capture::{
 /// user-session input broker host.
 pub struct HookInputPump {
     capture_runtime: CaptureRuntime,
-    control_actions: VecDeque<HookControlAction>,
     last_cursor: Option<(i32, i32)>,
     last_key_down: HashMap<u16, bool>,
     last_button_down: HashMap<u16, bool>,
@@ -33,7 +32,6 @@ impl HookInputPump {
     pub fn from_capture_runtime(capture_runtime: CaptureRuntime) -> Self {
         Self {
             capture_runtime,
-            control_actions: VecDeque::new(),
             last_cursor: None,
             last_key_down: HashMap::new(),
             last_button_down: HashMap::new(),
@@ -131,7 +129,7 @@ impl HookInputPump {
         self.last_cursor = None;
         self.last_key_down.clear();
         self.last_button_down.clear();
-        self.control_actions.clear();
+        let _ = self.capture_runtime.drain_control_actions();
         let _ = self.capture_runtime.drain_events();
     }
 
@@ -164,9 +162,6 @@ impl HookInputPump {
                     Self::flush_pending_move(&mut output, &mut pending_move);
                     self.update_pressed_state_and_filter(input_event, &mut output);
                 }
-                HookCaptureEvent::Control(action) => {
-                    self.control_actions.push_back(action);
-                }
             }
         }
 
@@ -176,7 +171,7 @@ impl HookInputPump {
     }
 
     pub fn drain_control_actions(&mut self) -> Vec<HookControlAction> {
-        self.control_actions.drain(..).collect()
+        self.capture_runtime.drain_control_actions()
     }
 
     pub fn set_lock_active(&mut self, active: bool) -> Result<bool> {
@@ -185,6 +180,14 @@ impl HookInputPump {
 
     pub fn lock_active(&self) -> bool {
         self.capture_runtime.lock_active()
+    }
+
+    pub fn enable_lock_lease(&mut self, timeout: std::time::Duration) -> Result<()> {
+        self.capture_runtime.enable_lock_lease(timeout)
+    }
+
+    pub fn renew_lock_lease(&self) -> bool {
+        self.capture_runtime.renew_lock_lease()
     }
 
     pub fn backend_mode(&self) -> &'static str {
