@@ -76,6 +76,7 @@ pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
 pub const MAX_INBOUND_TRANSFERS_PER_PEER: usize = 4;
 pub const CLIPBOARD_IMAGE_CHUNK_BYTES: usize = 128 * 1024;
 pub const MAX_TRANSPORT_EVENTS: usize = 512;
+const MAX_ACTIVITY_EVENT_SUMMARIES: usize = 64;
 
 #[derive(Debug, Clone)]
 pub enum OutboundPayload {
@@ -279,6 +280,63 @@ pub struct TransportEventRecord {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportEventPriority {
+    Diagnostic,
+    Activity,
+}
+
+#[derive(Debug, Clone)]
+struct RetainedTransportEvent {
+    event: TransportEventRecord,
+    first_timestamp: DateTime<Utc>,
+    sample_count: u64,
+    total_size_bytes: u64,
+    aggregation_key: Option<String>,
+    priority: TransportEventPriority,
+}
+
+impl RetainedTransportEvent {
+    fn new(mut event: TransportEventRecord) -> Self {
+        event.detail = sanitize_clipboard_event_detail(&event.kind, &event.detail);
+        let first_timestamp = event.timestamp;
+        let total_size_bytes = event.size_bytes;
+        let priority = transport_event_priority(&event.kind);
+        let aggregation_key = transport_event_is_aggregated(&event.kind)
+            .then(|| transport_event_aggregation_key(&event));
+        Self {
+            event,
+            first_timestamp,
+            sample_count: 1,
+            total_size_bytes,
+            aggregation_key,
+            priority,
+        }
+    }
+
+    fn merge(&mut self, mut event: TransportEventRecord) {
+        event.detail = sanitize_clipboard_event_detail(&event.kind, &event.detail);
+        self.sample_count = self.sample_count.saturating_add(1);
+        self.total_size_bytes = self.total_size_bytes.saturating_add(event.size_bytes);
+        self.event = event;
+    }
+
+    fn snapshot(&self) -> TransportEventRecord {
+        let mut event = self.event.clone();
+        event.size_bytes = self.total_size_bytes;
+        if self.sample_count > 1 {
+            event.detail = format!(
+                "{} sample_count={} first_seen={} last_seen={}",
+                event.detail,
+                self.sample_count,
+                self.first_timestamp.to_rfc3339(),
+                event.timestamp.to_rfc3339()
+            );
+        }
+        event
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RuntimeWakeSignal {
     notify: Notify,
@@ -312,7 +370,7 @@ pub struct TransportRuntimeState {
     pub reconnect_generation_by_peer: RwLock<HashMap<String, u64>>,
     pub outgoing_input_payloads: RwLock<HashMap<String, VecDeque<OutboundPayload>>>,
     pub outgoing_bulk_payloads: RwLock<HashMap<String, VecDeque<OutboundPayload>>>,
-    pub transport_events: Mutex<VecDeque<TransportEventRecord>>,
+    transport_events: Mutex<VecDeque<RetainedTransportEvent>>,
     pub outgoing_input_high_water_by_peer: Mutex<HashMap<String, usize>>,
     pub outgoing_flush_signal: watch::Sender<u64>,
     pub outgoing_flush_generation: AtomicU64,
@@ -434,16 +492,53 @@ impl TransportRuntimeState {
         None
     }
 
-    pub fn record_transport_event(&self, mut event: TransportEventRecord) {
+    pub fn record_transport_event(&self, event: TransportEventRecord) {
         let Ok(mut events) = self.transport_events.lock() else {
             return;
         };
 
-        event.detail = sanitize_clipboard_event_detail(&event.kind, &event.detail);
-        events.push_back(event);
-        while events.len() > MAX_TRANSPORT_EVENTS {
-            events.pop_front();
+        let retained = RetainedTransportEvent::new(event);
+        if let Some(key) = retained.aggregation_key.as_deref()
+            && let Some(index) = events
+                .iter()
+                .position(|existing| existing.aggregation_key.as_deref() == Some(key))
+        {
+            let Some(mut existing) = events.remove(index) else {
+                return;
+            };
+            existing.merge(retained.event);
+            events.push_back(existing);
+            return;
         }
+
+        if retained.priority == TransportEventPriority::Activity
+            && events
+                .iter()
+                .filter(|event| event.priority == TransportEventPriority::Activity)
+                .count()
+                >= MAX_ACTIVITY_EVENT_SUMMARIES
+            && let Some(index) = events
+                .iter()
+                .position(|event| event.priority == TransportEventPriority::Activity)
+        {
+            events.remove(index);
+        }
+
+        if events.len() >= MAX_TRANSPORT_EVENTS {
+            let activity_index = events
+                .iter()
+                .position(|event| event.priority == TransportEventPriority::Activity);
+            match (retained.priority, activity_index) {
+                (_, Some(index)) => {
+                    events.remove(index);
+                }
+                (TransportEventPriority::Diagnostic, None) => {
+                    events.pop_front();
+                }
+                (TransportEventPriority::Activity, None) => return,
+            }
+        }
+        events.push_back(retained);
     }
 
     pub fn transport_event_count(&self) -> usize {
@@ -457,7 +552,10 @@ impl TransportRuntimeState {
         let Ok(events) = self.transport_events.lock() else {
             return Vec::new();
         };
-        events.iter().cloned().collect()
+        events
+            .iter()
+            .map(RetainedTransportEvent::snapshot)
+            .collect()
     }
 
     pub fn register_pending_transport_session(&self, abort_handle: AbortHandle) -> u64 {
@@ -633,6 +731,75 @@ impl TransportRuntimeState {
     }
 }
 
+fn transport_event_priority(kind: &str) -> TransportEventPriority {
+    if matches!(
+        kind,
+        "runtime_wake"
+            | "input_runtime_wake"
+            | "input_frame"
+            | "input_inject_queued"
+            | "input_inject_applied"
+            | "input_broker_inject_dispatched"
+            | "anti_idle_pulse_sent"
+            | "anti_idle_pulse_received"
+            | "file_transfer_progress"
+            | "peer_reconcile_trigger"
+    ) {
+        TransportEventPriority::Activity
+    } else {
+        TransportEventPriority::Diagnostic
+    }
+}
+
+fn transport_event_is_aggregated(kind: &str) -> bool {
+    let repeated_failure = !kind.starts_with("clipboard")
+        && (kind.ends_with("_failed") || kind.ends_with("_rejected") || kind.ends_with("_dropped"));
+    transport_event_priority(kind) == TransportEventPriority::Activity
+        || repeated_failure
+        || matches!(
+            kind,
+            "input_inject_failed"
+                | "input_inject_skipped"
+                | "input_inject_dropped"
+                | "input_inject_dropped_permanent"
+                | "input_inject_retry_scheduled"
+                | "input_broker_inject_report"
+                | "input_queue_coalesced"
+                | "input_queue_overflow_drop"
+        )
+}
+
+fn transport_event_aggregation_key(event: &TransportEventRecord) -> String {
+    let dimensions = event
+        .detail
+        .split_whitespace()
+        .filter(|token| !transport_event_token_is_volatile(token))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{dimensions}",
+        event.direction, event.kind, event.peer_id
+    )
+}
+
+fn transport_event_token_is_volatile(token: &str) -> bool {
+    let Some((key, _value)) = token.split_once('=') else {
+        return false;
+    };
+    key == "sequence"
+        || key == "attempt"
+        || key == "attempts"
+        || key == "generation"
+        || key == "queue_depth"
+        || key == "retry_count"
+        || key == "events"
+        || key == "injected_frames"
+        || key == "failed_frames"
+        || key.ends_with("_count")
+        || key.ends_with("_ms")
+        || key.ends_with("_unix_ms")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,6 +819,141 @@ mod tests {
             detail,
             size_bytes: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn sixty_seconds_of_input_activity_preserves_causal_diagnostics() {
+        let state = TransportRuntimeState::default();
+        let started = Utc::now();
+        state.record_transport_event(test_event(
+            started,
+            "input_handoff",
+            "local",
+            "peer-a",
+            "direction=left activated=true".to_string(),
+        ));
+        state.record_transport_event(test_event(
+            started + chrono::Duration::milliseconds(1),
+            "transport_reachability_failed",
+            "outgoing",
+            "peer-a",
+            "stage=send reason=unreachable".to_string(),
+        ));
+
+        // Four thousand 15 ms samples model one minute of sustained pointer activity.
+        for sample in 0..4_000i64 {
+            let timestamp = started + chrono::Duration::milliseconds(sample * 15);
+            state.record_transport_event(test_event(
+                timestamp,
+                "runtime_wake",
+                "local",
+                "none",
+                "channel=input_capture source=input_broker_exchange".to_string(),
+            ));
+            state.record_transport_event(test_event(
+                timestamp,
+                "input_frame",
+                "outgoing",
+                "peer-a",
+                format!("sequence={sample} capture_to_send_ms=1 captured_at_unix_ms={sample}"),
+            ));
+            state.record_transport_event(test_event(
+                timestamp,
+                "input_inject_failed",
+                "local",
+                "peer-a",
+                format!(
+                    "sequence={sample} queue_wait_ms=1 capture_to_fail_ms=2 receive_to_fail_ms=1 interactive_session_unavailable"
+                ),
+            ));
+            state.record_transport_event(test_event(
+                timestamp,
+                "anti_idle_pulse_sent",
+                "outgoing",
+                "peer-a",
+                "source=local_activity".to_string(),
+            ));
+            state.record_transport_event(test_event(
+                timestamp,
+                "peer_reconcile_trigger",
+                "local",
+                "peer-a",
+                "source=runtime_wake".to_string(),
+            ));
+            state.record_transport_event(test_event(
+                timestamp,
+                "pairing_reconnect_failed",
+                "outgoing",
+                "peer-a",
+                format!("attempt={sample} reason=unreachable"),
+            ));
+        }
+
+        let events = state.transport_events_snapshot().await;
+        assert!(events.len() <= MAX_TRANSPORT_EVENTS);
+        assert!(events.iter().any(|event| event.kind == "input_handoff"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "transport_reachability_failed")
+        );
+        for kind in [
+            "runtime_wake",
+            "input_frame",
+            "input_inject_failed",
+            "anti_idle_pulse_sent",
+            "peer_reconcile_trigger",
+            "pairing_reconnect_failed",
+        ] {
+            let summary = events
+                .iter()
+                .find(|event| event.kind == kind)
+                .unwrap_or_else(|| panic!("missing {kind} summary"));
+            assert!(summary.detail.contains("sample_count=4000"));
+            assert!(summary.detail.contains("first_seen="));
+            assert!(summary.detail.contains("last_seen="));
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_budget_cannot_evict_diagnostic_records() {
+        let state = TransportRuntimeState::default();
+        let started = Utc::now();
+        for index in 0..480i64 {
+            state.record_transport_event(test_event(
+                started + chrono::Duration::milliseconds(index),
+                "causal_transition",
+                "local",
+                "peer-a",
+                format!("transition={index}"),
+            ));
+        }
+        for source in 0..200i64 {
+            state.record_transport_event(test_event(
+                started + chrono::Duration::seconds(source + 1),
+                "runtime_wake",
+                "local",
+                "none",
+                format!("channel=input_capture source=source_{source}"),
+            ));
+        }
+
+        let events = state.transport_events_snapshot().await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "causal_transition")
+                .count(),
+            480
+        );
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.kind == "runtime_wake")
+                .count()
+                <= MAX_ACTIVITY_EVENT_SUMMARIES
+        );
+        assert!(events.len() <= MAX_TRANSPORT_EVENTS);
     }
 
     #[tokio::test]

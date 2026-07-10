@@ -52,7 +52,7 @@ Checks:
 & "$env:ProgramFiles\Boundless\Boundless-ConnectivityDiagnostics.ps1" -RemoteHost 10.10.0.187
 ```
 
-Transport events are a bounded in-memory ring that retains the newest 512 events, not durable history. Use `--limit 0` to print the full retained ring and compare the first and last timestamps to estimate how much wall-clock history is still diagnosable. Use `--kind <substring>` and `--exclude-kind <substring>` to keep noisy local runtime events out of a focused view, for example `transport events --limit 100 --exclude-kind input_runtime`.
+Transport events are a bounded in-memory diagnostic ring, not durable history. State transitions and failures take precedence over high-rate activity. Repeated wake, input-frame, injection, anti-idle, reconcile, and transfer-progress activity is represented by bounded summaries with `sample_count`, `first_seen`, and `last_seen` rather than one retained record per sample. Use `--limit 0` to print the full retained ring. Use `--kind <substring>` and `--exclude-kind <substring>` to focus the view; filters are applied before the limit, for example `transport events --limit 100 --exclude-kind input_runtime`.
 
 The connectivity diagnostics script is read-only. It reports the active Windows network profiles, local listener/process ownership for TCP `15100`, `15101`, and `15200`, and remote TCP reachability for those ports when `-RemoteHost` is supplied. TCP `15200` is the nearby pairing listener; TCP `15100` is the transport listener used after trust is established. TCP `15101` is included to make side-by-side dogfood with Mouse Without Borders or other tools easier to diagnose.
 
