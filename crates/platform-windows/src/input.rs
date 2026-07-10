@@ -28,16 +28,16 @@ use windows_sys::Win32::{
     System::Threading::{GetCurrentProcess, OpenProcessToken},
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-            KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX,
-            MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-            MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-            MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-            MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput,
+            GetAsyncKeyState, GetKeyState, GetKeyboardState, INPUT, INPUT_0, INPUT_KEYBOARD,
+            INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+            MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+            MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+            MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput,
         },
         WindowsAndMessaging::{
-            GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+            GetCursorPos, GetSystemMetrics, MSG, PM_NOREMOVE, PeekMessageW, SM_CXVIRTUALSCREEN,
+            SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
         },
     },
 };
@@ -116,6 +116,9 @@ struct PreparedNumLockAuthority {
 struct PreparedInputRecords {
     records: Vec<INPUT>,
     authority_after_record: Vec<PreparedNumLockAuthority>,
+    committed_events_after_record: Vec<usize>,
+    committed_events_before_first_record: usize,
+    committed_events: usize,
 }
 
 #[cfg(windows)]
@@ -123,6 +126,62 @@ impl PreparedInputRecords {
     fn push(&mut self, record: INPUT, authority: PreparedNumLockAuthority) {
         self.records.push(record);
         self.authority_after_record.push(authority);
+        self.committed_events_after_record
+            .push(self.committed_events);
+    }
+
+    fn finish_event(&mut self, first_record_index: usize) {
+        self.committed_events = self.committed_events.saturating_add(1);
+        if self.records.len() > first_record_index {
+            *self
+                .committed_events_after_record
+                .last_mut()
+                .expect("event appended at least one input record") = self.committed_events;
+        } else if let Some(committed_after_last_record) =
+            self.committed_events_after_record.last_mut()
+        {
+            // A source event that intentionally emits no INPUT records is
+            // committed at the preceding record boundary.
+            *committed_after_last_record = self.committed_events;
+        } else {
+            // Preserve an exact prefix when one or more zero-record events
+            // precede the first record-producing event.
+            self.committed_events_before_first_record = self.committed_events;
+        }
+    }
+}
+
+/// Result of one source-event injection batch. `committed_event_count` is an
+/// exact prefix of the supplied events and remains valid even when `error` is
+/// present, allowing callers to retry only the uncommitted suffix.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct InputSendOutcome {
+    pub committed_event_count: usize,
+    pub error: Option<anyhow::Error>,
+}
+
+#[cfg(windows)]
+impl InputSendOutcome {
+    fn success(committed_event_count: usize) -> Self {
+        Self {
+            committed_event_count,
+            error: None,
+        }
+    }
+
+    fn failure(committed_event_count: usize, error: anyhow::Error) -> Self {
+        Self {
+            committed_event_count,
+            error: Some(error),
+        }
+    }
+
+    pub fn into_result(self) -> Result<usize> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(self.committed_event_count),
+        }
     }
 }
 
@@ -138,11 +197,18 @@ impl WindowsInputState {
         Self { num_lock }
     }
 
-    pub fn send_events(&self, events: &[InputEvent]) -> Result<()> {
+    pub fn send_events(&self, events: &[InputEvent]) -> InputSendOutcome {
         self.send_events_with(events, send_input_records_once)
     }
 
-    fn send_events_with<F>(&self, events: &[InputEvent], mut sender: F) -> Result<()>
+    pub fn send_events_with_sender<F>(&self, events: &[InputEvent], sender: F) -> InputSendOutcome
+    where
+        F: FnMut(&[INPUT]) -> Result<u32>,
+    {
+        self.send_events_with(events, sender)
+    }
+
+    fn send_events_with<F>(&self, events: &[InputEvent], mut sender: F) -> InputSendOutcome
     where
         F: FnMut(&[INPUT]) -> Result<u32>,
     {
@@ -150,11 +216,57 @@ impl WindowsInputState {
         // a concurrent local Num Lock press cannot be overwritten by a stale
         // post-SendInput state commit.
         let mut authority = self.num_lock.lock();
-        release_pending_boundless_num_lock(&mut authority, &mut sender)
-            .context("release pending Boundless Num Lock key before input batch")?;
+        if let Err(error) = release_pending_boundless_num_lock(&mut authority, &mut sender)
+            .context("release pending Boundless Num Lock key before input batch")
+        {
+            return InputSendOutcome::failure(0, error);
+        }
         let prepared = prepare_input_records(events, authority.on);
         send_prepared_input_records(&prepared, &mut authority, &mut sender)
     }
+}
+
+/// Reads Num Lock from a fresh thread that owns a Win32 message queue.
+///
+/// `GetKeyboardState` is message-queue state, so querying it from the daemon's
+/// Tokio worker would not be a truthful fallback for the hook message lane.
+/// Creating the queue with `PeekMessageW` gives the fallback its own supported
+/// message lane, while `GetKeyboardState` lets us fail closed if Windows cannot
+/// provide the seed instead of silently assuming that Num Lock is off.
+#[cfg(windows)]
+pub fn num_lock_state_from_dedicated_message_lane() -> Result<bool> {
+    std::thread::Builder::new()
+        .name("boundless-num-lock-seed".to_string())
+        .spawn(|| -> Result<bool> {
+            // SAFETY: A zero-initialized MSG is valid for PeekMessageW output.
+            let mut message = unsafe { std::mem::zeroed::<MSG>() };
+            // SAFETY: `message` is writable for the duration of the call and
+            // a null HWND requests messages for the current thread. Even when
+            // no message is available, PeekMessageW creates this thread's
+            // message queue before GetKeyState reads its keyboard state.
+            unsafe {
+                PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+            }
+            let mut keyboard_state = [0u8; 256];
+            // SAFETY: The buffer contains one writable byte for every virtual
+            // key as required by GetKeyboardState.
+            if unsafe { GetKeyboardState(keyboard_state.as_mut_ptr()) } == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("read Num Lock from dedicated Win32 message lane");
+            }
+            Ok((keyboard_state[usize::from(VK_NUMLOCK_CODE)] & 0x01) != 0)
+        })
+        .context("spawn dedicated Win32 message lane for Num Lock seeding")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("dedicated Num Lock message lane panicked"))?
+}
+
+#[cfg(windows)]
+pub(crate) fn num_lock_state_from_current_message_lane() -> bool {
+    // SAFETY: GetKeyState accepts any virtual-key code. Callers ensure the
+    // current thread owns the Win32 message queue whose state is authoritative.
+    let state = unsafe { GetKeyState(i32::from(VK_NUMLOCK_CODE)) };
+    (state as u16 & 0x0001) != 0
 }
 
 pub fn high_word(value: u32) -> u16 {
@@ -267,7 +379,9 @@ fn prepare_input_records(events: &[InputEvent], initial_num_lock_on: bool) -> Pr
         boundless_key_down: false,
     };
     for event in events {
+        let first_record_index = prepared.records.len();
         append_input_records_for_event(event, &mut authority, &mut prepared);
+        prepared.finish_event(first_record_index);
     }
     prepared
 }
@@ -449,56 +563,69 @@ fn send_prepared_input_records<F>(
     prepared: &PreparedInputRecords,
     authority: &mut WindowsNumLockAuthority,
     sender: &mut F,
-) -> Result<()>
+) -> InputSendOutcome
 where
     F: FnMut(&[INPUT]) -> Result<u32>,
 {
     let mut offset = 0usize;
+    let mut committed_event_count = prepared.committed_events_before_first_record;
     while offset < prepared.records.len() {
         let chunk = &prepared.records[offset..];
-        let sent =
-            match sender(chunk).with_context(|| format!("send input record at index {offset}")) {
-                Ok(sent) => sent as usize,
-                Err(error) => return finish_failed_input_send(error, authority, sender),
-            };
+        let sent = match sender(chunk)
+            .with_context(|| format!("send input record at index {offset}"))
+        {
+            Ok(sent) => sent as usize,
+            Err(error) => {
+                return finish_failed_input_send(error, committed_event_count, authority, sender);
+            }
+        };
         if sent == 0 {
             let error = anyhow::anyhow!(
                 "partial send at index {offset}: sent 0 / {} input records",
                 chunk.len()
             );
-            return finish_failed_input_send(error, authority, sender);
+            return finish_failed_input_send(error, committed_event_count, authority, sender);
         }
         if sent > chunk.len() {
             let error = anyhow::anyhow!(
                 "invalid send count at index {offset}: sent {sent} / {} input records",
                 chunk.len()
             );
-            return finish_failed_input_send(error, authority, sender);
+            return finish_failed_input_send(error, committed_event_count, authority, sender);
         }
 
-        for next in &prepared.authority_after_record[offset..offset + sent] {
+        for (next, next_committed_event_count) in prepared.authority_after_record
+            [offset..offset + sent]
+            .iter()
+            .zip(&prepared.committed_events_after_record[offset..offset + sent])
+        {
             authority.on = next.on;
             authority.boundless_key_down = next.boundless_key_down;
+            committed_event_count = *next_committed_event_count;
         }
         offset += sent;
     }
-    Ok(())
+    InputSendOutcome::success(prepared.committed_events)
 }
 
 #[cfg(windows)]
 fn finish_failed_input_send<F>(
     error: anyhow::Error,
+    committed_event_count: usize,
     authority: &mut WindowsNumLockAuthority,
     sender: &mut F,
-) -> Result<()>
+) -> InputSendOutcome
 where
     F: FnMut(&[INPUT]) -> Result<u32>,
 {
     match release_pending_boundless_num_lock(authority, sender) {
-        Ok(()) => Err(error),
-        Err(cleanup_error) => Err(anyhow::anyhow!(
-            "{error:#}; Boundless Num Lock key-up cleanup failed: {cleanup_error:#}"
-        )),
+        Ok(()) => InputSendOutcome::failure(committed_event_count, error),
+        Err(cleanup_error) => InputSendOutcome::failure(
+            committed_event_count,
+            anyhow::anyhow!(
+                "{error:#}; Boundless Num Lock key-up cleanup failed: {cleanup_error:#}"
+            ),
+        ),
     }
 }
 
@@ -577,10 +704,40 @@ fn is_extended_scan_code(scan_code: u16) -> bool {
 
 #[cfg(windows)]
 fn keypad_scan_uses_num_lock(scan_code: u16) -> bool {
+    ambiguous_keypad_virtual_key(scan_code, false).is_some()
+}
+
+#[cfg(windows)]
+pub(crate) fn ambiguous_keypad_virtual_key(scan_code: u16, num_lock_on: bool) -> Option<u16> {
     if is_extended_scan_code(scan_code) {
-        return false;
+        return None;
     }
-    matches!(scan_code & 0x00FF, 0x47..=0x49 | 0x4B..=0x4D | 0x4F..=0x53)
+
+    Some(match (scan_code & 0x00FF, num_lock_on) {
+        (0x47, true) => 0x67,  // VK_NUMPAD7
+        (0x47, false) => 0x24, // VK_HOME
+        (0x48, true) => 0x68,  // VK_NUMPAD8
+        (0x48, false) => 0x26, // VK_UP
+        (0x49, true) => 0x69,  // VK_NUMPAD9
+        (0x49, false) => 0x21, // VK_PRIOR
+        (0x4B, true) => 0x64,  // VK_NUMPAD4
+        (0x4B, false) => 0x25, // VK_LEFT
+        (0x4C, true) => 0x65,  // VK_NUMPAD5
+        (0x4C, false) => 0x0C, // VK_CLEAR
+        (0x4D, true) => 0x66,  // VK_NUMPAD6
+        (0x4D, false) => 0x27, // VK_RIGHT
+        (0x4F, true) => 0x61,  // VK_NUMPAD1
+        (0x4F, false) => 0x23, // VK_END
+        (0x50, true) => 0x62,  // VK_NUMPAD2
+        (0x50, false) => 0x28, // VK_DOWN
+        (0x51, true) => 0x63,  // VK_NUMPAD3
+        (0x51, false) => 0x22, // VK_NEXT
+        (0x52, true) => 0x60,  // VK_NUMPAD0
+        (0x52, false) => 0x2D, // VK_INSERT
+        (0x53, true) => 0x6E,  // VK_DECIMAL
+        (0x53, false) => 0x2E, // VK_DELETE
+        _ => return None,
+    })
 }
 
 pub fn input_event_kind(event: &InputEvent) -> &'static str {
@@ -720,6 +877,7 @@ mod tests {
                     Ok(records.len() as u32)
                 },
             )
+            .into_result()
             .expect("commit first injected frame");
         assert!(num_lock.is_on());
 
@@ -736,6 +894,7 @@ mod tests {
                     Ok(records.len() as u32)
                 },
             )
+            .into_result()
             .expect("inject keypad frame");
     }
 
@@ -749,10 +908,93 @@ mod tests {
                 &[windows_key(0x45, VK_NUMLOCK_CODE, true, KeyState::Down)],
                 |_records| Err(anyhow::anyhow!("injected failure")),
             )
+            .into_result()
             .expect_err("failed SendInput must surface");
 
         assert!(format!("{error:#}").contains("injected failure"));
         assert!(!num_lock.is_on());
+    }
+
+    #[test]
+    fn partial_send_reports_exact_committed_key_prefix_before_mouse_failure() {
+        let num_lock = WindowsNumLockState::new(false);
+        let input = WindowsInputState::new(num_lock);
+        let events = [
+            InputEvent::Key {
+                scan_code: 30,
+                state: KeyState::Down,
+                semantics: KeySemantics::Physical,
+            },
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                state: KeyState::Down,
+            },
+        ];
+        let mut calls = 0usize;
+
+        let outcome = input.send_events_with_sender(&events, |records| {
+            calls += 1;
+            match calls {
+                1 => {
+                    assert_eq!(records.len(), 2);
+                    assert_eq!(records[0].r#type, INPUT_KEYBOARD);
+                    assert_eq!(records[1].r#type, INPUT_MOUSE);
+                    Ok(1)
+                }
+                2 => {
+                    assert_eq!(records.len(), 1);
+                    assert_eq!(records[0].r#type, INPUT_MOUSE);
+                    Err(anyhow::anyhow!("scripted mouse injection failure"))
+                }
+                _ => panic!("unexpected send attempt {calls}"),
+            }
+        });
+
+        assert_eq!(outcome.committed_event_count, 1);
+        let error = outcome.error.expect("partial send must preserve its error");
+        assert!(format!("{error:#}").contains("scripted mouse injection failure"));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn zero_record_events_are_included_in_the_exact_committed_prefix() {
+        let num_lock = WindowsNumLockState::new(false);
+        let input = WindowsInputState::new(num_lock);
+        let events = [
+            InputEvent::MouseMove { dx: 0, dy: 0 },
+            InputEvent::Key {
+                scan_code: 30,
+                state: KeyState::Down,
+                semantics: KeySemantics::Physical,
+            },
+            InputEvent::MouseWheel {
+                delta_x: 0,
+                delta_y: 0,
+            },
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                state: KeyState::Down,
+            },
+        ];
+        let mut calls = 0usize;
+
+        let outcome = input.send_events_with_sender(&events, |records| {
+            calls += 1;
+            match calls {
+                1 => {
+                    assert_eq!(records.len(), 2);
+                    Ok(1)
+                }
+                2 => Err(anyhow::anyhow!("scripted suffix failure")),
+                _ => panic!("unexpected send attempt {calls}"),
+            }
+        });
+
+        assert_eq!(
+            outcome.committed_event_count, 3,
+            "leading and interstitial zero-record events commit at their adjacent record boundary"
+        );
+        assert!(outcome.error.is_some());
     }
 
     #[test]
@@ -792,6 +1034,7 @@ mod tests {
                     Ok(records.len() as u32)
                 },
             )
+            .into_result()
             .expect("inject keypad hold/toggle/release sequence");
 
         assert!(!num_lock.is_on(), "release must retain current authority");
@@ -828,6 +1071,7 @@ mod tests {
                     _ => panic!("unexpected send attempt {calls}"),
                 }
             })
+            .into_result()
             .expect_err("partial frame must remain retryable");
 
         assert!(error.to_string().contains("index 1"));
@@ -841,6 +1085,7 @@ mod tests {
                 assert_eq!(keyboard_record(&records[0]).wScan, 0x4F);
                 Ok(1)
             })
+            .into_result()
             .expect("retry after reconciled prefix");
     }
 
@@ -862,6 +1107,7 @@ mod tests {
                     _ => panic!("cleanup must be attempted at most once"),
                 }
             })
+            .into_result()
             .expect_err("cleanup failure must surface");
 
         assert_eq!(calls, 3);
@@ -884,6 +1130,7 @@ mod tests {
                 }
                 Ok(1)
             })
+            .into_result()
             .expect("next batch cleans up before retrying input");
         assert_eq!(retry_calls, 2);
         assert!(!num_lock.lock().boundless_key_down);

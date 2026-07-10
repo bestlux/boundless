@@ -72,7 +72,7 @@ use platform_windows::input::{
     HookControlAction, HookInputPump, VK_NUMLOCK_CODE, WindowsInputState,
     captured_key_virtual_keys, current_process_can_use_interactive_input, cursor_position,
     input_event_kind, is_virtual_key_down, mouse_button_from_virtual_key,
-    mouse_button_virtual_keys, vk_to_scan_code,
+    mouse_button_virtual_keys, num_lock_state_from_dedicated_message_lane, vk_to_scan_code,
 };
 #[cfg(all(test, windows))]
 use platform_windows::input::{
@@ -152,11 +152,43 @@ pub fn start(state: AppState, mode: InputRuntimeMode) {
 trait InputBackend: Send {
     fn apply(&mut self, event: &InputEvent) -> Result<()>;
 
-    fn apply_frame(&mut self, events: &[InputEvent]) -> Result<()> {
-        for event in events {
-            self.apply(event)?;
+    fn apply_frame(&mut self, events: &[InputEvent]) -> InputApplyOutcome {
+        for (index, event) in events.iter().enumerate() {
+            if let Err(error) = self.apply(event) {
+                return InputApplyOutcome::failure(index, error);
+            }
         }
-        Ok(())
+        InputApplyOutcome::success(events.len())
+    }
+}
+
+#[derive(Debug)]
+struct InputApplyOutcome {
+    committed_event_count: usize,
+    error: Option<anyhow::Error>,
+}
+
+impl InputApplyOutcome {
+    fn success(committed_event_count: usize) -> Self {
+        Self {
+            committed_event_count,
+            error: None,
+        }
+    }
+
+    fn failure(committed_event_count: usize, error: anyhow::Error) -> Self {
+        Self {
+            committed_event_count,
+            error: Some(error),
+        }
+    }
+
+    #[cfg(test)]
+    fn into_result(self) -> Result<usize> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(self.committed_event_count),
+        }
     }
 }
 
@@ -254,11 +286,18 @@ fn input_capture_backend(state: &AppState, mode: InputRuntimeMode) -> Box<dyn In
             Err(error) => {
                 warn!(
                     error = ?error,
-                    "failed to start low-level capture hooks; falling back to polling capture backend with reduced Num Lock state seeding"
+                    "failed to start low-level capture hooks; attempting polling capture fallback"
                 );
-                Box::new(WindowsPollingCaptureBackend::new(WindowsNumLockState::new(
-                    false,
-                )))
+                match WindowsPollingCaptureBackend::seeded() {
+                    Ok(backend) => Box::new(backend),
+                    Err(seed_error) => {
+                        warn!(
+                            error = ?seed_error,
+                            "polling capture fallback unavailable because Num Lock state could not be seeded"
+                        );
+                        service_session_unsupported_capture_backend()
+                    }
+                }
             }
         }
     }
@@ -349,6 +388,14 @@ impl WindowsPollingCaptureBackend {
             num_lock_state,
         }
     }
+
+    fn seeded() -> Result<Self> {
+        Self::seeded_with(num_lock_state_from_dedicated_message_lane)
+    }
+
+    fn seeded_with(query_num_lock: impl FnOnce() -> Result<bool>) -> Result<Self> {
+        Ok(Self::new(WindowsNumLockState::new(query_num_lock()?)))
+    }
 }
 
 #[cfg(windows)]
@@ -386,7 +433,9 @@ mod tests {
             ],
         };
 
-        apply_frame(&mut backend, &frame).expect("noop backend should accept events");
+        apply_frame(&mut backend, &frame)
+            .into_result()
+            .expect("noop backend should accept events");
     }
 
     #[test]
@@ -405,6 +454,7 @@ mod tests {
 
         let error = backend
             .apply_frame(&frame.events)
+            .into_result()
             .expect_err("unsupported injection");
         assert!(
             error
@@ -486,6 +536,24 @@ mod tests {
         fail_scan_code_once: u16,
         failed: bool,
         applied_scan_codes: Vec<u16>,
+    }
+
+    struct FailAfterFirstCommittedEventOnceBackend {
+        failed: bool,
+        applied: Vec<InputEvent>,
+    }
+
+    impl InputBackend for FailAfterFirstCommittedEventOnceBackend {
+        fn apply(&mut self, event: &InputEvent) -> Result<()> {
+            if !self.failed && self.applied.len() == 1 {
+                self.failed = true;
+                return Err(anyhow::anyhow!(
+                    "scripted failure after one committed source event"
+                ));
+            }
+            self.applied.push(event.clone());
+            Ok(())
+        }
     }
 
     impl InputBackend for FailOnceBackend {
@@ -660,6 +728,88 @@ mod tests {
             .expect("join");
 
         (state, peer_id, root)
+    }
+
+    async fn assert_committed_prefix_is_not_replayed(events: Vec<InputEvent>) {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim owner")
+        );
+        state
+            .route_incoming_input_frame(
+                &peer_id,
+                InputFrame {
+                    source_peer_id: peer_id.clone(),
+                    sequence: 1,
+                    timestamp_unix_ms: Utc::now().timestamp_millis(),
+                    events: events.clone(),
+                },
+            )
+            .await
+            .expect("route frame");
+
+        let mut backend = FailAfterFirstCommittedEventOnceBackend {
+            failed: false,
+            applied: Vec::new(),
+        };
+        drain_pending_inject_frames(&state, &mut backend).await;
+        assert_eq!(
+            backend.applied,
+            events[..1],
+            "the first injection pass should commit only the first source event"
+        );
+
+        tokio::time::sleep(Duration::from_millis(
+            INPUT_INJECT_RETRY_BASE_BACKOFF_MS + 5,
+        ))
+        .await;
+        drain_pending_inject_frames(&state, &mut backend).await;
+        assert_eq!(
+            backend.applied, events,
+            "retry must inject only the uncommitted suffix"
+        );
+        assert_eq!(state.pending_inject_input_frame_count().await, 0);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn direct_retry_trims_committed_key_and_mouse_prefixes() {
+        let key = InputEvent::Key {
+            scan_code: 30,
+            state: KeyState::Down,
+            semantics: KeySemantics::Physical,
+        };
+        let mouse = InputEvent::MouseButton {
+            button: core_input::MouseButton::Left,
+            state: KeyState::Down,
+        };
+
+        assert_committed_prefix_is_not_replayed(vec![key.clone(), mouse.clone()]).await;
+        assert_committed_prefix_is_not_replayed(vec![mouse, key]).await;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn polling_capture_seeds_num_lock_on_instead_of_assuming_false() {
+        let backend = WindowsPollingCaptureBackend::seeded_with(|| Ok(true))
+            .expect("seed Num Lock from message lane");
+        assert!(backend.num_lock_state.is_on());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn polling_capture_seed_failure_is_not_coerced_to_num_lock_off() {
+        let error = match WindowsPollingCaptureBackend::seeded_with(|| {
+            Err(anyhow::anyhow!("message lane unavailable"))
+        }) {
+            Ok(_) => panic!("fallback must fail closed when its seed is unavailable"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("message lane unavailable"));
     }
 
     #[tokio::test]

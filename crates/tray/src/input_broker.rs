@@ -18,7 +18,7 @@ use ipc_api::boundless::v1::{
 use ipc_api::broker_events::{broker_events_from_input_events, input_events_from_broker_events};
 use platform_windows::clipboard_backend::WindowsClipboardBackend;
 use platform_windows::input::{
-    HookControlAction, HookInputPump, WindowsInputState, WindowsNumLockState,
+    HookControlAction, HookInputPump, InputSendOutcome, WindowsInputState, WindowsNumLockState,
     current_process_can_use_interactive_input, virtual_screen_bounds,
 };
 use tonic::transport::Channel;
@@ -160,7 +160,10 @@ impl InjectedInputState {
 
     fn release_local(&mut self) -> Result<()> {
         let releases = self.drain_release_events();
-        self.windows_input.send_events(&releases)
+        self.windows_input
+            .send_events(&releases)
+            .into_result()
+            .map(|_| ())
     }
 }
 
@@ -1131,6 +1134,66 @@ mod input_broker_tests {
         );
     }
 
+    fn assert_partial_injection_tracks_only_committed_prefix(
+        events: Vec<core_input::InputEvent>,
+        expected_releases: Vec<core_input::InputEvent>,
+    ) {
+        let mut state = InjectedInputState::new(WindowsNumLockState::new(false));
+        let mut calls = 0usize;
+        let outcome = state
+            .windows_input
+            .send_events_with_sender(&events, |records| {
+                calls += 1;
+                match calls {
+                    1 => {
+                        assert_eq!(records.len(), 2);
+                        Ok(1)
+                    }
+                    2 => Err(anyhow::anyhow!("scripted suffix failure")),
+                    _ => panic!("unexpected SendInput attempt {calls}"),
+                }
+            });
+
+        reconcile_injected_input_outcome(&events, &mut state, outcome)
+            .expect_err("partial injection must retain its failure");
+        assert_eq!(
+            state.drain_release_events(),
+            expected_releases,
+            "shutdown cleanup must release the committed prefix and ignore the failed suffix"
+        );
+    }
+
+    #[test]
+    fn partial_injection_tracks_committed_key_and_mouse_prefixes_for_shutdown() {
+        let key_down = core_input::InputEvent::Key {
+            scan_code: 30,
+            state: core_input::KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let key_up = core_input::InputEvent::Key {
+            scan_code: 30,
+            state: core_input::KeyState::Up,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let mouse_down = core_input::InputEvent::MouseButton {
+            button: core_input::MouseButton::Left,
+            state: core_input::KeyState::Down,
+        };
+        let mouse_up = core_input::InputEvent::MouseButton {
+            button: core_input::MouseButton::Left,
+            state: core_input::KeyState::Up,
+        };
+
+        assert_partial_injection_tracks_only_committed_prefix(
+            vec![key_down.clone(), mouse_down.clone()],
+            vec![key_up],
+        );
+        assert_partial_injection_tracks_only_committed_prefix(
+            vec![mouse_down, key_down],
+            vec![mouse_up],
+        );
+    }
+
     #[test]
     fn supervisor_shutdown_signal_joins_cooperative_worker() {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1155,9 +1218,18 @@ fn inject_input_events(
     events: &[core_input::InputEvent],
     injected_state: &mut InjectedInputState,
 ) -> Result<()> {
-    injected_state.windows_input.send_events(events)?;
-    injected_state.observe(events);
-    Ok(())
+    let outcome = injected_state.windows_input.send_events(events);
+    reconcile_injected_input_outcome(events, injected_state, outcome)
+}
+
+fn reconcile_injected_input_outcome(
+    events: &[core_input::InputEvent],
+    injected_state: &mut InjectedInputState,
+    outcome: InputSendOutcome,
+) -> Result<()> {
+    let committed_event_count = outcome.committed_event_count.min(events.len());
+    injected_state.observe(&events[..committed_event_count]);
+    outcome.into_result().map(|_| ())
 }
 
 async fn clipboard_broker_supervisor_loop(

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex, OnceLock, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -15,8 +16,7 @@ use windows_sys::Win32::{
     UI::{
         Input::{
             GetCurrentInputMessageSource, GetRawInputData, GetRegisteredRawInputDevices,
-            IMO_INJECTED, INPUT_MESSAGE_SOURCE,
-            KeyboardAndMouse::{GetDoubleClickTime, GetKeyState},
+            IMO_INJECTED, INPUT_MESSAGE_SOURCE, KeyboardAndMouse::GetDoubleClickTime,
             MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RAWKEYBOARD, RAWMOUSE,
             RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE, RegisterRawInputDevices,
         },
@@ -33,7 +33,8 @@ use windows_sys::Win32::{
 };
 
 use super::{
-    BOUNDLESS_INJECTED_INPUT_MARKER, VK_NUMLOCK_CODE, WindowsNumLockState, is_virtual_key_down,
+    BOUNDLESS_INJECTED_INPUT_MARKER, VK_NUMLOCK_CODE, WindowsNumLockState,
+    ambiguous_keypad_virtual_key, is_virtual_key_down, num_lock_state_from_current_message_lane,
 };
 
 const VK_LBUTTON_CODE: u16 = 0x01;
@@ -117,7 +118,7 @@ struct CaptureRuntimeCore {
     wake_notifier: Mutex<Option<HookWakeNotifier>>,
     escape_detector_state: Mutex<EscapeDetectorState>,
     keyboard_state: Mutex<KeyboardRuntimeState>,
-    num_lock_state: WindowsNumLockState,
+    actual_num_lock_state: WindowsNumLockState,
     lock_lease: Mutex<HookLockLease>,
     lock_active: AtomicBool,
     keyboard_hook_degraded: AtomicBool,
@@ -142,7 +143,10 @@ struct HookRuntimeState {
 
 #[derive(Debug, Default)]
 struct KeyboardRuntimeState {
-    num_lock_down: bool,
+    capture_num_lock_on: bool,
+    capture_num_lock_down: bool,
+    external_num_lock_down: bool,
+    pressed_ambiguous_keypad_semantics: HashMap<u16, KeySemantics>,
 }
 
 #[derive(Debug, Default)]
@@ -222,7 +226,7 @@ impl CaptureRuntime {
                 EscapeDetectorSource::KeyboardHook,
             )),
             keyboard_state: Mutex::new(KeyboardRuntimeState::default()),
-            num_lock_state: WindowsNumLockState::new(false),
+            actual_num_lock_state: WindowsNumLockState::new(false),
             lock_lease: Mutex::new(HookLockLease::default()),
             lock_active: AtomicBool::new(false),
             keyboard_hook_degraded: AtomicBool::new(false),
@@ -325,7 +329,7 @@ impl CaptureRuntime {
                     EscapeDetectorSource::KeyboardHook
                 })),
                 keyboard_state: Mutex::new(KeyboardRuntimeState::default()),
-                num_lock_state: WindowsNumLockState::new(false),
+                actual_num_lock_state: WindowsNumLockState::new(false),
                 lock_lease: Mutex::new(HookLockLease::default()),
                 lock_active: AtomicBool::new(false),
                 keyboard_hook_degraded: AtomicBool::new(false),
@@ -424,7 +428,7 @@ impl CaptureRuntime {
     }
 
     pub fn num_lock_state(&self) -> WindowsNumLockState {
-        self.core.num_lock_state.clone()
+        self.core.actual_num_lock_state.clone()
     }
 
     pub fn set_lock_active(&mut self, active: bool) -> Result<bool> {
@@ -815,17 +819,49 @@ fn update_escape_state_for_key_at(
     false
 }
 
-fn key_semantics_for_hook_event(vk_code: u16, key_state: KeyState) -> KeySemantics {
-    let num_lock_on = with_active_capture_runtime(|runtime| {
+fn key_semantics_for_hook_event(
+    scan_code: u16,
+    raw_vk_code: u16,
+    key_state: KeyState,
+    suppressed: bool,
+) -> KeySemantics {
+    with_active_capture_runtime(|runtime| {
         let Ok(mut state) = runtime.keyboard_state.lock() else {
-            return runtime.num_lock_state.is_on();
+            return windows_key_semantics(
+                scan_code,
+                raw_vk_code,
+                runtime.actual_num_lock_state.is_on(),
+            );
         };
-        update_num_lock_state_for_key(&mut state, &runtime.num_lock_state, vk_code, key_state)
-    })
-    .unwrap_or(false);
+        let capture_num_lock_on = update_capture_num_lock_state_for_key(
+            &mut state,
+            &runtime.actual_num_lock_state,
+            raw_vk_code,
+            key_state,
+            suppressed,
+        );
+        let semantics = windows_key_semantics(scan_code, raw_vk_code, capture_num_lock_on);
+        if ambiguous_keypad_virtual_key(scan_code, capture_num_lock_on).is_none() {
+            return semantics;
+        }
 
+        match key_state {
+            KeyState::Down => *state
+                .pressed_ambiguous_keypad_semantics
+                .entry(scan_code)
+                .or_insert(semantics),
+            KeyState::Up => state
+                .pressed_ambiguous_keypad_semantics
+                .remove(&scan_code)
+                .unwrap_or(semantics),
+        }
+    })
+    .unwrap_or_else(|| windows_key_semantics(scan_code, raw_vk_code, false))
+}
+
+fn windows_key_semantics(scan_code: u16, raw_vk_code: u16, num_lock_on: bool) -> KeySemantics {
     KeySemantics::Windows {
-        virtual_key: vk_code,
+        virtual_key: ambiguous_keypad_virtual_key(scan_code, num_lock_on).unwrap_or(raw_vk_code),
         num_lock_on,
     }
 }
@@ -836,38 +872,71 @@ fn should_observe_external_injected_num_lock(flags: u32, extra_info: usize, vk_c
         && vk_code == VK_NUMLOCK_CODE
 }
 
-fn update_num_lock_state_for_key(
+fn update_capture_num_lock_state_for_key(
     state: &mut KeyboardRuntimeState,
-    num_lock_state: &WindowsNumLockState,
+    actual_num_lock_state: &WindowsNumLockState,
     vk_code: u16,
     key_state: KeyState,
+    suppressed: bool,
 ) -> bool {
     if vk_code == VK_NUMLOCK_CODE {
         match key_state {
-            KeyState::Down if !state.num_lock_down => {
-                state.num_lock_down = true;
-                return num_lock_state.toggle();
+            KeyState::Down if !state.capture_num_lock_down => {
+                state.capture_num_lock_down = true;
+                state.capture_num_lock_on = if suppressed {
+                    !state.capture_num_lock_on
+                } else {
+                    actual_num_lock_state.toggle()
+                };
             }
             KeyState::Down => {}
-            KeyState::Up => state.num_lock_down = false,
+            KeyState::Up => state.capture_num_lock_down = false,
         }
     }
-    num_lock_state.is_on()
+    state.capture_num_lock_on
 }
 
-fn num_lock_state_from_message_lane() -> bool {
-    let state = unsafe { GetKeyState(i32::from(VK_NUMLOCK_CODE)) };
-    (state as u16 & 0x0001) != 0
+fn observe_external_injected_num_lock(key_state: KeyState) {
+    let _ = with_active_capture_runtime(|runtime| {
+        let Ok(mut state) = runtime.keyboard_state.lock() else {
+            return;
+        };
+        update_external_injected_num_lock_state(
+            &mut state,
+            &runtime.actual_num_lock_state,
+            key_state,
+            runtime.lock_active.load(Ordering::Acquire),
+        );
+    });
+}
+
+fn update_external_injected_num_lock_state(
+    state: &mut KeyboardRuntimeState,
+    actual_num_lock_state: &WindowsNumLockState,
+    key_state: KeyState,
+    capture_locked: bool,
+) {
+    match key_state {
+        KeyState::Down if !state.external_num_lock_down => {
+            state.external_num_lock_down = true;
+            let actual_on = actual_num_lock_state.toggle();
+            if !capture_locked {
+                state.capture_num_lock_on = actual_on;
+            }
+        }
+        KeyState::Down => {}
+        KeyState::Up => state.external_num_lock_down = false,
+    }
 }
 
 fn seed_num_lock_state_from_message_lane(runtime: &CaptureRuntimeCore) {
-    runtime
-        .num_lock_state
-        .set(num_lock_state_from_message_lane());
+    let actual_on = num_lock_state_from_current_message_lane();
+    runtime.actual_num_lock_state.set(actual_on);
     if let Ok(mut state) = runtime.keyboard_state.lock() {
+        state.capture_num_lock_on = actual_on;
         // Preserve the edge detector when Boundless starts while Num Lock is
         // already held; the next autorepeat is not a fresh toggle.
-        state.num_lock_down = is_virtual_key_down(VK_NUMLOCK_CODE);
+        state.capture_num_lock_down = is_virtual_key_down(VK_NUMLOCK_CODE);
     }
 }
 
@@ -951,6 +1020,13 @@ fn set_hook_lock_active_for_arc(core: &CaptureRuntimeCore, active: bool) -> Resu
     }
     drop(state);
 
+    // Captured Num Lock may diverge while its physical toggle is suppressed.
+    // Every lock boundary discards that capture-only projection and starts
+    // from truthful local/destination OS authority; never copy it backwards.
+    if let Ok(mut keyboard_state) = core.keyboard_state.lock() {
+        keyboard_state.capture_num_lock_on = core.actual_num_lock_state.is_on();
+    }
+
     let mut lease = core
         .lock_lease
         .lock()
@@ -1002,7 +1078,7 @@ fn force_unlock_for_arc_with_hook(
         state.gesture = HookRuntimeState::default();
     }
     if let Ok(mut state) = core.keyboard_state.lock() {
-        state.num_lock_down = false;
+        state.capture_num_lock_on = core.actual_num_lock_state.is_on();
     }
     if let Ok(mut lease) = core.lock_lease.lock() {
         lease.last_renewed_at = None;
@@ -1554,7 +1630,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 // External OSK/remapper/MWB input is not relayed, preserving
                 // the existing loop guard, but its Num Lock transition still
                 // updates the process-local destination authority.
-                let _ = key_semantics_for_hook_event(vk_code, state);
+                observe_external_injected_num_lock(state);
             } else if (keyboard.flags & LLKHF_INJECTED_MASK) == 0 {
                 lock_active = is_hook_lock_active();
                 let control_vk = hook_control_virtual_key(vk_code, keyboard.flags);
@@ -1572,7 +1648,12 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     HookCaptureEvent::Input(InputEvent::Key {
                         scan_code,
                         state,
-                        semantics: key_semantics_for_hook_event(vk_code, state),
+                        semantics: key_semantics_for_hook_event(
+                            scan_code,
+                            vk_code,
+                            state,
+                            lock_active,
+                        ),
                     }),
                     "keyboard_hook",
                 );
@@ -1717,7 +1798,7 @@ mod tests {
                 EscapeDetectorSource::KeyboardHook,
             )),
             keyboard_state: Mutex::new(KeyboardRuntimeState::default()),
-            num_lock_state: WindowsNumLockState::new(false),
+            actual_num_lock_state: WindowsNumLockState::new(false),
             lock_lease: Mutex::new(HookLockLease::default()),
             lock_active: AtomicBool::new(false),
             keyboard_hook_degraded: AtomicBool::new(false),
@@ -2292,37 +2373,43 @@ mod tests {
     }
 
     #[test]
-    fn captured_num_lock_toggles_once_per_physical_press() {
+    fn suppressed_num_lock_toggles_capture_logical_state_only_once() {
         let mut state = KeyboardRuntimeState::default();
-        let num_lock_state = WindowsNumLockState::new(false);
+        let actual_num_lock_state = WindowsNumLockState::new(false);
 
-        assert!(update_num_lock_state_for_key(
+        assert!(update_capture_num_lock_state_for_key(
             &mut state,
-            &num_lock_state,
+            &actual_num_lock_state,
             VK_NUMLOCK_CODE,
-            KeyState::Down
+            KeyState::Down,
+            true,
         ));
+        assert!(!actual_num_lock_state.is_on());
         assert!(
-            update_num_lock_state_for_key(
+            update_capture_num_lock_state_for_key(
                 &mut state,
-                &num_lock_state,
+                &actual_num_lock_state,
                 VK_NUMLOCK_CODE,
-                KeyState::Down
+                KeyState::Down,
+                true,
             ),
             "repeat keydown must not toggle again"
         );
-        assert!(update_num_lock_state_for_key(
+        assert!(update_capture_num_lock_state_for_key(
             &mut state,
-            &num_lock_state,
+            &actual_num_lock_state,
             VK_NUMLOCK_CODE,
-            KeyState::Up
+            KeyState::Up,
+            true,
         ));
-        assert!(!update_num_lock_state_for_key(
+        assert!(!update_capture_num_lock_state_for_key(
             &mut state,
-            &num_lock_state,
+            &actual_num_lock_state,
             VK_NUMLOCK_CODE,
-            KeyState::Down
+            KeyState::Down,
+            true,
         ));
+        assert!(!actual_num_lock_state.is_on());
     }
 
     #[test]
@@ -2336,14 +2423,15 @@ mod tests {
             VK_NUMLOCK_CODE,
         ));
         if should_observe_external_injected_num_lock(LLKHF_INJECTED_MASK, 0, VK_NUMLOCK_CODE) {
-            update_num_lock_state_for_key(
+            update_external_injected_num_lock_state(
                 &mut state,
                 &num_lock_state,
-                VK_NUMLOCK_CODE,
                 KeyState::Down,
+                false,
             );
         }
         assert!(num_lock_state.is_on());
+        assert!(state.capture_num_lock_on);
 
         assert!(!should_observe_external_injected_num_lock(
             LLKHF_INJECTED_MASK,
@@ -2365,21 +2453,87 @@ mod tests {
     #[test]
     fn handoff_does_not_turn_held_num_lock_repeat_into_a_fresh_toggle() {
         let core = test_runtime_core();
-        core.num_lock_state.set(true);
-        core.keyboard_state
-            .lock()
-            .expect("keyboard state")
-            .num_lock_down = true;
+        core.actual_num_lock_state.set(true);
+        {
+            let mut state = core.keyboard_state.lock().expect("keyboard state");
+            state.capture_num_lock_on = false;
+            state.capture_num_lock_down = true;
+        }
 
         set_hook_lock_active_for_arc(&core, true).expect("enable hook lock");
         let mut state = core.keyboard_state.lock().expect("keyboard state");
-        assert!(update_num_lock_state_for_key(
+        assert!(update_capture_num_lock_state_for_key(
             &mut state,
-            &core.num_lock_state,
+            &core.actual_num_lock_state,
             VK_NUMLOCK_CODE,
             KeyState::Down,
+            true,
         ));
-        assert!(state.num_lock_down);
+        assert!(state.capture_num_lock_down);
+        assert!(core.actual_num_lock_state.is_on());
+    }
+
+    #[test]
+    fn suppressed_num_lock_preserves_numpad1_hold_identity_across_toggle() {
+        let _guard = registry_test_guard().lock().expect("test guard");
+        reset_active_runtime_for_test();
+        let core = test_runtime_core();
+        activate_capture_runtime(&core).expect("activate runtime");
+        set_hook_lock_active_for(&core, true).expect("lock capture");
+
+        let num_lock = key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Down, true);
+        assert_eq!(
+            num_lock,
+            KeySemantics::Windows {
+                virtual_key: VK_NUMLOCK_CODE,
+                num_lock_on: true,
+            }
+        );
+        assert!(!core.actual_num_lock_state.is_on());
+
+        let keypad = key_semantics_for_hook_event(0x4F, 0x23, KeyState::Down, true);
+        assert_eq!(
+            keypad,
+            KeySemantics::Windows {
+                virtual_key: 0x61,
+                num_lock_on: true,
+            }
+        );
+
+        assert_eq!(
+            key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Up, true),
+            KeySemantics::Windows {
+                virtual_key: VK_NUMLOCK_CODE,
+                num_lock_on: true,
+            }
+        );
+        assert_eq!(
+            key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Down, true),
+            KeySemantics::Windows {
+                virtual_key: VK_NUMLOCK_CODE,
+                num_lock_on: false,
+            }
+        );
+
+        let keypad_release = key_semantics_for_hook_event(0x4F, 0x23, KeyState::Up, true);
+        assert_eq!(
+            keypad_release,
+            KeySemantics::Windows {
+                virtual_key: 0x61,
+                num_lock_on: true,
+            },
+            "key-up must retain the first-down Numpad1 identity after Num Lock changes"
+        );
+
+        set_hook_lock_active_for(&core, false).expect("unlock capture");
+        assert!(
+            !core
+                .keyboard_state
+                .lock()
+                .expect("keyboard state")
+                .capture_num_lock_on
+        );
+        clear_active_capture_runtime(&core).expect("cleanup runtime");
     }
 
     #[test]

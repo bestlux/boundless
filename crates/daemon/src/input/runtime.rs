@@ -199,28 +199,43 @@ pub(super) async fn drain_pending_inject_frames(
             continue;
         }
 
-        match apply_frame(backend, &frame) {
-            Ok(()) => {
+        let attempted_event_count = frame.events.len();
+        let apply_outcome = apply_frame(backend, &frame);
+        let committed_event_count = apply_outcome.committed_event_count.min(frame.events.len());
+        if committed_event_count > 0 {
+            frame.events.drain(..committed_event_count);
+        }
+
+        match apply_outcome.error {
+            None => {
                 state
                     .record_input_inject_applied(
                         &frame.peer_id,
                         frame.sequence,
-                        frame.events.len(),
+                        attempted_event_count,
                         frame.timing(),
                     )
                     .await;
             }
-            Err(error) => {
+            Some(error) => {
                 let message = format!("{error:#}");
                 state
                     .record_input_inject_failed(
                         &frame.peer_id,
                         frame.sequence,
-                        frame.events.len(),
+                        attempted_event_count,
                         frame.timing(),
                         &message,
                     )
                     .await;
+
+                // Every event in the exact committed prefix is already in the
+                // OS input stream. Never replay that prefix, even if a cleanup
+                // error accompanied an otherwise fully committed frame.
+                if frame.events.is_empty() {
+                    processed += 1;
+                    continue;
+                }
 
                 let now_ms = Utc::now().timestamp_millis();
                 let frame_age_ms = now_ms.saturating_sub(frame.capture_timestamp_unix_ms);
@@ -296,7 +311,7 @@ pub(super) async fn drain_pending_inject_frames(
 pub(super) fn apply_frame(
     backend: &mut dyn InputBackend,
     frame: &PendingInjectInputFrame,
-) -> Result<()> {
+) -> InputApplyOutcome {
     backend.apply_frame(&frame.events)
 }
 

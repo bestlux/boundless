@@ -146,15 +146,22 @@ impl InputCaptureBackend for NoopCaptureBackend {
 #[cfg(windows)]
 impl InputBackend for WindowsInputBackend {
     fn apply(&mut self, event: &InputEvent) -> Result<()> {
-        self.input
-            .send_events(std::slice::from_ref(event))
-            .with_context(|| format!("SendInput failed for {}", input_event_kind(event)))
+        let outcome = self.input.send_events(std::slice::from_ref(event));
+        match outcome.error {
+            Some(error) => Err(error)
+                .with_context(|| format!("SendInput failed for {}", input_event_kind(event))),
+            None => Ok(()),
+        }
     }
 
-    fn apply_frame(&mut self, events: &[InputEvent]) -> Result<()> {
-        self.input
-            .send_events(events)
-            .context("SendInput failed for frame batch")
+    fn apply_frame(&mut self, events: &[InputEvent]) -> InputApplyOutcome {
+        let outcome = self.input.send_events(events);
+        InputApplyOutcome {
+            committed_event_count: outcome.committed_event_count,
+            error: outcome
+                .error
+                .map(|error| error.context("SendInput failed for frame batch")),
+        }
     }
 }
 
