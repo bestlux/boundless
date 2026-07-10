@@ -508,6 +508,13 @@ pub fn try_escape_unlock_for_key(vk_code: u16, key_state: KeyState) -> bool {
     force_unlock_for_arc(&runtime, Some(SafetyUnlockCause::Escape))
 }
 
+/// Releases the active hook lock synchronously without publishing a daemon
+/// reconciliation action. Tray shutdown invokes this before cancellation or
+/// cleanup RPCs so local input cannot remain captive behind a hung broker.
+pub fn release_active_hook_lock() -> bool {
+    active_capture_runtime().is_some_and(|runtime| force_unlock_for_arc(&runtime, None))
+}
+
 fn escape_double_ctrl_window(system_double_click_ms: u32) -> Duration {
     Duration::from_millis(u64::from(system_double_click_ms).clamp(
         ESCAPE_DOUBLE_CTRL_MIN_WINDOW_MS,

@@ -42,6 +42,81 @@ struct ClipboardBrokerState {
     apply_report: Option<ClipboardBrokerApplyReport>,
 }
 
+#[derive(Debug, Default)]
+struct InjectedInputState {
+    pressed_keys: Vec<u16>,
+    pressed_buttons: Vec<core_input::MouseButton>,
+}
+
+impl InjectedInputState {
+    fn observe(&mut self, events: &[core_input::InputEvent]) {
+        for event in events {
+            match event {
+                core_input::InputEvent::Key { scan_code, state } => match state {
+                    core_input::KeyState::Down => {
+                        if !self.pressed_keys.contains(scan_code) {
+                            self.pressed_keys.push(*scan_code);
+                        }
+                    }
+                    core_input::KeyState::Up => {
+                        self.pressed_keys.retain(|pressed| pressed != scan_code);
+                    }
+                },
+                core_input::InputEvent::MouseButton { button, state } => match state {
+                    core_input::KeyState::Down => {
+                        if !self.pressed_buttons.contains(button) {
+                            self.pressed_buttons.push(*button);
+                        }
+                    }
+                    core_input::KeyState::Up => {
+                        self.pressed_buttons.retain(|pressed| pressed != button);
+                    }
+                },
+                core_input::InputEvent::MouseMove { .. }
+                | core_input::InputEvent::MouseMoveAbsolute { .. }
+                | core_input::InputEvent::MouseWheel { .. } => {}
+            }
+        }
+    }
+
+    fn drain_release_events(&mut self) -> Vec<core_input::InputEvent> {
+        self.pressed_buttons.sort_by_key(|button| match button {
+            core_input::MouseButton::Left => 0,
+            core_input::MouseButton::Right => 1,
+            core_input::MouseButton::Middle => 2,
+            core_input::MouseButton::X1 => 3,
+            core_input::MouseButton::X2 => 4,
+        });
+        self.pressed_keys.sort_unstable();
+        let mut releases = self
+            .pressed_buttons
+            .drain(..)
+            .map(|button| core_input::InputEvent::MouseButton {
+                button,
+                state: core_input::KeyState::Up,
+            })
+            .collect::<Vec<_>>();
+        releases.extend(
+            self.pressed_keys
+                .drain(..)
+                .map(|scan_code| core_input::InputEvent::Key {
+                    scan_code,
+                    state: core_input::KeyState::Up,
+                }),
+        );
+        releases
+    }
+
+    fn release_local(&mut self) -> Result<()> {
+        let releases = self.drain_release_events();
+        let records = releases
+            .iter()
+            .flat_map(input_records_for_event)
+            .collect::<Vec<_>>();
+        send_input_records(&records)
+    }
+}
+
 impl ClipboardBrokerState {
     fn observe_sequence(&mut self, sequence: u64) -> bool {
         if self.last_sequence == Some(sequence) {
@@ -105,110 +180,226 @@ impl SafetyUnlockReconciler {
 enum BrokerSessionEnd {
     NotNeeded,
     Detached,
+    Shutdown,
 }
 
-pub(super) fn spawn_input_broker_supervisor(endpoint: String) {
-    let _ = std::thread::Builder::new()
-        .name("boundless-input-broker".to_string())
-        .spawn(move || input_broker_supervisor_loop(&endpoint));
+const INPUT_BROKER_CLEANUP_RPC_TIMEOUT: Duration = Duration::from_millis(500);
+const INPUT_BROKER_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone)]
+pub(super) struct InputBrokerShutdownSignal {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
-fn input_broker_supervisor_loop(endpoint: &str) {
-    loop {
-        match run_input_broker_session(endpoint) {
-            Ok(BrokerSessionEnd::NotNeeded) | Ok(BrokerSessionEnd::Detached) => {}
-            Err(error) => eprintln!("boundless input broker session ended: {error:#}"),
-        }
-        std::thread::sleep(INPUT_BROKER_SUPERVISOR_RETRY);
+impl InputBrokerShutdownSignal {
+    pub(super) fn request(&self) {
+        // This is intentionally first and IPC-independent. The rest of the
+        // supervisor may be stalled, but local input must already be free.
+        let _ = platform_windows::input::release_active_hook_lock();
+        self.shutdown_tx.send_replace(true);
     }
 }
 
-fn run_input_broker_session(endpoint: &str) -> Result<BrokerSessionEnd> {
+pub(super) struct InputBrokerSupervisor {
+    shutdown: InputBrokerShutdownSignal,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl InputBrokerSupervisor {
+    pub(super) fn shutdown_signal(&self) -> InputBrokerShutdownSignal {
+        self.shutdown.clone()
+    }
+
+    pub(super) fn shutdown(&mut self) {
+        self.shutdown.request();
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+
+        let deadline = Instant::now() + INPUT_BROKER_SHUTDOWN_JOIN_TIMEOUT;
+        while !thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if thread.is_finished() {
+            let _ = thread.join();
+        } else {
+            eprintln!(
+                "boundless_input_broker_shutdown=join_timeout timeout_ms={}",
+                INPUT_BROKER_SHUTDOWN_JOIN_TIMEOUT.as_millis()
+            );
+            // Dropping the handle detaches the still-cancelled thread. The
+            // tray process is already exiting; never wedge UI shutdown here.
+        }
+    }
+}
+
+impl Drop for InputBrokerSupervisor {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+pub(super) fn spawn_input_broker_supervisor(
+    endpoint: String,
+) -> Result<InputBrokerSupervisor> {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let thread = std::thread::Builder::new()
+        .name("boundless-input-broker".to_string())
+        .spawn(move || input_broker_supervisor_loop(endpoint, shutdown_rx))
+        .context("spawn input broker supervisor")?;
+    Ok(InputBrokerSupervisor {
+        shutdown: InputBrokerShutdownSignal { shutdown_tx },
+        thread: Some(thread),
+    })
+}
+
+fn input_broker_supervisor_loop(
+    endpoint: String,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("boundless input broker runtime creation failed: {error:#}");
+            return;
+        }
+    };
+    runtime.block_on(async move {
+        loop {
+            match run_input_broker_session(&endpoint, shutdown_rx.clone()).await {
+                Ok(BrokerSessionEnd::Shutdown) => break,
+                Ok(BrokerSessionEnd::NotNeeded) | Ok(BrokerSessionEnd::Detached) => {}
+                Err(error) => eprintln!("boundless input broker session ended: {error:#}"),
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(INPUT_BROKER_SUPERVISOR_RETRY) => {}
+                _ = wait_for_broker_shutdown(&mut shutdown_rx) => break,
+            }
+        }
+    });
+}
+
+async fn wait_for_broker_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if *shutdown_rx.borrow() {
+        return;
+    }
+    while shutdown_rx.changed().await.is_ok() {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+    }
+}
+
+async fn run_input_broker_session(
+    endpoint: &str,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<BrokerSessionEnd> {
     // Fail closed: never broker interactive input from a non-interactive
     // (session 0) process, even if a daemon would accept it.
     if !current_process_can_use_interactive_input().unwrap_or(false) {
         return Ok(BrokerSessionEnd::NotNeeded);
     }
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("create tokio runtime for input broker")?;
-    runtime.block_on(async move {
-        let mut client = connect_control_plane(endpoint).await?;
-        let backend_mode = client
-            .get_ui_snapshot(Empty {})
-            .await?
-            .into_inner()
-            .input_runtime
-            .map(|runtime| runtime.capture_backend_mode)
-            .unwrap_or_default();
-        if backend_mode != INPUT_BROKER_SERVICE_UNSUPPORTED_MODE {
-            // A user-session daemon owns capture/injection directly; a broker
-            // would double-capture. Stay detached and re-check later.
-            return Ok(BrokerSessionEnd::NotNeeded);
-        }
+    let mut client = tokio::select! {
+        result = connect_control_plane(endpoint) => result?,
+        _ = wait_for_broker_shutdown(&mut shutdown_rx) => return Ok(BrokerSessionEnd::Shutdown),
+    };
+    let backend_mode = tokio::select! {
+        result = client.get_ui_snapshot(Empty {}) => result?,
+        _ = wait_for_broker_shutdown(&mut shutdown_rx) => return Ok(BrokerSessionEnd::Shutdown),
+    }
+    .into_inner()
+    .input_runtime
+    .map(|runtime| runtime.capture_backend_mode)
+    .unwrap_or_default();
+    if backend_mode != INPUT_BROKER_SERVICE_UNSUPPORTED_MODE {
+        // A user-session daemon owns capture/injection directly; a broker
+        // would double-capture. Stay detached and re-check later.
+        return Ok(BrokerSessionEnd::NotNeeded);
+    }
 
-        let mut pump =
-            HookInputPump::start(|_source| {}).context("install user-session capture hooks")?;
-        pump.enable_lock_lease(INPUT_BROKER_LOCK_LEASE)
-            .context("enable fail-open input broker lock lease")?;
+    let mut pump =
+        HookInputPump::start(|_source| {}).context("install user-session capture hooks")?;
+    pump.enable_lock_lease(INPUT_BROKER_LOCK_LEASE)
+        .context("enable fail-open input broker lock lease")?;
 
-        // The daemon authorizes this attach against the verified pipe client
-        // identity (our process token SID and session), not anything we send.
-        let attach = client
-            .attach_input_broker(InputBrokerAttachRequest {
+    // The daemon authorizes this attach against the verified pipe client
+    // identity (our process token SID and session), not anything we send.
+    let attach = tokio::select! {
+        result = client.attach_input_broker(InputBrokerAttachRequest {
                 broker_version: env!("CARGO_PKG_VERSION").to_string(),
                 lock_supported: true,
-            })
-            .await?
-            .into_inner();
-        if !attach.accepted {
-            eprintln!("boundless input broker attach rejected: {}", attach.message);
-            return Ok(BrokerSessionEnd::NotNeeded);
-        }
-        let broker_token = attach.broker_token;
+            }) => result?,
+        _ = wait_for_broker_shutdown(&mut shutdown_rx) => return Ok(BrokerSessionEnd::Shutdown),
+    }
+    .into_inner();
+    if !attach.accepted {
+        eprintln!("boundless input broker attach rejected: {}", attach.message);
+        return Ok(BrokerSessionEnd::NotNeeded);
+    }
+    let broker_token = attach.broker_token;
 
-        let mut input_client = client.clone();
-        let clipboard_task = tokio::spawn(clipboard_broker_supervisor_loop(
-            client.clone(),
-            broker_token.clone(),
-        ));
-        let loop_result =
-            input_broker_exchange_loop(&mut input_client, &broker_token, &mut pump).await;
-        // Clipboard failures are supervised independently and never select the
-        // input path out of service. Conversely, ending the input session
-        // cancels its clipboard worker before token cleanup.
-        clipboard_task.abort();
-        let _ = clipboard_task.await;
+    let mut input_client = client.clone();
+    let clipboard_task = tokio::spawn(clipboard_broker_supervisor_loop(
+        client.clone(),
+        broker_token.clone(),
+    ));
+    let mut injected_state = InjectedInputState::default();
+    let (loop_result, session_end) = tokio::select! {
+        result = input_broker_exchange_loop(
+            &mut input_client,
+            &broker_token,
+            &mut pump,
+            &mut injected_state,
+        ) => (result, BrokerSessionEnd::Detached),
+        _ = wait_for_broker_shutdown(&mut shutdown_rx) => (Ok(()), BrokerSessionEnd::Shutdown),
+    };
+    // Clipboard failures are supervised independently and never select the
+    // input path out of service. Conversely, ending the input session cancels
+    // its clipboard worker before token cleanup.
+    clipboard_task.abort();
+    let _ = clipboard_task.await;
 
-        // Best-effort cleanup: release the local lock, flush synthetic
-        // release events for anything still held, and detach explicitly.
-        let _ = pump.set_lock_active(false);
-        let release_events = pump.drain_release_events();
-        if !release_events.is_empty() {
-            let _ = client
-                .exchange_input_broker(InputBrokerExchangeRequest {
-                    broker_token: broker_token.clone(),
-                    captured_events: broker_events_from_input_events(&release_events),
-                    ..Default::default()
-                })
-                .await;
-        }
-        let _ = client
-            .detach_input_broker(InputBrokerDetachRequest {
+    // Unlock and locally release injected state before any cleanup IPC.
+    let _ = pump.set_lock_active(false);
+    let _ = injected_state.release_local();
+
+    let release_events = pump.drain_release_events();
+    if !release_events.is_empty() {
+        let _ = tokio::time::timeout(
+            INPUT_BROKER_CLEANUP_RPC_TIMEOUT,
+            client.exchange_input_broker(InputBrokerExchangeRequest {
                 broker_token: broker_token.clone(),
-            })
-            .await;
+                captured_events: broker_events_from_input_events(&release_events),
+                ..Default::default()
+            }),
+        )
+        .await;
+    }
+    let _ = tokio::time::timeout(
+        INPUT_BROKER_CLEANUP_RPC_TIMEOUT,
+        client.clear_input_capture_target(Empty {}),
+    )
+    .await;
+    let _ = tokio::time::timeout(
+        INPUT_BROKER_CLEANUP_RPC_TIMEOUT,
+        client.detach_input_broker(InputBrokerDetachRequest {
+            broker_token: broker_token.clone(),
+        }),
+    )
+    .await;
 
-        loop_result.map(|_| BrokerSessionEnd::Detached)
-    })
+    loop_result.map(|_| session_end)
 }
 
 async fn input_broker_exchange_loop(
     client: &mut ControlPlaneServiceClient<Channel>,
     broker_token: &str,
     pump: &mut HookInputPump,
+    injected_state: &mut InjectedInputState,
 ) -> Result<()> {
     let mut injected_frame_count = 0u32;
     let mut inject_failure_count = 0u32;
@@ -272,7 +463,7 @@ async fn input_broker_exchange_loop(
         let had_inject_frames = !reply.inject_frames.is_empty();
         for frame in &reply.inject_frames {
             let (events, undecodable) = input_events_from_broker_events(&frame.events);
-            if undecodable > 0 || inject_input_events(&events).is_err() {
+            if undecodable > 0 || inject_input_events(&events, injected_state).is_err() {
                 inject_failure_count = inject_failure_count.saturating_add(1);
             } else {
                 injected_frame_count = injected_frame_count.saturating_add(1);
@@ -362,14 +553,72 @@ mod input_broker_tests {
         state.mark_exchange_accepted();
         assert!(state.apply_report_for_request().is_none());
     }
+
+    #[test]
+    fn injected_state_synthesizes_releases_for_shutdown() {
+        let mut state = InjectedInputState::default();
+        state.observe(&[
+            core_input::InputEvent::Key {
+                scan_code: 30,
+                state: core_input::KeyState::Down,
+            },
+            core_input::InputEvent::MouseButton {
+                button: core_input::MouseButton::Left,
+                state: core_input::KeyState::Down,
+            },
+            core_input::InputEvent::MouseWheel {
+                delta_x: 0,
+                delta_y: 120,
+            },
+        ]);
+
+        assert_eq!(
+            state.drain_release_events(),
+            vec![
+                core_input::InputEvent::MouseButton {
+                    button: core_input::MouseButton::Left,
+                    state: core_input::KeyState::Up,
+                },
+                core_input::InputEvent::Key {
+                    scan_code: 30,
+                    state: core_input::KeyState::Up,
+                },
+            ]
+        );
+        assert!(state.drain_release_events().is_empty());
+    }
+
+    #[test]
+    fn supervisor_shutdown_signal_joins_cooperative_worker() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let thread = std::thread::spawn(move || {
+            while !*shutdown_rx.borrow() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let mut supervisor = InputBrokerSupervisor {
+            shutdown: InputBrokerShutdownSignal { shutdown_tx },
+            thread: Some(thread),
+        };
+
+        let started = Instant::now();
+        supervisor.shutdown();
+        assert!(supervisor.thread.is_none());
+        assert!(started.elapsed() < INPUT_BROKER_SHUTDOWN_JOIN_TIMEOUT);
+    }
 }
 
-fn inject_input_events(events: &[core_input::InputEvent]) -> Result<()> {
+fn inject_input_events(
+    events: &[core_input::InputEvent],
+    injected_state: &mut InjectedInputState,
+) -> Result<()> {
     let mut records = Vec::new();
     for event in events {
         records.extend(input_records_for_event(event));
     }
-    send_input_records(&records)
+    send_input_records(&records)?;
+    injected_state.observe(events);
+    Ok(())
 }
 
 async fn clipboard_broker_supervisor_loop(

@@ -102,7 +102,8 @@ pub(super) fn run() -> Result<()> {
         daemon_candidates: resolve_boundlessd_candidates(std::env::current_exe().ok()),
     });
 
-    spawn_input_broker_supervisor(ctx.endpoint.clone());
+    let mut input_broker_supervisor = spawn_input_broker_supervisor(ctx.endpoint.clone())?;
+    let input_broker_shutdown = input_broker_supervisor.shutdown_signal();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -114,7 +115,7 @@ pub(super) fn run() -> Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         DASHBOARD_WINDOW_TITLE,
         options,
         Box::new(move |cc| {
@@ -123,10 +124,13 @@ pub(super) fn run() -> Result<()> {
                 cc,
                 ctx,
                 single_instance_guard,
+                input_broker_shutdown,
             )?))
         }),
     )
-    .map_err(|e| anyhow::anyhow!("eframe error: {:?}", e))
+    .map_err(|e| anyhow::anyhow!("eframe error: {:?}", e));
+    input_broker_supervisor.shutdown();
+    result
 }
 
 fn find_existing_dashboard_window_with_retry(

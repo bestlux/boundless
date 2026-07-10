@@ -98,6 +98,8 @@ impl InputBrokerRelay {
         if matches {
             inner.attachment = None;
             inner.last_exchange_at = None;
+            inner.desired_lock_active = false;
+            inner.reported_lock_active = false;
         }
         matches
     }

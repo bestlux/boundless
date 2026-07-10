@@ -314,11 +314,22 @@ async fn exchange_rejects_wrong_user_even_with_valid_token() {
 #[tokio::test]
 async fn detach_rejects_wrong_user_and_keeps_broker_attached() {
     let (state, root) = service_mode_broker_state("boundless-broker-detach-wrong-user-test").await;
+    let peer_id = join_connected_peer(&state).await;
 
     let attach = state
         .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
         .await;
     assert!(attach.accepted);
+    state
+        .set_input_capture_target(Some(&peer_id))
+        .await
+        .expect("set capture target");
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("claim input owner")
+    );
 
     assert!(
         !state
@@ -331,6 +342,16 @@ async fn detach_rejects_wrong_user_and_keeps_broker_attached() {
         "unverified callers must not detach the broker"
     );
     assert!(state.input_broker_route_active());
+    assert_eq!(
+        state.input_capture_target().await.as_deref(),
+        Some(peer_id.as_str()),
+        "unauthorized detach must not mutate capture state"
+    );
+    assert_eq!(
+        state.input_owner().await.as_deref(),
+        Some(peer_id.as_str()),
+        "unauthorized detach must not mutate owner state"
+    );
 
     assert!(
         state
@@ -339,6 +360,14 @@ async fn detach_rejects_wrong_user_and_keeps_broker_attached() {
         "allowed-user broker must be able to detach itself"
     );
     assert!(!state.input_broker_route_active());
+    assert!(
+        state.input_capture_target().await.is_none(),
+        "detach must clear stale capture target before tray relaunch"
+    );
+    assert!(
+        state.input_owner().await.is_none(),
+        "detach must release stale incoming owner before tray relaunch"
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }
