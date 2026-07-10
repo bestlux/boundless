@@ -50,7 +50,7 @@
       Message="A legacy script-installed Boundless build was detected in %LocalAppData%\Programs\Boundless. Uninstall the script-based package first, then rerun this installer." />
     <Launch
       Condition='REMOVE = "ALL" OR (BOUNDLESS_ALLOWED_USER_SID AND BOUNDLESS_ALLOWED_USER_SID &lt;&lt; "S-1-")'
-      Message="BoundlessService requires an explicit numeric SID such as BOUNDLESS_ALLOWED_USER_SID=S-1-5-21-..." />
+      Message="Do not run this MSI directly. Use the matching Boundless-*-windows-x64-install.ps1 helper, or supply an explicit numeric SID such as BOUNDLESS_ALLOWED_USER_SID=S-1-5-21-..." />
     <Launch
       Condition='REMOVE = "ALL" OR (NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&lt; "--") AND NOT (BOUNDLESS_ALLOWED_USER_SID &gt;&gt; "-"))'
       Message="BOUNDLESS_ALLOWED_USER_SID must not contain empty numeric segments." />
