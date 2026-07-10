@@ -353,7 +353,9 @@ impl HookInputPump {
     }
 
     pub fn backend_mode(&self) -> &'static str {
-        if self.capture_runtime.raw_input_enabled() {
+        if self.capture_runtime.keyboard_hook_degraded() {
+            "hook_raw_keyboard_hook_degraded"
+        } else if self.capture_runtime.raw_input_enabled() {
             "hook_raw"
         } else {
             "hook"

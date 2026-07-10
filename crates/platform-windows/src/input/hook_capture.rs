@@ -14,18 +14,19 @@ use windows_sys::Win32::{
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
         Input::{
-            GetRawInputData, GetRegisteredRawInputDevices, KeyboardAndMouse::GetDoubleClickTime,
-            MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RAWMOUSE, RID_INPUT,
-            RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
+            GetCurrentInputMessageSource, GetRawInputData, GetRegisteredRawInputDevices,
+            IMO_INJECTED, INPUT_MESSAGE_SOURCE, KeyboardAndMouse::GetDoubleClickTime,
+            MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RAWKEYBOARD, RAWMOUSE,
+            RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE, RegisterRawInputDevices,
         },
         WindowsAndMessaging::{
             CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW,
             HC_ACTION, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-            PostThreadMessageW, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, SetWindowsHookExW,
-            TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT,
-            WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-            WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-            WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+            PostThreadMessageW, RI_KEY_BREAK, RI_KEY_E0, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL,
+            SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+            WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+            WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
+            WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
         },
     },
 };
@@ -45,6 +46,7 @@ const LLKHF_INJECTED_MASK: u32 = 0x10;
 const LLMHF_INJECTED_MASK: u32 = 0x0000_0001;
 const RAW_INPUT_USAGE_PAGE_GENERIC: u16 = 0x01;
 const RAW_INPUT_USAGE_MOUSE: u16 = 0x02;
+const RAW_INPUT_USAGE_KEYBOARD: u16 = 0x06;
 const ESCAPE_DOUBLE_CTRL_MIN_WINDOW_MS: u64 = 800;
 const ESCAPE_DOUBLE_CTRL_MAX_WINDOW_MS: u64 = 1_200;
 const RAW_INPUT_REGISTRATION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -110,6 +112,9 @@ struct CaptureRuntimeCore {
     runtime_state: Mutex<HookRuntimeState>,
     lock_lease: Mutex<HookLockLease>,
     lock_active: AtomicBool,
+    raw_keyboard_escape_enabled: AtomicBool,
+    keyboard_hook_degraded: AtomicBool,
+    last_keyboard_hook_observation: Mutex<Option<KeyboardHookObservation>>,
     escape_unlock_pending: AtomicU64,
     lease_expired_unlock_pending: AtomicU64,
     safety_unlock_generation: AtomicU64,
@@ -120,8 +125,9 @@ struct CaptureRuntimeCore {
 
 #[derive(Debug, Default)]
 struct HookRuntimeState {
-    left_ctrl_down: bool,
-    right_ctrl_down: bool,
+    left_ctrl_down_at: Option<Instant>,
+    right_ctrl_down_at: Option<Instant>,
+    current_ctrl_tap_valid: bool,
     last_ctrl_tap_at: Option<Instant>,
 }
 
@@ -129,6 +135,27 @@ struct HookRuntimeState {
 struct HookLockLease {
     timeout: Option<Duration>,
     last_renewed_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeDetectorSource {
+    RawKeyboard,
+    KeyboardHook,
+}
+
+impl EscapeDetectorSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::RawKeyboard => "raw_keyboard",
+            Self::KeyboardHook => "keyboard_hook",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyboardHookObservation {
+    message_time_ms: u32,
+    state: KeyState,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -164,6 +191,9 @@ impl CaptureRuntime {
             runtime_state: Mutex::new(HookRuntimeState::default()),
             lock_lease: Mutex::new(HookLockLease::default()),
             lock_active: AtomicBool::new(false),
+            raw_keyboard_escape_enabled: AtomicBool::new(false),
+            keyboard_hook_degraded: AtomicBool::new(false),
+            last_keyboard_hook_observation: Mutex::new(None),
             escape_unlock_pending: AtomicU64::new(0),
             lease_expired_unlock_pending: AtomicU64::new(0),
             safety_unlock_generation: AtomicU64::new(0),
@@ -213,11 +243,14 @@ impl CaptureRuntime {
         };
         let (raw_input_thread_id, raw_input_thread, raw_input_hwnd, raw_input_enabled) =
             match spawn_raw_input_thread() {
-                Ok((thread_id, hwnd, thread)) => (Some(thread_id), Some(thread), Some(hwnd), true),
+                Ok((thread_id, hwnd, thread)) => {
+                    set_raw_keyboard_escape_enabled_for(&core, true);
+                    (Some(thread_id), Some(thread), Some(hwnd), true)
+                }
                 Err(error) => {
                     warn!(
                         error = ?error,
-                        "raw input mouse capture unavailable; falling back to mouse hook position deltas"
+                        "raw input capture unavailable; falling back to low-level hooks"
                     );
                     (None, None, None, false)
                 }
@@ -248,6 +281,9 @@ impl CaptureRuntime {
                 runtime_state: Mutex::new(HookRuntimeState::default()),
                 lock_lease: Mutex::new(HookLockLease::default()),
                 lock_active: AtomicBool::new(false),
+                raw_keyboard_escape_enabled: AtomicBool::new(raw_input_enabled),
+                keyboard_hook_degraded: AtomicBool::new(false),
+                last_keyboard_hook_observation: Mutex::new(None),
                 escape_unlock_pending: AtomicU64::new(0),
                 lease_expired_unlock_pending: AtomicU64::new(0),
                 safety_unlock_generation: AtomicU64::new(0),
@@ -287,7 +323,8 @@ impl CaptureRuntime {
             self.raw_input_thread_id = None;
             self.raw_input_hwnd = None;
             self.raw_input_enabled = false;
-            warn!("raw input capture thread exited; using mouse hook position delta fallback");
+            set_raw_keyboard_escape_enabled_for(&self.core, false);
+            warn!("raw input capture thread exited; using low-level hook fallback");
             return false;
         }
 
@@ -303,21 +340,27 @@ impl CaptureRuntime {
         self.raw_input_registration_checked_at = Instant::now();
 
         let hwnd = hwnd as HWND;
-        match raw_input_mouse_registration_owned(hwnd) {
-            Ok(true) => self.raw_input_enabled = true,
-            Ok(false) => match register_raw_input_mouse_device(hwnd) {
+        match raw_input_registration_owned(hwnd) {
+            Ok(true) => {
+                self.raw_input_enabled = true;
+                set_raw_keyboard_escape_enabled_for(&self.core, true);
+            }
+            Ok(false) => match register_raw_input_devices(hwnd) {
                 Ok(()) => {
                     self.raw_input_enabled = true;
-                    warn!("raw input mouse registration was replaced and has been reclaimed");
+                    set_raw_keyboard_escape_enabled_for(&self.core, true);
+                    warn!("raw input registration was replaced and has been reclaimed");
                 }
                 Err(error) => {
                     self.raw_input_enabled = false;
-                    warn!(error = ?error, "failed to reclaim raw input mouse registration");
+                    set_raw_keyboard_escape_enabled_for(&self.core, false);
+                    warn!(error = ?error, "failed to reclaim raw input registration");
                 }
             },
             Err(error) => {
                 self.raw_input_enabled = false;
-                warn!(error = ?error, "failed to verify raw input mouse registration ownership");
+                set_raw_keyboard_escape_enabled_for(&self.core, false);
+                warn!(error = ?error, "failed to verify raw input registration ownership");
             }
         }
         self.raw_input_enabled
@@ -325,6 +368,10 @@ impl CaptureRuntime {
 
     pub fn raw_input_enabled(&self) -> bool {
         self.raw_input_enabled
+    }
+
+    pub fn keyboard_hook_degraded(&self) -> bool {
+        self.core.keyboard_hook_degraded.load(Ordering::Acquire)
     }
 
     pub fn set_lock_active(&mut self, active: bool) -> Result<bool> {
@@ -424,6 +471,7 @@ impl Drop for CaptureRuntime {
         self.raw_input_thread_id = None;
         self.raw_input_hwnd = None;
         self.raw_input_enabled = false;
+        set_raw_keyboard_escape_enabled_for(&self.core, false);
         post_thread_quit(self.hook_thread_id);
         if let Some(thread) = self.hook_thread.take() {
             let _ = thread.join();
@@ -512,6 +560,84 @@ pub fn is_hook_lock_active() -> bool {
     with_active_capture_runtime(|core| core.lock_active.load(Ordering::Relaxed)).unwrap_or(false)
 }
 
+fn escape_detector_source(runtime: &CaptureRuntimeCore) -> EscapeDetectorSource {
+    if runtime.raw_keyboard_escape_enabled.load(Ordering::Acquire) {
+        EscapeDetectorSource::RawKeyboard
+    } else {
+        EscapeDetectorSource::KeyboardHook
+    }
+}
+
+fn set_raw_keyboard_escape_enabled_for(runtime: &CaptureRuntimeCore, enabled: bool) {
+    let previous = runtime
+        .raw_keyboard_escape_enabled
+        .swap(enabled, Ordering::AcqRel);
+    if previous == enabled {
+        return;
+    }
+
+    if let Ok(mut state) = runtime.runtime_state.lock() {
+        *state = HookRuntimeState::default();
+    }
+    if let Ok(mut observation) = runtime.last_keyboard_hook_observation.lock() {
+        *observation = None;
+    }
+    if !enabled {
+        runtime
+            .keyboard_hook_degraded
+            .store(false, Ordering::Release);
+    }
+
+    let source = escape_detector_source(runtime).label();
+    eprintln!("boundless_input_escape_detector source={source}");
+}
+
+fn record_keyboard_hook_observation(
+    runtime: &CaptureRuntimeCore,
+    vk_code: u16,
+    state: KeyState,
+    message_time_ms: u32,
+) {
+    if !is_control_virtual_key(vk_code) {
+        return;
+    }
+    if let Ok(mut observation) = runtime.last_keyboard_hook_observation.lock() {
+        *observation = Some(KeyboardHookObservation {
+            message_time_ms,
+            state,
+        });
+    }
+}
+
+fn observe_raw_keyboard_hook_health(
+    runtime: &CaptureRuntimeCore,
+    vk_code: u16,
+    state: KeyState,
+    message_time_ms: u32,
+) {
+    if !is_control_virtual_key(vk_code) {
+        return;
+    }
+    let hook_observed = runtime
+        .last_keyboard_hook_observation
+        .lock()
+        .ok()
+        .and_then(|observation| *observation)
+        .is_some_and(|observation| {
+            observation.message_time_ms == message_time_ms && observation.state == state
+        });
+    if !hook_observed && !runtime.keyboard_hook_degraded.swap(true, Ordering::AcqRel) {
+        eprintln!("boundless_input_keyboard_hook state=degraded detector=raw_keyboard");
+        warn!(
+            "low-level keyboard hook missed physical Control input; Raw Input remains authoritative for emergency unlock"
+        );
+    }
+}
+
+fn is_control_virtual_key(vk_code: u16) -> bool {
+    vk_code == VK_CONTROL_CODE || vk_code == VK_LCONTROL_CODE || vk_code == VK_RCONTROL_CODE
+}
+
 fn update_escape_state_for_key_at(
     runtime: &CaptureRuntimeCore,
     vk_code: u16,
@@ -519,7 +645,7 @@ fn update_escape_state_for_key_at(
     now: Instant,
     double_tap_window: Duration,
 ) -> bool {
-    if vk_code != VK_CONTROL_CODE && vk_code != VK_LCONTROL_CODE && vk_code != VK_RCONTROL_CODE {
+    if !is_control_virtual_key(vk_code) {
         return false;
     }
     if !runtime.lock_active.load(Ordering::Relaxed) {
@@ -530,39 +656,58 @@ fn update_escape_state_for_key_at(
         Err(_) => return false,
     };
 
-    let is_down = matches!(key_state, KeyState::Down);
-    let was_down = match vk_code {
-        VK_LCONTROL_CODE => state.left_ctrl_down,
-        VK_RCONTROL_CODE => state.right_ctrl_down,
-        _ => state.left_ctrl_down || state.right_ctrl_down,
+    if state
+        .left_ctrl_down_at
+        .is_some_and(|down_at| now.saturating_duration_since(down_at) > double_tap_window)
+        || state
+            .right_ctrl_down_at
+            .is_some_and(|down_at| now.saturating_duration_since(down_at) > double_tap_window)
+    {
+        state.left_ctrl_down_at = None;
+        state.right_ctrl_down_at = None;
+        state.current_ctrl_tap_valid = false;
+    }
+
+    let vk_code = if vk_code == VK_CONTROL_CODE {
+        VK_LCONTROL_CODE
+    } else {
+        vk_code
+    };
+    let other_down = match vk_code {
+        VK_LCONTROL_CODE => state.right_ctrl_down_at.is_some(),
+        VK_RCONTROL_CODE => state.left_ctrl_down_at.is_some(),
+        _ => return false,
+    };
+    let current_down = match vk_code {
+        VK_LCONTROL_CODE => &mut state.left_ctrl_down_at,
+        VK_RCONTROL_CODE => &mut state.right_ctrl_down_at,
+        _ => return false,
     };
 
-    if is_down {
-        match vk_code {
-            VK_LCONTROL_CODE => state.left_ctrl_down = true,
-            VK_RCONTROL_CODE => state.right_ctrl_down = true,
-            _ => {
-                state.left_ctrl_down = true;
-                state.right_ctrl_down = true;
-            }
+    if matches!(key_state, KeyState::Down) {
+        if current_down.is_some() {
+            return false;
+        }
+        *current_down = Some(now);
+        if other_down {
+            state.current_ctrl_tap_valid = false;
+            return false;
         }
 
-        if !was_down {
-            let triggered = state
-                .last_ctrl_tap_at
-                .is_some_and(|previous| now.duration_since(previous) <= double_tap_window);
-            state.last_ctrl_tap_at = Some(now);
-            return triggered;
+        state.current_ctrl_tap_valid = true;
+        return state
+            .last_ctrl_tap_at
+            .is_some_and(|previous| now.saturating_duration_since(previous) <= double_tap_window);
+    }
+
+    let Some(down_at) = current_down.take() else {
+        return false;
+    };
+    if !other_down {
+        if state.current_ctrl_tap_valid {
+            state.last_ctrl_tap_at = Some(down_at);
         }
-    } else {
-        match vk_code {
-            VK_LCONTROL_CODE => state.left_ctrl_down = false,
-            VK_RCONTROL_CODE => state.right_ctrl_down = false,
-            _ => {
-                state.left_ctrl_down = false;
-                state.right_ctrl_down = false;
-            }
-        }
+        state.current_ctrl_tap_valid = false;
     }
 
     false
@@ -575,16 +720,31 @@ pub fn try_escape_unlock_for_key(vk_code: u16, key_state: KeyState) -> bool {
     let Some(runtime) = active_capture_runtime() else {
         return false;
     };
-    if !update_escape_state_for_key_at(
+    try_escape_unlock_for_key_from_source_at(
         &runtime,
+        EscapeDetectorSource::KeyboardHook,
         vk_code,
         key_state,
         Instant::now(),
         escape_double_ctrl_window(unsafe { GetDoubleClickTime() }),
-    ) {
+    )
+}
+
+fn try_escape_unlock_for_key_from_source_at(
+    runtime: &CaptureRuntimeCore,
+    source: EscapeDetectorSource,
+    vk_code: u16,
+    key_state: KeyState,
+    now: Instant,
+    double_tap_window: Duration,
+) -> bool {
+    if escape_detector_source(runtime) != source {
         return false;
     }
-    force_unlock_for_arc(&runtime, Some(SafetyUnlockCause::Escape))
+    if !update_escape_state_for_key_at(runtime, vk_code, key_state, now, double_tap_window) {
+        return false;
+    }
+    force_unlock_for_arc(runtime, Some(SafetyUnlockCause::Escape))
 }
 
 /// Releases the active hook lock synchronously without publishing a daemon
@@ -612,9 +772,7 @@ fn set_hook_lock_active_for_arc(core: &CaptureRuntimeCore, active: bool) -> Resu
         .lock()
         .map_err(|_| anyhow::anyhow!("hook runtime state mutex poisoned"))?;
     if !active {
-        state.left_ctrl_down = false;
-        state.right_ctrl_down = false;
-        state.last_ctrl_tap_at = None;
+        *state = HookRuntimeState::default();
     }
     drop(state);
 
@@ -660,9 +818,7 @@ fn force_unlock_for_arc_with_hook(
     after_lock_release();
 
     if let Ok(mut state) = core.runtime_state.lock() {
-        state.left_ctrl_down = false;
-        state.right_ctrl_down = false;
-        state.last_ctrl_tap_at = None;
+        *state = HookRuntimeState::default();
     }
     if let Ok(mut lease) = core.lock_lease.lock() {
         lease.last_renewed_at = None;
@@ -671,10 +827,13 @@ fn force_unlock_for_arc_with_hook(
     match (cause, was_active) {
         (Some(SafetyUnlockCause::Escape), true) => {
             core.escape_unlock_pending.fetch_add(1, Ordering::AcqRel);
+            let detector = escape_detector_source(core).label();
+            eprintln!("boundless_input_safety_unlock cause=escape detector={detector}");
         }
         (Some(SafetyUnlockCause::LeaseExpired), true) => {
             core.lease_expired_unlock_pending
                 .fetch_add(1, Ordering::AcqRel);
+            eprintln!("boundless_input_safety_unlock cause=lease_expired");
         }
         _ => {}
     }
@@ -848,7 +1007,7 @@ pub fn spawn_raw_input_thread() -> Result<(u32, isize, JoinHandle<()>)> {
             }
         };
 
-        if let Err(error) = register_raw_input_mouse_device(hwnd) {
+        if let Err(error) = register_raw_input_devices(hwnd) {
             let _ = startup_tx.send(Err(error));
             unsafe {
                 let _ = DestroyWindow(hwnd);
@@ -904,13 +1063,21 @@ fn create_raw_input_window() -> Result<HWND> {
     Ok(hwnd)
 }
 
-fn register_raw_input_mouse_device(hwnd: HWND) -> Result<()> {
-    let devices = [RAWINPUTDEVICE {
-        usUsagePage: RAW_INPUT_USAGE_PAGE_GENERIC,
-        usUsage: RAW_INPUT_USAGE_MOUSE,
-        dwFlags: RIDEV_INPUTSINK,
-        hwndTarget: hwnd,
-    }];
+fn register_raw_input_devices(hwnd: HWND) -> Result<()> {
+    let devices = [
+        RAWINPUTDEVICE {
+            usUsagePage: RAW_INPUT_USAGE_PAGE_GENERIC,
+            usUsage: RAW_INPUT_USAGE_MOUSE,
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: hwnd,
+        },
+        RAWINPUTDEVICE {
+            usUsagePage: RAW_INPUT_USAGE_PAGE_GENERIC,
+            usUsage: RAW_INPUT_USAGE_KEYBOARD,
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: hwnd,
+        },
+    ];
     let ok = unsafe {
         RegisterRawInputDevices(
             devices.as_ptr(),
@@ -919,17 +1086,23 @@ fn register_raw_input_mouse_device(hwnd: HWND) -> Result<()> {
         )
     };
     if ok == 0 {
-        return Err(std::io::Error::last_os_error()).context("RegisterRawInputDevices mouse");
+        return Err(std::io::Error::last_os_error())
+            .context("RegisterRawInputDevices mouse and keyboard");
     }
     Ok(())
 }
 
-fn raw_input_mouse_target_owned(devices: &[RAWINPUTDEVICE], hwnd: HWND) -> bool {
+fn raw_input_target_owned(devices: &[RAWINPUTDEVICE], hwnd: HWND, usage: u16) -> bool {
     devices.iter().any(|device| {
         device.usUsagePage == RAW_INPUT_USAGE_PAGE_GENERIC
-            && device.usUsage == RAW_INPUT_USAGE_MOUSE
+            && device.usUsage == usage
             && device.hwndTarget == hwnd
     })
+}
+
+fn raw_input_targets_owned(devices: &[RAWINPUTDEVICE], hwnd: HWND) -> bool {
+    raw_input_target_owned(devices, hwnd, RAW_INPUT_USAGE_MOUSE)
+        && raw_input_target_owned(devices, hwnd, RAW_INPUT_USAGE_KEYBOARD)
 }
 
 fn registered_raw_input_devices() -> Result<Vec<RAWINPUTDEVICE>> {
@@ -964,8 +1137,8 @@ fn registered_raw_input_devices() -> Result<Vec<RAWINPUTDEVICE>> {
     Ok(devices)
 }
 
-fn raw_input_mouse_registration_owned(hwnd: HWND) -> Result<bool> {
-    registered_raw_input_devices().map(|devices| raw_input_mouse_target_owned(&devices, hwnd))
+fn raw_input_registration_owned(hwnd: HWND) -> Result<bool> {
+    registered_raw_input_devices().map(|devices| raw_input_targets_owned(&devices, hwnd))
 }
 
 unsafe fn run_raw_input_message_loop() -> Result<()> {
@@ -1044,6 +1217,26 @@ fn process_raw_input_message(lparam: LPARAM, message_time_ms: u32) -> Result<()>
     }
 
     let raw = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<RAWINPUT>()) };
+    if raw.header.dwType == RIM_TYPEKEYBOARD {
+        let keyboard = unsafe { raw.data.keyboard };
+        if let Some((vk_code, state)) = raw_keyboard_escape_key(&keyboard) {
+            if current_input_message_is_injected() {
+                return Ok(());
+            }
+            let _ = with_active_capture_runtime(|runtime| {
+                observe_raw_keyboard_hook_health(runtime, vk_code, state, message_time_ms);
+                let _ = try_escape_unlock_for_key_from_source_at(
+                    runtime,
+                    EscapeDetectorSource::RawKeyboard,
+                    vk_code,
+                    state,
+                    Instant::now(),
+                    escape_double_ctrl_window(unsafe { GetDoubleClickTime() }),
+                );
+            });
+        }
+        return Ok(());
+    }
     if raw.header.dwType != RIM_TYPEMOUSE {
         return Ok(());
     }
@@ -1069,6 +1262,40 @@ fn process_raw_input_message(lparam: LPARAM, message_time_ms: u32) -> Result<()>
     }
 
     Ok(())
+}
+
+fn current_input_message_is_injected() -> bool {
+    let mut source = INPUT_MESSAGE_SOURCE::default();
+    let ok = unsafe { GetCurrentInputMessageSource(&mut source as *mut INPUT_MESSAGE_SOURCE) };
+    ok != 0 && source.originId == IMO_INJECTED
+}
+
+fn raw_keyboard_escape_key(keyboard: &RAWKEYBOARD) -> Option<(u16, KeyState)> {
+    if keyboard.VKey == u8::MAX as u16 {
+        return None;
+    }
+    let vk_code = match keyboard.VKey {
+        VK_CONTROL_CODE if (u32::from(keyboard.Flags) & RI_KEY_E0) != 0 => VK_RCONTROL_CODE,
+        VK_CONTROL_CODE => VK_LCONTROL_CODE,
+        code => code,
+    };
+    if !is_control_virtual_key(vk_code) {
+        return None;
+    }
+    let state = if (u32::from(keyboard.Flags) & RI_KEY_BREAK) != 0 {
+        KeyState::Up
+    } else {
+        KeyState::Down
+    };
+    Some((vk_code, state))
+}
+
+fn hook_control_virtual_key(vk_code: u16, flags: u32) -> u16 {
+    match vk_code {
+        VK_CONTROL_CODE if (flags & LLKHF_EXTENDED_MASK) != 0 => VK_RCONTROL_CODE,
+        VK_CONTROL_CODE => VK_LCONTROL_CODE,
+        code => code,
+    }
 }
 
 pub fn raw_mouse_relative_delta(mouse: &RAWMOUSE) -> Option<(i32, i32)> {
@@ -1130,7 +1357,11 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             };
 
             if let Some(state) = state {
-                if lock_active && try_escape_unlock_for_key(keyboard.vkCode as u16, state) {
+                let control_vk = hook_control_virtual_key(keyboard.vkCode as u16, keyboard.flags);
+                let _ = with_active_capture_runtime(|runtime| {
+                    record_keyboard_hook_observation(runtime, control_vk, state, keyboard.time);
+                });
+                if lock_active && try_escape_unlock_for_key(control_vk, state) {
                     lock_active = false;
                 }
                 let mut scan_code = keyboard.scanCode as u16;
@@ -1281,6 +1512,9 @@ mod tests {
             runtime_state: Mutex::new(HookRuntimeState::default()),
             lock_lease: Mutex::new(HookLockLease::default()),
             lock_active: AtomicBool::new(false),
+            raw_keyboard_escape_enabled: AtomicBool::new(false),
+            keyboard_hook_degraded: AtomicBool::new(false),
+            last_keyboard_hook_observation: Mutex::new(None),
             escape_unlock_pending: AtomicU64::new(0),
             lease_expired_unlock_pending: AtomicU64::new(0),
             safety_unlock_generation: AtomicU64::new(0),
@@ -1372,7 +1606,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_input_ownership_requires_our_mouse_target() {
+    fn raw_input_ownership_requires_our_mouse_and_keyboard_targets() {
         let our_hwnd = 1usize as HWND;
         let other_hwnd = 2usize as HWND;
         let registrations = [
@@ -1389,15 +1623,272 @@ mod tests {
                 hwndTarget: our_hwnd,
             },
         ];
-        assert!(!raw_input_mouse_target_owned(&registrations, our_hwnd));
+        assert!(!raw_input_targets_owned(&registrations, our_hwnd));
 
-        let registrations = [RAWINPUTDEVICE {
-            usUsagePage: RAW_INPUT_USAGE_PAGE_GENERIC,
-            usUsage: RAW_INPUT_USAGE_MOUSE,
-            dwFlags: RIDEV_INPUTSINK,
-            hwndTarget: our_hwnd,
-        }];
-        assert!(raw_input_mouse_target_owned(&registrations, our_hwnd));
+        let registrations = [
+            RAWINPUTDEVICE {
+                usUsagePage: RAW_INPUT_USAGE_PAGE_GENERIC,
+                usUsage: RAW_INPUT_USAGE_MOUSE,
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: our_hwnd,
+            },
+            RAWINPUTDEVICE {
+                usUsagePage: RAW_INPUT_USAGE_PAGE_GENERIC,
+                usUsage: RAW_INPUT_USAGE_KEYBOARD,
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: our_hwnd,
+            },
+        ];
+        assert!(raw_input_targets_owned(&registrations, our_hwnd));
+    }
+
+    #[test]
+    fn raw_keyboard_normalizes_control_side_and_key_state() {
+        let mut keyboard = RAWKEYBOARD {
+            VKey: VK_CONTROL_CODE,
+            ..Default::default()
+        };
+        assert_eq!(
+            raw_keyboard_escape_key(&keyboard),
+            Some((VK_LCONTROL_CODE, KeyState::Down))
+        );
+
+        keyboard.Flags = RI_KEY_E0 as u16;
+        assert_eq!(
+            raw_keyboard_escape_key(&keyboard),
+            Some((VK_RCONTROL_CODE, KeyState::Down))
+        );
+
+        keyboard.Flags = (RI_KEY_E0 | RI_KEY_BREAK) as u16;
+        assert_eq!(
+            raw_keyboard_escape_key(&keyboard),
+            Some((VK_RCONTROL_CODE, KeyState::Up))
+        );
+
+        keyboard.VKey = 0x41;
+        assert_eq!(raw_keyboard_escape_key(&keyboard), None);
+        keyboard.VKey = u8::MAX as u16;
+        assert_eq!(raw_keyboard_escape_key(&keyboard), None);
+
+        assert_eq!(
+            hook_control_virtual_key(VK_CONTROL_CODE, 0),
+            VK_LCONTROL_CODE
+        );
+        assert_eq!(
+            hook_control_virtual_key(VK_CONTROL_CODE, LLKHF_EXTENDED_MASK),
+            VK_RCONTROL_CODE
+        );
+    }
+
+    #[test]
+    fn raw_keyboard_is_authoritative_and_hook_copies_do_not_double_count() {
+        let core = test_runtime_core();
+        set_hook_lock_active_for(&core, true).expect("lock");
+        set_raw_keyboard_escape_enabled_for(&core, true);
+        let start = Instant::now();
+        let window = Duration::from_millis(800);
+
+        assert!(!try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start,
+            window,
+        ));
+        assert!(!try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::RawKeyboard,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start,
+            window,
+        ));
+        assert!(!try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::RawKeyboard,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + Duration::from_millis(20),
+            window,
+        ));
+        assert!(!try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + Duration::from_millis(20),
+            window,
+        ));
+        assert!(try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::RawKeyboard,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start + Duration::from_millis(200),
+            window,
+        ));
+        assert!(!try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start + Duration::from_millis(200),
+            window,
+        ));
+
+        assert!(!core.lock_active.load(Ordering::Acquire));
+        assert_eq!(core.escape_unlock_pending.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn raw_keyboard_unlocks_when_low_level_hook_is_silent() {
+        for vk_code in [VK_LCONTROL_CODE, VK_RCONTROL_CODE] {
+            let core = test_runtime_core();
+            set_hook_lock_active_for(&core, true).expect("lock");
+            set_raw_keyboard_escape_enabled_for(&core, true);
+            let start = Instant::now();
+            let window = Duration::from_millis(800);
+
+            observe_raw_keyboard_hook_health(&core, vk_code, KeyState::Down, 41);
+            assert!(core.keyboard_hook_degraded.load(Ordering::Acquire));
+            assert!(!try_escape_unlock_for_key_from_source_at(
+                &core,
+                EscapeDetectorSource::RawKeyboard,
+                vk_code,
+                KeyState::Down,
+                start,
+                window,
+            ));
+            assert!(!try_escape_unlock_for_key_from_source_at(
+                &core,
+                EscapeDetectorSource::RawKeyboard,
+                vk_code,
+                KeyState::Up,
+                start + Duration::from_millis(20),
+                window,
+            ));
+            assert!(try_escape_unlock_for_key_from_source_at(
+                &core,
+                EscapeDetectorSource::RawKeyboard,
+                vk_code,
+                KeyState::Down,
+                start + Duration::from_millis(200),
+                window,
+            ));
+            assert_eq!(core.escape_unlock_pending.load(Ordering::Acquire), 1);
+        }
+    }
+
+    #[test]
+    fn hook_degradation_is_bounded_until_detector_source_resets() {
+        let core = test_runtime_core();
+        set_raw_keyboard_escape_enabled_for(&core, true);
+
+        observe_raw_keyboard_hook_health(&core, VK_LCONTROL_CODE, KeyState::Down, 50);
+        assert!(core.keyboard_hook_degraded.load(Ordering::Acquire));
+
+        record_keyboard_hook_observation(&core, VK_RCONTROL_CODE, KeyState::Up, 51);
+        observe_raw_keyboard_hook_health(&core, VK_RCONTROL_CODE, KeyState::Up, 51);
+        assert!(core.keyboard_hook_degraded.load(Ordering::Acquire));
+
+        set_raw_keyboard_escape_enabled_for(&core, false);
+        assert!(!core.keyboard_hook_degraded.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn switching_detector_source_discards_partial_gesture() {
+        let core = test_runtime_core();
+        set_hook_lock_active_for(&core, true).expect("lock");
+        set_raw_keyboard_escape_enabled_for(&core, true);
+        let start = Instant::now();
+        let window = Duration::from_millis(800);
+
+        assert!(!try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::RawKeyboard,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start,
+            window,
+        ));
+        assert!(!try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::RawKeyboard,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + Duration::from_millis(20),
+            window,
+        ));
+
+        set_raw_keyboard_escape_enabled_for(&core, false);
+        assert!(!try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start + Duration::from_millis(100),
+            window,
+        ));
+        assert!(core.lock_active.load(Ordering::Acquire));
+        assert!(!try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + Duration::from_millis(120),
+            window,
+        ));
+        assert!(try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start + Duration::from_millis(200),
+            window,
+        ));
+    }
+
+    #[test]
+    fn missing_control_key_up_expires_without_poisoning_next_gesture() {
+        let core = test_runtime_core();
+        set_hook_lock_active_for(&core, true).expect("lock");
+        let start = Instant::now();
+        let window = Duration::from_millis(800);
+
+        assert!(!try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start,
+            window,
+        ));
+        assert!(!try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start + window + Duration::from_millis(1),
+            window,
+        ));
+        assert!(core.lock_active.load(Ordering::Acquire));
+        assert!(!try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Up,
+            start + window + Duration::from_millis(20),
+            window,
+        ));
+        assert!(try_escape_unlock_for_key_from_source_at(
+            &core,
+            EscapeDetectorSource::KeyboardHook,
+            VK_LCONTROL_CODE,
+            KeyState::Down,
+            start + window + Duration::from_millis(200),
+            window,
+        ));
     }
 
     #[test]

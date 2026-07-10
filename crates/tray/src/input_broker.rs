@@ -221,12 +221,7 @@ impl ClipboardBrokerState {
 
 impl SafetyUnlockReconciler {
     fn observe(&mut self, actions: Vec<HookControlAction>) {
-        for action in actions {
-            let cause = match action {
-                HookControlAction::EscapeUnlock => "escape",
-                HookControlAction::LeaseExpiredUnlock => "lease_expired",
-            };
-            eprintln!("boundless_input_safety_unlock cause={cause}");
+        for _ in actions {
             self.pending_report_count = self.pending_report_count.saturating_add(1);
             self.waiting_for_daemon_release = true;
         }
