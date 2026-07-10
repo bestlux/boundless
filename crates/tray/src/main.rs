@@ -75,6 +75,10 @@ mod windows_app {
         start_daemon: bool,
         #[arg(long, hide = true, default_value_t = false)]
         start_service_elevated: bool,
+        /// Ask the existing tray in this user session to follow its normal
+        /// fail-open Quit path, then exit this control process.
+        #[arg(long, default_value_t = false)]
+        quit: bool,
     }
 
     #[derive(Debug)]
@@ -1793,6 +1797,15 @@ mod windows_app {
             assert!(first.starts_with("Local\\Boundless.Tray.SingleInstance.v1."));
             assert_ne!(first, other_session);
             assert_ne!(first, other_user);
+        }
+
+        #[test]
+        fn quit_control_mode_does_not_enable_service_start() {
+            let cli = Cli::try_parse_from(["boundlesstray", "--quit"])
+                .expect("quit control mode should parse");
+
+            assert!(cli.quit);
+            assert!(!cli.start_service_elevated);
         }
     }
 }

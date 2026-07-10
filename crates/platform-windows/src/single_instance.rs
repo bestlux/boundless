@@ -31,6 +31,7 @@ pub enum SingleInstanceAcquire {
 pub struct SingleInstanceGuard {
     owner_mutex: OwnedHandle,
     activation_event: Arc<OwnedHandle>,
+    shutdown_event: Arc<OwnedHandle>,
     listener: Option<ActivationListener>,
 }
 
@@ -66,6 +67,14 @@ impl SingleInstanceGuard {
         }
 
         let activation_event = Arc::new(OwnedHandle(activation_event));
+        let shutdown_event_name = wide_null(&format!("{name}.Shutdown"));
+        let shutdown_event =
+            unsafe { CreateEventW(&attributes, 0, 0, shutdown_event_name.as_ptr()) };
+        if shutdown_event.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to create tray shutdown event");
+        }
+        let shutdown_event = Arc::new(OwnedHandle(shutdown_event));
         if owner_already_exists {
             if unsafe { SetEvent(activation_event.0) } == 0 {
                 return Err(std::io::Error::last_os_error())
@@ -85,13 +94,61 @@ impl SingleInstanceGuard {
         Ok(SingleInstanceAcquire::Primary(Self {
             owner_mutex,
             activation_event,
+            shutdown_event,
             listener: None,
         }))
     }
 
-    pub fn start_activation_listener<F>(&mut self, on_activation: F) -> Result<()>
+    /// Signals a currently owned tray instance to follow its normal Quit path.
+    ///
+    /// `Ok(false)` means there is no owner. Creating the mutex without taking
+    /// ownership lets this probe stay race-safe without becoming a temporary
+    /// tray owner itself.
+    pub fn request_shutdown(name: &str, user_sid: &str) -> Result<bool> {
+        if name.is_empty() || !name.starts_with("Local\\") {
+            bail!("single-instance event name must use the Local namespace");
+        }
+        if !validate_allowed_user_sid_shape(user_sid) {
+            bail!("single-instance user SID must use canonical numeric SID syntax");
+        }
+
+        let security = KernelObjectSecurityDescriptor::for_user(user_sid)?;
+        let attributes = security.attributes();
+        let mutex_name = wide_null(&format!("{name}.Owner"));
+        unsafe {
+            SetLastError(0);
+        }
+        let owner_mutex = unsafe { CreateMutexW(&attributes, 0, mutex_name.as_ptr()) };
+        if owner_mutex.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to probe tray single-instance owner mutex");
+        }
+        let owner_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        let _owner_mutex = OwnedHandle(owner_mutex);
+        if !owner_exists {
+            return Ok(false);
+        }
+
+        let shutdown_event_name = wide_null(&format!("{name}.Shutdown"));
+        let shutdown_event =
+            unsafe { CreateEventW(&attributes, 0, 0, shutdown_event_name.as_ptr()) };
+        if shutdown_event.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to open tray shutdown event");
+        }
+        let shutdown_event = OwnedHandle(shutdown_event);
+        if unsafe { SetEvent(shutdown_event.0) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to signal the existing tray to shut down");
+        }
+
+        Ok(true)
+    }
+
+    pub fn start_listener<F, G>(&mut self, on_activation: F, on_shutdown: G) -> Result<()>
     where
         F: Fn() + Send + 'static,
+        G: Fn() + Send + 'static,
     {
         if self.listener.is_some() {
             bail!("single-instance activation listener is already running");
@@ -105,17 +162,22 @@ impl SingleInstanceGuard {
 
         let stop_event = Arc::new(OwnedHandle(stop_event));
         let activation_event = self.activation_event.clone();
+        let shutdown_event = self.shutdown_event.clone();
         let listener_stop_event = stop_event.clone();
         let join = thread::Builder::new()
             .name("boundless-tray-activation".to_string())
             .spawn(move || {
-                let handles = [activation_event.0, listener_stop_event.0];
+                let handles = [activation_event.0, shutdown_event.0, listener_stop_event.0];
                 loop {
                     match unsafe {
                         WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE)
                     } {
                         WAIT_OBJECT_0 => on_activation(),
-                        result if result == WAIT_OBJECT_0 + 1 => break,
+                        result if result == WAIT_OBJECT_0 + 1 => {
+                            on_shutdown();
+                            break;
+                        }
+                        result if result == WAIT_OBJECT_0 + 2 => break,
                         _ => break,
                     }
                 }
@@ -256,9 +318,12 @@ mod tests {
         };
         let (tx, rx) = mpsc::channel();
         primary
-            .start_activation_listener(move || {
-                tx.send(()).expect("activation receiver should stay open");
-            })
+            .start_listener(
+                move || {
+                    tx.send(()).expect("activation receiver should stay open");
+                },
+                || {},
+            )
             .expect("listener should start");
 
         let secondary_name = name.clone();
@@ -272,6 +337,47 @@ mod tests {
         assert!(secondary.join().expect("secondary thread should finish"));
         rx.recv_timeout(Duration::from_secs(2))
             .expect("primary should receive activation");
+    }
+
+    #[test]
+    fn shutdown_request_signals_primary_listener() {
+        let name = unique_name("shutdown");
+        let sid = current_sid();
+        let SingleInstanceAcquire::Primary(mut primary) =
+            SingleInstanceGuard::acquire(&name, &sid).expect("first acquire should succeed")
+        else {
+            panic!("first acquire must become primary");
+        };
+        let (tx, rx) = mpsc::channel();
+        primary
+            .start_listener(
+                || {},
+                move || {
+                    tx.send(()).expect("shutdown receiver should stay open");
+                },
+            )
+            .expect("listener should start");
+
+        assert!(
+            SingleInstanceGuard::request_shutdown(&name, &sid)
+                .expect("shutdown request should succeed")
+        );
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("primary should receive shutdown");
+    }
+
+    #[test]
+    fn shutdown_request_reports_missing_owner_without_claiming_it() {
+        let name = unique_name("shutdown-no-owner");
+        let sid = current_sid();
+        assert!(
+            !SingleInstanceGuard::request_shutdown(&name, &sid)
+                .expect("missing-owner shutdown probe should succeed")
+        );
+        assert!(matches!(
+            SingleInstanceGuard::acquire(&name, &sid).expect("acquire should succeed"),
+            SingleInstanceAcquire::Primary(_)
+        ));
     }
 
     #[test]

@@ -142,7 +142,7 @@ function ConvertTo-ProcessArgument {
     return '"' + ($Value -replace '"', '\"') + '"'
 }
 
-function Invoke-BoundlessMsi {
+function New-BoundlessMsiArguments {
     param(
         [string]$ResolvedInstallerPath,
         [string]$Sid
@@ -169,16 +169,25 @@ function Invoke-BoundlessMsi {
         $arguments += @("/l*v", $resolvedLogPath)
     }
 
-    $argumentLine = @($arguments | ForEach-Object { ConvertTo-ProcessArgument -Value $_ }) -join " "
-    $startArgs = @{
-        FilePath = "msiexec.exe"
-        ArgumentList = $argumentLine
-        Wait = $true
-        PassThru = $true
-    }
+    return $arguments
+}
+
+function Invoke-BoundlessMsiElevated {
+    param(
+        [string]$ResolvedInstallerPath,
+        [string]$Sid
+    )
 
     if (-not (Test-IsAdministrator)) {
-        $startArgs.Verb = "RunAs"
+        throw "The MSI phase must run elevated."
+    }
+
+    $arguments = New-BoundlessMsiArguments -ResolvedInstallerPath $ResolvedInstallerPath -Sid $Sid
+    $startArgs = @{
+        FilePath = "msiexec.exe"
+        ArgumentList = (@($arguments | ForEach-Object { ConvertTo-ProcessArgument -Value $_ }) -join " ")
+        Wait = $true
+        PassThru = $true
     }
 
     $process = Start-Process @startArgs
@@ -187,6 +196,186 @@ function Invoke-BoundlessMsi {
     }
 
     return $process.ExitCode
+}
+
+function Resolve-CurrentPowerShellExecutable {
+    $currentProcess = Get-Process -Id $PID -ErrorAction Stop
+    if (-not [string]::IsNullOrWhiteSpace($currentProcess.Path)) {
+        return $currentProcess.Path
+    }
+
+    foreach ($candidate in @("pwsh.exe", "powershell.exe")) {
+        $command = Get-Command $candidate -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $command) {
+            return $command.Source
+        }
+    }
+    throw "Could not resolve the current PowerShell executable for elevation."
+}
+
+function Assert-ElevatedInstallResult {
+    param([object]$Result)
+
+    if ($null -eq $Result -or $Result.status -ne "passed") {
+        $detail = if ($null -ne $Result -and $Result.PSObject.Properties.Match("error").Count -gt 0) {
+            $Result.error
+        }
+        else {
+            "elevated install result was missing or malformed"
+        }
+        throw "Elevated Boundless install failed: $detail"
+    }
+    if ($Result.msi_exit_code -notin @(0, 3010)) {
+        throw "Elevated Boundless install returned unexpected MSI exit code $($Result.msi_exit_code)."
+    }
+    if ($Result.service_shutdown.force_kill_used) {
+        throw "Elevated Boundless install reported a forbidden service force-kill."
+    }
+    return $Result
+}
+
+function Invoke-ElevatedInstallPhase {
+    param(
+        [string]$ResolvedInstallerPath,
+        [string]$Sid
+    )
+
+    if (-not (Test-IsAdministrator)) {
+        throw "Internal elevated install phase was not elevated."
+    }
+
+    # This stop is sequential and bounded. MSI ServiceControl remains in the
+    # package as an idempotent verification/repair contract; it does not race a
+    # concurrent helper stop and the helper never force-kills the service.
+    $serviceShutdown = Stop-BoundlessServiceForUpgrade
+    $exitCode = Invoke-BoundlessMsiElevated -ResolvedInstallerPath $ResolvedInstallerPath -Sid $Sid
+    return [pscustomobject]@{
+        status = "passed"
+        msi_exit_code = $exitCode
+        service_shutdown = $serviceShutdown
+    }
+}
+
+function New-BoundlessElevatedInstallCommand {
+    param(
+        [string]$ResolvedInstallerPath,
+        [string]$Sid
+    )
+
+    $payload = [ordered]@{
+        installer_path = $ResolvedInstallerPath
+        installer_sha256 = (Get-FileHash -LiteralPath $ResolvedInstallerPath -Algorithm SHA256).Hash
+        sid = $Sid
+        quiet = [bool]$Quiet
+        no_restart = [bool]$NoRestart
+        log_path = $LogPath
+    }
+    $payloadJson = $payload | ConvertTo-Json -Compress
+    $payloadBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payloadJson))
+    $newline = [Environment]::NewLine
+    $parts = @(
+        "Set-StrictMode -Version Latest",
+        '$ErrorActionPreference = "Stop"'
+    )
+    foreach ($functionName in @(
+        "Test-IsAdministrator",
+        "Assert-AllowedUserSid",
+        "ConvertTo-ProcessArgument",
+        "New-BoundlessMsiArguments",
+        "Invoke-BoundlessMsiElevated",
+        "Get-BoundlessServiceStopDecision",
+        "Stop-BoundlessServiceForUpgrade",
+        "Invoke-ElevatedInstallPhase"
+    )) {
+        $definition = (Get-Command $functionName -CommandType Function -ErrorAction Stop).Definition
+        $parts += ('function {0} {{{1}{2}{1}}}' -f $functionName, $newline, $definition)
+    }
+    $parts += @(
+        ('$payloadJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("{0}"))' -f $payloadBase64),
+        '$payload = $payloadJson | ConvertFrom-Json',
+        '$Quiet = [bool]$payload.quiet',
+        '$NoRestart = [bool]$payload.no_restart',
+        '$LogPath = [string]$payload.log_path',
+        'try {',
+        '    Assert-AllowedUserSid -Sid $payload.sid',
+        '    $actualHash = (Get-FileHash -LiteralPath $payload.installer_path -Algorithm SHA256).Hash',
+        '    if ($actualHash -ne $payload.installer_sha256) { throw "The MSI changed between preflight and elevation." }',
+        '    $result = Invoke-ElevatedInstallPhase -ResolvedInstallerPath $payload.installer_path -Sid $payload.sid',
+        '    Write-Host "boundless_install_service_stop_initial=$($result.service_shutdown.initial_status)"',
+        '    Write-Host "boundless_install_service_stop_final=$($result.service_shutdown.final_status)"',
+        '    Write-Host "boundless_install_service_stop_elapsed_ms=$($result.service_shutdown.elapsed_milliseconds)"',
+        '    exit [int]$result.msi_exit_code',
+        '}',
+        'catch {',
+        '    Write-Error $_',
+        '    exit 1',
+        '}'
+    )
+    $source = $parts -join ($newline + $newline)
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($source))
+    if ($encodedCommand.Length -gt 30000) {
+        throw "The bounded elevated install command exceeded the safe Windows command-line budget."
+    }
+    return [pscustomobject]@{
+        source = $source
+        encoded_command = $encodedCommand
+        installer_sha256 = $payload.installer_sha256
+    }
+}
+
+function Invoke-BoundlessMsi {
+    param(
+        [string]$ResolvedInstallerPath,
+        [string]$Sid
+    )
+
+    if (Test-IsAdministrator) {
+        return Assert-ElevatedInstallResult -Result (
+            Invoke-ElevatedInstallPhase -ResolvedInstallerPath $ResolvedInstallerPath -Sid $Sid
+        )
+    }
+
+    $elevatedCommandArgs = @{
+        ResolvedInstallerPath = $ResolvedInstallerPath
+        Sid = $Sid
+    }
+    $elevatedCommand = New-BoundlessElevatedInstallCommand @elevatedCommandArgs
+    $arguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        $elevatedCommand.encoded_command
+    )
+
+    $startArgs = @{
+        FilePath = (Resolve-CurrentPowerShellExecutable)
+        ArgumentList = (@($arguments | ForEach-Object { ConvertTo-ProcessArgument -Value $_ }) -join " ")
+        Verb = "RunAs"
+        WindowStyle = "Hidden"
+        Wait = $true
+        PassThru = $true
+    }
+    $process = Start-Process @startArgs
+    if ($process.ExitCode -notin @(0, 3010)) {
+        throw "Elevated Boundless install phase exited with $($process.ExitCode)."
+    }
+
+    # The elevated phase can launch MSI only after the bounded non-forced
+    # service stop completed. Exact stop timing is printed in that phase; this
+    # parent records only the cross-elevation contract.
+    return Assert-ElevatedInstallResult -Result ([pscustomobject]@{
+        status = "passed"
+        msi_exit_code = $process.ExitCode
+        service_shutdown = [pscustomobject]@{
+            initial_status = "captured_in_elevated_phase"
+            final_status = "StoppedOrNotInstalledBeforeMsi"
+            stop_requested = $null
+            elapsed_milliseconds = $null
+            force_kill_used = $false
+            msi_service_control = "idempotent_verification_after_helper_stop"
+        }
+    })
 }
 
 function Get-MsiProperty {
@@ -286,6 +475,258 @@ function Invoke-BoundedProcess {
     }
     finally {
         $process.Dispose()
+    }
+}
+
+function Get-BoundlessServiceStopDecision {
+    param(
+        [string]$Status,
+        [bool]$StopRequested
+    )
+
+    if ($Status -eq "Stopped") {
+        return "complete"
+    }
+    if ($Status -eq "StopPending" -or $StopRequested) {
+        return "wait"
+    }
+    return "request_stop"
+}
+
+function Stop-BoundlessServiceForUpgrade {
+    param([int]$TimeoutSeconds = 15)
+
+    if (-not (Test-IsAdministrator)) {
+        throw "Stopping BoundlessService for upgrade requires elevation."
+    }
+
+    $service = Get-Service -Name "BoundlessService" -ErrorAction SilentlyContinue
+    if ($null -eq $service) {
+        return [pscustomobject]@{
+            initial_status = "NotInstalled"
+            final_status = "NotInstalled"
+            stop_requested = $false
+            elapsed_milliseconds = 0
+            force_kill_used = $false
+            msi_service_control = "idempotent_install_contract"
+        }
+    }
+
+    $initialStatus = $service.Status.ToString()
+    $stopRequested = $false
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $service = Get-Service -Name "BoundlessService" -ErrorAction SilentlyContinue
+        if ($null -eq $service) {
+            throw "BoundlessService disappeared while the helper was stopping it."
+        }
+
+        $status = $service.Status.ToString()
+        $decision = Get-BoundlessServiceStopDecision -Status $status -StopRequested $stopRequested
+        if ($decision -eq "complete") {
+            $stopwatch.Stop()
+            return [pscustomobject]@{
+                initial_status = $initialStatus
+                final_status = $status
+                stop_requested = $stopRequested
+                elapsed_milliseconds = $stopwatch.ElapsedMilliseconds
+                force_kill_used = $false
+                msi_service_control = "idempotent_verification_after_helper_stop"
+            }
+        }
+        if ($decision -eq "request_stop" -and $service.CanStop) {
+            # ServiceController.Stop sends one normal SCM stop control and
+            # returns. The bounded poll below owns completion; there is no
+            # Stop-Process/TerminateProcess fallback.
+            $service.Stop()
+            $stopRequested = $true
+        }
+
+        Start-Sleep -Milliseconds 200
+    } while ((Get-Date) -lt $deadline)
+
+    $finalService = Get-Service -Name "BoundlessService" -ErrorAction SilentlyContinue
+    $finalStatus = if ($null -eq $finalService) { "Missing" } else { $finalService.Status.ToString() }
+    throw "BoundlessService did not stop within $($TimeoutSeconds)s; initial=$initialStatus current=$finalStatus. The MSI was not started."
+}
+
+function Get-ProcessOwnerSid {
+    param([int]$ProcessId)
+
+    $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop |
+        Select-Object -First 1
+    if ($null -eq $process) {
+        throw "Process $ProcessId exited before its owner could be verified."
+    }
+    $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop
+    if ($owner.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace($owner.Sid)) {
+        throw "Could not prove the owner SID for Boundless tray process $ProcessId; return=$($owner.ReturnValue)."
+    }
+    return $owner.Sid
+}
+
+function Assert-BoundlessTrayShutdownTargets {
+    param(
+        [object[]]$Processes,
+        [string]$ExpectedOwnerSid,
+        [int]$ExpectedSessionId
+    )
+
+    foreach ($process in @($Processes)) {
+        if ($process.session_id -ne $ExpectedSessionId) {
+            throw "Refusing to stop Boundless tray PID $($process.id) from session $($process.session_id); expected session $ExpectedSessionId."
+        }
+        if ([string]::IsNullOrWhiteSpace($process.owner_sid) -or $process.owner_sid -ne $ExpectedOwnerSid) {
+            throw "Refusing to stop Boundless tray PID $($process.id) because its owner SID could not be proven as $ExpectedOwnerSid."
+        }
+    }
+    return @($Processes)
+}
+
+function Initialize-BoundlessInstallNativeMethods {
+    if ($null -ne ("BoundlessInstallNativeMethods" -as [type])) {
+        return
+    }
+
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class BoundlessInstallNativeMethods
+{
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool PostThreadMessage(
+        uint threadId,
+        uint message,
+        UIntPtr wParam,
+        IntPtr lParam);
+}
+"@
+}
+
+function Request-LegacyBoundlessTrayQuit {
+    param([int[]]$ProcessIds)
+
+    Initialize-BoundlessInstallNativeMethods
+    $postCount = 0
+    foreach ($processId in $ProcessIds) {
+        $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+        if ($null -eq $process) {
+            continue
+        }
+        try {
+            foreach ($thread in @($process.Threads)) {
+                # v5.0.13 has no external Quit command. Posting WM_QUIT to its
+                # same-user GUI/hook message queues causes eframe to unwind and
+                # DashboardApp to drop; InputBrokerSupervisor::Drop then runs
+                # the existing local fail-open and bounded detach path.
+                if ([BoundlessInstallNativeMethods]::PostThreadMessage(
+                    [uint32]$thread.Id,
+                    [uint32]0x0012,
+                    [UIntPtr]::Zero,
+                    [IntPtr]::Zero
+                )) {
+                    $postCount += 1
+                }
+            }
+        }
+        catch {
+            if ($null -ne (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
+                throw "Could not request graceful legacy shutdown for Boundless tray PID $processId. $($_.Exception.Message)"
+            }
+        }
+    }
+    return $postCount
+}
+
+function Wait-BoundlessTrayProcessIdsExited {
+    param(
+        [int[]]$ProcessIds,
+        [int]$TimeoutMilliseconds
+    )
+
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMilliseconds)
+    do {
+        $remaining = @(
+            $ProcessIds |
+                Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) }
+        )
+        if ($remaining.Count -eq 0) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 100
+    } while ((Get-Date) -lt $deadline)
+    return $false
+}
+
+function Stop-BoundlessTrayForUpgrade {
+    param(
+        [string]$ExpectedOwnerSid,
+        [int]$TimeoutSeconds = 8
+    )
+
+    $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    $targets = @(
+        Assert-BoundlessTrayShutdownTargets -Processes @(
+            Get-BoundlessTrayProcessesForCurrentSession
+        ) -ExpectedOwnerSid $ExpectedOwnerSid -ExpectedSessionId $sessionId
+    )
+    if ($targets.Count -eq 0) {
+        return [pscustomobject]@{
+            initial_count = 0
+            control_requests = 0
+            legacy_thread_quit_posts = 0
+            elapsed_milliseconds = 0
+            force_kill_used = $false
+        }
+    }
+
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $processIds = @($targets | Select-Object -ExpandProperty id)
+    $controlRequests = 0
+    foreach ($path in @($targets.path | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)) {
+        try {
+            $result = Invoke-BoundedProcess -FilePath $path -ArgumentList @("--quit") -TimeoutSeconds 3
+            if ($result.exit_code -eq 0) {
+                $controlRequests += 1
+            }
+        }
+        catch {
+            # The v5.0.13 tray does not recognize --quit. Its bounded WM_QUIT
+            # bridge below is the only supported compatibility path.
+        }
+    }
+
+    if (Wait-BoundlessTrayProcessIdsExited -ProcessIds $processIds -TimeoutMilliseconds 2000) {
+        $stopwatch.Stop()
+        return [pscustomobject]@{
+            initial_count = $targets.Count
+            control_requests = $controlRequests
+            legacy_thread_quit_posts = 0
+            elapsed_milliseconds = $stopwatch.ElapsedMilliseconds
+            force_kill_used = $false
+        }
+    }
+
+    $legacyPosts = Request-LegacyBoundlessTrayQuit -ProcessIds $processIds
+    $remainingMilliseconds = [Math]::Max(100, ($TimeoutSeconds * 1000) - [int]$stopwatch.ElapsedMilliseconds)
+    if (-not (Wait-BoundlessTrayProcessIdsExited -ProcessIds $processIds -TimeoutMilliseconds $remainingMilliseconds)) {
+        $remaining = @(
+            $processIds |
+                Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) }
+        ) -join ","
+        throw "Boundless tray did not exit gracefully within $($TimeoutSeconds)s (remaining PIDs: $remaining). Quit Boundless manually and rerun the helper. The UAC/MSI phase was not started."
+    }
+
+    $stopwatch.Stop()
+    return [pscustomobject]@{
+        initial_count = $targets.Count
+        control_requests = $controlRequests
+        legacy_thread_quit_posts = $legacyPosts
+        elapsed_milliseconds = $stopwatch.ElapsedMilliseconds
+        force_kill_used = $false
     }
 }
 
@@ -408,6 +849,8 @@ function Get-BoundlessTrayProcessesForCurrentSession {
                 $responding = try { $_.Responding } catch { $false }
                 [pscustomobject]@{
                     id = $_.Id
+                    session_id = $_.SessionId
+                    owner_sid = Get-ProcessOwnerSid -ProcessId $_.Id
                     path = $path
                     responding = $responding
                 }
@@ -752,6 +1195,107 @@ function Invoke-InstallHelperSelfTest {
         throw "Tray path fixture accepted an old or portable executable path."
     }
 
+    $shutdownTarget = [pscustomobject]@{
+        id = 789
+        session_id = 7
+        owner_sid = $validSid
+        path = $expectedTrayPath
+        responding = $true
+    }
+    $shutdownTargetArgs = @{
+        Processes = @($shutdownTarget)
+        ExpectedOwnerSid = $validSid
+        ExpectedSessionId = 7
+    }
+    $acceptedShutdownTargets = @(
+        Assert-BoundlessTrayShutdownTargets @shutdownTargetArgs
+    )
+    if ($acceptedShutdownTargets.Count -ne 1) {
+        throw "Tray shutdown target fixture did not retain the proven same-user target."
+    }
+    $wrongOwnerRejected = $false
+    try {
+        $wrongOwnerTarget = $shutdownTarget.PSObject.Copy()
+        $wrongOwnerTarget.owner_sid = "S-1-5-21-9-9-9-1002"
+        $wrongOwnerArgs = @{
+            Processes = @($wrongOwnerTarget)
+            ExpectedOwnerSid = $validSid
+            ExpectedSessionId = 7
+        }
+        Assert-BoundlessTrayShutdownTargets @wrongOwnerArgs | Out-Null
+    }
+    catch {
+        $wrongOwnerRejected = $true
+    }
+    if (-not $wrongOwnerRejected) {
+        throw "Tray shutdown target fixture accepted another Windows user."
+    }
+    $currentProcessOwnerSid = Get-ProcessOwnerSid -ProcessId $PID
+    $currentIdentitySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($currentProcessOwnerSid -ne $currentIdentitySid) {
+        throw "Live process-owner fixture returned $currentProcessOwnerSid; expected $currentIdentitySid."
+    }
+    Initialize-BoundlessInstallNativeMethods
+    if ($null -eq [BoundlessInstallNativeMethods].GetMethod("PostThreadMessage")) {
+        throw "Legacy WM_QUIT bridge native fixture did not expose PostThreadMessage."
+    }
+
+    if (
+        (Get-BoundlessServiceStopDecision -Status "Stopped" -StopRequested $false) -ne "complete" -or
+        (Get-BoundlessServiceStopDecision -Status "StopPending" -StopRequested $false) -ne "wait" -or
+        (Get-BoundlessServiceStopDecision -Status "Running" -StopRequested $false) -ne "request_stop" -or
+        (Get-BoundlessServiceStopDecision -Status "Running" -StopRequested $true) -ne "wait"
+    ) {
+        throw "Bounded service-stop state fixture returned an unexpected action."
+    }
+
+    $validElevatedResult = [pscustomobject]@{
+        status = "passed"
+        msi_exit_code = 0
+        service_shutdown = [pscustomobject]@{
+            force_kill_used = $false
+        }
+    }
+    Assert-ElevatedInstallResult -Result $validElevatedResult | Out-Null
+    $rebootElevatedResult = $validElevatedResult.PSObject.Copy()
+    $rebootElevatedResult.msi_exit_code = 3010
+    Assert-ElevatedInstallResult -Result $rebootElevatedResult | Out-Null
+    $serviceForceKillRejected = $false
+    try {
+        $invalidElevatedResult = $validElevatedResult.PSObject.Copy()
+        $invalidElevatedResult.service_shutdown = [pscustomobject]@{
+            force_kill_used = $true
+        }
+        Assert-ElevatedInstallResult -Result $invalidElevatedResult | Out-Null
+    }
+    catch {
+        $serviceForceKillRejected = $true
+    }
+    if (-not $serviceForceKillRejected) {
+        throw "Elevated install fixture accepted a service force-kill."
+    }
+    $elevatedCommandArgs = @{
+        ResolvedInstallerPath = $PSCommandPath
+        Sid = $validSid
+    }
+    $elevatedCommand = New-BoundlessElevatedInstallCommand @elevatedCommandArgs
+    $decodedElevatedCommand = [Text.Encoding]::Unicode.GetString(
+        [Convert]::FromBase64String($elevatedCommand.encoded_command)
+    )
+    $commandTokens = $null
+    $commandErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput(
+        $decodedElevatedCommand,
+        [ref]$commandTokens,
+        [ref]$commandErrors
+    )
+    if ($commandErrors.Count -ne 0) {
+        throw "Elevated in-memory command fixture did not parse: $($commandErrors[0].Message)"
+    }
+    if ($decodedElevatedCommand -match '\$PSCommandPath|-File\s') {
+        throw "Elevated command fixture attempted to reload a user-writable helper script."
+    }
+
     $msiPropertyFixture = "skipped"
     if (-not [string]::IsNullOrWhiteSpace($InstallerPath)) {
         $resolvedSelfTestInstaller = (Resolve-Path -LiteralPath $InstallerPath).Path
@@ -800,6 +1344,11 @@ function Invoke-InstallHelperSelfTest {
         daemon_version_fixture = "passed"
         executable_version_fixture = "passed"
         tray_path_fixture = "passed"
+        tray_shutdown_identity_fixture = "passed"
+        legacy_quit_bridge_fixture = "passed"
+        bounded_service_stop_fixture = "passed"
+        elevated_install_result_fixture = "passed"
+        elevated_in_memory_command_fixture = "passed"
         msi_property_fixture = $msiPropertyFixture
     } | ConvertTo-Json -Depth 3
 }
@@ -834,12 +1383,24 @@ if (-not [string]::IsNullOrWhiteSpace($selection.account)) {
 }
 Write-Host "boundless_install_selected_user_source=$($selection.source)"
 
-$exitCode = Invoke-BoundlessMsi -ResolvedInstallerPath $resolvedInstallerPath -Sid $selection.sid
+$currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$trayShutdown = Stop-BoundlessTrayForUpgrade -ExpectedOwnerSid $currentUserSid
+Write-Host "boundless_install_tray_shutdown_count=$($trayShutdown.initial_count)"
+Write-Host "boundless_install_tray_shutdown_elapsed_ms=$($trayShutdown.elapsed_milliseconds)"
+$installResult = Invoke-BoundlessMsi -ResolvedInstallerPath $resolvedInstallerPath -Sid $selection.sid
+$exitCode = $installResult.msi_exit_code
 Write-Host "boundless_install_exit_code=$exitCode"
+Write-Host "boundless_install_service_stop_initial=$($installResult.service_shutdown.initial_status)"
+Write-Host "boundless_install_service_stop_final=$($installResult.service_shutdown.final_status)"
+if ($null -ne $installResult.service_shutdown.elapsed_milliseconds) {
+    Write-Host "boundless_install_service_stop_elapsed_ms=$($installResult.service_shutdown.elapsed_milliseconds)"
+}
 $verification = Invoke-PostInstallVerification `
     -ResolvedInstallerPath $resolvedInstallerPath `
     -ExpectedAllowedUserSid $selection.sid `
     -LaunchTray:(-not $Quiet -and -not (Test-IsAdministrator))
+$summary.pre_install_tray_shutdown = $trayShutdown
+$summary.elevated_install = $installResult
 $summary.post_install_verification = $verification
 $summary.status = if ($verification.tray_verification -eq "passed") {
     "installed_and_verified"

@@ -503,6 +503,26 @@ function Get-BoundlessProcessCountForSession {
     return @($procs).Count
 }
 
+function Wait-BoundlessProcessCountForSession {
+    param(
+        [string]$Name,
+        [int]$SessionId,
+        [int]$ExpectedCount,
+        [int]$TimeoutSeconds = 10
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $count = Get-BoundlessProcessCountForSession -Name $Name -SessionId $SessionId
+        if ($count -eq $ExpectedCount) {
+            return $count
+        }
+        Start-Sleep -Milliseconds 100
+    } while ((Get-Date) -lt $deadline)
+
+    throw "Expected $ExpectedCount $Name process(es) in session $SessionId within $($TimeoutSeconds)s; found $count."
+}
+
 function Get-BoundlessDaemonRuntimeCount {
     return (Get-BoundlessProcessCount -Name "boundlessd") +
         (Get-BoundlessProcessCount -Name "boundless-service")
@@ -625,6 +645,9 @@ try {
     $traySingleInstanceTested = $false
     $traySecondLaunchExitCode = $null
     $trayCurrentSessionCount = $null
+    $trayGracefulQuitTested = $false
+    $trayQuitControlExitCode = $null
+    $trayQuitElapsedMilliseconds = $null
     $upgradeInstallExitCode = $null
     $installExitCode = $null
     $repairExitCode = $null
@@ -862,6 +885,50 @@ try {
         }
         $null = Wait-ForDaemonReady -CliPath $cliPath
         $traySingleInstanceTested = $true
+
+        $quitStopwatch = [Diagnostics.Stopwatch]::StartNew()
+        $quitControlArgs = @{
+            FilePath = $trayPath
+            ArgumentList = "--quit"
+            WorkingDirectory = $installRoot
+            PassThru = $true
+        }
+        $quitControlProcess = Start-Process @quitControlArgs
+        if (-not $quitControlProcess.WaitForExit(5000)) {
+            throw "Tray --quit control process did not exit within 5 seconds. PID: $($quitControlProcess.Id)"
+        }
+        $trayQuitControlExitCode = $quitControlProcess.ExitCode
+        if ($trayQuitControlExitCode -ne 0) {
+            throw "Tray --quit control process failed. Exit code: $trayQuitControlExitCode"
+        }
+        $waitForQuitArgs = @{
+            Name = "boundlesstray"
+            SessionId = $currentSessionId
+            ExpectedCount = 0
+            TimeoutSeconds = 8
+        }
+        $null = Wait-BoundlessProcessCountForSession @waitForQuitArgs
+        $quitStopwatch.Stop()
+        $trayQuitElapsedMilliseconds = $quitStopwatch.ElapsedMilliseconds
+        $trayGracefulQuitTested = $true
+
+        $postQuitTrayArgs = @{
+            FilePath = $trayPath
+            WorkingDirectory = $installRoot
+            PassThru = $true
+        }
+        $postQuitTrayProcess = Start-Process @postQuitTrayArgs
+        Start-Sleep -Milliseconds 500
+        if ($postQuitTrayProcess.HasExited) {
+            throw "Tray exited immediately after graceful Quit/relaunch smoke. Exit code: $($postQuitTrayProcess.ExitCode)"
+        }
+        $null = Wait-ForDaemonReady -CliPath $cliPath
+        $waitForRelaunchArgs = @{
+            Name = "boundlesstray"
+            SessionId = $currentSessionId
+            ExpectedCount = 1
+        }
+        $trayCurrentSessionCount = Wait-BoundlessProcessCountForSession @waitForRelaunchArgs
     }
 
     $repairServiceDeleteOutput = Remove-BoundlessServiceRegistrationForRepair
@@ -928,6 +995,9 @@ try {
         tray_single_instance_tested = $traySingleInstanceTested
         tray_second_launch_exit_code = $traySecondLaunchExitCode
         tray_current_session_count = $trayCurrentSessionCount
+        tray_graceful_quit_tested = $trayGracefulQuitTested
+        tray_quit_control_exit_code = $trayQuitControlExitCode
+        tray_quit_elapsed_milliseconds = $trayQuitElapsedMilliseconds
         daemon_ready_output = $daemonReadyOutput
         upgraded_from = $PreviousInstallerPath
         previous_install_root = $previousInstallRoot

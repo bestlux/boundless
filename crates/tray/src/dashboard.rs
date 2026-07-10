@@ -59,6 +59,15 @@ pub(super) fn run() -> Result<()> {
     }
     let session_id = current_process_session_id().context("failed to resolve tray session id")?;
     let user_sid = current_user_sid_string().context("failed to resolve tray user SID")?;
+    let event_name = tray_single_instance_event_name(&user_sid, session_id);
+    if cli.quit {
+        let requested = SingleInstanceGuard::request_shutdown(&event_name, &user_sid)?;
+        eprintln!(
+            "boundless_tray_shutdown={}",
+            if requested { "requested" } else { "not_running" }
+        );
+        return Ok(());
+    }
     if let Some(hwnd) = find_existing_dashboard_window(session_id, &user_sid)? {
         if !activate_existing_dashboard_window(hwnd) {
             show_tray_startup_error("The existing Boundless tray could not be brought forward. Close it from Task Manager, then launch Boundless again.");
@@ -67,7 +76,6 @@ pub(super) fn run() -> Result<()> {
         eprintln!("boundless_tray_single_instance=legacy_existing_activated");
         return Ok(());
     }
-    let event_name = tray_single_instance_event_name(&user_sid, session_id);
     let acquisition = match SingleInstanceGuard::acquire(&event_name, &user_sid) {
         Ok(acquisition) => acquisition,
         Err(error) => {

@@ -29,7 +29,11 @@ Recommended flow
 
    powershell -NoProfile -ExecutionPolicy Bypass -File .\Boundless-<version>-windows-x64-install.ps1
 
-   The helper captures that user's SID before the UAC prompt and passes it to the elevated MSI.
+   The helper captures that user's SID, asks the current session's tray to run
+   its normal fail-open Quit path, and then uses one UAC prompt for a bounded
+   BoundlessService stop plus MSI execution. If the tray or service does not
+   stop within its safety bound, the helper fails before starting the MSI
+   rather than entering a FilesInUse loop or force-killing the service.
 
 2. Launch Boundless from the Start Menu, desktop shortcut, or boundlesstray.exe.
 
@@ -46,6 +50,11 @@ Install behavior
 ----------------
 - Default install root: %ProgramFiles%\Boundless
 - Default service integration: registers and starts BoundlessService as LocalSystem with AutoStart, using the supplied BOUNDLESS_ALLOWED_USER_SID for the control-pipe ACL
+- Upgrade shutdown ownership: the elevated helper pre-stops BoundlessService
+  once and waits for Stopped; MSI ServiceControl remains an idempotent
+  verification/repair contract and never races a concurrent helper stop
+- Same-version MSI upgrades are enabled for dogfood rebuilds; post-install
+  version and runtime checks still have to pass
 - Default startup integration: deferred; the machine-wide MSI does not create a Startup-folder shortcut yet
 - Default Start Menu entry: machine-wide Start Menu Programs shortcut for Boundless
 - Default desktop entry: machine-wide desktop shortcut for Boundless
