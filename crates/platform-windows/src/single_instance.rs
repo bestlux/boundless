@@ -5,23 +5,26 @@ use std::{
     mem, ptr,
     sync::Arc,
     thread::{self, JoinHandle},
+    time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, LocalFree, SetLastError,
-        WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, GetLastError, HANDLE, LocalFree,
+        SetLastError, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Security::{
         Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
         PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
     },
     System::Threading::{
-        CreateEventW, CreateMutexW, INFINITE, ReleaseMutex, SetEvent, WaitForMultipleObjects,
-        WaitForSingleObject,
+        CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, INFINITE, MUTEX_MODIFY_STATE, OpenEventW,
+        OpenMutexW, ReleaseMutex, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
     },
 };
 
 const OWNER_RECOVERY_WAIT_MS: u32 = 250;
+const SHUTDOWN_OPEN_RETRY_COUNT: usize = 50;
+const SHUTDOWN_OPEN_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 pub enum SingleInstanceAcquire {
     Primary(SingleInstanceGuard),
@@ -68,17 +71,6 @@ impl SingleInstanceGuard {
         }
 
         let activation_event = Arc::new(OwnedHandle(activation_event));
-        let shutdown_security =
-            KernelObjectSecurityDescriptor::for_user(user_sid, IntegrityLevel::Medium)?;
-        let shutdown_attributes = shutdown_security.attributes();
-        let shutdown_event_name = wide_null(&format!("{name}.Shutdown"));
-        let shutdown_event =
-            unsafe { CreateEventW(&shutdown_attributes, 0, 0, shutdown_event_name.as_ptr()) };
-        if shutdown_event.is_null() {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to create tray shutdown event");
-        }
-        let shutdown_event = Arc::new(OwnedHandle(shutdown_event));
         if owner_already_exists {
             if unsafe { SetEvent(activation_event.0) } == 0 {
                 return Err(std::io::Error::last_os_error())
@@ -95,6 +87,34 @@ impl SingleInstanceGuard {
             }
         }
 
+        // Only the thread that owns the primary mutex may publish Shutdown.
+        // A secondary/requester must never create it during the small gap
+        // between owner-mutex acquisition and primary initialization.
+        let shutdown_security =
+            KernelObjectSecurityDescriptor::for_user(user_sid, IntegrityLevel::Medium)?;
+        let shutdown_attributes = shutdown_security.attributes();
+        let shutdown_event_name = wide_null(&format!("{name}.Shutdown"));
+        unsafe {
+            SetLastError(0);
+        }
+        let shutdown_event =
+            unsafe { CreateEventW(&shutdown_attributes, 0, 0, shutdown_event_name.as_ptr()) };
+        if shutdown_event.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                ReleaseMutex(owner_mutex.0);
+            }
+            return Err(error).context("failed to create tray shutdown event");
+        }
+        let shutdown_already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        let shutdown_event = Arc::new(OwnedHandle(shutdown_event));
+        if shutdown_already_exists {
+            unsafe {
+                ReleaseMutex(owner_mutex.0);
+            }
+            bail!("refusing tray ownership because the shutdown event unexpectedly pre-existed");
+        }
+
         Ok(SingleInstanceAcquire::Primary(Self {
             owner_mutex,
             activation_event,
@@ -105,9 +125,9 @@ impl SingleInstanceGuard {
 
     /// Signals a currently owned tray instance to follow its normal Quit path.
     ///
-    /// `Ok(false)` means there is no owner. Creating the mutex without taking
-    /// ownership lets this probe stay race-safe without becoming a temporary
-    /// tray owner itself.
+    /// `Ok(false)` means there is no shutdown-capable owner. This path opens
+    /// existing kernel objects only, so it cannot pre-create a lower-integrity
+    /// shutdown event during primary initialization.
     pub fn request_shutdown(name: &str, user_sid: &str) -> Result<bool> {
         if name.is_empty() || !name.starts_with("Local\\") {
             bail!("single-instance event name must use the Local namespace");
@@ -116,41 +136,41 @@ impl SingleInstanceGuard {
             bail!("single-instance user SID must use canonical numeric SID syntax");
         }
 
-        let owner_security =
-            KernelObjectSecurityDescriptor::for_user(user_sid, IntegrityLevel::Low)?;
-        let attributes = owner_security.attributes();
         let mutex_name = wide_null(&format!("{name}.Owner"));
-        unsafe {
-            SetLastError(0);
-        }
-        let owner_mutex = unsafe { CreateMutexW(&attributes, 0, mutex_name.as_ptr()) };
+        let owner_mutex = unsafe { OpenMutexW(MUTEX_MODIFY_STATE, 0, mutex_name.as_ptr()) };
         if owner_mutex.is_null() {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to probe tray single-instance owner mutex");
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+                return Ok(false);
+            }
+            return Err(error).context("failed to open tray single-instance owner mutex");
         }
-        let owner_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
         let _owner_mutex = OwnedHandle(owner_mutex);
-        if !owner_exists {
-            return Ok(false);
-        }
 
-        let shutdown_security =
-            KernelObjectSecurityDescriptor::for_user(user_sid, IntegrityLevel::Medium)?;
-        let shutdown_attributes = shutdown_security.attributes();
         let shutdown_event_name = wide_null(&format!("{name}.Shutdown"));
-        let shutdown_event =
-            unsafe { CreateEventW(&shutdown_attributes, 0, 0, shutdown_event_name.as_ptr()) };
-        if shutdown_event.is_null() {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to open tray shutdown event");
-        }
-        let shutdown_event = OwnedHandle(shutdown_event);
-        if unsafe { SetEvent(shutdown_event.0) } == 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to signal the existing tray to shut down");
+        for attempt in 0..=SHUTDOWN_OPEN_RETRY_COUNT {
+            let shutdown_event =
+                unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, shutdown_event_name.as_ptr()) };
+            if !shutdown_event.is_null() {
+                let shutdown_event = OwnedHandle(shutdown_event);
+                if unsafe { SetEvent(shutdown_event.0) } == 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("failed to signal the existing tray to shut down");
+                }
+                return Ok(true);
+            }
+
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_FILE_NOT_FOUND as i32) {
+                return Err(error).context("failed to open tray shutdown event");
+            }
+            if attempt == SHUTDOWN_OPEN_RETRY_COUNT {
+                return Ok(false);
+            }
+            thread::sleep(SHUTDOWN_OPEN_RETRY_DELAY);
         }
 
-        Ok(true)
+        Ok(false)
     }
 
     pub fn start_listener<F, G>(&mut self, on_activation: F, on_shutdown: G) -> Result<()>
@@ -327,6 +347,34 @@ mod tests {
         current_user_sid_string().expect("current user SID should resolve")
     }
 
+    fn create_owned_mutex(name: &str, sid: &str) -> OwnedHandle {
+        let security = KernelObjectSecurityDescriptor::for_user(sid, IntegrityLevel::Low)
+            .expect("owner mutex security should build");
+        let attributes = security.attributes();
+        let owner_name = wide_null(&format!("{name}.Owner"));
+        unsafe {
+            SetLastError(0);
+        }
+        let owner = unsafe { CreateMutexW(&attributes, 1, owner_name.as_ptr()) };
+        assert!(!owner.is_null(), "owner mutex should be created");
+        assert_ne!(unsafe { GetLastError() }, ERROR_ALREADY_EXISTS);
+        OwnedHandle(owner)
+    }
+
+    fn create_shutdown_event(name: &str, sid: &str, integrity: IntegrityLevel) -> OwnedHandle {
+        let security = KernelObjectSecurityDescriptor::for_user(sid, integrity)
+            .expect("shutdown event security should build");
+        let attributes = security.attributes();
+        let shutdown_name = wide_null(&format!("{name}.Shutdown"));
+        unsafe {
+            SetLastError(0);
+        }
+        let shutdown = unsafe { CreateEventW(&attributes, 0, 0, shutdown_name.as_ptr()) };
+        assert!(!shutdown.is_null(), "shutdown event should be created");
+        assert_ne!(unsafe { GetLastError() }, ERROR_ALREADY_EXISTS);
+        OwnedHandle(shutdown)
+    }
+
     #[test]
     fn second_acquire_signals_primary_listener() {
         let name = unique_name("activation");
@@ -401,6 +449,62 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_request_waits_for_primary_to_publish_event_without_creating_it() {
+        let name = unique_name("shutdown-open-race");
+        let sid = current_sid();
+        let owner_name = name.clone();
+        let owner_sid = sid.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let publisher = thread::spawn(move || {
+            let owner = create_owned_mutex(&owner_name, &owner_sid);
+            ready_tx
+                .send(())
+                .expect("shutdown requester should wait for owner readiness");
+            thread::sleep(Duration::from_millis(50));
+            let shutdown = create_shutdown_event(&owner_name, &owner_sid, IntegrityLevel::Medium);
+            assert_eq!(
+                unsafe { WaitForSingleObject(shutdown.0, 2_000) },
+                WAIT_OBJECT_0,
+                "requester should signal the event published after the owner mutex"
+            );
+            unsafe {
+                ReleaseMutex(owner.0);
+            }
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("owner mutex should be published");
+        assert!(
+            SingleInstanceGuard::request_shutdown(&name, &sid)
+                .expect("requester should tolerate the owner initialization gap")
+        );
+        publisher
+            .join()
+            .expect("shutdown event publisher should finish");
+    }
+
+    #[test]
+    fn primary_rejects_a_precreated_low_integrity_shutdown_event() {
+        let name = unique_name("shutdown-precreated");
+        let sid = current_sid();
+        let rogue_shutdown = create_shutdown_event(&name, &sid, IntegrityLevel::Low);
+
+        let error = match SingleInstanceGuard::acquire(&name, &sid) {
+            Ok(_) => panic!("primary must reject a pre-created shutdown event"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unexpectedly pre-existed"));
+
+        drop(rogue_shutdown);
+        assert!(matches!(
+            SingleInstanceGuard::acquire(&name, &sid)
+                .expect("acquire should recover after the rogue event closes"),
+            SingleInstanceAcquire::Primary(_)
+        ));
+    }
+
+    #[test]
     fn dropping_primary_allows_clean_reacquire() {
         let name = unique_name("reacquire");
         let SingleInstanceAcquire::Primary(primary) =
@@ -453,24 +557,54 @@ mod tests {
     #[test]
     fn abandoned_owner_is_promoted_to_primary() {
         let name = unique_name("abandoned");
+        let sid = current_sid();
         let owner_name = name.clone();
+        let owner_sid = sid.clone();
+        let (owner_tx, owner_rx) = mpsc::channel();
         thread::spawn(move || {
-            let SingleInstanceAcquire::Primary(primary) =
-                SingleInstanceGuard::acquire(&owner_name, &current_sid())
-                    .expect("owner acquire should succeed")
-            else {
-                panic!("owner thread must become primary");
-            };
-            std::mem::forget(primary);
+            owner_tx
+                .send(create_owned_mutex(&owner_name, &owner_sid))
+                .expect("abandoned owner handle should stay open for recovery");
         })
         .join()
-        .expect("owner thread should exit");
+        .expect("owner thread should exit and abandon the mutex");
+        let abandoned_owner = owner_rx
+            .recv()
+            .expect("abandoned owner handle should be retained");
 
-        assert!(matches!(
-            SingleInstanceGuard::acquire(&name, &current_sid())
-                .expect("abandoned owner recovery should succeed"),
-            SingleInstanceAcquire::Primary(_)
-        ));
+        let recovered = SingleInstanceGuard::acquire(&name, &sid)
+            .expect("abandoned owner recovery should succeed");
+        assert!(matches!(&recovered, SingleInstanceAcquire::Primary(_)));
+        drop(recovered);
+        drop(abandoned_owner);
+    }
+
+    #[test]
+    fn abandoned_owner_promotion_rejects_a_preexisting_shutdown_event() {
+        let name = unique_name("abandoned-precreated-shutdown");
+        let sid = current_sid();
+        let owner_name = name.clone();
+        let owner_sid = sid.clone();
+        let (handles_tx, handles_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let owner = create_owned_mutex(&owner_name, &owner_sid);
+            let shutdown = create_shutdown_event(&owner_name, &owner_sid, IntegrityLevel::Low);
+            handles_tx
+                .send((owner, shutdown))
+                .expect("stale handles should remain open during promotion");
+        })
+        .join()
+        .expect("owner thread should abandon the mutex");
+        let stale_handles = handles_rx
+            .recv()
+            .expect("stale kernel object handles should be retained");
+
+        let error = match SingleInstanceGuard::acquire(&name, &sid) {
+            Ok(_) => panic!("stale-owner promotion must reject a pre-existing shutdown event"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unexpectedly pre-existed"));
+        drop(stale_handles);
     }
 
     #[test]

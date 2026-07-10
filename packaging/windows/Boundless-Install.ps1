@@ -337,7 +337,54 @@ function Exit-BoundlessTrayQuiescence {
 }
 
 function Get-BoundlessAdminOnlyStageSddl {
-    return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)S:(ML;;NW;;;ME)"
+    # A protected DACL is sufficient because the stage is created atomically
+    # below a machine-owned known folder. Avoid a mandatory-label SACL here:
+    # setting one during directory creation requires a privilege that a normal
+    # split-token administrator does not receive merely by accepting UAC.
+    return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+}
+
+function New-BoundlessSecuredDirectoryAtomic {
+    param(
+        [string]$Path,
+        [Security.AccessControl.DirectorySecurity]$Security
+    )
+
+    $create = [IO.Directory].GetMethods() |
+        Where-Object {
+            $parameters = $_.GetParameters()
+            $_.Name -eq "CreateDirectory" -and $parameters.Count -eq 2 -and
+                $parameters[0].ParameterType -eq [string] -and
+                $parameters[1].ParameterType -eq [Security.AccessControl.DirectorySecurity]
+        } | Select-Object -First 1
+    $invokeArguments = [Array]::CreateInstance([object], 2)
+    if ($null -ne $create) {
+        # MethodInfo.Invoke does not unwrap PowerShell's PSObject wrappers from
+        # an object[] literal under either Windows PowerShell 5.1 or pwsh.
+        $invokeArguments.SetValue($Path.PSObject.BaseObject, 0)
+        $invokeArguments.SetValue($Security.PSObject.BaseObject, 1)
+    }
+    else {
+        $aclType = "System.IO.FileSystemAclExtensions" -as [type]
+        if ($null -eq $aclType) {
+            throw "No secured directory creation API is available."
+        }
+        $create = $aclType.GetMethods() |
+            Where-Object {
+                $parameters = $_.GetParameters()
+                $_.Name -eq "CreateDirectory" -and $parameters.Count -eq 2 -and
+                    $parameters[0].ParameterType -eq [Security.AccessControl.DirectorySecurity] -and
+                    $parameters[1].ParameterType -eq [string]
+            } | Select-Object -First 1
+        if ($null -eq $create) {
+            throw "No FileSystemAclExtensions.CreateDirectory API is available."
+        }
+        $invokeArguments.SetValue($Security.PSObject.BaseObject, 0)
+        $invokeArguments.SetValue($Path.PSObject.BaseObject, 1)
+    }
+
+    $null = $create.Invoke($null, $invokeArguments)
+    return Get-Item -LiteralPath $Path -Force -ErrorAction Stop
 }
 
 function Get-BoundlessProgramDataRoot {
@@ -404,6 +451,198 @@ function Assert-BoundlessAdminOnlyAcl {
         }
     }
     return $acl
+}
+
+function New-BoundlessStagingProbeCommand {
+    param(
+        [string]$ProbeParent,
+        [string]$SourcePath,
+        [string]$UserSid
+    )
+
+    $stageLeaf = "BoundlessInstaller-$([guid]::NewGuid().ToString('N'))"
+    $payload = [ordered]@{
+        stage_parent = $ProbeParent
+        stage_leaf = $stageLeaf
+        source_path = $SourcePath
+        source_sha256 = (Get-FileHash -LiteralPath $SourcePath -Algorithm SHA256).Hash
+        user_sid = $UserSid
+        stage_sddl = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;$UserSid)"
+    }
+    $payloadJson = $payload | ConvertTo-Json -Compress
+    $payloadBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payloadJson))
+    $source = @'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+function New-BoundlessSecuredDirectoryAtomic {
+__SECURED_DIRECTORY_FUNCTION__
+}
+function Assert-ProbeAcl {
+    param([string]$Path, [string[]]$ExpectedSids)
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    if (-not $acl.AreAccessRulesProtected) {
+        throw "Staging probe inherited an ACL."
+    }
+    $observed = @()
+    foreach ($rule in @($acl.Access)) {
+        $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow) {
+            if ($sid -notin $ExpectedSids) {
+                throw "Staging probe granted an unexpected principal."
+            }
+            $observed += $sid
+        }
+    }
+    foreach ($sid in $ExpectedSids) {
+        if ($sid -notin $observed) {
+            throw "Staging probe omitted a required principal."
+        }
+    }
+}
+$payloadJson = [Text.Encoding]::UTF8.GetString(
+    [Convert]::FromBase64String("__PAYLOAD_BASE64__")
+)
+$payload = $payloadJson | ConvertFrom-Json
+$parent = (Resolve-Path -LiteralPath $payload.stage_parent -ErrorAction Stop).Path.TrimEnd('\')
+$stageRoot = Join-Path $parent $payload.stage_leaf
+$trustedStage = $false
+try {
+    if (
+        [IO.Directory]::GetParent([IO.Path]::GetFullPath($stageRoot)).FullName -ne $parent -or
+        [IO.Path]::GetFileName($stageRoot) -notmatch '^BoundlessInstaller-[0-9a-f]{32}$'
+    ) {
+        throw "Staging probe received an unsafe boundary."
+    }
+    $security = [Security.AccessControl.DirectorySecurity]::new()
+    $security.SetSecurityDescriptorSddlForm([string]$payload.stage_sddl)
+    $item = New-BoundlessSecuredDirectoryAtomic -Path $stageRoot -Security $security
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Staging probe created a reparse point."
+    }
+    $probeSids = @("S-1-5-18", "S-1-5-32-544", [string]$payload.user_sid)
+    Assert-ProbeAcl -Path $stageRoot -ExpectedSids $probeSids
+    $trustedStage = $true
+
+    $stagedCopy = Join-Path $stageRoot "probe.bin"
+    Copy-Item -LiteralPath $payload.source_path -Destination $stagedCopy -ErrorAction Stop
+    if ((Get-FileHash -LiteralPath $stagedCopy -Algorithm SHA256).Hash -ne $payload.source_sha256) {
+        throw "Staging probe copy hash did not match."
+    }
+}
+finally {
+    if ($trustedStage -and (Test-Path -LiteralPath $stageRoot)) {
+        $resolved = (Resolve-Path -LiteralPath $stageRoot).Path
+        $resolvedParent = [IO.Directory]::GetParent($resolved)
+        $leaf = [IO.Path]::GetFileName($resolved)
+        $item = Get-Item -LiteralPath $resolved -Force
+        if (
+            $null -eq $resolvedParent -or
+            -not $resolvedParent.FullName.Equals($parent, [StringComparison]::OrdinalIgnoreCase) -or
+            $leaf -notmatch '^BoundlessInstaller-[0-9a-f]{32}$' -or
+            ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+        ) {
+            throw "Staging probe refused an unsafe cleanup boundary."
+        }
+        Assert-ProbeAcl -Path $resolved -ExpectedSids $probeSids
+        Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction Stop
+    }
+}
+if (Test-Path -LiteralPath $stageRoot) {
+    throw "Staging probe did not clean its stage."
+}
+Write-Output "boundless_staging_child_probe=passed"
+'@
+    $securedDirectoryFunction = (
+        Get-Command New-BoundlessSecuredDirectoryAtomic -CommandType Function -ErrorAction Stop
+    ).Definition
+    $source = $source.Replace("__SECURED_DIRECTORY_FUNCTION__", $securedDirectoryFunction)
+    $source = $source.Replace("__PAYLOAD_BASE64__", $payloadBase64)
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($source))
+    if ($encodedCommand.Length -gt 30000) {
+        throw "The staging child-process probe exceeded the safe Windows command-line budget."
+    }
+    return [pscustomobject]@{
+        encoded_command = $encodedCommand
+        stage_path = Join-Path $ProbeParent $stageLeaf
+    }
+}
+
+function Invoke-BoundlessStagingChildProbes {
+    param([string]$SourcePath)
+
+    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+    $probeParent = Join-Path $tempRoot (
+        "BoundlessStagingProbe-$([guid]::NewGuid().ToString('N'))"
+    )
+    $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $testedHosts = @()
+    try {
+        New-Item -ItemType Directory -Path $probeParent -ErrorAction Stop | Out-Null
+        foreach ($hostName in @("powershell.exe", "pwsh.exe")) {
+            $hostCommand = Get-Command $hostName -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $hostCommand) {
+                continue
+            }
+            $probe = New-BoundlessStagingProbeCommand `
+                -ProbeParent $probeParent `
+                -SourcePath $SourcePath `
+                -UserSid $userSid
+            $probeProcessArgs = @{
+                FilePath = $hostCommand.Source
+                ArgumentList = @("-NoProfile", "-EncodedCommand", $probe.encoded_command)
+                TimeoutSeconds = 20
+            }
+            if ($hostName -eq "powershell.exe") {
+                # pwsh prepends its own modules to the inherited PSModulePath.
+                # Windows PowerShell can then find the pwsh Security manifest
+                # first and fail to load Get-Acl. Restore Desktop-edition paths
+                # for this cross-host executable probe.
+                $userWindowsModules = Join-Path (
+                    [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+                ) "WindowsPowerShell\Modules"
+                $machineWindowsModules = @(
+                    [Environment]::GetEnvironmentVariable("PSModulePath", "Machine") -split ';' |
+                        Where-Object { $_ -match '(?i)\\WindowsPowerShell\\' }
+                )
+                $probeProcessArgs.EnvironmentVariables = @{
+                    PSModulePath = (@($userWindowsModules) + $machineWindowsModules) -join ';'
+                }
+            }
+            try {
+                $result = Invoke-BoundedProcess @probeProcessArgs
+            }
+            catch {
+                throw "Could not launch staging child-process probe under $hostName at '$($hostCommand.Source)'. $($_.Exception.Message)"
+            }
+            if (
+                $result.exit_code -ne 0 -or
+                $result.stdout -notmatch 'boundless_staging_child_probe=passed' -or
+                (Test-Path -LiteralPath $probe.stage_path)
+            ) {
+                throw "Staging child-process probe failed under $hostName. exit=$($result.exit_code) stdout='$($result.stdout)' stderr='$($result.stderr)'"
+            }
+            $testedHosts += $hostName
+        }
+        if ($testedHosts.Count -eq 0) {
+            throw "No PowerShell host was available for the staging child-process probe."
+        }
+        return @($testedHosts)
+    }
+    finally {
+        if (Test-Path -LiteralPath $probeParent) {
+            $resolved = (Resolve-Path -LiteralPath $probeParent).Path
+            $parent = [IO.Directory]::GetParent($resolved)
+            $leaf = [IO.Path]::GetFileName($resolved)
+            if (
+                $null -eq $parent -or
+                -not $parent.FullName.TrimEnd('\').Equals($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or
+                $leaf -notmatch '^BoundlessStagingProbe-[0-9a-f]{32}$'
+            ) {
+                throw "Refusing unsafe staging probe cleanup: $resolved"
+            }
+            Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction Stop
+        }
+    }
 }
 
 function Assert-ElevatedInstallResult {
@@ -508,6 +747,9 @@ function New-BoundlessElevatedInstallCommand {
     $source = @'
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+function New-BoundlessSecuredDirectoryAtomic {
+__SECURED_DIRECTORY_FUNCTION__
+}
 function Assert-AdminAcl {
     param([string]$Path, [bool]$RequireProtected = $false)
     $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
@@ -549,30 +791,7 @@ $exitCode = 1
 try {
     $security = [Security.AccessControl.DirectorySecurity]::new()
     $security.SetSecurityDescriptorSddlForm([string]$payload.stage_sddl)
-    $create = [IO.Directory].GetMethods() |
-        Where-Object {
-            $p = $_.GetParameters()
-            $_.Name -eq "CreateDirectory" -and $p.Count -eq 2 -and
-                $p[0].ParameterType -eq [string] -and
-                $p[1].ParameterType -eq [Security.AccessControl.DirectorySecurity]
-        } | Select-Object -First 1
-    if ($null -ne $create) {
-        $null = $create.Invoke($null, [object[]]@($stageRoot, $security))
-    }
-    else {
-        $aclType = "System.IO.FileSystemAclExtensions" -as [type]
-        if ($null -eq $aclType) { throw "No secured directory creation API." }
-        $create = $aclType.GetMethods() |
-            Where-Object {
-                $p = $_.GetParameters()
-                $_.Name -eq "CreateDirectory" -and $p.Count -eq 2 -and
-                    $p[0].ParameterType -eq [Security.AccessControl.DirectorySecurity] -and
-                    $p[1].ParameterType -eq [string]
-            } | Select-Object -First 1
-        if ($null -eq $create) { throw "No FileSystemAclExtensions.CreateDirectory API." }
-        $null = $create.Invoke($null, [object[]]@($security, $stageRoot))
-    }
-    $item = Get-Item -LiteralPath $stageRoot -Force
+    $item = New-BoundlessSecuredDirectoryAtomic -Path $stageRoot -Security $security
     if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "Installer stage was a reparse point."
     }
@@ -635,6 +854,10 @@ finally {
 }
 exit $exitCode
 '@
+    $securedDirectoryFunction = (
+        Get-Command New-BoundlessSecuredDirectoryAtomic -CommandType Function -ErrorAction Stop
+    ).Definition
+    $source = $source.Replace("__SECURED_DIRECTORY_FUNCTION__", $securedDirectoryFunction)
     $source = $source.Replace("__PAYLOAD_BASE64__", $payloadBase64)
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($source))
     if ($encodedCommand.Length -gt 30000) {
@@ -765,7 +988,8 @@ function Invoke-BoundedProcess {
     param(
         [string]$FilePath,
         [string[]]$ArgumentList,
-        [int]$TimeoutSeconds = 10
+        [int]$TimeoutSeconds = 10,
+        [hashtable]$EnvironmentVariables = @{}
     )
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
@@ -775,6 +999,9 @@ function Invoke-BoundedProcess {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    foreach ($entry in $EnvironmentVariables.GetEnumerator()) {
+        $startInfo.EnvironmentVariables[$entry.Key] = [string]$entry.Value
+    }
 
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
@@ -1584,6 +1811,10 @@ function Invoke-InstallHelperSelfTest {
     ) {
         throw "Tray quiescence mutex fixture did not preserve its ownership DACL."
     }
+    $selectedSidMutexName = Get-BoundlessTrayOwnerMutexName -UserSid $validSid -SessionId 7
+    if ($selectedSidMutexName -ne "Local\Boundless.Tray.SingleInstance.v1.$validSid.7.Owner") {
+        throw "Tray quiescence identity fixture did not retain the selected desktop SID and current session."
+    }
     $quiescenceFixtureName = "Local\Boundless.Test.UpgradeLease.$PID.$([guid]::NewGuid().ToString('N'))"
     $firstLeaseArgs = @{
         Name = $quiescenceFixtureName
@@ -1622,9 +1853,9 @@ function Invoke-InstallHelperSelfTest {
         $stageSddl -notmatch '\(A;OICI;FA;;;SY\)' -or
         $stageSddl -notmatch '\(A;OICI;FA;;;BA\)' -or
         $stageSddl -match ';;;BU\)' -or
-        $stageSddl -notmatch 'S:\(ML;;NW;;;ME\)'
+        $stageSddl -match 'S:'
     ) {
-        throw "Installer staging security fixture was not admin-only medium-integrity."
+        throw "Installer staging security fixture was not an admin-only protected DACL."
     }
     $knownProgramData = Get-BoundlessProgramDataRoot
     $originalProgramDataEnvironment = $env:ProgramData
@@ -1650,6 +1881,9 @@ function Invoke-InstallHelperSelfTest {
     ) {
         throw "Installer staging path fixture accepted an unsafe cleanup boundary."
     }
+    $stagingProbeHosts = @(
+        Invoke-BoundlessStagingChildProbes -SourcePath $PSCommandPath
+    )
 
     if (
         (Get-BoundlessServiceStopDecision -Status "Stopped" -StopRequested $false) -ne "complete" -or
@@ -1710,7 +1944,9 @@ function Invoke-InstallHelperSelfTest {
     if (
         $decodedElevatedCommand -match '\$PSCommandPath' -or
         $decodedElevatedCommand -match '\$env:ProgramData' -or
+        $decodedElevatedCommand -match 'S:\(ML;' -or
         $decodedElevatedCommand -notmatch 'BoundlessInstaller-' -or
+        $decodedElevatedCommand -notmatch 'PSObject\.BaseObject' -or
         $decodedElevatedCommand -notmatch 'Staged helper hash mismatch'
     ) {
         throw "Elevated command fixture did not enforce immutable helper/MSI staging."
@@ -1769,6 +2005,7 @@ function Invoke-InstallHelperSelfTest {
         tray_quiescence_lease_fixture = "passed"
         admin_only_stage_fixture = "passed"
         program_data_known_folder_fixture = "passed"
+        staging_child_process_probe_hosts = $stagingProbeHosts
         bounded_service_stop_fixture = "passed"
         elevated_install_result_fixture = "passed"
         elevated_in_memory_command_fixture = "passed"
@@ -1842,10 +2079,13 @@ if (-not [string]::IsNullOrWhiteSpace($selection.account)) {
 }
 Write-Host "boundless_install_selected_user_source=$($selection.source)"
 
-$currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $currentSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
 $quiescenceArgs = @{
-    ExpectedOwnerSid = $currentUserSid
+    # The selected SID is the intended desktop identity captured before UAC.
+    # Using the helper process token here breaks over-the-shoulder elevation by
+    # leasing an administrator-owned mutex while the real desktop tray remains
+    # free to relaunch in this same session.
+    ExpectedOwnerSid = $selection.sid
     ExpectedSessionId = $currentSessionId
 }
 $trayQuiescence = Enter-BoundlessTrayQuiescence @quiescenceArgs

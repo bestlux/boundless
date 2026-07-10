@@ -49,7 +49,11 @@ Fallback/debug flow
 - If the helper cannot infer the intended desktop user safely, it fails closed.
 - From an already-elevated shell, pass the intended user's SID explicitly:
 
-  msiexec /i Boundless-<version>-windows-x64.msi BOUNDLESS_ALLOWED_USER_SID=S-...
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\Boundless-<version>-windows-x64-install.ps1 -InstallerPath .\Boundless-<version>-windows-x64.msi -AllowedUserSid S-...
+
+  Keep using the matching helper even when the shell is already elevated. It
+  owns tray quiescence, bounded service shutdown, immutable MSI staging, and
+  post-install verification; invoking raw msiexec bypasses those safeguards.
 
 - Use the helper's -UseCurrentUserWhenElevated switch only when the elevated account is intentionally the desktop user that should control Boundless.
 

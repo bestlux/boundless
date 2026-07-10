@@ -83,11 +83,28 @@ foreach ($requiredInstallContract in @(
         'BoundlessInstaller-',
         'boundless_install_tray_quiescence_acquired',
         'ExpectedInstallerSha256',
-        'CommonApplicationData'
+        'CommonApplicationData',
+        'New-BoundlessSecuredDirectoryAtomic',
+        'staging_child_process_probe_hosts'
     )) {
     if ($installScriptText -notmatch [regex]::Escape($requiredInstallContract)) {
         throw "Boundless-Install.ps1 is missing the upgrade safety contract: $requiredInstallContract"
     }
+}
+if ($installScriptText -notmatch 'ExpectedOwnerSid\s*=\s*\$selection\.sid') {
+    throw "Boundless-Install.ps1 must key tray quiescence to the selected desktop SID."
+}
+
+$packagingReadme = Join-Path $packagingRoot "README.txt"
+$packagingReadmeText = Get-Content -LiteralPath $packagingReadme -Raw
+if ($packagingReadmeText -match '(?mi)^\s*msiexec(?:\.exe)?\s+/i') {
+    throw "README.txt must not recommend raw msiexec because it bypasses the upgrade lifecycle helper."
+}
+if (
+    $packagingReadmeText -notmatch 'windows-x64-install\.ps1' -or
+    $packagingReadmeText -notmatch '-AllowedUserSid'
+) {
+    throw "README.txt must route elevated fallback installs through the matching helper with an explicit SID."
 }
 
 $installerSmoke = Join-Path $RepoRoot "scripts\dev\installer-smoke.ps1"
