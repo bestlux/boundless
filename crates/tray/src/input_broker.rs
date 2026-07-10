@@ -26,7 +26,50 @@ const INPUT_BROKER_SERVICE_UNSUPPORTED_MODE: &str = "service_session_unsupported
 const INPUT_BROKER_SUPERVISOR_RETRY: Duration = Duration::from_secs(3);
 const INPUT_BROKER_ACTIVE_POLL: Duration = Duration::from_millis(8);
 const INPUT_BROKER_IDLE_POLL: Duration = Duration::from_millis(40);
+const INPUT_BROKER_LOCK_LEASE: Duration = Duration::from_secs(2);
 const CLIPBOARD_BROKER_POLL: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Default)]
+struct SafetyUnlockReconciler {
+    pending_report_count: u32,
+    waiting_for_daemon_release: bool,
+}
+
+impl SafetyUnlockReconciler {
+    fn observe(&mut self, actions: Vec<HookControlAction>) {
+        for action in actions {
+            let cause = match action {
+                HookControlAction::EscapeUnlock => "escape",
+                HookControlAction::LeaseExpiredUnlock => "lease_expired",
+            };
+            eprintln!("boundless_input_safety_unlock cause={cause}");
+            self.pending_report_count = self.pending_report_count.saturating_add(1);
+            self.waiting_for_daemon_release = true;
+        }
+    }
+
+    fn report_count(&self) -> u32 {
+        self.pending_report_count
+    }
+
+    fn mark_report_delivered(&mut self) {
+        self.pending_report_count = 0;
+    }
+
+    fn should_forward_captured_events(&self) -> bool {
+        !self.waiting_for_daemon_release
+    }
+
+    fn lock_should_be_active(&mut self, daemon_lock: bool, daemon_capture: bool) -> bool {
+        if self.waiting_for_daemon_release {
+            if !daemon_lock && !daemon_capture {
+                self.waiting_for_daemon_release = false;
+            }
+            return false;
+        }
+        daemon_lock
+    }
+}
 
 enum BrokerSessionEnd {
     NotNeeded,
@@ -77,6 +120,8 @@ fn run_input_broker_session(endpoint: &str) -> Result<BrokerSessionEnd> {
 
         let mut pump =
             HookInputPump::start(|_source| {}).context("install user-session capture hooks")?;
+        pump.enable_lock_lease(INPUT_BROKER_LOCK_LEASE)
+            .context("enable fail-open input broker lock lease")?;
 
         // The daemon authorizes this attach against the verified pipe client
         // identity (our process token SID and session), not anything we send.
@@ -130,14 +175,16 @@ async fn input_broker_exchange_loop(
 ) -> Result<()> {
     let mut injected_frame_count = 0u32;
     let mut inject_failure_count = 0u32;
+    let mut safety_unlock = SafetyUnlockReconciler::default();
 
     loop {
+        safety_unlock.observe(pump.drain_control_actions());
         let captured = pump.poll_events();
-        let escape_unlock_count = pump
-            .drain_control_actions()
-            .into_iter()
-            .filter(|action| matches!(action, HookControlAction::EscapeUnlock))
-            .count() as u32;
+        let captured = if safety_unlock.should_forward_captured_events() {
+            captured
+        } else {
+            Vec::new()
+        };
         let cursor = pump
             .cursor_position()
             .or_else(|| platform_windows::input::cursor_position().ok().flatten());
@@ -155,7 +202,7 @@ async fn input_broker_exchange_loop(
                 bounds_top: bounds.map(|bounds| bounds.1).unwrap_or_default(),
                 bounds_right: bounds.map(|bounds| bounds.2).unwrap_or_default(),
                 bounds_bottom: bounds.map(|bounds| bounds.3).unwrap_or_default(),
-                escape_unlock_count,
+                escape_unlock_count: safety_unlock.report_count(),
                 lock_active: pump.lock_active(),
                 dropped_event_count: pump.take_dropped_event_count(),
                 injected_frame_count,
@@ -166,11 +213,19 @@ async fn input_broker_exchange_loop(
         if !reply.accepted {
             bail!("input broker exchange rejected: {}", reply.message);
         }
+        pump.renew_lock_lease();
+        safety_unlock.mark_report_delivered();
+        // A gesture or watchdog expiry can happen while the exchange future is
+        // in flight. Drain again before considering the daemon's lock reply so
+        // a stale response can never re-lock local input.
+        safety_unlock.observe(pump.drain_control_actions());
         injected_frame_count = 0;
         inject_failure_count = 0;
 
-        if pump.lock_active() != reply.lock_should_be_active
-            && let Err(error) = pump.set_lock_active(reply.lock_should_be_active)
+        let local_lock_should_be_active = safety_unlock
+            .lock_should_be_active(reply.lock_should_be_active, reply.capture_active);
+        if pump.lock_active() != local_lock_should_be_active
+            && let Err(error) = pump.set_lock_active(local_lock_should_be_active)
         {
             eprintln!(
                 "boundless input broker failed to update local input lock: {error:#}"
@@ -193,6 +248,43 @@ async fn input_broker_exchange_loop(
             INPUT_BROKER_IDLE_POLL
         };
         tokio::time::sleep(poll).await;
+    }
+}
+
+#[cfg(test)]
+mod input_broker_tests {
+    use super::*;
+
+    #[test]
+    fn safety_unlock_suppresses_stale_relock_until_daemon_reconciles() {
+        let mut state = SafetyUnlockReconciler::default();
+        state.observe(vec![HookControlAction::EscapeUnlock]);
+
+        assert_eq!(state.report_count(), 1);
+        assert!(!state.should_forward_captured_events());
+        state.mark_report_delivered();
+        assert_eq!(state.report_count(), 0);
+        assert!(
+            !state.lock_should_be_active(true, true),
+            "the reply racing the escape must not re-lock local input"
+        );
+        assert!(!state.should_forward_captured_events());
+        assert!(!state.lock_should_be_active(false, false));
+        assert!(state.should_forward_captured_events());
+        assert!(state.lock_should_be_active(true, true));
+    }
+
+    #[test]
+    fn safety_unlocks_during_exchange_remain_pending_for_next_report() {
+        let mut state = SafetyUnlockReconciler::default();
+        state.observe(vec![HookControlAction::EscapeUnlock]);
+        let submitted = state.report_count();
+        assert_eq!(submitted, 1);
+        state.mark_report_delivered();
+
+        state.observe(vec![HookControlAction::LeaseExpiredUnlock]);
+        assert_eq!(state.report_count(), 1);
+        assert!(!state.lock_should_be_active(true, true));
     }
 }
 
