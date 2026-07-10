@@ -27,6 +27,8 @@ Full implementation briefs live in git history (`git show ac4d4d0:docs/backlog.m
 
 Installed 5.0.12 proved service-mode text clipboard in both directions for the first time. The image path then failed below the advertised policy limit: Paint placed a 1254×1254 32-bit bitmap on the clipboard (about 6.29 MB), while Boundless permits images up to 8 MB. The tray-to-service unary RPC retained its lower default message limit. That error won a shared `select!`, cancelled input exchange, detached the user-session broker, and retried the same clipboard sequence every three seconds. Peer health still said connected/trusted while mouse and keyboard input fell back to unsupported Session 0 injection.
 
+A follow-up copy of a 400×400 Paint bitmap was immediately followed by an unavailable edge handoff. The 01:25 capture showed the service, peer, and user-session broker healthy again with no target or lock, but all 50 retained events were broker/anti-idle wake noise from a 3.8-second window. That confirms a second user-visible image-copy/input interaction and a BND-NEXT-34 evidence failure; it does not prove that the small image hit the same RPC-size fault.
+
 ### What to build
 
 - Make input and clipboard broker supervision independent: clipboard read, validation, IPC, or apply failure must never cancel input capture/injection or detach the input broker.
@@ -39,6 +41,7 @@ Installed 5.0.12 proved service-mode text clipboard in both directions for the f
 - The observed 6.29 MB bitmap and boundary payloads up to the configured 8 MB policy transfer through Paint in both directions.
 - Payloads above policy are rejected once with an actionable size error; they do not detach input, loop every three seconds, or retry until the clipboard changes.
 - Mouse and keyboard handoff remain usable throughout local read errors, request-side oversize, response-side oversize, remote apply failure, and clipboard unavailability.
+- Normal-size image reads and encoding may not monopolize the input exchange loop; edge detection and emergency unlock remain responsive while clipboard work is in progress.
 - Input/clipboard broker state and peer health distinguish attached, clipboard-degraded, input-degraded, and fully healthy states.
 - Deterministic tests cover both IPC directions, message-size overhead, independent task failure, unchanged failed-sequence suppression, and recovery after a short text copy.
 
@@ -77,6 +80,63 @@ After reset on both 5.0.12 PCs, launching Boundless from Start opened the tray b
 ### Blocked by
 
 None. Preserve BND-NEXT-11’s service-ownership rule rather than reverting to a per-user daemon fallback.
+
+---
+
+## BND-NEXT-38 (P0, ready for agent): Make emergency input unlock local and IPC-independent
+
+### Context and evidence
+
+The 5.0.12 tray lifecycle smoke passed single-instance launch and visually recovered connection, trust, layout, input, and clipboard after Quit/relaunch. The first real left-edge handoff then trapped local input. CODY-PC recorded `input_handoff` at 01:29:16.957, `input_lock_engaged requested=true applied=true` at 01:29:17.002, and eight outgoing frames through 01:29:36.251. Double-Control did not return control and no escape event was recorded. Force-ending tray PID 58820 restored local input; Windows recorded Application Hang 1002 (`Top level window is idle`), and the daemon fell back to `service_session_unsupported` at 01:29:43 while retaining the EliteBook as the configured target.
+
+The safety boundary is architecturally confirmed even though the destination injection failure is not: the hook currently queues `EscapeUnlock` but keeps swallowing input until the tray completes another broker RPC and the daemon replies with lock disabled. A stalled exchange, clipboard failure, tray hang, daemon loss, or full event queue can therefore defeat the emergency escape.
+
+### What to build
+
+- Make the escape gesture atomically release the local hook lock before any channel send, IPC, daemon, network, or UI work; reconcile capture state asynchronously afterward.
+- Give the local lock a short broker-exchange lease or watchdog owned outside the dashboard/UI loop. If successful exchanges stop, fail open to local control within a documented bound no longer than the daemon’s broker-stale window.
+- Provide one reconciliation operation for local escape/lease expiry that asynchronously clears capture, releases remote held keys/buttons, and suppresses immediate edge recapture. BND-NEXT-31 invokes the same primitive during graceful tray shutdown.
+- Record one bounded safety transition with cause (`escape` or `lease_expired`) without logging keys or per-frame activity.
+
+### Acceptance criteria
+
+- Double-Control restores local mouse and keyboard within 100 ms while the broker RPC is stalled, daemon is unavailable, clipboard exchange has failed, event queues are full, or the dashboard is hung.
+- If no successful broker exchange occurs, the local hook lock releases automatically within three seconds without requiring Task Manager or process termination.
+- Normal escape and lease timeout clear the configured/active capture target, release remote held keys/buttons, and prevent immediate edge recapture.
+- The escape gesture remains reliable under realistic human tap timing while avoiding accidental single-Control unlocks; exact timing is covered by deterministic tests.
+- Installed Windows fault smoke proves local recovery during handoff with a deliberately stalled exchange and confirms the next handoff works without restart.
+
+### Dependencies and scope boundary
+
+Coordinate with BND-NEXT-24’s independent broker supervision. This story owns the fail-open hook primitive, watchdog, and reconciliation operation; BND-NEXT-31 owns invoking them during graceful Quit and broker lifecycle. Do not wait for either story to make the local emergency path fail-safe.
+
+---
+
+## BND-NEXT-39 (P0, ready for agent): Carry laptop two-finger scrolling through remote input
+
+### Context and evidence
+
+EliteBook-to-CODY control passed movement, buttons, typing, handoff, return, and initial Double-Control escape, but two-finger vertical scrolling on the EliteBook trackpad produced no movement in remote browser/chat surfaces. The device/driver path was not captured, so do not yet classify it as a Windows Precision Touchpad. Boundless has end-to-end generic `MouseWheel` serialization and `SendInput` injection, but capture only accepts wheel messages surfaced through the low-level mouse hook. Its Raw Input path registers a generic mouse and reads only relative X/Y; it ignores raw wheel flags, and there is no touchpad/pointer capture path. Current diagnostics cannot distinguish “gesture never reached capture” from filtering or small-delta loss, so the exact capture mechanism remains an evidence-gated implementation choice.
+
+### What to build
+
+- Use a targeted development trace to identify the EliteBook device/driver and prove where its gesture disappears without retaining individual input content. Durable production counters belong to BND-NEXT-34.
+- Capture vertical and horizontal two-finger scrolling through the appropriate supported Windows path. Prefer existing Raw Input wheel data when the device emits it; use touchpad-capable pointer input only when required by the observed device path.
+- Deduplicate legacy hook, Raw Input, and pointer representations so one physical gesture never scrolls twice.
+- Preserve signed high-resolution deltas and configured Windows scroll direction through broker IPC, peer transport, and injection.
+
+### Acceptance criteria
+
+- While the EliteBook owns remote capture, two-finger vertical and horizontal pans scroll the remote application without scrolling the local surface, and diagnostics identify the actual source/device path used.
+- Deltas `±1`, `±40`, and `±120` survive capture, broker IPC, wire encoding/decoding, and `SendInput`; direction, gesture completion, and inertia do not reverse, disappear, or continue indefinitely.
+- A conventional physical wheel/hwheel still works, and duplicate event sources do not double-scroll.
+- Input disable, emergency escape, broker detach, and tray restart terminate active scrolling safely.
+- Tests cover source classification, legitimate touchpad input versus injected-loop suppression, both axes and high-resolution deltas, IPC/wire round trips, and injection records.
+- Installed two-PC validation uses the EliteBook trackpad and, when available, a conventional mouse wheel.
+
+### Dependencies and scope boundary
+
+BND-NEXT-34 owns durable bounded stage counters. This story may use temporary targeted tracing or consume those counters, but must not add a second production telemetry system. Do not broaden into arbitrary three-/four-finger gesture sharing.
 
 ---
 
@@ -188,15 +248,15 @@ Acceptance: each item has a targeted test or self-test where the surface allows;
 
 ---
 
-## BND-NEXT-31 (P1): Enforce one tray instance per Windows user session
+## BND-NEXT-31 (P1, reopened): Enforce one tray instance and a safe broker lifecycle per Windows user session
 
-Status: code complete; installed-build and MSI upgrade evidence pending.
+Status: single-instance ownership passed installed dogfood; Quit/relaunch broker lifecycle failed and remains open.
 
 ### Context and evidence
 
 Dogfood can launch any number of `boundlesstray.exe` processes in the same desktop session. Duplicate trays each start their own dashboard and broker activity, then compete for or lose access to the same backend service. The resulting connection failures look like daemon, named-pipe, or service instability even though the initiating defect is duplicate UI ownership. Installer smoke detects an unexpected tray count after upgrade, but normal application launch has no single-instance guard.
 
-Installed 5.0.12 evidence also recorded Windows Application Hang event 1002 for `boundlesstray.exe` three times during install/reset/relaunch churn. Treat non-hanging exit and existing-window activation as part of the pending installed-build proof; do not mark the single-instance story proven from process count alone.
+Repeated Start Menu launch three times left one tray/dashboard, proving the ownership guard on installed 5.0.12. Quit/relaunch then created a new tray and visually restored connection/trust/layout, but its first handoff trapped local input until force termination. That run produced the fourth Windows Application Hang 1002 since July 9 and left no graceful broker-detach event. Treat single-instance ownership as partial success, not story completion.
 
 ### Scope
 
@@ -204,6 +264,7 @@ Installed 5.0.12 evidence also recorded Windows Application Hang event 1002 for 
 - When a second launch is attempted, activate or focus the existing dashboard and exit the new process successfully. If activation is temporarily unavailable, exit with a clear diagnostic instead of starting another broker owner.
 - Do not use a machine-global lock that prevents a different interactive Windows session or user from running its own tray.
 - Keep lifecycle behavior correct across normal exit, crash recovery, sign-out, MSI upgrade, and tray restart.
+- Make Quit signal, cancel, and bounded-join the broker supervisor: unlock locally first, flush held-input releases, detach, clear any capture target, then close the dashboard process.
 - Record enough local diagnostics to distinguish "existing tray activated" from daemon or IPC connection failure without exposing sensitive state.
 
 ### Likely files
@@ -216,6 +277,7 @@ Installed 5.0.12 evidence also recorded Windows Application Hang event 1002 for 
 - A second launch focuses or opens the existing dashboard and does not start another input/clipboard broker.
 - Different Windows users or interactive sessions do not block one another.
 - After clean exit or forced termination, the tray can be launched again without manual cleanup or reboot.
+- Quit/relaunch while connected and while actively captured leaves local input unlocked, clears stale capture ownership, and the first post-relaunch handoff plus emergency escape succeeds.
 - Upgrade-while-running and installer smoke still finish with exactly one tray process and a healthy daemon API connection.
 - Focused tests cover lock acquisition, second-launch behavior, stale-owner recovery, and session scoping; a Windows runtime check proves the process-count behavior.
 
@@ -334,7 +396,7 @@ Done when the implementation matches the approved responsive states, keyboard an
 
 ### Context and evidence
 
-BND-NEXT-25 removed retained `input_runtime_wake` safety-tick noise and added CLI kind filters, but 5.0.12 two-PC dogfood exposed additional high-rate paths. While the user pushed the cursor through a configured edge, `runtime_wake channel=input_capture source=input_broker_exchange` and later per-frame `input_frame`/inject-failure records were retained roughly every 15 milliseconds. The bounded event ring then evicted the useful `input_handoff` transition before a follow-up query could retrieve it. Live status proved that the cursor reached the edge and capture briefly selected and locked to the trusted peer, but retained telemetry could not preserve a concise causal path.
+BND-NEXT-25 removed retained `input_runtime_wake` safety-tick noise and added CLI kind filters, but 5.0.12 two-PC dogfood exposed additional high-rate paths. While the user pushed the cursor through a configured edge, `runtime_wake channel=input_capture source=input_broker_exchange` and later per-frame `input_frame`/inject-failure records were retained roughly every 15 milliseconds. The bounded event ring then evicted the useful `input_handoff` transition before a follow-up query could retrieve it. A later capture retained exactly 50 broker/anti-idle wake records spanning only 3.8 seconds and no clipboard, edge, or failure cause. Live status proved that the broker was exchanging, but retained telemetry could not preserve a concise causal path.
 
 ### Desired behavior
 
@@ -352,6 +414,7 @@ High-frequency wake/activity signals must remain available as bounded health sum
 - During at least 60 seconds of continuous mouse movement and broker exchange, the retained ring still contains the most recent `input_handoff` state transition and any input queue/transport/injection failure.
 - Equivalent high-rate wake events are represented by bounded aggregate or sampled records that include count and time range; retained-event growth is not proportional to mouse polling frequency.
 - A diagnostic query can distinguish: edge never detected, capture activated, outgoing frames queued, transport delivery failed, remote frames received, injection skipped, and injection failed.
+- Bounded per-kind/per-source counters distinguish low-level hook, Raw Input, touchpad/pointer normalization, broker acceptance, network send/receive, and injection without retaining individual key or pointer content.
 - `--kind` and `--exclude-kind` continue to filter before `--limit`, and filtering behavior has deterministic tests against both aggregate and high-value event kinds.
 - Event retention has explicit priority/budget tests proving low-value activity cannot evict newer state transitions or errors under sustained input, clipboard, anti-idle, and reconnect activity.
 - Default diagnostics remain local, bounded, and redacted; raw per-movement logging is not introduced.
