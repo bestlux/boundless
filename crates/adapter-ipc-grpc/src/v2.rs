@@ -3,7 +3,8 @@ use std::{path::PathBuf, time::Duration};
 use app_services::{
     SharedControlPlaneApp, commands as app_commands,
     queries::{
-        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ClipboardRuntimeSnapshot, ConsoleSnapshot,
+        AntiIdleConfigSnapshot, AntiIdleStatusSnapshot,
+        ClipboardBrokerLocalPayloadDispositionSnapshot, ClipboardRuntimeSnapshot, ConsoleSnapshot,
         FileTransferConfigSnapshot, FileTransferSnapshot, InputHandoffConfigSnapshot,
         InputRuntimeSnapshot, StatusSnapshot, TransportEventSnapshot, UiDiscoveredPeer,
         UiPairedPeer, UiPendingRequest, UiSnapshot,
@@ -16,23 +17,23 @@ use tonic::{Request, Response, Status};
 
 use ipc_api::boundless::v1::{
     AntiIdleConfigReply, AntiIdleSetRequest, AntiIdleStatusReply, ClipboardBrokerExchangeReply,
-    ClipboardBrokerExchangeRequest, ClipboardBrokerPayload, ClipboardRuntimeStatusReply,
-    ConsoleSnapshotReply, DiagnosticsDumpReply, DiagnosticsDumpRequest, DiscoveredPeerInfo, Empty,
-    FeatureListReply, FeatureSetRequest, FileTransferActionRequest, FileTransferConfigReply,
-    FileTransferInfo, FileTransferSetRequest, HotkeySetRequest, HotkeyTriggerRequest,
-    ImportTrustBundleRequest, InputBrokerAttachReply, InputBrokerAttachRequest,
-    InputBrokerDetachRequest, InputBrokerExchangeReply, InputBrokerExchangeRequest,
-    InputBrokerInjectFrame, InputCaptureTargetReply, InputCaptureTargetRequest,
-    InputHandoffConfigReply, InputHandoffSetRequest, InputOwnerReply, InputOwnerRequest,
-    InputRuntimeStatusReply, LayoutReply, LayoutSetRequest, NearbyJoinStartRequest,
-    NearbyJoinStatusReply, NearbyJoinStatusRequest, NearbyPairingCompletionReply,
-    NearbyPairingDecisionRequest, NearbyPairingRequestInfo, NearbyRequestCodeStartReply,
-    NearbyRequestCodeStartRequest, NearbySubmitCodeRequest, OperationReply, PairCreateCodeReply,
-    PairCreateCodeRequest, PairJoinReply, PairJoinRequest, PeerInfo, PeerListReply,
-    RemovePeerRequest, RotateTrustRequest, SafeResetRequest, SendClipboardImageRequest,
-    SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest, SendInputMoveRequest,
-    StatusReply, StatusRequest, TransportEvent, TransportEventsReply, TrustBundleReply,
-    UiSnapshotReply, clipboard_broker_payload,
+    ClipboardBrokerExchangeRequest, ClipboardBrokerLocalPayloadDisposition, ClipboardBrokerPayload,
+    ClipboardRuntimeStatusReply, ConsoleSnapshotReply, DiagnosticsDumpReply,
+    DiagnosticsDumpRequest, DiscoveredPeerInfo, Empty, FeatureListReply, FeatureSetRequest,
+    FileTransferActionRequest, FileTransferConfigReply, FileTransferInfo, FileTransferSetRequest,
+    HotkeySetRequest, HotkeyTriggerRequest, ImportTrustBundleRequest, InputBrokerAttachReply,
+    InputBrokerAttachRequest, InputBrokerDetachRequest, InputBrokerExchangeReply,
+    InputBrokerExchangeRequest, InputBrokerInjectFrame, InputCaptureTargetReply,
+    InputCaptureTargetRequest, InputHandoffConfigReply, InputHandoffSetRequest, InputOwnerReply,
+    InputOwnerRequest, InputRuntimeStatusReply, LayoutReply, LayoutSetRequest,
+    NearbyJoinStartRequest, NearbyJoinStatusReply, NearbyJoinStatusRequest,
+    NearbyPairingCompletionReply, NearbyPairingDecisionRequest, NearbyPairingRequestInfo,
+    NearbyRequestCodeStartReply, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
+    OperationReply, PairCreateCodeReply, PairCreateCodeRequest, PairJoinReply, PairJoinRequest,
+    PeerInfo, PeerListReply, RemovePeerRequest, RotateTrustRequest, SafeResetRequest,
+    SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest, SendInputKeyRequest,
+    SendInputMoveRequest, StatusReply, StatusRequest, TransportEvent, TransportEventsReply,
+    TrustBundleReply, UiSnapshotReply, clipboard_broker_payload,
     control_plane_service_server::{ControlPlaneService, ControlPlaneServiceServer},
 };
 
@@ -861,6 +862,20 @@ impl ControlPlaneService for ControlPlaneApi {
             remote_payload: reply.remote_payload.map(clipboard_payload_to_proto),
             remote_source_peer_id: reply.remote_source_peer_id,
             remote_hash: reply.remote_hash,
+            local_payload_disposition: match reply.local_payload_disposition {
+                ClipboardBrokerLocalPayloadDispositionSnapshot::NotSubmitted => {
+                    ClipboardBrokerLocalPayloadDisposition::NotSubmitted as i32
+                }
+                ClipboardBrokerLocalPayloadDispositionSnapshot::Accepted => {
+                    ClipboardBrokerLocalPayloadDisposition::Accepted as i32
+                }
+                ClipboardBrokerLocalPayloadDispositionSnapshot::TransientRejected => {
+                    ClipboardBrokerLocalPayloadDisposition::TransientRejected as i32
+                }
+                ClipboardBrokerLocalPayloadDispositionSnapshot::DeterministicRejected => {
+                    ClipboardBrokerLocalPayloadDisposition::DeterministicRejected as i32
+                }
+            },
         }))
     }
 

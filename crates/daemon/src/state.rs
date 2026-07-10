@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, RwLock, watch};
 use tracing::info;
 
 use core_clipboard::{
-    ClipboardPayload, ClipboardPolicy, ClipboardPolicyError, payload_hash_hex,
+    BmpValidationError, ClipboardPayload, ClipboardPolicy, ClipboardPolicyError, payload_hash_hex,
     validate_bmp_payload, validate_payload,
 };
 use core_discovery::parse_manual_target;
@@ -96,8 +96,9 @@ pub(crate) use input_broker::{
     SERVICE_SESSION_UNSUPPORTED_BACKEND_MODE,
 };
 pub use input_broker_ops::{
-    ClipboardBrokerApplyReport, ClipboardBrokerExchangeOutcome, InputBrokerAttachOutcome,
-    InputBrokerClientIdentity, InputBrokerExchangeObservations, InputBrokerExchangeOutcome,
+    ClipboardBrokerApplyReport, ClipboardBrokerExchangeOutcome,
+    ClipboardBrokerLocalPayloadDisposition, InputBrokerAttachOutcome, InputBrokerClientIdentity,
+    InputBrokerExchangeObservations, InputBrokerExchangeOutcome,
 };
 use input_state::InputState;
 #[cfg(test)]

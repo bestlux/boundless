@@ -508,12 +508,21 @@ message ClipboardBrokerExchangeRequest {
   ClipboardBrokerApplyReport apply_report = 3;
 }
 
+enum ClipboardBrokerLocalPayloadDisposition {
+  CLIPBOARD_BROKER_LOCAL_PAYLOAD_DISPOSITION_UNSPECIFIED = 0;
+  CLIPBOARD_BROKER_LOCAL_PAYLOAD_DISPOSITION_NOT_SUBMITTED = 1;
+  CLIPBOARD_BROKER_LOCAL_PAYLOAD_DISPOSITION_ACCEPTED = 2;
+  CLIPBOARD_BROKER_LOCAL_PAYLOAD_DISPOSITION_TRANSIENT_REJECTED = 3;
+  CLIPBOARD_BROKER_LOCAL_PAYLOAD_DISPOSITION_DETERMINISTIC_REJECTED = 4;
+}
+
 message ClipboardBrokerExchangeReply {
   bool accepted = 1;
   string message = 2;
   ClipboardBrokerPayload remote_payload = 3;
   string remote_source_peer_id = 4;
   string remote_hash = 5;
+  ClipboardBrokerLocalPayloadDisposition local_payload_disposition = 6;
 }
 
 message InputBrokerDetachRequest {

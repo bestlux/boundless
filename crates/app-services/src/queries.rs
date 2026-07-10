@@ -101,6 +101,16 @@ pub struct ClipboardBrokerExchangeSnapshot {
     pub remote_payload: Option<ClipboardPayload>,
     pub remote_source_peer_id: String,
     pub remote_hash: String,
+    pub local_payload_disposition: ClipboardBrokerLocalPayloadDispositionSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipboardBrokerLocalPayloadDispositionSnapshot {
+    #[default]
+    NotSubmitted,
+    Accepted,
+    TransientRejected,
+    DeterministicRejected,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

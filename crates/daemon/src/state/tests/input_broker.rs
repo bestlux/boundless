@@ -700,6 +700,10 @@ async fn clipboard_broker_exchange_routes_local_payloads_to_connected_peers() {
 
     assert!(outcome.accepted);
     assert_eq!(
+        outcome.local_payload_disposition,
+        ClipboardBrokerLocalPayloadDisposition::Accepted
+    );
+    assert_eq!(
         state
             .input_broker_relay()
             .last_exchange_at_for_test()
@@ -713,6 +717,80 @@ async fn clipboard_broker_exchange_routes_local_payloads_to_connected_peers() {
         outgoing.as_slice(),
         [OutboundPayload::ClipboardText { text }] if text == "broker-local"
     ));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn newer_local_clipboard_payload_supersedes_broker_inflight_remote() {
+    let (state, root) =
+        service_mode_broker_state("boundless-broker-clipboard-supersede-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+    state
+        .enqueue_remote_clipboard_text(&peer_id, "stale remote".to_string())
+        .await
+        .expect("enqueue remote clipboard");
+
+    let staged = state
+        .exchange_clipboard_broker(allowed_client(), &attach.broker_token, None, None)
+        .await;
+    assert!(staged.remote_payload.is_some());
+
+    let local = state
+        .exchange_clipboard_broker(
+            allowed_client(),
+            &attach.broker_token,
+            Some(ClipboardPayload::Text("new local".to_string())),
+            None,
+        )
+        .await;
+    assert!(local.accepted);
+    assert_eq!(
+        local.local_payload_disposition,
+        ClipboardBrokerLocalPayloadDisposition::Accepted
+    );
+    assert!(
+        local.remote_payload.is_none(),
+        "an accepted local update must not return the older remote payload"
+    );
+
+    let next = state
+        .exchange_clipboard_broker(allowed_client(), &attach.broker_token, None, None)
+        .await;
+    assert!(
+        next.remote_payload.is_none(),
+        "the superseded remote payload must not reappear on the next poll"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn invalid_local_clipboard_payload_reports_deterministic_rejection() {
+    let (state, root) =
+        service_mode_broker_state("boundless-broker-clipboard-deterministic-test").await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+
+    let outcome = state
+        .exchange_clipboard_broker(
+            allowed_client(),
+            &attach.broker_token,
+            Some(ClipboardPayload::Image(vec![0; 64])),
+            None,
+        )
+        .await;
+    assert!(outcome.accepted);
+    assert_eq!(
+        outcome.local_payload_disposition,
+        ClipboardBrokerLocalPayloadDisposition::DeterministicRejected
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }

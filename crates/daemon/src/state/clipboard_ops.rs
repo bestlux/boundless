@@ -637,6 +637,17 @@ impl AppState {
         sync.pending_remote.push_front(item);
     }
 
+    /// A successfully accepted local user update is newer than remote values
+    /// already waiting for this broker. Drop those stale remote candidates so
+    /// they cannot overwrite the local clipboard on the next exchange.
+    pub(crate) async fn discard_broker_remote_clipboard_for_local_update(&self) -> usize {
+        let mut sync = self.clipboard.sync.write().await;
+        let mut discarded = sync.pending_remote.len();
+        sync.pending_remote.clear();
+        discarded += usize::from(sync.broker_inflight_remote.take().is_some());
+        discarded
+    }
+
     pub(crate) async fn report_broker_remote_clipboard_apply(
         &self,
         source_peer_id: &str,
