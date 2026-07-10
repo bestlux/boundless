@@ -73,6 +73,8 @@ mod windows_app {
         endpoint: String,
         #[arg(long, default_value_t = true)]
         start_daemon: bool,
+        #[arg(long, hide = true, default_value_t = false)]
+        start_service_elevated: bool,
     }
 
     #[derive(Debug)]
@@ -279,6 +281,8 @@ mod windows_app {
     include!("dashboard.rs");
 
     include!("input_broker.rs");
+
+    include!("service_recovery.rs");
 
     #[cfg(test)]
     #[allow(dead_code)]
@@ -837,9 +841,20 @@ mod windows_app {
                         "{BOUNDLESS_SERVICE_NAME} is running but the tray cannot reach the service pipe at {endpoint}: {initial_error}. Do not start a separate per-user boundlessd.exe. Restart {BOUNDLESS_SERVICE_NAME}, repair the install, or verify the MSI allowed-user SID."
                     );
                 }
+                BoundlessServiceState::StartPending => {
+                    wait_for_boundless_service_and_pipe(endpoint, SERVICE_START_TIMEOUT).await?;
+                    return Ok(Some(format!(
+                        "{BOUNDLESS_SERVICE_NAME} completed an existing startup request"
+                    )));
+                }
+                BoundlessServiceState::Stopped => {
+                    bail!(
+                        "{BOUNDLESS_SERVICE_NAME} is installed but stopped and the tray cannot reach {endpoint}: {initial_error}. Use the dashboard's Start service action; do not start a separate per-user boundlessd.exe."
+                    );
+                }
                 BoundlessServiceState::Installed { state } => {
                     bail!(
-                        "{BOUNDLESS_SERVICE_NAME} is installed but not running (state={state}) and the tray cannot reach {endpoint}: {initial_error}. Start {BOUNDLESS_SERVICE_NAME} or repair the install; do not start a separate per-user boundlessd.exe."
+                        "{BOUNDLESS_SERVICE_NAME} is installed in SCM state {state} and the tray cannot reach {endpoint}: {initial_error}. Wait for that transition or repair the install; do not start a separate per-user boundlessd.exe."
                     );
                 }
                 BoundlessServiceState::Missing => {}
@@ -908,64 +923,6 @@ mod windows_app {
 
     fn spawn_daemon_process(candidates: &[String]) -> Result<String> {
         spawn_boundlessd_process(candidates)
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum BoundlessServiceState {
-        Missing,
-        Running,
-        Installed { state: String },
-        QueryFailed(String),
-    }
-
-    fn query_boundless_service_state() -> BoundlessServiceState {
-        match ProcessCommand::new("sc.exe")
-            .args(["query", BOUNDLESS_SERVICE_NAME])
-            .output()
-        {
-            Ok(output) => parse_boundless_service_state(
-                output.status.success(),
-                &String::from_utf8_lossy(&output.stdout),
-                &String::from_utf8_lossy(&output.stderr),
-            ),
-            Err(error) => BoundlessServiceState::QueryFailed(error.to_string()),
-        }
-    }
-
-    fn parse_boundless_service_state(
-        success: bool,
-        stdout: &str,
-        stderr: &str,
-    ) -> BoundlessServiceState {
-        let combined = format!("{stdout}\n{stderr}");
-        let lowered = combined.to_ascii_lowercase();
-        if lowered.contains("failed 1060") || lowered.contains("does not exist") {
-            return BoundlessServiceState::Missing;
-        }
-
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if !trimmed.starts_with("STATE") {
-                continue;
-            }
-            if trimmed.contains("RUNNING") {
-                return BoundlessServiceState::Running;
-            }
-            let state = trimmed
-                .split_once(':')
-                .map(|(_, value)| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "unknown".to_string());
-            return BoundlessServiceState::Installed { state };
-        }
-
-        if success {
-            BoundlessServiceState::Installed {
-                state: "unknown".to_string(),
-            }
-        } else {
-            BoundlessServiceState::QueryFailed(combined.trim().to_string())
-        }
     }
 
     async fn pair_nearby_request_code(
@@ -1737,42 +1694,6 @@ mod windows_app {
                     "source=mdns tcp ipv4 port 15200".to_string(),
                     "source=manual-host tcp hostname port 15200".to_string(),
                 ]
-            );
-        }
-
-        #[test]
-        fn service_state_parser_detects_running_stopped_and_missing() {
-            let running = r#"
-SERVICE_NAME: BoundlessService
-        TYPE               : 10  WIN32_OWN_PROCESS
-        STATE              : 4  RUNNING
-"#;
-            assert_eq!(
-                parse_boundless_service_state(true, running, ""),
-                BoundlessServiceState::Running
-            );
-
-            let stopped = r#"
-SERVICE_NAME: BoundlessService
-        TYPE               : 10  WIN32_OWN_PROCESS
-        STATE              : 1  STOPPED
-"#;
-            assert_eq!(
-                parse_boundless_service_state(true, stopped, ""),
-                BoundlessServiceState::Installed {
-                    state: "1  STOPPED".to_string()
-                }
-            );
-
-            let missing = "[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\r\nThe specified service does not exist as an installed service.";
-            assert_eq!(
-                parse_boundless_service_state(false, "", missing),
-                BoundlessServiceState::Missing
-            );
-
-            assert_eq!(
-                parse_boundless_service_state(false, "", "unexpected sc.exe failure"),
-                BoundlessServiceState::QueryFailed("unexpected sc.exe failure".to_string())
             );
         }
 

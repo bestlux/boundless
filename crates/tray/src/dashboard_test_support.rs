@@ -32,6 +32,8 @@ pub(super) fn test_app() -> DashboardApp {
         active_pairing_attempt_id: None,
         pending_onboarding_focus: false,
         onboarding_focus_shown: false,
+        pending_service_recovery_focus: false,
+        service_recovery: None,
         exit_requested: false,
         exit_requested_signal: Arc::new(AtomicBool::new(false)),
         native_window_handle: None,

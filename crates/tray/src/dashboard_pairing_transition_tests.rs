@@ -4,6 +4,33 @@ use super::dashboard_test_support::{
 };
 use super::*;
 
+#[test]
+fn stopped_service_recovery_offer_focuses_dashboard_once_and_preserves_active_request() {
+    let mut app = test_app();
+    let initial = ServiceRecoveryOffer {
+        state: "Stopped".to_string(),
+        message: "BoundlessService is installed but stopped.".to_string(),
+        action_label: "Start service".to_string(),
+    };
+
+    app.apply_app_msg(AppMsg::ServiceRecoveryRequired(initial));
+    assert!(app.pending_service_recovery_focus);
+    let recovery = app.service_recovery.as_mut().expect("recovery offer");
+    recovery.in_progress = true;
+
+    app.pending_service_recovery_focus = false;
+    app.apply_app_msg(AppMsg::ServiceRecoveryRequired(ServiceRecoveryOffer {
+        state: "StartPending".to_string(),
+        message: "replacement".to_string(),
+        action_label: "Finish startup".to_string(),
+    }));
+
+    let recovery = app.service_recovery.expect("active recovery");
+    assert!(recovery.in_progress);
+    assert_eq!(recovery.offer.state, "Stopped");
+    assert!(!app.pending_service_recovery_focus);
+}
+
 fn app_with_active_pairing_flow() -> DashboardApp {
     let mut app = test_app();
     app.begin_pairing_flow(sample_guided_flow());

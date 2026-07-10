@@ -54,6 +54,9 @@ use dashboard_window::{
 
 pub(super) fn run() -> Result<()> {
     let cli = Cli::parse();
+    if cli.start_service_elevated {
+        return start_boundless_service_elevated_entrypoint();
+    }
     let session_id = current_process_session_id().context("failed to resolve tray session id")?;
     let user_sid = current_user_sid_string().context("failed to resolve tray user SID")?;
     if let Some(hwnd) = find_existing_dashboard_window(session_id, &user_sid)? {
@@ -220,6 +223,11 @@ impl eframe::App for DashboardApp {
             self.onboarding_focus_shown = true;
         }
 
+        if self.pending_service_recovery_focus {
+            show_dashboard_window(self.native_window_handle, ctx);
+            self.pending_service_recovery_focus = false;
+        }
+
         if self.exit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -248,6 +256,8 @@ impl eframe::App for DashboardApp {
             });
             ui.separator();
 
+            self.render_service_recovery_banner(ui, &ctx);
+
             let pairing_modal_visible =
                 self.pairing_in_progress || self.pairing_challenge.is_some();
             if !pairing_modal_visible && self.pairing_last_error.is_some() {
@@ -266,6 +276,68 @@ impl eframe::App for DashboardApp {
 }
 
 impl DashboardApp {
+    fn render_service_recovery_banner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(recovery) = self.service_recovery.clone() else {
+            return;
+        };
+
+        let mut start_requested = false;
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(64, 52, 20))
+            .corner_radius(8.0)
+            .inner_margin(12.0)
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                egui::Color32::from_rgb(190, 145, 45),
+            ))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Boundless service needs attention")
+                                .strong()
+                                .color(egui::Color32::from_rgb(255, 220, 135)),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} (state={})",
+                                recovery.offer.message, recovery.offer.state
+                            ))
+                            .color(egui::Color32::from_rgb(235, 225, 195)),
+                        );
+                    });
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let label = if recovery.in_progress {
+                                "Starting..."
+                            } else {
+                                &recovery.offer.action_label
+                            };
+                            if ui
+                                .add_enabled(!recovery.in_progress, egui::Button::new(label))
+                                .clicked()
+                            {
+                                start_requested = true;
+                            }
+                        },
+                    );
+                });
+            });
+        ui.add_space(8.0);
+
+        if start_requested {
+            if let Some(active) = self.service_recovery.as_mut() {
+                active.in_progress = true;
+            }
+            self.task_runner().recover_boundless_service(
+                self.tx.clone(),
+                self.ctx.endpoint.clone(),
+                ctx.clone(),
+            );
+        }
+    }
+
     fn render_toast_overlay(&mut self, ctx: &egui::Context) {
         if self.toasts.is_empty() {
             return;

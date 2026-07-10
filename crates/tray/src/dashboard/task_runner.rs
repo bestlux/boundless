@@ -91,6 +91,12 @@ impl DashboardTaskRunner {
                                 }
                             }
                         }
+                        if app_ctx.start_daemon
+                            && let Some(offer) =
+                                boundless_service_recovery_offer(&app_ctx.endpoint)
+                        {
+                            let _ = tx.send(AppMsg::ServiceRecoveryRequired(offer));
+                        }
                         let _ = tx.send(AppMsg::SnapshotError(message));
                         egui_ctx.request_repaint();
                     }
@@ -143,6 +149,23 @@ impl DashboardTaskRunner {
                     });
                 }
             }
+        });
+    }
+
+    pub(super) fn recover_boundless_service(
+        &self,
+        tx: Sender<AppMsg>,
+        endpoint: String,
+        egui_ctx: egui::Context,
+    ) {
+        Self::spawn_with_repaint(egui_ctx, move || {
+            let message = match recover_boundless_service_blocking(&endpoint) {
+                Ok(message) => AppMsg::ServiceRecoveryComplete(message),
+                Err(error) => AppMsg::ServiceRecoveryFailed(format!(
+                    "Could not start BoundlessService: {error}"
+                )),
+            };
+            let _ = tx.send(message);
         });
     }
 
