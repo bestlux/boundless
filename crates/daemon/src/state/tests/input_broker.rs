@@ -547,6 +547,10 @@ async fn clipboard_broker_exchange_routes_local_payloads_to_connected_peers() {
         .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
         .await;
     assert!(attach.accepted);
+    let last_input_exchange_at = state
+        .input_broker_relay()
+        .last_exchange_at_for_test()
+        .expect("attach heartbeat");
 
     let outcome = state
         .exchange_clipboard_broker(
@@ -558,6 +562,14 @@ async fn clipboard_broker_exchange_routes_local_payloads_to_connected_peers() {
         .await;
 
     assert!(outcome.accepted);
+    assert_eq!(
+        state
+            .input_broker_relay()
+            .last_exchange_at_for_test()
+            .expect("heartbeat remains present"),
+        last_input_exchange_at,
+        "clipboard traffic must not extend input broker liveness"
+    );
     assert!(outcome.remote_payload.is_none());
     let outgoing = state.drain_outgoing(&peer_id).await;
     assert!(matches!(

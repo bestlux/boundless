@@ -28,11 +28,42 @@ const INPUT_BROKER_ACTIVE_POLL: Duration = Duration::from_millis(8);
 const INPUT_BROKER_IDLE_POLL: Duration = Duration::from_millis(40);
 const INPUT_BROKER_LOCK_LEASE: Duration = Duration::from_secs(2);
 const CLIPBOARD_BROKER_POLL: Duration = Duration::from_millis(200);
+const CLIPBOARD_BROKER_RETRY: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Default)]
 struct SafetyUnlockReconciler {
     pending_report_count: u32,
     waiting_for_daemon_release: bool,
+}
+
+#[derive(Debug, Default)]
+struct ClipboardBrokerState {
+    last_sequence: Option<u64>,
+    apply_report: Option<ClipboardBrokerApplyReport>,
+}
+
+impl ClipboardBrokerState {
+    fn observe_sequence(&mut self, sequence: u64) -> bool {
+        if self.last_sequence == Some(sequence) {
+            return false;
+        }
+        // Advance before attempting the RPC. A rejected or oversized payload
+        // must not be replayed every time the clipboard worker reconnects.
+        self.last_sequence = Some(sequence);
+        true
+    }
+
+    fn apply_report_for_request(&self) -> Option<ClipboardBrokerApplyReport> {
+        self.apply_report.clone()
+    }
+
+    fn mark_exchange_accepted(&mut self) {
+        self.apply_report = None;
+    }
+
+    fn stage_apply_report(&mut self, report: ClipboardBrokerApplyReport) {
+        self.apply_report = Some(report);
+    }
 }
 
 impl SafetyUnlockReconciler {
@@ -139,11 +170,17 @@ fn run_input_broker_session(endpoint: &str) -> Result<BrokerSessionEnd> {
         let broker_token = attach.broker_token;
 
         let mut input_client = client.clone();
-        let mut clipboard_client = client.clone();
-        let loop_result = tokio::select! {
-            result = input_broker_exchange_loop(&mut input_client, &broker_token, &mut pump) => result,
-            result = clipboard_broker_exchange_loop(&mut clipboard_client, &broker_token) => result,
-        };
+        let clipboard_task = tokio::spawn(clipboard_broker_supervisor_loop(
+            client.clone(),
+            broker_token.clone(),
+        ));
+        let loop_result =
+            input_broker_exchange_loop(&mut input_client, &broker_token, &mut pump).await;
+        // Clipboard failures are supervised independently and never select the
+        // input path out of service. Conversely, ending the input session
+        // cancels its clipboard worker before token cleanup.
+        clipboard_task.abort();
+        let _ = clipboard_task.await;
 
         // Best-effort cleanup: release the local lock, flush synthetic
         // release events for anything still held, and detach explicitly.
@@ -286,6 +323,45 @@ mod input_broker_tests {
         assert_eq!(state.report_count(), 1);
         assert!(!state.lock_should_be_active(true, true));
     }
+
+    #[test]
+    fn clipboard_sequence_is_consumed_once_even_when_exchange_will_fail() {
+        let mut state = ClipboardBrokerState::default();
+        assert!(state.observe_sequence(41));
+        assert!(
+            !state.observe_sequence(41),
+            "the same failed clipboard sequence must not replay"
+        );
+        assert!(state.observe_sequence(42));
+    }
+
+    #[test]
+    fn clipboard_apply_report_is_retained_until_exchange_is_accepted() {
+        let mut state = ClipboardBrokerState::default();
+        state.stage_apply_report(ClipboardBrokerApplyReport {
+            source_peer_id: "peer-a".to_string(),
+            hash: "hash-a".to_string(),
+            applied: true,
+            message: String::new(),
+        });
+
+        assert_eq!(
+            state
+                .apply_report_for_request()
+                .expect("first attempt")
+                .hash,
+            "hash-a"
+        );
+        assert_eq!(
+            state
+                .apply_report_for_request()
+                .expect("retry after transport error")
+                .hash,
+            "hash-a"
+        );
+        state.mark_exchange_accepted();
+        assert!(state.apply_report_for_request().is_none());
+    }
 }
 
 fn inject_input_events(events: &[core_input::InputEvent]) -> Result<()> {
@@ -296,46 +372,64 @@ fn inject_input_events(events: &[core_input::InputEvent]) -> Result<()> {
     send_input_records(&records)
 }
 
-async fn clipboard_broker_exchange_loop(
-    client: &mut ControlPlaneServiceClient<Channel>,
-    broker_token: &str,
-) -> Result<()> {
-    let mut last_sequence: Option<u64> = None;
-    let mut apply_report: Option<ClipboardBrokerApplyReport> = None;
-
+async fn clipboard_broker_supervisor_loop(
+    mut client: ControlPlaneServiceClient<Channel>,
+    broker_token: String,
+) {
+    let mut state = ClipboardBrokerState::default();
     loop {
-        let local_payload = read_clipboard_payload_if_changed(&mut last_sequence).await;
-        let reply = client
-            .exchange_clipboard_broker(ClipboardBrokerExchangeRequest {
-                broker_token: broker_token.to_string(),
-                local_payload: local_payload.map(clipboard_payload_to_proto),
-                apply_report: apply_report.take(),
-            })
-            .await?
-            .into_inner();
-        if !reply.accepted {
-            bail!("clipboard broker exchange rejected: {}", reply.message);
-        }
-        if !reply.message.is_empty() {
-            eprintln!("boundless clipboard broker: {}", reply.message);
-        }
-
-        if let Some(remote_payload) = reply.remote_payload {
-            let result = write_clipboard_payload(remote_payload).await;
-            apply_report = Some(ClipboardBrokerApplyReport {
-                source_peer_id: reply.remote_source_peer_id,
-                hash: reply.remote_hash,
-                applied: result.is_ok(),
-                message: result.err().map(|error| format!("{error:#}")).unwrap_or_default(),
-            });
-        }
-
-        tokio::time::sleep(CLIPBOARD_BROKER_POLL).await;
+        let delay = match clipboard_broker_exchange_once(&mut client, &broker_token, &mut state).await
+        {
+            Ok(()) => CLIPBOARD_BROKER_POLL,
+            Err(error) => {
+                eprintln!("boundless clipboard broker exchange failed: {error:#}");
+                CLIPBOARD_BROKER_RETRY
+            }
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 
+async fn clipboard_broker_exchange_once(
+    client: &mut ControlPlaneServiceClient<Channel>,
+    broker_token: &str,
+    state: &mut ClipboardBrokerState,
+) -> Result<()> {
+    let local_payload = read_clipboard_payload_if_changed(state).await;
+    let reply = client
+        .exchange_clipboard_broker(ClipboardBrokerExchangeRequest {
+            broker_token: broker_token.to_string(),
+            local_payload: local_payload.map(clipboard_payload_to_proto),
+            apply_report: state.apply_report_for_request(),
+        })
+        .await?
+        .into_inner();
+    if !reply.accepted {
+        bail!("clipboard broker exchange rejected: {}", reply.message);
+    }
+    state.mark_exchange_accepted();
+    if !reply.message.is_empty() {
+        eprintln!("boundless clipboard broker: {}", reply.message);
+    }
+
+    if let Some(remote_payload) = reply.remote_payload {
+        let result = write_clipboard_payload(remote_payload).await;
+        state.stage_apply_report(ClipboardBrokerApplyReport {
+            source_peer_id: reply.remote_source_peer_id,
+            hash: reply.remote_hash,
+            applied: result.is_ok(),
+            message: result
+                .err()
+                .map(|error| format!("{error:#}"))
+                .unwrap_or_default(),
+        });
+    }
+
+    Ok(())
+}
+
 async fn read_clipboard_payload_if_changed(
-    last_sequence: &mut Option<u64>,
+    state: &mut ClipboardBrokerState,
 ) -> Option<core_clipboard::ClipboardPayload> {
     let sequence = tokio::task::spawn_blocking(|| {
         let mut backend = WindowsClipboardBackend;
@@ -344,11 +438,10 @@ async fn read_clipboard_payload_if_changed(
     .await
     .ok()
     .flatten();
-    if let Some(sequence) = sequence {
-        if *last_sequence == Some(sequence) {
-            return None;
-        }
-        *last_sequence = Some(sequence);
+    if let Some(sequence) = sequence
+        && !state.observe_sequence(sequence)
+    {
+        return None;
     }
 
     tokio::task::spawn_blocking(|| {
