@@ -178,6 +178,19 @@ impl HookInputPump {
         self.capture_runtime.set_lock_active(active)
     }
 
+    pub fn safety_unlock_generation(&self) -> u64 {
+        self.capture_runtime.safety_unlock_generation()
+    }
+
+    pub fn set_lock_active_if_safety_generation(
+        &mut self,
+        active: bool,
+        expected_generation: u64,
+    ) -> Result<bool> {
+        self.capture_runtime
+            .set_lock_active_if_safety_generation(active, expected_generation)
+    }
+
     pub fn lock_active(&self) -> bool {
         self.capture_runtime.lock_active()
     }

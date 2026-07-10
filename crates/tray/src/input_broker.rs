@@ -367,27 +367,15 @@ async fn run_input_broker_session(
     let _ = pump.set_lock_active(false);
     let _ = injected_state.release_local();
 
-    let release_events = pump.drain_release_events();
-    if !release_events.is_empty() {
-        let _ = tokio::time::timeout(
-            INPUT_BROKER_CLEANUP_RPC_TIMEOUT,
-            client.exchange_input_broker(InputBrokerExchangeRequest {
-                broker_token: broker_token.clone(),
-                captured_events: broker_events_from_input_events(&release_events),
-                ..Default::default()
-            }),
-        )
-        .await;
-    }
-    let _ = tokio::time::timeout(
-        INPUT_BROKER_CLEANUP_RPC_TIMEOUT,
-        client.clear_input_capture_target(Empty {}),
-    )
-    .await;
+    // Do not submit synthetic captured releases through the ordinary exchange:
+    // that would consume the daemon relay's authoritative pressed-state before
+    // it can forward releases to the captured peer. Authorized detach owns the
+    // release-then-clear operation as one server-side lifecycle transition.
+    let _ = pump.drain_release_events();
     let _ = tokio::time::timeout(
         INPUT_BROKER_CLEANUP_RPC_TIMEOUT,
         client.detach_input_broker(InputBrokerDetachRequest {
-            broker_token: broker_token.clone(),
+            broker_token,
         }),
     )
     .await;
@@ -446,18 +434,24 @@ async fn input_broker_exchange_loop(
         // A gesture or watchdog expiry can happen while the exchange future is
         // in flight. Drain again before considering the daemon's lock reply so
         // a stale response can never re-lock local input.
+        let relock_generation = pump.safety_unlock_generation();
         safety_unlock.observe(pump.drain_control_actions());
         injected_frame_count = 0;
         inject_failure_count = 0;
 
         let local_lock_should_be_active = safety_unlock
             .lock_should_be_active(reply.lock_should_be_active, reply.capture_active);
-        if pump.lock_active() != local_lock_should_be_active
-            && let Err(error) = pump.set_lock_active(local_lock_should_be_active)
-        {
-            eprintln!(
-                "boundless input broker failed to update local input lock: {error:#}"
-            );
+        if pump.lock_active() != local_lock_should_be_active {
+            let result = if local_lock_should_be_active {
+                pump.set_lock_active_if_safety_generation(true, relock_generation)
+            } else {
+                pump.set_lock_active(false)
+            };
+            if let Err(error) = result {
+                eprintln!(
+                    "boundless input broker failed to update local input lock: {error:#}"
+                );
+            }
         }
 
         let had_inject_frames = !reply.inject_frames.is_empty();

@@ -84,6 +84,7 @@ struct CaptureRuntimeCore {
     lock_active: AtomicBool,
     escape_unlock_pending: AtomicU64,
     lease_expired_unlock_pending: AtomicU64,
+    safety_unlock_generation: AtomicU64,
     lock_watchdog_stop: AtomicBool,
     raw_input_mouse_enabled: AtomicBool,
     dropped_event_count: AtomicU64,
@@ -137,6 +138,7 @@ impl CaptureRuntime {
             lock_active: AtomicBool::new(false),
             escape_unlock_pending: AtomicU64::new(0),
             lease_expired_unlock_pending: AtomicU64::new(0),
+            safety_unlock_generation: AtomicU64::new(0),
             lock_watchdog_stop: AtomicBool::new(false),
             raw_input_mouse_enabled: AtomicBool::new(false),
             dropped_event_count: AtomicU64::new(0),
@@ -221,6 +223,7 @@ impl CaptureRuntime {
                 lock_active: AtomicBool::new(false),
                 escape_unlock_pending: AtomicU64::new(0),
                 lease_expired_unlock_pending: AtomicU64::new(0),
+                safety_unlock_generation: AtomicU64::new(0),
                 lock_watchdog_stop: AtomicBool::new(false),
                 raw_input_mouse_enabled: AtomicBool::new(raw_input_enabled),
                 dropped_event_count: AtomicU64::new(0),
@@ -274,6 +277,21 @@ impl CaptureRuntime {
 
     pub fn set_lock_active(&mut self, active: bool) -> Result<bool> {
         set_hook_lock_active_for(&self.core, active)
+    }
+
+    pub fn safety_unlock_generation(&self) -> u64 {
+        self.core.safety_unlock_generation.load(Ordering::SeqCst)
+    }
+
+    /// Applies a daemon-requested relock only if no local safety unlock or
+    /// shutdown unlock occurred since `expected_generation` was sampled. A
+    /// post-store generation check closes the final check/store race.
+    pub fn set_lock_active_if_safety_generation(
+        &mut self,
+        active: bool,
+        expected_generation: u64,
+    ) -> Result<bool> {
+        set_hook_lock_active_if_generation_for(&self.core, active, expected_generation, || {})
     }
 
     /// Enables a fail-open lease for the local hook lock. The caller must
@@ -579,9 +597,7 @@ fn renew_hook_lock_lease_for(core: &CaptureRuntimeCore, now: Instant) -> bool {
 }
 
 fn force_unlock_for_arc(core: &CaptureRuntimeCore, cause: Option<SafetyUnlockCause>) -> bool {
-    if !core.lock_active.swap(false, Ordering::AcqRel) {
-        return false;
-    }
+    let was_active = core.lock_active.swap(false, Ordering::SeqCst);
 
     if let Ok(mut state) = core.runtime_state.lock() {
         state.left_ctrl_down = false;
@@ -592,23 +608,49 @@ fn force_unlock_for_arc(core: &CaptureRuntimeCore, cause: Option<SafetyUnlockCau
         lease.last_renewed_at = None;
     }
 
-    match cause {
-        Some(SafetyUnlockCause::Escape) => {
+    match (cause, was_active) {
+        (Some(SafetyUnlockCause::Escape), true) => {
             core.escape_unlock_pending.fetch_add(1, Ordering::AcqRel);
         }
-        Some(SafetyUnlockCause::LeaseExpired) => {
+        (Some(SafetyUnlockCause::LeaseExpired), true) => {
             core.lease_expired_unlock_pending
                 .fetch_add(1, Ordering::AcqRel);
         }
-        None => {}
+        _ => {}
     }
+    // Publish this last. A relock guard that missed the pending action must
+    // observe the generation change in its post-store check and fail open.
+    core.safety_unlock_generation.fetch_add(1, Ordering::SeqCst);
     if cause.is_some()
+        && was_active
         && let Ok(notifier) = core.wake_notifier.lock()
         && let Some(notifier) = notifier.as_ref()
     {
         notifier("input_safety_unlock");
     }
-    true
+    was_active
+}
+
+fn set_hook_lock_active_if_generation_for(
+    core: &Arc<CaptureRuntimeCore>,
+    active: bool,
+    expected_generation: u64,
+    after_store: impl FnOnce(),
+) -> Result<bool> {
+    if !active {
+        return set_hook_lock_active_for(core, false);
+    }
+    if core.safety_unlock_generation.load(Ordering::SeqCst) != expected_generation {
+        return Ok(false);
+    }
+
+    set_hook_lock_active_for(core, true)?;
+    after_store();
+    if core.safety_unlock_generation.load(Ordering::SeqCst) != expected_generation {
+        let _ = set_hook_lock_active_for(core, false);
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn expire_hook_lock_lease_if_needed(core: &CaptureRuntimeCore, now: Instant) -> bool {
@@ -1116,6 +1158,7 @@ mod tests {
             lock_active: AtomicBool::new(false),
             escape_unlock_pending: AtomicU64::new(0),
             lease_expired_unlock_pending: AtomicU64::new(0),
+            safety_unlock_generation: AtomicU64::new(0),
             lock_watchdog_stop: AtomicBool::new(false),
             raw_input_mouse_enabled: AtomicBool::new(false),
             dropped_event_count: AtomicU64::new(0),
@@ -1384,5 +1427,49 @@ mod tests {
             1,
             "one lease transition must produce one bounded action"
         );
+    }
+
+    #[test]
+    fn relock_generation_rejects_safety_unlock_before_store() {
+        let core = test_runtime_core();
+        set_hook_lock_active_for(&core, true).expect("initial lock");
+        let expected_generation = core.safety_unlock_generation.load(Ordering::SeqCst);
+        assert!(force_unlock_for_arc(&core, Some(SafetyUnlockCause::Escape)));
+
+        assert!(
+            !set_hook_lock_active_if_generation_for(&core, true, expected_generation, || {})
+                .expect("guarded relock"),
+            "a safety generation change before the store must inhibit relock"
+        );
+        assert!(!core.lock_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn relock_generation_post_store_guard_closes_final_race() {
+        let core = test_runtime_core();
+        let expected_generation = core.safety_unlock_generation.load(Ordering::SeqCst);
+
+        assert!(
+            !set_hook_lock_active_if_generation_for(&core, true, expected_generation, || {
+                assert!(force_unlock_for_arc(&core, Some(SafetyUnlockCause::Escape)));
+            })
+            .expect("guarded relock"),
+            "an unlock racing after the store must win the post-store guard"
+        );
+        assert!(!core.lock_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn shutdown_unlock_inhibits_pending_relock_even_when_already_unlocked() {
+        let core = test_runtime_core();
+        let expected_generation = core.safety_unlock_generation.load(Ordering::SeqCst);
+        assert!(!force_unlock_for_arc(&core, None));
+
+        assert!(
+            !set_hook_lock_active_if_generation_for(&core, true, expected_generation, || {})
+                .expect("guarded relock"),
+            "shutdown must invalidate a pending relock even if the hook was momentarily unlocked"
+        );
+        assert!(!core.lock_active.load(Ordering::Acquire));
     }
 }

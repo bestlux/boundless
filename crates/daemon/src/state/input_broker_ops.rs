@@ -201,12 +201,11 @@ impl AppState {
         let detached = self.input_broker.detach(broker_token);
         if detached {
             let release_events = self.input_broker.drain_release_events();
+            let release_event_count = release_events.len();
             if let Some(peer_id) = capture_target.as_deref()
                 && !release_events.is_empty()
             {
-                let _ = self
-                    .queue_input_events(peer_id, release_events.clone())
-                    .await;
+                let _ = self.queue_input_events(peer_id, release_events).await;
             }
             self.clear_input_capture_target().await;
             let released_owner = if let Some(peer_id) = self.input_owner().await {
@@ -224,7 +223,7 @@ impl AppState {
                 detail: format!(
                     "reason=broker_requested capture_target_cleared={} owner_released={released_owner} release_events={}",
                     capture_target.is_some(),
-                    release_events.len()
+                    release_event_count
                 ),
                 size_bytes: 0,
             });
