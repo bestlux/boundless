@@ -17,9 +17,13 @@ impl WindowsClipboardBackend {
             return Ok(Some(ClipboardPayload::Image(image_bmp)));
         }
 
-        Ok(clipboard_win::get_clipboard_string()
-            .ok()
-            .map(ClipboardPayload::Text))
+        if formats::Unicode.is_format_avail() {
+            let text = clipboard_win::get_clipboard_string()
+                .map_err(|error| anyhow::anyhow!("clipboard text read failed: {error}"))?;
+            return Ok(Some(ClipboardPayload::Text(text)));
+        }
+
+        Ok(None)
     }
 
     pub fn write_payload(&mut self, payload: &ClipboardPayload) -> Result<()> {

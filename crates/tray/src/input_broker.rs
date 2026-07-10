@@ -39,7 +39,14 @@ struct SafetyUnlockReconciler {
 #[derive(Debug, Default)]
 struct ClipboardBrokerState {
     last_sequence: Option<u64>,
+    pending_local_payload: Option<PendingLocalClipboardPayload>,
     apply_report: Option<ClipboardBrokerApplyReport>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingLocalClipboardPayload {
+    sequence: u64,
+    payload: core_clipboard::ClipboardPayload,
 }
 
 #[derive(Debug, Default)]
@@ -118,14 +125,46 @@ impl InjectedInputState {
 }
 
 impl ClipboardBrokerState {
-    fn observe_sequence(&mut self, sequence: u64) -> bool {
-        if self.last_sequence == Some(sequence) {
-            return false;
+    fn should_read_sequence(&self, sequence: u64) -> bool {
+        self.pending_local_payload.is_none() && self.last_sequence != Some(sequence)
+    }
+
+    fn stage_local_read(
+        &mut self,
+        sequence: u64,
+        payload: Option<core_clipboard::ClipboardPayload>,
+    ) -> Option<core_clipboard::ClipboardPolicyError> {
+        let Some(payload) = payload else {
+            self.last_sequence = Some(sequence);
+            return None;
+        };
+
+        if let Err(error) =
+            core_clipboard::validate_payload(core_clipboard::ClipboardPolicy::default(), &payload)
+        {
+            // Policy rejection is deterministic for this clipboard sequence.
+            // Consume it locally so an oversized payload cannot become a
+            // ResourceExhausted retry loop at the tonic boundary.
+            self.last_sequence = Some(sequence);
+            return Some(error);
         }
-        // Advance before attempting the RPC. A rejected or oversized payload
-        // must not be replayed every time the clipboard worker reconnects.
-        self.last_sequence = Some(sequence);
-        true
+
+        self.pending_local_payload = Some(PendingLocalClipboardPayload { sequence, payload });
+        None
+    }
+
+    fn stage_local_read_result(
+        &mut self,
+        sequence: u64,
+        result: Result<Option<core_clipboard::ClipboardPayload>>,
+    ) -> Result<Option<core_clipboard::ClipboardPolicyError>> {
+        Ok(self.stage_local_read(sequence, result?))
+    }
+
+    fn local_payload_for_request(&self) -> Option<core_clipboard::ClipboardPayload> {
+        self.pending_local_payload
+            .as_ref()
+            .map(|pending| pending.payload.clone())
     }
 
     fn apply_report_for_request(&self) -> Option<ClipboardBrokerApplyReport> {
@@ -133,6 +172,9 @@ impl ClipboardBrokerState {
     }
 
     fn mark_exchange_accepted(&mut self) {
+        if let Some(pending) = self.pending_local_payload.take() {
+            self.last_sequence = Some(pending.sequence);
+        }
         self.apply_report = None;
     }
 
@@ -514,14 +556,78 @@ mod input_broker_tests {
     }
 
     #[test]
-    fn clipboard_sequence_is_consumed_once_even_when_exchange_will_fail() {
+    fn clipboard_payload_survives_transient_read_and_rpc_failures() {
         let mut state = ClipboardBrokerState::default();
-        assert!(state.observe_sequence(41));
+        assert!(state.should_read_sequence(41));
+
+        let error = state
+            .stage_local_read_result(41, Err(anyhow::anyhow!("clipboard busy")))
+            .expect_err("transient read failure must surface");
+        assert!(error.to_string().contains("clipboard busy"));
         assert!(
-            !state.observe_sequence(41),
-            "the same failed clipboard sequence must not replay"
+            state.should_read_sequence(41),
+            "a failed read must leave the sequence eligible for retry"
         );
-        assert!(state.observe_sequence(42));
+
+        let rejection = state
+            .stage_local_read_result(
+                41,
+                Ok(Some(core_clipboard::ClipboardPayload::Text(
+                    "retry me".to_string(),
+                ))),
+            )
+            .expect("successful retry");
+        assert!(
+            rejection.is_none(),
+            "policy-valid payload must not be rejected"
+        );
+        assert_eq!(
+            state.local_payload_for_request(),
+            Some(core_clipboard::ClipboardPayload::Text(
+                "retry me".to_string()
+            ))
+        );
+        assert_eq!(
+            state.local_payload_for_request(),
+            Some(core_clipboard::ClipboardPayload::Text(
+                "retry me".to_string()
+            )),
+            "a transport failure must leave the same payload pending"
+        );
+
+        state.mark_exchange_accepted();
+        assert!(state.local_payload_for_request().is_none());
+        assert!(
+            !state.should_read_sequence(41),
+            "only an accepted app reply consumes a staged payload sequence"
+        );
+    }
+
+    #[test]
+    fn oversized_clipboard_payload_is_consumed_without_staging_rpc_retry() {
+        let mut state = ClipboardBrokerState::default();
+        let policy = core_clipboard::ClipboardPolicy::default();
+        let rejection = state
+            .stage_local_read_result(
+                52,
+                Ok(Some(core_clipboard::ClipboardPayload::Image(vec![
+                    0;
+                    policy.max_image_bytes + 1
+                ]))),
+            )
+            .expect("deterministic local validation")
+            .expect("oversize payload must be rejected");
+
+        assert!(matches!(
+            rejection,
+            core_clipboard::ClipboardPolicyError::ImageTooLarge { .. }
+        ));
+        assert!(state.local_payload_for_request().is_none());
+        assert!(
+            !state.should_read_sequence(52),
+            "an unchanged oversize sequence must not retry toward tonic"
+        );
+        assert!(state.should_read_sequence(53));
     }
 
     #[test]
@@ -642,11 +748,16 @@ async fn clipboard_broker_exchange_once(
     broker_token: &str,
     state: &mut ClipboardBrokerState,
 ) -> Result<()> {
-    let local_payload = read_clipboard_payload_if_changed(state).await;
+    // A busy local clipboard must not block apply reports or inbound payloads.
+    // Preserve the unread sequence, complete this exchange, then surface the
+    // local error so the supervisor uses its bounded retry delay.
+    let local_read_error = stage_clipboard_payload_if_changed(state).await.err();
     let reply = client
         .exchange_clipboard_broker(ClipboardBrokerExchangeRequest {
             broker_token: broker_token.to_string(),
-            local_payload: local_payload.map(clipboard_payload_to_proto),
+            local_payload: state
+                .local_payload_for_request()
+                .map(clipboard_payload_to_proto),
             apply_report: state.apply_report_for_request(),
         })
         .await?
@@ -672,33 +783,41 @@ async fn clipboard_broker_exchange_once(
         });
     }
 
+    if let Some(error) = local_read_error {
+        return Err(error).context("local clipboard read deferred");
+    }
+
     Ok(())
 }
 
-async fn read_clipboard_payload_if_changed(
-    state: &mut ClipboardBrokerState,
-) -> Option<core_clipboard::ClipboardPayload> {
+async fn stage_clipboard_payload_if_changed(state: &mut ClipboardBrokerState) -> Result<()> {
+    if state.pending_local_payload.is_some() {
+        return Ok(());
+    }
+
     let sequence = tokio::task::spawn_blocking(|| {
         let mut backend = WindowsClipboardBackend;
         backend.sequence_number()
     })
     .await
-    .ok()
-    .flatten();
-    if let Some(sequence) = sequence
-        && !state.observe_sequence(sequence)
-    {
-        return None;
+    .context("clipboard sequence task panicked")?
+    .context("clipboard sequence unavailable")?;
+    if !state.should_read_sequence(sequence) {
+        return Ok(());
     }
 
-    tokio::task::spawn_blocking(|| {
+    let payload_result = tokio::task::spawn_blocking(|| {
         let mut backend = WindowsClipboardBackend;
         backend.read_payload()
     })
     .await
-    .ok()
-    .and_then(|result| result.ok())
-    .flatten()
+    .context("clipboard read task panicked")?;
+    if let Some(error) = state.stage_local_read_result(sequence, payload_result)? {
+        eprintln!(
+            "boundless clipboard local payload skipped sequence={sequence} reason={error}"
+        );
+    }
+    Ok(())
 }
 
 async fn write_clipboard_payload(payload: ClipboardBrokerPayload) -> Result<()> {
