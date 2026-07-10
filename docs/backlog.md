@@ -4,7 +4,7 @@ Prioritized, implementation-ready story briefs for the path to a real release. E
 
 Ordering rationale: P0 stories are things a launch user would hit in their first hour. P1 stories are the reliability/trust surface that made dogfood expensive. P2 stories are hardening and paper cuts that compound.
 
-Evidence base: the 2026-07-07 two-PC dogfood sessions recorded in [release/launch-ledger.md](release/launch-ledger.md). Transport, pairing, layout propagation, and input latency are PROVEN GOOD on real asymmetric-reachability hardware. The 2026-07-08 v5.0.11 release landed the P0 slice in code; converting those to dogfood-proven is now the top of the queue.
+Evidence base: the 2026-07-07 and 2026-07-10 two-PC dogfood sessions recorded in [release/launch-ledger.md](release/launch-ledger.md). Transport, pairing, layout propagation, input handoff, and service-mode text clipboard are proven on real asymmetric-reachability hardware. The same sessions exposed first-hour recovery, image-clipboard, discovery, and diagnostics failures that remain ahead of broader feature work.
 
 ---
 
@@ -15,9 +15,68 @@ Full implementation briefs live in git history (`git show ac4d4d0:docs/backlog.m
 | story | commit | remaining evidence before marking proven |
 | --- | --- | --- |
 | BND-NEXT-23 (P0) — service honors SCM stop | 0828513 | The 5.0.11 install over a running 5.0.10 service is the first real-binary upgrade this fix will face. Capture a verbose msiexec log showing no multi-minute `ServiceControl` stall, and `Stop-Service` completing in seconds with a broker attached and a peer connected. |
-| BND-NEXT-24 (P0) — broker-routed clipboard | 9bd45dd | Two-PC service-mode copy/paste both directions (text, and image within size limits); echo suppression holds; diagnostics show the active clipboard backend and a visible degraded reason when no broker is attached. |
-| BND-NEXT-25 (P1) — transport events readable | a96613b | On an installed build after an idle minute with a peer: `transport events --limit 100` shows real history (no safety-tick flood); `--kind` / `--exclude-kind` filters work. |
+| BND-NEXT-24 (P0) — broker-routed clipboard | 9bd45dd | Reopened after live partial pass: text passed both directions in 5.0.12 service mode, but a policy-valid 6.29 MB bitmap exceeded the broker RPC limit, detached the shared input/clipboard broker, and disabled input. See the active brief below. |
+| BND-NEXT-25 (P1) — transport events readable | a96613b | Reopened by BND-NEXT-34 evidence: safety ticks are filtered and CLI filters work, but broker wakes and per-frame input records can still evict the causal transition or failure within seconds. |
 | BND-NEXT-26 (P1) — packaging-script CI | 0305022 | Done — self-tests + CLI daemon-status output contract wired into `ci.yml` and release validation, green on main. Optional: demonstrate a deliberate `^machine_id=` regression fails CI locally. |
+
+---
+
+## BND-NEXT-24 (P0, reopened): Isolate service-mode clipboard failures and carry policy-valid images
+
+### Context and evidence
+
+Installed 5.0.12 proved service-mode text clipboard in both directions for the first time. The image path then failed below the advertised policy limit: Paint placed a 1254×1254 32-bit bitmap on the clipboard (about 6.29 MB), while Boundless permits images up to 8 MB. The tray-to-service unary RPC retained its lower default message limit. That error won a shared `select!`, cancelled input exchange, detached the user-session broker, and retried the same clipboard sequence every three seconds. Peer health still said connected/trusted while mouse and keyboard input fell back to unsupported Session 0 injection.
+
+### What to build
+
+- Make input and clipboard broker supervision independent: clipboard read, validation, IPC, or apply failure must never cancel input capture/injection or detach the input broker.
+- Carry every policy-valid clipboard image through the tray/service boundary in both directions. Use a symmetric message contract with protobuf overhead accounted for, or chunk the local IPC payload; do not silently lower the 8 MB product policy.
+- Classify a non-retryable clipboard sequence once, retain a bounded failure summary, and wait for clipboard contents to change instead of replaying an attach/detach storm.
+- Surface exact clipboard degradation in tray/CLI while peer and input health remain truthful.
+
+### Acceptance criteria
+
+- The observed 6.29 MB bitmap and boundary payloads up to the configured 8 MB policy transfer through Paint in both directions.
+- Payloads above policy are rejected once with an actionable size error; they do not detach input, loop every three seconds, or retry until the clipboard changes.
+- Mouse and keyboard handoff remain usable throughout local read errors, request-side oversize, response-side oversize, remote apply failure, and clipboard unavailability.
+- Input/clipboard broker state and peer health distinguish attached, clipboard-degraded, input-degraded, and fully healthy states.
+- Deterministic tests cover both IPC directions, message-size overhead, independent task failure, unchanged failed-sequence suppression, and recovery after a short text copy.
+
+### Out of scope
+
+- Clipboard image streaming/spooling across the peer transport; this failure occurred before peer transport and below the current policy limit.
+- Explorer copied-file clipboard semantics, tracked separately in BND-NEXT-36.
+
+### Validation
+
+Focused broker/IPC fault tests; installed service-mode Paint copy/paste at small, observed, boundary, and over-limit sizes; continuous input handoff during each clipboard failure case.
+
+---
+
+## BND-NEXT-35 (P0, ready for agent): Start a stopped installed service from the tray without console flashes
+
+### Context and evidence
+
+After reset on both 5.0.12 PCs, launching Boundless from Start opened the tray but left the installed automatic `BoundlessService` stopped. The tray repeatedly reported backend failure and flashed a console window until the user opened elevated PowerShell and ran `Start-Service BoundlessService`. The current tray correctly refuses to launch a competing per-user daemon when the service exists, but it only queries service state and bails; its retry loop repeatedly launches visible `sc.exe query` processes.
+
+### What to build
+
+- Preserve fail-closed daemon ownership while adding a bounded, quiet Windows service recovery path for installed/stopped and start-pending states.
+- Present one explicit “Start Boundless service” action. Start without elevation when service ACLs permit; otherwise request UAC once and report cancellation/access denied without retrying or flashing terminals.
+- Wait for both SCM Running and the named-pipe API before declaring recovery, then reconnect the existing tray/brokers without another launch.
+- Keep missing-service development fallback and running-but-unreachable repair guidance distinct.
+
+### Acceptance criteria
+
+- With the installed service explicitly stopped, Start Menu launch reaches a healthy service/API through one user-visible recovery action and no manual shell.
+- No console, PowerShell, or `sc.exe` window flashes during state queries, start, polling, failure, or retry.
+- Access denied, UAC cancellation, start timeout, running/unreachable, start-pending, and missing-service cases remain stable and actionable; no exponential retry storm occurs.
+- Recovery never starts `boundlessd.exe`, never creates a second service or tray, and leaves service ownership LocalSystem with the configured allowed-user SID.
+- Focused state-machine tests plus an installed standard-user Windows smoke prove stopped-to-running recovery on both dogfood PCs.
+
+### Blocked by
+
+None. Preserve BND-NEXT-11’s service-ownership rule rather than reverting to a per-user daemon fallback.
 
 ---
 
@@ -78,6 +137,35 @@ Scoped in [architecture/one-sided-reachability.md](architecture/one-sided-reacha
 
 Scope: surface the collision in the tray (peer health or a dedicated warning), and provide a guided alternate-`network_port` flow that applies the same port on all trusted peers (pairing port = network_port + 100). Acceptance: with MWB listening on 15100, the tray shows the collision and the guided flow moves both machines to a working alternate port without breaking trust. Files: diagnostics surface already exists in `crates/app-services/src/diagnostics.rs`; add tray workflow + config propagation.
 
+Add the 2026-07-10 start-order evidence to validation: MWB was still running when Boundless first installed/launched, and input recovered only after MWB was fully removed plus broader Boundless recovery. The exact hook-collision cause was not isolated, so do not claim it as confirmed. Validate start-order permutations and require a narrow recovery—stop MWB and restart only the tray broker—without trust/network reset. Surface active MWB hook/port ownership separately from generic backend failure.
+
+---
+
+## BND-NEXT-20E (P1, ready for agent): Self-heal and explain one-way discovery
+
+### Context and evidence
+
+On the routed dogfood topology, CODY-ELITEBOOK (`10.10.0.187`) discovered CODY-PC (`192.168.1.102`) while CODY-PC showed no discovered peers. Direct TCP from CODY-PC to the EliteBook succeeded on 15100 and 15200, manual-host pairing succeeded, and discovery returned after reset/restart. The blocked-side error reported `role_reversal_attempted=false`. The symptom is confirmed; whether the cause was a stopped browse, an unusable resolution, interface churn, or routed multicast behavior is not.
+
+### What to build
+
+- Supervise discovery lifecycle with bounded restart/backoff when browse stops, its receiver closes, or interface state changes.
+- Record why a resolved service is discarded and expose active, healthy, last-success, and last-error discovery state instead of one `mdns_active` boolean.
+- When automatic reverse signaling is impossible, immediately explain the exact other-machine manual-host action. Persist a successfully paired/reachable candidate so reconnect does not depend on fresh mDNS.
+- Keep cross-subnet multicast support decision-gated: do not promise that every routed network reflects mDNS.
+
+### Acceptance criteria
+
+- Injected browse stop, receiver close, and interface-change cases recover without daemon restart and without duplicate registrations.
+- Missing TXT properties, empty addresses, scope problems, and filtered self-records produce bounded diagnostic reasons instead of silent disappearance.
+- The exact two-subnet installed topology has a recorded restart/reinstall matrix; unsupported routed multicast produces immediate manual-host guidance rather than indefinite empty discovery.
+- After successful manual pairing, service/tray restart reconnects by persisted trusted candidate even when mDNS remains one-way.
+- Role-reversal diagnostics explain why reversal was or was not attempted and never imply success when no signaling path exists.
+
+### Dependencies and scope boundary
+
+Build on the existing BND-NEXT-20 candidate and role-reversal model; no relay/cloud or broad discovery redesign.
+
 ---
 
 ## BND-NEXT-28 (P2): `boundlessctl --json`
@@ -92,10 +180,11 @@ Independent small items, one PR each or one sweep; all observed 2026-07-07:
 2. `scripts/release/package-windows.ps1` must clean `packaging/windows/installer/obj` and `bin` before `dotnet build` (stale obj + renamed output ⇒ MSB3030). Still open as of 0305022 (that commit only added fixture staging).
 3. Same-version dogfood upgrades silently no-op (`MajorUpgrade` without `AllowSameVersionUpgrades`). Either add `AllowSameVersionUpgrades="yes"` or make the packaging script refuse to build an MSI whose version equals an already-published dogfood artifact. Decide and document in `packaging/windows/README.txt`.
 4. `boundlessctl daemon status` reported `daemon_version=5.0.0` on 5.0.10 installs. The workspace version bump in v5.0.11 (55c5f6b) likely resolves this — verify on the installed 5.0.11 build, and if the value still lags, wire the real package version through.
+5. Double-clicking the released 5.0.12 MSI failed with Windows Installer error 1603 because `BOUNDLESS_ALLOWED_USER_SID` was absent; a later helper/property-driven install succeeded. Make the intended release entry point unmistakable and directly usable, then verify product/version registration, the service command’s allowed-user SID, service Running, daemon API health, and exactly one tray rather than trusting `msiexec` exit alone. Any bootstrapper/MSI-UI/helper-as-primary choice must preserve explicit user selection and fail closed rather than inferring the wrong elevated account.
 
 Tray single-instance ownership moved to standalone story BND-NEXT-31 because duplicate trays interfere with the backend connection and need their own runtime acceptance criteria.
 
-Acceptance: each item has a targeted test or self-test where the surface allows (1 and 2 are testable; 3 is a policy + doc change; 4 is verify-then-fix).
+Acceptance: each item has a targeted test or self-test where the surface allows; install success is defined by registered version plus healthy service/API/tray postconditions, not process exit alone.
 
 ---
 
@@ -106,6 +195,8 @@ Status: code complete; installed-build and MSI upgrade evidence pending.
 ### Context and evidence
 
 Dogfood can launch any number of `boundlesstray.exe` processes in the same desktop session. Duplicate trays each start their own dashboard and broker activity, then compete for or lose access to the same backend service. The resulting connection failures look like daemon, named-pipe, or service instability even though the initiating defect is duplicate UI ownership. Installer smoke detects an unexpected tray count after upgrade, but normal application launch has no single-instance guard.
+
+Installed 5.0.12 evidence also recorded Windows Application Hang event 1002 for `boundlesstray.exe` three times during install/reset/relaunch churn. Treat non-hanging exit and existing-window activation as part of the pending installed-build proof; do not mark the single-instance story proven from process count alone.
 
 ### Scope
 
@@ -243,7 +334,7 @@ Done when the implementation matches the approved responsive states, keyboard an
 
 ### Context and evidence
 
-BND-NEXT-25 removed retained `input_runtime_wake` safety-tick noise and added CLI kind filters, but 5.0.12 two-PC dogfood exposed a second high-rate path. While the user pushed the cursor through a configured edge, `runtime_wake channel=input_capture source=input_broker_exchange` was retained roughly every 15 milliseconds. The bounded event ring then evicted the useful `input_handoff` transition before a follow-up `transport events` query could retrieve it. Live status proved that the cursor reached the edge and capture briefly selected and locked to the trusted peer, but retained telemetry could not show whether frames were queued, sent, received, injected, skipped, or failed.
+BND-NEXT-25 removed retained `input_runtime_wake` safety-tick noise and added CLI kind filters, but 5.0.12 two-PC dogfood exposed additional high-rate paths. While the user pushed the cursor through a configured edge, `runtime_wake channel=input_capture source=input_broker_exchange` and later per-frame `input_frame`/inject-failure records were retained roughly every 15 milliseconds. The bounded event ring then evicted the useful `input_handoff` transition before a follow-up query could retrieve it. Live status proved that the cursor reached the edge and capture briefly selected and locked to the trusted peer, but retained telemetry could not preserve a concise causal path.
 
 ### Desired behavior
 
@@ -277,6 +368,58 @@ Focused event-store/runtime tests with a synthetic high-rate broker stream; CLI 
 
 ---
 
+## BND-NEXT-37 (P1, ready for agent): Never retain clipboard content in runtime events
+
+### Context and evidence
+
+During the successful 5.0.12 text-clipboard test, `boundlessctl transport events --kind clipboard` printed the first 80 characters of copied text. Clipboard content is stored in the in-memory event ring at event creation and returned unchanged through the raw event API/CLI; only support-bundle generation redacts it. Local-only storage does not make clipboard plaintext appropriate diagnostic metadata.
+
+### What to build
+
+- Record only direction, payload type, byte count, disposition, and non-content-derived correlation metadata for clipboard events.
+- Remove content at event creation so later redaction is defense in depth, not the primary privacy boundary.
+- Apply output-side protection to raw API/CLI paths so older or malformed event producers cannot expose clipboard content.
+
+### Acceptance criteria
+
+- A unique secret sentinel copied in either direction is absent from the in-memory event store, raw event API, CLI output, logs, and default/full diagnostic bundles.
+- Successful, disabled, rejected, deduped, replayed, and apply-failed clipboard cases remain diagnosable using metadata only.
+- No preview, reversible encoding, or content-derived value suitable for trivial lookup is retained.
+- Tests cover incoming and outgoing text plus image metadata without weakening existing endpoint, identifier, path, and filename redaction.
+
+### Blocked by
+
+None. Coordinate event-shape tests with BND-NEXT-34, but do not block this privacy fix on retention redesign.
+
+---
+
+## BND-NEXT-36 (P2, blocked): Deliver one copied Explorer file through a visible receive workflow
+
+### Context and evidence
+
+The dogfooder naturally copied `Boundless-Clipboard-Test.png` in Explorer and pasted on the peer. Windows supplied a file-list clipboard format; Boundless emitted no file or image event and the paste silently did nothing. The gap was documented but not backlog-ready. Service-mode file configuration also defaulted to `C:\WINDOWS\system32\config\systemprofile\AppData\Local\Boundless`, a LocalSystem-owned location a desktop user cannot reasonably discover or use, with trusted-peer auto-accept correctly defaulting false.
+
+### What to build
+
+- Define and deliver one local regular-file clipboard vertical slice: capture the copied path, apply existing size/trust/receive policy, transfer it, and make remote paste/receipt destination and outcome visible.
+- Require a user-visible receive folder before enabling receipt; never present the service profile directory as a normal desktop destination.
+- Show progress, consent/auto-accept decision, final path, collision rename, rejection, and interrupted cleanup through the tray/Transfer Center.
+- Defer folders, multiple files, network paths, resumable transfer, and shell-extension parity unless separately approved.
+
+### Acceptance criteria
+
+- Copying one disposable local file in Explorer and pasting through the supported peer workflow produces one byte-identical file in the explicitly selected user folder.
+- Default-deny receive policy gives an actionable consent state, and trusted-peer auto-accept works only after explicit opt-in.
+- Duplicate names are collision-safe; interrupted or rejected transfers leave no ambiguous final file and expose cleanup status.
+- No file-list attempt is silently treated as bitmap clipboard, and unsupported multi-file/folder/network inputs explain the limitation.
+- Installed service-mode tests prove both directions with a user-owned receive directory and no writes to systemprofile.
+
+### Blocked by
+
+BND-NEXT-24 broker fault containment and supported-size image proof. Explicit send-file remains the supported fallback meanwhile.
+
+---
+
 ## Post-launch candidates
 
 ### BND-NEXT-30: Remote audio device sharing (mic + output across peers)
@@ -294,4 +437,4 @@ Do not start before the P0/P1 stories above land; write the full implementation 
 
 - Relay/cloud transport, QUIC/iroh/libp2p migrations: the 2026-07-07 evidence shows direct TCP with role reversal satisfies the LAN dogfood; revisit only per the decision gates in the one-sided-reachability doc.
 - Clipboard image streaming/spooling, lock-screen/elevated-app service parity, mixed-DPI matrix: tracked as explicit gaps in [project-status.md](project-status.md); they need dedicated evidence-driven slices, not backlog stubs.
-- File-transfer UX productization: next after P0/P1 above; write its brief when the 5.0.11 clipboard brokerage (BND-NEXT-24) is dogfood-proven, since it reuses the same session-boundary pattern.
+- Broader file-transfer UX beyond BND-NEXT-36’s one-file tracer bullet: folders, multiple files, network paths, resumable transfer, and richer shell integration remain deferred until the P0/P1 clipboard and broker work is proven.
