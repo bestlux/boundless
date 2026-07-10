@@ -60,6 +60,10 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
         self.pump.renew_lock_lease()
     }
 
+    fn lock_activation_is_synchronous(&self) -> bool {
+        true
+    }
+
     fn lock_supported(&self) -> bool {
         true
     }

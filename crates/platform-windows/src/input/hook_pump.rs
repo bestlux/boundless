@@ -318,7 +318,6 @@ impl HookInputPump {
         self.last_button_down.clear();
         self.pending_wheels.clear();
         self.emitted_wheel_tombstones.clear();
-        let _ = self.capture_runtime.drain_control_actions();
         let _ = self.capture_runtime.drain_events();
     }
 
@@ -439,6 +438,30 @@ mod tests {
             "hook_escape_detector_unavailable"
         );
         assert_eq!(backend_mode_for(false, false), "hook");
+    }
+
+    #[test]
+    fn reset_preserves_pending_safety_unlock_actions() {
+        let (_tx, rx) = mpsc::channel();
+        let runtime = CaptureRuntime::from_test_parts(rx, true);
+        let mut pump = HookInputPump::from_capture_runtime(runtime);
+        pump.enable_lock_lease(Duration::from_millis(20))
+            .expect("enable lock lease");
+        assert!(pump.set_lock_active(true).expect("engage lock"));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while pump.lock_active() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!pump.lock_active(), "watchdog must expire the test lock");
+
+        pump.reset();
+
+        assert_eq!(
+            pump.drain_control_actions(),
+            vec![HookControlAction::LeaseExpiredUnlock],
+            "stream reset must not consume a pending fail-open reconciliation action"
+        );
     }
 
     fn wheel(

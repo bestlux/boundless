@@ -243,6 +243,25 @@ impl SafetyUnlockReconciler {
         }
     }
 
+    fn observe_lock_update(
+        &mut self,
+        requested_active: bool,
+        result: &Result<bool>,
+        followup_actions: Vec<HookControlAction>,
+    ) {
+        let observed_action = !followup_actions.is_empty();
+        self.observe(followup_actions);
+        if requested_active && !matches!(result, Ok(true)) && !observed_action {
+            // An unavailable detector can refuse activation while the hook is
+            // already unlocked, so there is no unlock transition for the
+            // platform runtime to publish. Synthesize the same reconciliation
+            // boundary here and keep local events suppressed until the daemon
+            // confirms capture ownership has been cleared.
+            self.pending_report_count = self.pending_report_count.saturating_add(1);
+            self.waiting_for_daemon_release = true;
+        }
+    }
+
     fn report_count(&self) -> u32 {
         self.pending_report_count
     }
@@ -540,7 +559,19 @@ async fn input_broker_exchange_loop(
             } else {
                 pump.set_lock_active(false)
             };
-            if let Err(error) = result {
+            if local_lock_should_be_active && result.is_err() {
+                let _ = pump.set_lock_active(false);
+            }
+            safety_unlock.observe_lock_update(
+                local_lock_should_be_active,
+                &result,
+                pump.drain_control_actions(),
+            );
+            if local_lock_should_be_active && matches!(result, Ok(false)) {
+                eprintln!(
+                    "boundless input broker local lock activation refused; clearing daemon capture"
+                );
+            } else if let Err(error) = result {
                 eprintln!(
                     "boundless input broker failed to update local input lock: {error:#}"
                 );
@@ -600,6 +631,24 @@ mod input_broker_tests {
         state.observe(vec![HookControlAction::LeaseExpiredUnlock]);
         assert_eq!(state.report_count(), 1);
         assert!(!state.lock_should_be_active(true, true));
+    }
+
+    #[test]
+    fn refused_local_lock_becomes_a_safety_unlock_reconciliation() {
+        let mut state = SafetyUnlockReconciler::default();
+        let result = Ok(false);
+
+        state.observe_lock_update(true, &result, Vec::new());
+
+        assert_eq!(state.report_count(), 1);
+        assert!(!state.should_forward_captured_events());
+        assert!(
+            !state.lock_should_be_active(true, true),
+            "the stale daemon reply must not keep capture active after local refusal"
+        );
+        state.mark_report_delivered();
+        assert!(!state.lock_should_be_active(false, false));
+        assert!(state.should_forward_captured_events());
     }
 
     #[test]

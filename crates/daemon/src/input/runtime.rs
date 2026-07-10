@@ -320,13 +320,17 @@ pub(super) async fn capture_and_queue_outgoing_frames(
         initial_relock_generation,
     )
     .await;
-    sync_local_input_lock(
+    let lock_activation_refused = sync_local_input_lock(
         state,
         backend,
         capture_target.is_some(),
         initial_relock_generation,
     )
     .await;
+    if lock_activation_refused {
+        clear_capture_after_lock_refusal(state, &mut capture_target, edge_switch_state).await;
+        escape_triggered = true;
+    }
 
     if &capture_target != last_capture_target {
         if let Some(previous_target) = last_capture_target.as_deref() {
@@ -415,14 +419,17 @@ pub(super) async fn capture_and_queue_outgoing_frames(
         .await;
     }
 
-    let post_handoff_target = state.active_input_capture_target().await;
-    sync_local_input_lock(
+    let mut post_handoff_target = state.active_input_capture_target().await;
+    let lock_activation_refused = sync_local_input_lock(
         state,
         backend,
         post_handoff_target.is_some(),
         final_relock_generation,
     )
     .await;
+    if lock_activation_refused {
+        clear_capture_after_lock_refusal(state, &mut post_handoff_target, edge_switch_state).await;
+    }
 
     let (Some(peer_id), None) = (
         post_handoff_target.as_deref(),
@@ -492,7 +499,7 @@ async fn sync_local_input_lock(
     backend: &mut dyn InputCaptureBackend,
     should_lock: bool,
     relock_generation: u64,
-) {
+) -> bool {
     let supported = backend.lock_supported();
     let result = if should_lock {
         backend.set_lock_active_if_safety_generation(true, relock_generation)
@@ -503,6 +510,9 @@ async fn sync_local_input_lock(
         Ok(active) => active,
         Err(error) => {
             warn!(error = ?error, should_lock, "failed to update local input lock state");
+            if should_lock {
+                let _ = backend.set_lock_active(false);
+            }
             false
         }
     };
@@ -527,6 +537,35 @@ async fn sync_local_input_lock(
     if last_active != active || last_supported != supported {
         state.set_input_lock_runtime(active, supported).await;
     }
+
+    let activation_refused =
+        should_lock && supported && backend.lock_activation_is_synchronous() && !active;
+    if activation_refused {
+        record_local_input_runtime_event(
+            state,
+            "input_lock_activation_refused",
+            "requested=true applied=false capture_target=clearing",
+            "none",
+        )
+        .await;
+    }
+    activation_refused
+}
+
+async fn clear_capture_after_lock_refusal(
+    state: &AppState,
+    capture_target: &mut Option<String>,
+    edge_switch_state: &mut EdgeSwitchState,
+) {
+    if capture_target.is_some() {
+        state.clear_input_capture_target().await;
+    }
+    *capture_target = None;
+    edge_switch_state.last_direction = None;
+    edge_switch_state.x_pressure = 0;
+    edge_switch_state.y_pressure = 0;
+    edge_switch_state.suppress_until_instant =
+        Some(std::time::Instant::now() + Duration::from_millis(ESCAPE_EDGE_RECAPTURE_SUPPRESS_MS));
 }
 
 pub(super) async fn record_local_input_runtime_event(

@@ -298,7 +298,6 @@ impl InputBrokerRelay {
     pub(crate) fn reset_capture_stream(&self) {
         let mut inner = self.lock();
         inner.captured_events.clear();
-        inner.escape_unlock_pending = 0;
         inner.pressed_keys.clear();
         inner.pressed_buttons.clear();
     }
@@ -476,6 +475,20 @@ mod tests {
                 state: KeyState::Up,
                 semantics: first_down,
             }]
+        );
+    }
+
+    #[test]
+    fn capture_stream_reset_preserves_pending_safety_unlock() {
+        let relay = InputBrokerRelay::default();
+        relay.push_broker_observations(Vec::new(), None, None, 1, false, 0);
+
+        relay.reset_capture_stream();
+
+        assert_eq!(
+            relay.take_escape_unlock_count(),
+            1,
+            "a target transition must not consume broker safety reconciliation"
         );
     }
 }

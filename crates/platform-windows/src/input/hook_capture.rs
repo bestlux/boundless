@@ -1033,7 +1033,9 @@ fn set_hook_lock_active_if_generation_for(
         return Ok(false);
     }
 
-    set_hook_lock_active_for(core, true)?;
+    if !set_hook_lock_active_for(core, true)? {
+        return Ok(false);
+    }
     after_store();
     if core.safety_unlock_generation.load(Ordering::SeqCst) != expected_generation
         || core.safety_unlock_in_progress.load(Ordering::SeqCst) != 0
@@ -2520,6 +2522,27 @@ mod tests {
             "a safety generation change before the store must inhibit relock"
         );
         assert!(!core.lock_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn guarded_relock_propagates_detector_policy_refusal() {
+        let core = test_runtime_core();
+        core.keyboard_hook_degraded.store(true, Ordering::Release);
+        let expected_generation = core.safety_unlock_generation.load(Ordering::SeqCst);
+        let after_store_called = AtomicBool::new(false);
+
+        assert!(
+            !set_hook_lock_active_if_generation_for(&core, true, expected_generation, || {
+                after_store_called.store(true, Ordering::Release);
+            })
+            .expect("guarded relock"),
+            "an unavailable emergency-unlock detector must refuse the guarded relock"
+        );
+        assert!(!core.lock_active.load(Ordering::Acquire));
+        assert!(
+            !after_store_called.load(Ordering::Acquire),
+            "the post-store hook must not run when detector policy rejected the store"
+        );
     }
 
     #[test]

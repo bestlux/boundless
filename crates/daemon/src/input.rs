@@ -175,6 +175,11 @@ trait InputCaptureBackend: Send {
     fn renew_lock_lease(&self) -> bool {
         false
     }
+    /// Whether a false result from guarded lock activation is an authoritative
+    /// local refusal rather than an asynchronous broker acknowledgement.
+    fn lock_activation_is_synchronous(&self) -> bool {
+        false
+    }
     fn lock_supported(&self) -> bool;
     fn backend_mode(&self) -> &'static str;
     fn cursor_position(&self) -> Option<(i32, i32)> {
@@ -503,6 +508,7 @@ mod tests {
         lock_supported: bool,
         lock_active: bool,
         lock_updates: Vec<bool>,
+        refuse_guarded_lock: bool,
         reset_count: usize,
         poll_count: usize,
     }
@@ -516,6 +522,7 @@ mod tests {
                 lock_supported: true,
                 lock_active: false,
                 lock_updates: Vec::new(),
+                refuse_guarded_lock: false,
                 reset_count: 0,
                 poll_count: 0,
             }
@@ -523,6 +530,11 @@ mod tests {
 
         fn with_control_actions(mut self, actions: Vec<CaptureControlAction>) -> Self {
             self.control_actions = VecDeque::from(actions);
+            self
+        }
+
+        fn with_guarded_lock_refusal(mut self) -> Self {
+            self.refuse_guarded_lock = true;
             self
         }
     }
@@ -554,6 +566,23 @@ mod tests {
                 self.lock_active = false;
                 Ok(false)
             }
+        }
+
+        fn set_lock_active_if_safety_generation(
+            &mut self,
+            active: bool,
+            _expected_generation: u64,
+        ) -> Result<bool> {
+            if active && self.refuse_guarded_lock {
+                self.lock_updates.push(true);
+                self.lock_active = false;
+                return Ok(false);
+            }
+            self.set_lock_active(active)
+        }
+
+        fn lock_activation_is_synchronous(&self) -> bool {
+            true
         }
 
         fn lock_supported(&self) -> bool {
@@ -1641,6 +1670,55 @@ mod tests {
             !backend.lock_updates.contains(&true),
             "a pending safety action must be drained before any relock attempt"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn guarded_lock_refusal_clears_target_before_forwarding_input() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set target");
+
+        let mut backend = ScriptedCaptureBackend::new(
+            vec![vec![InputEvent::Key {
+                scan_code: 30,
+                state: KeyState::Down,
+            }]],
+            Vec::new(),
+        )
+        .with_guarded_lock_refusal();
+        let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
+
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+
+        assert!(
+            backend.lock_updates.contains(&true),
+            "the production capture path must exercise guarded activation"
+        );
+        assert!(
+            state.input_capture_target().await.is_none(),
+            "an authoritative local lock refusal must clear capture ownership"
+        );
+        assert!(
+            state.drain_outgoing(&peer_id).await.is_empty(),
+            "captured input must not be forwarded while it is also active locally"
+        );
+        let (locked, _) = state.input_lock_runtime().await;
+        assert!(!locked, "a refused activation must be reported as unlocked");
 
         let _ = std::fs::remove_dir_all(root);
     }
