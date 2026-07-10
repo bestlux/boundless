@@ -112,6 +112,7 @@ impl DashboardApp {
         cc: &eframe::CreationContext<'_>,
         app_ctx: Arc<AppContext>,
         mut single_instance_guard: SingleInstanceGuard,
+        input_broker_shutdown: InputBrokerShutdownSignal,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let exit_requested_signal = Arc::new(AtomicBool::new(false));
@@ -138,6 +139,7 @@ impl DashboardApp {
                 if event.id.as_ref() == ACTION_DASHBOARD {
                     show_dashboard_window(menu_window_handle, &menu_ctx);
                 } else if event.id.as_ref() == ACTION_QUIT {
+                    input_broker_shutdown.request();
                     request_dashboard_exit(menu_window_handle, &menu_ctx, &menu_exit_requested);
                 }
             },

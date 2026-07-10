@@ -197,15 +197,35 @@ impl AppState {
             return false;
         }
 
+        let capture_target = self.input_capture_target().await;
         let detached = self.input_broker.detach(broker_token);
         if detached {
+            let release_events = self.input_broker.drain_release_events();
+            if let Some(peer_id) = capture_target.as_deref()
+                && !release_events.is_empty()
+            {
+                let _ = self
+                    .queue_input_events(peer_id, release_events.clone())
+                    .await;
+            }
+            self.clear_input_capture_target().await;
+            let released_owner = if let Some(peer_id) = self.input_owner().await {
+                self.release_input_owner(&peer_id).await
+            } else {
+                false
+            };
+            self.set_input_lock_runtime(false, false).await;
             self.requeue_broker_clipboard_inflight().await;
             self.record_transport_event(TransportEventRecord {
                 timestamp: Utc::now(),
                 direction: "local".to_string(),
                 kind: "input_broker_detached".to_string(),
                 peer_id: "none".to_string(),
-                detail: "reason=broker_requested".to_string(),
+                detail: format!(
+                    "reason=broker_requested capture_target_cleared={} owner_released={released_owner} release_events={}",
+                    capture_target.is_some(),
+                    release_events.len()
+                ),
                 size_bytes: 0,
             });
             self.notify_input_capture_wake("input_broker_detached");
