@@ -2856,6 +2856,24 @@ mod tests {
     }
 
     #[test]
+    fn transport_event_filters_aggregates_before_limit() {
+        let events = vec![
+            test_transport_event("input_handoff", "direction=Left"),
+            test_transport_event(
+                "input_frame",
+                "sequence=4000 sample_count=4000 first_seen=one last_seen=two",
+            ),
+            test_transport_event("runtime_wake", "sample_count=4000"),
+        ];
+
+        let selected = select_transport_events(events, 1, Some("input_frame"), None);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].kind, "input_frame");
+        assert!(selected[0].detail.contains("sample_count=4000"));
+    }
+
+    #[test]
     fn build_orientation_matrix_builds_cross_layout() {
         let matrix = build_orientation_matrix(
             Some("peer-left"),
