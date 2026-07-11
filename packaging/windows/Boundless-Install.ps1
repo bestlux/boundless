@@ -3023,26 +3023,32 @@ function Wait-BoundlessElevatedInstallSupervised {
             -TreeJobName $TreeJobName
         $TreeClosureState.confirmed = $true
         if ($hardKillUsed -and $null -ne $HardKillRecoveryAction) {
-            while ($true) {
-                try {
-                    $recovery = & $HardKillRecoveryAction
-                    $TreeClosureState | Add-Member `
-                        -NotePropertyName parent_service_recovery_reconciled `
-                        -NotePropertyValue $true `
-                        -Force
-                    $TreeClosureState | Add-Member `
-                        -NotePropertyName parent_service_recovery_status `
-                        -NotePropertyValue ([string]$recovery.status) `
-                        -Force
-                    break
-                }
-                catch {
-                    Write-Warning (
-                        "Parent recovery after hard-killing the elevated installer failed; " +
-                        "tray quiescence remains held and recovery will retry. $($_.Exception.Message)"
-                    )
-                    Start-Sleep -Seconds 1
-                }
+            try {
+                $recovery = & $HardKillRecoveryAction
+                $TreeClosureState | Add-Member `
+                    -NotePropertyName parent_service_recovery_reconciled `
+                    -NotePropertyValue $true `
+                    -Force
+                $TreeClosureState | Add-Member `
+                    -NotePropertyName parent_service_recovery_status `
+                    -NotePropertyValue ([string]$recovery.status) `
+                    -Force
+            }
+            catch {
+                $recoveryFailure = $_
+                $TreeClosureState | Add-Member `
+                    -NotePropertyName parent_service_recovery_reconciled `
+                    -NotePropertyValue $false `
+                    -Force
+                $TreeClosureState | Add-Member `
+                    -NotePropertyName parent_service_recovery_status `
+                    -NotePropertyValue "failed" `
+                    -Force
+                throw (
+                    "$failure The staged installer process boundary was canceled. " +
+                    "Parent service recovery after the hard kill also failed: " +
+                    $recoveryFailure.Exception.Message
+                )
             }
         }
         throw "$failure The staged installer process boundary was canceled."
@@ -5616,6 +5622,11 @@ function Invoke-BoundlessInstallerSupervisionFixture {
     $treeJobName = "Local\Boundless.Installer.Tree.v1.$([guid]::NewGuid().ToString('N'))"
     $installer = $null
     $monitorProcess = $null
+    $failedInstaller = $null
+    $failedMonitorProcess = $null
+    $failedControl = $null
+    $failedCompletion = $null
+    $failedHeartbeat = $null
     $heartbeat = [Threading.EventWaitHandle]::new(
         $true,
         [Threading.EventResetMode]::ManualReset
@@ -5725,6 +5736,79 @@ try { [void]$event.Set() } finally { $event.Dispose() }
         ) {
             throw "Installer supervision fixture did not hard-kill its wrapper and reconcile parent-owned service recovery before returning."
         }
+
+        $failedControl = New-BoundlessInstallerControlEvent -UserSid $UserSid
+        $failedCompletion = New-BoundlessInstallerCompletionEvent -UserSid $UserSid
+        $failedHeartbeat = [Threading.EventWaitHandle]::new(
+            $true,
+            [Threading.EventResetMode]::ManualReset
+        )
+        $sleepCommand = [Convert]::ToBase64String(
+            [Text.Encoding]::Unicode.GetBytes('Start-Sleep -Seconds 30')
+        )
+        $failedInstaller = Start-Process `
+            -FilePath (Resolve-CurrentPowerShellExecutable) `
+            -ArgumentList @("-NoProfile", "-EncodedCommand", $sleepCommand) `
+            -WindowStyle Hidden `
+            -PassThru
+        $failedMonitorProcess = Start-Process `
+            -FilePath (Resolve-CurrentPowerShellExecutable) `
+            -ArgumentList @(
+                "-NoProfile",
+                "-EncodedCommand",
+                [Convert]::ToBase64String(
+                    [Text.Encoding]::Unicode.GetBytes('Start-Sleep -Milliseconds 250; exit 19')
+                )
+            ) `
+            -WindowStyle Hidden `
+            -PassThru
+        $failedTreeState = [pscustomobject]@{ confirmed = $false }
+        $failedRecovery = [pscustomobject]@{ attempts = 0 }
+        $failedError = $null
+        $failedStopwatch = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            Wait-BoundlessElevatedInstallSupervised `
+                -InstallerProcess $failedInstaller `
+                -Monitor ([pscustomobject]@{
+                    process = $failedMonitorProcess
+                    heartbeat_event = $failedHeartbeat
+                }) `
+                -CancellationEvent $failedControl.event `
+                -CompletionEvent $failedCompletion.event `
+                -TreeJobName "Local\Boundless.Installer.Tree.v1.$([guid]::NewGuid().ToString('N'))" `
+                -TreeClosureState $failedTreeState `
+                -HardKillRecoveryAction {
+                    Restore-BoundlessServiceAfterHardKilledElevatedInstall `
+                        -QuiescenceLease $fixtureLease `
+                        -StagedHelperPath "fixture" `
+                        -TimeoutMilliseconds 5000 `
+                        -ServiceStatusProbe { "Stopped" } `
+                        -RecoveryProcessFactory {
+                            $failedRecovery.attempts += 1
+                            throw "fixture permanent parent recovery failure"
+                        }
+                } `
+                -TimeoutSeconds 15 `
+                -CancellationGraceMilliseconds 250 | Out-Null
+        }
+        catch {
+            $failedError = $_
+        }
+        $failedStopwatch.Stop()
+        if (
+            $null -eq $failedError -or
+            $failedError.Exception.Message -notmatch 'quiescence monitor exited' -or
+            $failedError.Exception.Message -notmatch 'permanent parent recovery failure' -or
+            $failedRecovery.attempts -ne 1 -or
+            -not $failedInstaller.HasExited -or
+            -not $failedTreeState.confirmed -or
+            -not $failedTreeState.hard_kill_used -or
+            $failedTreeState.parent_service_recovery_reconciled -or
+            $failedTreeState.parent_service_recovery_status -ne "failed" -or
+            $failedStopwatch.ElapsedMilliseconds -gt 7000
+        ) {
+            throw "Permanent parent-recovery failure fixture did not preserve both errors and exit after one bounded attempt."
+        }
     }
     finally {
         if ($null -ne $installer) {
@@ -5739,6 +5823,16 @@ try { [void]$event.Set() } finally { $event.Dispose() }
             }
             $monitorProcess.Dispose()
         }
+        foreach ($process in @($failedInstaller, $failedMonitorProcess)) {
+            if ($null -eq $process) { continue }
+            if (-not $process.HasExited) {
+                Stop-BoundlessProcessBoundary -Process $process
+            }
+            $process.Dispose()
+        }
+        if ($null -ne $failedControl) { $failedControl.event.Dispose() }
+        if ($null -ne $failedCompletion) { $failedCompletion.event.Dispose() }
+        if ($null -ne $failedHeartbeat) { $failedHeartbeat.Dispose() }
         $control.event.Dispose()
         $completion.event.Dispose()
         $msiMayHaveStarted.event.Dispose()
@@ -7870,6 +7964,7 @@ function Invoke-InstallHelperSelfTest {
         replacement_tray_window_fixture = "passed"
         supervised_installer_cancellation_fixture = "passed"
         hard_kill_parent_service_recovery_fixture = "passed"
+        hard_kill_recovery_failure_fixture = "passed"
         stalled_monitor_heartbeat_fixture = "passed"
         coordinator_death_cancellation_fixture = "passed"
         failed_drain_quiescence_fixture = "passed"

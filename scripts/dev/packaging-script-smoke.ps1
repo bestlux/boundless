@@ -141,6 +141,7 @@ foreach ($requiredInstallContract in @(
         'stalled_monitor_heartbeat_fixture',
         'stalled_monitor_takeover_fixture',
         'hard_kill_parent_service_recovery_fixture',
+        'hard_kill_recovery_failure_fixture',
         'Start-BoundlessTrayQuiescenceSentinelOwner',
         'ElevatedInstallCoordinatorProcessId',
         'Get-BoundlessServiceStatusBounded',
@@ -214,6 +215,15 @@ if (
     $invokeMsiSource -notmatch 'Restore-BoundlessServiceAfterHardKilledElevatedInstall'
 ) {
     throw "Installer parent must supervise elevation/tree completion, hard-kill recovery, and completed staged-log handoff."
+}
+$supervisedInstallSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Wait-BoundlessElevatedInstallSupervised'
+if (
+    $supervisedInstallSource -match 'while\s*\(\$true\)' -or
+    $supervisedInstallSource -notmatch 'Parent service recovery after the hard kill also failed'
+) {
+    throw "Parent hard-kill recovery must make one bounded attempt and preserve its failure with the original supervision error."
 }
 $elevatedCommandSource = Get-PowerShellFunctionSource `
     -Path $installScript `
