@@ -64,7 +64,8 @@ use runtime::{outbound_target_candidates, wait_for_reconcile_or_backoff};
 use session::handle_incoming_connection;
 #[cfg(test)]
 use session::{
-    configure_low_latency_socket, reconnect_requested_for_peer, run_authenticated_session,
+    WireFrameReader, configure_low_latency_socket, reconnect_requested_for_peer,
+    run_authenticated_session,
 };
 #[cfg(test)]
 use tls::parse_server_name;
@@ -471,6 +472,26 @@ mod tests {
         bytes: Vec<u8>,
     }
 
+    struct PartialWriteBlockingWriter {
+        bytes: Vec<u8>,
+        entered_blocked_write: Arc<tokio::sync::Notify>,
+        wrote_prefix: bool,
+    }
+
+    impl PartialWriteBlockingWriter {
+        fn new() -> (Self, Arc<tokio::sync::Notify>) {
+            let entered_blocked_write = Arc::new(tokio::sync::Notify::new());
+            (
+                Self {
+                    bytes: Vec::new(),
+                    entered_blocked_write: entered_blocked_write.clone(),
+                    wrote_prefix: false,
+                },
+                entered_blocked_write,
+            )
+        }
+    }
+
     impl AsyncWrite for CaptureWriter {
         fn poll_write(
             mut self: Pin<&mut Self>,
@@ -479,6 +500,34 @@ mod tests {
         ) -> Poll<Result<usize, io::Error>> {
             self.bytes.extend_from_slice(buf);
             Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for PartialWriteBlockingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            if self.wrote_prefix {
+                return Poll::Pending;
+            }
+            let written = (buf.len() / 2).max(1);
+            self.bytes.extend_from_slice(&buf[..written]);
+            self.wrote_prefix = true;
+            self.entered_blocked_write.notify_one();
+            Poll::Ready(Ok(written))
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
@@ -901,6 +950,52 @@ mod tests {
         out
     }
 
+    async fn flush_profile_clipboard_image<W>(state: &AppState, peer_id: &str, writer: &mut W)
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut outbound_transfer_flow = peer_transport::OutboundTransferFlows::new();
+        let mut frame_buffer = Vec::with_capacity(4096);
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            state,
+            "local",
+            Some(peer_id),
+            PROTOCOL_CURRENT,
+            usize::MAX,
+            &mut outbound_transfer_flow,
+            writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("start outbound clipboard image profile transfer");
+
+        while state.outgoing_bulk_queue_len(peer_id).await > 0 {
+            let transfer_id = outbound_transfer_flow
+                .keys()
+                .next()
+                .cloned()
+                .expect("chunked clipboard profile transfer must retain flow state");
+            peer_transport::apply_outbound_chunk_credits(
+                &mut outbound_transfer_flow,
+                &transfer_id,
+                1,
+            )
+            .expect("credit active outbound clipboard profile transfer");
+            super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+                state,
+                "local",
+                Some(peer_id),
+                PROTOCOL_CURRENT,
+                usize::MAX,
+                &mut outbound_transfer_flow,
+                writer,
+                &mut frame_buffer,
+            )
+            .await
+            .expect("flush credited outbound clipboard profile chunk");
+        }
+    }
+
     #[tokio::test]
     #[ignore = "run with scripts/dev/profile-clipboard-image-memory.ps1"]
     async fn clipboard_image_memory_profile_workload() {
@@ -923,15 +1018,7 @@ mod tests {
                     .await
                     .expect("queue direct clipboard image");
                 let mut writer = tokio::io::sink();
-                flush_outgoing_payloads(
-                    &state,
-                    "local",
-                    Some(&peer_id),
-                    PROTOCOL_CURRENT,
-                    &mut writer,
-                )
-                .await
-                .expect("flush direct clipboard image");
+                flush_profile_clipboard_image(&state, &peer_id, &mut writer).await;
                 assert!(
                     state.drain_outgoing(&peer_id).await.is_empty(),
                     "direct outbound profile must drain queued payloads"
@@ -952,15 +1039,7 @@ mod tests {
                     .expect("queue local clipboard image");
                 assert!(queued, "local image should queue for connected peer");
                 let mut writer = tokio::io::sink();
-                flush_outgoing_payloads(
-                    &state,
-                    "local",
-                    Some(&peer_id),
-                    PROTOCOL_CURRENT,
-                    &mut writer,
-                )
-                .await
-                .expect("flush local clipboard image");
+                flush_profile_clipboard_image(&state, &peer_id, &mut writer).await;
                 assert!(
                     state.drain_outgoing(&peer_id).await.is_empty(),
                     "local outbound profile must drain queued payloads"
@@ -1117,6 +1196,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wire_frame_reader_resumes_after_header_and_payload_read_cancellation() {
+        let first = WireMessage::ClipboardText {
+            machine_id: "peer-a".to_string(),
+            text: "partial-frame".to_string(),
+        };
+        let second = WireMessage::Heartbeat {
+            machine_id: "peer-a".to_string(),
+            timestamp_unix_ms: 42,
+        };
+        let mut first_frame = Vec::new();
+        let mut second_frame = Vec::new();
+        encode_frame_to_vec(&first, &mut first_frame).expect("encode first frame");
+        encode_frame_to_vec(&second, &mut second_frame).expect("encode second frame");
+
+        let (mut sender, receiver) = tokio::io::duplex(1024);
+        let mut receiver = BufReader::new(receiver);
+        let mut frame_reader = WireFrameReader::default();
+
+        sender
+            .write_all(&first_frame[..2])
+            .await
+            .expect("write partial header");
+        assert!(
+            time::timeout(
+                Duration::from_millis(20),
+                frame_reader.read_next(&mut receiver)
+            )
+            .await
+            .is_err(),
+            "read should be cancelled while waiting for the rest of the header"
+        );
+
+        let partial_payload_end = WIRE_FRAME_LENGTH_PREFIX_BYTES + 3;
+        sender
+            .write_all(&first_frame[2..partial_payload_end])
+            .await
+            .expect("write rest of header and partial payload");
+        assert!(
+            time::timeout(
+                Duration::from_millis(20),
+                frame_reader.read_next(&mut receiver)
+            )
+            .await
+            .is_err(),
+            "read should be cancelled while waiting for the rest of the payload"
+        );
+
+        sender
+            .write_all(&first_frame[partial_payload_end..])
+            .await
+            .expect("finish first frame");
+        sender
+            .write_all(&second_frame)
+            .await
+            .expect("write following frame");
+
+        let first_len = frame_reader
+            .read_next(&mut receiver)
+            .await
+            .expect("resume first frame")
+            .expect("first frame available");
+        assert_eq!(
+            first_len,
+            first_frame.len() - WIRE_FRAME_LENGTH_PREFIX_BYTES
+        );
+        assert_eq!(
+            decode_frame_payload(frame_reader.payload()).expect("decode resumed first frame"),
+            first
+        );
+
+        frame_reader
+            .read_next(&mut receiver)
+            .await
+            .expect("read second frame")
+            .expect("second frame available");
+        assert_eq!(
+            decode_frame_payload(frame_reader.payload()).expect("decode following frame"),
+            second
+        );
+    }
+
+    #[tokio::test]
     async fn fault_harness_delayed_hello_flushes_clipboard_replay_then_disconnects() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         state
@@ -1145,6 +1306,12 @@ mod tests {
 
         remote.queue_delayed_frame(remote_hello(&peer_id));
         remote.release_delayed_frame().await;
+        remote
+            .send_frame(WireMessage::HelloAck {
+                machine_id: peer_id.clone(),
+                accepted: true,
+            })
+            .await;
 
         let local_machine_id = state.snapshot().await.machine_id;
         let replay = remote
@@ -1292,6 +1459,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn simultaneous_large_clipboard_replay_keeps_both_read_loops_live_for_first_input() {
+        let (state_a, peer_b, root_a) =
+            state_with_ordered_peer_for_queue_test("a-machine", "b-machine");
+        let (state_b, peer_a, root_b) =
+            state_with_ordered_peer_for_queue_test("b-machine", "a-machine");
+        let image_a = synthetic_bmp_payload(128 * 1024);
+        let mut image_b = synthetic_bmp_payload(128 * 1024);
+        image_b[54] = 0x42;
+
+        state_a
+            .queue_clipboard_image(&peer_b, image_a.clone())
+            .await
+            .expect("queue A clipboard replay");
+        state_b
+            .queue_clipboard_image(&peer_a, image_b.clone())
+            .await
+            .expect("queue B clipboard replay");
+        state_a
+            .queue_input_events(&peer_b, vec![InputEvent::MouseMove { dx: 11, dy: 0 }])
+            .await
+            .expect("queue A first input");
+        state_b
+            .queue_input_events(&peer_a, vec![InputEvent::MouseMove { dx: -11, dy: 0 }])
+            .await
+            .expect("queue B first input");
+
+        // This capacity is deliberately far below either image. The previous
+        // whole-payload write path filled both directions and prevented either
+        // session from returning to its read loop.
+        let (stream_a, stream_b) = tokio::io::duplex(16 * 1024);
+        let session_a = tokio::spawn(run_authenticated_session(
+            state_a.clone(),
+            peer_b.clone(),
+            stream_a,
+            true,
+            None,
+        ));
+        let session_b = tokio::spawn(run_authenticated_session(
+            state_b.clone(),
+            peer_a.clone(),
+            stream_b,
+            false,
+            None,
+        ));
+
+        time::timeout(Duration::from_secs(3), async {
+            loop {
+                let a_received_image = state_a.transport_events().await.iter().any(|event| {
+                    event.direction == "incoming"
+                        && event.kind == "clipboard_image"
+                        && event.size_bytes == image_b.len() as u64
+                });
+                let b_received_image = state_b.transport_events().await.iter().any(|event| {
+                    event.direction == "incoming"
+                        && event.kind == "clipboard_image"
+                        && event.size_bytes == image_a.len() as u64
+                });
+                if a_received_image
+                    && b_received_image
+                    && state_a.pending_inject_input_frame_count().await == 1
+                    && state_b.pending_inject_input_frame_count().await == 1
+                {
+                    break;
+                }
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("simultaneous image replay and first input must converge without deadlock");
+        assert!(
+            state_a
+                .drain_outgoing_input(&peer_b, usize::MAX)
+                .await
+                .is_empty()
+        );
+        assert!(
+            state_b
+                .drain_outgoing_input(&peer_a, usize::MAX)
+                .await
+                .is_empty()
+        );
+        assert_eq!(state_a.outgoing_bulk_queue_len(&peer_b).await, 0);
+        assert_eq!(state_b.outgoing_bulk_queue_len(&peer_a).await, 0);
+
+        session_a.abort();
+        session_b.abort();
+        let _ = session_a.await;
+        let _ = session_b.await;
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
+    }
+
+    #[tokio::test]
+    async fn startup_bulk_turn_serializes_five_max_clipboard_text_frames_each_way() {
+        let (state_a, peer_b, root_a) =
+            state_with_ordered_peer_for_queue_test("a-machine", "b-machine");
+        let (state_b, peer_a, root_b) =
+            state_with_ordered_peer_for_queue_test("b-machine", "a-machine");
+
+        for index in 0..5 {
+            let prefix_a = format!("a-{index}-");
+            let prefix_b = format!("b-{index}-");
+            let text_a = format!(
+                "{prefix_a}{}",
+                "a".repeat(peer_transport::MAX_CLIPBOARD_TEXT_BYTES - prefix_a.len())
+            );
+            let text_b = format!(
+                "{prefix_b}{}",
+                "b".repeat(peer_transport::MAX_CLIPBOARD_TEXT_BYTES - prefix_b.len())
+            );
+            state_a
+                .queue_clipboard_text(&peer_b, text_a)
+                .await
+                .expect("queue max text from A");
+            state_b
+                .queue_clipboard_text(&peer_a, text_b)
+                .await
+                .expect("queue max text from B");
+        }
+        state_a
+            .queue_input_events(&peer_b, vec![InputEvent::MouseMove { dx: 5, dy: 0 }])
+            .await
+            .expect("queue A first input");
+        state_b
+            .queue_input_events(&peer_a, vec![InputEvent::MouseMove { dx: -5, dy: 0 }])
+            .await
+            .expect("queue B first input");
+
+        let (stream_a, stream_b) = tokio::io::duplex(4 * 1024);
+        let session_a = tokio::spawn(run_authenticated_session(
+            state_a.clone(),
+            peer_b.clone(),
+            stream_a,
+            true,
+            None,
+        ));
+        let session_b = tokio::spawn(run_authenticated_session(
+            state_b.clone(),
+            peer_a.clone(),
+            stream_b,
+            false,
+            None,
+        ));
+
+        let mut received_by_a = Vec::new();
+        let mut received_by_b = Vec::new();
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                while let Some(item) = state_a.dequeue_remote_clipboard_payload().await {
+                    received_by_a.push(item);
+                }
+                while let Some(item) = state_b.dequeue_remote_clipboard_payload().await {
+                    received_by_b.push(item);
+                }
+                if received_by_a.len() == 5
+                    && received_by_b.len() == 5
+                    && state_a.pending_inject_input_frame_count().await == 1
+                    && state_b.pending_inject_input_frame_count().await == 1
+                {
+                    break;
+                }
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("deterministic startup bulk turns must drain five max text frames each way");
+
+        assert!(received_by_a.iter().all(|item| matches!(
+            &item.payload,
+            ClipboardPayload::Text(text)
+                if text.len() == peer_transport::MAX_CLIPBOARD_TEXT_BYTES
+                    && text.starts_with("b-")
+        )));
+        assert!(received_by_b.iter().all(|item| matches!(
+            &item.payload,
+            ClipboardPayload::Text(text)
+                if text.len() == peer_transport::MAX_CLIPBOARD_TEXT_BYTES
+                    && text.starts_with("a-")
+        )));
+        assert_eq!(state_a.outgoing_bulk_queue_len(&peer_b).await, 0);
+        assert_eq!(state_b.outgoing_bulk_queue_len(&peer_a).await, 0);
+
+        session_a.abort();
+        session_b.abort();
+        let _ = session_a.await;
+        let _ = session_b.await;
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
+    }
+
+    #[tokio::test]
     async fn superseded_teardown_cannot_disconnect_replacement_owner() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         let old_cancellation = Arc::new(crate::state::RuntimeWakeSignal::default());
@@ -1361,6 +1719,145 @@ mod tests {
                 .iter()
                 .any(|peer| peer.peer_id == peer_id && peer.connected),
             "closing the current replacement owner must publish disconnect"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn blocked_partial_write_times_out_requeues_and_unblocks_preferred_replacement() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let old_cancellation = Arc::new(crate::state::RuntimeWakeSignal::default());
+        assert_eq!(
+            state
+                .claim_transport_session(&peer_id, 10, false, old_cancellation.clone())
+                .await,
+            crate::state::TransportSessionClaim::Claimed
+        );
+        state
+            .queue_input_events(
+                &peer_id,
+                vec![InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    state: KeyState::Down,
+                }],
+            )
+            .await
+            .expect("queue sequence one");
+
+        let (writer, entered_blocked_write) = PartialWriteBlockingWriter::new();
+        let old_state = state.clone();
+        let old_peer = peer_id.clone();
+        let old_flush = tokio::spawn(async move {
+            let _egress = old_state
+                .acquire_transport_session_egress(&old_peer, 10)
+                .await
+                .expect("old session owns egress");
+            let mut writer = writer;
+            let mut flow = HashMap::new();
+            let mut frame_buffer = Vec::new();
+            let result = super::outbound::flush_outgoing_input_payloads_with_buffer(
+                &old_state,
+                "local",
+                Some(&old_peer),
+                PROTOCOL_CURRENT,
+                &mut flow,
+                &mut writer,
+                &mut frame_buffer,
+            )
+            .await;
+            (writer, result)
+        });
+        time::timeout(Duration::from_secs(1), entered_blocked_write.notified())
+            .await
+            .expect("old lane reaches blocked partial write");
+
+        let replacement_state = state.clone();
+        let replacement_peer = peer_id.clone();
+        let replacement = tokio::spawn(async move {
+            replacement_state
+                .claim_transport_session(
+                    &replacement_peer,
+                    20,
+                    true,
+                    Arc::new(crate::state::RuntimeWakeSignal::default()),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !replacement.is_finished(),
+            "replacement claim must wait while the old owner still owns a partial frame"
+        );
+
+        state
+            .queue_input_events(
+                &peer_id,
+                vec![InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    state: KeyState::Up,
+                }],
+            )
+            .await
+            .expect("queue sequence two during replacement");
+
+        let (old_writer, old_result) = time::timeout(
+            peer_transport::TRANSPORT_EGRESS_IO_TIMEOUT + Duration::from_secs(1),
+            old_flush,
+        )
+        .await
+        .expect("old partial write exits after bounded timeout")
+        .expect("old flush joins");
+        let old_error = old_result.expect_err("partial write must time out");
+        assert!(
+            old_error.to_string().contains("timed out"),
+            "unexpected old-lane failure: {old_error:#}"
+        );
+        assert!(
+            !old_writer.bytes.is_empty(),
+            "test must exercise a partially written frame before timeout"
+        );
+        assert_eq!(
+            time::timeout(Duration::from_secs(1), replacement)
+                .await
+                .expect("replacement claims promptly after old write timeout")
+                .expect("replacement joins"),
+            crate::state::TransportSessionClaim::Replaced {
+                active_session_id: 10
+            }
+        );
+        assert!(old_cancellation.take_pending());
+
+        let _egress = state
+            .acquire_transport_session_egress(&peer_id, 20)
+            .await
+            .expect("replacement owns egress");
+        let mut replacement_writer = CaptureWriter::default();
+        let mut replacement_flow = HashMap::new();
+        let mut frame_buffer = Vec::new();
+        super::outbound::flush_outgoing_input_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            &mut replacement_flow,
+            &mut replacement_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("replacement input flush");
+        assert!(matches!(
+            decode_written_frames(&replacement_writer.bytes).as_slice(),
+            [
+                WireMessage::InputFrame { sequence: 1, .. },
+                WireMessage::InputFrame { sequence: 2, .. }
+            ]
+        ));
+        assert!(
+            state
+                .drain_outgoing_input(&peer_id, usize::MAX)
+                .await
+                .is_empty()
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -1721,7 +2218,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_requeues_remaining_payloads_on_mid_flush_failure() {
+    async fn flush_requeues_unsafely_committed_and_remaining_payloads_on_mid_write_failure() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         let large = "x".repeat(16 * 1024);
 
@@ -1751,13 +2248,17 @@ mod tests {
         .expect_err("must fail");
 
         let queued = state.drain_outgoing(&peer_id).await;
-        assert_eq!(queued.len(), 2);
+        assert_eq!(queued.len(), 3);
         assert!(matches!(
             queued.first(),
             Some(OutboundPayload::ClipboardText { text }) if text.len() == 16 * 1024
         ));
         assert!(matches!(
             queued.get(1),
+            Some(OutboundPayload::ClipboardText { text }) if text.len() == 16 * 1024
+        ));
+        assert!(matches!(
+            queued.get(2),
             Some(OutboundPayload::ClipboardText { text }) if text.len() == 16 * 1024
         ));
 
@@ -1839,7 +2340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_chunks_clipboard_image_that_exceeds_wire_frame_cap() {
+    async fn flush_credit_streams_large_clipboard_image() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         let image_bmp = vec![0u8; 300 * 1024];
         state
@@ -1851,21 +2352,65 @@ mod tests {
             )
             .await;
 
+        let mut outbound_transfer_flow = HashMap::new();
+        let mut frame_buffer = Vec::new();
         let mut writer = CaptureWriter::default();
-        flush_outgoing_payloads(
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
             &state,
             "local",
             Some(&peer_id),
             PROTOCOL_CURRENT,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+            &mut outbound_transfer_flow,
             &mut writer,
+            &mut frame_buffer,
         )
         .await
-        .expect("oversized clipboard image should be dropped before write");
+        .expect("start large clipboard image replay");
+
+        let start_frames = decode_written_frames(&writer.bytes);
+        let transfer_id = match start_frames.as_slice() {
+            [
+                WireMessage::ClipboardImageStart {
+                    machine_id,
+                    transfer_id,
+                    total_bytes,
+                    hash_hex,
+                },
+            ] if machine_id == "local"
+                && *total_bytes == image_bmp.len() as u64
+                && hash_hex == &payload_hash_hex(&ClipboardPayload::Image(image_bmp.clone())) =>
+            {
+                transfer_id.clone()
+            }
+            other => panic!("expected one clipboard image start, got {other:?}"),
+        };
+
+        while state.outgoing_bulk_queue_len(&peer_id).await > 0 {
+            peer_transport::apply_outbound_chunk_credits(
+                &mut outbound_transfer_flow,
+                &transfer_id,
+                1,
+            )
+            .expect("active clipboard replay flow");
+            super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+                &state,
+                "local",
+                Some(&peer_id),
+                PROTOCOL_CURRENT,
+                DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+                &mut outbound_transfer_flow,
+                &mut writer,
+                &mut frame_buffer,
+            )
+            .await
+            .expect("flush one credited clipboard image chunk");
+        }
 
         let queued = state.drain_outgoing(&peer_id).await;
         assert!(
             queued.is_empty(),
-            "chunked clipboard image must not remain queued after send"
+            "credited clipboard image must not remain queued after completion"
         );
 
         let frames = decode_written_frames(&writer.bytes);
@@ -1875,29 +2420,33 @@ mod tests {
                 machine_id,
                 total_bytes,
                 hash_hex,
+                transfer_id: frame_transfer_id,
                 ..
-            }) if machine_id == "local"
+            }) if machine_id == "local" && frame_transfer_id == &transfer_id
                 && *total_bytes == image_bmp.len() as u64
                 && hash_hex == &payload_hash_hex(&ClipboardPayload::Image(image_bmp.clone()))
         ));
         assert!(matches!(
             frames.last(),
-            Some(WireMessage::ClipboardImageEnd { .. })
+            Some(WireMessage::ClipboardImageEnd { transfer_id: frame_transfer_id })
+                if frame_transfer_id == &transfer_id
         ));
-        assert!(
+        assert_eq!(
             frames
                 .iter()
                 .filter(|frame| matches!(frame, WireMessage::ClipboardImageChunk { .. }))
-                .count()
-                >= 2,
-            "oversized image should be split across multiple chunk frames"
+                .count(),
+            image_bmp
+                .len()
+                .div_ceil(peer_transport::CLIPBOARD_IMAGE_CHUNK_BYTES),
+            "large image should send exactly one frame per credited chunk"
         );
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn flush_requeues_chunked_clipboard_image_on_mid_transfer_failure() {
+    async fn failed_clipboard_chunk_restarts_from_start_on_replacement_session() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         state
             .requeue_outgoing_front(
@@ -1908,26 +2457,78 @@ mod tests {
             )
             .await;
 
-        let mut writer = FailAfterCallsWriter::new(3);
-        let _ = flush_outgoing_payloads(
+        let mut outbound_transfer_flow = HashMap::new();
+        let mut frame_buffer = Vec::new();
+        let mut start_writer = CaptureWriter::default();
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
             &state,
             "local",
             Some(&peer_id),
             PROTOCOL_CURRENT,
-            &mut writer,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+            &mut outbound_transfer_flow,
+            &mut start_writer,
+            &mut frame_buffer,
         )
         .await
-        .expect_err("chunked clipboard image should requeue on mid-transfer failure");
+        .expect("send clipboard image start");
+        let transfer_id = match decode_written_frames(&start_writer.bytes).as_slice() {
+            [WireMessage::ClipboardImageStart { transfer_id, .. }] => transfer_id.clone(),
+            other => panic!("expected clipboard image start, got {other:?}"),
+        };
+        peer_transport::apply_outbound_chunk_credits(&mut outbound_transfer_flow, &transfer_id, 1)
+            .expect("active clipboard replay flow");
 
-        let queued = state.drain_outgoing(&peer_id).await;
+        let mut failing_writer = FailAfterCallsWriter::new(0);
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+            &mut outbound_transfer_flow,
+            &mut failing_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect_err("failed chunk write should preserve replay cursor");
+
+        let queued = state.drain_outgoing_bulk(&peer_id, usize::MAX).await;
         assert_eq!(
             queued.len(),
             1,
-            "failed chunked transfer should requeue the original clipboard image payload"
+            "failed chunk should requeue one clipboard replay cursor"
         );
         assert!(matches!(
             queued.first(),
-            Some(OutboundPayload::ClipboardImage { image_bmp }) if image_bmp.len() == 300 * 1024
+            Some(OutboundPayload::ClipboardImageCursor {
+                transfer_id: cursor_transfer_id,
+                image_bmp,
+                offset_bytes: 0,
+            }) if cursor_transfer_id == &transfer_id && image_bmp.len() == 300 * 1024
+        ));
+
+        state.requeue_outgoing_front(&peer_id, queued).await;
+        let mut replacement_flow = HashMap::new();
+        let mut replacement_writer = CaptureWriter::default();
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
+            &mut replacement_flow,
+            &mut replacement_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("replacement session restarts orphaned clipboard cursor");
+        assert!(matches!(
+            decode_written_frames(&replacement_writer.bytes).as_slice(),
+            [WireMessage::ClipboardImageStart {
+                transfer_id: replacement_transfer_id,
+                ..
+            }] if replacement_transfer_id != &transfer_id
         ));
 
         let _ = std::fs::remove_dir_all(root);
@@ -2431,6 +3032,7 @@ mod tests {
             transfer_id.clone(),
             OutboundTransferFlow {
                 available_chunk_credits: 0,
+                kind: peer_transport::OutboundTransferKind::File,
             },
         )]);
 
@@ -2731,7 +3333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hello_handler_rejects_protocol_4_2_after_keyboard_wire_change() {
+    async fn hello_handler_rejects_protocol_4_3_before_clipboard_flow_control() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         let mut remote_protocol = None;
         let mut outbound_transfer_flow = std::collections::HashMap::new();
@@ -2747,7 +3349,7 @@ mod tests {
             peer_id.clone(),
             ProtocolVersion {
                 major: 4,
-                minor: 2,
+                minor: 3,
                 patch: 0,
             },
             &mut remote_protocol,
@@ -2763,7 +3365,7 @@ mod tests {
         assert!(matches!(
             decode_written_frames(&writer.bytes).as_slice(),
             [WireMessage::Error { message }]
-                if message.contains("remote=4.2.0") && message.contains("expected=4.3.0")
+                if message.contains("remote=4.3.0") && message.contains("expected=4.4.0")
         ));
 
         let _ = std::fs::remove_dir_all(root);
@@ -2810,7 +3412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbound_hello_flushes_ack_and_pending_clipboard_replay_once() {
+    async fn inbound_hello_flushes_ack_and_defers_pending_bulk_to_startup_turn() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         state
             .queue_local_clipboard_text_for_connected_peers("replay-inbound".to_string())
@@ -2840,11 +3442,7 @@ mod tests {
 
         assert!(matches!(handling, HelloHandling::Continue));
         let frames = decode_written_frames(&writer.bytes);
-        assert_eq!(
-            frames.len(),
-            2,
-            "inbound hello should flush ack plus one replay"
-        );
+        assert_eq!(frames.len(), 1, "inbound hello should flush only its ack");
         assert!(matches!(
             frames.first(),
             Some(WireMessage::HelloAck {
@@ -2853,20 +3451,15 @@ mod tests {
             }) if machine_id == "local-machine-id"
         ));
         assert!(matches!(
-            frames.get(1),
-            Some(WireMessage::ClipboardText { machine_id, text })
-                if machine_id == "local-machine-id" && text == "replay-inbound"
+            state.drain_outgoing(&peer_id).await.as_slice(),
+            [OutboundPayload::ClipboardText { text }] if text == "replay-inbound"
         ));
-        assert!(
-            state.drain_outgoing(&peer_id).await.is_empty(),
-            "inbound hello should consume the pending replay exactly once"
-        );
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn hello_ack_handler_flushes_pending_outgoing_payloads() {
+    async fn hello_ack_handler_flushes_input_only_and_defers_bulk_to_session_turn() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         state
             .queue_clipboard_text(&peer_id, "hello-control".to_string())
@@ -2891,15 +3484,13 @@ mod tests {
         .expect("handle hello ack");
 
         let frames = decode_written_frames(&writer.bytes);
-        assert_eq!(frames.len(), 1);
-        assert!(matches!(
-            frames.first(),
-            Some(WireMessage::ClipboardText { machine_id, text })
-                if machine_id == "local-machine-id" && text == "hello-control"
-        ));
+        assert!(frames.is_empty());
 
         let queued = state.drain_outgoing(&peer_id).await;
-        assert!(queued.is_empty(), "payload should be flushed from queue");
+        assert!(matches!(
+            queued.as_slice(),
+            [OutboundPayload::ClipboardText { text }] if text == "hello-control"
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3435,7 +4026,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hello_then_hello_ack_only_flushes_pending_clipboard_replay_once() {
+    async fn hello_then_hello_ack_leave_pending_bulk_for_session_startup_turn() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         state
             .queue_local_clipboard_text_for_connected_peers("replay-once".to_string())
@@ -3465,16 +4056,7 @@ mod tests {
 
         assert!(matches!(handling, HelloHandling::Continue));
         let hello_frames = decode_written_frames(&hello_writer.bytes);
-        assert_eq!(
-            hello_frames.len(),
-            1,
-            "outbound hello should flush one replay"
-        );
-        assert!(matches!(
-            hello_frames.first(),
-            Some(WireMessage::ClipboardText { machine_id, text })
-                if machine_id == "local-machine-id" && text == "replay-once"
-        ));
+        assert!(hello_frames.is_empty());
 
         let mut ack_writer = CaptureWriter::default();
         handle_hello_ack_message(
@@ -3493,12 +4075,12 @@ mod tests {
         let ack_frames = decode_written_frames(&ack_writer.bytes);
         assert!(
             ack_frames.is_empty(),
-            "hello ack must not reschedule an already-flushed replay"
+            "control handlers leave bulk to the explicit session startup turn"
         );
-        assert!(
-            state.drain_outgoing(&peer_id).await.is_empty(),
-            "no replay payload should remain queued after hello plus hello ack"
-        );
+        assert!(matches!(
+            state.drain_outgoing(&peer_id).await.as_slice(),
+            [OutboundPayload::ClipboardText { text }] if text == "replay-once"
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }

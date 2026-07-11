@@ -50,10 +50,11 @@ This patch train fixes the three regressions found during installed v5.0.13 dogf
 | BND-NEXT-40 | code complete; needs physical evidence | c7b346a, ffb4a51, 049eafa, a59c16d, b50f206, e086e5c | Key semantics and source logical Num Lock now survive broker, protocol 4.3, wire, and Windows injection. Run the opposite-Num-Lock matrix both directions, including digits, decimal, Enter, divide, navigation, toggle, hold/repeat, and release. |
 | BND-NEXT-41 | code complete; needs installed/UAC evidence | 5a0be2b, 0d79580, 36cbb60, bc0c69d, 64f4700 | The helper owns a bounded per-user/session quiescence path, protects elevated staging and log handoff, supervises tray and installer liveness, and leaves MSI as the service-stop owner. Prove a normal-user 5.0.13→5.0.14 upgrade with one UAC prompt, no Restart Manager loop, bounded timing, and healthy postconditions on both PCs. |
 | BND-NEXT-42 | code complete; needs installed asymmetric evidence | 6b0aa59, cb48c2b | Simultaneous trusted connections now converge on one deterministic physical session, a sole-reachable reverse session remains valid, and stale teardown or a delayed failed dial cannot publish a false disconnect. Four extended local two-node smokes plus a post-review reverse-orientation smoke passed; repeat connection, first input, clipboard, and reconnect on the routed dogfood pair. |
+| BND-NEXT-43 | open P1 transport design gap | — | Protocol 4.4 serializes startup bulk, credits large clipboard images, bounds socket writes, and preserves partial frame reads. Live simultaneous bidirectional file chunks and post-startup maximum text can still contend because the session loop awaits writes instead of reading continuously. |
 | BND-NEXT-31 | code complete for graceful Quit path; needs installed evidence | 5a0be2b, 0d79580, bc0c69d, 64f4700 | The true Quit signal now fails open and exits the broker before process shutdown. Run active-capture Quit/relaunch, upgrade-while-running, process-count, first post-relaunch handoff, and emergency escape on installed hardware. |
 | BND-NEXT-29 item 3 | code complete; needs same-version install evidence | 5a0be2b | WiX now allows same-version upgrades and packaging smoke enforces the contract. Prove a same-version helper rebuild replaces the installed payload instead of silently no-oping. |
 
-Protocol 4.3 is an intentional clean break for the expanded keyboard/input contract. A v5.0.13/v5.0.14 mixed pair must remain disconnected until both PCs are upgraded; this is expected upgrade sequencing, not a compatibility regression.
+Protocol 4.4 is an intentional clean break for the expanded keyboard/input contract and bounded startup clipboard flow. A v5.0.13/v5.0.14 mixed pair must remain disconnected until both PCs are upgraded; this is expected upgrade sequencing, not a compatibility regression.
 
 ---
 
@@ -194,6 +195,37 @@ The transport registry previously let the first authenticated connection win ind
 ### Dependencies and scope boundary
 
 This story hardens authenticated session ownership only. BND-NEXT-20E owns discovery lifecycle and manual-host recovery; BND-NEXT-21 owns firewall policy; it does not add relay/cloud transport or change trust admission.
+
+---
+
+## BND-NEXT-43 (P1): Make bulk transport continuously readable under live bidirectional load
+
+**Category:** architecture / reliability
+
+### Context and evidence
+
+The v5.0.14 smoke exposed a startup deadlock when both peers replayed a multi-megabyte bitmap: each session synchronously filled its TCP send window and neither returned to its read branch. Protocol 4.4 fixes the observed path with deterministic startup bulk turns, credited 8 KiB clipboard-image chunks, cancellation-safe frame offsets, and bounded write/flush timeouts. Those safeguards do not make the transport generically full duplex. After startup reaches `Ready`, two peers can still initiate maximum text or credited file chunks together; file flow currently grants eight initial 48 KiB chunks, and each selected session branch awaits its write before polling reads again.
+
+The release fence also reuses the global `transport_session_transition` mutex while an owned batch writes. Each socket operation is bounded at two seconds, but one batch can span multiple bounded operations. That is acceptable for the current two-PC dogfood topology, but one stalled peer can temporarily delay ownership claims and egress for unrelated peers for a multi-second window.
+
+### What to build
+
+- Give each authenticated session a continuously serviced read path while bulk egress is pending, using a dedicated bounded writer pump, explicit generic credits, or an equivalently testable design.
+- Preserve one ordered peer-owned egress stream across preferred-session replacement; a timed-out or partially written socket must requeue unsafely committed payloads and cannot let a new owner overtake them.
+- Apply bounded memory and fair scheduling across input, clipboard text/image, layout, and file payloads. Input latency must not wait behind bulk progress.
+- Replace the global egress ownership fence with per-peer serialization or prove equivalent cross-peer fairness under one stalled peer and one healthy peer.
+- Keep protocol framing cancellation-safe and retain bounded progress/stall diagnostics without logging clipboard or file content.
+
+### Acceptance criteria
+
+- Two peers simultaneously send at least five maximum-size text payloads after startup over a constrained duplex transport; all arrive in order without reconnect, timeout, or frame rejection.
+- Two peers simultaneously transfer multi-chunk files with transport capacity smaller than one file chunk; both complete byte-identically while first input continues in both directions.
+- Replacement during a partial bulk write completes within the bounded egress timeout, requeues the unsafely committed payload, and never delivers N+1 ahead of N.
+- Queue and writer memory remain bounded under a stalled reader, and input flush latency has a deterministic upper bound while bulk is active.
+
+### Scope boundary
+
+Do not solve this by increasing smoke timeouts, TCP buffers, or retained queue limits. Protocol 4.4 startup turns and clipboard-image credits remain the release fix for the observed dogfood failure; this story owns the generic live full-duplex architecture.
 
 ---
 

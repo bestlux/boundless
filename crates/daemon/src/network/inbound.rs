@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use core_clipboard::{ClipboardPayload, ClipboardPolicy, payload_hash_hex};
 use core_protocol::WireMessage;
@@ -13,6 +13,7 @@ use peer_transport::{
     MAX_INBOUND_TRANSFERS_PER_PEER,
 };
 
+use super::codec::flush_transport_writer;
 use super::inbound_payload::enqueue_clipboard_image_payload;
 use super::outbound::{send_file_chunk_credit, send_message};
 
@@ -223,9 +224,7 @@ where
             frame_buffer,
         )
         .await?;
-        tokio::io::AsyncWriteExt::flush(writer)
-            .await
-            .context("flush inbound file transfer initial credit")
+        flush_transport_writer(writer, "flush inbound file transfer initial credit").await
     }
     .await;
     if let Err(error) = initial_credit_result {
@@ -440,9 +439,7 @@ where
     if replenish_credits > 0 {
         let credit_result = async {
             send_file_chunk_credit(writer, &transfer_id, replenish_credits, frame_buffer).await?;
-            tokio::io::AsyncWriteExt::flush(writer)
-                .await
-                .context("flush inbound file transfer chunk credit")
+            flush_transport_writer(writer, "flush inbound file transfer chunk credit").await
         }
         .await;
         if let Err(error) = credit_result {
@@ -701,9 +698,7 @@ where
         frame_buffer,
     )
     .await?;
-    tokio::io::AsyncWriteExt::flush(writer)
-        .await
-        .context("flush inbound file transfer rejection")
+    flush_transport_writer(writer, "flush inbound file transfer rejection").await
 }
 
 pub(super) async fn discard_inbound_clipboard_image_transfer(

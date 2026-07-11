@@ -64,18 +64,33 @@ pub const DEFAULT_TRANSPORT_TUNING: TransportTuning = TransportTuning::new(
     4,
 );
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundTransferKind {
+    File,
+    ClipboardImage,
+}
+
+#[derive(Debug)]
 pub struct OutboundTransferFlow {
     pub available_chunk_credits: u32,
+    pub kind: OutboundTransferKind,
 }
 
 pub type OutboundTransferFlows = HashMap<String, OutboundTransferFlow>;
 
 pub const FILE_TRANSFER_INITIAL_CHUNK_CREDITS: u32 = 8;
 pub const FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS: u32 = 256;
-pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 255 * 1024;
 pub const MAX_INBOUND_TRANSFERS_PER_PEER: usize = 4;
-pub const CLIPBOARD_IMAGE_CHUNK_BYTES: usize = 128 * 1024;
+// Keep each credited clipboard write comfortably below typical TCP send
+// buffers. A session processes at most one credited chunk before returning to
+// its read loop, so two peers replaying images simultaneously cannot fill both
+// directions and wait forever for the other side to read.
+pub const CLIPBOARD_IMAGE_CHUNK_BYTES: usize = 8 * 1024;
+pub const CLIPBOARD_IMAGE_INLINE_MAX_BYTES: usize = 8 * 1024;
+pub const CLIPBOARD_IMAGE_INITIAL_CHUNK_CREDITS: u32 = 1;
+pub const TRANSPORT_EGRESS_IO_TIMEOUT: Duration = Duration::from_secs(2);
+pub const TRANSPORT_EGRESS_BATCH_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_TRANSPORT_EVENTS: usize = 512;
 const MAX_ACTIVITY_EVENT_SUMMARIES: usize = 64;
 const MAX_DIAGNOSTIC_EVENT_SUMMARIES: usize = 128;
@@ -87,6 +102,11 @@ pub enum OutboundPayload {
     },
     ClipboardImage {
         image_bmp: Vec<u8>,
+    },
+    ClipboardImageCursor {
+        transfer_id: String,
+        image_bmp: Arc<[u8]>,
+        offset_bytes: usize,
     },
     FileStart {
         transfer_id: String,
@@ -141,6 +161,20 @@ pub fn register_outbound_transfer_flow(
         transfer_id,
         OutboundTransferFlow {
             available_chunk_credits: 0,
+            kind: OutboundTransferKind::File,
+        },
+    );
+}
+
+pub fn register_outbound_clipboard_transfer_flow(
+    outbound_transfer_flow: &mut OutboundTransferFlows,
+    transfer_id: String,
+) {
+    outbound_transfer_flow.insert(
+        transfer_id,
+        OutboundTransferFlow {
+            available_chunk_credits: 0,
+            kind: OutboundTransferKind::ClipboardImage,
         },
     );
 }
@@ -183,6 +217,23 @@ pub fn apply_outbound_chunk_credits(
     Some(flow.available_chunk_credits)
 }
 
+pub fn apply_outbound_chunk_credits_for_kind(
+    outbound_transfer_flow: &mut OutboundTransferFlows,
+    transfer_id: &str,
+    chunk_credits: u32,
+    expected_kind: OutboundTransferKind,
+) -> Option<u32> {
+    let flow = outbound_transfer_flow.get_mut(transfer_id)?;
+    if flow.kind != expected_kind {
+        return None;
+    }
+    flow.available_chunk_credits = flow
+        .available_chunk_credits
+        .saturating_add(chunk_credits)
+        .min(FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS);
+    Some(flow.available_chunk_credits)
+}
+
 pub fn restore_outbound_chunk_credits_for_payloads(
     outbound_transfer_flow: &mut OutboundTransferFlows,
     payloads: &[OutboundPayload],
@@ -190,7 +241,8 @@ pub fn restore_outbound_chunk_credits_for_payloads(
     for payload in payloads {
         let transfer_id = match payload {
             OutboundPayload::FileChunk { transfer_id, .. }
-            | OutboundPayload::FileTransferCursor { transfer_id } => transfer_id,
+            | OutboundPayload::FileTransferCursor { transfer_id }
+            | OutboundPayload::ClipboardImageCursor { transfer_id, .. } => transfer_id,
             _ => continue,
         };
         let Some(flow) = outbound_transfer_flow.get_mut(transfer_id) else {
@@ -756,6 +808,17 @@ impl TransportRuntimeState {
             .is_ok_and(|registry| registry.active_session_by_peer.contains_key(peer_id))
     }
 
+    pub fn is_active_transport_session(&self, peer_id: &str, session_id: u64) -> bool {
+        self.transport_session_registry
+            .lock()
+            .is_ok_and(|registry| {
+                registry
+                    .active_session_by_peer
+                    .get(peer_id)
+                    .is_some_and(|active| active.session_id == session_id)
+            })
+    }
+
     pub fn register_transport_session_for_peer(
         &self,
         peer_id: &str,
@@ -1135,6 +1198,40 @@ fn transport_event_token_is_volatile(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_credits_cannot_cross_transfer_kinds() {
+        let mut flows = OutboundTransferFlows::new();
+        register_outbound_clipboard_transfer_flow(&mut flows, "clip-1".to_string());
+
+        assert_eq!(
+            apply_outbound_chunk_credits_for_kind(
+                &mut flows,
+                "clip-1",
+                8,
+                OutboundTransferKind::File,
+            ),
+            None
+        );
+        assert_eq!(flows["clip-1"].available_chunk_credits, 0);
+        assert_eq!(
+            apply_outbound_chunk_credits_for_kind(
+                &mut flows,
+                "clip-1",
+                1,
+                OutboundTransferKind::ClipboardImage,
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn wire_clipboard_text_cap_matches_default_clipboard_policy() {
+        assert_eq!(
+            MAX_CLIPBOARD_TEXT_BYTES,
+            core_clipboard::ClipboardPolicy::default().max_text_bytes
+        );
+    }
 
     fn test_event(
         timestamp: DateTime<Utc>,

@@ -19,7 +19,10 @@ impl Default for ClipboardPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_text_bytes: 256 * 1024,
+            // Leave bounded framing overhead below the 256 KiB wire payload
+            // ceiling; accepting an exact 256 KiB string would otherwise pass
+            // clipboard validation and be dropped during wire encoding.
+            max_text_bytes: 255 * 1024,
             max_image_bytes: 8 * 1024 * 1024,
         }
     }
@@ -320,6 +323,24 @@ mod tests {
         )
         .expect_err("must reject");
         assert!(matches!(err, ClipboardPolicyError::TextTooLarge { .. }));
+    }
+
+    #[test]
+    fn default_text_limit_reserves_wire_framing_overhead() {
+        let policy = ClipboardPolicy::default();
+        assert_eq!(policy.max_text_bytes, 255 * 1024);
+        validate_payload(
+            policy,
+            &ClipboardPayload::Text("x".repeat(policy.max_text_bytes)),
+        )
+        .expect("exact default limit remains valid");
+        assert!(matches!(
+            validate_payload(
+                policy,
+                &ClipboardPayload::Text("x".repeat(policy.max_text_bytes + 1)),
+            ),
+            Err(ClipboardPolicyError::TextTooLarge { .. })
+        ));
     }
 
     #[test]

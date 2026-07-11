@@ -1,5 +1,42 @@
 use super::*;
 
+pub(super) async fn write_transport_bytes<W>(
+    writer: &mut W,
+    bytes: &[u8],
+    operation: &'static str,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    time::timeout(
+        peer_transport::TRANSPORT_EGRESS_IO_TIMEOUT,
+        writer.write_all(bytes),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "{operation} timed out after {} ms",
+            peer_transport::TRANSPORT_EGRESS_IO_TIMEOUT.as_millis()
+        )
+    })?
+    .with_context(|| operation.to_string())
+}
+
+pub(super) async fn flush_transport_writer<W>(writer: &mut W, operation: &'static str) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    time::timeout(peer_transport::TRANSPORT_EGRESS_IO_TIMEOUT, writer.flush())
+        .await
+        .with_context(|| {
+            format!(
+                "{operation} timed out after {} ms",
+                peer_transport::TRANSPORT_EGRESS_IO_TIMEOUT.as_millis()
+            )
+        })?
+        .with_context(|| operation.to_string())
+}
+
 pub(super) fn input_events_to_wire(events: &[InputEvent]) -> Vec<WireInputEvent> {
     events.iter().map(input_event_to_wire).collect()
 }

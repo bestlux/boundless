@@ -1,5 +1,9 @@
 use super::*;
 
+pub(crate) struct TransportSessionEgressGuard {
+    _transition: tokio::sync::OwnedMutexGuard<()>,
+}
+
 impl AppState {
     pub async fn request_peer_reconnect(&self, peer_id: &str) -> u64 {
         let generation = self.transport.request_peer_reconnect(peer_id).await;
@@ -94,6 +98,28 @@ impl AppState {
         let _transition = self.transport_session_transition.lock().await;
         self.transport
             .claim_transport_session(peer_id, session_id, preferred, cancellation)
+    }
+
+    /// Serializes queue drain/write/flush with transport ownership changes.
+    ///
+    /// The caller must hold this guard until every drained payload has either
+    /// been flushed or returned to the shared queue. That prevents a preferred
+    /// replacement from draining N+1 while the superseded lane still owns N.
+    pub(crate) async fn acquire_transport_session_egress(
+        &self,
+        peer_id: &str,
+        session_id: u64,
+    ) -> Option<TransportSessionEgressGuard> {
+        let transition = self.transport_session_transition.clone().lock_owned().await;
+        if !self
+            .transport
+            .is_active_transport_session(peer_id, session_id)
+        {
+            return None;
+        }
+        Some(TransportSessionEgressGuard {
+            _transition: transition,
+        })
     }
 
     pub fn clear_active_transport_session(&self, peer_id: &str, session_id: u64) -> bool {

@@ -33,7 +33,7 @@ Each of these should work first-try, with a clear next step printed when it can'
 
 | flow | current friction |
 | --- | --- |
-| Install / upgrade | v5.0.14 has a bounded helper-owned quiescence candidate and allows same-version replacement. The first installed proof is 5.0.13→5.0.14 on both PCs. Protocol 4.3 intentionally disconnects a mixed 5.0.13/v5.0.14 pair until the second PC is upgraded; after both upgrades, trust/layout/connection and first input must recover without reset. |
+| Install / upgrade | v5.0.14 has a bounded helper-owned quiescence candidate and allows same-version replacement. The first installed proof is 5.0.13→5.0.14 on both PCs. Protocol 4.4 intentionally disconnects a mixed 5.0.13/v5.0.14 pair until the second PC is upgraded; after both upgrades, trust/layout/connection and first input must recover without reset. |
 | Reset / recover | Fixed in c2e1509 but the shape remains fragile: daemon-API failure degrades to a warning plus user-profile-only cleanup. A failed service-trust reset should be unmissable. |
 | Pair | Proven on asymmetric hardware 2026-07-07 (P0 #3) and felt smooth end-to-end. Remaining polish: verify the reverse-initiation copy ("waiting for the other peer to connect back") appears in the real UI when pairing is started from the blocked side. |
 | Diagnose in one command | v5.0.13 gives transitions/failures priority, bounds repeated activity/failure summaries, and strips clipboard content at creation and raw output (BND-NEXT-34/37). Full per-stage counters, a sustained installed handoff trace, and an installed clipboard-sentinel sweep remain pending. |

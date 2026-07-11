@@ -35,7 +35,7 @@ Default payload sizes are 2 MiB and 8 MiB. 8 MiB is the default ClipboardPolicy:
 - Windows clipboard reads use platform-windows::clipboard_backend::WindowsClipboardBackend::read_payload, which materializes formats::Bitmap into ClipboardPayload::Image(Vec<u8>).
 - Local clipboard observation calls queue_local_clipboard_image_for_connected_peers; it validates policy and BMP shape, stores the latest replay snapshot, prunes stale outgoing clipboard payloads, and queues the image for connected peers.
 - Direct control-plane image sends call AppState::queue_clipboard_image, validate BMP shape, and enqueue OutboundPayload::ClipboardImage.
-- Outbound transport drains bulk queues in network::outbound; images at or above the 256 KiB wire payload cap are sent as ClipboardImageStart, 128 KiB ClipboardImageChunk frames, and ClipboardImageEnd.
+- Outbound transport drains bulk queues in network::outbound; protocol 4.4 sends images above 8 KiB as ClipboardImageStart, receiver-credited 8 KiB ClipboardImageChunk frames, and ClipboardImageEnd.
 - Inbound chunked images allocate InboundClipboardImageTransfer.data with the announced total size, extend it per chunk, validate final hash, and enqueue a full remote clipboard image payload.
 - Remote clipboard apply writes the full ClipboardPayload::Image back to the platform clipboard backend. This still requires a full image payload in memory.
 
@@ -64,6 +64,6 @@ These artifact files are local run output and are not required to be committed.
 
 Category: bounded allocation fix implemented.
 
-The material issue was in the outbound/local path: large images that necessarily exceed the 256 KiB wire payload cap were still cloned into a monolithic ClipboardImage wire message and serialized into a full frame before falling back to chunked transfer. The fix skips that doomed monolithic encode for definitely chunked images, hashes chunked image bytes without constructing a temporary ClipboardPayload::Image(Vec<u8>), and moves the local image payload into replay state instead of cloning it there.
+The earlier material issue was in the outbound/local path: images that exceeded the wire payload cap were cloned into a monolithic ClipboardImage message before falling back to chunked transfer. Protocol 4.4 now bypasses monolithic encoding above 8 KiB and advances one receiver-credited 8 KiB chunk per read/write turn. Chunk hashing still avoids a temporary ClipboardPayload::Image clone, and local replay state retains one image payload.
 
 The inbound path still reassembles and queues a full BMP payload because the current clipboard apply boundary and Windows clipboard API path require a complete image buffer. A streaming or spooling design should be a separate architecture task if future profiling shows inbound image pressure is unacceptable.

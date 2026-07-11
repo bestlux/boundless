@@ -71,6 +71,19 @@ fn clipboard_payload_from_outbound_payload(payload: &OutboundPayload) -> Option<
     }
 }
 
+fn clipboard_payload_hash_from_outbound_payload(payload: &OutboundPayload) -> Option<String> {
+    match payload {
+        OutboundPayload::ClipboardText { text } => Some(core_clipboard::text_hash_hex(text)),
+        OutboundPayload::ClipboardImage { image_bmp } => {
+            Some(core_clipboard::image_hash_hex(image_bmp))
+        }
+        OutboundPayload::ClipboardImageCursor { image_bmp, .. } => {
+            Some(core_clipboard::image_hash_hex(image_bmp))
+        }
+        _ => None,
+    }
+}
+
 fn outbound_input_move_only_delta(payload: &OutboundPayload) -> Option<(u64, i64, i32, i32)> {
     let OutboundPayload::InputFrame {
         sequence,
@@ -201,7 +214,9 @@ impl AppState {
             queue.retain(|payload| {
                 !matches!(
                     payload,
-                    OutboundPayload::ClipboardText { .. } | OutboundPayload::ClipboardImage { .. }
+                    OutboundPayload::ClipboardText { .. }
+                        | OutboundPayload::ClipboardImage { .. }
+                        | OutboundPayload::ClipboardImageCursor { .. }
                 )
             });
             !queue.is_empty()
@@ -234,10 +249,9 @@ impl AppState {
         peer_id: &str,
         payload: &OutboundPayload,
     ) -> bool {
-        let Some(clipboard_payload) = clipboard_payload_from_outbound_payload(payload) else {
+        let Some(hash) = clipboard_payload_hash_from_outbound_payload(payload) else {
             return false;
         };
-        let hash = payload_hash_hex(&clipboard_payload);
 
         let mut sync = self.clipboard.sync.write().await;
         let Some(obsolete_hashes) = sync
@@ -276,8 +290,8 @@ impl AppState {
         let queue_map = self.transport.outgoing_bulk_payloads.read().await;
         queue_map.get(peer_id).is_some_and(|queue| {
             queue.iter().any(|payload| {
-                clipboard_payload_from_outbound_payload(payload)
-                    .is_some_and(|payload| payload_hash_hex(&payload) == replay_state.hash)
+                clipboard_payload_hash_from_outbound_payload(payload)
+                    .is_some_and(|hash| hash == replay_state.hash)
             })
         })
     }
@@ -1146,6 +1160,29 @@ impl AppState {
             size_bytes: transfer.total_bytes,
         });
         true
+    }
+
+    pub(crate) async fn has_outgoing_clipboard_image_cursor(
+        &self,
+        peer_id: &str,
+        transfer_id: &str,
+    ) -> bool {
+        self.transport
+            .outgoing_bulk_payloads
+            .read()
+            .await
+            .get(peer_id)
+            .is_some_and(|queue| {
+                queue.iter().any(|payload| {
+                    matches!(
+                        payload,
+                        OutboundPayload::ClipboardImageCursor {
+                            transfer_id: cursor_transfer_id,
+                            ..
+                        } if cursor_transfer_id == transfer_id
+                    )
+                })
+            })
     }
 
     #[cfg(test)]
