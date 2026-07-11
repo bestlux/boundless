@@ -46,10 +46,10 @@ This patch train fixes the three regressions found during installed v5.0.13 dogf
 
 | story | candidate status | primary commits | remaining gap |
 | --- | --- | --- | --- |
-| BND-NEXT-38 | code complete; needs installed evidence | 57dd527, f180a81, 7207252, cfc7161, ac61ad1, 41b437c | Raw Input is authoritative for the Double-Control detector, hook loss and broker stalls fail open, and input ownership is acknowledged before local lock. Test both Control keys with PowerToys on/off, stalled/unavailable IPC, forced tray loss, and a successful next handoff. |
-| BND-NEXT-40 | code complete; needs physical evidence | c7b346a, ffb4a51, 049eafa, a59c16d, b50f206, e086e5c | Key semantics and source logical Num Lock now survive broker, protocol 4.3, wire, and Windows injection. Run the opposite-Num-Lock matrix both directions, including digits, decimal, Enter, divide, navigation, toggle, hold/repeat, and release. |
-| BND-NEXT-41 | code complete; needs installed/UAC evidence | 5a0be2b, 0d79580, 36cbb60, bc0c69d, 64f4700 | The helper owns a bounded per-user/session quiescence path, protects elevated staging and log handoff, supervises tray and installer liveness, and leaves MSI as the service-stop owner. Prove a normal-user 5.0.13→5.0.14 upgrade with one UAC prompt, no Restart Manager loop, bounded timing, and healthy postconditions on both PCs. |
-| BND-NEXT-42 | code complete; needs installed asymmetric evidence | 6b0aa59, cb48c2b | Simultaneous trusted connections now converge on one deterministic physical session, a sole-reachable reverse session remains valid, and stale teardown or a delayed failed dial cannot publish a false disconnect. Four extended local two-node smokes plus a post-review reverse-orientation smoke passed; repeat connection, first input, clipboard, and reconnect on the routed dogfood pair. |
+| BND-NEXT-38 | code complete; needs installed evidence | 57dd527, f180a81, 7207252, cfc7161, ac61ad1, 41b437c, c6d6f59, fe4e05a, b47a5af, 9d4a53d, f80f808, 28d3936, baf6a62 | Raw Input is authoritative; detector/broker loss and broker-session replacement fail open, while delivery receipts and held-state recovery preserve safe reattach and local lock waits for daemon acknowledgment. Test both Control keys with PowerToys on/off, stalled/unavailable IPC, forced tray loss, and a successful next handoff. |
+| BND-NEXT-40 | code complete; needs physical evidence | c7b346a, ffb4a51, 049eafa, a59c16d, b50f206, e086e5c, e545de7, 92967fe | Key semantics introduced in protocol 4.3 and retained by protocol 4.4, source logical Num Lock, tray handoff identity, and modifier projection now survive broker, wire, and Windows injection. Run the opposite-Num-Lock matrix both directions, including digits, decimal, Enter, divide, navigation, toggle, hold/repeat, and release. |
+| BND-NEXT-41 | code complete; needs installed/UAC evidence | 5a0be2b, 0d79580, 36cbb60, bc0c69d, 64f4700, cdd3c35, 681424f, 1284adc, 08e49bc, b47f2f0, d1f7bd6, 852cc7a, f2781ec | The helper bounds per-user/session quiescence and the elevated installer process tree, retains quiescence through uncertain cancellation, and fences fail-closed service recovery until privileged authority drains and the service-start action settles. Prove a normal-user 5.0.13→5.0.14 upgrade with one UAC prompt, no Restart Manager loop, bounded timing, and healthy postconditions on both PCs. |
+| BND-NEXT-42 | code complete; needs installed asymmetric evidence | 6b0aa59, cb48c2b, 2b766ee, b1d15a1 | Simultaneous trusted connections now converge on one deterministic physical session, while protocol 4.4 startup turns, credited image replay, bounded writes, and latest-wins supersession close the observed startup liveness failure. Four extended local two-node smokes plus a post-review reverse-orientation smoke passed; repeat connection, first input, clipboard, and reconnect on the routed dogfood pair. Generic post-startup full-duplex work remains BND-NEXT-43. |
 | BND-NEXT-43 | open P1 transport design gap | — | Protocol 4.4 serializes startup bulk, credits large clipboard images, bounds socket writes, and preserves partial frame reads. Live simultaneous bidirectional file chunks and post-startup maximum text can still contend because the session loop awaits writes instead of reading continuously. |
 | BND-NEXT-31 | code complete for graceful Quit path; needs installed evidence | 5a0be2b, 0d79580, bc0c69d, 64f4700 | The true Quit signal now fails open and exits the broker before process shutdown. Run active-capture Quit/relaunch, upgrade-while-running, process-count, first post-relaunch handoff, and emergency escape on installed hardware. |
 | BND-NEXT-29 item 3 | code complete; needs same-version install evidence | 5a0be2b | WiX now allows same-version upgrades and packaging smoke enforces the contract. Prove a same-version helper rebuild replaces the installed payload instead of silently no-oping. |
@@ -130,7 +130,7 @@ None. Preserve BND-NEXT-11’s service-ownership rule rather than reverting to a
 
 **Category:** bug
 
-Status: the failure was reproduced during the normal-user 5.0.12→5.0.13 helper/UAC upgrade. The v5.0.14 candidate adds bounded tray/service quiescence, concurrent installer supervision, protected elevated staging and log handoff, exact user/session ownership, and fail-closed privileged service-start authorization. A real normal-user 5.0.13→5.0.14 upgrade on both PCs remains the proof boundary.
+Status: the failure was reproduced during the normal-user 5.0.12→5.0.13 helper/UAC upgrade. The v5.0.14 candidate bounds per-user/session quiescence and the elevated installer process tree, retains quiescence through uncertain cancellation, and fences fail-closed service recovery until privileged authority drains and the service-start action settles. A real normal-user 5.0.13→5.0.14 upgrade on both PCs remains the proof boundary.
 
 ### Context and evidence
 
@@ -165,7 +165,7 @@ BND-NEXT-23 owns bounded SCM stop, BND-NEXT-31 owns tray/broker lifecycle, and B
 
 **Category:** bug
 
-Status: found during the v5.0.14 release gate and fixed in `6b0aa59`/`cb48c2b`. Deterministic state-machine, reverse-session, replacement-teardown, stale-dial, and queue-delivery tests pass, as do four extended local two-node smokes split across both connection orientations plus a post-review reverse-orientation run. The routed CODY-PC/CODY-ELITEBOOK pair remains the installed proof boundary.
+Status: found during the v5.0.14 release gate and fixed in `6b0aa59`/`cb48c2b`. The adjacent startup replay failure is fixed in `2b766ee`/`b1d15a1`. Deterministic state-machine, reverse-session, replacement-teardown, stale-dial, queue-delivery, credited image replay, and newest-payload tests pass, as do four extended local two-node smokes split across both connection orientations plus a post-review reverse-orientation run. The routed CODY-PC/CODY-ELITEBOOK pair remains the installed proof boundary.
 
 ### Context and evidence
 
@@ -202,6 +202,8 @@ This story hardens authenticated session ownership only. BND-NEXT-20E owns disco
 
 **Category:** architecture / reliability
 
+Status: open. Protocol 4.4 closes the observed startup clipboard-replay deadlock only; simultaneous post-startup maximum-text/file traffic and cross-peer fairness remain unimplemented.
+
 ### Context and evidence
 
 The v5.0.14 smoke exposed a startup deadlock when both peers replayed a multi-megabyte bitmap: each session synchronously filled its TCP send window and neither returned to its read branch. Protocol 4.4 fixes the observed path with deterministic startup bulk turns, credited 8 KiB clipboard-image chunks, cancellation-safe frame offsets, and bounded write/flush timeouts. Those safeguards do not make the transport generically full duplex. After startup reaches `Ready`, two peers can still initiate maximum text or credited file chunks together; file flow currently grants eight initial 48 KiB chunks, and each selected session branch awaits its write before polling reads again.
@@ -231,7 +233,7 @@ Do not solve this by increasing smoke timeouts, TCP buffers, or retained queue l
 
 ## BND-NEXT-38 (P0, v5.0.14 candidate needs installed evidence): Make emergency input unlock local and IPC-independent
 
-Status: reopened after installed v5.0.13 failed to recognize a physical Double-Control gesture. The v5.0.14 candidate makes Raw Input keyboard state authoritative, treats the hook as a health-checked fallback, fails open on detector/broker loss, and requires daemon acknowledgment before local lock. Physical both-Control, PowerToys, fault-path, and next-handoff evidence remains pending.
+Status: reopened after installed v5.0.13 failed to recognize a physical Double-Control gesture. The v5.0.14 candidate makes Raw Input keyboard state authoritative, treats the hook as a health-checked fallback, fails open on detector/broker loss and broker-session replacement, preserves delivery receipts and held-state recovery across safe reattach, and requires daemon acknowledgment before local lock. Physical both-Control, PowerToys, fault-path, and next-handoff evidence remains pending.
 
 ### Context and evidence
 
@@ -298,7 +300,7 @@ BND-NEXT-34 owns durable bounded stage counters. This story may use temporary ta
 
 **Category:** bug
 
-Status: reported on installed v5.0.13 and believed present in earlier versions. The v5.0.14 candidate preserves semantic key identity and source logical Num Lock through the broker, protocol 4.3 wire contract, and Windows injection while retaining physical scan/E0 distinctions. The opposite-Num-Lock two-PC matrix remains pending.
+Status: reported on installed v5.0.13 and believed present in earlier versions. The v5.0.14 candidate preserves semantic key identity and source logical Num Lock through the broker, the keyboard identity introduced in protocol 4.3 and retained by final protocol 4.4, and Windows injection while retaining physical scan/E0 distinctions. The opposite-Num-Lock two-PC matrix remains pending.
 
 ### Context and evidence
 
@@ -310,7 +312,7 @@ The confirmed loss is source logical Num Lock meaning for ambiguous non-E0 keypa
 
 - Define one keyboard event model that preserves the existing physical scan/E0 information and state while adding source virtual-key identity plus the effective logical Num Lock semantics needed to reproduce intent.
 - Make Num Lock pressed during remote capture predictably change subsequent keypad behavior even though the source hook suppresses captured keys. Do not force Num Lock on or map every shared scan to a digit; intentional Num-Lock-off navigation must keep working.
-- Carry the new identity through user-session broker IPC, core input, peer wire, and Windows injection. `WireInputEvent::Key` is bincode-backed, so make the clean wire change with protocol 4.3.0 and the matching config migration rather than a compatibility shim.
+- Carry the new identity through user-session broker IPC, core input, peer wire, and Windows injection. `WireInputEvent::Key` is bincode-backed, so the clean wire change landed in protocol 4.3.0; older local config now migrates directly to final protocol 4.4 rather than using a compatibility shim.
 - Keep the existing keypad/main-cluster Enter, divide, and navigation distinctions intact while fixing decimal, digit, operator, Num Lock, repeat, and release semantics. Make polling preserve identity or report reduced support truthfully instead of silently changing meaning.
 - Add only bounded mode/capability diagnostics; do not retain individual key content or per-keystroke telemetry.
 
@@ -321,7 +323,7 @@ The confirmed loss is source logical Num Lock meaning for ambiguous non-E0 keypa
 - Pressing Num Lock during an active remote capture changes subsequent keypad semantics predictably without requiring a handoff or restart.
 - Key down, repeat, and key up survive capture, broker IPC, wire encode/decode, and `SendInput` without duplicate or stuck keys.
 - User-session broker and direct-hook modes pass the matrix; polling either passes or surfaces its limitation before capture.
-- Protocol/config compatibility fails truthfully between 4.2 and 4.3 peers rather than decoding the changed bincode shape incorrectly.
+- Protocol/config compatibility fails truthfully when 4.2/4.3 peers meet a 4.4 peer rather than decoding the changed bincode shape incorrectly.
 
 ### Likely files and validation
 
