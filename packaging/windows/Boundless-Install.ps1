@@ -18,6 +18,10 @@ param(
     [Parameter(DontShow = $true)]
     [switch]$ElevatedBootstrapMsiIdleServiceRecovery,
     [Parameter(DontShow = $true)]
+    [string]$ElevatedBootstrapRecoveryJob = "",
+    [Parameter(DontShow = $true)]
+    [string]$ElevatedBootstrapRecoveryRevocationEvent = "",
+    [Parameter(DontShow = $true)]
     [string]$ExpectedInstallerSha256 = "",
     [Parameter(DontShow = $true)]
     [string]$ElevatedInstallCancelEvent = "",
@@ -687,6 +691,300 @@ public static class BoundlessProcessTreeNativeMethods
         }
         try { return GetActiveProcessCount(job); }
         finally { CloseHandle(job); }
+    }
+}
+'@
+}
+
+function Initialize-BoundlessRecoveryAuthorityNativeMethods {
+    if ($null -ne ("BoundlessRecoveryAuthorityNativeMethodsV1" -as [type])) {
+        return
+    }
+
+    # Keep recovery authority interop versioned and independent from the
+    # process-tree native type. PowerShell hosts can retain an older Add-Type
+    # definition across helper invocations during an upgrade.
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public sealed class BoundlessRecoveryAuthorityJobV1 : IDisposable
+{
+    private IntPtr jobHandle;
+    private bool disposed;
+
+    internal BoundlessRecoveryAuthorityJobV1(IntPtr jobHandle)
+    {
+        this.jobHandle = jobHandle;
+    }
+
+    public int ActiveProcessCount
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return BoundlessRecoveryAuthorityNativeMethodsV1.GetActiveProcessCount(jobHandle);
+        }
+    }
+
+    public void Terminate(int exitCode)
+    {
+        ThrowIfDisposed();
+        if (ActiveProcessCount == 0) { return; }
+        if (!BoundlessRecoveryAuthorityNativeMethodsV1.TerminateJobObject(
+            jobHandle,
+            unchecked((uint)exitCode)))
+        {
+            throw new Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "TerminateJobObject(recovery authority) failed");
+        }
+    }
+
+    public bool WaitForEmpty(int timeoutMilliseconds)
+    {
+        ThrowIfDisposed();
+        Stopwatch stopwatch = Stopwatch.StartNew();
+        do
+        {
+            if (ActiveProcessCount == 0) { return true; }
+            Thread.Sleep(20);
+        }
+        while (timeoutMilliseconds < 0 || stopwatch.ElapsedMilliseconds < timeoutMilliseconds);
+        return ActiveProcessCount == 0;
+    }
+
+    public void Dispose()
+    {
+        if (disposed) { return; }
+        disposed = true;
+        if (jobHandle != IntPtr.Zero)
+        {
+            BoundlessRecoveryAuthorityNativeMethodsV1.CloseHandle(jobHandle);
+            jobHandle = IntPtr.Zero;
+        }
+        GC.SuppressFinalize(this);
+    }
+
+    ~BoundlessRecoveryAuthorityJobV1() { Dispose(); }
+
+    private void ThrowIfDisposed()
+    {
+        if (disposed)
+            throw new ObjectDisposedException("BoundlessRecoveryAuthorityJobV1");
+    }
+}
+
+public static class BoundlessRecoveryAuthorityNativeMethodsV1
+{
+    private const uint JOB_OBJECT_ASSIGN_PROCESS = 0x0001;
+    private const uint JOB_OBJECT_QUERY = 0x0004;
+    private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    private const int JobObjectBasicAccountingInformation = 1;
+    private const int JobObjectExtendedLimitInformation = 9;
+    private const int ERROR_ALREADY_EXISTS = 183;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SECURITY_ATTRIBUTES
+    {
+        public int nLength;
+        public IntPtr lpSecurityDescriptor;
+        [MarshalAs(UnmanagedType.Bool)] public bool bInheritHandle;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public IntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+    {
+        public long TotalUserTime;
+        public long TotalKernelTime;
+        public long ThisPeriodTotalUserTime;
+        public long ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount;
+        public uint TotalProcesses;
+        public uint ActiveProcesses;
+        public uint TotalTerminatedProcesses;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateJobObjectW(
+        ref SECURITY_ATTRIBUTES attributes,
+        string name);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr OpenJobObjectW(
+        uint desiredAccess,
+        bool inheritHandle,
+        string name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(
+        IntPtr job,
+        int informationClass,
+        ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION information,
+        uint length);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool QueryInformationJobObject(
+        IntPtr job,
+        int informationClass,
+        out JOBOBJECT_BASIC_ACCOUNTING_INFORMATION information,
+        uint length,
+        IntPtr returnLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        string descriptor,
+        uint revision,
+        out IntPtr securityDescriptor,
+        IntPtr size);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
+
+    public static BoundlessRecoveryAuthorityJobV1 Create(string name, string jobSddl)
+    {
+        IntPtr securityDescriptor = IntPtr.Zero;
+        IntPtr job = IntPtr.Zero;
+        try
+        {
+            SECURITY_ATTRIBUTES attributes = new SECURITY_ATTRIBUTES();
+            attributes.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+            if (!String.IsNullOrEmpty(jobSddl))
+            {
+                if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    jobSddl,
+                    1,
+                    out securityDescriptor,
+                    IntPtr.Zero))
+                {
+                    throw new Win32Exception(
+                        Marshal.GetLastWin32Error(),
+                        "recovery authority job SDDL conversion failed");
+                }
+                attributes.lpSecurityDescriptor = securityDescriptor;
+            }
+            job = CreateJobObjectW(ref attributes, name);
+            if (job == IntPtr.Zero)
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "CreateJobObject(recovery authority) failed");
+            if (Marshal.GetLastWin32Error() == ERROR_ALREADY_EXISTS)
+                throw new InvalidOperationException(
+                    "Recovery authority job unexpectedly already existed.");
+
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits =
+                new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (!SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                ref limits,
+                unchecked((uint)Marshal.SizeOf(
+                    typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)))))
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "SetInformationJobObject(recovery authority) failed");
+            }
+            BoundlessRecoveryAuthorityJobV1 result =
+                new BoundlessRecoveryAuthorityJobV1(job);
+            job = IntPtr.Zero;
+            return result;
+        }
+        finally
+        {
+            if (job != IntPtr.Zero) { CloseHandle(job); }
+            if (securityDescriptor != IntPtr.Zero) { LocalFree(securityDescriptor); }
+        }
+    }
+
+    public static void Join(string name)
+    {
+        IntPtr job = OpenJobObjectW(
+            JOB_OBJECT_ASSIGN_PROCESS | JOB_OBJECT_QUERY,
+            false,
+            name);
+        if (job == IntPtr.Zero)
+            throw new Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "OpenJobObject(recovery authority) failed");
+        try
+        {
+            if (!AssignProcessToJobObject(job, GetCurrentProcess()))
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "AssignProcessToJobObject(recovery authority) failed");
+        }
+        finally { CloseHandle(job); }
+    }
+
+    internal static int GetActiveProcessCount(IntPtr job)
+    {
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
+        if (!QueryInformationJobObject(
+            job,
+            JobObjectBasicAccountingInformation,
+            out accounting,
+            unchecked((uint)Marshal.SizeOf(
+                typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION))),
+            IntPtr.Zero))
+        {
+            throw new Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "QueryInformationJobObject(recovery authority) failed");
+        }
+        return unchecked((int)accounting.ActiveProcesses);
     }
 }
 '@
@@ -2869,35 +3167,49 @@ function Wait-BoundlessInstallerTreeBoundaryClosed {
 function Invoke-BoundlessRecoveryLauncherBounded {
     param(
         [string]$LauncherSource,
-        [int]$TimeoutMilliseconds
+        [int]$TimeoutMilliseconds,
+        [object]$RecoveryAuthority
     )
 
-    $launcher = Start-BoundlessOwnedProcessBoundary `
-        -FilePath (Resolve-CurrentPowerShellExecutable) `
-        -ArgumentList @(
-            "-NoProfile",
-            "-EncodedCommand",
-            [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($LauncherSource))
-        ) `
-        -CreateNoWindow
+    $launcher = $null
+    $completed = $false
     try {
+        $launcher = Start-BoundlessOwnedProcessBoundary `
+            -FilePath (Resolve-CurrentPowerShellExecutable) `
+            -ArgumentList @(
+                "-NoProfile",
+                "-EncodedCommand",
+                [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($LauncherSource))
+            ) `
+            -CreateNoWindow
         if (-not $launcher.WaitForExit($TimeoutMilliseconds)) {
-            Stop-BoundlessProcessBoundary -Process $launcher -TimeoutMilliseconds 5000
             throw "Parent service recovery elevation launch/execution exceeded $TimeoutMilliseconds milliseconds."
         }
         if (-not $launcher.WaitForTreeExit(5000)) {
-            Stop-BoundlessProcessBoundary -Process $launcher -TimeoutMilliseconds 5000
             throw "Parent service recovery launcher left an owned descendant."
         }
         if ($launcher.ExitCode -ne 0) {
             throw "Parent service recovery launcher failed with exit code $($launcher.ExitCode)."
         }
+        if ($RecoveryAuthority.job.ActiveProcessCount -gt 0) {
+            throw "Parent service recovery launcher exited before its privileged child drained."
+        }
+        $completed = $true
     }
     finally {
-        if ($launcher.ActiveProcessCount -gt 0) {
-            Stop-BoundlessProcessBoundary -Process $launcher -TimeoutMilliseconds 5000
+        try {
+            Close-BoundlessRecoveryAuthority `
+                -Authority $RecoveryAuthority `
+                -Revoke:(-not $completed)
         }
-        $launcher.Dispose()
+        finally {
+            if ($null -ne $launcher) {
+                if ($launcher.ActiveProcessCount -gt 0) {
+                    Stop-BoundlessProcessBoundary -Process $launcher -TimeoutMilliseconds 5000
+                }
+                $launcher.Dispose()
+            }
+        }
     }
 }
 
@@ -2915,7 +3227,8 @@ function Restore-BoundlessServiceAfterHardKilledElevatedInstall {
         $null -eq $QuiescenceLease.service_initial_running_event -or
         $null -eq $QuiescenceLease.msi_may_have_started_event -or
         $null -eq $QuiescenceLease.msi_definitive_completion_event -or
-        $null -eq $QuiescenceLease.msi_idle_proven_event
+        $null -eq $QuiescenceLease.msi_idle_proven_event -or
+        $null -eq $QuiescenceLease.PSObject.Properties["expected_owner_sid"]
     ) {
         throw "Parent service recovery did not receive protected installer phase evidence."
     }
@@ -2946,6 +3259,10 @@ function Restore-BoundlessServiceAfterHardKilledElevatedInstall {
         throw "Parent service recovery found ineligible BoundlessService state $statusBeforeRecovery."
     }
 
+    $recoveryAuthority = New-BoundlessRecoveryAuthority `
+        -UserSid $QuiescenceLease.expected_owner_sid
+    $authorityTransferred = $false
+    try {
     $launcherSource = if (-not [string]::IsNullOrWhiteSpace($FixtureLauncherSource)) {
         $FixtureLauncherSource
     }
@@ -2970,7 +3287,11 @@ function Restore-BoundlessServiceAfterHardKilledElevatedInstall {
             "-ElevatedInstallMsiDefinitiveCompletionEvent",
             $QuiescenceLease.msi_definitive_completion_event_name,
             "-ElevatedInstallMsiIdleProvenEvent",
-            $QuiescenceLease.msi_idle_proven_event_name
+            $QuiescenceLease.msi_idle_proven_event_name,
+            "-ElevatedBootstrapRecoveryJob",
+            $recoveryAuthority.job_name,
+            "-ElevatedBootstrapRecoveryRevocationEvent",
+            $recoveryAuthority.revocation_event_name
         )
         $payload = [ordered]@{
             file_path = Resolve-CurrentPowerShellExecutable
@@ -3014,11 +3335,26 @@ finally {
         if ([string]::IsNullOrWhiteSpace($FixtureLauncherSource)) {
             throw "Before-launch recovery fixture hook is not available in production mode."
         }
-        & $BeforeFixtureLauncherAction
+        & $BeforeFixtureLauncherAction $recoveryAuthority
     }
+    $launcherSource = $launcherSource.Replace(
+        "__RECOVERY_JOB__",
+        $recoveryAuthority.job_name
+    ).Replace(
+        "__RECOVERY_REVOCATION__",
+        $recoveryAuthority.revocation_event_name
+    )
+    $authorityTransferred = $true
     Invoke-BoundlessRecoveryLauncherBounded `
         -LauncherSource $launcherSource `
-        -TimeoutMilliseconds $TimeoutMilliseconds
+        -TimeoutMilliseconds $TimeoutMilliseconds `
+        -RecoveryAuthority $recoveryAuthority
+    }
+    finally {
+        if (-not $authorityTransferred) {
+            Close-BoundlessRecoveryAuthority -Authority $recoveryAuthority -Revoke
+        }
+    }
     if (
         $requiresMsiIdleProof -and
         -not $QuiescenceLease.msi_definitive_completion_event.WaitOne(0) -and
@@ -3150,6 +3486,89 @@ function Get-BoundlessOwnedTreeSddl {
     # JOB_OBJECT_QUERY only: the unelevated monitor can prove drain without
     # receiving assign, terminate, or ACL mutation rights.
     return "D:P(A;;RC;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00000004;;;$UserSid)"
+}
+
+function New-BoundlessRecoveryAuthority {
+    param([string]$UserSid)
+
+    Assert-AllowedUserSid -Sid $UserSid
+    Initialize-BoundlessRecoveryAuthorityNativeMethods
+    $authorityId = [guid]::NewGuid().ToString('N')
+    $jobName = "Local\Boundless.Installer.RecoveryAuthority.v1.$authorityId"
+    $revocation = New-BoundlessSentinelOwnerEvent `
+        -Prefix "Boundless.Installer.RecoveryRevoked.v1" `
+        -UserSid $UserSid
+    $job = $null
+    try {
+        $job = [BoundlessRecoveryAuthorityNativeMethodsV1]::Create(
+            $jobName,
+            "D:P(A;;RC;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;$UserSid)"
+        )
+        return [pscustomobject]@{
+            job = $job
+            job_name = $jobName
+            revocation_event = $revocation.event
+            revocation_event_name = $revocation.name
+        }
+    }
+    catch {
+        if ($null -ne $job) { $job.Dispose() }
+        $revocation.event.Dispose()
+        throw
+    }
+}
+
+function Join-BoundlessRecoveryAuthority {
+    param(
+        [string]$JobName,
+        [string]$RevocationEventName
+    )
+
+    if ($JobName -notmatch '^Local\\Boundless\.Installer\.RecoveryAuthority\.v1\.[0-9a-f]{32}$') {
+        throw "Recovery authority job name was invalid."
+    }
+    if ($RevocationEventName -notmatch '^Local\\Boundless\.Installer\.RecoveryRevoked\.v1\.[0-9a-f]{32}$') {
+        throw "Recovery revocation event name was invalid."
+    }
+    $revocation = [Threading.EventWaitHandle]::OpenExisting($RevocationEventName)
+    try {
+        if ($revocation.WaitOne(0)) { throw "Recovery authority was revoked before admission." }
+        Initialize-BoundlessRecoveryAuthorityNativeMethods
+        [BoundlessRecoveryAuthorityNativeMethodsV1]::Join($JobName)
+        if ($revocation.WaitOne(0)) { throw "Recovery authority was revoked during admission." }
+        return $revocation
+    }
+    catch {
+        $revocation.Dispose()
+        throw
+    }
+}
+
+function Close-BoundlessRecoveryAuthority {
+    param(
+        [object]$Authority,
+        [switch]$Revoke
+    )
+
+    if ($null -eq $Authority) { return }
+    try {
+        if ($Revoke) {
+            [void]$Authority.revocation_event.Set()
+            if ($Authority.job.ActiveProcessCount -gt 0) {
+                $Authority.job.Terminate(1)
+            }
+        }
+        elseif ($Authority.job.ActiveProcessCount -gt 0) {
+            throw "Recovery authority still had an active privileged process at successful completion."
+        }
+        if (-not $Authority.job.WaitForEmpty(5000)) {
+            throw "Recovery authority job did not drain within 5000 milliseconds."
+        }
+    }
+    finally {
+        $Authority.job.Dispose()
+        $Authority.revocation_event.Dispose()
+    }
 }
 
 function Test-BoundlessInstallerStagePath {
@@ -4914,6 +5333,7 @@ function Start-BoundlessServiceAfterFailedInstall {
         [int]$TimeoutSeconds = 15,
         [scriptblock]$StatusProbe = $null,
         [scriptblock]$WorkerFactory = $null,
+        [Threading.EventWaitHandle]$RecoveryAuthority = $null,
         [switch]$SkipAdministratorCheck
     )
 
@@ -4948,6 +5368,9 @@ function Start-BoundlessServiceAfterFailedInstall {
             -TimeoutSeconds $TimeoutSeconds `
             -FailurePrefix "BoundlessService recovery existing start"
         return [pscustomobject]@{ start_requested = $false; final_status = $finalStatus }
+    }
+    if ($null -ne $RecoveryAuthority -and $RecoveryAuthority.WaitOne(0)) {
+        throw "BoundlessService recovery authority was revoked before the start request."
     }
     $worker = if ($null -ne $WorkerFactory) {
         & $WorkerFactory
@@ -5702,6 +6125,9 @@ function Invoke-BoundlessInstallerSupervisionFixture {
     $failedCompletion = $null
     $failedHeartbeat = $null
     $failedLaunchAttempts = $null
+    $failedBrokerReady = $null
+    $failedBrokerServiceStart = $null
+    $failedBrokerState = [pscustomobject]@{ process = $null }
     $heartbeat = [Threading.EventWaitHandle]::new(
         $true,
         [Threading.EventResetMode]::ManualReset
@@ -5755,6 +6181,7 @@ $event = [Threading.EventWaitHandle]::OpenExisting($name)
 try { [void]$event.Set() } finally { $event.Dispose() }
 '@.Replace("__EVENT__", $recoveryPayload)
         $fixtureLease = [pscustomobject]@{
+            expected_owner_sid = $UserSid
             service_initial_running_event = $serviceInitial.event
             msi_may_have_started_event = $msiMayHaveStarted.event
             msi_definitive_completion_event = $msiDefinitive.event
@@ -5856,6 +6283,12 @@ try {
 }
 finally { $attempt.Dispose() }
 '@.Replace("__SEMAPHORE__", $failedLaunchPayload)
+        $failedBrokerReady = New-BoundlessSentinelOwnerEvent `
+            -Prefix "Boundless.Test.RecoveryBrokerReady.v1" `
+            -UserSid $UserSid
+        $failedBrokerServiceStart = New-BoundlessSentinelOwnerEvent `
+            -Prefix "Boundless.Test.RecoveryBrokerServiceStart.v1" `
+            -UserSid $UserSid
         $failedError = $null
         $failedStopwatch = [Diagnostics.Stopwatch]::StartNew()
         try {
@@ -5875,6 +6308,56 @@ finally { $attempt.Dispose() }
                         -StagedHelperPath "fixture" `
                         -TimeoutMilliseconds 300 `
                         -FixtureLauncherSource $failedLauncherSource `
+                        -BeforeFixtureLauncherAction {
+                            param($authority)
+                            $brokerPayload = [Convert]::ToBase64String(
+                                [Text.Encoding]::UTF8.GetBytes(
+                                    "$($authority.job_name)`n$($authority.revocation_event_name)`n$($failedBrokerReady.name)`n$($failedBrokerServiceStart.name)"
+                                )
+                            )
+                            $brokerSource = @'
+Add-Type -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class BoundlessRecoveryBrokerFixtureNative
+{
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr OpenJobObjectW(uint access, bool inherit, string name);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    public static void Join(string name) {
+        IntPtr job=OpenJobObjectW(5,false,name); if(job==IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try { if(!AssignProcessToJobObject(job,GetCurrentProcess())) throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        finally { CloseHandle(job); }
+    }
+}
+"@
+$names = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("__PAYLOAD__")) -split "`n"
+$revoked = [Threading.EventWaitHandle]::OpenExisting($names[1])
+$ready = [Threading.EventWaitHandle]::OpenExisting($names[2])
+$serviceStart = [Threading.EventWaitHandle]::OpenExisting($names[3])
+try {
+    [BoundlessRecoveryBrokerFixtureNative]::Join($names[0])
+    if ($revoked.WaitOne(0)) { exit 85 }
+    [void]$ready.Set()
+    Start-Sleep -Seconds 30
+    if (-not $revoked.WaitOne(0)) { [void]$serviceStart.Set() }
+}
+finally { $serviceStart.Dispose(); $ready.Dispose(); $revoked.Dispose() }
+'@.Replace("__PAYLOAD__", $brokerPayload)
+                            $failedBrokerState.process = Start-Process `
+                                -FilePath (Resolve-CurrentPowerShellExecutable) `
+                                -ArgumentList @(
+                                    "-NoProfile", "-EncodedCommand",
+                                    [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($brokerSource))
+                                ) `
+                                -WindowStyle Hidden `
+                                -PassThru
+                            if (-not $failedBrokerReady.event.WaitOne(5000)) {
+                                throw "Recovery broker fixture did not join its authority job."
+                            }
+                        } `
                         -ServiceStatusProbe { "Stopped" }
                 } `
                 -TimeoutSeconds 15 `
@@ -5886,12 +6369,18 @@ finally { $attempt.Dispose() }
         $failedStopwatch.Stop()
         $firstLaunchObserved = $failedLaunchAttempts.WaitOne(0)
         $secondLaunchObserved = $failedLaunchAttempts.WaitOne(0)
+        $failedBrokerExited = (
+            $null -ne $failedBrokerState.process -and
+            $failedBrokerState.process.WaitForExit(5000)
+        )
         if (
             $null -eq $failedError -or
             $failedError.Exception.Message -notmatch 'quiescence monitor exited' -or
             $failedError.Exception.Message -notmatch 'elevation launch/execution exceeded 300' -or
             -not $firstLaunchObserved -or
             $secondLaunchObserved -or
+            -not $failedBrokerExited -or
+            $failedBrokerServiceStart.event.WaitOne(0) -or
             -not $failedInstaller.HasExited -or
             -not $failedTreeState.confirmed -or
             -not $failedTreeState.hard_kill_used -or
@@ -5926,6 +6415,14 @@ finally { $attempt.Dispose() }
         if ($null -ne $failedCompletion) { $failedCompletion.event.Dispose() }
         if ($null -ne $failedHeartbeat) { $failedHeartbeat.Dispose() }
         if ($null -ne $failedLaunchAttempts) { $failedLaunchAttempts.Dispose() }
+        if ($null -ne $failedBrokerState.process) {
+            if (-not $failedBrokerState.process.HasExited) {
+                Stop-BoundlessProcessBoundary -Process $failedBrokerState.process
+            }
+            $failedBrokerState.process.Dispose()
+        }
+        if ($null -ne $failedBrokerReady) { $failedBrokerReady.event.Dispose() }
+        if ($null -ne $failedBrokerServiceStart) { $failedBrokerServiceStart.event.Dispose() }
         $control.event.Dispose()
         $completion.event.Dispose()
         $msiMayHaveStarted.event.Dispose()
@@ -6045,6 +6542,7 @@ finally {
 }
 '@.Replace("__PAYLOAD__", $launcherPayload)
         $lease = [pscustomobject]@{
+            expected_owner_sid = $UserSid
             service_initial_running_event = $serviceInitial.event
             msi_may_have_started_event = $mayHaveStarted.event
             msi_definitive_completion_event = $definitive.event
@@ -8319,6 +8817,7 @@ if (
     $msiMayHaveStarted = $null
     $msiDefinitiveCompletion = $null
     $msiIdleProven = $null
+    $recoveryAuthority = $null
     try {
         if (-not (Test-IsAdministrator)) {
             throw "Bootstrap service recovery did not receive an elevated token."
@@ -8328,6 +8827,11 @@ if (
             throw "Bootstrap service recovery was not running from an immutable installer stage."
         }
         Assert-BoundlessAdminOnlyAcl -Path $PSCommandPath | Out-Null
+        if ($ElevatedBootstrapServiceRecovery -or $ElevatedBootstrapMsiIdleServiceRecovery) {
+            $recoveryAuthority = Join-BoundlessRecoveryAuthority `
+                -JobName $ElevatedBootstrapRecoveryJob `
+                -RevocationEventName $ElevatedBootstrapRecoveryRevocationEvent
+        }
         $serviceInitialRunning = Open-BoundlessInstallerPhaseEvent `
             -Name $ElevatedInstallServiceInitialRunningEvent `
             -Phase "ServiceInitialRunning"
@@ -8361,7 +8865,12 @@ if (
             ) {
                 throw "Bootstrap service recovery evidence no longer permits a service start."
             }
-            $recovery = Start-BoundlessServiceAfterFailedInstall -TimeoutSeconds 10
+            if ($recoveryAuthority.WaitOne(0)) {
+                throw "Bootstrap service recovery authority was revoked before service start."
+            }
+            $recovery = Start-BoundlessServiceAfterFailedInstall `
+                -TimeoutSeconds 10 `
+                -RecoveryAuthority $recoveryAuthority
             Write-Host "boundless_install_bootstrap_recovery_start_requested=$($recovery.start_requested)"
             Write-Host "boundless_install_bootstrap_recovery_final_status=$($recovery.final_status)"
         }
@@ -8381,7 +8890,12 @@ if (
                 }
                 [void]$msiIdleProven.Set()
             }
-            $recovery = Start-BoundlessServiceAfterFailedInstall -TimeoutSeconds 10
+            if ($recoveryAuthority.WaitOne(0)) {
+                throw "Bootstrap deferred recovery authority was revoked before service start."
+            }
+            $recovery = Start-BoundlessServiceAfterFailedInstall `
+                -TimeoutSeconds 10 `
+                -RecoveryAuthority $recoveryAuthority
             Write-Host "boundless_install_bootstrap_recovery_start_requested=$($recovery.start_requested)"
             Write-Host "boundless_install_bootstrap_recovery_final_status=$($recovery.final_status)"
         }
@@ -8404,6 +8918,7 @@ if (
         exit 1
     }
     finally {
+        if ($null -ne $recoveryAuthority) { $recoveryAuthority.Dispose() }
         if ($null -ne $msiIdleProven) { $msiIdleProven.Dispose() }
         if ($null -ne $msiDefinitiveCompletion) { $msiDefinitiveCompletion.Dispose() }
         if ($null -ne $msiMayHaveStarted) { $msiMayHaveStarted.Dispose() }
