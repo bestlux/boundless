@@ -77,6 +77,7 @@ pub struct InputBrokerAttachSnapshot {
     pub broker_token: String,
     pub message: String,
     pub protocol_revision: u32,
+    pub delivery_epoch: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

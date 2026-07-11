@@ -36,6 +36,7 @@ pub(crate) struct SafetyUnlockCounts {
 
 #[derive(Debug, Default)]
 struct InputBrokerRelayInner {
+    delivery_epoch: String,
     service_session_input: bool,
     allowed_user_sid: Option<String>,
     attachment: Option<InputBrokerAttachment>,
@@ -69,9 +70,20 @@ pub(crate) struct InputBrokerInjectBatch {
 /// Session-neutral relay between the LocalSystem service daemon and the
 /// user-session input broker. The daemon stays the routing/trust authority;
 /// the broker only supplies captured events and applies inject frames.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InputBrokerRelay {
     inner: Mutex<InputBrokerRelayInner>,
+}
+
+impl Default for InputBrokerRelay {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(InputBrokerRelayInner {
+                delivery_epoch: uuid::Uuid::new_v4().to_string(),
+                ..Default::default()
+            }),
+        }
+    }
 }
 
 impl InputBrokerRelay {
@@ -117,24 +129,43 @@ impl InputBrokerRelay {
         inner.last_accepted_clipboard_sequence = None;
         inner.pressed_keys.clear();
         inner.pressed_buttons.clear();
-        inner.last_acked_inject_batch_id = 0;
-        inner.inflight_inject_batch = None;
+        // Inject delivery identity is daemon-instance state, not attachment
+        // state. Keeping the receipt and in-flight batch across a transient
+        // broker reattach lets a surviving tray process prove that it already
+        // completed the exact delivery instead of applying it again.
     }
 
-    pub(crate) fn detach(&self, broker_token: &str) -> bool {
+    pub(crate) fn delivery_epoch(&self) -> String {
+        self.lock().delivery_epoch.clone()
+    }
+
+    /// Atomically validates the attachment and daemon delivery epoch, commits
+    /// the tray's exact completed-batch receipt, and only then detaches. On a
+    /// mismatched epoch or batch ID no receipt or attachment state changes.
+    pub(crate) fn acknowledge_and_detach(
+        &self,
+        broker_token: &str,
+        delivery_epoch: &str,
+        acked_inject_batch_id: u64,
+    ) -> Result<bool, &'static str> {
         let mut inner = self.lock();
         let matches = inner
             .attachment
             .as_ref()
             .is_some_and(|attachment| attachment.broker_token == broker_token);
-        if matches {
-            inner.attachment = None;
-            inner.last_exchange_at = None;
-            inner.desired_lock_active = false;
-            inner.reported_lock_active = false;
-            inner.capture_forwarding_authorized = false;
+        if !matches {
+            return Ok(false);
         }
-        matches
+        if inner.delivery_epoch != delivery_epoch {
+            return Err("delivery epoch mismatch");
+        }
+        Self::acknowledge_inject_batch_locked(&mut inner, acked_inject_batch_id)?;
+        inner.attachment = None;
+        inner.last_exchange_at = None;
+        inner.desired_lock_active = false;
+        inner.reported_lock_active = false;
+        inner.capture_forwarding_authorized = false;
+        Ok(true)
     }
 
     pub(crate) fn detach_any(&self) -> bool {
@@ -145,6 +176,13 @@ impl InputBrokerRelay {
         inner.desired_lock_active = false;
         inner.reported_lock_active = false;
         inner.capture_forwarding_authorized = false;
+        // `detach_any` is the destructive safe-reset path. Rotate the epoch
+        // whenever delivery state is discarded so a surviving tray cannot
+        // apply or acknowledge a pre-reset batch ID against the new state.
+        inner.delivery_epoch = uuid::Uuid::new_v4().to_string();
+        inner.next_inject_batch_id = 0;
+        inner.last_acked_inject_batch_id = 0;
+        inner.inflight_inject_batch = None;
         was_attached
     }
 
@@ -375,10 +413,16 @@ impl InputBrokerRelay {
     }
 
     pub(crate) fn acknowledge_inject_batch(&self, batch_id: u64) -> Result<(), &'static str> {
+        Self::acknowledge_inject_batch_locked(&mut self.lock(), batch_id)
+    }
+
+    fn acknowledge_inject_batch_locked(
+        inner: &mut InputBrokerRelayInner,
+        batch_id: u64,
+    ) -> Result<(), &'static str> {
         if batch_id == 0 {
             return Ok(());
         }
-        let mut inner = self.lock();
         if inner.last_acked_inject_batch_id == batch_id {
             return Ok(());
         }

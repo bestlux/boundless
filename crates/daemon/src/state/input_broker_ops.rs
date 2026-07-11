@@ -9,6 +9,7 @@ pub struct InputBrokerAttachOutcome {
     pub broker_token: String,
     pub message: String,
     pub protocol_revision: u32,
+    pub delivery_epoch: String,
 }
 
 #[derive(Debug, Default)]
@@ -168,6 +169,7 @@ impl AppState {
                     ipc_api::INPUT_BROKER_PROTOCOL_REVISION
                 ),
                 protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
+                delivery_epoch: String::new(),
             };
         }
         if !self.input_broker.service_session_input() {
@@ -176,6 +178,7 @@ impl AppState {
                 broker_token: String::new(),
                 message: "input broker not required: this daemon owns interactive input in its own session".to_string(),
                 protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
+                delivery_epoch: String::new(),
             };
         }
         if let Some(reason) = self.input_broker_client_rejection(&verified_client) {
@@ -187,6 +190,7 @@ impl AppState {
                     "input broker attach denied ({reason}): the pipe client must be a verified interactive-session process of the allowed desktop user"
                 ),
                 protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
+                delivery_epoch: String::new(),
             };
         }
 
@@ -218,17 +222,16 @@ impl AppState {
                     message: "input broker replacement deferred: authoritative releases could not be queued; retry attach"
                         .to_string(),
                     protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
+                    delivery_epoch: String::new(),
                 };
             }
             self.input_broker.clear_pressed_state();
             self.requeue_broker_clipboard_inflight().await;
         }
-        // Re-attach is also the recovery path after a stale attachment. Keep
-        // daemon-owned delivery exact by returning every unacknowledged batch
-        // even when no live attachment remains to count as `replaced`.
-        let unacked_inject_frames = self.input_broker.take_inflight_inject_frames();
-        self.requeue_pending_inject_input_frames_front(unacked_inject_frames)
-            .await;
+        // Delivery state belongs to the daemon instance, not one broker token.
+        // Preserve the exact in-flight batch ID across replacement/stale
+        // reattach so a surviving tray receipt can acknowledge without
+        // re-injecting an already completed batch.
         self.input_broker.attach(InputBrokerAttachment {
             broker_token: broker_token.clone(),
             lock_supported,
@@ -255,6 +258,7 @@ impl AppState {
             message: "input broker attached for the normal unlocked desktop of the allowed user"
                 .to_string(),
             protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
+            delivery_epoch: self.input_broker.delivery_epoch(),
         }
     }
 
@@ -278,6 +282,8 @@ impl AppState {
         &self,
         verified_client: Option<InputBrokerClientIdentity>,
         broker_token: &str,
+        delivery_epoch: &str,
+        acked_inject_batch_id: u64,
     ) -> bool {
         if let Some(reason) = self.input_broker_client_rejection(&verified_client) {
             self.record_input_broker_rejection("detach", reason).await;
@@ -288,7 +294,17 @@ impl AppState {
         // or detach first so the capture pass observes an empty relay.
         let _capture_transition = self.input_capture_transition.lock().await;
         let capture_target = self.input_capture_target().await;
-        let detached = self.input_broker.detach(broker_token);
+        let detached = match self.input_broker.acknowledge_and_detach(
+            broker_token,
+            delivery_epoch,
+            acked_inject_batch_id,
+        ) {
+            Ok(detached) => detached,
+            Err(reason) => {
+                self.record_input_broker_rejection("detach", reason).await;
+                return false;
+            }
+        };
         if detached {
             let unacked_inject_frames = self.input_broker.take_inflight_inject_frames();
             // The daemon owns delivery until the tray acknowledges a batch.

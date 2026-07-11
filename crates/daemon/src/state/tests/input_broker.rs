@@ -504,12 +504,19 @@ async fn detach_rejects_wrong_user_and_keeps_broker_attached() {
 
     assert!(
         !state
-            .detach_input_broker(verified_client(ADMIN_USER_SID, 2), &attach.broker_token)
+            .detach_input_broker(
+                verified_client(ADMIN_USER_SID, 2),
+                &attach.broker_token,
+                &attach.delivery_epoch,
+                0,
+            )
             .await,
         "non-allowed users must not detach the broker even with the token"
     );
     assert!(
-        !state.detach_input_broker(None, &attach.broker_token).await,
+        !state
+            .detach_input_broker(None, &attach.broker_token, &attach.delivery_epoch, 0)
+            .await,
         "unverified callers must not detach the broker"
     );
     assert!(state.input_broker_route_active());
@@ -526,7 +533,12 @@ async fn detach_rejects_wrong_user_and_keeps_broker_attached() {
 
     assert!(
         state
-            .detach_input_broker(allowed_client(), &attach.broker_token)
+            .detach_input_broker(
+                allowed_client(),
+                &attach.broker_token,
+                &attach.delivery_epoch,
+                0,
+            )
             .await,
         "allowed-user broker must be able to detach itself"
     );
@@ -795,7 +807,12 @@ async fn stale_reject_cleanup_and_reattach_preserve_final_release_ordering() {
     assert!(!stale.accepted);
     assert!(
         state
-            .detach_input_broker(allowed_client(), &first.broker_token)
+            .detach_input_broker(
+                allowed_client(),
+                &first.broker_token,
+                &first.delivery_epoch,
+                0,
+            )
             .await,
         "stale rejection must preserve token identity for authoritative cleanup"
     );
@@ -1163,7 +1180,7 @@ async fn retained_inject_batch_cancellation_replays_until_ack_and_unblocks_later
 }
 
 #[tokio::test]
-async fn stale_reattach_requeues_unacknowledged_inject_batch() {
+async fn stale_reattach_accepts_completed_receipt_without_replaying_inject_batch() {
     let (state, root) = service_mode_broker_state("boundless-broker-stale-inject-test").await;
     let peer_id = join_connected_peer(&state).await;
     let first_attach = state
@@ -1203,17 +1220,192 @@ async fn stale_reattach_requeues_unacknowledged_inject_batch() {
         .attach_input_broker(allowed_client(), "replacement-broker".to_string(), true)
         .await;
     assert!(replacement.accepted);
-    let replayed = state
+    assert_eq!(
+        replacement.delivery_epoch, first_attach.delivery_epoch,
+        "broker sessions in one daemon process must share a delivery epoch"
+    );
+    let recovered = state
+        .exchange_input_broker(
+            allowed_client(),
+            &replacement.broker_token,
+            InputBrokerExchangeObservations {
+                acked_inject_batch_id: dispatched.inject_batch_id,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        recovered.accepted,
+        "same-daemon reattach must retain the exact delivery ID so the surviving receipt remains valid"
+    );
+    assert!(
+        recovered.inject_frames.is_empty(),
+        "a completed same-epoch receipt must be committed before any replay"
+    );
+    assert_eq!(recovered.inject_batch_id, 0);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn detach_acknowledges_completed_inject_batch_before_requeue() {
+    let (state, root) = service_mode_broker_state("boundless-broker-detach-ack-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("claim owner")
+    );
+    state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id.clone(),
+                sequence: 51,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::MouseMove { dx: 5, dy: 0 }],
+            },
+        )
+        .await
+        .expect("route frame");
+    let dispatched = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert_ne!(dispatched.inject_batch_id, 0);
+
+    assert!(
+        state
+            .detach_input_broker(
+                allowed_client(),
+                &attach.broker_token,
+                &attach.delivery_epoch,
+                dispatched.inject_batch_id,
+            )
+            .await,
+        "cooperative detach must commit the tray's completed receipt before considering requeue"
+    );
+
+    let replacement = state
+        .attach_input_broker(allowed_client(), "replacement-broker".to_string(), true)
+        .await;
+    assert!(replacement.accepted);
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("restore owner")
+    );
+    let after_detach = state
         .exchange_input_broker(
             allowed_client(),
             &replacement.broker_token,
             InputBrokerExchangeObservations::default(),
         )
         .await;
-    assert!(replayed.accepted);
-    assert_eq!(replayed.inject_frames.len(), 1);
-    assert_eq!(replayed.inject_frames[0].sequence, 41);
-    assert_ne!(replayed.inject_batch_id, dispatched.inject_batch_id);
+    assert!(after_detach.accepted);
+    assert!(
+        after_detach.inject_frames.is_empty(),
+        "an acknowledged completed batch must not return after detach"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn detach_receipt_with_wrong_epoch_or_batch_id_fails_closed() {
+    let (state, root) = service_mode_broker_state("boundless-broker-detach-receipt-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("claim owner")
+    );
+    state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id.clone(),
+                sequence: 61,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::MouseMove { dx: 6, dy: 0 }],
+            },
+        )
+        .await
+        .expect("route frame");
+    let dispatched = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert_ne!(dispatched.inject_batch_id, 0);
+
+    assert!(
+        !state
+            .detach_input_broker(
+                allowed_client(),
+                &attach.broker_token,
+                "wrong-delivery-epoch",
+                dispatched.inject_batch_id,
+            )
+            .await,
+        "a receipt from another daemon epoch must not detach or acknowledge"
+    );
+    assert!(state.input_broker_route_active());
+    assert_eq!(
+        state
+            .input_broker_relay()
+            .inflight_inject_batch()
+            .map(|batch| batch.batch_id),
+        Some(dispatched.inject_batch_id)
+    );
+
+    assert!(
+        !state
+            .detach_input_broker(
+                allowed_client(),
+                &attach.broker_token,
+                &attach.delivery_epoch,
+                dispatched.inject_batch_id.saturating_add(1),
+            )
+            .await,
+        "an out-of-order receipt must not detach or requeue"
+    );
+    assert!(state.input_broker_route_active());
+    assert_eq!(
+        state
+            .input_broker_relay()
+            .inflight_inject_batch()
+            .map(|batch| batch.batch_id),
+        Some(dispatched.inject_batch_id)
+    );
+
+    assert!(
+        state
+            .detach_input_broker(
+                allowed_client(),
+                &attach.broker_token,
+                &attach.delivery_epoch,
+                dispatched.inject_batch_id,
+            )
+            .await
+    );
+    assert!(!state.input_broker_route_active());
 
     let _ = std::fs::remove_dir_all(root);
 }

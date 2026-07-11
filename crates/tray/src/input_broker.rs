@@ -83,6 +83,7 @@ struct InjectedInputState {
 
 #[derive(Debug, Default)]
 struct BrokerInjectBatchState {
+    delivery_epoch: Option<String>,
     active_batch_id: Option<u64>,
     frames: std::collections::VecDeque<Vec<core_input::InputEvent>>,
     last_completed_batch_id: u64,
@@ -95,6 +96,24 @@ struct BrokerInjectProgress {
 }
 
 impl BrokerInjectBatchState {
+    fn begin_delivery_epoch(&mut self, delivery_epoch: &str) -> Result<()> {
+        if delivery_epoch.is_empty() {
+            bail!("input broker attach omitted the daemon delivery epoch");
+        }
+        if self.delivery_epoch.as_deref() == Some(delivery_epoch) {
+            return Ok(());
+        }
+
+        // A new daemon process can restart batch IDs from one. Receipts and
+        // retained suffixes are meaningful only within the epoch that issued
+        // them, so never acknowledge or apply them against another daemon.
+        self.delivery_epoch = Some(delivery_epoch.to_string());
+        self.active_batch_id = None;
+        self.frames.clear();
+        self.last_completed_batch_id = 0;
+        Ok(())
+    }
+
     fn backpressure_active(&self) -> bool {
         self.active_batch_id.is_some()
     }
@@ -646,8 +665,18 @@ fn input_broker_supervisor_loop(
         }
     };
     runtime.block_on(async move {
+        // A completed delivery receipt must outlive an individual exchange
+        // future/session. That closes the response-loss window between the
+        // final SendInput call and the next exchange acknowledgement.
+        let mut inject_batches = BrokerInjectBatchState::default();
         loop {
-            match run_input_broker_session(&endpoint, shutdown_rx.clone()).await {
+            match run_input_broker_session(
+                &endpoint,
+                shutdown_rx.clone(),
+                &mut inject_batches,
+            )
+            .await
+            {
                 Ok(BrokerSessionEnd::Shutdown) => break,
                 Ok(BrokerSessionEnd::NotNeeded) | Ok(BrokerSessionEnd::Detached) => {}
                 Err(error) => eprintln!("boundless input broker session ended: {error:#}"),
@@ -674,6 +703,7 @@ async fn wait_for_broker_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver
 async fn run_input_broker_session(
     endpoint: &str,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    inject_batches: &mut BrokerInjectBatchState,
 ) -> Result<BrokerSessionEnd> {
     // Fail closed: never broker interactive input from a non-interactive
     // (session 0) process, even if a daemon would accept it.
@@ -724,6 +754,8 @@ async fn run_input_broker_session(
                 INPUT_BROKER_CLEANUP_RPC_TIMEOUT,
                 client.detach_input_broker(InputBrokerDetachRequest {
                     broker_token: stale_token.to_string(),
+                    delivery_epoch: String::new(),
+                    acked_inject_batch_id: 0,
                 }),
             )
             .await;
@@ -734,7 +766,9 @@ async fn run_input_broker_session(
         eprintln!("boundless input broker attach rejected: {}", attach.message);
         return Ok(BrokerSessionEnd::NotNeeded);
     }
+    inject_batches.begin_delivery_epoch(&attach.delivery_epoch)?;
     let broker_token = attach.broker_token;
+    let delivery_epoch = attach.delivery_epoch;
 
     let mut input_client = client.clone();
     let clipboard_task = tokio::spawn(clipboard_broker_supervisor_loop(
@@ -748,6 +782,7 @@ async fn run_input_broker_session(
             &broker_token,
             &mut pump,
             &mut injected_state,
+            inject_batches,
         ) => (result, BrokerSessionEnd::Detached),
         _ = wait_for_broker_shutdown(&mut shutdown_rx) => (Ok(()), BrokerSessionEnd::Shutdown),
     };
@@ -766,13 +801,24 @@ async fn run_input_broker_session(
     // it can forward releases to the captured peer. Authorized detach owns the
     // release-then-clear operation as one server-side lifecycle transition.
     let _ = pump.drain_release_events();
-    let _ = tokio::time::timeout(
-        INPUT_BROKER_CLEANUP_RPC_TIMEOUT,
-        client.detach_input_broker(InputBrokerDetachRequest {
-            broker_token,
-        }),
-    )
-    .await;
+    // A transient exchange failure with an incomplete batch keeps the daemon
+    // attachment/batch intact so this supervisor can reattach to the same
+    // delivery ID and retry only its retained suffix. Cooperative shutdown,
+    // and every cleanup after a completed batch, atomically submit the latest
+    // exact receipt before the daemon considers any unacknowledged requeue.
+    if matches!(session_end, BrokerSessionEnd::Shutdown)
+        || !inject_batches.backpressure_active()
+    {
+        let _ = tokio::time::timeout(
+            INPUT_BROKER_CLEANUP_RPC_TIMEOUT,
+            client.detach_input_broker(InputBrokerDetachRequest {
+                broker_token,
+                delivery_epoch,
+                acked_inject_batch_id: inject_batches.acked_batch_id(),
+            }),
+        )
+        .await;
+    }
 
     loop_result.map(|_| session_end)
 }
@@ -782,13 +828,12 @@ async fn input_broker_exchange_loop(
     broker_token: &str,
     pump: &mut HookInputPump,
     injected_state: &mut InjectedInputState,
+    inject_batches: &mut BrokerInjectBatchState,
 ) -> Result<()> {
     let mut injected_frame_count = 0u32;
     let mut inject_failure_count = 0u32;
     let mut safety_unlock = SafetyUnlockReconciler::default();
     let mut capture_forwarding = BrokerCaptureForwardingGate::default();
-    let mut inject_batches = BrokerInjectBatchState::default();
-
     loop {
         safety_unlock.observe(pump.drain_control_actions());
         let observed_events = pump.poll_events();
@@ -938,6 +983,7 @@ mod input_broker_tests {
             broker_token: "stale-token".to_string(),
             message: String::new(),
             protocol_revision: 0,
+            delivery_epoch: String::new(),
         };
 
         let error = validate_input_broker_attach_revision(&old_daemon_reply)
@@ -950,6 +996,7 @@ mod input_broker_tests {
 
         let current = InputBrokerAttachReply {
             protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
+            delivery_epoch: "daemon-epoch".to_string(),
             ..old_daemon_reply
         };
         validate_input_broker_attach_revision(&current).expect("current daemon revision");
@@ -1040,6 +1087,47 @@ mod input_broker_tests {
             .accept_batch(7, vec![vec![core_input::InputEvent::MouseMove { dx: 1, dy: 0 }]])
             .expect("completed batch replay is deduplicated");
         assert!(!batch.backpressure_active());
+    }
+
+    #[test]
+    fn completed_receipt_survives_same_epoch_reattach_without_reinjection() {
+        let event = core_input::InputEvent::MouseMove { dx: 1, dy: 0 };
+        let mut batch = BrokerInjectBatchState::default();
+        batch
+            .begin_delivery_epoch("daemon-epoch")
+            .expect("begin first broker session");
+        batch
+            .accept_batch(7, vec![vec![event.clone()]])
+            .expect("stage batch");
+        let mut injected = InjectedInputState::new(WindowsNumLockState::new(false));
+        let mut inject_calls = 0;
+        let completed = batch.process_with(&mut injected, |events, state| {
+            inject_calls += 1;
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: events.len(),
+                    remaining_events: Vec::new(),
+                    error: None,
+                },
+            )
+        });
+        assert_eq!(completed.completed_frames, 1);
+        assert_eq!(inject_calls, 1);
+        assert_eq!(batch.acked_batch_id(), 7);
+
+        batch
+            .begin_delivery_epoch("daemon-epoch")
+            .expect("reattach to same daemon epoch");
+        batch
+            .accept_batch(7, vec![vec![event]])
+            .expect("replayed response after lost acknowledgement");
+        let replay = batch.process_with(&mut injected, |_events, _state| {
+            panic!("same-epoch completed delivery must not reach SendInput twice")
+        });
+        assert_eq!(replay, BrokerInjectProgress::default());
+        assert_eq!(batch.acked_batch_id(), 7);
     }
 
     #[test]

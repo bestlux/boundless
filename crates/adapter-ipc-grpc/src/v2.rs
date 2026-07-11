@@ -779,6 +779,7 @@ impl ControlPlaneService for ControlPlaneApi {
             broker_token: reply.broker_token,
             message: reply.message,
             protocol_revision: reply.protocol_revision,
+            delivery_epoch: reply.delivery_epoch,
         }))
     }
 
@@ -898,11 +899,14 @@ impl ControlPlaneService for ControlPlaneApi {
         request: Request<InputBrokerDetachRequest>,
     ) -> Result<Response<OperationReply>, Status> {
         let verified_client = verified_control_client(&request);
+        let request = request.into_inner();
         let reply = self
             .app
             .detach_input_broker(app_commands::InputBrokerDetachCommand {
                 verified_client,
-                broker_token: request.into_inner().broker_token,
+                broker_token: request.broker_token,
+                delivery_epoch: request.delivery_epoch,
+                acked_inject_batch_id: request.acked_inject_batch_id,
             })
             .await
             .map_err(|error| Status::internal(format!("detach input broker: {error:#}")))?;

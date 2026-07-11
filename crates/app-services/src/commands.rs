@@ -218,6 +218,8 @@ pub struct ClipboardBrokerExchangeCommand {
 pub struct InputBrokerDetachCommand {
     pub verified_client: Option<VerifiedControlClient>,
     pub broker_token: String,
+    pub delivery_epoch: String,
+    pub acked_inject_batch_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

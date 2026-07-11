@@ -571,6 +571,7 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             broker_token: outcome.broker_token,
             message: outcome.message,
             protocol_revision: outcome.protocol_revision,
+            delivery_epoch: outcome.delivery_epoch,
         })
     }
 
@@ -684,6 +685,8 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             .detach_input_broker(
                 broker_client_identity(command.verified_client),
                 &command.broker_token,
+                &command.delivery_epoch,
+                command.acked_inject_batch_id,
             )
             .await;
         Ok(OperationReply {

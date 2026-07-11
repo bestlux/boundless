@@ -459,6 +459,7 @@ message InputBrokerAttachReply {
   string broker_token = 2;
   string message = 3;
   uint32 protocol_revision = 4;
+  string delivery_epoch = 5;
 }
 
 message InputBrokerExchangeRequest {
@@ -546,6 +547,8 @@ message ClipboardBrokerExchangeReply {
 
 message InputBrokerDetachRequest {
   string broker_token = 1;
+  string delivery_epoch = 2;
+  uint64 acked_inject_batch_id = 3;
 }
 
 message NearbyPairingCompletionReply {

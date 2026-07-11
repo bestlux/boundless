@@ -62,9 +62,20 @@ Incoming (peer frame -> local injection):
    drops its local remainder, releases any locally held keys/buttons, and
    acknowledges that ID. A batch is otherwise acknowledged only after every
    frame completes.
-4. Cooperative detach, replacement, or stale re-attach returns any
-   unacknowledged, non-cancelled daemon-owned batch to the front of the pending
-   queue; a latched cancellation is never resurrected.
+4. The daemon assigns one random delivery epoch for its in-memory relay and
+   retains an in-flight batch under the same ID across replacement or stale
+   re-attach. The tray keeps completed receipts and partial suffix state across
+   its supervisor sessions, but accepts them only when the new attach reports
+   the same epoch. A lost acknowledgment followed by a transient same-process
+   re-attach therefore acknowledges the repeated ID without another
+   `SendInput` call.
+5. Cooperative detach carries the tray's latest completed batch ID and delivery
+   epoch. Under the capture-transition lock, the daemon validates the broker
+   token and epoch, acknowledges that exact batch, and only then returns any
+   still-unacknowledged, non-cancelled batch to the front of the pending queue;
+   a mismatched receipt fails closed and a latched cancellation is never
+   resurrected. A transient exchange failure with a partial batch leaves the
+   retained ID in place for suffix-only retry by the same tray supervisor.
 
 Clipboard (service mode with broker attached):
 
@@ -136,9 +147,16 @@ Clipboard (service mode with broker attached):
   of latency per direction; a streaming exchange is a candidate follow-up if
   two-PC latency evidence warrants it.
 - Pending and in-flight injection queues are intentionally in-memory. Normal
-  detach/replacement/stale-recovery requeues unacknowledged work, but a hard
-  daemon-process crash is the durability boundary and can lose those frames.
-- Abrupt broker death (kill -9 of the tray) can leave keys held on a remote
-  peer until the release synthesis runs on the next capture-target transition.
+  detach/replacement/stale-recovery preserves or requeues unacknowledged work,
+  but a hard daemon-process crash is the durability boundary and can lose those
+  frames. A safe reset rotates the delivery epoch before accepting new broker
+  receipts.
+- Delivery dedupe is exact only while the tray supervisor process retains its
+  epoch-scoped receipt. A hard tray crash erases that evidence; the daemon
+  deliberately keeps and replays its unacknowledged in-flight batch on the next
+  attach (at-least-once), so input that completed immediately before the crash
+  can be applied twice. Persisting receipts would be required to close that
+  boundary. Abrupt broker death can also leave keys held on a remote peer until
+  release synthesis runs on the next capture-target transition.
 - Real two-PC dogfood evidence is still required before the parity matrix rows
   can move; nothing here upgrades BND-NEXT-9C claims.

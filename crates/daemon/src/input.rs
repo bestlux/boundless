@@ -2475,9 +2475,10 @@ mod tests {
 
         let detach_state = state.clone();
         let broker_token = attach.broker_token.clone();
+        let delivery_epoch = attach.delivery_epoch.clone();
         let mut detach = tokio::spawn(async move {
             detach_state
-                .detach_input_broker(allowed_broker_client(), &broker_token)
+                .detach_input_broker(allowed_broker_client(), &broker_token, &delivery_epoch, 0)
                 .await
         });
         assert!(
