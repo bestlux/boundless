@@ -470,7 +470,7 @@ try {
         Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("input", "capture-stop") | Out-Host
         Wait-ForInputCaptureTarget -Endpoint $node1Endpoint -ExpectedTarget "none" -Seconds $TimeoutSeconds
         $modeEventsOutput = Invoke-CliChecked -Endpoint $node1Endpoint -CommandArgs @("transport", "events", "--limit", "500")
-        if ($modeEventsOutput -notmatch "direction=local kind=input_capture_backend_mode peer_id=none detail=(hook_raw|hook|polling|noop|scripted)") {
+        if (($modeEventsOutput -join "`n") -notmatch "direction=local kind=input_capture_backend_mode peer_id=none detail=(hook_raw|hook|polling|noop|scripted)") {
             Write-Warning "[smoke] input_capture_backend_mode event not observed in current transport event window; continuing"
         }
 
