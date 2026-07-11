@@ -2667,7 +2667,7 @@ function Invoke-ElevatedInstallPhase {
     # The request and status polling are bounded independently. A blocked
     # ServiceController call remains inside an owned child process tree that is
     # drained before this function can return or allow MSI to start.
-    $serviceShutdown = Stop-BoundlessServiceForUpgrade
+    $serviceShutdown = Stop-BoundlessServiceBeforeMsi
     $msiArgs = @{
         ResolvedInstallerPath = $ResolvedInstallerPath
         Sid = $Sid
@@ -3649,16 +3649,20 @@ function Stop-BoundlessServiceForUpgrade {
     $worker = $null
     $stopRequested = $false
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
-    if ($initialStatus -ne "StopPending") {
-        $worker = if ($null -ne $WorkerFactory) {
-            & $WorkerFactory
-        }
-        else {
-            Start-BoundlessServiceControlWorker -Action "stop"
-        }
-        $stopRequested = $true
-    }
     try {
+        if ($initialStatus -ne "StopPending") {
+            # Mark the request as attempted before invoking the worker factory.
+            # If worker creation races with a fast successful stop and then
+            # throws, the pre-MSI recovery boundary must still probe the live
+            # service state rather than assume no mutation occurred.
+            $stopRequested = $true
+            $worker = if ($null -ne $WorkerFactory) {
+                & $WorkerFactory
+            }
+            else {
+                Start-BoundlessServiceControlWorker -Action "stop"
+            }
+        }
         $finalStatus = Wait-BoundlessServiceTransition `
             -DesiredStatus "Stopped" `
             -Worker $worker `
@@ -3677,7 +3681,102 @@ function Stop-BoundlessServiceForUpgrade {
         }
     }
     catch {
-        throw "$($_.Exception.Message) The MSI was not started."
+        $originalError = $_
+        $exception = [InvalidOperationException]::new(
+            "$($originalError.Exception.Message) The MSI was not started.",
+            $originalError.Exception
+        )
+        $exception.Data["BoundlessMsiCompletionState"] = "not_started"
+        $exception.Data["BoundlessServiceStopInitialStatus"] = $initialStatus
+        $exception.Data["BoundlessServiceStopRequested"] = $stopRequested
+        throw $exception
+    }
+}
+
+function Stop-BoundlessServiceBeforeMsi {
+    param(
+        [int]$TimeoutSeconds = 15,
+        [scriptblock]$StatusProbe = $null,
+        [scriptblock]$WorkerFactory = $null,
+        [scriptblock]$RecoveryStatusProbe = $null,
+        [scriptblock]$RecoveryWorkerFactory = $null,
+        [switch]$SkipAdministratorCheck
+    )
+
+    $stopArguments = @{
+        TimeoutSeconds = $TimeoutSeconds
+        StatusProbe = $StatusProbe
+        WorkerFactory = $WorkerFactory
+        SkipAdministratorCheck = $SkipAdministratorCheck
+    }
+    try {
+        return Stop-BoundlessServiceForUpgrade @stopArguments
+    }
+    catch {
+        $originalError = $_
+        $initialStatus = [string]$originalError.Exception.Data[
+            "BoundlessServiceStopInitialStatus"
+        ]
+        $stopRequested = [bool]$originalError.Exception.Data[
+            "BoundlessServiceStopRequested"
+        ]
+        if ($initialStatus -ne "Running" -or -not $stopRequested) {
+            $originalError.Exception.Data["BoundlessServiceRecovery"] = (
+                "start_requested=False;reason=original_service_not_running_or_stop_not_requested"
+            )
+            throw $originalError
+        }
+
+        $effectiveRecoveryProbe = if ($null -ne $RecoveryStatusProbe) {
+            $RecoveryStatusProbe
+        }
+        elseif ($null -ne $StatusProbe) {
+            $StatusProbe
+        }
+        else {
+            { Get-BoundlessServiceStatusBounded -TimeoutSeconds 2 }
+        }
+        try {
+            $recoveryStatus = & $effectiveRecoveryProbe
+        }
+        catch {
+            $originalError.Exception.Data["BoundlessServiceRecoveryError"] = (
+                "Could not establish the post-stop service state: $($_.Exception.Message)"
+            )
+            Write-Warning "BoundlessService recovery after pre-MSI stop failure could not establish service state: $($_.Exception.Message)"
+            throw $originalError
+        }
+
+        if ($recoveryStatus -notin @("Stopped", "StopPending")) {
+            $reason = if ($recoveryStatus -eq "Missing") {
+                "service_missing_or_uninstall_policy"
+            }
+            else {
+                "stop_not_observed"
+            }
+            $originalError.Exception.Data["BoundlessServiceRecovery"] = (
+                "start_requested=False;current_status=$recoveryStatus;reason=$reason"
+            )
+            throw $originalError
+        }
+
+        try {
+            $recoveryArguments = @{
+                TimeoutSeconds = $TimeoutSeconds
+                StatusProbe = $effectiveRecoveryProbe
+                WorkerFactory = $RecoveryWorkerFactory
+                SkipAdministratorCheck = $SkipAdministratorCheck
+            }
+            $recovery = Start-BoundlessServiceAfterFailedInstall @recoveryArguments
+            $originalError.Exception.Data["BoundlessServiceRecovery"] = (
+                "start_requested=$($recovery.start_requested);final_status=$($recovery.final_status)"
+            )
+        }
+        catch {
+            $originalError.Exception.Data["BoundlessServiceRecoveryError"] = $_.Exception.Message
+            Write-Warning "BoundlessService recovery after pre-MSI stop failure also failed: $($_.Exception.Message)"
+        }
+        throw $originalError
     }
 }
 
@@ -3699,10 +3798,27 @@ function Start-BoundlessServiceAfterFailedInstall {
     }
     $initialStatus = & $StatusProbe
     if ($initialStatus -eq "Missing") {
-        throw "BoundlessService was no longer registered after the failed MSI transaction."
+        throw "BoundlessService was no longer registered after the failed install boundary."
     }
     if ($initialStatus -eq "Running") {
         return [pscustomobject]@{ start_requested = $false; final_status = "Running" }
+    }
+    if ($initialStatus -eq "StopPending") {
+        $initialStatus = Wait-BoundlessServiceTransition `
+            -DesiredStatus "Stopped" `
+            -Worker $null `
+            -StatusProbe $StatusProbe `
+            -TimeoutSeconds $TimeoutSeconds `
+            -FailurePrefix "BoundlessService recovery stop settlement"
+    }
+    elseif ($initialStatus -eq "StartPending") {
+        $finalStatus = Wait-BoundlessServiceTransition `
+            -DesiredStatus "Running" `
+            -Worker $null `
+            -StatusProbe $StatusProbe `
+            -TimeoutSeconds $TimeoutSeconds `
+            -FailurePrefix "BoundlessService recovery existing start"
+        return [pscustomobject]@{ start_requested = $false; final_status = $finalStatus }
     }
     $worker = if ($null -ne $WorkerFactory) {
         & $WorkerFactory
@@ -4873,6 +4989,11 @@ function Invoke-BoundlessBlockingServiceStopFixture {
     )
     $childPidPath = Join-Path $fixtureRoot "child.pid"
     $msiInvoked = $false
+    $recoveryState = [pscustomobject]@{
+        service = "Running"
+        status_calls = 0
+        start_requests = 0
+    }
     try {
         New-Item -ItemType Directory -Path $fixtureRoot -Force -ErrorAction Stop | Out-Null
         $pathPayload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($childPidPath))
@@ -4934,6 +5055,160 @@ Start-Sleep -Seconds 30
             $childPid = [int](Get-Content -LiteralPath $childPidPath -Raw)
             if ($null -ne (Get-Process -Id $childPid -ErrorAction SilentlyContinue)) {
                 throw "Blocking service-stop fixture left worker descendant PID $childPid running."
+            }
+        }
+
+        $recoveryError = $null
+        try {
+            Stop-BoundlessServiceBeforeMsi `
+                -TimeoutSeconds 2 `
+                -StatusProbe {
+                    $recoveryState.status_calls += 1
+                    if ($recoveryState.status_calls -eq 1) { return "Running" }
+                    if ($recoveryState.status_calls -eq 2) {
+                        $recoveryState.service = "Stopped"
+                        throw "fixture late service-status failure"
+                    }
+                    return $recoveryState.service
+                } `
+                -WorkerFactory {
+                    $recoveryState.service = "Stopped"
+                    Start-BoundlessServiceControlWorker -Action "stop" -FixtureSource "exit 0"
+                } `
+                -RecoveryWorkerFactory {
+                    $recoveryState.start_requests += 1
+                    $recoveryState.service = "Running"
+                    Start-BoundlessServiceControlWorker -Action "start" -FixtureSource "exit 0"
+                } `
+                -SkipAdministratorCheck | Out-Null
+        }
+        catch {
+            $recoveryError = $_
+        }
+        if (
+            $null -eq $recoveryError -or
+            $recoveryError.Exception.Message -notmatch 'fixture late service-status failure' -or
+            [string]$recoveryError.Exception.Data["BoundlessServiceRecovery"] -notmatch
+                'start_requested=True;final_status=Running' -or
+            $recoveryState.start_requests -ne 1 -or
+            $recoveryState.service -ne "Running"
+        ) {
+            throw "Pre-MSI partial-stop fixture did not restore the originally running service exactly once while preserving the stop error."
+        }
+
+        $pendingState = [pscustomobject]@{
+            service = "Running"
+            status_calls = 0
+            start_requests = 0
+        }
+        $pendingError = $null
+        try {
+            Stop-BoundlessServiceBeforeMsi `
+                -TimeoutSeconds 2 `
+                -StatusProbe {
+                    $pendingState.status_calls += 1
+                    switch ($pendingState.status_calls) {
+                        1 { return "Running" }
+                        2 { throw "fixture post-request polling failure" }
+                        3 { return "StopPending" }
+                        4 { return "StopPending" }
+                        5 {
+                            $pendingState.service = "Stopped"
+                            return "Stopped"
+                        }
+                        default { return $pendingState.service }
+                    }
+                } `
+                -WorkerFactory {
+                    $pendingState.service = "StopPending"
+                    Start-BoundlessServiceControlWorker -Action "stop" -FixtureSource "exit 0"
+                } `
+                -RecoveryWorkerFactory {
+                    $pendingState.start_requests += 1
+                    $pendingState.service = "Running"
+                    Start-BoundlessServiceControlWorker -Action "start" -FixtureSource "exit 0"
+                } `
+                -SkipAdministratorCheck | Out-Null
+        }
+        catch {
+            $pendingError = $_
+        }
+        if (
+            $null -eq $pendingError -or
+            $pendingError.Exception.Message -notmatch 'fixture post-request polling failure' -or
+            $pendingState.start_requests -ne 1 -or
+            $pendingState.service -ne "Running"
+        ) {
+            throw "Pre-MSI StopPending fixture did not settle and restart the originally running service exactly once."
+        }
+
+        foreach ($neverRunningStatus in @("Stopped", "Missing")) {
+            $neverRunningStarts = [pscustomobject]@{ count = 0 }
+            $result = Stop-BoundlessServiceBeforeMsi `
+                -StatusProbe { $neverRunningStatus } `
+                -WorkerFactory { throw "stop worker must not run" } `
+                -RecoveryWorkerFactory {
+                    $neverRunningStarts.count += 1
+                    throw "recovery worker must not run"
+                } `
+                -SkipAdministratorCheck
+            if ($neverRunningStarts.count -ne 0) {
+                throw "Initially $neverRunningStatus service fixture attempted an unsolicited restart."
+            }
+            $expectedInitial = if ($neverRunningStatus -eq "Missing") {
+                "NotInstalled"
+            }
+            else {
+                "Stopped"
+            }
+            if ($result.initial_status -ne $expectedInitial) {
+                throw "Initially $neverRunningStatus service fixture returned malformed shutdown evidence."
+            }
+        }
+
+        foreach ($postFailureStatus in @("Running", "Missing")) {
+            $exclusionState = [pscustomobject]@{
+                status_calls = 0
+                start_requests = 0
+            }
+            $exclusionError = $null
+            try {
+                Stop-BoundlessServiceBeforeMsi `
+                    -TimeoutSeconds 2 `
+                    -StatusProbe {
+                        $exclusionState.status_calls += 1
+                        if ($exclusionState.status_calls -eq 1) { return "Running" }
+                        if ($exclusionState.status_calls -eq 2) {
+                            throw "fixture excluded stop failure"
+                        }
+                        return $postFailureStatus
+                    } `
+                    -WorkerFactory {
+                        Start-BoundlessServiceControlWorker -Action "stop" -FixtureSource "exit 0"
+                    } `
+                    -RecoveryWorkerFactory {
+                        $exclusionState.start_requests += 1
+                        Start-BoundlessServiceControlWorker -Action "start" -FixtureSource "exit 0"
+                    } `
+                    -SkipAdministratorCheck | Out-Null
+            }
+            catch {
+                $exclusionError = $_
+            }
+            $expectedReason = if ($postFailureStatus -eq "Missing") {
+                "service_missing_or_uninstall_policy"
+            }
+            else {
+                "stop_not_observed"
+            }
+            if (
+                $null -eq $exclusionError -or
+                $exclusionError.Exception.Message -notmatch 'fixture excluded stop failure' -or
+                [string]$exclusionError.Exception.Data["BoundlessServiceRecovery"] -notmatch
+                    [regex]::Escape("reason=$expectedReason") -or
+                $exclusionState.start_requests -ne 0
+            ) {
+                throw "Pre-MSI recovery exclusion fixture for $postFailureStatus attempted an unsafe service restart or lost diagnostics."
             }
         }
     }

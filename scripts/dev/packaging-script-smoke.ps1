@@ -200,9 +200,27 @@ $serviceStopSource = Get-PowerShellFunctionSource `
 if (
     $serviceStopSource -match '\$service\.Stop\(\)' -or
     $serviceStopSource -notmatch 'Wait-BoundlessServiceTransition' -or
-    $serviceStopSource -notmatch 'The MSI was not started'
+    $serviceStopSource -notmatch 'The MSI was not started' -or
+    $serviceStopSource -notmatch 'BoundlessServiceStopInitialStatus'
 ) {
     throw "Upgrade service stop must supervise the blocking SCM request outside the installer process."
+}
+$preMsiRecoverySource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Stop-BoundlessServiceBeforeMsi'
+if (
+    $preMsiRecoverySource -notmatch 'original_service_not_running_or_stop_not_requested' -or
+    $preMsiRecoverySource -notmatch 'service_missing_or_uninstall_policy' -or
+    $preMsiRecoverySource -notmatch 'Start-BoundlessServiceAfterFailedInstall' -or
+    $preMsiRecoverySource -notmatch 'BoundlessServiceRecoveryError'
+) {
+    throw "A failed pre-MSI partial service stop must restore only a proven originally-running service."
+}
+$elevatedPhaseSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Invoke-ElevatedInstallPhase'
+if ($elevatedPhaseSource -notmatch 'Stop-BoundlessServiceBeforeMsi') {
+    throw "The elevated install phase must use the bounded pre-MSI service recovery boundary."
 }
 $serviceRecoverySource = Get-PowerShellFunctionSource `
     -Path $installScript `
