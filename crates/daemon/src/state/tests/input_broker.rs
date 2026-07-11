@@ -676,6 +676,47 @@ async fn replacement_attach_queues_final_release_after_prior_captured_down() {
 }
 
 #[tokio::test]
+async fn replacement_attach_fails_open_existing_capture_target() {
+    let (state, root) = service_mode_broker_state("boundless-broker-replace-unlock-test").await;
+    let peer_id = join_connected_peer(&state).await;
+
+    let first = state
+        .attach_input_broker(allowed_client(), "first-broker".to_string(), true)
+        .await;
+    assert!(first.accepted);
+    authorize_broker_capture(&state, &peer_id, &first.broker_token).await;
+    assert_eq!(
+        state.input_capture_target().await.as_deref(),
+        Some(peer_id.as_str())
+    );
+
+    // A replacement process cannot prove whether the previous broker exited
+    // before reporting a local emergency unlock. Treat replacement as a
+    // fail-open boundary instead of letting stale daemon state relock it.
+    let replacement = state
+        .attach_input_broker(allowed_client(), "replacement-broker".to_string(), true)
+        .await;
+    assert!(replacement.accepted);
+    assert!(
+        state.input_capture_target().await.is_none(),
+        "replacement attach must not inherit capture authority from a broker that may have crashed"
+    );
+
+    let first_exchange = state
+        .exchange_input_broker(
+            allowed_client(),
+            &replacement.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert!(first_exchange.accepted);
+    assert!(!first_exchange.capture_active);
+    assert!(!first_exchange.lock_should_be_active);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn replacement_attach_queue_failure_preserves_prior_broker_and_pressed_state() {
     let (state, root) =
         service_mode_broker_state("boundless-broker-replace-queue-failure-test").await;

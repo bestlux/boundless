@@ -230,6 +230,13 @@ impl AppState {
             }
             self.input_broker.clear_pressed_state();
             self.requeue_broker_clipboard_inflight().await;
+            // A replacement broker cannot prove whether the previous tray
+            // process exited before reporting a local emergency unlock. End
+            // the outgoing capture at this process boundary so stale daemon
+            // state can never relock the replacement broker. Inject delivery
+            // receipts and incoming owner state remain daemon-owned below.
+            self.clear_input_capture_target().await;
+            let _ = self.input_broker.set_desired_lock_active(false);
         }
         // Delivery state belongs to the daemon instance, not one broker token.
         // Preserve the exact in-flight batch ID across replacement/stale
