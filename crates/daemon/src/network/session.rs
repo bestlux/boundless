@@ -147,6 +147,27 @@ impl SessionRuntime {
         self.startup_bulk_state == StartupBulkState::Ready
     }
 
+    fn retire_inbound_clipboard_images(
+        &mut self,
+        state: &AppState,
+        peer_id: &str,
+        successor: &'static str,
+    ) {
+        let retired_transfers = self.inbound_clipboard_image_transfers.len();
+        if retired_transfers == 0 {
+            return;
+        }
+        self.inbound_clipboard_image_transfers.clear();
+        state.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "incoming".to_string(),
+            kind: "clipboard_image_superseded".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("payload_type=bmp disposition=superseded reason={successor}"),
+            size_bytes: 0,
+        });
+    }
+
     async fn reconnect_requested_exit(
         &mut self,
         state: &AppState,
@@ -487,6 +508,9 @@ impl SessionRuntime {
                     .await;
             }
             WireMessage::ClipboardText { machine_id, text } => {
+                if machine_id == session.peer_id {
+                    self.retire_inbound_clipboard_images(state, &session.peer_id, "clipboard_text");
+                }
                 handle_clipboard_text_message(
                     state,
                     &session.peer_id,
@@ -497,6 +521,13 @@ impl SessionRuntime {
                 .await;
             }
             WireMessage::ClipboardImage { machine_id, data } => {
+                if machine_id == session.peer_id {
+                    self.retire_inbound_clipboard_images(
+                        state,
+                        &session.peer_id,
+                        "clipboard_image_inline",
+                    );
+                }
                 handle_clipboard_image_message(
                     state,
                     &session.peer_id,
@@ -514,10 +545,7 @@ impl SessionRuntime {
                 ..
             } => {
                 let credit_transfer_id = transfer_id.clone();
-                let transfer_already_present = self
-                    .inbound_clipboard_image_transfers
-                    .contains_key(&credit_transfer_id);
-                handle_clipboard_image_start(
+                let accepted = handle_clipboard_image_start(
                     state,
                     &session.peer_id,
                     session.remote_peer_id(),
@@ -528,11 +556,7 @@ impl SessionRuntime {
                     &mut self.inbound_clipboard_image_transfers,
                 )
                 .await?;
-                if !transfer_already_present
-                    && self
-                        .inbound_clipboard_image_transfers
-                        .contains_key(&credit_transfer_id)
-                {
+                if accepted {
                     send_clipboard_image_chunk_credit(
                         writer,
                         &credit_transfer_id,

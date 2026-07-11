@@ -127,6 +127,7 @@ fn sanitize_clipboard_metadata_token(
                 | "disabled"
                 | "deduped"
                 | "replayed"
+                | "superseded"
                 | "apply_failed"
                 | "unmatched_apply_report"
         ),
@@ -145,6 +146,8 @@ fn sanitize_clipboard_metadata_token(
                 | "chunk_exceeds_total"
                 | "size_mismatch"
                 | "hash_mismatch"
+                | "clipboard_text"
+                | "clipboard_image_inline"
                 | "unknown"
         ),
         "applied" | "metadata_only" => matches!(value, "true" | "false"),
@@ -385,6 +388,14 @@ mod tests {
         assert!(!sanitized.contains(SECRET));
         assert!(!sanitized.contains("expected="));
         assert!(!sanitized.contains("actual="));
+
+        assert_eq!(
+            sanitize_clipboard_event_detail(
+                "clipboard_image_superseded",
+                "payload_type=bmp disposition=superseded reason=clipboard_image_inline",
+            ),
+            "payload_type=bmp disposition=superseded reason=clipboard_image_inline"
+        );
     }
 
     #[test]

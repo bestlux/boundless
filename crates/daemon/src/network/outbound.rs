@@ -1,11 +1,11 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use crate::state::TransportEventRecord;
 use chrono::Utc;
 use core_clipboard::image_hash_hex;
 use peer_transport::{
     CLIPBOARD_IMAGE_CHUNK_BYTES, CLIPBOARD_IMAGE_INLINE_MAX_BYTES, OutboundTransferFlows,
-    consume_outbound_chunk_credit, has_available_outbound_chunk_credit,
+    OutboundTransferKind, consume_outbound_chunk_credit, has_available_outbound_chunk_credit,
     register_outbound_clipboard_transfer_flow, register_outbound_transfer_flow,
     remove_outbound_transfer_flow, restore_outbound_chunk_credits_for_payloads,
 };
@@ -140,12 +140,14 @@ where
         return Ok(());
     };
     let pending = state.drain_outgoing_bulk(peer_id, max_payloads).await;
+    let pending =
+        coalesce_pending_clipboard_payloads(state, peer_id, pending, outbound_transfer_flow).await;
     let mut writer_ctx = OutboundPayloadWriter {
         outbound_transfer_flow,
         writer,
         frame_buffer,
     };
-    flush_pending_payloads_with_buffer(
+    let result = flush_pending_payloads_with_buffer(
         state,
         local_machine_id,
         peer_id,
@@ -153,7 +155,61 @@ where
         pending,
         &mut writer_ctx,
     )
-    .await
+    .await;
+    prune_orphaned_clipboard_transfer_flows(state, peer_id, writer_ctx.outbound_transfer_flow)
+        .await;
+    result
+}
+
+fn outbound_payload_is_clipboard(payload: &OutboundPayload) -> bool {
+    matches!(
+        payload,
+        OutboundPayload::ClipboardText { .. }
+            | OutboundPayload::ClipboardImage { .. }
+            | OutboundPayload::ClipboardImageCursor { .. }
+    )
+}
+
+async fn coalesce_pending_clipboard_payloads(
+    state: &AppState,
+    peer_id: &str,
+    pending: Vec<OutboundPayload>,
+    outbound_transfer_flow: &mut OutboundTransferFlows,
+) -> Vec<OutboundPayload> {
+    let latest_clipboard_index = if state.has_queued_outgoing_clipboard_payload(peer_id).await {
+        None
+    } else {
+        pending.iter().rposition(outbound_payload_is_clipboard)
+    };
+
+    pending
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, payload)| {
+            let keep = !outbound_payload_is_clipboard(&payload)
+                || latest_clipboard_index.is_some_and(|latest| latest == index);
+            if keep {
+                return Some(payload);
+            }
+            if let OutboundPayload::ClipboardImageCursor { transfer_id, .. } = &payload {
+                remove_outbound_transfer_flow(outbound_transfer_flow, transfer_id);
+            }
+            None
+        })
+        .collect()
+}
+
+async fn prune_orphaned_clipboard_transfer_flows(
+    state: &AppState,
+    peer_id: &str,
+    outbound_transfer_flow: &mut OutboundTransferFlows,
+) {
+    let active_cursor_ids: HashSet<String> = state
+        .outgoing_clipboard_image_cursor_transfer_ids(peer_id)
+        .await;
+    outbound_transfer_flow.retain(|transfer_id, flow| {
+        flow.kind != OutboundTransferKind::ClipboardImage || active_cursor_ids.contains(transfer_id)
+    });
 }
 
 async fn flush_pending_payloads_with_buffer<W>(

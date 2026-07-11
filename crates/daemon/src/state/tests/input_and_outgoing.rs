@@ -1454,35 +1454,33 @@ async fn drain_outgoing_bulk_respects_max_payloads() {
         .await
         .expect("join peer");
 
-    state
-        .queue_clipboard_text(&peer_id, "one".to_string())
-        .await
-        .expect("queue one");
-    state
-        .queue_clipboard_text(&peer_id, "two".to_string())
-        .await
-        .expect("queue two");
-    state
-        .queue_clipboard_text(&peer_id, "three".to_string())
-        .await
-        .expect("queue three");
+    for matrix_spec in ["one", "two", "three"] {
+        state
+            .queue_outgoing_bulk_payload(
+                &peer_id,
+                OutboundPayload::LayoutMatrix {
+                    matrix_spec: matrix_spec.to_string(),
+                },
+            )
+            .await;
+    }
 
     let first_batch = state.drain_outgoing_bulk(&peer_id, 2).await;
     assert_eq!(first_batch.len(), 2);
     assert!(matches!(
         first_batch.first(),
-        Some(OutboundPayload::ClipboardText { text }) if text == "one"
+        Some(OutboundPayload::LayoutMatrix { matrix_spec }) if matrix_spec == "one"
     ));
     assert!(matches!(
         first_batch.get(1),
-        Some(OutboundPayload::ClipboardText { text }) if text == "two"
+        Some(OutboundPayload::LayoutMatrix { matrix_spec }) if matrix_spec == "two"
     ));
 
     let second_batch = state.drain_outgoing_bulk(&peer_id, usize::MAX).await;
     assert_eq!(second_batch.len(), 1);
     assert!(matches!(
         second_batch.first(),
-        Some(OutboundPayload::ClipboardText { text }) if text == "three"
+        Some(OutboundPayload::LayoutMatrix { matrix_spec }) if matrix_spec == "three"
     ));
 
     let _ = std::fs::remove_dir_all(&root);

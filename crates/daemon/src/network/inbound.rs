@@ -253,37 +253,10 @@ pub(super) async fn handle_clipboard_image_start(
     total_bytes: u64,
     hash_hex: String,
     inbound_clipboard_transfers: &mut HashMap<String, InboundClipboardImageTransfer>,
-) -> Result<()> {
+) -> Result<bool> {
     if machine_id != authenticated_peer_id {
         warn!("dropping clipboard image start with mismatched authenticated identity");
-        return Ok(());
-    }
-
-    if inbound_clipboard_transfers.len() >= MAX_INBOUND_TRANSFERS_PER_PEER {
-        record_clipboard_image_rejected(
-            state,
-            authenticated_peer_id,
-            "too_many_transfers",
-            ClipboardImageRejectionMetrics::ActiveLimit {
-                active_transfers: inbound_clipboard_transfers.len() as u64,
-                transfer_limit: MAX_INBOUND_TRANSFERS_PER_PEER as u64,
-            },
-            0,
-        )
-        .await;
-        return Ok(());
-    }
-
-    if inbound_clipboard_transfers.contains_key(&transfer_id) {
-        record_clipboard_image_rejected(
-            state,
-            authenticated_peer_id,
-            "duplicate_transfer",
-            ClipboardImageRejectionMetrics::None,
-            0,
-        )
-        .await;
-        return Ok(());
+        return Ok(false);
     }
 
     let max_image_bytes = ClipboardPolicy::default().max_image_bytes as u64;
@@ -299,7 +272,7 @@ pub(super) async fn handle_clipboard_image_start(
             total_bytes,
         )
         .await;
-        return Ok(());
+        return Ok(false);
     }
 
     let Ok(capacity) = usize::try_from(total_bytes) else {
@@ -313,24 +286,37 @@ pub(super) async fn handle_clipboard_image_start(
             total_bytes,
         )
         .await;
-        return Ok(());
+        return Ok(false);
     };
 
-    if let Some(peer_id) = remote_peer_id {
-        inbound_clipboard_transfers.insert(
-            transfer_id.clone(),
-            InboundClipboardImageTransfer {
-                peer_id: peer_id.to_string(),
-                total_bytes,
-                bytes_received: 0,
-                hash_hex,
-                data: Vec::with_capacity(capacity),
-            },
+    let Some(peer_id) = remote_peer_id else {
+        return Ok(false);
+    };
+
+    let retired_transfers = inbound_clipboard_transfers.len();
+    inbound_clipboard_transfers.clear();
+    if retired_transfers > 0 {
+        info!(
+            peer_id = %peer_id,
+            retired_transfers,
+            "retired superseded inbound clipboard image transfers"
         );
-        info!(peer_id = %peer_id, total_bytes, "started inbound clipboard image transfer");
     }
 
-    Ok(())
+    debug_assert!(inbound_clipboard_transfers.len() < MAX_INBOUND_TRANSFERS_PER_PEER);
+    inbound_clipboard_transfers.insert(
+        transfer_id.clone(),
+        InboundClipboardImageTransfer {
+            peer_id: peer_id.to_string(),
+            total_bytes,
+            bytes_received: 0,
+            hash_hex,
+            data: Vec::with_capacity(capacity),
+        },
+    );
+    info!(peer_id = %peer_id, total_bytes, "started inbound clipboard image transfer");
+
+    Ok(true)
 }
 
 pub(super) async fn handle_file_chunk<W>(
@@ -725,10 +711,6 @@ async fn record_transport_transfer_rejected(
 #[derive(Debug, Clone, Copy)]
 enum ClipboardImageRejectionMetrics {
     None,
-    ActiveLimit {
-        active_transfers: u64,
-        transfer_limit: u64,
-    },
     AnnouncedLimit {
         announced_bytes: u64,
         configured_limit_bytes: u64,
@@ -754,10 +736,6 @@ impl ClipboardImageRejectionMetrics {
     fn detail(self, reason: &str) -> String {
         let metadata = match self {
             Self::None => String::new(),
-            Self::ActiveLimit {
-                active_transfers,
-                transfer_limit,
-            } => format!(" active_transfers={active_transfers} transfer_limit={transfer_limit}"),
             Self::AnnouncedLimit {
                 announced_bytes,
                 configured_limit_bytes,

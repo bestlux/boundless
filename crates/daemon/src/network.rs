@@ -1344,6 +1344,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_clipboard_restart_gets_fresh_credit_and_newer_payloads_retire_it() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let (stream, mut remote) = TransportFaultHarness::pair();
+        let session = tokio::spawn(run_authenticated_session(
+            state.clone(),
+            peer_id.clone(),
+            stream,
+            true,
+            None,
+        ));
+        remote
+            .read_until("local hello", |frame| {
+                matches!(frame, WireMessage::Hello { .. })
+            })
+            .await;
+        remote.send_frame(remote_hello(&peer_id)).await;
+        remote
+            .send_frame(WireMessage::HelloAck {
+                machine_id: peer_id.clone(),
+                accepted: true,
+            })
+            .await;
+
+        let image_one = synthetic_bmp_payload(16 * 1024);
+        let transfer_id = "same-id-restart".to_string();
+        let start = WireMessage::ClipboardImageStart {
+            machine_id: peer_id.clone(),
+            transfer_id: transfer_id.clone(),
+            total_bytes: image_one.len() as u64,
+            hash_hex: clipboard_image_hash_hex(&image_one),
+        };
+        remote.send_frame(start.clone()).await;
+        remote
+            .read_until("initial clipboard credit", |frame| {
+                matches!(
+                    frame,
+                    WireMessage::ClipboardImageChunkCredit {
+                        transfer_id: credited,
+                        chunk_credits: 1,
+                    } if credited == &transfer_id
+                )
+            })
+            .await;
+        remote.send_frame(start).await;
+        remote
+            .read_until("same-id restart clipboard credit", |frame| {
+                matches!(
+                    frame,
+                    WireMessage::ClipboardImageChunkCredit {
+                        transfer_id: credited,
+                        chunk_credits: 1,
+                    } if credited == &transfer_id
+                )
+            })
+            .await;
+
+        remote
+            .send_frame(WireMessage::ClipboardText {
+                machine_id: peer_id.clone(),
+                text: "newer-text".to_string(),
+            })
+            .await;
+
+        let transfer_two = "inline-retired-transfer".to_string();
+        remote
+            .send_frame(WireMessage::ClipboardImageStart {
+                machine_id: peer_id.clone(),
+                transfer_id: transfer_two.clone(),
+                total_bytes: image_one.len() as u64,
+                hash_hex: clipboard_image_hash_hex(&image_one),
+            })
+            .await;
+        remote
+            .read_until("post-text clipboard credit barrier", |frame| {
+                matches!(
+                    frame,
+                    WireMessage::ClipboardImageChunkCredit {
+                        transfer_id: credited,
+                        chunk_credits: 1,
+                    } if credited == &transfer_two
+                )
+            })
+            .await;
+        let text = state
+            .dequeue_remote_clipboard_payload()
+            .await
+            .expect("newer text should be queued");
+        assert!(matches!(
+            text.payload,
+            ClipboardPayload::Text(ref value) if value == "newer-text"
+        ));
+        assert!(
+            state.dequeue_remote_clipboard_payload().await.is_none(),
+            "text supersession should queue only the latest payload"
+        );
+        assert!(state.transport_events().await.iter().any(|event| {
+            event.kind == "clipboard_image_superseded"
+                && event.detail == "payload_type=bmp disposition=superseded reason=clipboard_text"
+        }));
+
+        let mut inline_image = minimal_bmp_payload();
+        inline_image[54] = 0x33;
+        remote
+            .send_frame(WireMessage::ClipboardImage {
+                machine_id: peer_id.clone(),
+                data: inline_image.clone(),
+            })
+            .await;
+
+        let barrier_transfer_id = "inline-barrier".to_string();
+        remote
+            .send_frame(WireMessage::ClipboardImageStart {
+                machine_id: peer_id.clone(),
+                transfer_id: barrier_transfer_id.clone(),
+                total_bytes: 64,
+                hash_hex: "barrier-hash".to_string(),
+            })
+            .await;
+        remote
+            .read_until("post-inline clipboard credit barrier", |frame| {
+                matches!(
+                    frame,
+                    WireMessage::ClipboardImageChunkCredit {
+                        transfer_id: credited,
+                        chunk_credits: 1,
+                    } if credited == &barrier_transfer_id
+                )
+            })
+            .await;
+        let inline = state
+            .dequeue_remote_clipboard_payload()
+            .await
+            .expect("newer inline image should be queued");
+        assert!(matches!(
+            inline.payload,
+            ClipboardPayload::Image(ref image) if image == &inline_image
+        ));
+        assert!(
+            state.dequeue_remote_clipboard_payload().await.is_none(),
+            "inline image supersession should queue only the latest payload"
+        );
+        assert!(state.transport_events().await.iter().any(|event| {
+            event.kind == "clipboard_image_superseded"
+                && event.detail
+                    == "payload_type=bmp disposition=superseded reason=clipboard_image_inline"
+        }));
+
+        remote.disconnect().await;
+        session
+            .await
+            .expect("session task joins")
+            .expect("disconnect closes session cleanly");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn authenticated_duplicate_session_is_recorded_and_rejected() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         let (first_stream, mut first_remote) = TransportFaultHarness::pair();
@@ -1552,7 +1708,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_bulk_turn_serializes_five_max_clipboard_text_frames_each_way() {
+    async fn startup_bulk_turn_delivers_latest_max_clipboard_text_each_way() {
         let (state_a, peer_b, root_a) =
             state_with_ordered_peer_for_queue_test("a-machine", "b-machine");
         let (state_b, peer_a, root_b) =
@@ -1613,8 +1769,8 @@ mod tests {
                 while let Some(item) = state_b.dequeue_remote_clipboard_payload().await {
                     received_by_b.push(item);
                 }
-                if received_by_a.len() == 5
-                    && received_by_b.len() == 5
+                if received_by_a.len() == 1
+                    && received_by_b.len() == 1
                     && state_a.pending_inject_input_frame_count().await == 1
                     && state_b.pending_inject_input_frame_count().await == 1
                 {
@@ -1624,19 +1780,19 @@ mod tests {
             }
         })
         .await
-        .expect("deterministic startup bulk turns must drain five max text frames each way");
+        .expect("deterministic startup bulk turns must deliver latest max text each way");
 
         assert!(received_by_a.iter().all(|item| matches!(
             &item.payload,
             ClipboardPayload::Text(text)
                 if text.len() == peer_transport::MAX_CLIPBOARD_TEXT_BYTES
-                    && text.starts_with("b-")
+                    && text.starts_with("b-4-")
         )));
         assert!(received_by_b.iter().all(|item| matches!(
             &item.payload,
             ClipboardPayload::Text(text)
                 if text.len() == peer_transport::MAX_CLIPBOARD_TEXT_BYTES
-                    && text.starts_with("a-")
+                    && text.starts_with("a-4-")
         )));
         assert_eq!(state_a.outgoing_bulk_queue_len(&peer_b).await, 0);
         assert_eq!(state_b.outgoing_bulk_queue_len(&peer_a).await, 0);
@@ -2148,13 +2304,21 @@ mod tests {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
 
         state
-            .queue_clipboard_text(&peer_id, "one".to_string())
-            .await
-            .expect("queue one");
+            .queue_outgoing_bulk_payload(
+                &peer_id,
+                OutboundPayload::LayoutMatrix {
+                    matrix_spec: "one".to_string(),
+                },
+            )
+            .await;
         state
-            .queue_clipboard_text(&peer_id, "two".to_string())
-            .await
-            .expect("queue two");
+            .queue_outgoing_bulk_payload(
+                &peer_id,
+                OutboundPayload::LayoutMatrix {
+                    matrix_spec: "two".to_string(),
+                },
+            )
+            .await;
 
         let mut writer = FailAfterCallsWriter::new(1);
         let _err = flush_outgoing_payloads(
@@ -2171,11 +2335,11 @@ mod tests {
         assert_eq!(queued.len(), 2);
         assert!(matches!(
             queued.first(),
-            Some(OutboundPayload::ClipboardText { text }) if text == "one"
+            Some(OutboundPayload::LayoutMatrix { matrix_spec }) if matrix_spec == "one"
         ));
         assert!(matches!(
             queued.get(1),
-            Some(OutboundPayload::ClipboardText { text }) if text == "two"
+            Some(OutboundPayload::LayoutMatrix { matrix_spec }) if matrix_spec == "two"
         ));
 
         let _ = std::fs::remove_dir_all(root);
@@ -2222,18 +2386,16 @@ mod tests {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         let large = "x".repeat(16 * 1024);
 
-        state
-            .queue_clipboard_text(&peer_id, large.clone())
-            .await
-            .expect("queue one");
-        state
-            .queue_clipboard_text(&peer_id, large.clone())
-            .await
-            .expect("queue two");
-        state
-            .queue_clipboard_text(&peer_id, large)
-            .await
-            .expect("queue three");
+        for suffix in ["one", "two", "three"] {
+            state
+                .queue_outgoing_bulk_payload(
+                    &peer_id,
+                    OutboundPayload::LayoutMatrix {
+                        matrix_spec: format!("{suffix}-{large}"),
+                    },
+                )
+                .await;
+        }
 
         // Oversized lines force direct writes past BufWriter, so this fails on the second payload write.
         let mut writer = FailAfterCallsWriter::new(2);
@@ -2251,15 +2413,15 @@ mod tests {
         assert_eq!(queued.len(), 3);
         assert!(matches!(
             queued.first(),
-            Some(OutboundPayload::ClipboardText { text }) if text.len() == 16 * 1024
+            Some(OutboundPayload::LayoutMatrix { matrix_spec }) if matrix_spec.starts_with("one-")
         ));
         assert!(matches!(
             queued.get(1),
-            Some(OutboundPayload::ClipboardText { text }) if text.len() == 16 * 1024
+            Some(OutboundPayload::LayoutMatrix { matrix_spec }) if matrix_spec.starts_with("two-")
         ));
         assert!(matches!(
             queued.get(2),
-            Some(OutboundPayload::ClipboardText { text }) if text.len() == 16 * 1024
+            Some(OutboundPayload::LayoutMatrix { matrix_spec }) if matrix_spec.starts_with("three-")
         ));
 
         let _ = std::fs::remove_dir_all(root);
@@ -2270,13 +2432,21 @@ mod tests {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
 
         state
-            .queue_clipboard_text(&peer_id, "one".to_string())
-            .await
-            .expect("queue one");
+            .queue_outgoing_bulk_payload(
+                &peer_id,
+                OutboundPayload::LayoutMatrix {
+                    matrix_spec: "one".to_string(),
+                },
+            )
+            .await;
         state
-            .queue_clipboard_text(&peer_id, "two".to_string())
-            .await
-            .expect("queue two");
+            .queue_outgoing_bulk_payload(
+                &peer_id,
+                OutboundPayload::LayoutMatrix {
+                    matrix_spec: "two".to_string(),
+                },
+            )
+            .await;
 
         // Writes succeed; final flush fails deterministically.
         let mut writer = FlushFailWriter::new(1);
@@ -2294,11 +2464,11 @@ mod tests {
         assert_eq!(queued.len(), 2);
         assert!(matches!(
             queued.first(),
-            Some(OutboundPayload::ClipboardText { text }) if text == "one"
+            Some(OutboundPayload::LayoutMatrix { matrix_spec }) if matrix_spec == "one"
         ));
         assert!(matches!(
             queued.get(1),
-            Some(OutboundPayload::ClipboardText { text }) if text == "two"
+            Some(OutboundPayload::LayoutMatrix { matrix_spec }) if matrix_spec == "two"
         ));
 
         let _ = std::fs::remove_dir_all(root);
@@ -2441,6 +2611,241 @@ mod tests {
                 .div_ceil(peer_transport::CLIPBOARD_IMAGE_CHUNK_BYTES),
             "large image should send exactly one frame per credited chunk"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn rapid_direct_clipboard_supersession_completes_latest_and_unblocks_layout() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let oldest_image = synthetic_bmp_payload(32 * 1024);
+        state
+            .queue_clipboard_image(&peer_id, oldest_image.clone())
+            .await
+            .expect("queue initial clipboard image");
+
+        let mut outbound_transfer_flow = HashMap::new();
+        let mut frame_buffer = Vec::new();
+        let mut initial_writer = CaptureWriter::default();
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            usize::MAX,
+            &mut outbound_transfer_flow,
+            &mut initial_writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("start initial clipboard image");
+        let initial_transfer_id = match decode_written_frames(&initial_writer.bytes).as_slice() {
+            [WireMessage::ClipboardImageStart { transfer_id, .. }] => transfer_id.clone(),
+            other => panic!("expected initial clipboard start, got {other:?}"),
+        };
+        assert!(
+            state
+                .has_outgoing_clipboard_image_cursor(&peer_id, &initial_transfer_id)
+                .await
+        );
+
+        let mut inbound_transfers = HashMap::new();
+        assert!(
+            handle_clipboard_image_start(
+                &state,
+                &peer_id,
+                Some(&peer_id),
+                peer_id.clone(),
+                initial_transfer_id.clone(),
+                oldest_image.len() as u64,
+                clipboard_image_hash_hex(&oldest_image),
+                &mut inbound_transfers,
+            )
+            .await
+            .expect("accept initial inbound clipboard start")
+        );
+
+        let mut newest_image = Vec::new();
+        for index in 0..(peer_transport::MAX_INBOUND_TRANSFERS_PER_PEER + 3) {
+            let mut image = synthetic_bmp_payload(32 * 1024 + index);
+            image[54] = index as u8;
+            newest_image = image.clone();
+            state
+                .queue_clipboard_image(&peer_id, image)
+                .await
+                .expect("queue superseding direct clipboard image");
+        }
+        state
+            .queue_outgoing_bulk_payload(
+                &peer_id,
+                OutboundPayload::LayoutMatrix {
+                    matrix_spec: "self,peer".to_string(),
+                },
+            )
+            .await;
+        assert_eq!(
+            state.outgoing_bulk_queue_len(&peer_id).await,
+            2,
+            "one latest image and following layout should remain queued"
+        );
+
+        let mut writer = CaptureWriter::default();
+        super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+            &state,
+            "local",
+            Some(&peer_id),
+            PROTOCOL_CURRENT,
+            usize::MAX,
+            &mut outbound_transfer_flow,
+            &mut writer,
+            &mut frame_buffer,
+        )
+        .await
+        .expect("flush latest clipboard start and following layout");
+        let frames = decode_written_frames(&writer.bytes);
+        let latest_transfer_id = frames
+            .iter()
+            .find_map(|frame| match frame {
+                WireMessage::ClipboardImageStart {
+                    transfer_id,
+                    total_bytes,
+                    ..
+                } if *total_bytes == newest_image.len() as u64 => Some(transfer_id.clone()),
+                _ => None,
+            })
+            .expect("latest clipboard start frame");
+        assert!(frames.iter().any(|frame| matches!(
+            frame,
+            WireMessage::LayoutMatrix { matrix_spec, .. } if matrix_spec == "self,peer"
+        )));
+        assert!(
+            !outbound_transfer_flow.contains_key(&initial_transfer_id),
+            "superseded live cursor flow must be retired"
+        );
+        assert!(
+            handle_clipboard_image_start(
+                &state,
+                &peer_id,
+                Some(&peer_id),
+                peer_id.clone(),
+                latest_transfer_id.clone(),
+                newest_image.len() as u64,
+                clipboard_image_hash_hex(&newest_image),
+                &mut inbound_transfers,
+            )
+            .await
+            .expect("accept latest inbound clipboard start")
+        );
+        assert_eq!(inbound_transfers.len(), 1);
+        assert!(inbound_transfers.contains_key(&latest_transfer_id));
+
+        while state.outgoing_bulk_queue_len(&peer_id).await > 0 {
+            peer_transport::apply_outbound_chunk_credits(
+                &mut outbound_transfer_flow,
+                &latest_transfer_id,
+                1,
+            )
+            .expect("credit latest clipboard transfer");
+            let frame_offset = writer.bytes.len();
+            super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+                &state,
+                "local",
+                Some(&peer_id),
+                PROTOCOL_CURRENT,
+                usize::MAX,
+                &mut outbound_transfer_flow,
+                &mut writer,
+                &mut frame_buffer,
+            )
+            .await
+            .expect("flush latest clipboard chunk");
+            for frame in decode_written_frames(&writer.bytes[frame_offset..]) {
+                match frame {
+                    WireMessage::ClipboardImageChunk { transfer_id, data } => {
+                        handle_clipboard_image_chunk(
+                            &state,
+                            transfer_id,
+                            data,
+                            &mut inbound_transfers,
+                        )
+                        .await
+                        .expect("accept latest clipboard chunk");
+                    }
+                    WireMessage::ClipboardImageEnd { transfer_id } => {
+                        handle_clipboard_image_end(&state, transfer_id, &mut inbound_transfers)
+                            .await
+                            .expect("complete latest clipboard image");
+                    }
+                    other => panic!("unexpected credited clipboard frame: {other:?}"),
+                }
+            }
+        }
+
+        let received = state
+            .dequeue_remote_clipboard_payload()
+            .await
+            .expect("latest clipboard image should complete");
+        assert!(matches!(
+            received.payload,
+            ClipboardPayload::Image(image) if image == newest_image
+        ));
+        assert!(inbound_transfers.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn inbound_clipboard_start_is_latest_wins_beyond_transfer_cap_and_same_id_restart() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let mut inbound_transfers = HashMap::new();
+        let total_starts = peer_transport::MAX_INBOUND_TRANSFERS_PER_PEER + 3;
+
+        for index in 0..total_starts {
+            let transfer_id = format!("clip-{index}");
+            assert!(
+                handle_clipboard_image_start(
+                    &state,
+                    &peer_id,
+                    Some(&peer_id),
+                    peer_id.clone(),
+                    transfer_id.clone(),
+                    64,
+                    format!("hash-{index}"),
+                    &mut inbound_transfers,
+                )
+                .await
+                .expect("accept superseding clipboard start")
+            );
+            assert_eq!(inbound_transfers.len(), 1);
+            assert!(inbound_transfers.contains_key(&transfer_id));
+        }
+
+        let latest_transfer_id = format!("clip-{}", total_starts - 1);
+        let latest = inbound_transfers
+            .get_mut(&latest_transfer_id)
+            .expect("latest transfer retained");
+        latest.bytes_received = 1;
+        latest.data.push(7);
+        assert!(
+            handle_clipboard_image_start(
+                &state,
+                &peer_id,
+                Some(&peer_id),
+                peer_id.clone(),
+                latest_transfer_id.clone(),
+                96,
+                "replacement-hash".to_string(),
+                &mut inbound_transfers,
+            )
+            .await
+            .expect("accept same-id clipboard restart")
+        );
+        let restarted = inbound_transfers
+            .get(&latest_transfer_id)
+            .expect("same-id restart retained");
+        assert_eq!(restarted.total_bytes, 96);
+        assert_eq!(restarted.bytes_received, 0);
+        assert!(restarted.data.is_empty());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3695,6 +4100,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn inbound_clipboard_image_logs_omit_attacker_transfer_identifiers() {
+        use tracing::instrument::WithSubscriber;
+
         const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_clipboard_log_6d78c298";
         let capture = TestLogCapture::default();
         let subscriber = tracing_subscriber::fmt()
@@ -3702,48 +4109,58 @@ mod tests {
             .without_time()
             .with_writer(capture.clone())
             .finish();
-        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let dispatch = tracing::Dispatch::new(subscriber);
 
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         let mut inbound_transfers = HashMap::new();
-        handle_clipboard_image_start(
-            &state,
-            &peer_id,
-            Some(&peer_id),
-            SECRET.to_string(),
-            SECRET.to_string(),
-            1,
-            SECRET.to_string(),
-            &mut inbound_transfers,
-        )
-        .await
-        .expect("drop mismatched identity start");
-        handle_clipboard_image_chunk(&state, SECRET.to_string(), vec![0], &mut inbound_transfers)
+        async {
+            tracing::callsite::rebuild_interest_cache();
+            handle_clipboard_image_start(
+                &state,
+                &peer_id,
+                Some(&peer_id),
+                SECRET.to_string(),
+                SECRET.to_string(),
+                1,
+                SECRET.to_string(),
+                &mut inbound_transfers,
+            )
+            .await
+            .expect("drop mismatched identity start");
+            handle_clipboard_image_chunk(
+                &state,
+                SECRET.to_string(),
+                vec![0],
+                &mut inbound_transfers,
+            )
             .await
             .expect("drop unknown chunk");
-        handle_clipboard_image_end(&state, SECRET.to_string(), &mut inbound_transfers)
-            .await
-            .expect("drop unknown end");
+            handle_clipboard_image_end(&state, SECRET.to_string(), &mut inbound_transfers)
+                .await
+                .expect("drop unknown end");
 
-        let image = minimal_bmp_payload();
-        handle_clipboard_image_start(
-            &state,
-            &peer_id,
-            Some(&peer_id),
-            peer_id.clone(),
-            SECRET.to_string(),
-            image.len() as u64,
-            payload_hash_hex(&ClipboardPayload::Image(image.clone())),
-            &mut inbound_transfers,
-        )
-        .await
-        .expect("start valid transfer with attacker identifier");
-        handle_clipboard_image_chunk(&state, SECRET.to_string(), image, &mut inbound_transfers)
+            let image = minimal_bmp_payload();
+            handle_clipboard_image_start(
+                &state,
+                &peer_id,
+                Some(&peer_id),
+                peer_id.clone(),
+                SECRET.to_string(),
+                image.len() as u64,
+                payload_hash_hex(&ClipboardPayload::Image(image.clone())),
+                &mut inbound_transfers,
+            )
             .await
-            .expect("append valid transfer");
-        handle_clipboard_image_end(&state, SECRET.to_string(), &mut inbound_transfers)
-            .await
-            .expect("complete valid transfer");
+            .expect("start valid transfer with attacker identifier");
+            handle_clipboard_image_chunk(&state, SECRET.to_string(), image, &mut inbound_transfers)
+                .await
+                .expect("append valid transfer");
+            handle_clipboard_image_end(&state, SECRET.to_string(), &mut inbound_transfers)
+                .await
+                .expect("complete valid transfer");
+        }
+        .with_subscriber(dispatch)
+        .await;
 
         let rendered = capture.rendered();
         assert!(rendered.contains("dropping clipboard image start"));
