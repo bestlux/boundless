@@ -1270,6 +1270,48 @@ function New-BoundlessTrayOwnerMutexSecurity {
     return $security
 }
 
+function Test-BoundlessTrayOwnerMutexSecurity {
+    param(
+        [Security.AccessControl.MutexSecurity]$Security,
+        [string]$UserSid
+    )
+
+    Assert-AllowedUserSid -Sid $UserSid
+    if (-not $Security.AreAccessRulesProtected) {
+        return $false
+    }
+    $rules = @(
+        $Security.GetAccessRules(
+            $true,
+            $false,
+            [Security.Principal.SecurityIdentifier]
+        )
+    )
+    $expectedSids = @(
+        "S-1-5-18",
+        "S-1-5-32-544",
+        $UserSid
+    ) | Select-Object -Unique
+    $genericAll = [uint32]0x10000000
+    $mutexFullControl = [uint32][Security.AccessControl.MutexRights]::FullControl
+    foreach ($expectedSid in $expectedSids) {
+        $matchingRule = $rules | Where-Object {
+            $rights = [uint32]$_.MutexRights
+            $_.IdentityReference.Value -eq $expectedSid -and
+                $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+                -not $_.IsInherited -and
+                (
+                    ($rights -band $genericAll) -eq $genericAll -or
+                    ($rights -band $mutexFullControl) -eq $mutexFullControl
+                )
+        } | Select-Object -First 1
+        if ($null -eq $matchingRule) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function New-BoundlessNamedMutex {
     param(
         [string]$Name,
@@ -9065,15 +9107,26 @@ public static class BoundlessInstallNativeMethods
     }
 
     $mutexSecurity = New-BoundlessTrayOwnerMutexSecurity -UserSid $currentIdentitySid
-    $mutexSddl = $mutexSecurity.GetSecurityDescriptorSddlForm(
-        [Security.AccessControl.AccessControlSections]::All
-    )
-    if (
-        $mutexSddl -notmatch '\(A;;GA;;;SY\)' -or
-        $mutexSddl -notmatch '\(A;;GA;;;BA\)' -or
-        $mutexSddl -notmatch [regex]::Escape("(A;;GA;;;$currentIdentitySid)")
-    ) {
+    if (-not (Test-BoundlessTrayOwnerMutexSecurity `
+        -Security $mutexSecurity `
+        -UserSid $currentIdentitySid)) {
         throw "Tray quiescence mutex fixture did not preserve its ownership DACL."
+    }
+    $accountAdministratorMutexFixture = "skipped"
+    $accountDomainSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.AccountDomainSid
+    if ($null -ne $accountDomainSid) {
+        $accountAdministratorSid = [Security.Principal.SecurityIdentifier]::new(
+            [Security.Principal.WellKnownSidType]::AccountAdministratorSid,
+            $accountDomainSid
+        ).Value
+        $accountAdministratorSecurity = New-BoundlessTrayOwnerMutexSecurity `
+            -UserSid $accountAdministratorSid
+        if (-not (Test-BoundlessTrayOwnerMutexSecurity `
+            -Security $accountAdministratorSecurity `
+            -UserSid $accountAdministratorSid)) {
+            throw "Tray quiescence mutex fixture did not preserve an account-administrator DACL."
+        }
+        $accountAdministratorMutexFixture = "passed"
     }
     $selectedSidMutexName = Get-BoundlessTrayOwnerMutexName -UserSid $validSid -SessionId 7
     if ($selectedSidMutexName -ne "Local\Boundless.Tray.SingleInstance.v1.$validSid.7.Owner") {
@@ -9438,6 +9491,7 @@ public static class BoundlessInstallNativeMethods
         legacy_quit_bridge_fixture = "passed"
         direct_shutdown_signal_fixture = "passed"
         tray_quiescence_lease_fixture = "passed"
+        account_administrator_mutex_dacl_fixture = $accountAdministratorMutexFixture
         tray_quiescence_monitor_fixture = "passed"
         replacement_tray_window_fixture = "passed"
         supervised_installer_cancellation_fixture = "passed"

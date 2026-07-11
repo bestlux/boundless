@@ -148,6 +148,7 @@ foreach ($requiredInstallContract in @(
         'recovery_action_fence_fixture',
         'recovery_authority_drain_failure_fixture',
         'native_type_upgrade_compatibility_fixture',
+        'account_administrator_mutex_dacl_fixture',
         'Start-BoundlessTrayQuiescenceSentinelOwner',
         'ElevatedInstallCoordinatorProcessId',
         'Get-BoundlessServiceStatusBounded',
@@ -162,6 +163,16 @@ foreach ($requiredInstallContract in @(
 }
 if ($installScriptText -notmatch 'ExpectedOwnerSid\s*=\s*\$selection\.sid') {
     throw "Boundless-Install.ps1 must key tray quiescence to the selected desktop SID."
+}
+$mutexSecuritySource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Test-BoundlessTrayOwnerMutexSecurity'
+if (
+    $mutexSecuritySource -notmatch 'GetAccessRules' -or
+    $mutexSecuritySource -notmatch 'AreAccessRulesProtected' -or
+    $mutexSecuritySource -match 'GetSecurityDescriptorSddlForm'
+) {
+    throw "Tray owner mutex validation must compare protected semantic access rules, not serialized SDDL aliases."
 }
 $stopTraySource = Get-PowerShellFunctionSource `
     -Path $installScript `
