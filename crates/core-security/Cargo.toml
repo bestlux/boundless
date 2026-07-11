@@ -1,6 +1,6 @@
 [package]
 name = "core-security"
-version = "5.0.13"
+version = "5.0.14"
 edition.workspace = true
 license.workspace = true
 

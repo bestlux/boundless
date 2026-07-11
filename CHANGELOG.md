@@ -1,5 +1,53 @@
 # Changelog
 
+## [5.0.14](https://github.com/bestlux/boundless/compare/v5.0.13...v5.0.14) (2026-07-11)
+
+
+### Bug Fixes
+
+* **ci:** inspect inherited kernel ACL rules ([b8c9086](https://github.com/bestlux/boundless/commit/b8c9086b9afc93a088ecc09dda5856c6d6608bf5))
+* **ci:** make kernel ACL probe token-aware ([e929a93](https://github.com/bestlux/boundless/commit/e929a93691fb5dc495420fb801ca5474304c8734))
+* **ci:** validate mutex dacl semantically ([4390cdd](https://github.com/bestlux/boundless/commit/4390cdd01b5dca35fa6bdbaf924fdeb12799069f))
+* harden Windows input and upgrade lifecycle ([6eef42c](https://github.com/bestlux/boundless/commit/6eef42c8fbcd9a8ddf3125ac66ff8ead34024266))
+* **input:** detect emergency unlock with raw keyboard ([57dd527](https://github.com/bestlux/boundless/commit/57dd5273ffb26845684a17001e73a1473d652ea1))
+* **input:** fail open on broker replacement ([baf6a62](https://github.com/bestlux/boundless/commit/baf6a6267c47c196f70439ccfe6844a74480af2e))
+* **input:** harden broker authority recovery ([f80f808](https://github.com/bestlux/boundless/commit/f80f8084859667664a7f8c8d7aa5a13b0055ed04))
+* **input:** harden broker delivery and safety state ([ac61ad1](https://github.com/bestlux/boundless/commit/ac61ad1b02481a87366ec989e750ce75ba21fb26))
+* **input:** harden emergency unlock detector ([f180a81](https://github.com/bestlux/boundless/commit/f180a8138cd470d01639cb8453740fd36eb34e0a))
+* **input:** harden fail-open broker handshake ([cfc7161](https://github.com/bestlux/boundless/commit/cfc7161efdd07927da6b6bb4eca54afbd40ada19))
+* **input:** harden num lock injection recovery ([049eafa](https://github.com/bestlux/boundless/commit/049eafa1d46887def4a76d5becbb0c0c91dbdd08))
+* **input:** persist broker delivery receipts across reattach ([fe4e05a](https://github.com/bestlux/boundless/commit/fe4e05a0dfe5b0de294222c48b9cec50e162f06c))
+* **input:** persist num lock state across frames ([ffb4a51](https://github.com/bestlux/boundless/commit/ffb4a51bb8da8f733663b44f8553e151ac51bc8a))
+* **input:** preserve fail-open reconciliation ([7207252](https://github.com/bestlux/boundless/commit/72072522f44f8fb94f6d92debaf908a8233b704f))
+* **input:** preserve held state across broker recovery ([9d4a53d](https://github.com/bestlux/boundless/commit/9d4a53daf98084b1c289310a2b617fab1dea8528))
+* **input:** preserve numpad semantics across peers ([c7b346a](https://github.com/bestlux/boundless/commit/c7b346aa56de248ed1ec67cb87e20f8f9dba6c33))
+* **input:** preserve safety unlock across broker sessions ([28d3936](https://github.com/bestlux/boundless/commit/28d39361eb659dc11e7e663516ff43c9b331c909))
+* **input:** project keypad modifiers across num lock state ([92967fe](https://github.com/bestlux/boundless/commit/92967fedf53c850bde168ed2efe5c6ecbdf39e2f))
+* **input:** restore held state before partial reattach retry ([b47a5af](https://github.com/bestlux/boundless/commit/b47a5aff1f4205b6ea0e18e0d48960de4c12e33c))
+* **input:** revalidate broker retries before injection ([41b437c](https://github.com/bestlux/boundless/commit/41b437c4996ac06e532a546abfac4695b1a5633a))
+* **input:** separate capture state and retry progress ([e086e5c](https://github.com/bestlux/boundless/commit/e086e5c7ac0a35d018e0ce276c39e23b892c7bbf))
+* **installer:** bound deferred service recovery ([d1f7bd6](https://github.com/bestlux/boundless/commit/d1f7bd607a50b06af630229ff77f1783f3284690))
+* **installer:** bound hard-kill recovery ([b47f2f0](https://github.com/bestlux/boundless/commit/b47f2f09907807e6692a0a22ccaa3ef8823dadee))
+* **installer:** close integration security gaps ([64f4700](https://github.com/bestlux/boundless/commit/64f4700876ccb3b87aa370eb2b81f9373465453b))
+* **installer:** close upgrade hardening gaps ([36cbb60](https://github.com/bestlux/boundless/commit/36cbb6018890158a908be40db685db28ab97c6f1))
+* **installer:** fence privileged service recovery ([f2781ec](https://github.com/bestlux/boundless/commit/f2781ecc36560906d7403d902fdefa1c8e20dbd4))
+* **installer:** harden elevated upgrade handoff ([0d79580](https://github.com/bestlux/boundless/commit/0d7958068235c02f97f2ad5f28efe53fd5e2ca21))
+* **installer:** prevent upgrade shutdown loops ([5a0be2b](https://github.com/bestlux/boundless/commit/5a0be2bbd05967324d21f84a609358c535a1a23d))
+* **installer:** recover after forced cancellation ([08e49bc](https://github.com/bestlux/boundless/commit/08e49bcddb39bd29f9f4b26541f7a78a2a4748c9))
+* **installer:** restore service after preflight failure ([681424f](https://github.com/bestlux/boundless/commit/681424fd8bad44472568ef230f3662341bae9204))
+* **installer:** retain quiescence through uncertain transactions ([1284adc](https://github.com/bestlux/boundless/commit/1284adc11cc0f0be760566d89a14395643ac67b8))
+* **installer:** revoke privileged recovery children ([852cc7a](https://github.com/bestlux/boundless/commit/852cc7ada9d89d88f5a02e3814a779568a02ac9d))
+* **installer:** secure upgrade quiescence boundary ([bc0c69d](https://github.com/bestlux/boundless/commit/bc0c69daa6f2757760d27a2847067acc94ce47cf))
+* **installer:** supervise upgrade process trees ([cdd3c35](https://github.com/bestlux/boundless/commit/cdd3c35b9c0fa5749f5a6dfeba95d9ece0bc911a))
+* **network:** bound startup replay and session egress ([2b766ee](https://github.com/bestlux/boundless/commit/2b766eea337d99789c4a61e62e138af2a99fa59e))
+* **network:** converge competing transport sessions ([6b0aa59](https://github.com/bestlux/boundless/commit/6b0aa59c261c3c5351915d0755d6b2083a2d2de4))
+* **network:** make clipboard replay latest wins ([b1d15a1](https://github.com/bestlux/boundless/commit/b1d15a11ddf3b7c980900eb1314c3a204e551640))
+* **network:** preserve active session payloads ([cb48c2b](https://github.com/bestlux/boundless/commit/cb48c2b8e989cee6c6b3f3a1b7e16269fd2abac7))
+* **test:** add guarded lock key semantics ([a59c16d](https://github.com/bestlux/boundless/commit/a59c16d234b0a389bc2a140f54f23c4919a90796))
+* **test:** use keyboard state for num lock injection ([b50f206](https://github.com/bestlux/boundless/commit/b50f206b3948a691a2230b5dd2d3fd63602ba7d4))
+* **windows:** close input and tray handoff races ([c6d6f59](https://github.com/bestlux/boundless/commit/c6d6f596f5c3a7659a345fe1a2217775480a2e27))
+* **windows:** preserve keypad and tray handoff identity ([e545de7](https://github.com/bestlux/boundless/commit/e545de7aa31c4738775e729152c8743940d93415))
+
 ## [5.0.13](https://github.com/bestlux/boundless/compare/v5.0.12...v5.0.13) (2026-07-10)
 
 
