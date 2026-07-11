@@ -49,7 +49,7 @@ This patch train fixes the three regressions found during installed v5.0.13 dogf
 | BND-NEXT-38 | code complete; needs installed evidence | 57dd527, f180a81, 7207252, cfc7161, ac61ad1, 41b437c | Raw Input is authoritative for the Double-Control detector, hook loss and broker stalls fail open, and input ownership is acknowledged before local lock. Test both Control keys with PowerToys on/off, stalled/unavailable IPC, forced tray loss, and a successful next handoff. |
 | BND-NEXT-40 | code complete; needs physical evidence | c7b346a, ffb4a51, 049eafa, a59c16d, b50f206, e086e5c | Key semantics and source logical Num Lock now survive broker, protocol 4.3, wire, and Windows injection. Run the opposite-Num-Lock matrix both directions, including digits, decimal, Enter, divide, navigation, toggle, hold/repeat, and release. |
 | BND-NEXT-41 | code complete; needs installed/UAC evidence | 5a0be2b, 0d79580, 36cbb60, bc0c69d, 64f4700 | The helper owns a bounded per-user/session quiescence path, protects elevated staging and log handoff, supervises tray and installer liveness, and leaves MSI as the service-stop owner. Prove a normal-user 5.0.13→5.0.14 upgrade with one UAC prompt, no Restart Manager loop, bounded timing, and healthy postconditions on both PCs. |
-| BND-NEXT-42 | code complete; needs installed asymmetric evidence | 6b0aa59 | Simultaneous trusted connections now converge on one deterministic physical session, a sole-reachable reverse session remains valid, and stale teardown cannot publish a false disconnect. Four extended local two-node smokes passed across both initiation orientations; repeat connection, first input, clipboard, and reconnect on the routed dogfood pair. |
+| BND-NEXT-42 | code complete; needs installed asymmetric evidence | 6b0aa59, cb48c2b | Simultaneous trusted connections now converge on one deterministic physical session, a sole-reachable reverse session remains valid, and stale teardown or a delayed failed dial cannot publish a false disconnect. Four extended local two-node smokes plus a post-review reverse-orientation smoke passed; repeat connection, first input, clipboard, and reconnect on the routed dogfood pair. |
 | BND-NEXT-31 | code complete for graceful Quit path; needs installed evidence | 5a0be2b, 0d79580, bc0c69d, 64f4700 | The true Quit signal now fails open and exits the broker before process shutdown. Run active-capture Quit/relaunch, upgrade-while-running, process-count, first post-relaunch handoff, and emergency escape on installed hardware. |
 | BND-NEXT-29 item 3 | code complete; needs same-version install evidence | 5a0be2b | WiX now allows same-version upgrades and packaging smoke enforces the contract. Prove a same-version helper rebuild replaces the installed payload instead of silently no-oping. |
 
@@ -164,7 +164,7 @@ BND-NEXT-23 owns bounded SCM stop, BND-NEXT-31 owns tray/broker lifecycle, and B
 
 **Category:** bug
 
-Status: found during the v5.0.14 release gate and fixed in `6b0aa59`. Deterministic state-machine, reverse-session, replacement-teardown, and queue-delivery tests pass, as do four extended local two-node smokes split across both connection orientations. The routed CODY-PC/CODY-ELITEBOOK pair remains the installed proof boundary.
+Status: found during the v5.0.14 release gate and fixed in `6b0aa59`/`cb48c2b`. Deterministic state-machine, reverse-session, replacement-teardown, stale-dial, and queue-delivery tests pass, as do four extended local two-node smokes split across both connection orientations plus a post-review reverse-orientation run. The routed CODY-PC/CODY-ELITEBOOK pair remains the installed proof boundary.
 
 ### Context and evidence
 
@@ -175,8 +175,10 @@ The transport registry previously let the first authenticated connection win ind
 ### Scope
 
 - Derive the same preferred physical connection on both peers when direct and reverse sessions race, while accepting a nonpreferred reverse session when it is the only reachable route.
-- Preserve the outbound worker registration ID as its authenticated ownership ID so replacement targets the exact displaced task.
+- Preserve the outbound worker registration ID as its authenticated ownership ID so ownership, explicit reset, and shutdown target the exact task.
 - Serialize claim and close transitions; only the still-current owner may clear the registry claim and publish `connected=false`.
+- Replace sessions through cooperative cancellation so an in-progress flush can finish or requeue drained input/clipboard/file payloads; reserve hard abort for explicit reset and shutdown.
+- Serialize stale outbound-failure disposition with claims so a dial that began earlier cannot clear a reverse session that became active while it was in flight.
 - Keep input, clipboard, and file queues peer-owned rather than direction-owned so either initiation orientation remains fully bidirectional.
 - Preserve bounded failure snapshots for the session, peer, owner, and retained transport-event state when a smoke assertion fails.
 
@@ -185,6 +187,7 @@ The transport registry previously let the first authenticated connection win ind
 - Crossed two-connection permutations converge on the same preferred session at both endpoints without livelock or duplicate delivery.
 - A sole-reachable reverse session negotiates and carries input in both directions; deterministic preference must not break asymmetric LAN routing.
 - Delayed teardown from a superseded session cannot clear the replacement owner or publish a stale disconnected state.
+- A delayed failed outbound attempt cannot clear an active reverse owner, capture target, input authorization, or peer-connected state.
 - After convergence, input, text/image clipboard, file transfer, and forced reconnect complete without reset and without an output queue remaining stranded.
 - Extended local smoke passes repeatedly in both initiation orientations, followed by an installed two-PC run on the known asymmetric topology.
 
