@@ -178,12 +178,18 @@ if (
 $kernelObjectAclSource = Get-PowerShellFunctionSource `
     -Path $installScript `
     -Name 'Invoke-BoundlessKernelObjectAclFixture'
+$kernelObjectSecuritySource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Test-BoundlessProtectedKernelObjectSecurity'
 if (
     $kernelObjectAclSource -notmatch 'Test-BoundlessProtectedKernelObjectSecurity' -or
     $kernelObjectAclSource -notmatch 'currentTokenCanUsePrivilegedAcl' -or
     $kernelObjectAclSource -notmatch 'negativeMutationProbeRequired = -not' -or
     $kernelObjectAclSource -notmatch 'ChangePermissions' -or
-    $kernelObjectAclSource -notmatch 'Synchronize'
+    $kernelObjectAclSource -notmatch 'Synchronize' -or
+    $kernelObjectAclSource -notmatch 'inherited Everyone full control' -or
+    $kernelObjectSecuritySource -notmatch '(?s)GetAccessRules\(\s*\$true,\s*\$true,' -or
+    $kernelObjectSecuritySource -notmatch 'IsInherited'
 ) {
     throw "Kernel-object ACL fixtures must always verify semantic rules and retain a real non-admin mutation probe."
 }

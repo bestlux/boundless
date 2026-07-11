@@ -1283,7 +1283,7 @@ function Test-BoundlessTrayOwnerMutexSecurity {
     $rules = @(
         $Security.GetAccessRules(
             $true,
-            $false,
+            $true,
             [Security.Principal.SecurityIdentifier]
         )
     )
@@ -1324,7 +1324,7 @@ function Test-BoundlessProtectedKernelObjectSecurity {
     $rules = @(
         $Security.GetAccessRules(
             $true,
-            $false,
+            $true,
             [Security.Principal.SecurityIdentifier]
         )
     )
@@ -7288,6 +7288,16 @@ function Invoke-BoundlessKernelObjectAclFixture {
         $observableRules = @($privilegedRules) + @(
             [pscustomobject]@{ sid = $UserSid; rights = $synchronize }
         )
+        $poisonSecurity = [Security.AccessControl.EventWaitHandleSecurity]::new()
+        $poisonSecurity.SetSecurityDescriptorSddlForm(
+            "D:P(A;;RC;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)" +
+            "(A;;0x00100000;;;$UserSid)(A;ID;GA;;;WD)"
+        )
+        if (Test-BoundlessProtectedKernelObjectSecurity `
+            -Security $poisonSecurity `
+            -ExpectedRules $observableRules) {
+            throw "Installer kernel-object ACL fixture accepted inherited Everyone full control."
+        }
         foreach ($securityFixture in @(
                 [pscustomobject]@{
                     name = "cancellation event"
