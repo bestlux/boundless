@@ -49,6 +49,7 @@ This patch train fixes the three regressions found during installed v5.0.13 dogf
 | BND-NEXT-38 | code complete; needs installed evidence | 57dd527, f180a81, 7207252, cfc7161, ac61ad1, 41b437c | Raw Input is authoritative for the Double-Control detector, hook loss and broker stalls fail open, and input ownership is acknowledged before local lock. Test both Control keys with PowerToys on/off, stalled/unavailable IPC, forced tray loss, and a successful next handoff. |
 | BND-NEXT-40 | code complete; needs physical evidence | c7b346a, ffb4a51, 049eafa, a59c16d, b50f206, e086e5c | Key semantics and source logical Num Lock now survive broker, protocol 4.3, wire, and Windows injection. Run the opposite-Num-Lock matrix both directions, including digits, decimal, Enter, divide, navigation, toggle, hold/repeat, and release. |
 | BND-NEXT-41 | code complete; needs installed/UAC evidence | 5a0be2b, 0d79580, 36cbb60, bc0c69d, 64f4700 | The helper owns a bounded per-user/session quiescence path, protects elevated staging and log handoff, supervises tray and installer liveness, and leaves MSI as the service-stop owner. Prove a normal-user 5.0.13→5.0.14 upgrade with one UAC prompt, no Restart Manager loop, bounded timing, and healthy postconditions on both PCs. |
+| BND-NEXT-42 | code complete; needs installed asymmetric evidence | 6b0aa59 | Simultaneous trusted connections now converge on one deterministic physical session, a sole-reachable reverse session remains valid, and stale teardown cannot publish a false disconnect. Four extended local two-node smokes passed across both initiation orientations; repeat connection, first input, clipboard, and reconnect on the routed dogfood pair. |
 | BND-NEXT-31 | code complete for graceful Quit path; needs installed evidence | 5a0be2b, 0d79580, bc0c69d, 64f4700 | The true Quit signal now fails open and exits the broker before process shutdown. Run active-capture Quit/relaunch, upgrade-while-running, process-count, first post-relaunch handoff, and emergency escape on installed hardware. |
 | BND-NEXT-29 item 3 | code complete; needs same-version install evidence | 5a0be2b | WiX now allows same-version upgrades and packaging smoke enforces the contract. Prove a same-version helper rebuild replaces the installed payload instead of silently no-oping. |
 
@@ -156,6 +157,40 @@ This is not a recurrence of the old service-stop wedge. `boundless-service-start
 ### Dependencies and scope boundary
 
 BND-NEXT-23 owns bounded SCM stop, BND-NEXT-31 owns tray/broker lifecycle, and BND-NEXT-29 owns the remaining independent packaging paper cuts. This story owns orchestration across those surfaces for install/upgrade.
+
+---
+
+## BND-NEXT-42 (P0, v5.0.14 candidate needs installed evidence): Converge competing trusted sessions without false connected state
+
+**Category:** bug
+
+Status: found during the v5.0.14 release gate and fixed in `6b0aa59`. Deterministic state-machine, reverse-session, replacement-teardown, and queue-delivery tests pass, as do four extended local two-node smokes split across both connection orientations. The routed CODY-PC/CODY-ELITEBOOK pair remains the installed proof boundary.
+
+### Context and evidence
+
+The extended two-node smoke twice queued a synthetic input frame while both peers reported connected and trusted, then timed out without an outgoing `input_frame`. Failure snapshots showed `input_queue_high_water queue=outgoing_input depth=1`, a correct destination input owner, and no authority, injection, write, or protocol error. The retained session records exposed simultaneous direct and reverse TLS connections.
+
+The transport registry previously let the first authenticated connection win independently on each machine. The outbound supervisor registered one task ID but the authenticated session allocated a different ownership ID, so replacement could not cancel the exact displaced task. Every claimed session also published `connected=false` when it exited, even if another session had already replaced it. Crossed claims could therefore strand a peer-owned output queue or let stale teardown overwrite a healthy replacement while the UI remained green.
+
+### Scope
+
+- Derive the same preferred physical connection on both peers when direct and reverse sessions race, while accepting a nonpreferred reverse session when it is the only reachable route.
+- Preserve the outbound worker registration ID as its authenticated ownership ID so replacement targets the exact displaced task.
+- Serialize claim and close transitions; only the still-current owner may clear the registry claim and publish `connected=false`.
+- Keep input, clipboard, and file queues peer-owned rather than direction-owned so either initiation orientation remains fully bidirectional.
+- Preserve bounded failure snapshots for the session, peer, owner, and retained transport-event state when a smoke assertion fails.
+
+### Acceptance criteria
+
+- Crossed two-connection permutations converge on the same preferred session at both endpoints without livelock or duplicate delivery.
+- A sole-reachable reverse session negotiates and carries input in both directions; deterministic preference must not break asymmetric LAN routing.
+- Delayed teardown from a superseded session cannot clear the replacement owner or publish a stale disconnected state.
+- After convergence, input, text/image clipboard, file transfer, and forced reconnect complete without reset and without an output queue remaining stranded.
+- Extended local smoke passes repeatedly in both initiation orientations, followed by an installed two-PC run on the known asymmetric topology.
+
+### Dependencies and scope boundary
+
+This story hardens authenticated session ownership only. BND-NEXT-20E owns discovery lifecycle and manual-host recovery; BND-NEXT-21 owns firewall policy; it does not add relay/cloud transport or change trust admission.
 
 ---
 
