@@ -32,10 +32,18 @@ pub enum SingleInstanceAcquire {
 }
 
 pub struct SingleInstanceGuard {
-    owner_mutex: OwnedHandle,
-    activation_event: Arc<OwnedHandle>,
-    shutdown_event: Arc<OwnedHandle>,
+    owner_mutex: Option<OwnedHandle>,
+    activation_event: Option<Arc<OwnedHandle>>,
+    shutdown_event: Option<Arc<OwnedHandle>>,
     listener: Option<ActivationListener>,
+    #[cfg(test)]
+    drop_probe: Option<SingleInstanceDropProbe>,
+}
+
+#[cfg(test)]
+struct SingleInstanceDropProbe {
+    owner_released: std::sync::mpsc::SyncSender<()>,
+    resume_drop: std::sync::mpsc::Receiver<()>,
 }
 
 pub struct ServiceStartOriginGuard {
@@ -198,10 +206,12 @@ impl SingleInstanceGuard {
         }
 
         Ok(SingleInstanceAcquire::Primary(Self {
-            owner_mutex,
-            activation_event,
-            shutdown_event,
+            owner_mutex: Some(owner_mutex),
+            activation_event: Some(activation_event),
+            shutdown_event: Some(shutdown_event),
             listener: None,
+            #[cfg(test)]
+            drop_probe: None,
         }))
     }
 
@@ -271,8 +281,16 @@ impl SingleInstanceGuard {
         }
 
         let stop_event = Arc::new(OwnedHandle(stop_event));
-        let activation_event = self.activation_event.clone();
-        let shutdown_event = self.shutdown_event.clone();
+        let activation_event = self
+            .activation_event
+            .as_ref()
+            .context("single-instance activation event is unavailable")?
+            .clone();
+        let shutdown_event = self
+            .shutdown_event
+            .as_ref()
+            .context("single-instance shutdown event is unavailable")?
+            .clone();
         let listener_stop_event = stop_event.clone();
         let join = thread::Builder::new()
             .name("boundless-tray-activation".to_string())
@@ -304,9 +322,21 @@ impl SingleInstanceGuard {
 
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
-        self.listener.take();
-        unsafe {
-            ReleaseMutex(self.owner_mutex.0);
+        // A recovering secondary may already be waiting on the owner mutex.
+        // Remove every stale event handle before making ownership available.
+        drop(self.listener.take());
+        drop(self.activation_event.take());
+        drop(self.shutdown_event.take());
+        if let Some(owner_mutex) = self.owner_mutex.take() {
+            unsafe {
+                ReleaseMutex(owner_mutex.0);
+            }
+            #[cfg(test)]
+            if let Some(probe) = self.drop_probe.take() {
+                let _ = probe.owner_released.send(());
+                let _ = probe.resume_drop.recv_timeout(Duration::from_secs(5));
+            }
+            drop(owner_mutex);
         }
     }
 }
@@ -631,6 +661,89 @@ mod tests {
             SingleInstanceGuard::acquire(&name, &current_sid()).expect("reacquire should succeed"),
             SingleInstanceAcquire::Primary(_)
         ));
+    }
+
+    #[test]
+    fn dropping_primary_closes_events_before_waiting_secondary_acquires_owner() {
+        let name = unique_name("drop-order");
+        let sid = current_sid();
+        let SingleInstanceAcquire::Primary(mut primary) =
+            SingleInstanceGuard::acquire(&name, &sid).expect("first acquire should succeed")
+        else {
+            panic!("first acquire must become primary");
+        };
+
+        let (activation_tx, activation_rx) = mpsc::channel();
+        primary
+            .start_listener(
+                move || {
+                    activation_tx
+                        .send(())
+                        .expect("activation receiver should stay open");
+                },
+                || {},
+            )
+            .expect("listener should start");
+
+        let (owner_released_tx, owner_released_rx) = mpsc::sync_channel(0);
+        let (resume_drop_tx, resume_drop_rx) = mpsc::channel();
+        primary.drop_probe = Some(SingleInstanceDropProbe {
+            owner_released: owner_released_tx,
+            resume_drop: resume_drop_rx,
+        });
+
+        let secondary_name = name.clone();
+        let secondary_sid = sid.clone();
+        let (secondary_result_tx, secondary_result_rx) = mpsc::channel();
+        let secondary = thread::spawn(move || {
+            match SingleInstanceGuard::acquire(&secondary_name, &secondary_sid) {
+                Ok(SingleInstanceAcquire::Primary(secondary_primary)) => {
+                    secondary_result_tx
+                        .send(Ok(()))
+                        .expect("secondary result receiver should stay open");
+                    drop(secondary_primary);
+                }
+                Ok(SingleInstanceAcquire::ExistingSignaled) => {
+                    secondary_result_tx
+                        .send(Err(
+                            "secondary timed out waiting for owner mutex".to_string()
+                        ))
+                        .expect("secondary result receiver should stay open");
+                }
+                Err(error) => {
+                    secondary_result_tx
+                        .send(Err(format!("secondary acquire failed: {error:#}")))
+                        .expect("secondary result receiver should stay open");
+                }
+            }
+        });
+
+        activation_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("secondary should signal before waiting for owner recovery");
+        let coordinator = thread::spawn(move || {
+            owner_released_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("primary drop should publish owner release");
+            let secondary_result = secondary_result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("waiting secondary should finish while primary drop is paused");
+            resume_drop_tx
+                .send(())
+                .expect("primary drop should still be waiting");
+            secondary_result
+        });
+
+        // A Win32 mutex must be released by the thread that acquired it.
+        // Coordinate from a helper while dropping the primary on this thread.
+        drop(primary);
+        let secondary_result = coordinator.join().expect("drop coordinator should finish");
+        secondary.join().expect("secondary should finish");
+
+        assert!(
+            secondary_result.is_ok(),
+            "waiting secondary must acquire without observing stale events: {secondary_result:?}"
+        );
     }
 
     #[test]

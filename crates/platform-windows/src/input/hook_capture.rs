@@ -880,9 +880,12 @@ fn key_semantics_for_hook_event(
     .unwrap_or_else(|| windows_key_semantics(scan_code, raw_vk_code, false))
 }
 
-fn windows_key_semantics(scan_code: u16, raw_vk_code: u16, num_lock_on: bool) -> KeySemantics {
+fn windows_key_semantics(_scan_code: u16, raw_vk_code: u16, num_lock_on: bool) -> KeySemantics {
     KeySemantics::Windows {
-        virtual_key: ambiguous_keypad_virtual_key(scan_code, num_lock_on).unwrap_or(raw_vk_code),
+        // KBDLLHOOKSTRUCT already reflects temporary modifier overrides such
+        // as Shift turning Numpad1 into End. Keep that first-down identity;
+        // Num Lock remains separate metadata for destination reconciliation.
+        virtual_key: raw_vk_code,
         num_lock_on,
     }
 }
@@ -2569,7 +2572,7 @@ mod tests {
         );
         assert!(!core.actual_num_lock_state.is_on());
 
-        let keypad = key_semantics_for_hook_event(0x4F, 0x23, KeyState::Down, true);
+        let keypad = key_semantics_for_hook_event(0x4F, 0x61, KeyState::Down, true);
         assert_eq!(
             keypad,
             KeySemantics::Windows {
@@ -2593,7 +2596,7 @@ mod tests {
             }
         );
 
-        let keypad_release = key_semantics_for_hook_event(0x4F, 0x23, KeyState::Up, true);
+        let keypad_release = key_semantics_for_hook_event(0x4F, 0x61, KeyState::Up, true);
         assert_eq!(
             keypad_release,
             KeySemantics::Windows {
@@ -2611,6 +2614,102 @@ mod tests {
                 .expect("keyboard state")
                 .capture_num_lock_on
         );
+        clear_active_capture_runtime(&core).expect("cleanup runtime");
+    }
+
+    #[test]
+    fn shift_overridden_numpad_identity_survives_repeat_modifier_and_num_lock_changes() {
+        const VK_END: u16 = 0x23;
+        const VK_NUMPAD1: u16 = 0x61;
+        const VK_LSHIFT: u16 = 0xA0;
+
+        let _guard = registry_test_guard().lock().expect("test guard");
+        reset_active_runtime_for_test();
+        let core = test_runtime_core();
+        activate_capture_runtime(&core).expect("activate runtime");
+        set_hook_lock_active_for(&core, true).expect("lock capture");
+
+        assert_eq!(
+            key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Down, true),
+            KeySemantics::Windows {
+                virtual_key: VK_NUMLOCK_CODE,
+                num_lock_on: true,
+            }
+        );
+        assert_eq!(
+            key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Up, true),
+            KeySemantics::Windows {
+                virtual_key: VK_NUMLOCK_CODE,
+                num_lock_on: true,
+            }
+        );
+        assert_eq!(
+            key_semantics_for_hook_event(0x2A, VK_LSHIFT, KeyState::Down, true),
+            KeySemantics::Windows {
+                virtual_key: VK_LSHIFT,
+                num_lock_on: true,
+            }
+        );
+
+        let first_down = KeySemantics::Windows {
+            virtual_key: VK_END,
+            num_lock_on: true,
+        };
+        assert_eq!(
+            key_semantics_for_hook_event(0x4F, VK_END, KeyState::Down, true),
+            first_down,
+            "Shift must preserve the hook-observed navigation identity even with logical Num Lock on"
+        );
+
+        assert_eq!(
+            key_semantics_for_hook_event(0x2A, VK_LSHIFT, KeyState::Up, true),
+            KeySemantics::Windows {
+                virtual_key: VK_LSHIFT,
+                num_lock_on: true,
+            }
+        );
+        assert_eq!(
+            key_semantics_for_hook_event(0x4F, VK_NUMPAD1, KeyState::Down, true),
+            first_down,
+            "repeat after Shift release must retain the first-down identity"
+        );
+
+        assert_eq!(
+            key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Down, true),
+            KeySemantics::Windows {
+                virtual_key: VK_NUMLOCK_CODE,
+                num_lock_on: false,
+            }
+        );
+        assert_eq!(
+            key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Up, true),
+            KeySemantics::Windows {
+                virtual_key: VK_NUMLOCK_CODE,
+                num_lock_on: false,
+            }
+        );
+        assert_eq!(
+            key_semantics_for_hook_event(0x4F, VK_NUMPAD1, KeyState::Down, true),
+            first_down,
+            "repeat after Num Lock transition must retain first-down metadata"
+        );
+        assert_eq!(
+            key_semantics_for_hook_event(0x4F, VK_NUMPAD1, KeyState::Up, true),
+            first_down,
+            "key-up must release the exact first-down virtual-key identity"
+        );
+
+        assert_eq!(
+            key_semantics_for_hook_event(0x4F, VK_END, KeyState::Down, true),
+            KeySemantics::Windows {
+                virtual_key: VK_END,
+                num_lock_on: false,
+            },
+            "a new press after release must observe the current hook identity and Num Lock metadata"
+        );
+        let _ = key_semantics_for_hook_event(0x4F, VK_END, KeyState::Up, true);
+
+        set_hook_lock_active_for(&core, false).expect("unlock capture");
         clear_active_capture_runtime(&core).expect("cleanup runtime");
     }
 
@@ -2634,7 +2733,7 @@ mod tests {
 
         set_hook_lock_active_for(&core, true).expect("redundant active update");
         assert_eq!(
-            key_semantics_for_hook_event(0x4F, 0x23, KeyState::Down, true),
+            key_semantics_for_hook_event(0x4F, 0x61, KeyState::Down, true),
             KeySemantics::Windows {
                 virtual_key: 0x61,
                 num_lock_on: true,
