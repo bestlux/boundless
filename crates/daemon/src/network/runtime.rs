@@ -109,11 +109,14 @@ pub(super) async fn supervisor_loop(state: AppState) {
             let worker_state = state.clone();
             let registration_state = state.clone();
             let peer_id = peer.peer_id.clone();
+            let (session_id_tx, session_id_rx) = oneshot::channel::<u64>();
             let handle = tokio::spawn(async move {
-                peer_worker(worker_state, peer_id).await;
+                let session_id = session_id_rx.await.ok();
+                peer_worker(worker_state, peer_id, session_id).await;
             });
             let session_id = registration_state
                 .register_transport_session_for_peer(&peer.peer_id, handle.abort_handle());
+            let _ = session_id_tx.send(session_id);
             workers.insert(peer.peer_id.clone(), handle);
             worker_session_ids.insert(peer.peer_id, session_id);
         }
@@ -133,7 +136,7 @@ pub(super) async fn supervisor_loop(state: AppState) {
     }
 }
 
-async fn peer_worker(state: AppState, peer_id: String) {
+async fn peer_worker(state: AppState, peer_id: String, session_registration_id: Option<u64>) {
     let mut backoff_secs: u64 = 1;
     let reconcile_wake = state.peer_reconcile_wake_signal();
 
@@ -157,9 +160,13 @@ async fn peer_worker(state: AppState, peer_id: String) {
             continue;
         }
 
-        if let Err(error) =
-            connect_and_run_outbound_to_candidates(state.clone(), &peer_id, &target_candidates)
-                .await
+        if let Err(error) = connect_and_run_outbound_to_candidates(
+            state.clone(),
+            &peer_id,
+            &target_candidates,
+            session_registration_id,
+        )
+        .await
         {
             state.record_transport_event(crate::state::TransportEventRecord {
                 timestamp: chrono::Utc::now(),
@@ -203,6 +210,7 @@ async fn connect_and_run_outbound_to_candidates(
     state: AppState,
     peer_id: &str,
     target_candidates: &[TcpEndpointCandidate],
+    session_registration_id: Option<u64>,
 ) -> Result<()> {
     let (stream, selected) =
         connect_first_authenticated_outbound_candidate(state.clone(), peer_id, target_candidates)
@@ -218,7 +226,8 @@ async fn connect_and_run_outbound_to_candidates(
         ),
         size_bytes: 0,
     });
-    run_authenticated_outbound_session(state, peer_id.to_string(), stream).await
+    run_authenticated_outbound_session(state, peer_id.to_string(), stream, session_registration_id)
+        .await
 }
 
 async fn connect_first_authenticated_outbound_candidate(
@@ -595,7 +604,7 @@ mod tests {
             )
             .await;
 
-        let worker = tokio::spawn(peer_worker(state.clone(), peer_id.clone()));
+        let worker = tokio::spawn(peer_worker(state.clone(), peer_id.clone(), None));
         let event = time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some(event) = state.transport_events().await.into_iter().find(|event| {

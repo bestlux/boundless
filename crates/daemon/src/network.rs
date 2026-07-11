@@ -815,6 +815,32 @@ mod tests {
         (state, peer_id, root)
     }
 
+    fn state_with_ordered_peer_for_queue_test(
+        local_machine_id: &str,
+        peer_id: &str,
+    ) -> (AppState, String, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-ordered-queue-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = root.join("config.json");
+        let security_root = root.join("security");
+        let mut config = crate::config::RuntimeConfig {
+            machine_id: local_machine_id.to_string(),
+            ..Default::default()
+        };
+        config.peers.push(crate::config::PeerConfig {
+            peer_id: peer_id.to_string(),
+            display_name: "peer".to_string(),
+            address: "127.0.0.1:15100".to_string(),
+            connected: false,
+            last_seen: Utc::now(),
+        });
+        crate::config::save_config_at(&config_path, &config).expect("seed ordered config");
+        let state = AppState::load_or_create_with_paths(config_path, security_root).expect("state");
+        (state, peer_id.to_string(), root)
+    }
+
     async fn state_for_listener_test() -> (AppState, std::path::PathBuf) {
         let root =
             std::env::temp_dir().join(format!("boundless-listener-test-{}", uuid::Uuid::new_v4()));
@@ -1207,6 +1233,254 @@ mod tests {
             "first session exit should clear active ownership"
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn reverse_initiated_session_flushes_input_queued_after_hello() {
+        let (state, peer_id, root) = state_with_ordered_peer_for_queue_test("z-local", "a-peer");
+        let (stream, mut remote) = TransportFaultHarness::pair();
+
+        let session = tokio::spawn(run_authenticated_session(
+            state.clone(),
+            peer_id.clone(),
+            stream,
+            false,
+            None,
+        ));
+        remote
+            .read_until("reverse session local hello", |frame| {
+                matches!(frame, WireMessage::Hello { .. })
+            })
+            .await;
+        remote.send_frame(remote_hello(&peer_id)).await;
+        remote
+            .read_until("reverse session hello ack", |frame| {
+                matches!(frame, WireMessage::HelloAck { accepted: true, .. })
+            })
+            .await;
+
+        let (duplicate_stream, _duplicate_remote) = TransportFaultHarness::pair();
+        run_authenticated_session(state.clone(), peer_id.clone(), duplicate_stream, true, None)
+            .await
+            .expect(
+                "duplicate outbound session should be rejected without disturbing reverse owner",
+            );
+
+        state
+            .queue_input_events(&peer_id, vec![InputEvent::MouseMove { dx: 3, dy: 2 }])
+            .await
+            .expect("queue input after reverse session negotiation");
+        let frame = remote
+            .read_until("input frame on reverse session", |frame| {
+                matches!(frame, WireMessage::InputFrame { .. })
+            })
+            .await;
+        assert!(matches!(
+            frame,
+            WireMessage::InputFrame { events, .. }
+                if matches!(events.as_slice(), [WireInputEvent::MouseMove { dx: 3, dy: 2 }])
+        ));
+
+        remote.disconnect().await;
+        time::timeout(Duration::from_secs(1), session)
+            .await
+            .expect("reverse session exits promptly")
+            .expect("reverse session task joins")
+            .expect("disconnect closes reverse session cleanly");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn superseded_teardown_cannot_disconnect_replacement_owner() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let old_cancellation = Arc::new(crate::state::RuntimeWakeSignal::default());
+        assert_eq!(
+            state
+                .claim_transport_session(&peer_id, 10, false, old_cancellation.clone())
+                .await,
+            crate::state::TransportSessionClaim::Claimed
+        );
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("mark old owner connected");
+
+        let (release_teardown, wait_for_teardown) = tokio::sync::oneshot::channel();
+        let teardown_state = state.clone();
+        let teardown_peer = peer_id.clone();
+        let old_teardown = tokio::spawn(async move {
+            let _ = wait_for_teardown.await;
+            teardown_state
+                .close_active_transport_session(&teardown_peer, 10)
+                .await
+        });
+
+        assert_eq!(
+            state
+                .claim_transport_session(
+                    &peer_id,
+                    20,
+                    true,
+                    Arc::new(crate::state::RuntimeWakeSignal::default()),
+                )
+                .await,
+            crate::state::TransportSessionClaim::Replaced {
+                active_session_id: 10
+            }
+        );
+        assert!(old_cancellation.take_pending());
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("mark replacement owner connected");
+
+        release_teardown.send(()).expect("release old teardown");
+        assert!(
+            !time::timeout(Duration::from_secs(1), old_teardown)
+                .await
+                .expect("old teardown exits promptly")
+                .expect("old teardown joins"),
+            "superseded session must not clear replacement ownership"
+        );
+        assert!(
+            state
+                .snapshot()
+                .await
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == peer_id && peer.connected),
+            "superseded teardown must not publish a stale disconnect"
+        );
+        assert!(state.close_active_transport_session(&peer_id, 20).await);
+        assert!(
+            !state
+                .snapshot()
+                .await
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == peer_id && peer.connected),
+            "closing the current replacement owner must publish disconnect"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn preferred_session_replaces_nonpreferred_and_becomes_only_input_lane() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let local_machine_id = state.snapshot().await.machine_id;
+        let preferred_is_outbound = local_machine_id < peer_id;
+        let old_is_outbound = !preferred_is_outbound;
+        let (old_stream, mut old_remote) = TransportFaultHarness::pair();
+        let old_session = tokio::spawn(run_authenticated_session(
+            state.clone(),
+            peer_id.clone(),
+            old_stream,
+            old_is_outbound,
+            None,
+        ));
+        old_remote
+            .read_until("nonpreferred local hello", |frame| {
+                matches!(frame, WireMessage::Hello { .. })
+            })
+            .await;
+        old_remote.send_frame(remote_hello(&peer_id)).await;
+        if !old_is_outbound {
+            old_remote
+                .read_until("nonpreferred reverse hello ack", |frame| {
+                    matches!(frame, WireMessage::HelloAck { accepted: true, .. })
+                })
+                .await;
+        }
+        for _ in 0..50 {
+            if state
+                .snapshot()
+                .await
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == peer_id && peer.connected)
+            {
+                break;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .snapshot()
+                .await
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == peer_id && peer.connected),
+            "nonpreferred sole-reachable lane must negotiate"
+        );
+
+        let (preferred_stream, mut preferred_remote) = TransportFaultHarness::pair();
+        let preferred_session = tokio::spawn(run_authenticated_session(
+            state.clone(),
+            peer_id.clone(),
+            preferred_stream,
+            preferred_is_outbound,
+            None,
+        ));
+        preferred_remote
+            .read_until("preferred local hello", |frame| {
+                matches!(frame, WireMessage::Hello { .. })
+            })
+            .await;
+        preferred_remote.send_frame(remote_hello(&peer_id)).await;
+        if !preferred_is_outbound {
+            preferred_remote
+                .read_until("preferred reverse hello ack", |frame| {
+                    matches!(frame, WireMessage::HelloAck { accepted: true, .. })
+                })
+                .await;
+        }
+        time::timeout(Duration::from_secs(1), old_session)
+            .await
+            .expect("superseded session exits promptly")
+            .expect("superseded session task joins")
+            .expect("superseded session exits cleanly");
+        assert!(
+            state
+                .snapshot()
+                .await
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == peer_id && peer.connected),
+            "superseded teardown must preserve replacement connected state"
+        );
+
+        state
+            .queue_input_events(&peer_id, vec![InputEvent::MouseMove { dx: 7, dy: -4 }])
+            .await
+            .expect("queue input for replacement session");
+        let frame = preferred_remote
+            .read_until("input on preferred replacement", |frame| {
+                matches!(frame, WireMessage::InputFrame { .. })
+            })
+            .await;
+        assert!(matches!(
+            frame,
+            WireMessage::InputFrame { events, .. }
+                if matches!(events.as_slice(), [WireInputEvent::MouseMove { dx: 7, dy: -4 }])
+        ));
+
+        preferred_remote.disconnect().await;
+        time::timeout(Duration::from_secs(1), preferred_session)
+            .await
+            .expect("preferred session exits promptly")
+            .expect("preferred session task joins")
+            .expect("preferred disconnect closes session cleanly");
+        assert!(
+            !state
+                .snapshot()
+                .await
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == peer_id && peer.connected),
+            "only closing the preferred current owner should disconnect the peer"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

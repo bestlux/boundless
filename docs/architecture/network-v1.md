@@ -40,7 +40,7 @@ Related design notes:
   - Performs machine identity checks and payload-level rejection logging.
 - `crates/daemon/src/network/runtime.rs`
   - Owns listener and outbound supervisor loops.
-  - Handles endpoint selection/backoff/reconnect scheduling.
+  - Handles endpoint selection/backoff/reconnect scheduling and preserves the outbound worker registration id through its authenticated sessions.
 - `crates/daemon/src/network/tls.rs`
   - Owns TLS config, connector/acceptor construction, and server-name parsing.
 - `crates/daemon/src/network/codec.rs`
@@ -54,6 +54,14 @@ Related design notes:
 - Session-level inbound transfer staging is isolated to `inbound_transfers`.
 - Non-canonical protocol peers are rejected at handshake and guarded again in outbound send paths.
 - Protocol 4.3 keyboard frames retain physical scan/E0 identity plus source Windows virtual-key and effective Num Lock semantics. The clean bincode shape change intentionally rejects 4.2 peers at handshake; local 4.2 runtime config is migrated to 4.3 on upgrade.
+
+## Authenticated session ownership
+
+- A trusted peer may reach the daemon through either a locally initiated outbound connection or a reverse-initiated inbound connection. A nonpreferred direction is accepted when it is the only authenticated route, preserving one-sided LAN reachability.
+- When both physical directions race, both peers derive the same preferred connection: the lexicographically smaller machine id initiates it. The preferred authenticated session replaces and cancels an already claimed nonpreferred session; later nonpreferred duplicates cannot displace it.
+- Outbound worker registration ids and inbound task registration ids are also the ownership ids used by the session registry, so replacement can cancel the exact displaced task instead of aborting an unrelated peer session.
+- Session claim and close transitions are serialized. A superseded session may clean up its private transfer state, but only the session that still owns the registry claim can publish `connected=false`; stale teardown cannot disconnect or clear a replacement session.
+- Input and bulk queues remain peer-owned rather than direction-owned. Either the preferred connection or a sole-reachable nonpreferred connection must flush payloads after `Hello` negotiation.
 
 ## Slice 1 regression focus
 
@@ -76,7 +84,7 @@ Landed boundaries:
 - `SessionExitReason` names clean session exits for reconnect requests, dropped state, peer close, invalid frames, and protocol rejection.
 - Outgoing work has named private branch boundaries for heartbeat ticks, input flush ticks, bulk flush ticks, explicit flush signals, file chunk credit handling, and shared input/bulk flush helpers.
 - Inbound work has named private boundaries for reading a frame result, decoding/recording rejected frames, and dispatching decoded `WireMessage` values.
-- Session-close cleanup still discards inbound transfer staging and marks the peer disconnected after the loop exits.
+- Session-close cleanup still discards inbound transfer staging after the loop exits. It marks the peer disconnected only when that session still owns the active registry claim.
 
 Fault-harness status:
 

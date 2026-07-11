@@ -308,6 +308,7 @@ pub struct AppState {
     clipboard: Arc<ClipboardState>,
     pairing: Arc<PairingState>,
     transport: Arc<TransportState>,
+    transport_session_transition: Arc<Mutex<()>>,
     discovery: Arc<DiscoveryState>,
     input: Arc<InputState>,
     input_broker: Arc<InputBrokerRelay>,

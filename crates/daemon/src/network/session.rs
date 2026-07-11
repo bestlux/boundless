@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Instant};
+use std::{cmp::Ordering, collections::HashMap, sync::Arc, time::Instant};
 
 use chrono::Utc;
 use peer_transport::{
@@ -7,7 +7,7 @@ use peer_transport::{
     remove_outbound_transfer_flow,
 };
 
-use crate::state::TransportEventRecord;
+use crate::state::{RuntimeWakeSignal, TransportEventRecord};
 
 use super::codec::now_millis;
 use super::control::{
@@ -29,6 +29,7 @@ use super::outbound::{
 use super::*;
 
 struct AuthenticatedSession {
+    session_id: u64,
     peer_id: String,
     remote_peer_id: Option<String>,
     is_outbound: bool,
@@ -37,9 +38,10 @@ struct AuthenticatedSession {
 }
 
 impl AuthenticatedSession {
-    async fn new(state: &AppState, peer_id: String, is_outbound: bool) -> Self {
+    async fn new(state: &AppState, session_id: u64, peer_id: String, is_outbound: bool) -> Self {
         let snapshot = state.snapshot().await;
         Self {
+            session_id,
             remote_peer_id: Some(peer_id.clone()),
             peer_id,
             is_outbound,
@@ -66,6 +68,7 @@ struct ActiveTransportSessionGuard {
     state: AppState,
     peer_id: String,
     session_id: u64,
+    armed: bool,
 }
 
 impl ActiveTransportSessionGuard {
@@ -74,14 +77,21 @@ impl ActiveTransportSessionGuard {
             state,
             peer_id,
             session_id,
+            armed: true,
         }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
 impl Drop for ActiveTransportSessionGuard {
     fn drop(&mut self) {
-        self.state
-            .clear_active_transport_session(&self.peer_id, self.session_id);
+        if self.armed {
+            self.state
+                .clear_active_transport_session(&self.peer_id, self.session_id);
+        }
     }
 }
 
@@ -91,6 +101,7 @@ enum SessionExitReason {
     PeerClosed,
     InvalidFrame,
     ProtocolRejected,
+    Superseded,
 }
 
 enum SessionBranchOutcome {
@@ -676,8 +687,9 @@ pub(super) async fn run_authenticated_outbound_session(
     state: AppState,
     peer_id: String,
     stream: tokio_rustls::TlsStream<TcpStream>,
+    session_registration_id: Option<u64>,
 ) -> Result<()> {
-    run_authenticated_session(state, peer_id, stream, true, None).await
+    run_authenticated_session(state, peer_id, stream, true, session_registration_id).await
 }
 
 async fn tcp_connect_with_timeout(address: &str) -> Result<TcpStream> {
@@ -840,16 +852,50 @@ where
     let ownership_session_id = session_registration_id
         .filter(|session_id| *session_id != 0)
         .unwrap_or_else(|| state.allocate_transport_session_id());
-    match state.claim_transport_session(&authenticated_peer_id, ownership_session_id) {
+    let session = AuthenticatedSession::new(
+        &state,
+        ownership_session_id,
+        authenticated_peer_id,
+        is_outbound,
+    )
+    .await;
+    let preferred = transport_session_direction_is_preferred(
+        &session.local_machine_id,
+        &session.peer_id,
+        is_outbound,
+    );
+    let session_cancellation = Arc::new(RuntimeWakeSignal::default());
+    match state
+        .claim_transport_session(
+            &session.peer_id,
+            ownership_session_id,
+            preferred,
+            session_cancellation.clone(),
+        )
+        .await
+    {
         crate::state::TransportSessionClaim::Claimed => {
             state.record_transport_event(TransportEventRecord {
                 timestamp: Utc::now(),
                 direction: transport_session_direction(is_outbound).to_string(),
                 kind: "transport_session_authenticated".to_string(),
-                peer_id: authenticated_peer_id.clone(),
+                peer_id: session.peer_id.clone(),
                 detail: format!(
-                    "transport={} ownership=claimed",
-                    transport_initiation_label(is_outbound)
+                    "transport={} ownership=claimed preferred={preferred}",
+                    transport_initiation_label(is_outbound),
+                ),
+                size_bytes: 0,
+            });
+        }
+        crate::state::TransportSessionClaim::Replaced { active_session_id } => {
+            state.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: transport_session_direction(is_outbound).to_string(),
+                kind: "transport_session_replaced".to_string(),
+                peer_id: session.peer_id.clone(),
+                detail: format!(
+                    "transport={} ownership=replaced_nonpreferred active_session_id={active_session_id}",
+                    transport_initiation_label(is_outbound),
                 ),
                 size_bytes: 0,
             });
@@ -859,10 +905,10 @@ where
                 timestamp: Utc::now(),
                 direction: transport_session_direction(is_outbound).to_string(),
                 kind: "transport_session_duplicate".to_string(),
-                peer_id: authenticated_peer_id,
+                peer_id: session.peer_id,
                 detail: format!(
-                    "transport={} ownership=duplicate active_session=present",
-                    transport_initiation_label(is_outbound)
+                    "transport={} ownership=duplicate active_session=present preferred={preferred}",
+                    transport_initiation_label(is_outbound),
                 ),
                 size_bytes: 0,
             });
@@ -872,16 +918,16 @@ where
             bail!("transport session registry closed");
         }
     }
-    let _active_session_guard = ActiveTransportSessionGuard::new(
+    let mut active_session_guard = ActiveTransportSessionGuard::new(
         state.clone(),
-        authenticated_peer_id.clone(),
+        session.peer_id.clone(),
         ownership_session_id,
     );
 
     let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
-    let mut write_frame_buffer = Vec::<u8>::with_capacity(4096);
+    let write_frame_buffer = Vec::<u8>::with_capacity(4096);
     let mut heartbeat_interval = time::interval(DEFAULT_TRANSPORT_TUNING.heartbeat_interval);
     let mut outgoing_input_flush_interval =
         time::interval(DEFAULT_TRANSPORT_TUNING.outgoing_input_flush_interval);
@@ -892,19 +938,32 @@ where
     outgoing_input_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     outgoing_bulk_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
-    let session = AuthenticatedSession::new(&state, authenticated_peer_id, is_outbound).await;
     let local_hello = session.local_hello();
-
-    send_message(&mut writer, &local_hello, &mut write_frame_buffer).await?;
-    writer.flush().await.context("flush local hello")?;
-
     let observed_reconnect_generation = state.peer_reconnect_generation(&session.peer_id).await;
     let mut runtime = SessionRuntime::new(observed_reconnect_generation, write_frame_buffer);
 
     let session_result: Result<SessionExitReason> = {
         async {
+            send_message(
+                &mut writer,
+                &local_hello,
+                &mut runtime.write_frame_buffer,
+            )
+            .await?;
+            writer.flush().await.context("flush local hello")?;
+
             loop {
+                let superseded = session_cancellation.notified();
+                tokio::pin!(superseded);
+                if session_cancellation.take_pending() {
+                    break Ok(SessionExitReason::Superseded);
+                }
         tokio::select! {
+            biased;
+            _ = &mut superseded => {
+                let _ = session_cancellation.take_pending();
+                break Ok(SessionExitReason::Superseded);
+            }
             _ = heartbeat_interval.tick() => {
                 if let SessionBranchOutcome::Exit(exit_reason) = runtime
                     .handle_heartbeat_tick(&state, &session, &mut writer)
@@ -956,12 +1015,24 @@ where
     };
 
     runtime.discard_inbound_state(&state).await;
-
-    if let Some(peer_id) = session.remote_peer_id() {
-        let _ = state.set_peer_connected(peer_id, false).await;
-    }
+    let _was_current = state
+        .close_active_transport_session(&session.peer_id, session.session_id)
+        .await;
+    active_session_guard.disarm();
 
     session_result.map(|_| ())
+}
+
+fn transport_session_direction_is_preferred(
+    local_machine_id: &str,
+    remote_machine_id: &str,
+    is_outbound: bool,
+) -> bool {
+    match local_machine_id.cmp(remote_machine_id) {
+        Ordering::Less => is_outbound,
+        Ordering::Greater => !is_outbound,
+        Ordering::Equal => is_outbound,
+    }
 }
 
 fn transport_session_direction(is_outbound: bool) -> &'static str {

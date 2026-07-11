@@ -84,13 +84,33 @@ impl AppState {
         self.transport.allocate_transport_session_id()
     }
 
-    pub fn claim_transport_session(&self, peer_id: &str, session_id: u64) -> TransportSessionClaim {
-        self.transport.claim_transport_session(peer_id, session_id)
+    pub async fn claim_transport_session(
+        &self,
+        peer_id: &str,
+        session_id: u64,
+        preferred: bool,
+        cancellation: Arc<RuntimeWakeSignal>,
+    ) -> TransportSessionClaim {
+        let _transition = self.transport_session_transition.lock().await;
+        self.transport
+            .claim_transport_session(peer_id, session_id, preferred, cancellation)
     }
 
     pub fn clear_active_transport_session(&self, peer_id: &str, session_id: u64) -> bool {
         self.transport
             .clear_active_transport_session(peer_id, session_id)
+    }
+
+    pub async fn close_active_transport_session(&self, peer_id: &str, session_id: u64) -> bool {
+        let _transition = self.transport_session_transition.lock().await;
+        if !self
+            .transport
+            .clear_active_transport_session(peer_id, session_id)
+        {
+            return false;
+        }
+        let _ = self.set_peer_connected(peer_id, false).await;
+        true
     }
 
     pub fn has_active_transport_session(&self, peer_id: &str) -> bool {
