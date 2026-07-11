@@ -437,6 +437,12 @@ message BrokerMouseWheel {
 message BrokerKey {
   uint32 scan_code = 1;
   bool down = 2;
+  BrokerWindowsKeySemantics windows_semantics = 3;
+}
+
+message BrokerWindowsKeySemantics {
+  uint32 virtual_key = 1;
+  bool num_lock_on = 2;
 }
 
 // Broker authorization is derived server-side from the verified named-pipe
@@ -445,12 +451,15 @@ message BrokerKey {
 message InputBrokerAttachRequest {
   string broker_version = 1;
   bool lock_supported = 2;
+  uint32 protocol_revision = 3;
 }
 
 message InputBrokerAttachReply {
   bool accepted = 1;
   string broker_token = 2;
   string message = 3;
+  uint32 protocol_revision = 4;
+  string delivery_epoch = 5;
 }
 
 message InputBrokerExchangeRequest {
@@ -472,6 +481,13 @@ message InputBrokerExchangeRequest {
   uint32 raw_device_wheel_event_count = 16;
   uint32 raw_system_wheel_event_count = 17;
   uint32 hook_wheel_event_count = 18;
+  int32 handoff_probe_dx = 19;
+  int32 handoff_probe_dy = 20;
+  uint32 lease_expired_unlock_count = 21;
+  uint32 detector_unavailable_unlock_count = 22;
+  bool inject_backpressure = 23;
+  uint64 acked_inject_batch_id = 24;
+  uint64 held_input_authorization_generation = 25;
 }
 
 message InputBrokerInjectFrame {
@@ -486,6 +502,11 @@ message InputBrokerExchangeReply {
   repeated InputBrokerInjectFrame inject_frames = 3;
   bool lock_should_be_active = 4;
   bool capture_active = 5;
+  bool capture_forwarding_authorized = 6;
+  uint64 inject_batch_id = 7;
+  bool inject_batch_cancelled = 8;
+  uint64 inject_authorization_generation = 9;
+  bool held_input_authorized = 10;
 }
 
 message ClipboardBrokerPayload {
@@ -529,6 +550,8 @@ message ClipboardBrokerExchangeReply {
 
 message InputBrokerDetachRequest {
   string broker_token = 1;
+  string delivery_epoch = 2;
+  uint64 acked_inject_batch_id = 3;
 }
 
 message NearbyPairingCompletionReply {

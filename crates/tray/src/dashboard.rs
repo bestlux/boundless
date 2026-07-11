@@ -55,10 +55,34 @@ use dashboard_window::{
 pub(super) fn run() -> Result<()> {
     let cli = Cli::parse();
     if cli.start_service_elevated {
-        return start_boundless_service_elevated_entrypoint();
+        return start_boundless_service_elevated_entrypoint(
+            cli.service_start_origin_sid.as_deref(),
+            cli.service_start_origin_session,
+            cli.service_start_origin_nonce.as_deref(),
+        );
+    }
+    if cli.service_start_origin_sid.is_some()
+        || cli.service_start_origin_session.is_some()
+        || cli.service_start_origin_nonce.is_some()
+    {
+        anyhow::bail!("service-start origin arguments require the privileged helper mode");
     }
     let session_id = current_process_session_id().context("failed to resolve tray session id")?;
     let user_sid = current_user_sid_string().context("failed to resolve tray user SID")?;
+    let event_name = tray_single_instance_event_name(&user_sid, session_id);
+    if cli.quit {
+        let requested = SingleInstanceGuard::request_shutdown(&event_name, &user_sid)?;
+        eprintln!(
+            "boundless_tray_shutdown={}",
+            if requested { "requested" } else { "not_running" }
+        );
+        return Ok(());
+    }
+    let upgrade_quiescence_name = tray_upgrade_quiescence_sentinel_name(&user_sid, session_id);
+    if SingleInstanceGuard::local_mutex_exists(&upgrade_quiescence_name)? {
+        eprintln!("boundless_tray_startup=upgrade_quiescence");
+        return Ok(());
+    }
     if let Some(hwnd) = find_existing_dashboard_window(session_id, &user_sid)? {
         if !activate_existing_dashboard_window(hwnd) {
             show_tray_startup_error("The existing Boundless tray could not be brought forward. Close it from Task Manager, then launch Boundless again.");
@@ -67,7 +91,6 @@ pub(super) fn run() -> Result<()> {
         eprintln!("boundless_tray_single_instance=legacy_existing_activated");
         return Ok(());
     }
-    let event_name = tray_single_instance_event_name(&user_sid, session_id);
     let acquisition = match SingleInstanceGuard::acquire(&event_name, &user_sid) {
         Ok(acquisition) => acquisition,
         Err(error) => {
@@ -148,6 +171,10 @@ fn tray_single_instance_event_name(user_sid: &str, session_id: u32) -> String {
     format!(
         "{TRAY_SINGLE_INSTANCE_EVENT_PREFIX}.{user_sid}.{session_id}"
     )
+}
+
+fn tray_upgrade_quiescence_sentinel_name(user_sid: &str, session_id: u32) -> String {
+    format!("Local\\Boundless.Tray.UpgradeQuiescence.v1.{user_sid}.{session_id}")
 }
 
 fn validate_pairing_code(code: &str) -> Result<()> {

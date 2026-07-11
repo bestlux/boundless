@@ -41,7 +41,7 @@ if (-not (Test-Path -LiteralPath $harness)) {
     throw "Missing two-machine evidence harness: $harness"
 }
 
-$MaxClipboardTextBytes = 256 * 1024
+$MaxClipboardTextBytes = 255 * 1024
 $MaxClipboardImageBytes = 8 * 1024 * 1024
 $BmpHeaderBytes = 54
 

@@ -13,6 +13,8 @@ use tracing::warn;
 
 use chrono::Utc;
 
+#[cfg(any(windows, test))]
+use core_input::KeySemantics;
 use core_input::{InputEvent, MAX_EVENTS_PER_FRAME, SwitchDirection};
 
 use crate::{
@@ -62,17 +64,19 @@ use edge_switch::{
 use platform_windows::input::CaptureRuntime;
 #[cfg(all(windows, test))]
 use platform_windows::input::HookCaptureEvent;
+use platform_windows::input::WindowsNumLockState;
 #[cfg(all(windows, test))]
 use platform_windows::input::raw_mouse_relative_delta;
-#[cfg(test)]
-#[cfg(windows)]
-use platform_windows::input::send_input_records_with_sender;
 #[cfg(windows)]
 use platform_windows::input::{
-    HookControlAction, HookInputPump, captured_key_virtual_keys,
-    current_process_can_use_interactive_input, cursor_position, input_event_kind,
-    input_records_for_event, is_virtual_key_down, mouse_button_from_virtual_key,
-    mouse_button_virtual_keys, send_input_records, vk_to_scan_code,
+    HookControlAction, HookInputPump, VK_NUMLOCK_CODE, WindowsInputState,
+    captured_key_virtual_keys, current_process_can_use_interactive_input, cursor_position,
+    input_event_kind, is_virtual_key_down, mouse_button_from_virtual_key,
+    mouse_button_virtual_keys, num_lock_state_from_dedicated_message_lane, vk_to_scan_code,
+};
+#[cfg(all(test, windows))]
+use platform_windows::input::{
+    input_records_for_event_with_num_lock_state, send_input_records_with_sender,
 };
 #[cfg(all(test, not(windows)))]
 use runtime::apply_frame;
@@ -83,7 +87,11 @@ use runtime::{record_local_input_runtime_event, run};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureControlAction {
     #[cfg_attr(not(any(windows, test)), allow(dead_code))]
-    EscapeUnlock,
+    Escape,
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    LeaseExpired,
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    DetectorUnavailable,
 }
 
 #[derive(Debug, Default)]
@@ -144,11 +152,50 @@ pub fn start(state: AppState, mode: InputRuntimeMode) {
 trait InputBackend: Send {
     fn apply(&mut self, event: &InputEvent) -> Result<()>;
 
-    fn apply_frame(&mut self, events: &[InputEvent]) -> Result<()> {
-        for event in events {
-            self.apply(event)?;
+    fn apply_frame(&mut self, events: &[InputEvent]) -> InputApplyOutcome {
+        for (index, event) in events.iter().enumerate() {
+            if let Err(error) = self.apply(event) {
+                return InputApplyOutcome::failure(index, events[index..].to_vec(), error);
+            }
         }
-        Ok(())
+        InputApplyOutcome::success(events.len())
+    }
+}
+
+#[derive(Debug)]
+struct InputApplyOutcome {
+    committed_event_count: usize,
+    remaining_events: Vec<InputEvent>,
+    error: Option<anyhow::Error>,
+}
+
+impl InputApplyOutcome {
+    fn success(committed_event_count: usize) -> Self {
+        Self {
+            committed_event_count,
+            remaining_events: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn failure(
+        committed_event_count: usize,
+        remaining_events: Vec<InputEvent>,
+        error: anyhow::Error,
+    ) -> Self {
+        Self {
+            committed_event_count,
+            remaining_events,
+            error: Some(error),
+        }
+    }
+
+    #[cfg(test)]
+    fn into_result(self) -> Result<usize> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(self.committed_event_count),
+        }
     }
 }
 
@@ -156,6 +203,9 @@ trait InputCaptureBackend: Send {
     fn drain_release_events(&mut self) -> Vec<InputEvent>;
     fn reset(&mut self);
     fn poll_events(&mut self) -> Result<Vec<InputEvent>>;
+    fn poll_handoff_probe(&mut self) -> Option<InputEvent> {
+        None
+    }
     fn drain_control_actions(&mut self) -> Vec<CaptureControlAction>;
     fn set_lock_active(&mut self, active: bool) -> Result<bool>;
     fn safety_unlock_generation(&self) -> u64 {
@@ -169,6 +219,11 @@ trait InputCaptureBackend: Send {
         self.set_lock_active(active)
     }
     fn renew_lock_lease(&self) -> bool {
+        false
+    }
+    /// Whether a false result from guarded lock activation is an authoritative
+    /// local refusal rather than an asynchronous broker acknowledgement.
+    fn lock_activation_is_synchronous(&self) -> bool {
         false
     }
     fn lock_supported(&self) -> bool;
@@ -186,9 +241,16 @@ trait InputCaptureBackend: Send {
     fn take_dropped_event_count(&mut self) -> u64 {
         0
     }
+
+    fn windows_num_lock_state(&self) -> Option<WindowsNumLockState> {
+        None
+    }
 }
 
-fn input_backend(mode: InputRuntimeMode) -> Box<dyn InputBackend> {
+fn input_backend(
+    mode: InputRuntimeMode,
+    num_lock_state: Option<WindowsNumLockState>,
+) -> Box<dyn InputBackend> {
     if mode.is_service_session_unsupported() {
         return service_session_unsupported_input_backend();
     }
@@ -198,11 +260,18 @@ fn input_backend(mode: InputRuntimeMode) -> Box<dyn InputBackend> {
         if !windows_interactive_input_supported("input injection") {
             return service_session_unsupported_input_backend();
         }
-        Box::new(WindowsInputBackend)
+        let Some(num_lock_state) = num_lock_state else {
+            warn!("interactive input injection has no capture-owned Num Lock state");
+            return service_session_unsupported_input_backend();
+        };
+        Box::new(WindowsInputBackend {
+            input: WindowsInputState::new(num_lock_state),
+        })
     }
 
     #[cfg(not(windows))]
     {
+        let _ = num_lock_state;
         Box::new(NoopInputBackend)
     }
 }
@@ -224,9 +293,18 @@ fn input_capture_backend(state: &AppState, mode: InputRuntimeMode) -> Box<dyn In
             Err(error) => {
                 warn!(
                     error = ?error,
-                    "failed to start low-level capture hooks; falling back to polling capture backend"
+                    "failed to start low-level capture hooks; attempting polling capture fallback"
                 );
-                Box::new(WindowsPollingCaptureBackend::default())
+                match WindowsPollingCaptureBackend::seeded() {
+                    Ok(backend) => Box::new(backend),
+                    Err(seed_error) => {
+                        warn!(
+                            error = ?seed_error,
+                            "polling capture fallback unavailable because Num Lock state could not be seeded"
+                        );
+                        service_session_unsupported_capture_backend()
+                    }
+                }
             }
         }
     }
@@ -295,15 +373,36 @@ struct BrokerRelayCaptureBackend {
 }
 
 #[cfg(windows)]
-#[derive(Default)]
-struct WindowsInputBackend;
+struct WindowsInputBackend {
+    input: WindowsInputState,
+}
 
 #[cfg(windows)]
-#[derive(Default)]
 struct WindowsPollingCaptureBackend {
     last_cursor: Option<(i32, i32)>,
-    last_key_down: HashMap<u16, bool>,
+    last_key_down: HashMap<u16, (bool, KeySemantics)>,
     last_button_down: HashMap<u16, bool>,
+    num_lock_state: WindowsNumLockState,
+}
+
+#[cfg(windows)]
+impl WindowsPollingCaptureBackend {
+    fn new(num_lock_state: WindowsNumLockState) -> Self {
+        Self {
+            last_cursor: None,
+            last_key_down: HashMap::new(),
+            last_button_down: HashMap::new(),
+            num_lock_state,
+        }
+    }
+
+    fn seeded() -> Result<Self> {
+        Self::seeded_with(num_lock_state_from_dedicated_message_lane)
+    }
+
+    fn seeded_with(query_num_lock: impl FnOnce() -> Result<bool>) -> Result<Self> {
+        Ok(Self::new(WindowsNumLockState::new(query_num_lock()?)))
+    }
 }
 
 #[cfg(windows)]
@@ -326,6 +425,7 @@ mod tests {
         let frame = PendingInjectInputFrame {
             peer_id: "peer-a".to_string(),
             sequence: 1,
+            authorization_generation: 1,
             capture_timestamp_unix_ms: 1,
             received_timestamp_unix_ms: 2,
             queued_timestamp_unix_ms: 3,
@@ -336,11 +436,14 @@ mod tests {
                 InputEvent::Key {
                     scan_code: 30,
                     state: core_input::KeyState::Down,
+                    semantics: KeySemantics::Physical,
                 },
             ],
         };
 
-        apply_frame(&mut backend, &frame).expect("noop backend should accept events");
+        apply_frame(&mut backend, &frame)
+            .into_result()
+            .expect("noop backend should accept events");
     }
 
     #[test]
@@ -349,6 +452,7 @@ mod tests {
         let frame = PendingInjectInputFrame {
             peer_id: "peer-a".to_string(),
             sequence: 1,
+            authorization_generation: 1,
             capture_timestamp_unix_ms: 1,
             received_timestamp_unix_ms: 2,
             queued_timestamp_unix_ms: 3,
@@ -359,6 +463,7 @@ mod tests {
 
         let error = backend
             .apply_frame(&frame.events)
+            .into_result()
             .expect_err("unsupported injection");
         assert!(
             error
@@ -442,6 +547,24 @@ mod tests {
         applied_scan_codes: Vec<u16>,
     }
 
+    struct FailAfterFirstCommittedEventOnceBackend {
+        failed: bool,
+        applied: Vec<InputEvent>,
+    }
+
+    impl InputBackend for FailAfterFirstCommittedEventOnceBackend {
+        fn apply(&mut self, event: &InputEvent) -> Result<()> {
+            if !self.failed && self.applied.len() == 1 {
+                self.failed = true;
+                return Err(anyhow::anyhow!(
+                    "scripted failure after one committed source event"
+                ));
+            }
+            self.applied.push(event.clone());
+            Ok(())
+        }
+    }
+
     impl InputBackend for FailOnceBackend {
         fn apply(&mut self, event: &InputEvent) -> Result<()> {
             match event {
@@ -469,6 +592,7 @@ mod tests {
         lock_supported: bool,
         lock_active: bool,
         lock_updates: Vec<bool>,
+        refuse_guarded_lock: bool,
         reset_count: usize,
         poll_count: usize,
     }
@@ -482,6 +606,7 @@ mod tests {
                 lock_supported: true,
                 lock_active: false,
                 lock_updates: Vec::new(),
+                refuse_guarded_lock: false,
                 reset_count: 0,
                 poll_count: 0,
             }
@@ -489,6 +614,11 @@ mod tests {
 
         fn with_control_actions(mut self, actions: Vec<CaptureControlAction>) -> Self {
             self.control_actions = VecDeque::from(actions);
+            self
+        }
+
+        fn with_guarded_lock_refusal(mut self) -> Self {
+            self.refuse_guarded_lock = true;
             self
         }
     }
@@ -520,6 +650,23 @@ mod tests {
                 self.lock_active = false;
                 Ok(false)
             }
+        }
+
+        fn set_lock_active_if_safety_generation(
+            &mut self,
+            active: bool,
+            _expected_generation: u64,
+        ) -> Result<bool> {
+            if active && self.refuse_guarded_lock {
+                self.lock_updates.push(true);
+                self.lock_active = false;
+                return Ok(false);
+            }
+            self.set_lock_active(active)
+        }
+
+        fn lock_activation_is_synchronous(&self) -> bool {
+            true
         }
 
         fn lock_supported(&self) -> bool {
@@ -592,6 +739,88 @@ mod tests {
         (state, peer_id, root)
     }
 
+    async fn assert_committed_prefix_is_not_replayed(events: Vec<InputEvent>) {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim owner")
+        );
+        state
+            .route_incoming_input_frame(
+                &peer_id,
+                InputFrame {
+                    source_peer_id: peer_id.clone(),
+                    sequence: 1,
+                    timestamp_unix_ms: Utc::now().timestamp_millis(),
+                    events: events.clone(),
+                },
+            )
+            .await
+            .expect("route frame");
+
+        let mut backend = FailAfterFirstCommittedEventOnceBackend {
+            failed: false,
+            applied: Vec::new(),
+        };
+        drain_pending_inject_frames(&state, &mut backend).await;
+        assert_eq!(
+            backend.applied,
+            events[..1],
+            "the first injection pass should commit only the first source event"
+        );
+
+        tokio::time::sleep(Duration::from_millis(
+            INPUT_INJECT_RETRY_BASE_BACKOFF_MS + 5,
+        ))
+        .await;
+        drain_pending_inject_frames(&state, &mut backend).await;
+        assert_eq!(
+            backend.applied, events,
+            "retry must inject only the uncommitted suffix"
+        );
+        assert_eq!(state.pending_inject_input_frame_count().await, 0);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn direct_retry_trims_committed_key_and_mouse_prefixes() {
+        let key = InputEvent::Key {
+            scan_code: 30,
+            state: KeyState::Down,
+            semantics: KeySemantics::Physical,
+        };
+        let mouse = InputEvent::MouseButton {
+            button: core_input::MouseButton::Left,
+            state: KeyState::Down,
+        };
+
+        assert_committed_prefix_is_not_replayed(vec![key.clone(), mouse.clone()]).await;
+        assert_committed_prefix_is_not_replayed(vec![mouse, key]).await;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn polling_capture_seeds_num_lock_on_instead_of_assuming_false() {
+        let backend = WindowsPollingCaptureBackend::seeded_with(|| Ok(true))
+            .expect("seed Num Lock from message lane");
+        assert!(backend.num_lock_state.is_on());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn polling_capture_seed_failure_is_not_coerced_to_num_lock_off() {
+        let error = match WindowsPollingCaptureBackend::seeded_with(|| {
+            Err(anyhow::anyhow!("message lane unavailable"))
+        }) {
+            Ok(_) => panic!("fallback must fail closed when its seed is unavailable"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("message lane unavailable"));
+    }
+
     #[tokio::test]
     async fn perf_probe_inject_wake_backlog_throughput() {
         let (state, peer_id, root) = state_with_peer_for_input_test().await;
@@ -619,6 +848,7 @@ mod tests {
                         events: vec![InputEvent::Key {
                             scan_code: sequence as u16,
                             state: KeyState::Down,
+                            semantics: KeySemantics::Physical,
                         }],
                     },
                 )
@@ -646,7 +876,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_skips_frame_if_owner_changes_before_inject() {
+    async fn drain_skips_stale_generation_and_keeps_reclaimed_owner_frame_distinct() {
         let (state, peer_id, root) = state_with_peer_for_input_test().await;
         assert!(
             state
@@ -662,20 +892,56 @@ mod tests {
                     source_peer_id: peer_id.clone(),
                     sequence: 1,
                     timestamp_unix_ms: 1,
-                    events: vec![InputEvent::Key {
-                        scan_code: 30,
-                        state: KeyState::Down,
-                    }],
+                    events: vec![InputEvent::MouseMove { dx: 1, dy: 0 }],
                 },
             )
             .await
             .expect("route");
 
         assert!(state.release_input_owner(&peer_id).await, "release owner");
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("same peer reclaims owner"),
+            "same peer should reclaim owner under a new authorization generation"
+        );
+        state
+            .route_incoming_input_frame(
+                &peer_id,
+                InputFrame {
+                    source_peer_id: peer_id.clone(),
+                    sequence: 2,
+                    timestamp_unix_ms: 2,
+                    events: vec![InputEvent::MouseMove { dx: 2, dy: 0 }],
+                },
+            )
+            .await
+            .expect("route reclaimed owner frame");
+
+        let mut queued = state
+            .dequeue_pending_inject_input_frames_up_to(usize::MAX)
+            .await;
+        assert_eq!(
+            queued.len(),
+            2,
+            "move frames from different authorization generations must not coalesce"
+        );
+        assert_ne!(
+            queued[0].authorization_generation,
+            queued[1].authorization_generation
+        );
+        queued[0].next_retry_at = Some(Instant::now() + Duration::from_secs(60));
+        state
+            .requeue_pending_inject_input_frames_front(queued)
+            .await;
 
         let mut backend = CountingBackend { applied: 0 };
         drain_pending_inject_frames(&state, &mut backend).await;
-        assert_eq!(backend.applied, 0, "stale owner frame must not be injected");
+        assert_eq!(
+            backend.applied, 1,
+            "only the reclaimed owner's current-generation frame should be injected"
+        );
         assert!(
             state.dequeue_pending_inject_input_frame().await.is_none(),
             "skipped stale frame should be dropped"
@@ -715,6 +981,7 @@ mod tests {
                         events: vec![InputEvent::Key {
                             scan_code: sequence as u16,
                             state: KeyState::Down,
+                            semantics: KeySemantics::Physical,
                         }],
                     },
                 )
@@ -793,6 +1060,7 @@ mod tests {
                         events: vec![InputEvent::Key {
                             scan_code: sequence as u16,
                             state: KeyState::Down,
+                            semantics: KeySemantics::Physical,
                         }],
                     },
                 )
@@ -846,6 +1114,7 @@ mod tests {
             .map(|index| InputEvent::Key {
                 scan_code: index as u16 + 1,
                 state: KeyState::Down,
+                semantics: KeySemantics::Physical,
             })
             .collect::<Vec<_>>();
         let mut backend = ScriptedCaptureBackend::new(vec![events], Vec::new());
@@ -983,6 +1252,7 @@ mod tests {
                 InputEvent::Key {
                     scan_code: 30,
                     state: KeyState::Up,
+                    semantics: KeySemantics::Physical,
                 },
             ],
         );
@@ -1039,6 +1309,7 @@ mod tests {
             vec![InputEvent::Key {
                 scan_code: 42,
                 state: KeyState::Up,
+                semantics: KeySemantics::Physical,
             }],
         );
         let mut last_target = None;
@@ -1066,7 +1337,11 @@ mod tests {
             outgoing.first(),
             Some(crate::state::OutboundPayload::InputFrame { sequence: 1, events, .. }) if matches!(
                 events.as_slice(),
-                [InputEvent::Key { scan_code: 42, state: KeyState::Up }]
+                [InputEvent::Key {
+                    scan_code: 42,
+                    state: KeyState::Up,
+                    ..
+                }]
             )
         ));
 
@@ -1115,6 +1390,7 @@ mod tests {
             vec![InputEvent::Key {
                 scan_code: 30,
                 state: KeyState::Up,
+                semantics: KeySemantics::Physical,
             }],
         );
         let mut last_target = None;
@@ -1160,7 +1436,11 @@ mod tests {
             left_outgoing.get(1),
             Some(crate::state::OutboundPayload::InputFrame { sequence: 2, events, .. }) if matches!(
                 events.as_slice(),
-                [InputEvent::Key { scan_code: 30, state: KeyState::Up }]
+                [InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Up,
+                    ..
+                }]
             )
         ));
         let right_outgoing = state.drain_outgoing(&right_peer).await;
@@ -1569,7 +1849,7 @@ mod tests {
             .expect("set target");
 
         let mut backend = ScriptedCaptureBackend::new(vec![Vec::new()], Vec::new())
-            .with_control_actions(vec![CaptureControlAction::EscapeUnlock]);
+            .with_control_actions(vec![CaptureControlAction::Escape]);
         let mut last_target = None;
         let mut edge_switch_state = EdgeSwitchState::default();
 
@@ -1591,6 +1871,105 @@ mod tests {
             !backend.lock_updates.contains(&true),
             "a pending safety action must be drained before any relock attempt"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn capture_safety_unlock_telemetry_preserves_each_cause() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set target");
+
+        let mut backend = ScriptedCaptureBackend::new(vec![Vec::new()], Vec::new())
+            .with_control_actions(vec![
+                CaptureControlAction::Escape,
+                CaptureControlAction::LeaseExpired,
+                CaptureControlAction::DetectorUnavailable,
+            ]);
+        let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
+
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+
+        let events = state.transport_events().await;
+        for (kind, detail) in [
+            ("input_escape_triggered", "cause=double_ctrl"),
+            ("input_lock_lease_expired", "cause=lease_expired"),
+            (
+                "input_escape_detector_unavailable",
+                "cause=detector_unavailable",
+            ),
+        ] {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.kind == kind && event.detail == detail),
+                "missing cause-specific safety telemetry {kind} {detail}: {events:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn guarded_lock_refusal_clears_target_before_forwarding_input() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set target");
+
+        let mut backend = ScriptedCaptureBackend::new(
+            vec![vec![InputEvent::Key {
+                scan_code: 30,
+                state: KeyState::Down,
+                semantics: KeySemantics::Physical,
+            }]],
+            Vec::new(),
+        )
+        .with_guarded_lock_refusal();
+        let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
+
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+
+        assert!(
+            backend.lock_updates.contains(&true),
+            "the production capture path must exercise guarded activation"
+        );
+        assert!(
+            state.input_capture_target().await.is_none(),
+            "an authoritative local lock refusal must clear capture ownership"
+        );
+        assert!(
+            state.drain_outgoing(&peer_id).await.is_empty(),
+            "captured input must not be forwarded while it is also active locally"
+        );
+        let (locked, _) = state.input_lock_runtime().await;
+        assert!(!locked, "a refused activation must be reported as unlocked");
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1618,7 +1997,7 @@ mod tests {
             }]],
             Vec::new(),
         )
-        .with_control_actions(vec![CaptureControlAction::EscapeUnlock]);
+        .with_control_actions(vec![CaptureControlAction::Escape]);
         let mut last_target = None;
         let mut edge_switch_state = EdgeSwitchState::default();
 
@@ -1643,10 +2022,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn maps_key_event_to_scan_code_record() {
-        let records = input_records_for_event(&InputEvent::Key {
-            scan_code: 30,
-            state: core_input::KeyState::Down,
-        });
+        let records = input_records_for_event_with_num_lock_state(
+            &InputEvent::Key {
+                scan_code: 30,
+                state: core_input::KeyState::Down,
+                semantics: KeySemantics::Physical,
+            },
+            false,
+        );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].r#type, INPUT_KEYBOARD);
 
@@ -1659,10 +2042,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn maps_extended_scan_code_with_extended_flag() {
-        let records = input_records_for_event(&InputEvent::Key {
-            scan_code: 0xE04D,
-            state: core_input::KeyState::Down,
-        });
+        let records = input_records_for_event_with_num_lock_state(
+            &InputEvent::Key {
+                scan_code: 0xE04D,
+                state: core_input::KeyState::Down,
+                semantics: KeySemantics::Physical,
+            },
+            false,
+        );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].r#type, INPUT_KEYBOARD);
 
@@ -1677,10 +2064,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn maps_e1_prefixed_scan_code_with_extended_flag() {
-        let records = input_records_for_event(&InputEvent::Key {
-            scan_code: 0xE11D,
-            state: core_input::KeyState::Down,
-        });
+        let records = input_records_for_event_with_num_lock_state(
+            &InputEvent::Key {
+                scan_code: 0xE11D,
+                state: core_input::KeyState::Down,
+                semantics: KeySemantics::Physical,
+            },
+            false,
+        );
         assert_eq!(records.len(), 1);
 
         let record = unsafe { records[0].Anonymous.ki };
@@ -1694,10 +2085,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn maps_wheel_event_to_two_records_when_both_axes_present() {
-        let records = input_records_for_event(&InputEvent::MouseWheel {
-            delta_x: 120,
-            delta_y: -120,
-        });
+        let records = input_records_for_event_with_num_lock_state(
+            &InputEvent::MouseWheel {
+                delta_x: 120,
+                delta_y: -120,
+            },
+            false,
+        );
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].r#type, INPUT_MOUSE);
         assert_eq!(records[1].r#type, INPUT_MOUSE);
@@ -1711,10 +2105,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn maps_absolute_move_event_to_absolute_mouse_record() {
-        let records = input_records_for_event(&InputEvent::MouseMoveAbsolute {
-            x_norm: 1234,
-            y_norm: 5678,
-        });
+        let records = input_records_for_event_with_num_lock_state(
+            &InputEvent::MouseMoveAbsolute {
+                x_norm: 1234,
+                y_norm: 5678,
+            },
+            false,
+        );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].r#type, INPUT_MOUSE);
 
@@ -1730,10 +2127,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn send_input_records_with_sender_batches_records_per_call() {
-        let records = input_records_for_event(&InputEvent::MouseWheel {
-            delta_x: 120,
-            delta_y: -120,
-        });
+        let records = input_records_for_event_with_num_lock_state(
+            &InputEvent::MouseWheel {
+                delta_x: 120,
+                delta_y: -120,
+            },
+            false,
+        );
         let mut call_count = 0usize;
 
         send_input_records_with_sender(&records, |chunk| {
@@ -1749,10 +2149,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn send_input_records_with_sender_stops_after_first_failed_record() {
-        let records = input_records_for_event(&InputEvent::MouseWheel {
-            delta_x: 120,
-            delta_y: -120,
-        });
+        let records = input_records_for_event_with_num_lock_state(
+            &InputEvent::MouseWheel {
+                delta_x: 120,
+                delta_y: -120,
+            },
+            false,
+        );
         let mut call_count = 0usize;
 
         let err = send_input_records_with_sender(&records, |_chunk| {
@@ -1849,6 +2252,18 @@ mod tests {
         )
         .await;
 
+        let lock_report = state
+            .exchange_input_broker(
+                allowed_broker_client(),
+                &attach.broker_token,
+                crate::state::InputBrokerExchangeObservations {
+                    lock_active: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(lock_report.capture_forwarding_authorized);
+
         let outcome = state
             .exchange_input_broker(
                 allowed_broker_client(),
@@ -1857,7 +2272,9 @@ mod tests {
                     captured_events: vec![InputEvent::Key {
                         scan_code: 30,
                         state: KeyState::Down,
+                        semantics: KeySemantics::Physical,
                     }],
+                    lock_active: true,
                     ..Default::default()
                 },
             )
@@ -1882,9 +2299,132 @@ mod tests {
             outgoing.first(),
             Some(crate::state::OutboundPayload::InputFrame { events, .. }) if matches!(
                 events.as_slice(),
-                [InputEvent::Key { scan_code: 30, state: KeyState::Down }]
+                [InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Down,
+                    ..
+                }]
             )
         ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn broker_handoff_probe_starts_capture_without_forwarding_prelock_keys() {
+        let (state, peer_id, root) = state_with_peer_for_input_test().await;
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("connect");
+        state
+            .set_layout(format!("self,{peer_id}"))
+            .await
+            .expect("set layout");
+        apply_startup_mode(&state, InputRuntimeMode::ServiceSessionUnsupported).await;
+        state.set_input_broker_allowed_user_sid("S-1-5-21-1000-2000-3000-1001");
+        let attach = state
+            .attach_input_broker(allowed_broker_client(), "test-broker".to_string(), true)
+            .await;
+        assert!(attach.accepted);
+        state
+            .set_input_capture_backend_mode(crate::state::INPUT_BROKER_BACKEND_MODE)
+            .await;
+
+        let observed = state
+            .exchange_input_broker(
+                allowed_broker_client(),
+                &attach.broker_token,
+                crate::state::InputBrokerExchangeObservations {
+                    captured_events: vec![InputEvent::Key {
+                        scan_code: 30,
+                        state: KeyState::Down,
+                        semantics: KeySemantics::Physical,
+                    }],
+                    cursor: Some((1919, 540)),
+                    virtual_bounds: Some((0, 0, 1919, 1079)),
+                    handoff_probe: Some((8, 0)),
+                    lock_active: false,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(observed.accepted);
+        assert!(!observed.capture_forwarding_authorized);
+
+        let mut backend = BrokerRelayCaptureBackend {
+            relay: state.input_broker_relay(),
+        };
+        let mut last_target = None;
+        let mut edge_switch_state = EdgeSwitchState::default();
+        capture_and_queue_outgoing_frames(
+            &state,
+            &mut backend,
+            &mut last_target,
+            &mut edge_switch_state,
+        )
+        .await;
+
+        assert_eq!(
+            state.input_capture_target().await.as_deref(),
+            Some(peer_id.as_str()),
+            "the unrouteable motion probe must still drive edge handoff"
+        );
+        let outgoing_events = state
+            .drain_outgoing(&peer_id)
+            .await
+            .into_iter()
+            .filter_map(|payload| match payload {
+                crate::state::OutboundPayload::InputFrame { events, .. } => Some(events),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(
+            outgoing_events
+                .iter()
+                .all(|event| !matches!(event, InputEvent::Key { .. })),
+            "pre-lock keys must not share the synthetic handoff path: {outgoing_events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn broker_relay_preserves_each_safety_unlock_cause() {
+        let (state, _peer_id, root) = state_with_peer_for_input_test().await;
+        apply_startup_mode(&state, InputRuntimeMode::ServiceSessionUnsupported).await;
+        state.set_input_broker_allowed_user_sid("S-1-5-21-1000-2000-3000-1001");
+        let attach = state
+            .attach_input_broker(allowed_broker_client(), "test-broker".to_string(), true)
+            .await;
+        assert!(attach.accepted);
+
+        let outcome = state
+            .exchange_input_broker(
+                allowed_broker_client(),
+                &attach.broker_token,
+                crate::state::InputBrokerExchangeObservations {
+                    escape_unlock_count: 1,
+                    lease_expired_unlock_count: 1,
+                    detector_unavailable_unlock_count: 1,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(outcome.accepted);
+
+        let mut backend = BrokerRelayCaptureBackend {
+            relay: state.input_broker_relay(),
+        };
+        assert_eq!(
+            backend.drain_control_actions(),
+            vec![
+                CaptureControlAction::Escape,
+                CaptureControlAction::LeaseExpired,
+                CaptureControlAction::DetectorUnavailable,
+            ]
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1909,7 +2449,20 @@ mod tests {
             .set_input_capture_target(Some(&peer_id))
             .await
             .expect("set target");
+        let _ = state.input_broker_relay().set_desired_lock_active(true);
         let _ = state.drain_outgoing(&peer_id).await;
+
+        let lock_report = state
+            .exchange_input_broker(
+                allowed_broker_client(),
+                &attach.broker_token,
+                crate::state::InputBrokerExchangeObservations {
+                    lock_active: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(lock_report.capture_forwarding_authorized);
 
         let observed = state
             .exchange_input_broker(
@@ -1919,7 +2472,9 @@ mod tests {
                     captured_events: vec![InputEvent::Key {
                         scan_code: 30,
                         state: KeyState::Down,
+                        semantics: KeySemantics::Physical,
                     }],
+                    lock_active: true,
                     ..Default::default()
                 },
             )
@@ -1957,9 +2512,10 @@ mod tests {
 
         let detach_state = state.clone();
         let broker_token = attach.broker_token.clone();
+        let delivery_epoch = attach.delivery_epoch.clone();
         let mut detach = tokio::spawn(async move {
             detach_state
-                .detach_input_broker(allowed_broker_client(), &broker_token)
+                .detach_input_broker(allowed_broker_client(), &broker_token, &delivery_epoch, 0)
                 .await
         });
         assert!(
@@ -1989,10 +2545,12 @@ mod tests {
                 InputEvent::Key {
                     scan_code: 30,
                     state: KeyState::Down,
+                    semantics: KeySemantics::Physical,
                 },
                 InputEvent::Key {
                     scan_code: 30,
                     state: KeyState::Up,
+                    semantics: KeySemantics::Physical,
                 },
             ],
             "the final release must be ordered after any pre-detach captured down event"
@@ -2024,7 +2582,7 @@ mod tests {
         assert!(!backend.pump.lock_active(), "stalled cycle must fail open");
         assert_eq!(
             backend.drain_control_actions(),
-            vec![CaptureControlAction::EscapeUnlock]
+            vec![CaptureControlAction::LeaseExpired]
         );
         assert!(
             !backend
@@ -2114,21 +2672,25 @@ mod tests {
         tx.send(HookCaptureEvent::Input(InputEvent::Key {
             scan_code: 30,
             state: KeyState::Down,
+            semantics: KeySemantics::Physical,
         }))
         .expect("send key down 1");
         tx.send(HookCaptureEvent::Input(InputEvent::Key {
             scan_code: 30,
             state: KeyState::Down,
+            semantics: KeySemantics::Physical,
         }))
         .expect("send key down 2");
         tx.send(HookCaptureEvent::Input(InputEvent::Key {
             scan_code: 30,
             state: KeyState::Up,
+            semantics: KeySemantics::Physical,
         }))
         .expect("send key up");
         tx.send(HookCaptureEvent::Input(InputEvent::Key {
             scan_code: 30,
             state: KeyState::Up,
+            semantics: KeySemantics::Physical,
         }))
         .expect("send duplicate key up");
 
@@ -2138,15 +2700,18 @@ mod tests {
             [
                 InputEvent::Key {
                     scan_code: 30,
-                    state: KeyState::Down
+                    state: KeyState::Down,
+                    ..
                 },
                 InputEvent::Key {
                     scan_code: 30,
-                    state: KeyState::Down
+                    state: KeyState::Down,
+                    ..
                 },
                 InputEvent::Key {
                     scan_code: 30,
-                    state: KeyState::Up
+                    state: KeyState::Up,
+                    ..
                 }
             ]
         ));

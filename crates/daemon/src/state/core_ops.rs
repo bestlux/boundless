@@ -52,6 +52,7 @@ impl AppState {
             clipboard: Arc::new(ClipboardState::default()),
             pairing: Arc::new(PairingState::default()),
             transport: Arc::new(TransportState::default()),
+            transport_session_transition: Arc::new(Mutex::new(())),
             discovery: Arc::new(DiscoveryState::default()),
             input: Arc::new(InputState::new(input_enabled)),
             input_broker: Arc::new(InputBrokerRelay::default()),

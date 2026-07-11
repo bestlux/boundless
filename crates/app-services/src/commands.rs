@@ -172,6 +172,7 @@ pub struct InputBrokerAttachCommand {
     pub verified_client: Option<VerifiedControlClient>,
     pub broker_version: String,
     pub lock_supported: bool,
+    pub protocol_revision: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -182,10 +183,16 @@ pub struct InputBrokerExchangeCommand {
     pub cursor: Option<(i32, i32)>,
     pub virtual_bounds: Option<(i32, i32, i32, i32)>,
     pub escape_unlock_count: u32,
+    pub lease_expired_unlock_count: u32,
+    pub detector_unavailable_unlock_count: u32,
+    pub handoff_probe: Option<(i32, i32)>,
     pub lock_active: bool,
     pub dropped_event_count: u64,
     pub injected_frame_count: u32,
     pub inject_failure_count: u32,
+    pub inject_backpressure: bool,
+    pub acked_inject_batch_id: u64,
+    pub held_input_authorization_generation: u64,
     pub raw_device_wheel_event_count: u32,
     pub raw_system_wheel_event_count: u32,
     pub hook_wheel_event_count: u32,
@@ -212,6 +219,8 @@ pub struct ClipboardBrokerExchangeCommand {
 pub struct InputBrokerDetachCommand {
     pub verified_client: Option<VerifiedControlClient>,
     pub broker_token: String,
+    pub delivery_epoch: String,
+    pub acked_inject_batch_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

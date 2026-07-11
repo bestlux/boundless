@@ -18,6 +18,7 @@ const ERROR_SERVICE_ALREADY_RUNNING_CODE: i32 = 1056;
 const ERROR_SERVICE_DOES_NOT_EXIST_CODE: i32 = 1060;
 const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(15);
 const ELEVATED_HELPER_TIMEOUT_MS: u32 = 20_000;
+const SERVICE_START_ORIGIN_EVENT_PREFIX: &str = "Local\\Boundless.Tray.ServiceStartOrigin.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServiceRecoveryOffer {
@@ -209,8 +210,81 @@ fn classify_start_access_denied() -> Result<ServiceStartRequest> {
     }
 }
 
-fn start_boundless_service_elevated_entrypoint() -> Result<()> {
-    match request_boundless_service_start()? {
+fn service_start_origin_event_name(user_sid: &str, session_id: u32, nonce: &str) -> Result<String> {
+    if !validate_allowed_user_sid_shape(user_sid) {
+        bail!("service-start origin SID must use canonical numeric SID syntax");
+    }
+    if session_id == 0 {
+        bail!("service-start origin session must be an interactive Windows session");
+    }
+    if nonce.len() != 32
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("service-start origin nonce must use 32 lowercase hexadecimal characters");
+    }
+    Ok(format!(
+        "{SERVICE_START_ORIGIN_EVENT_PREFIX}.{user_sid}.{session_id}.{nonce}"
+    ))
+}
+
+fn request_elevated_service_start_with<OriginExists, SentinelExists, StartService>(
+    origin_sid: Option<&str>,
+    origin_session: Option<u32>,
+    origin_nonce: Option<&str>,
+    current_session: u32,
+    origin_exists: OriginExists,
+    sentinel_exists: SentinelExists,
+    start_service: StartService,
+) -> Result<ServiceStartRequest>
+where
+    OriginExists: FnOnce(&str) -> Result<bool>,
+    SentinelExists: FnOnce(&str) -> Result<bool>,
+    StartService: FnOnce() -> Result<ServiceStartRequest>,
+{
+    let origin_sid = origin_sid
+        .filter(|value| !value.is_empty())
+        .context("privileged service-start mode requires an origin SID")?;
+    let origin_session =
+        origin_session.context("privileged service-start mode requires an origin session")?;
+    let origin_nonce = origin_nonce
+        .filter(|value| !value.is_empty())
+        .context("privileged service-start mode requires an origin nonce")?;
+    if origin_session != current_session {
+        bail!(
+            "service-start origin session {origin_session} did not match helper session {current_session}"
+        );
+    }
+    let origin_event_name =
+        service_start_origin_event_name(origin_sid, origin_session, origin_nonce)?;
+    if !origin_exists(&origin_event_name)? {
+        bail!("privileged service-start origin event was not held by the requesting tray");
+    }
+    let sentinel_name = tray_upgrade_quiescence_sentinel_name(origin_sid, origin_session);
+    if sentinel_exists(&sentinel_name)? {
+        bail!("BoundlessService startup is blocked while an installer quiescence sentinel is active");
+    }
+    start_service()
+}
+
+fn start_boundless_service_elevated_entrypoint(
+    origin_sid: Option<&str>,
+    origin_session: Option<u32>,
+    origin_nonce: Option<&str>,
+) -> Result<()> {
+    let current_session =
+        current_process_session_id().context("resolve privileged service-start helper session")?;
+    let request = request_elevated_service_start_with(
+        origin_sid,
+        origin_session,
+        origin_nonce,
+        current_session,
+        ServiceStartOriginGuard::exists,
+        SingleInstanceGuard::local_mutex_exists,
+        request_boundless_service_start,
+    )?;
+    match request {
         ServiceStartRequest::Requested | ServiceStartRequest::AlreadyInProgress => {
             wait_for_service_running_blocking(SERVICE_START_TIMEOUT)
         }
@@ -254,9 +328,25 @@ fn wait_for_service_running_blocking(timeout: Duration) -> Result<()> {
 
 fn launch_elevated_service_start_helper() -> Result<()> {
     let executable = std::env::current_exe().context("resolve current Boundless tray executable")?;
+    let origin_sid = current_user_sid_string().context("resolve service-start origin SID")?;
+    let origin_session =
+        current_process_session_id().context("resolve service-start origin session")?;
+    let origin_nonce = uuid::Uuid::new_v4().simple().to_string();
+    let origin_event_name =
+        service_start_origin_event_name(&origin_sid, origin_session, &origin_nonce)?;
+    let sentinel_name = tray_upgrade_quiescence_sentinel_name(&origin_sid, origin_session);
+    if SingleInstanceGuard::local_mutex_exists(&sentinel_name)? {
+        bail!("BoundlessService startup is blocked while an installer quiescence sentinel is active");
+    }
+    let origin_guard = ServiceStartOriginGuard::create(&origin_event_name, &origin_sid)?;
+    if !origin_guard.is_held() {
+        bail!("service-start origin guard was not held before elevation");
+    }
     let verb = wide_null("runas");
     let executable = os_wide_null(executable.as_os_str());
-    let parameters = wide_null("--start-service-elevated");
+    let parameters = wide_null(&format!(
+        "--start-service-elevated --service-start-origin-sid {origin_sid} --service-start-origin-session {origin_session} --service-start-origin-nonce {origin_nonce}"
+    ));
     let mut execute_info = unsafe { std::mem::zeroed::<SHELLEXECUTEINFOW>() };
     execute_info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
     execute_info.fMask = SEE_MASK_NOCLOSEPROCESS;
@@ -398,6 +488,7 @@ impl Drop for OwnedProcessHandle {
 #[cfg(test)]
 mod service_recovery_tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn service_states_map_to_recovery_boundaries() {
@@ -435,5 +526,82 @@ mod service_recovery_tests {
 
         assert!(service_recovery_offer_for_state(&BoundlessServiceState::Running).is_none());
         assert!(service_recovery_offer_for_state(&BoundlessServiceState::Missing).is_none());
+    }
+
+    #[test]
+    fn privileged_service_start_requires_a_complete_verified_origin() {
+        let start_called = Cell::new(false);
+        let error = request_elevated_service_start_with(
+            None,
+            None,
+            None,
+            1,
+            |_| panic!("origin event must not be inspected without identity arguments"),
+            |_| panic!("sentinel must not be inspected without identity arguments"),
+            || {
+                start_called.set(true);
+                Ok(ServiceStartRequest::Requested)
+            },
+        )
+        .expect_err("direct hidden invocation without origin identity must fail");
+
+        assert!(error.to_string().contains("requires an origin SID"));
+        assert!(!start_called.get());
+    }
+
+    #[test]
+    fn held_upgrade_sentinel_refuses_before_scm_start_mutation() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let start_called = Cell::new(false);
+        let error = request_elevated_service_start_with(
+            Some(sid),
+            Some(7),
+            Some(nonce),
+            7,
+            |name| {
+                assert_eq!(
+                    name,
+                    "Local\\Boundless.Tray.ServiceStartOrigin.v1.S-1-5-21-1-2-3-1001.7.0123456789abcdef0123456789abcdef"
+                );
+                Ok(true)
+            },
+            |name| {
+                assert_eq!(
+                    name,
+                    "Local\\Boundless.Tray.UpgradeQuiescence.v1.S-1-5-21-1-2-3-1001.7"
+                );
+                Ok(true)
+            },
+            || {
+                start_called.set(true);
+                Ok(ServiceStartRequest::Requested)
+            },
+        )
+        .expect_err("held upgrade sentinel must block privileged service start");
+
+        assert!(error.to_string().contains("quiescence sentinel"));
+        assert!(!start_called.get());
+    }
+
+    #[test]
+    fn verified_origin_without_sentinel_reaches_service_start_once() {
+        let start_calls = Cell::new(0);
+        let request = request_elevated_service_start_with(
+            Some("S-1-5-21-1-2-3-1001"),
+            Some(7),
+            Some("0123456789abcdef0123456789abcdef"),
+            7,
+            |_| Ok(true),
+            |_| Ok(false),
+            || {
+                start_calls.set(start_calls.get() + 1);
+                Ok(ServiceStartRequest::Requested)
+            },
+        )
+        .expect("verified origin should reach SCM start boundary");
+
+        assert_eq!(request, ServiceStartRequest::Requested);
+        assert_eq!(start_calls.get(), 1);
     }
 }

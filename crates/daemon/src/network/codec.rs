@@ -1,5 +1,42 @@
 use super::*;
 
+pub(super) async fn write_transport_bytes<W>(
+    writer: &mut W,
+    bytes: &[u8],
+    operation: &'static str,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    time::timeout(
+        peer_transport::TRANSPORT_EGRESS_IO_TIMEOUT,
+        writer.write_all(bytes),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "{operation} timed out after {} ms",
+            peer_transport::TRANSPORT_EGRESS_IO_TIMEOUT.as_millis()
+        )
+    })?
+    .with_context(|| operation.to_string())
+}
+
+pub(super) async fn flush_transport_writer<W>(writer: &mut W, operation: &'static str) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    time::timeout(peer_transport::TRANSPORT_EGRESS_IO_TIMEOUT, writer.flush())
+        .await
+        .with_context(|| {
+            format!(
+                "{operation} timed out after {} ms",
+                peer_transport::TRANSPORT_EGRESS_IO_TIMEOUT.as_millis()
+            )
+        })?
+        .with_context(|| operation.to_string())
+}
+
 pub(super) fn input_events_to_wire(events: &[InputEvent]) -> Vec<WireInputEvent> {
     events.iter().map(input_event_to_wire).collect()
 }
@@ -28,11 +65,25 @@ fn input_event_to_wire(event: &InputEvent) -> WireInputEvent {
             delta_x: *delta_x,
             delta_y: *delta_y,
         },
-        InputEvent::Key { scan_code, state } => WireInputEvent::Key {
+        InputEvent::Key {
+            scan_code,
+            state,
+            semantics,
+        } => WireInputEvent::Key {
             scan_code: *scan_code,
             state: match state {
                 KeyState::Down => WireKeyState::Down,
                 KeyState::Up => WireKeyState::Up,
+            },
+            semantics: match semantics {
+                KeySemantics::Physical => WireKeySemantics::Physical,
+                KeySemantics::Windows {
+                    virtual_key,
+                    num_lock_on,
+                } => WireKeySemantics::Windows {
+                    virtual_key: *virtual_key,
+                    num_lock_on: *num_lock_on,
+                },
             },
         },
     }
@@ -60,11 +111,25 @@ pub(super) fn input_event_from_wire(event: WireInputEvent) -> InputEvent {
         WireInputEvent::MouseWheel { delta_x, delta_y } => {
             InputEvent::MouseWheel { delta_x, delta_y }
         }
-        WireInputEvent::Key { scan_code, state } => InputEvent::Key {
+        WireInputEvent::Key {
+            scan_code,
+            state,
+            semantics,
+        } => InputEvent::Key {
             scan_code,
             state: match state {
                 WireKeyState::Down => KeyState::Down,
                 WireKeyState::Up => KeyState::Up,
+            },
+            semantics: match semantics {
+                WireKeySemantics::Physical => KeySemantics::Physical,
+                WireKeySemantics::Windows {
+                    virtual_key,
+                    num_lock_on,
+                } => KeySemantics::Windows {
+                    virtual_key,
+                    num_lock_on,
+                },
             },
         },
     }
@@ -75,4 +140,24 @@ pub(super) fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_key_semantics_survive_wire_conversion() {
+        let original = InputEvent::Key {
+            scan_code: 0x4F,
+            state: KeyState::Down,
+            semantics: KeySemantics::Windows {
+                virtual_key: 0x61,
+                num_lock_on: true,
+            },
+        };
+
+        let wire = input_event_to_wire(&original);
+        assert_eq!(input_event_from_wire(wire), original);
+    }
 }

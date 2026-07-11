@@ -1,5 +1,9 @@
 use super::*;
 
+pub(crate) struct TransportSessionEgressGuard {
+    _transition: tokio::sync::OwnedMutexGuard<()>,
+}
+
 impl AppState {
     pub async fn request_peer_reconnect(&self, peer_id: &str) -> u64 {
         let generation = self.transport.request_peer_reconnect(peer_id).await;
@@ -84,13 +88,67 @@ impl AppState {
         self.transport.allocate_transport_session_id()
     }
 
-    pub fn claim_transport_session(&self, peer_id: &str, session_id: u64) -> TransportSessionClaim {
-        self.transport.claim_transport_session(peer_id, session_id)
+    pub async fn claim_transport_session(
+        &self,
+        peer_id: &str,
+        session_id: u64,
+        preferred: bool,
+        cancellation: Arc<RuntimeWakeSignal>,
+    ) -> TransportSessionClaim {
+        let _transition = self.transport_session_transition.lock().await;
+        self.transport
+            .claim_transport_session(peer_id, session_id, preferred, cancellation)
+    }
+
+    /// Serializes queue drain/write/flush with transport ownership changes.
+    ///
+    /// The caller must hold this guard until every drained payload has either
+    /// been flushed or returned to the shared queue. That prevents a preferred
+    /// replacement from draining N+1 while the superseded lane still owns N.
+    pub(crate) async fn acquire_transport_session_egress(
+        &self,
+        peer_id: &str,
+        session_id: u64,
+    ) -> Option<TransportSessionEgressGuard> {
+        let transition = self.transport_session_transition.clone().lock_owned().await;
+        if !self
+            .transport
+            .is_active_transport_session(peer_id, session_id)
+        {
+            return None;
+        }
+        Some(TransportSessionEgressGuard {
+            _transition: transition,
+        })
     }
 
     pub fn clear_active_transport_session(&self, peer_id: &str, session_id: u64) -> bool {
         self.transport
             .clear_active_transport_session(peer_id, session_id)
+    }
+
+    pub async fn close_active_transport_session(&self, peer_id: &str, session_id: u64) -> bool {
+        let _transition = self.transport_session_transition.lock().await;
+        if !self
+            .transport
+            .clear_active_transport_session(peer_id, session_id)
+        {
+            return false;
+        }
+        let _ = self.set_peer_connected(peer_id, false).await;
+        true
+    }
+
+    pub async fn mark_peer_disconnected_if_no_active_transport_session(
+        &self,
+        peer_id: &str,
+    ) -> Result<bool> {
+        let _transition = self.transport_session_transition.lock().await;
+        if self.transport.has_active_transport_session(peer_id) {
+            return Ok(false);
+        }
+        self.set_peer_connected(peer_id, false).await?;
+        Ok(true)
     }
 
     pub fn has_active_transport_session(&self, peer_id: &str) -> bool {
@@ -145,15 +203,15 @@ impl AppState {
             .await?;
 
         if !disconnected_peer_ids.is_empty() {
-            let mut router = self.input.control.router.write().await;
+            let mut authorization = self.input.control.authorization.write().await;
             let mut released_owner = false;
             for peer_id in &disconnected_peer_ids {
-                released_owner = router.release_owner(peer_id) || released_owner;
-                router.clear_peer_state(peer_id);
+                released_owner = authorization.release_owner(peer_id) || released_owner;
+                authorization.clear_peer_state(peer_id);
             }
-            drop(router);
+            drop(authorization);
             if released_owner {
-                self.note_input_owner_transition().await;
+                self.notify_input_owner_transition();
             }
 
             for peer_id in &disconnected_peer_ids {

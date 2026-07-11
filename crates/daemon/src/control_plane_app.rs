@@ -559,16 +559,19 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
     ) -> Result<InputBrokerAttachSnapshot> {
         let outcome = self
             .state
-            .attach_input_broker(
+            .attach_input_broker_versioned(
                 broker_client_identity(command.verified_client),
                 command.broker_version,
                 command.lock_supported,
+                command.protocol_revision,
             )
             .await;
         Ok(InputBrokerAttachSnapshot {
             accepted: outcome.accepted,
             broker_token: outcome.broker_token,
             message: outcome.message,
+            protocol_revision: outcome.protocol_revision,
+            delivery_epoch: outcome.delivery_epoch,
         })
     }
 
@@ -586,10 +589,17 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
                     cursor: command.cursor,
                     virtual_bounds: command.virtual_bounds,
                     escape_unlock_count: command.escape_unlock_count,
+                    lease_expired_unlock_count: command.lease_expired_unlock_count,
+                    detector_unavailable_unlock_count: command.detector_unavailable_unlock_count,
+                    handoff_probe: command.handoff_probe,
                     lock_active: command.lock_active,
                     dropped_event_count: command.dropped_event_count,
                     injected_frame_count: command.injected_frame_count,
                     inject_failure_count: command.inject_failure_count,
+                    inject_backpressure: command.inject_backpressure,
+                    acked_inject_batch_id: command.acked_inject_batch_id,
+                    held_input_authorization_generation: command
+                        .held_input_authorization_generation,
                     raw_device_wheel_event_count: command.raw_device_wheel_event_count,
                     raw_system_wheel_event_count: command.raw_system_wheel_event_count,
                     hook_wheel_event_count: command.hook_wheel_event_count,
@@ -610,6 +620,11 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
                 .collect(),
             lock_should_be_active: outcome.lock_should_be_active,
             capture_active: outcome.capture_active,
+            capture_forwarding_authorized: outcome.capture_forwarding_authorized,
+            inject_batch_id: outcome.inject_batch_id,
+            inject_batch_cancelled: outcome.inject_batch_cancelled,
+            inject_authorization_generation: outcome.inject_authorization_generation,
+            held_input_authorized: outcome.held_input_authorized,
         })
     }
 
@@ -674,6 +689,8 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             .detach_input_broker(
                 broker_client_identity(command.verified_client),
                 &command.broker_token,
+                &command.delivery_epoch,
+                command.acked_inject_batch_id,
             )
             .await;
         Ok(OperationReply {

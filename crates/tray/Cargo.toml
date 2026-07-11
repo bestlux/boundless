@@ -20,6 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 eframe = { version = "0.34.1", default-features = false, features = ["default_fonts", "glow"] }

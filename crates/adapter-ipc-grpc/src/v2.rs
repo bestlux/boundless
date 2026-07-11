@@ -770,6 +770,7 @@ impl ControlPlaneService for ControlPlaneApi {
                 verified_client,
                 broker_version: request.broker_version,
                 lock_supported: request.lock_supported,
+                protocol_revision: request.protocol_revision,
             })
             .await
             .map_err(|error| Status::internal(format!("attach input broker: {error:#}")))?;
@@ -777,6 +778,8 @@ impl ControlPlaneService for ControlPlaneApi {
             accepted: reply.accepted,
             broker_token: reply.broker_token,
             message: reply.message,
+            protocol_revision: reply.protocol_revision,
+            delivery_epoch: reply.delivery_epoch,
         }))
     }
 
@@ -804,12 +807,19 @@ impl ControlPlaneService for ControlPlaneApi {
                     request.bounds_bottom,
                 )),
                 escape_unlock_count: request.escape_unlock_count,
+                lease_expired_unlock_count: request.lease_expired_unlock_count,
+                detector_unavailable_unlock_count: request.detector_unavailable_unlock_count,
+                handoff_probe: (request.handoff_probe_dx != 0 || request.handoff_probe_dy != 0)
+                    .then_some((request.handoff_probe_dx, request.handoff_probe_dy)),
                 lock_active: request.lock_active,
                 dropped_event_count: request
                     .dropped_event_count
                     .saturating_add(undecodable_events as u64),
                 injected_frame_count: request.injected_frame_count,
                 inject_failure_count: request.inject_failure_count,
+                inject_backpressure: request.inject_backpressure,
+                acked_inject_batch_id: request.acked_inject_batch_id,
+                held_input_authorization_generation: request.held_input_authorization_generation,
                 raw_device_wheel_event_count: request.raw_device_wheel_event_count,
                 raw_system_wheel_event_count: request.raw_system_wheel_event_count,
                 hook_wheel_event_count: request.hook_wheel_event_count,
@@ -830,6 +840,11 @@ impl ControlPlaneService for ControlPlaneApi {
                 .collect(),
             lock_should_be_active: reply.lock_should_be_active,
             capture_active: reply.capture_active,
+            capture_forwarding_authorized: reply.capture_forwarding_authorized,
+            inject_batch_id: reply.inject_batch_id,
+            inject_batch_cancelled: reply.inject_batch_cancelled,
+            inject_authorization_generation: reply.inject_authorization_generation,
+            held_input_authorized: reply.held_input_authorized,
         }))
     }
 
@@ -887,11 +902,14 @@ impl ControlPlaneService for ControlPlaneApi {
         request: Request<InputBrokerDetachRequest>,
     ) -> Result<Response<OperationReply>, Status> {
         let verified_client = verified_control_client(&request);
+        let request = request.into_inner();
         let reply = self
             .app
             .detach_input_broker(app_commands::InputBrokerDetachCommand {
                 verified_client,
-                broker_token: request.into_inner().broker_token,
+                broker_token: request.broker_token,
+                delivery_epoch: request.delivery_epoch,
+                acked_inject_batch_id: request.acked_inject_batch_id,
             })
             .await
             .map_err(|error| Status::internal(format!("detach input broker: {error:#}")))?;
@@ -1401,6 +1419,7 @@ mod tests {
         let mut request = Request::new(InputBrokerAttachRequest {
             broker_version: "test".to_string(),
             lock_supported: true,
+            protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
         });
         assert_eq!(
             verified_control_client(&request),

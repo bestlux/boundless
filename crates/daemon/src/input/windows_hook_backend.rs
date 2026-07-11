@@ -30,8 +30,10 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
             .drain_control_actions()
             .into_iter()
             .map(|action| match action {
-                HookControlAction::EscapeUnlock | HookControlAction::LeaseExpiredUnlock => {
-                    CaptureControlAction::EscapeUnlock
+                HookControlAction::EscapeUnlock => CaptureControlAction::Escape,
+                HookControlAction::LeaseExpiredUnlock => CaptureControlAction::LeaseExpired,
+                HookControlAction::DetectorUnavailableUnlock => {
+                    CaptureControlAction::DetectorUnavailable
                 }
             })
             .collect()
@@ -58,6 +60,10 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
         self.pump.renew_lock_lease()
     }
 
+    fn lock_activation_is_synchronous(&self) -> bool {
+        true
+    }
+
     fn lock_supported(&self) -> bool {
         true
     }
@@ -72,6 +78,10 @@ impl InputCaptureBackend for WindowsHookCaptureBackend {
 
     fn take_dropped_event_count(&mut self) -> u64 {
         self.pump.take_dropped_event_count()
+    }
+
+    fn windows_num_lock_state(&self) -> Option<WindowsNumLockState> {
+        Some(self.pump.num_lock_state())
     }
 }
 

@@ -6,8 +6,8 @@ pub(super) struct InjectDrainOutcome {
 }
 
 pub(super) async fn run(state: AppState, mode: InputRuntimeMode) -> Result<()> {
-    let mut inject_backend = input_backend(mode);
     let mut capture_backend = input_capture_backend(&state, mode);
+    let mut inject_backend = input_backend(mode, capture_backend.windows_num_lock_state());
     state
         .set_input_lock_runtime(false, capture_backend.lock_supported())
         .await;
@@ -176,17 +176,10 @@ pub(super) async fn drain_pending_inject_frames(
             break;
         }
 
-        if frame
-            .next_retry_at
-            .is_some_and(|next| std::time::Instant::now() < next)
+        if !state
+            .input_injection_authorized(&frame.peer_id, frame.authorization_generation)
+            .await
         {
-            deferred_frames.push(frame);
-            deferred_frames.extend(remaining);
-            preserve_deferred_front = true;
-            break;
-        }
-
-        if !state.input_injection_allowed_for_peer(&frame.peer_id).await {
             state
                 .record_input_inject_skipped(
                     &frame.peer_id,
@@ -199,28 +192,70 @@ pub(super) async fn drain_pending_inject_frames(
             continue;
         }
 
-        match apply_frame(backend, &frame) {
-            Ok(()) => {
+        if frame
+            .next_retry_at
+            .is_some_and(|next| std::time::Instant::now() < next)
+        {
+            deferred_frames.push(frame);
+            deferred_frames.extend(remaining);
+            preserve_deferred_front = true;
+            break;
+        }
+
+        let Some(apply_outcome) = state
+            .with_input_injection_authorization(
+                &frame.peer_id,
+                frame.authorization_generation,
+                || apply_frame(backend, &frame),
+            )
+            .await
+        else {
+            state
+                .record_input_inject_skipped(
+                    &frame.peer_id,
+                    frame.sequence,
+                    frame.events.len(),
+                    frame.timing(),
+                    "owner_or_feature_changed",
+                )
+                .await;
+            continue;
+        };
+
+        let attempted_event_count = frame.events.len();
+        debug_assert!(apply_outcome.committed_event_count <= attempted_event_count);
+        frame.events = apply_outcome.remaining_events;
+
+        match apply_outcome.error {
+            None => {
                 state
                     .record_input_inject_applied(
                         &frame.peer_id,
                         frame.sequence,
-                        frame.events.len(),
+                        attempted_event_count,
                         frame.timing(),
                     )
                     .await;
             }
-            Err(error) => {
+            Some(error) => {
                 let message = format!("{error:#}");
                 state
                     .record_input_inject_failed(
                         &frame.peer_id,
                         frame.sequence,
-                        frame.events.len(),
+                        attempted_event_count,
                         frame.timing(),
                         &message,
                     )
                     .await;
+
+                // Every event in the exact committed prefix is already in the
+                // OS input stream. Never replay that prefix, even if a cleanup
+                // error accompanied an otherwise fully committed frame.
+                if frame.events.is_empty() {
+                    processed += 1;
+                    continue;
+                }
 
                 let now_ms = Utc::now().timestamp_millis();
                 let frame_age_ms = now_ms.saturating_sub(frame.capture_timestamp_unix_ms);
@@ -296,7 +331,7 @@ pub(super) async fn drain_pending_inject_frames(
 pub(super) fn apply_frame(
     backend: &mut dyn InputBackend,
     frame: &PendingInjectInputFrame,
-) -> Result<()> {
+) -> InputApplyOutcome {
     backend.apply_frame(&frame.events)
 }
 
@@ -320,13 +355,17 @@ pub(super) async fn capture_and_queue_outgoing_frames(
         initial_relock_generation,
     )
     .await;
-    sync_local_input_lock(
+    let lock_activation_refused = sync_local_input_lock(
         state,
         backend,
         capture_target.is_some(),
         initial_relock_generation,
     )
     .await;
+    if lock_activation_refused {
+        clear_capture_after_lock_refusal(state, &mut capture_target, edge_switch_state).await;
+        escape_triggered = true;
+    }
 
     if &capture_target != last_capture_target {
         if let Some(previous_target) = last_capture_target.as_deref() {
@@ -359,6 +398,7 @@ pub(super) async fn capture_and_queue_outgoing_frames(
             Vec::new()
         }
     };
+    let handoff_probe = backend.poll_handoff_probe();
     let dropped_event_count = backend.take_dropped_event_count();
     if dropped_event_count > 0 {
         record_local_input_runtime_event(
@@ -369,7 +409,7 @@ pub(super) async fn capture_and_queue_outgoing_frames(
         )
         .await;
     }
-    if !events.is_empty() {
+    if !events.is_empty() || handoff_probe.is_some() {
         state.note_real_local_input_activity().await;
     }
     let cursor_position = backend.cursor_position();
@@ -404,9 +444,13 @@ pub(super) async fn capture_and_queue_outgoing_frames(
     }
 
     if !escape_triggered {
+        let handoff_events = handoff_probe
+            .as_ref()
+            .map(std::slice::from_ref)
+            .unwrap_or(&events);
         maybe_handoff_capture_target_from_motion(
             state,
-            &events,
+            handoff_events,
             pre_handoff_target.as_deref(),
             edge_switch_state,
             cursor_position,
@@ -415,14 +459,17 @@ pub(super) async fn capture_and_queue_outgoing_frames(
         .await;
     }
 
-    let post_handoff_target = state.active_input_capture_target().await;
-    sync_local_input_lock(
+    let mut post_handoff_target = state.active_input_capture_target().await;
+    let lock_activation_refused = sync_local_input_lock(
         state,
         backend,
         post_handoff_target.is_some(),
         final_relock_generation,
     )
     .await;
+    if lock_activation_refused {
+        clear_capture_after_lock_refusal(state, &mut post_handoff_target, edge_switch_state).await;
+    }
 
     let (Some(peer_id), None) = (
         post_handoff_target.as_deref(),
@@ -460,20 +507,20 @@ async fn drain_capture_control_actions(
 ) -> bool {
     let mut escape_triggered = false;
     for action in backend.drain_control_actions() {
-        if !matches!(action, CaptureControlAction::EscapeUnlock) {
-            continue;
-        }
-
         if capture_target.is_some() {
             state.clear_input_capture_target().await;
-            record_local_input_runtime_event(
-                state,
-                "input_escape_triggered",
-                "double_ctrl",
-                "none",
-            )
-            .await;
         }
+        let (kind, detail) = match action {
+            CaptureControlAction::Escape => ("input_escape_triggered", "cause=double_ctrl"),
+            CaptureControlAction::LeaseExpired => {
+                ("input_lock_lease_expired", "cause=lease_expired")
+            }
+            CaptureControlAction::DetectorUnavailable => (
+                "input_escape_detector_unavailable",
+                "cause=detector_unavailable",
+            ),
+        };
+        record_local_input_runtime_event(state, kind, detail, "none").await;
         edge_switch_state.last_direction = None;
         edge_switch_state.x_pressure = 0;
         edge_switch_state.y_pressure = 0;
@@ -492,7 +539,7 @@ async fn sync_local_input_lock(
     backend: &mut dyn InputCaptureBackend,
     should_lock: bool,
     relock_generation: u64,
-) {
+) -> bool {
     let supported = backend.lock_supported();
     let result = if should_lock {
         backend.set_lock_active_if_safety_generation(true, relock_generation)
@@ -503,6 +550,9 @@ async fn sync_local_input_lock(
         Ok(active) => active,
         Err(error) => {
             warn!(error = ?error, should_lock, "failed to update local input lock state");
+            if should_lock {
+                let _ = backend.set_lock_active(false);
+            }
             false
         }
     };
@@ -527,6 +577,35 @@ async fn sync_local_input_lock(
     if last_active != active || last_supported != supported {
         state.set_input_lock_runtime(active, supported).await;
     }
+
+    let activation_refused =
+        should_lock && supported && backend.lock_activation_is_synchronous() && !active;
+    if activation_refused {
+        record_local_input_runtime_event(
+            state,
+            "input_lock_activation_refused",
+            "requested=true applied=false capture_target=clearing",
+            "none",
+        )
+        .await;
+    }
+    activation_refused
+}
+
+async fn clear_capture_after_lock_refusal(
+    state: &AppState,
+    capture_target: &mut Option<String>,
+    edge_switch_state: &mut EdgeSwitchState,
+) {
+    if capture_target.is_some() {
+        state.clear_input_capture_target().await;
+    }
+    *capture_target = None;
+    edge_switch_state.last_direction = None;
+    edge_switch_state.x_pressure = 0;
+    edge_switch_state.y_pressure = 0;
+    edge_switch_state.suppress_until_instant =
+        Some(std::time::Instant::now() + Duration::from_millis(ESCAPE_EDGE_RECAPTURE_SUPPRESS_MS));
 }
 
 pub(super) async fn record_local_input_runtime_event(

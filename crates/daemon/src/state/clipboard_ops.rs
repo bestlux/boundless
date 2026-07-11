@@ -71,6 +71,41 @@ fn clipboard_payload_from_outbound_payload(payload: &OutboundPayload) -> Option<
     }
 }
 
+fn clipboard_payload_hash_from_outbound_payload(payload: &OutboundPayload) -> Option<String> {
+    match payload {
+        OutboundPayload::ClipboardText { text } => Some(core_clipboard::text_hash_hex(text)),
+        OutboundPayload::ClipboardImage { image_bmp } => {
+            Some(core_clipboard::image_hash_hex(image_bmp))
+        }
+        OutboundPayload::ClipboardImageCursor { image_bmp, .. } => {
+            Some(core_clipboard::image_hash_hex(image_bmp))
+        }
+        _ => None,
+    }
+}
+
+fn outbound_payload_is_clipboard(payload: &OutboundPayload) -> bool {
+    matches!(
+        payload,
+        OutboundPayload::ClipboardText { .. }
+            | OutboundPayload::ClipboardImage { .. }
+            | OutboundPayload::ClipboardImageCursor { .. }
+    )
+}
+
+fn retain_latest_outbound_clipboard_payload(queue: &mut VecDeque<OutboundPayload>) {
+    let Some(latest_clipboard_index) = queue.iter().rposition(outbound_payload_is_clipboard) else {
+        return;
+    };
+
+    let mut index = 0usize;
+    queue.retain(|payload| {
+        let keep = !outbound_payload_is_clipboard(payload) || index == latest_clipboard_index;
+        index = index.saturating_add(1);
+        keep
+    });
+}
+
 fn outbound_input_move_only_delta(payload: &OutboundPayload) -> Option<(u64, i64, i32, i32)> {
     let OutboundPayload::InputFrame {
         sequence,
@@ -201,7 +236,9 @@ impl AppState {
             queue.retain(|payload| {
                 !matches!(
                     payload,
-                    OutboundPayload::ClipboardText { .. } | OutboundPayload::ClipboardImage { .. }
+                    OutboundPayload::ClipboardText { .. }
+                        | OutboundPayload::ClipboardImage { .. }
+                        | OutboundPayload::ClipboardImageCursor { .. }
                 )
             });
             !queue.is_empty()
@@ -234,10 +271,9 @@ impl AppState {
         peer_id: &str,
         payload: &OutboundPayload,
     ) -> bool {
-        let Some(clipboard_payload) = clipboard_payload_from_outbound_payload(payload) else {
+        let Some(hash) = clipboard_payload_hash_from_outbound_payload(payload) else {
             return false;
         };
-        let hash = payload_hash_hex(&clipboard_payload);
 
         let mut sync = self.clipboard.sync.write().await;
         let Some(obsolete_hashes) = sync
@@ -276,8 +312,8 @@ impl AppState {
         let queue_map = self.transport.outgoing_bulk_payloads.read().await;
         queue_map.get(peer_id).is_some_and(|queue| {
             queue.iter().any(|payload| {
-                clipboard_payload_from_outbound_payload(payload)
-                    .is_some_and(|payload| payload_hash_hex(&payload) == replay_state.hash)
+                clipboard_payload_hash_from_outbound_payload(payload)
+                    .is_some_and(|hash| hash == replay_state.hash)
             })
         })
     }
@@ -359,6 +395,9 @@ impl AppState {
                 .entry(peer_id.to_string())
                 .or_default()
                 .push_back(payload);
+            if let Some(queue) = queue_map.get_mut(peer_id) {
+                retain_latest_outbound_clipboard_payload(queue);
+            }
         }
         self.notify_outgoing_flush_signal();
     }
@@ -557,7 +596,9 @@ impl AppState {
         {
             let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
             for (peer_id, outbound) in initially_connected_payloads {
-                queue_map.entry(peer_id).or_default().push_back(outbound);
+                let queue = queue_map.entry(peer_id).or_default();
+                queue.push_back(outbound);
+                retain_latest_outbound_clipboard_payload(queue);
             }
         }
         self.notify_outgoing_flush_signal();
@@ -1148,6 +1189,58 @@ impl AppState {
         true
     }
 
+    pub(crate) async fn has_outgoing_clipboard_image_cursor(
+        &self,
+        peer_id: &str,
+        transfer_id: &str,
+    ) -> bool {
+        self.transport
+            .outgoing_bulk_payloads
+            .read()
+            .await
+            .get(peer_id)
+            .is_some_and(|queue| {
+                queue.iter().any(|payload| {
+                    matches!(
+                        payload,
+                        OutboundPayload::ClipboardImageCursor {
+                            transfer_id: cursor_transfer_id,
+                            ..
+                        } if cursor_transfer_id == transfer_id
+                    )
+                })
+            })
+    }
+
+    pub(crate) async fn has_queued_outgoing_clipboard_payload(&self, peer_id: &str) -> bool {
+        self.transport
+            .outgoing_bulk_payloads
+            .read()
+            .await
+            .get(peer_id)
+            .is_some_and(|queue| queue.iter().any(outbound_payload_is_clipboard))
+    }
+
+    pub(crate) async fn outgoing_clipboard_image_cursor_transfer_ids(
+        &self,
+        peer_id: &str,
+    ) -> HashSet<String> {
+        self.transport
+            .outgoing_bulk_payloads
+            .read()
+            .await
+            .get(peer_id)
+            .into_iter()
+            .flat_map(|queue| queue.iter())
+            .filter_map(|payload| match payload {
+                OutboundPayload::ClipboardImageCursor { transfer_id, .. } => {
+                    Some(transfer_id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub async fn outgoing_bulk_queue_len(&self, peer_id: &str) -> usize {
         self.transport
@@ -1257,16 +1350,16 @@ impl AppState {
             }
         }
 
-        let has_bulk = !requeued_bulk.is_empty();
-        if has_bulk {
+        let has_requeued_bulk = !requeued_bulk.is_empty();
+        if has_requeued_bulk {
             let mut queue_map = self.transport.outgoing_bulk_payloads.write().await;
             let queue = queue_map.entry(peer_id.to_string()).or_default();
-            for payload in requeued_bulk.into_iter().rev() {
-                queue.push_front(payload);
-            }
+            requeued_bulk.append(queue);
+            retain_latest_outbound_clipboard_payload(&mut requeued_bulk);
+            *queue = requeued_bulk;
         }
 
-        if restored_replay || has_input || has_bulk {
+        if restored_replay || has_input || has_requeued_bulk {
             self.notify_outgoing_flush_signal();
         }
     }

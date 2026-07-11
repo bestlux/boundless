@@ -13,6 +13,7 @@ Related design notes:
   - Owns the authenticated session context and orchestrates read/write loop branches.
   - Owns per-session runtime state:
     - `SessionRuntime`
+    - cancellation-safe `WireFrameReader` offsets
     - `inbound_transfers`
     - `inbound_clipboard_image_transfers`
     - `outbound_transfer_flow`
@@ -21,10 +22,10 @@ Related design notes:
 - `crates/daemon/src/network/control.rs`
   - Handles `Hello`, `HelloAck`, and `Heartbeat` transport control frames.
   - Enforces canonical `PROTOCOL_CURRENT` handshake acceptance.
-  - Flushes queued outbound payloads on successful handshake control transitions.
+  - Flushes queued input on successful handshake control transitions; bulk waits for the session-owned startup turn.
 - `crates/daemon/src/network/outbound.rs`
   - Owns outbound queue drain/requeue and backpressure behavior.
-  - Enforces file chunk credit flow (`FileChunkCredit`) and chunk credit caps.
+  - Enforces file and clipboard-image chunk credit flow and chunk credit caps.
   - Converts outbound state payloads to wire messages and writes framed bytes.
 - `crates/daemon/src/network/inbound.rs`
   - Owns inbound file transfer lifecycle:
@@ -40,7 +41,7 @@ Related design notes:
   - Performs machine identity checks and payload-level rejection logging.
 - `crates/daemon/src/network/runtime.rs`
   - Owns listener and outbound supervisor loops.
-  - Handles endpoint selection/backoff/reconnect scheduling.
+  - Handles endpoint selection/backoff/reconnect scheduling and preserves the outbound worker registration id through its authenticated sessions.
 - `crates/daemon/src/network/tls.rs`
   - Owns TLS config, connector/acceptor construction, and server-name parsing.
 - `crates/daemon/src/network/codec.rs`
@@ -52,7 +53,20 @@ Related design notes:
 - Only `outbound.rs` drains/requeues outgoing payload queues.
 - Session-level chunk credit bookkeeping is isolated to `outbound_transfer_flow`.
 - Session-level inbound transfer staging is isolated to `inbound_transfers`.
+- Header and payload offsets survive `select!` cancellation so timer or egress branches cannot restart a partially consumed frame at the wrong byte.
+- Startup bulk is deterministic: the transport initiator drains its immediately-sendable queue, hands the turn to the acceptor with `StartupSyncComplete`, and waits for the return marker before normal bulk ticks begin.
 - Non-canonical protocol peers are rejected at handshake and guarded again in outbound send paths.
+- Protocol 4.4 retains the 4.3 physical keyboard identity and adds credited clipboard-image chunks. The clean bincode shape change intentionally rejects 4.3 peers at handshake; older local runtime config is migrated to 4.4 on upgrade.
+
+## Authenticated session ownership
+
+- A trusted peer may reach the daemon through either a locally initiated outbound connection or a reverse-initiated inbound connection. A nonpreferred direction is accepted when it is the only authenticated route, preserving one-sided LAN reachability.
+- When both physical directions race, both peers derive the same preferred connection: the lexicographically smaller machine id initiates it. The preferred authenticated session replaces and cancels an already claimed nonpreferred session; later nonpreferred duplicates cannot displace it.
+- Outbound worker registration ids and inbound task registration ids are also the ownership ids used by the session registry, so replacement can cancel the exact displaced task instead of aborting an unrelated peer session.
+- Session claim, close, and outbound-failure transitions are serialized. Queue drain/write/flush holds the same ownership transition guard, so a replacement cannot drain later input or bulk payloads while the superseded lane still owns an earlier batch. A superseded session may clean up its private transfer state, but only the session that still owns the registry claim can publish `connected=false`; stale teardown or a delayed failed dial cannot disconnect or clear a replacement session.
+- Input and bulk queues remain peer-owned rather than direction-owned. Either the preferred connection or a sole-reachable nonpreferred connection must flush payloads after `Hello` negotiation.
+- Socket frame writes and flushes are individually bounded. A timed-out partial frame makes that connection unusable and returns the payload to peer-owned state before replacement can drain later work.
+- Protocol 4.4 does not claim generic live full-duplex bulk liveness. BND-NEXT-43 owns continuously serviced reads during simultaneous post-startup file or maximum-text egress.
 
 ## Slice 1 regression focus
 
@@ -61,7 +75,7 @@ Related design notes:
 - Session-control behavior coverage:
   - `hello_handler_rejects_machine_id_mismatch_with_error_frame`
   - `hello_handler_accepts_canonical_protocol_and_emits_ack_for_inbound`
-  - `hello_ack_handler_flushes_pending_outgoing_payloads`
+  - `hello_ack_handler_flushes_input_only_and_defers_bulk_to_session_turn`
 
 ## BND-NEXT-7 post-auth reactor boundaries
 
@@ -75,7 +89,7 @@ Landed boundaries:
 - `SessionExitReason` names clean session exits for reconnect requests, dropped state, peer close, invalid frames, and protocol rejection.
 - Outgoing work has named private branch boundaries for heartbeat ticks, input flush ticks, bulk flush ticks, explicit flush signals, file chunk credit handling, and shared input/bulk flush helpers.
 - Inbound work has named private boundaries for reading a frame result, decoding/recording rejected frames, and dispatching decoded `WireMessage` values.
-- Session-close cleanup still discards inbound transfer staging and marks the peer disconnected after the loop exits.
+- Session-close cleanup still discards inbound transfer staging after the loop exits. It marks the peer disconnected only when that session still owns the active registry claim.
 
 Fault-harness status:
 

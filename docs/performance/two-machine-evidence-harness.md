@@ -114,7 +114,7 @@ Default behavior:
 
 - directions: A-to-B and B-to-A
 - iterations: 10 per preset and direction
-- text presets: small 128 B, medium 8 KiB, large 256 KiB
+- text presets: small 128 B, medium 8 KiB, large 255 KiB
 - image presets: screenshot-scale 1366x768 BMP, 1080p BMP, 4K BMP policy-bound sizing row, and near-limit 1448x1448 BMP
 - privacy: payload_synthetic=true, payload_contents_recorded=false, and no raw clipboard contents or image bytes in artifacts
 
@@ -124,7 +124,7 @@ Current policy bounds used by the lab:
 | --- | --- | ---: | --- |
 | text-small | text-clipboard | 128 | accepted |
 | text-medium | text-clipboard | 8192 | accepted |
-| text-large-policy-limit | text-clipboard | 262144 | accepted |
+| text-large-policy-limit | text-clipboard | 261120 | accepted |
 | image-screenshot-scale | image-clipboard | 4196406 | accepted |
 | image-1080p | image-clipboard | 8294454 | accepted |
 | image-4k-policy-bound | image-clipboard | 33177654 | rejected-by-current-policy |

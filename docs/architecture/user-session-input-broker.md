@@ -50,10 +50,56 @@ Incoming (peer frame -> local injection):
 1. Peer transport routes frames through the unchanged `InputRouter`
    owner/policy checks into the pending inject queue.
 2. While a fresh broker is attached, the service inject loop leaves the queue
-   alone; each `ExchangeInputBroker` drains up to 64 frames, re-checking
-   `input_injection_allowed_for_peer` per frame.
-3. The broker injects returned frames with `SendInput` in the user session and
-   reports applied/failed counts on the next exchange.
+   alone. `ExchangeInputBroker` drains up to 64 frames only when no earlier
+   batch is in flight, re-checks `input_injection_allowed_for_peer` per frame,
+   assigns a batch ID, and retains that batch until its exact acknowledgment.
+3. The broker injects frames in FIFO order with `SendInput` in the user session.
+   A partial native send retains the exact uncommitted event suffix and applies
+   request-side backpressure, so later frames cannot overtake it. Before any
+   suffix retry, another successful exchange revalidates every retained frame's
+   owner/share-input authority. Revocation latches a whole-batch cancellation
+   under the same ID; the daemon repeats it across response loss until the tray
+   drops its local remainder, releases any locally held keys/buttons, and
+   acknowledges that ID. A batch is otherwise acknowledged only after every
+   frame completes.
+4. The daemon assigns one random delivery epoch for its in-memory relay and
+   retains an in-flight batch under the same ID across replacement or stale
+   re-attach. The tray keeps completed receipts, partial suffix state, and the
+   intended held key/button state across its supervisor sessions, but accepts
+   them only when the new attach reports the same epoch. Each injected batch
+   also carries the daemon's input-authorization generation. The owner, sharing
+   policy, owner-transition cooldown, and generation live under one router
+   lock: owner transitions, `share_input` changes, and resets advance the
+   generation while holding the write lock, while held-state validation and
+   batch staging read one coherent snapshot. Pending input is stamped with the
+   generation that accepted it and is rejected by both injection paths if that
+   generation changes, including after an owner A-to-B-to-A or policy-off/on
+   cycle. A completed Down-only batch therefore cannot be restored after
+   authority changes even if the same peer later reclaims ownership. Session
+   failure first releases committed holds locally so input fails open. A
+   partial or zero-record native release failure retains the exact uncommitted
+   Up suffix and the same Windows input authority, including any synthetic Num
+   Lock key-up still owed after a partial toggle. Bounded cleanup retries run
+   before connecting to the daemon again and gate every restore or new payload.
+   After same-epoch re-attach, the tray waits for a successful exchange to
+   revalidate the retained generation, restores completed or partial holds,
+   and only then resumes any returned payload suffix. A partial restore retains
+   its exact uncommitted suffix and makes at most one native restore attempt per
+   authorized exchange. Cancellation, authorization-generation rejection, or a
+   new delivery epoch discards the restore intent. Lost receipt requests and
+   request-consumed/response-lost retries remain idempotent without applying a
+   payload before its holds.
+5. Cooperative shutdown detach carries the tray's latest completed batch ID
+   and delivery epoch. Under the capture-transition lock, the daemon validates
+   the broker token and epoch, acknowledges that exact batch, and only then
+   returns any still-unacknowledged, non-cancelled batch to the front of the
+   pending queue; a mismatched receipt fails closed and a latched cancellation
+   is never resurrected. A transient exchange failure skips detach while an
+   active suffix, held-state restore, or local cleanup remains. That preserves
+   the daemon owner/generation and retained ID until the same tray supervisor
+   completes local cleanup, re-attaches, submits its receipt, revalidates held
+   authority, and restores before resuming payload. A completed exchange with
+   no recovery state may still use bounded detach cleanup.
 
 Clipboard (service mode with broker attached):
 
@@ -91,6 +137,14 @@ Clipboard (service mode with broker attached):
 - Attach is rejected unless the daemon was started in service-session mode
   (`InputRuntimeMode::ServiceSessionUnsupported`); a user-session daemon owns
   capture directly and a broker would double-capture.
+- Attach also negotiates an exact broker protocol revision. An older tray is
+  rejected before it can lock input; a newer tray rejects an unversioned older
+  daemon and performs bounded cleanup if that daemon already issued a token.
+- Held-input restore is separately authorized by an epoch-scoped daemon
+  generation. The generation is issued with an inject batch and revalidated on
+  every exchange while a key or button remains down; it is never inferred from
+  a client-supplied peer identity. Owner, input-sharing policy, or reset changes
+  reject the old generation and force local release without restore.
 - The broker adds a per-attachment token, and exchanges with a stale or
   replaced token are rejected.
 - Clipboard broker exchange uses the same attachment token and verified-client
@@ -121,7 +175,20 @@ Clipboard (service mode with broker attached):
 - Poll-based exchange (8 ms active / 40 ms idle) adds up to one poll interval
   of latency per direction; a streaming exchange is a candidate follow-up if
   two-PC latency evidence warrants it.
-- Abrupt broker death (kill -9 of the tray) can leave keys held on a remote
-  peer until the release synthesis runs on the next capture-target transition.
+- Pending and in-flight injection queues are intentionally in-memory. Normal
+  detach/replacement/stale-recovery preserves or requeues unacknowledged work,
+  but a hard daemon-process crash is the durability boundary and can lose those
+  frames. A safe reset rotates the delivery epoch before accepting new broker
+  receipts.
+- Delivery dedupe is exact only while the tray supervisor process retains its
+  epoch-scoped receipt. A hard tray crash erases that evidence; the daemon
+  deliberately keeps and replays its unacknowledged in-flight batch on the next
+  attach (at-least-once), so input that completed immediately before the crash
+  can be applied twice. Persisting receipts would be required to close that
+  boundary. The tray's locally injected held-state snapshot is process-local as
+  well: a hard tray/process crash can erase both its intended hold snapshot and
+  any pending exact release suffix before the bounded cleanup loop finishes.
+  Abrupt broker death can also leave keys held on a remote
+  peer until release synthesis runs on the next capture-target transition.
 - Real two-PC dogfood evidence is still required before the parity matrix rows
   can move; nothing here upgrades BND-NEXT-9C claims.

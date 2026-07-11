@@ -29,7 +29,18 @@ Recommended flow
 
    powershell -NoProfile -ExecutionPolicy Bypass -File .\Boundless-<version>-windows-x64-install.ps1
 
-   The helper captures that user's SID before the UAC prompt and passes it to the elevated MSI.
+   The helper captures that user's SID, asks the current session's tray to run
+   its normal fail-open Quit path, and then uses one UAC prompt for a bounded
+   BoundlessService stop plus MSI execution. If the tray or service does not
+   stop within its safety bound, the helper fails before starting the MSI
+   rather than entering a FilesInUse loop or force-killing the service.
+
+   While UAC and MSI are active, the helper owns the tray's existing
+   per-session single-instance mutex so a Start Menu relaunch cannot race the
+   upgrade. The elevated phase copies the matching helper and MSI into a new
+   administrator-only ProgramData staging directory, verifies both hashes,
+   installs only from that immutable staging boundary, and removes it before
+   reporting success.
 
 2. Launch Boundless from the Start Menu, desktop shortcut, or boundlesstray.exe.
 
@@ -38,7 +49,11 @@ Fallback/debug flow
 - If the helper cannot infer the intended desktop user safely, it fails closed.
 - From an already-elevated shell, pass the intended user's SID explicitly:
 
-  msiexec /i Boundless-<version>-windows-x64.msi BOUNDLESS_ALLOWED_USER_SID=S-...
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\Boundless-<version>-windows-x64-install.ps1 -InstallerPath .\Boundless-<version>-windows-x64.msi -AllowedUserSid S-...
+
+  Keep using the matching helper even when the shell is already elevated. It
+  owns tray quiescence, bounded service shutdown, immutable MSI staging, and
+  post-install verification; invoking raw msiexec bypasses those safeguards.
 
 - Use the helper's -UseCurrentUserWhenElevated switch only when the elevated account is intentionally the desktop user that should control Boundless.
 
@@ -46,6 +61,17 @@ Install behavior
 ----------------
 - Default install root: %ProgramFiles%\Boundless
 - Default service integration: registers and starts BoundlessService as LocalSystem with AutoStart, using the supplied BOUNDLESS_ALLOWED_USER_SID for the control-pipe ACL
+- Upgrade shutdown ownership: the elevated helper pre-stops BoundlessService
+  once and waits for Stopped; MSI ServiceControl remains an idempotent
+  verification/repair contract and never races a concurrent helper stop
+- Upgrade input ownership: the helper holds the intended session's existing
+  tray-owner mutex from preflight through MSI completion, then releases it
+  before post-install tray launch
+- Elevated installer handoff: the helper and MSI are copied into an
+  administrator-only ProgramData staging directory and hash-verified before
+  the service is stopped or msiexec reopens the package
+- Same-version MSI upgrades are enabled for dogfood rebuilds; post-install
+  version and runtime checks still have to pass
 - Default startup integration: deferred; the machine-wide MSI does not create a Startup-folder shortcut yet
 - Default Start Menu entry: machine-wide Start Menu Programs shortcut for Boundless
 - Default desktop entry: machine-wide desktop shortcut for Boundless

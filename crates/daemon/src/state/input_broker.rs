@@ -4,13 +4,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use core_input::{InputEvent, KeyState, MouseButton};
+use core_input::{InputEvent, KeySemantics, KeyState, MouseButton};
+
+use super::PendingInjectInputFrame;
 
 /// How long an attached user-session broker may go without an exchange before
 /// the daemon treats it as gone and reports `service_session_unsupported`
 /// again. Fail-closed: silence means no interactive input path.
 pub(crate) const INPUT_BROKER_STALE_AFTER: Duration = Duration::from_secs(3);
 const MAX_BROKER_CAPTURED_EVENTS: usize = 4096;
+const MAX_PENDING_SAFETY_UNLOCKS_PER_CAUSE: u32 = 64;
 
 pub(crate) const INPUT_BROKER_BACKEND_MODE: &str = "user_session_broker";
 pub(crate) const SERVICE_SESSION_UNSUPPORTED_BACKEND_MODE: &str = "service_session_unsupported";
@@ -24,31 +27,64 @@ pub struct InputBrokerAttachment {
     pub lock_supported: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SafetyUnlockCounts {
+    pub escape: u32,
+    pub lease_expired: u32,
+    pub detector_unavailable: u32,
+}
+
 #[derive(Debug, Default)]
 struct InputBrokerRelayInner {
+    delivery_epoch: String,
     service_session_input: bool,
     allowed_user_sid: Option<String>,
     attachment: Option<InputBrokerAttachment>,
     last_exchange_at: Option<Instant>,
     captured_events: VecDeque<InputEvent>,
-    escape_unlock_pending: u32,
+    safety_unlock_pending: SafetyUnlockCounts,
+    handoff_probe_dx: i32,
+    handoff_probe_dy: i32,
     cursor: Option<(i32, i32)>,
     virtual_bounds: Option<(i32, i32, i32, i32)>,
     desired_lock_active: bool,
     reported_lock_active: bool,
+    capture_forwarding_authorized: bool,
     dropped_event_count: u64,
     last_wheel_source_mode: Option<&'static str>,
     last_accepted_clipboard_sequence: Option<u64>,
-    pressed_key_scan_codes: Vec<u16>,
+    pressed_keys: Vec<(u16, KeySemantics)>,
     pressed_buttons: Vec<MouseButton>,
+    next_inject_batch_id: u64,
+    last_acked_inject_batch_id: u64,
+    inflight_inject_batch: Option<InputBrokerInjectBatch>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InputBrokerInjectBatch {
+    pub batch_id: u64,
+    pub authorization_generation: u64,
+    pub frames: Vec<PendingInjectInputFrame>,
+    pub cancelled: bool,
 }
 
 /// Session-neutral relay between the LocalSystem service daemon and the
 /// user-session input broker. The daemon stays the routing/trust authority;
 /// the broker only supplies captured events and applies inject frames.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InputBrokerRelay {
     inner: Mutex<InputBrokerRelayInner>,
+}
+
+impl Default for InputBrokerRelay {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(InputBrokerRelayInner {
+                delivery_epoch: uuid::Uuid::new_v4().to_string(),
+                ..Default::default()
+            }),
+        }
+    }
 }
 
 impl InputBrokerRelay {
@@ -82,30 +118,55 @@ impl InputBrokerRelay {
         inner.attachment = Some(attachment);
         inner.last_exchange_at = Some(Instant::now());
         inner.captured_events.clear();
-        inner.escape_unlock_pending = 0;
+        inner.safety_unlock_pending = SafetyUnlockCounts::default();
+        inner.handoff_probe_dx = 0;
+        inner.handoff_probe_dy = 0;
         inner.cursor = None;
         inner.virtual_bounds = None;
         inner.reported_lock_active = false;
+        inner.capture_forwarding_authorized = false;
         inner.dropped_event_count = 0;
         inner.last_wheel_source_mode = None;
         inner.last_accepted_clipboard_sequence = None;
-        inner.pressed_key_scan_codes.clear();
+        inner.pressed_keys.clear();
         inner.pressed_buttons.clear();
+        // Inject delivery identity is daemon-instance state, not attachment
+        // state. Keeping the receipt and in-flight batch across a transient
+        // broker reattach lets a surviving tray process prove that it already
+        // completed the exact delivery instead of applying it again.
     }
 
-    pub(crate) fn detach(&self, broker_token: &str) -> bool {
+    pub(crate) fn delivery_epoch(&self) -> String {
+        self.lock().delivery_epoch.clone()
+    }
+
+    /// Atomically validates the attachment and daemon delivery epoch, commits
+    /// the tray's exact completed-batch receipt, and only then detaches. On a
+    /// mismatched epoch or batch ID no receipt or attachment state changes.
+    pub(crate) fn acknowledge_and_detach(
+        &self,
+        broker_token: &str,
+        delivery_epoch: &str,
+        acked_inject_batch_id: u64,
+    ) -> Result<bool, &'static str> {
         let mut inner = self.lock();
         let matches = inner
             .attachment
             .as_ref()
             .is_some_and(|attachment| attachment.broker_token == broker_token);
-        if matches {
-            inner.attachment = None;
-            inner.last_exchange_at = None;
-            inner.desired_lock_active = false;
-            inner.reported_lock_active = false;
+        if !matches {
+            return Ok(false);
         }
-        matches
+        if inner.delivery_epoch != delivery_epoch {
+            return Err("delivery epoch mismatch");
+        }
+        Self::acknowledge_inject_batch_locked(&mut inner, acked_inject_batch_id)?;
+        inner.attachment = None;
+        inner.last_exchange_at = None;
+        inner.desired_lock_active = false;
+        inner.reported_lock_active = false;
+        inner.capture_forwarding_authorized = false;
+        Ok(true)
     }
 
     pub(crate) fn detach_any(&self) -> bool {
@@ -113,6 +174,16 @@ impl InputBrokerRelay {
         let was_attached = inner.attachment.is_some();
         inner.attachment = None;
         inner.last_exchange_at = None;
+        inner.desired_lock_active = false;
+        inner.reported_lock_active = false;
+        inner.capture_forwarding_authorized = false;
+        // `detach_any` is the destructive safe-reset path. Rotate the epoch
+        // whenever delivery state is discarded so a surviving tray cannot
+        // apply or acknowledge a pre-reset batch ID against the new state.
+        inner.delivery_epoch = uuid::Uuid::new_v4().to_string();
+        inner.next_inject_batch_id = 0;
+        inner.last_acked_inject_batch_id = 0;
+        inner.inflight_inject_batch = None;
         was_attached
     }
 
@@ -156,6 +227,9 @@ impl InputBrokerRelay {
         cursor: Option<(i32, i32)>,
         virtual_bounds: Option<(i32, i32, i32, i32)>,
         escape_unlock_count: u32,
+        lease_expired_unlock_count: u32,
+        detector_unavailable_unlock_count: u32,
+        handoff_probe: Option<(i32, i32)>,
         reported_lock_active: bool,
         dropped_event_count: u64,
     ) -> usize {
@@ -166,9 +240,25 @@ impl InputBrokerRelay {
         if virtual_bounds.is_some() {
             inner.virtual_bounds = virtual_bounds;
         }
-        inner.escape_unlock_pending = inner
-            .escape_unlock_pending
-            .saturating_add(escape_unlock_count);
+        inner.safety_unlock_pending.escape = inner
+            .safety_unlock_pending
+            .escape
+            .saturating_add(escape_unlock_count)
+            .min(MAX_PENDING_SAFETY_UNLOCKS_PER_CAUSE);
+        inner.safety_unlock_pending.lease_expired = inner
+            .safety_unlock_pending
+            .lease_expired
+            .saturating_add(lease_expired_unlock_count)
+            .min(MAX_PENDING_SAFETY_UNLOCKS_PER_CAUSE);
+        inner.safety_unlock_pending.detector_unavailable = inner
+            .safety_unlock_pending
+            .detector_unavailable
+            .saturating_add(detector_unavailable_unlock_count)
+            .min(MAX_PENDING_SAFETY_UNLOCKS_PER_CAUSE);
+        if let Some((dx, dy)) = handoff_probe {
+            inner.handoff_probe_dx = inner.handoff_probe_dx.saturating_add(dx);
+            inner.handoff_probe_dy = inner.handoff_probe_dy.saturating_add(dy);
+        }
         inner.reported_lock_active = reported_lock_active;
         inner.dropped_event_count = inner
             .dropped_event_count
@@ -196,8 +286,15 @@ impl InputBrokerRelay {
         inner.captured_events.drain(..).collect()
     }
 
-    pub(crate) fn take_escape_unlock_count(&self) -> u32 {
-        std::mem::take(&mut self.lock().escape_unlock_pending)
+    pub(crate) fn take_safety_unlock_counts(&self) -> SafetyUnlockCounts {
+        std::mem::take(&mut self.lock().safety_unlock_pending)
+    }
+
+    pub(crate) fn drain_handoff_probe(&self) -> Option<InputEvent> {
+        let mut inner = self.lock();
+        let dx = std::mem::take(&mut inner.handoff_probe_dx);
+        let dy = std::mem::take(&mut inner.handoff_probe_dy);
+        (dx != 0 || dy != 0).then_some(InputEvent::MouseMove { dx, dy })
     }
 
     pub(crate) fn cursor_position(&self) -> Option<(i32, i32)> {
@@ -212,6 +309,9 @@ impl InputBrokerRelay {
     /// state the broker reported as actually applied in its session.
     pub(crate) fn set_desired_lock_active(&self, active: bool) -> bool {
         let mut inner = self.lock();
+        if inner.desired_lock_active != active || !active {
+            inner.capture_forwarding_authorized = false;
+        }
         inner.desired_lock_active = active;
         if !Self::attachment_fresh(&inner, Instant::now()) {
             return false;
@@ -221,6 +321,14 @@ impl InputBrokerRelay {
 
     pub(crate) fn desired_lock_active(&self) -> bool {
         self.lock().desired_lock_active
+    }
+
+    pub(crate) fn capture_forwarding_authorized(&self) -> bool {
+        self.lock().capture_forwarding_authorized
+    }
+
+    pub(crate) fn set_capture_forwarding_authorized(&self, authorized: bool) {
+        self.lock().capture_forwarding_authorized = authorized;
     }
 
     pub(crate) fn lock_supported(&self) -> bool {
@@ -281,7 +389,7 @@ impl InputBrokerRelay {
         let mut inner = self.lock();
         let events = release_events_for_pressed_state(&inner);
         inner.pressed_buttons.clear();
-        inner.pressed_key_scan_codes.clear();
+        inner.pressed_keys.clear();
         events
     }
 
@@ -292,15 +400,86 @@ impl InputBrokerRelay {
     pub(crate) fn clear_pressed_state(&self) {
         let mut inner = self.lock();
         inner.pressed_buttons.clear();
-        inner.pressed_key_scan_codes.clear();
+        inner.pressed_keys.clear();
     }
 
     pub(crate) fn reset_capture_stream(&self) {
         let mut inner = self.lock();
         inner.captured_events.clear();
-        inner.escape_unlock_pending = 0;
-        inner.pressed_key_scan_codes.clear();
+        inner.pressed_keys.clear();
+        inner.capture_forwarding_authorized = false;
+        inner.handoff_probe_dx = 0;
+        inner.handoff_probe_dy = 0;
         inner.pressed_buttons.clear();
+    }
+
+    pub(crate) fn acknowledge_inject_batch(&self, batch_id: u64) -> Result<(), &'static str> {
+        Self::acknowledge_inject_batch_locked(&mut self.lock(), batch_id)
+    }
+
+    fn acknowledge_inject_batch_locked(
+        inner: &mut InputBrokerRelayInner,
+        batch_id: u64,
+    ) -> Result<(), &'static str> {
+        if batch_id == 0 {
+            return Ok(());
+        }
+        if inner.last_acked_inject_batch_id == batch_id {
+            return Ok(());
+        }
+        let Some(inflight) = inner.inflight_inject_batch.as_ref() else {
+            return Err("unknown inject batch acknowledgement");
+        };
+        if inflight.batch_id != batch_id {
+            return Err("out-of-order inject batch acknowledgement");
+        }
+        inner.inflight_inject_batch = None;
+        inner.last_acked_inject_batch_id = batch_id;
+        Ok(())
+    }
+
+    pub(crate) fn inflight_inject_batch(&self) -> Option<InputBrokerInjectBatch> {
+        self.lock().inflight_inject_batch.clone()
+    }
+
+    pub(crate) fn stage_inject_batch(
+        &self,
+        frames: Vec<PendingInjectInputFrame>,
+        authorization_generation: u64,
+    ) -> InputBrokerInjectBatch {
+        let mut inner = self.lock();
+        debug_assert!(inner.inflight_inject_batch.is_none());
+        inner.next_inject_batch_id = inner.next_inject_batch_id.wrapping_add(1).max(1);
+        let batch = InputBrokerInjectBatch {
+            batch_id: inner.next_inject_batch_id,
+            authorization_generation,
+            frames,
+            cancelled: false,
+        };
+        inner.inflight_inject_batch = Some(batch.clone());
+        batch
+    }
+
+    pub(crate) fn cancel_inflight_inject_batch(
+        &self,
+        batch_id: u64,
+    ) -> Option<InputBrokerInjectBatch> {
+        let mut inner = self.lock();
+        let batch = inner.inflight_inject_batch.as_mut()?;
+        if batch.batch_id != batch_id {
+            return None;
+        }
+        batch.cancelled = true;
+        Some(batch.clone())
+    }
+
+    pub(crate) fn take_inflight_inject_frames(&self) -> Vec<PendingInjectInputFrame> {
+        self.lock()
+            .inflight_inject_batch
+            .take()
+            .filter(|batch| !batch.cancelled)
+            .map(|batch| batch.frames)
+            .unwrap_or_default()
     }
 }
 
@@ -335,15 +514,23 @@ fn validate_attachment_token(
 
 fn track_pressed_state(inner: &mut InputBrokerRelayInner, event: &InputEvent) {
     match event {
-        InputEvent::Key { scan_code, state } => match state {
+        InputEvent::Key {
+            scan_code,
+            state,
+            semantics,
+        } => match state {
             KeyState::Down => {
-                if !inner.pressed_key_scan_codes.contains(scan_code) {
-                    inner.pressed_key_scan_codes.push(*scan_code);
+                if !inner
+                    .pressed_keys
+                    .iter()
+                    .any(|(pressed_scan_code, _)| pressed_scan_code == scan_code)
+                {
+                    inner.pressed_keys.push((*scan_code, *semantics));
                 }
             }
             KeyState::Up => inner
-                .pressed_key_scan_codes
-                .retain(|code| code != scan_code),
+                .pressed_keys
+                .retain(|(pressed_scan_code, _)| pressed_scan_code != scan_code),
         },
         InputEvent::MouseButton { button, state } => match state {
             KeyState::Down => {
@@ -379,12 +566,13 @@ fn release_events_for_pressed_state(inner: &InputBrokerRelayInner) -> Vec<InputE
             state: KeyState::Up,
         });
     }
-    let mut scan_codes = inner.pressed_key_scan_codes.clone();
-    scan_codes.sort_unstable();
-    for scan_code in scan_codes {
+    let mut pressed_keys = inner.pressed_keys.clone();
+    pressed_keys.sort_unstable_by_key(|(scan_code, _)| *scan_code);
+    for (scan_code, semantics) in pressed_keys {
         events.push(InputEvent::Key {
             scan_code,
             state: KeyState::Up,
+            semantics,
         });
     }
     events
@@ -426,6 +614,105 @@ mod tests {
         assert_eq!(
             relay.observe_wheel_source_counts(1, 0, 0),
             Some("raw_device")
+        );
+    }
+
+    #[test]
+    fn detach_release_keeps_first_down_semantics_across_key_repeat() {
+        let relay = InputBrokerRelay::default();
+        let first_down = KeySemantics::Windows {
+            virtual_key: 0x61,
+            num_lock_on: true,
+        };
+        let repeat_after_toggle = KeySemantics::Windows {
+            virtual_key: 0x23,
+            num_lock_on: false,
+        };
+        relay.push_broker_observations(
+            vec![
+                InputEvent::Key {
+                    scan_code: 0x4F,
+                    state: KeyState::Down,
+                    semantics: first_down,
+                },
+                InputEvent::Key {
+                    scan_code: 0x4F,
+                    state: KeyState::Down,
+                    semantics: repeat_after_toggle,
+                },
+            ],
+            None,
+            None,
+            0,
+            0,
+            0,
+            None,
+            false,
+            0,
+        );
+
+        assert_eq!(
+            relay.drain_release_events(),
+            vec![InputEvent::Key {
+                scan_code: 0x4F,
+                state: KeyState::Up,
+                semantics: first_down,
+            }]
+        );
+    }
+
+    #[test]
+    fn capture_stream_reset_preserves_pending_safety_unlock() {
+        let relay = InputBrokerRelay::default();
+        relay.push_broker_observations(Vec::new(), None, None, 1, 2, 3, None, false, 0);
+
+        relay.reset_capture_stream();
+
+        assert_eq!(
+            relay.take_safety_unlock_counts(),
+            SafetyUnlockCounts {
+                escape: 1,
+                lease_expired: 2,
+                detector_unavailable: 3,
+            },
+            "a target transition must not consume broker safety reconciliation"
+        );
+    }
+
+    #[test]
+    fn handoff_probe_never_enters_captured_event_queue() {
+        let relay = InputBrokerRelay::default();
+        relay.push_broker_observations(Vec::new(), None, None, 0, 0, 0, Some((7, -2)), false, 0);
+
+        assert!(relay.drain_captured_events().is_empty());
+        assert_eq!(
+            relay.drain_handoff_probe(),
+            Some(InputEvent::MouseMove { dx: 7, dy: -2 })
+        );
+    }
+
+    #[test]
+    fn broker_safety_unlock_counts_are_memory_bounded() {
+        let relay = InputBrokerRelay::default();
+        relay.push_broker_observations(
+            Vec::new(),
+            None,
+            None,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX,
+            None,
+            false,
+            0,
+        );
+
+        assert_eq!(
+            relay.take_safety_unlock_counts(),
+            SafetyUnlockCounts {
+                escape: MAX_PENDING_SAFETY_UNLOCKS_PER_CAUSE,
+                lease_expired: MAX_PENDING_SAFETY_UNLOCKS_PER_CAUSE,
+                detector_unavailable: MAX_PENDING_SAFETY_UNLOCKS_PER_CAUSE,
+            }
         );
     }
 }

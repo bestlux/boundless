@@ -3,11 +3,11 @@
 //! exchange. Shared by the daemon-side adapter and the tray broker host so
 //! both sides agree on one encoding.
 
-use core_input::{InputEvent, KeyState, MouseButton};
+use core_input::{InputEvent, KeySemantics, KeyState, MouseButton};
 
 use crate::boundless::v1::{
     BrokerInputEvent, BrokerKey, BrokerMouseButton, BrokerMouseMove, BrokerMouseMoveAbsolute,
-    BrokerMouseWheel, broker_input_event,
+    BrokerMouseWheel, BrokerWindowsKeySemantics, broker_input_event,
 };
 
 fn key_state(down: bool) -> KeyState {
@@ -58,9 +58,23 @@ pub fn broker_event_from_input_event(event: &InputEvent) -> BrokerInputEvent {
                 delta_y: *delta_y,
             })
         }
-        InputEvent::Key { scan_code, state } => broker_input_event::Event::Key(BrokerKey {
+        InputEvent::Key {
+            scan_code,
+            state,
+            semantics,
+        } => broker_input_event::Event::Key(BrokerKey {
             scan_code: u32::from(*scan_code),
             down: matches!(state, KeyState::Down),
+            windows_semantics: match semantics {
+                KeySemantics::Physical => None,
+                KeySemantics::Windows {
+                    virtual_key,
+                    num_lock_on,
+                } => Some(BrokerWindowsKeySemantics {
+                    virtual_key: u32::from(*virtual_key),
+                    num_lock_on: *num_lock_on,
+                }),
+            },
         }),
     };
 
@@ -90,6 +104,13 @@ pub fn input_event_from_broker_event(event: &BrokerInputEvent) -> Option<InputEv
         broker_input_event::Event::Key(key) => InputEvent::Key {
             scan_code: u16::try_from(key.scan_code).ok()?,
             state: key_state(key.down),
+            semantics: match key.windows_semantics.as_ref() {
+                Some(semantics) => KeySemantics::Windows {
+                    virtual_key: u16::try_from(semantics.virtual_key).ok()?,
+                    num_lock_on: semantics.num_lock_on,
+                },
+                None => KeySemantics::Physical,
+            },
         },
     })
 }
@@ -135,6 +156,10 @@ mod tests {
             InputEvent::Key {
                 scan_code: 0xE04D,
                 state: KeyState::Up,
+                semantics: KeySemantics::Windows {
+                    virtual_key: 0x27,
+                    num_lock_on: true,
+                },
             },
         ];
 
@@ -158,13 +183,24 @@ mod tests {
                 event: Some(broker_input_event::Event::Key(BrokerKey {
                     scan_code: u32::from(u16::MAX) + 1,
                     down: true,
+                    windows_semantics: None,
+                })),
+            },
+            BrokerInputEvent {
+                event: Some(broker_input_event::Event::Key(BrokerKey {
+                    scan_code: 0x4F,
+                    down: true,
+                    windows_semantics: Some(BrokerWindowsKeySemantics {
+                        virtual_key: u32::from(u16::MAX) + 1,
+                        num_lock_on: true,
+                    }),
                 })),
             },
         ];
 
         let (decoded, dropped) = input_events_from_broker_events(&malformed);
         assert!(decoded.is_empty());
-        assert_eq!(dropped, 3);
+        assert_eq!(dropped, 4);
     }
 
     #[test]

@@ -95,6 +95,100 @@ function Invoke-MsiExec {
     return $process.ExitCode
 }
 
+function Resolve-PowerShellExecutable {
+    foreach ($name in @("pwsh", "powershell")) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $command) {
+            return $command.Source
+        }
+    }
+    throw "Could not find pwsh or powershell for the packaged install helper."
+}
+
+function Get-BoundlessInstallHelperEvidenceValue {
+    param(
+        [string]$Output,
+        [string]$Name
+    )
+
+    $match = [regex]::Match(
+        $Output,
+        "(?m)^$([regex]::Escape($Name))=(?<value>[^\r\n]+)$"
+    )
+    if (-not $match.Success) {
+        throw "Packaged install helper did not emit required evidence '$Name'."
+    }
+    return $match.Groups["value"].Value.Trim()
+}
+
+function Invoke-BoundlessInstallHelper {
+    param(
+        [string]$HelperPath,
+        [string]$MsiPath,
+        [string]$Sid,
+        [string]$LogPath,
+        [bool]$ExpectRunningTray
+    )
+
+    $arguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        $HelperPath,
+        "-InstallerPath",
+        $MsiPath,
+        "-AllowedUserSid",
+        $Sid,
+        "-Quiet",
+        "-NoRestart",
+        "-LogPath",
+        $LogPath
+    )
+    $global:LASTEXITCODE = 0
+    $outputLines = @(
+        & $script:PowerShellExe @arguments 2>&1 |
+            ForEach-Object { $_.ToString() }
+    )
+    $exitCode = if ($null -eq $global:LASTEXITCODE) { 0 } else { $global:LASTEXITCODE }
+    $outputLines | ForEach-Object { Write-Host $_ }
+    if ($exitCode -ne 0) {
+        throw "Packaged install helper exited with $exitCode."
+    }
+
+    $output = $outputLines -join [Environment]::NewLine
+    $trayShutdownCount = [int](Get-BoundlessInstallHelperEvidenceValue -Output $output -Name "boundless_install_tray_shutdown_count")
+    $quiescenceAcquired = Get-BoundlessInstallHelperEvidenceValue -Output $output -Name "boundless_install_tray_quiescence_acquired"
+    $serviceStopFinal = Get-BoundlessInstallHelperEvidenceValue -Output $output -Name "boundless_install_service_stop_final"
+    $msiExitCode = [int](Get-BoundlessInstallHelperEvidenceValue -Output $output -Name "boundless_install_exit_code")
+    $coreVerified = Get-BoundlessInstallHelperEvidenceValue -Output $output -Name "boundless_install_core_verified"
+
+    if ($ExpectRunningTray -and $trayShutdownCount -lt 1) {
+        throw "Packaged helper did not report closing the running N-1 tray."
+    }
+    if ($quiescenceAcquired -ne "True") {
+        throw "Packaged helper did not report acquiring the tray quiescence lease."
+    }
+    if ($serviceStopFinal -ne "StoppedOrNotInstalledBeforeMsi") {
+        throw "Packaged helper did not report a completed pre-MSI service stop."
+    }
+    if ($msiExitCode -notin @(0, 3010)) {
+        throw "Packaged helper reported unexpected MSI exit code $msiExitCode."
+    }
+    if ($coreVerified -ne "true") {
+        throw "Packaged helper did not report verified post-install core health."
+    }
+
+    return [ordered]@{
+        helper_path = $HelperPath
+        tray_shutdown_count = $trayShutdownCount
+        tray_quiescence_acquired = $true
+        service_stop_final = $serviceStopFinal
+        msi_exit_code = $msiExitCode
+        core_verified = $true
+    }
+}
+
 function Get-ShortcutTarget {
     param([string]$ShortcutPath)
 
@@ -356,6 +450,77 @@ function Get-BoundlessServiceConfig {
         Select-Object -First 1
 }
 
+function Test-WindowsPathEqual {
+    param(
+        [string]$Left,
+        [string]$Right
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Left) -or [string]::IsNullOrWhiteSpace($Right)) {
+        return $false
+    }
+    $leftFull = [IO.Path]::GetFullPath($Left).TrimEnd('\')
+    $rightFull = [IO.Path]::GetFullPath($Right).TrimEnd('\')
+    return $leftFull.Equals($rightFull, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-WindowsCommandExecutablePath {
+    param([string]$CommandLine)
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        throw "Windows command line was empty while parsing its executable."
+    }
+    $trimmed = $CommandLine.Trim()
+    if ($trimmed.StartsWith('"')) {
+        $match = [regex]::Match($trimmed, '^"(?<path>[^\"]+)"(?=\s|$)')
+    }
+    else {
+        $match = [regex]::Match(
+            $trimmed,
+            '^(?<path>.+?\.exe)(?=\s|$)',
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+    }
+    if (-not $match.Success) {
+        throw "Could not parse an executable token from Windows command line: $CommandLine"
+    }
+    try {
+        return [IO.Path]::GetFullPath($match.Groups['path'].Value).TrimEnd('\')
+    }
+    catch {
+        throw "Windows command line executable path was invalid: $($match.Groups['path'].Value)"
+    }
+}
+
+function Assert-WindowsServiceExecutablePathFixtures {
+    $expected = 'C:\Program Files\Boundless\boundless-service.exe'
+    foreach ($commandLine in @(
+        '"C:\Program Files\Boundless\boundless-service.exe" --allowed-user-sid=S-1-5-21-1',
+        'C:\Program Files\Boundless\boundless-service.exe --allowed-user-sid=S-1-5-21-1'
+    )) {
+        $actual = Get-WindowsCommandExecutablePath -CommandLine $commandLine
+        if (-not (Test-WindowsPathEqual -Left $actual -Right $expected)) {
+            throw "Service executable parser fixture did not accept the exact executable token: $commandLine"
+        }
+    }
+    foreach ($commandLine in @(
+        '"C:\Program Files\Boundless\boundless-service.exe.evil" --allowed-user-sid=S-1-5-21-1',
+        'C:\Program Files\Boundless\boundless-service.exe.evil --allowed-user-sid=S-1-5-21-1'
+    )) {
+        $accepted = $false
+        try {
+            $actual = Get-WindowsCommandExecutablePath -CommandLine $commandLine
+            $accepted = Test-WindowsPathEqual -Left $actual -Right $expected
+        }
+        catch {
+            $accepted = $false
+        }
+        if ($accepted) {
+            throw "Service executable parser fixture accepted a suffix-confused executable: $commandLine"
+        }
+    }
+}
+
 function Wait-BoundlessServiceStatus {
     param(
         [string]$ExpectedStatus,
@@ -424,7 +589,8 @@ function Assert-BoundlessServiceConfig {
         throw "BoundlessService was not registered by the installer."
     }
 
-    if ($service.PathName -notmatch [regex]::Escape($ExpectedServicePath)) {
+    $actualServicePath = Get-WindowsCommandExecutablePath -CommandLine $service.PathName
+    if (-not (Test-WindowsPathEqual -Left $actualServicePath -Right $ExpectedServicePath)) {
         throw "BoundlessService PathName did not point at the Program Files service binary. PathName=$($service.PathName)"
     }
     if ($service.PathName -notmatch "(^|\s)--allowed-user-sid=([^\s]+)") {
@@ -503,6 +669,26 @@ function Get-BoundlessProcessCountForSession {
     return @($procs).Count
 }
 
+function Wait-BoundlessProcessCountForSession {
+    param(
+        [string]$Name,
+        [int]$SessionId,
+        [int]$ExpectedCount,
+        [int]$TimeoutSeconds = 10
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $count = Get-BoundlessProcessCountForSession -Name $Name -SessionId $SessionId
+        if ($count -eq $ExpectedCount) {
+            return $count
+        }
+        Start-Sleep -Milliseconds 100
+    } while ((Get-Date) -lt $deadline)
+
+    throw "Expected $ExpectedCount $Name process(es) in session $SessionId within $($TimeoutSeconds)s; found $count."
+}
+
 function Get-BoundlessDaemonRuntimeCount {
     return (Get-BoundlessProcessCount -Name "boundlessd") +
         (Get-BoundlessProcessCount -Name "boundless-service")
@@ -542,9 +728,11 @@ if ((Get-Variable -Name IsWindows -ErrorAction SilentlyContinue) -and (-not $IsW
 if ((-not (Get-Variable -Name IsWindows -ErrorAction SilentlyContinue)) -and ($env:OS -ne "Windows_NT")) {
     throw "installer-smoke.ps1 is supported on Windows only."
 }
+Assert-WindowsServiceExecutablePathFixtures
 if (-not (Test-IsAdministrator)) {
     throw "installer-smoke.ps1 must run from an elevated PowerShell session for machine-wide Program Files MSI validation."
 }
+$script:PowerShellExe = Resolve-PowerShellExecutable
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
@@ -590,6 +778,15 @@ if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
 
 $InstallerPath = (Resolve-Path -LiteralPath $InstallerPath).Path
 Assert-PathExists -Path $InstallerPath -Message "Installer was not found."
+$installHelperPath = Join-Path (Split-Path -Parent $InstallerPath) (
+    [IO.Path]::GetFileNameWithoutExtension($InstallerPath) + "-install.ps1"
+)
+if (
+    -not [string]::IsNullOrWhiteSpace($PreviousInstallerPath) -and
+    -not (Test-Path -LiteralPath $installHelperPath)
+) {
+    throw "N-1 upgrade smoke requires the packaged install helper: $installHelperPath"
+}
 $installerSignature = Assert-Authenticode -Path $InstallerPath -Required:$RequireSignature.IsPresent
 $expectedDisplayVersion = Get-ExpectedDisplayVersion -Path $InstallerPath
 
@@ -625,8 +822,12 @@ try {
     $traySingleInstanceTested = $false
     $traySecondLaunchExitCode = $null
     $trayCurrentSessionCount = $null
+    $trayGracefulQuitTested = $false
+    $trayQuitControlExitCode = $null
+    $trayQuitElapsedMilliseconds = $null
     $upgradeInstallExitCode = $null
     $installExitCode = $null
+    $installHelperUpgradeEvidence = $null
     $repairExitCode = $null
     $uninstallExitCode = $null
     $previousInstallRoot = $null
@@ -685,7 +886,32 @@ try {
         }
     }
 
-    $installExitCode = Invoke-MsiExec -ArgumentList (@("/i", $InstallerPath, "/qn", "/norestart") + $msiInstallProperties) -LogPath $installLog
+    if (-not [string]::IsNullOrWhiteSpace($PreviousInstallerPath)) {
+        $helperArgs = @{
+            HelperPath = $installHelperPath
+            MsiPath = $InstallerPath
+            Sid = $AllowedUserSid
+            LogPath = $installLog
+            ExpectRunningTray = $interactiveDesktopSession
+        }
+        $installHelperUpgradeEvidence = Invoke-BoundlessInstallHelper @helperArgs
+        $installExitCode = $installHelperUpgradeEvidence.msi_exit_code
+    }
+    else {
+        $installExitCode = Invoke-MsiExec -ArgumentList (@("/i", $InstallerPath, "/qn", "/norestart") + $msiInstallProperties) -LogPath $installLog
+    }
+
+    Assert-PathExists -Path $installLog -Message "Installer did not preserve the requested MSI log."
+    $installerStageResidue = @(
+        Get-ChildItem `
+            -LiteralPath ([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)) `
+            -Directory `
+            -Filter "BoundlessInstaller-*" `
+            -ErrorAction SilentlyContinue
+    )
+    if ($installerStageResidue.Count -ne 0) {
+        throw "Installer left a ProgramData staging directory after log handoff: $(@($installerStageResidue.FullName) -join ', ')"
+    }
 
     $daemonPath = Join-Path $installRoot "boundlessd.exe"
     $servicePath = Join-Path $installRoot "boundless-service.exe"
@@ -862,6 +1088,50 @@ try {
         }
         $null = Wait-ForDaemonReady -CliPath $cliPath
         $traySingleInstanceTested = $true
+
+        $quitStopwatch = [Diagnostics.Stopwatch]::StartNew()
+        $quitControlArgs = @{
+            FilePath = $trayPath
+            ArgumentList = "--quit"
+            WorkingDirectory = $installRoot
+            PassThru = $true
+        }
+        $quitControlProcess = Start-Process @quitControlArgs
+        if (-not $quitControlProcess.WaitForExit(5000)) {
+            throw "Tray --quit control process did not exit within 5 seconds. PID: $($quitControlProcess.Id)"
+        }
+        $trayQuitControlExitCode = $quitControlProcess.ExitCode
+        if ($trayQuitControlExitCode -ne 0) {
+            throw "Tray --quit control process failed. Exit code: $trayQuitControlExitCode"
+        }
+        $waitForQuitArgs = @{
+            Name = "boundlesstray"
+            SessionId = $currentSessionId
+            ExpectedCount = 0
+            TimeoutSeconds = 8
+        }
+        $null = Wait-BoundlessProcessCountForSession @waitForQuitArgs
+        $quitStopwatch.Stop()
+        $trayQuitElapsedMilliseconds = $quitStopwatch.ElapsedMilliseconds
+        $trayGracefulQuitTested = $true
+
+        $postQuitTrayArgs = @{
+            FilePath = $trayPath
+            WorkingDirectory = $installRoot
+            PassThru = $true
+        }
+        $postQuitTrayProcess = Start-Process @postQuitTrayArgs
+        Start-Sleep -Milliseconds 500
+        if ($postQuitTrayProcess.HasExited) {
+            throw "Tray exited immediately after graceful Quit/relaunch smoke. Exit code: $($postQuitTrayProcess.ExitCode)"
+        }
+        $null = Wait-ForDaemonReady -CliPath $cliPath
+        $waitForRelaunchArgs = @{
+            Name = "boundlesstray"
+            SessionId = $currentSessionId
+            ExpectedCount = 1
+        }
+        $trayCurrentSessionCount = Wait-BoundlessProcessCountForSession @waitForRelaunchArgs
     }
 
     $repairServiceDeleteOutput = Remove-BoundlessServiceRegistrationForRepair
@@ -928,6 +1198,9 @@ try {
         tray_single_instance_tested = $traySingleInstanceTested
         tray_second_launch_exit_code = $traySecondLaunchExitCode
         tray_current_session_count = $trayCurrentSessionCount
+        tray_graceful_quit_tested = $trayGracefulQuitTested
+        tray_quit_control_exit_code = $trayQuitControlExitCode
+        tray_quit_elapsed_milliseconds = $trayQuitElapsedMilliseconds
         daemon_ready_output = $daemonReadyOutput
         upgraded_from = $PreviousInstallerPath
         previous_install_root = $previousInstallRoot
@@ -940,6 +1213,7 @@ try {
         upgrade_payload_replacement = $upgradePayloadReplacement
         previous_install_exit_code = $upgradeInstallExitCode
         install_exit_code = $installExitCode
+        install_helper_upgrade_evidence = $installHelperUpgradeEvidence
         uninstall_exit_code = $uninstallExitCode
         upgrade_while_running_tested = $upgradeWhileRunningTested
         upgrade_while_running_skipped_reason = $upgradeWhileRunningSkippedReason

@@ -15,7 +15,7 @@ use core_transfer::MAX_TRANSFER_BYTES;
 
 const DEFAULT_LAYOUT_MATRIX: &str = "self";
 const RUNTIME_CONFIG_VERSION: &str = "5";
-const MIGRATABLE_PROTOCOL_VERSIONS: &[&str] = &["4.1.0"];
+const MIGRATABLE_PROTOCOL_VERSIONS: &[&str] = &["4.1.0", "4.2.0", "4.3.0"];
 const DEFAULT_ANTI_IDLE_RECENT_ACTIVITY_WINDOW_SECS: u32 = 300;
 const DEFAULT_ANTI_IDLE_PULSE_INTERVAL_SECS: u32 = 30;
 const DEFAULT_INPUT_CORNER_BLOCK_PX: u32 = 24;
@@ -540,9 +540,10 @@ fn migrate_config_value(path: &Path, value: &mut serde_json::Value) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        AntiIdleConfig, ApiTransport, FileTransferConfig, InputHandoffConfig, RuntimeConfig,
-        default_input_corner_block_px, default_pulse_interval_secs,
-        default_recent_activity_window_secs, load_or_create_config_at, save_config_at,
+        AntiIdleConfig, ApiTransport, FileTransferConfig, InputHandoffConfig,
+        MIGRATABLE_PROTOCOL_VERSIONS, RuntimeConfig, default_input_corner_block_px,
+        default_pulse_interval_secs, default_recent_activity_window_secs, load_or_create_config_at,
+        save_config_at,
     };
     use core_protocol::PROTOCOL_CURRENT;
     use core_transfer::MAX_TRANSFER_BYTES;
@@ -643,28 +644,31 @@ mod tests {
     }
 
     #[test]
-    fn load_or_create_config_migrates_previous_local_protocol_version() {
-        let root = std::env::temp_dir().join(format!(
-            "boundless-config-protocol-migrate-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let path = root.join("config.json");
-        std::fs::create_dir_all(&root).expect("create temp root");
+    fn load_or_create_config_migrates_previous_local_protocol_versions() {
+        for previous in MIGRATABLE_PROTOCOL_VERSIONS {
+            let root = std::env::temp_dir().join(format!(
+                "boundless-config-protocol-migrate-{}-test-{}",
+                previous.replace('.', "-"),
+                uuid::Uuid::new_v4()
+            ));
+            let path = root.join("config.json");
+            std::fs::create_dir_all(&root).expect("create temp root");
 
-        let seed = RuntimeConfig {
-            protocol_version: "4.1.0".to_string(),
-            ..RuntimeConfig::default()
-        };
-        save_config_at(&path, &seed).expect("seed stale local protocol config");
+            let seed = RuntimeConfig {
+                protocol_version: (*previous).to_string(),
+                ..RuntimeConfig::default()
+            };
+            save_config_at(&path, &seed).expect("seed stale local protocol config");
 
-        let config = load_or_create_config_at(&path).expect("migrate local protocol");
-        assert_eq!(config.protocol_version, PROTOCOL_CURRENT.to_string());
+            let config = load_or_create_config_at(&path).expect("migrate local protocol");
+            assert_eq!(config.protocol_version, PROTOCOL_CURRENT.to_string());
 
-        let saved = std::fs::read_to_string(&path).expect("read migrated config");
-        assert!(saved.contains(&format!(r#""protocol_version": "{}""#, PROTOCOL_CURRENT)));
-        assert!(!saved.contains(r#""protocol_version": "4.1.0""#));
+            let saved = std::fs::read_to_string(&path).expect("read migrated config");
+            assert!(saved.contains(&format!(r#""protocol_version": "{}""#, PROTOCOL_CURRENT)));
+            assert!(!saved.contains(&format!(r#""protocol_version": "{previous}""#)));
 
-        let _ = std::fs::remove_dir_all(root);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]

@@ -650,6 +650,52 @@ async fn newer_local_snapshot_prunes_stale_queued_clipboard_payloads() {
 }
 
 #[tokio::test]
+async fn newer_local_snapshot_prunes_stale_chunked_clipboard_cursor() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-clipboard-prune-stale-cursor-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let state =
+        AppState::load_or_create_with_paths(root.join("config.json"), root.join("security"))
+            .expect("load state");
+    let (code, _) = state.create_pairing_code(120).await;
+    let peer_id = state
+        .join_peer(
+            code,
+            "127.0.0.1:15100".to_string(),
+            Some("peer-a".to_string()),
+        )
+        .await
+        .expect("join peer");
+    state
+        .set_peer_connected(&peer_id, true)
+        .await
+        .expect("connect peer");
+
+    state
+        .queue_outgoing_bulk_payload(
+            &peer_id,
+            OutboundPayload::ClipboardImageCursor {
+                transfer_id: "stale-transfer".to_string(),
+                image_bmp: Arc::from(vec![7u8; 32 * 1024]),
+                offset_bytes: 8 * 1024,
+            },
+        )
+        .await;
+    state
+        .queue_local_clipboard_text_for_connected_peers("fresh".to_string())
+        .await
+        .expect("queue fresh local clipboard");
+
+    assert!(matches!(
+        state.drain_outgoing_bulk(&peer_id, usize::MAX).await.as_slice(),
+        [OutboundPayload::ClipboardText { text }] if text == "fresh"
+    ));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn stale_drained_replay_is_dropped_after_newer_local_snapshot_supersedes_it() {
     let root = std::env::temp_dir().join(format!(
         "boundless-clipboard-stale-drained-replay-drop-test-{}",

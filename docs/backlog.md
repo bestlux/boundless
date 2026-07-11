@@ -14,33 +14,53 @@ Full implementation briefs live in git history (`git show ac4d4d0:docs/backlog.m
 
 | story | commit | remaining evidence before marking proven |
 | --- | --- | --- |
-| BND-NEXT-23 (P0) — service honors SCM stop | 0828513 | The 5.0.11 install over a running 5.0.10 service is the first real-binary upgrade this fix will face. Capture a verbose msiexec log showing no multi-minute `ServiceControl` stall, and `Stop-Service` completing in seconds with a broker attached and a peer connected. |
+| BND-NEXT-23 (P0) — service honors SCM stop | 0828513 | Partial installed pass: during the 5.0.12→5.0.13 upgrade the old service reported `StopPending` and stopped cleanly in about 2.02 seconds. The overall helper run still took about 281 seconds because Restart Manager could not close the tray (BND-NEXT-41), not because `ServiceControl` wedged. No verbose helper MSI log survived, so retain that final evidence criterion. |
 | BND-NEXT-24 (P0) — broker-routed clipboard | 9bd45dd | Reopened after live partial pass: text passed both directions in 5.0.12 service mode, but a policy-valid 6.29 MB bitmap exceeded the broker RPC limit, detached the shared input/clipboard broker, and disabled input. See the active brief below. |
-| BND-NEXT-25 (P1) — transport events readable | a96613b | Reopened by 5.0.12 BND-NEXT-34 evidence. The v5.0.13 candidate now bounds repeated activity/failures and prioritizes causal records; full per-stage counters and the installed sustained-input trace remain pending under BND-NEXT-34. |
+| BND-NEXT-25 (P1) — transport events readable | a96613b | Reopened by 5.0.12 BND-NEXT-34 evidence. v5.0.13 bounds repeated activity/failures and prioritizes causal records; full per-stage counters and the installed sustained-input trace remain pending under BND-NEXT-34. |
 | BND-NEXT-26 (P1) — packaging-script CI | 0305022 | Done — self-tests + CLI daemon-status output contract wired into `ci.yml` and release validation, green on main. Optional: demonstrate a deliberate `^machine_id=` regression fails CI locally. |
 
 ---
 
-## v5.0.13 fix train (2026-07-10) — engineering status, not dogfood proof
+## v5.0.13 fix train and first installed dogfood (2026-07-10)
 
-These commits are integrated on the candidate branch. `Code complete` means the scoped implementation and automated coverage exist; `needs installed evidence` means the behavior has not yet passed the two-PC, UAC, or physical-device acceptance checks below.
+These commits shipped in v5.0.13. `Code complete` means the scoped implementation and automated coverage exist; installed status records only the exact two-PC, UAC, and physical-device checks that actually ran.
 
 | story | candidate status | primary commits | remaining gap |
 | --- | --- | --- | --- |
 | BND-NEXT-24 | in progress | 0235d25, 106d289, 4593fea, a6d76f4 | Broker fault isolation, the symmetric 9 MiB control-plane limit, transient retry, failed-sequence suppression, and sequence-aware newest-payload preservation are implemented. Explicit tray/CLI `clipboard-degraded` versus `input-degraded` UX is still missing, and the installed Paint size/fault matrix has not run. |
-| BND-NEXT-29 items 1, 2, and 5 | code complete; needs installed evidence | 5dc1521, 7a39d66 | The helper verifies package/runtime postconditions and packaging removes stale WiX output. A real helper-driven 5.0.12→5.0.13 upgrade remains pending; item 3 is open and item 4 still needs installed version verification. |
-| BND-NEXT-31 | code complete; needs installed evidence | dacfad8, 6f1bd28, 68f42f1 | Bounded shutdown, fail-open cleanup, held-input release, replacement, and stale-owner ordering have automated coverage. Quit/relaunch during active capture, first post-relaunch handoff/escape, and upgrade-while-running still need installed proof. |
+| BND-NEXT-29 items 1, 2, 4, and 5 | partial installed pass; upgrade lifecycle failed | 5dc1521, 7a39d66 | Both PCs reached installed 5.0.13 through the normal-user helper/UAC path, the runtime now reports 5.0.13, and trust/connection survived. The helper could not complete while the tray was running and required manual intervention; BND-NEXT-41 owns that P0 lifecycle failure. Item 3 remains open. |
+| BND-NEXT-31 | partial installed pass | dacfad8, 6f1bd28, 68f42f1 | Three Start launches plus three direct launches left one tray, and forced source-tray termination/relaunch restored connection and input. Graceful active-capture Quit remains open; upgrade shutdown failed because Restart Manager close was interpreted as hide-to-tray (BND-NEXT-41), and the first emergency escape failed under BND-NEXT-38. |
 | BND-NEXT-34 | in progress | e3f1752, 77ec135, b3c64d9, b1f38a1 | Priority retention and bounded activity/failure aggregation are implemented. The complete per-stage counter vocabulary and a 60-second installed two-PC trace remain acceptance gaps. |
-| BND-NEXT-35 | code complete; needs installed evidence | d516728 | Native SCM recovery, the explicit action, bounded polling, and UAC fallback have automated coverage; stopped-to-running recovery still needs standard-user validation on both PCs. |
+| BND-NEXT-35 | partial installed pass | d516728 | With the service stopped, Start Menu launch exposed the tray's `Start service` action and that action restored the service without a manual shell. Confirm the same exact path on the second PC plus cancellation/denied/timeout cases before marking proven. |
 | BND-NEXT-37 | code complete; needs installed evidence | 42a31ad, 6115c6b, b1f38a1 | Event creation and raw-output sanitization retain metadata only in automated tests. An installed unique-sentinel sweep across API, CLI, logs, and diagnostic bundles remains pending. |
-| BND-NEXT-38 | code complete; needs installed evidence | be32484, 6cdb326, 10ef0ed | Local fail-open escape, lease expiry, reconciliation, and direct-capture unlock have deterministic coverage. Installed stalled-IPC/daemon-loss/UI-hang fault smoke and the next-handoff check remain pending. |
-| BND-NEXT-39 | implementation candidate; needs physical evidence | 06facb7, dfeba9c | Raw Input vertical/horizontal high-resolution wheel capture and cross-source deduplication are implemented. The EliteBook source path is still unknown; pointer-input fallback is evidence-gated, and trackpad plus conventional-wheel proof has not run. |
+| BND-NEXT-38 | reopened P0 installed regression | be32484, 6cdb326, 10ef0ed | Double-left-Control on the locked source activated PowerToys Find My Mouse but did not unlock Boundless; no retained daemon `input_escape_triggered` event exists. The v5.0.13 path returned only through a later ordinary boundary handoff. Raw keyboard escape detection and hook-loss recovery are now required. |
+| BND-NEXT-39 | released implementation; needs physical evidence | 06facb7, dfeba9c | Raw Input vertical/horizontal high-resolution wheel capture and cross-source deduplication shipped in v5.0.13. The EliteBook source path is still unknown; pointer-input fallback is evidence-gated, and trackpad plus conventional-wheel proof has not run. |
+| BND-NEXT-40 | open P1 design defect | — | Source `vkCode` and logical Num Lock semantics are discarded before broker/wire transport, so the destination Num Lock state can reinterpret ambiguous keypad digit/decimal scans. Add the explicit opposite-Num-Lock physical matrix while preserving the scan/E0 distinctions that already work. |
+| BND-NEXT-41 | open P0 installed failure | — | The normal-user helper requested UAC but entered repeated Restart Manager close prompts; the user stopped the service and retried to finish. The service itself stopped in about 2.02 seconds, while event evidence identifies the tray's close-to-hide lifecycle as the loop blocker. |
+
+---
+
+## v5.0.14 fix train (engineering candidate; installed proof pending)
+
+This patch train fixes the three regressions found during installed v5.0.13 dogfood and folds in the directly adjacent lifecycle and packaging work. Automated coverage is not installed two-PC evidence; the listed physical/UAC checks remain required before these stories are marked proven.
+
+| story | candidate status | primary commits | remaining gap |
+| --- | --- | --- | --- |
+| BND-NEXT-38 | code complete; needs installed evidence | 57dd527, f180a81, 7207252, cfc7161, ac61ad1, 41b437c, c6d6f59, fe4e05a, b47a5af, 9d4a53d, f80f808, 28d3936, baf6a62 | Raw Input is authoritative; detector/broker loss and broker-session replacement fail open, while delivery receipts and held-state recovery preserve safe reattach and local lock waits for daemon acknowledgment. Test both Control keys with PowerToys on/off, stalled/unavailable IPC, forced tray loss, and a successful next handoff. |
+| BND-NEXT-40 | code complete; needs physical evidence | c7b346a, ffb4a51, 049eafa, a59c16d, b50f206, e086e5c, e545de7, 92967fe | Key semantics introduced in protocol 4.3 and retained by protocol 4.4, source logical Num Lock, tray handoff identity, and modifier projection now survive broker, wire, and Windows injection. Run the opposite-Num-Lock matrix both directions, including digits, decimal, Enter, divide, navigation, toggle, hold/repeat, and release. |
+| BND-NEXT-41 | code complete; needs installed/UAC evidence | 5a0be2b, 0d79580, 36cbb60, bc0c69d, 64f4700, cdd3c35, 681424f, 1284adc, 08e49bc, b47f2f0, d1f7bd6, 852cc7a, f2781ec | The helper bounds per-user/session quiescence and the elevated installer process tree, retains quiescence through uncertain cancellation, and fences fail-closed service recovery until privileged authority drains and the service-start action settles. Prove a normal-user 5.0.13→5.0.14 upgrade with one UAC prompt, no Restart Manager loop, bounded timing, and healthy postconditions on both PCs. |
+| BND-NEXT-42 | code complete; needs installed asymmetric evidence | 6b0aa59, cb48c2b, 2b766ee, b1d15a1 | Simultaneous trusted connections now converge on one deterministic physical session, while protocol 4.4 startup turns, credited image replay, bounded writes, and latest-wins supersession close the observed startup liveness failure. Four extended local two-node smokes plus a post-review reverse-orientation smoke passed; repeat connection, first input, clipboard, and reconnect on the routed dogfood pair. Generic post-startup full-duplex work remains BND-NEXT-43. |
+| BND-NEXT-43 | open P1 transport design gap | — | Protocol 4.4 serializes startup bulk, credits large clipboard images, bounds socket writes, and preserves partial frame reads. Live simultaneous bidirectional file chunks and post-startup maximum text can still contend because the session loop awaits writes instead of reading continuously. |
+| BND-NEXT-31 | code complete for graceful Quit path; needs installed evidence | 5a0be2b, 0d79580, bc0c69d, 64f4700 | The true Quit signal now fails open and exits the broker before process shutdown. Run active-capture Quit/relaunch, upgrade-while-running, process-count, first post-relaunch handoff, and emergency escape on installed hardware. |
+| BND-NEXT-29 item 3 | code complete; needs same-version install evidence | 5a0be2b | WiX now allows same-version upgrades and packaging smoke enforces the contract. Prove a same-version helper rebuild replaces the installed payload instead of silently no-oping. |
+
+Protocol 4.4 is an intentional clean break for the expanded keyboard/input contract and bounded startup clipboard flow. A v5.0.13/v5.0.14 mixed pair must remain disconnected until both PCs are upgraded; this is expected upgrade sequencing, not a compatibility regression.
 
 ---
 
 ## BND-NEXT-24 (P0, in progress): Isolate service-mode clipboard failures and carry policy-valid images
 
-Status: the broker-isolation and policy-valid IPC path are implemented on the v5.0.13 candidate, but the explicit degraded-state tray/CLI UX and installed service-mode Paint matrix remain open.
+Status: the broker-isolation and policy-valid IPC path shipped in v5.0.13, but the explicit degraded-state tray/CLI UX and installed service-mode Paint matrix remain open.
 
 ### Context and evidence
 
@@ -75,13 +95,15 @@ Focused broker/IPC fault tests; installed service-mode Paint copy/paste at small
 
 ---
 
-## BND-NEXT-35 (P0, needs installed evidence): Start a stopped installed service from the tray without console flashes
+## BND-NEXT-35 (P0, partial installed pass): Start a stopped installed service from the tray without console flashes
 
-Status: code complete in d516728; automated state/offer tests pass, but standard-user stopped-to-running recovery has not run on either dogfood PC.
+Status: code complete in d516728. The explicit tray action passed once on installed v5.0.13; second-PC and negative-path evidence remains.
 
 ### Context and evidence
 
 After reset on both 5.0.12 PCs, launching Boundless from Start opened the tray but left the installed automatic `BoundlessService` stopped. The tray repeatedly reported backend failure and flashed a console window until the user opened elevated PowerShell and ran `Start-Service BoundlessService`. The current tray correctly refuses to launch a competing per-user daemon when the service exists, but it only queries service state and bails; its retry loop repeatedly launches visible `sc.exe query` processes.
+
+Installed v5.0.13 improved the real recovery path: after the service was explicitly stopped, Start Menu launch exposed a `Start service` action in the tray, and clicking it restored the service without a manual `Start-Service` shell command. The user does not recall Start Menu launch starting the service automatically, so count the explicit action—not automatic recovery—as the pass. Repeat on the second PC and retain UAC/cancellation/timeout evidence before closing the story.
 
 ### What to build
 
@@ -104,30 +126,139 @@ None. Preserve BND-NEXT-11’s service-ownership rule rather than reverting to a
 
 ---
 
-## BND-NEXT-38 (P0, needs installed evidence): Make emergency input unlock local and IPC-independent
+## BND-NEXT-41 (P0, v5.0.14 candidate needs installed evidence): Make helper upgrades close Boundless once without Restart Manager loops
 
-Status: code complete in be32484, 6cdb326, and 10ef0ed; deterministic fault-path coverage exists, but installed fault injection and post-recovery handoff remain unproven.
+**Category:** bug
+
+Status: the failure was reproduced during the normal-user 5.0.12→5.0.13 helper/UAC upgrade. The v5.0.14 candidate bounds per-user/session quiescence and the elevated installer process tree, retains quiescence through uncertain cancellation, and fences fail-closed service recovery until privileged authority drains and the service-start action settles. A real normal-user 5.0.13→5.0.14 upgrade on both PCs remains the proof boundary.
+
+### Context and evidence
+
+The matching install helper correctly resolved the desktop user and requested one UAC elevation, but Windows repeatedly reported that Boundless was still running and offered to close it automatically. Choosing automatic close waited for minutes and returned to the same prompt. On CODY-PC, Windows Installer ran from 09:52:54 to 09:57:35 (about 281 seconds). Restart Manager event 10006 at 09:53:31 says `boundless-tray` could not be shut down, and the tray did not close until 09:57:33. The user stopped the service during recovery and reran the helper; both PCs ultimately upgraded, and trust plus the peer connection reasserted without reset.
+
+This is not a recurrence of the old service-stop wedge. `boundless-service-startup.log` records the old service reporting `StopPending` at 14:52:56.518Z and `stopped cleanly` at 14:52:58.536Z, about 2.02 seconds. The helper currently launches elevated `msiexec` without a Boundless preflight. In the released MSI, `InstallValidate=1400` and `RemoveExistingProducts=1401` run before `StopServices=1900` and `Wix4CloseApplications=3999`, so Restart Manager sees locked files before the late CloseApplication action; early major-upgrade removal can then repeat that pass through a nested uninstall. The later CloseApplication target still cannot perform a safe tray shutdown because the tray interprets an ordinary window close as hide-to-tray; only its explicit tray-menu Quit path requests broker shutdown and true process exit.
+
+### What to build
+
+- Give the normal-user helper one bounded preflight: request the current user's tray to execute its real graceful Quit path, verify it exits, elevate once, stop `BoundlessService` through SCM, and only then invoke MSI.
+- Expose a same-user tray shutdown signal that performs broker fail-open, held-input release, detach, and bounded process exit. Distinguish installer/system shutdown from the normal dashboard close-to-tray gesture.
+- Let MSI `ServiceControl` own service shutdown; remove the service executable from `CloseApplication` force-termination fallback rather than racing two owners.
+- Make every wait bounded and leave actionable evidence naming the process that failed to close. Never cycle through the same FilesInUse/Restart Manager prompt indefinitely.
+- Extend installer smoke beyond `/qn` success: run with a live tray and service, enforce upgrade-duration budgets, and fail on Restart Manager 10006 or unexpected SCM 7034 evidence.
+
+### Acceptance criteria
+
+- From a normal desktop PowerShell with one tray, a connected peer, and the service running, the helper upgrades with one UAC prompt and no FilesInUse/Restart Manager dialog.
+- The tray exits gracefully within five seconds, service stop completes within five seconds, and the whole upgrade has a documented bounded duration.
+- No Restart Manager 10006, unexpected SCM 7034, forced tray/service termination, second tray, or competing `boundlessd.exe` occurs.
+- Post-install verification reports the intended version, service/API health, correct allowed-user SID, and exactly one responsive tray.
+- Existing trust, layout, and connection recover without reset; the first handoff and emergency escape work after upgrade.
+- Automated coverage exercises running-tray upgrade, tray refusal/timeout, UAC cancellation, service-stop failure, repair, and uninstall without masking interactive lifecycle failures behind `/qn`.
+
+### Dependencies and scope boundary
+
+BND-NEXT-23 owns bounded SCM stop, BND-NEXT-31 owns tray/broker lifecycle, and BND-NEXT-29 owns the remaining independent packaging paper cuts. This story owns orchestration across those surfaces for install/upgrade.
+
+---
+
+## BND-NEXT-42 (P0, v5.0.14 candidate needs installed evidence): Converge competing trusted sessions without false connected state
+
+**Category:** bug
+
+Status: found during the v5.0.14 release gate and fixed in `6b0aa59`/`cb48c2b`. The adjacent startup replay failure is fixed in `2b766ee`/`b1d15a1`. Deterministic state-machine, reverse-session, replacement-teardown, stale-dial, queue-delivery, credited image replay, and newest-payload tests pass, as do four extended local two-node smokes split across both connection orientations plus a post-review reverse-orientation run. The routed CODY-PC/CODY-ELITEBOOK pair remains the installed proof boundary.
+
+### Context and evidence
+
+The extended two-node smoke twice queued a synthetic input frame while both peers reported connected and trusted, then timed out without an outgoing `input_frame`. Failure snapshots showed `input_queue_high_water queue=outgoing_input depth=1`, a correct destination input owner, and no authority, injection, write, or protocol error. The retained session records exposed simultaneous direct and reverse TLS connections.
+
+The transport registry previously let the first authenticated connection win independently on each machine. The outbound supervisor registered one task ID but the authenticated session allocated a different ownership ID, so replacement could not cancel the exact displaced task. Every claimed session also published `connected=false` when it exited, even if another session had already replaced it. Crossed claims could therefore strand a peer-owned output queue or let stale teardown overwrite a healthy replacement while the UI remained green.
+
+### Scope
+
+- Derive the same preferred physical connection on both peers when direct and reverse sessions race, while accepting a nonpreferred reverse session when it is the only reachable route.
+- Preserve the outbound worker registration ID as its authenticated ownership ID so ownership, explicit reset, and shutdown target the exact task.
+- Serialize claim and close transitions; only the still-current owner may clear the registry claim and publish `connected=false`.
+- Replace sessions through cooperative cancellation so an in-progress flush can finish or requeue drained input/clipboard/file payloads; reserve hard abort for explicit reset and shutdown.
+- Serialize stale outbound-failure disposition with claims so a dial that began earlier cannot clear a reverse session that became active while it was in flight.
+- Keep input, clipboard, and file queues peer-owned rather than direction-owned so either initiation orientation remains fully bidirectional.
+- Preserve bounded failure snapshots for the session, peer, owner, and retained transport-event state when a smoke assertion fails.
+
+### Acceptance criteria
+
+- Crossed two-connection permutations converge on the same preferred session at both endpoints without livelock or duplicate delivery.
+- A sole-reachable reverse session negotiates and carries input in both directions; deterministic preference must not break asymmetric LAN routing.
+- Delayed teardown from a superseded session cannot clear the replacement owner or publish a stale disconnected state.
+- A delayed failed outbound attempt cannot clear an active reverse owner, capture target, input authorization, or peer-connected state.
+- After convergence, input, text/image clipboard, file transfer, and forced reconnect complete without reset and without an output queue remaining stranded.
+- Extended local smoke passes repeatedly in both initiation orientations, followed by an installed two-PC run on the known asymmetric topology.
+
+### Dependencies and scope boundary
+
+This story hardens authenticated session ownership only. BND-NEXT-20E owns discovery lifecycle and manual-host recovery; BND-NEXT-21 owns firewall policy; it does not add relay/cloud transport or change trust admission.
+
+---
+
+## BND-NEXT-43 (P1): Make bulk transport continuously readable under live bidirectional load
+
+**Category:** architecture / reliability
+
+Status: open. Protocol 4.4 closes the observed startup clipboard-replay deadlock only; simultaneous post-startup maximum-text/file traffic and cross-peer fairness remain unimplemented.
+
+### Context and evidence
+
+The v5.0.14 smoke exposed a startup deadlock when both peers replayed a multi-megabyte bitmap: each session synchronously filled its TCP send window and neither returned to its read branch. Protocol 4.4 fixes the observed path with deterministic startup bulk turns, credited 8 KiB clipboard-image chunks, cancellation-safe frame offsets, and bounded write/flush timeouts. Those safeguards do not make the transport generically full duplex. After startup reaches `Ready`, two peers can still initiate maximum text or credited file chunks together; file flow currently grants eight initial 48 KiB chunks, and each selected session branch awaits its write before polling reads again.
+
+The release fence also reuses the global `transport_session_transition` mutex while an owned batch writes. Each socket operation is bounded at two seconds, but one batch can span multiple bounded operations. That is acceptable for the current two-PC dogfood topology, but one stalled peer can temporarily delay ownership claims and egress for unrelated peers for a multi-second window.
+
+### What to build
+
+- Give each authenticated session a continuously serviced read path while bulk egress is pending, using a dedicated bounded writer pump, explicit generic credits, or an equivalently testable design.
+- Preserve one ordered peer-owned egress stream across preferred-session replacement; a timed-out or partially written socket must requeue unsafely committed payloads and cannot let a new owner overtake them.
+- Apply bounded memory and fair scheduling across input, clipboard text/image, layout, and file payloads. Input latency must not wait behind bulk progress.
+- Replace the global egress ownership fence with per-peer serialization or prove equivalent cross-peer fairness under one stalled peer and one healthy peer.
+- Keep protocol framing cancellation-safe and retain bounded progress/stall diagnostics without logging clipboard or file content.
+
+### Acceptance criteria
+
+- Two peers simultaneously send at least five maximum-size text payloads after startup over a constrained duplex transport; all arrive in order without reconnect, timeout, or frame rejection.
+- Two peers simultaneously transfer multi-chunk files with transport capacity smaller than one file chunk; both complete byte-identically while first input continues in both directions.
+- Replacement during a partial bulk write completes within the bounded egress timeout, requeues the unsafely committed payload, and never delivers N+1 ahead of N.
+- Queue and writer memory remain bounded under a stalled reader, and input flush latency has a deterministic upper bound while bulk is active.
+
+### Scope boundary
+
+Do not solve this by increasing smoke timeouts, TCP buffers, or retained queue limits. Protocol 4.4 startup turns and clipboard-image credits remain the release fix for the observed dogfood failure; this story owns the generic live full-duplex architecture.
+
+---
+
+## BND-NEXT-38 (P0, v5.0.14 candidate needs installed evidence): Make emergency input unlock local and IPC-independent
+
+Status: reopened after installed v5.0.13 failed to recognize a physical Double-Control gesture. The v5.0.14 candidate makes Raw Input keyboard state authoritative, treats the hook as a health-checked fallback, fails open on detector/broker loss and broker-session replacement, preserves delivery receipts and held-state recovery across safe reattach, and requires daemon acknowledgment before local lock. Physical both-Control, PowerToys, fault-path, and next-handoff evidence remains pending.
 
 ### Context and evidence
 
 The 5.0.12 tray lifecycle smoke passed single-instance launch and visually recovered connection, trust, layout, input, and clipboard after Quit/relaunch. The first real left-edge handoff then trapped local input. CODY-PC recorded `input_handoff` at 01:29:16.957, `input_lock_engaged requested=true applied=true` at 01:29:17.002, and eight outgoing frames through 01:29:36.251. Double-Control did not return control and no escape event was recorded. Force-ending tray PID 58820 restored local input; Windows recorded Application Hang 1002 (`Top level window is idle`), and the daemon fell back to `service_session_unsupported` at 01:29:43 while retaining the EliteBook as the configured target.
 
-The safety boundary is architecturally confirmed even though the destination injection failure is not: the hook currently queues `EscapeUnlock` but keeps swallowing input until the tray completes another broker RPC and the daemon replies with lock disabled. A stalled exchange, clipboard failure, tray hang, daemon loss, or full event queue can therefore defeat the emergency escape.
+Installed v5.0.13 produced a second, more discriminating failure. CODY-PC recorded left handoff at 18:21:06.948Z and local lock at 18:21:06.979Z. Double-left-Control activated PowerToys Find My Mouse—the dark overlay and cursor spotlight—but Boundless retained no daemon `input_escape_triggered`; control later returned through an ordinary right-boundary handoff at 18:23:44.467Z. Find My Mouse requires the physical left-Control sequence within 500 ms while Boundless allows at least 800 ms, so slow human timing is unlikely. PowerToys reads Raw Input and does not consume the low-level hook; the spotlight is proof of a real UX collision and a physical sequence, not proof Boundless's hook received it.
+
+The v5.0.13 hook now releases synchronously before IPC when it detects the gesture, and its two-second broker lease covers stalled exchange. The missing event instead narrows the current failure to detection: the `WH_KEYBOARD_LL` callback did not see a qualifying sequence, rejected it as injected/incomplete, or had been silently removed. Windows can silently remove a timed-out low-level keyboard hook; Boundless refreshes its Raw Input mouse registration but does not health-check or reinstall the keyboard hook. Healthy broker IPC can renew the lease forever, so the lease cannot rescue a gesture detector that never fires.
 
 ### What to build
 
-- Make the escape gesture atomically release the local hook lock before any channel send, IPC, daemon, network, or UI work; reconcile capture state asynchronously afterward.
-- Give the local lock a short broker-exchange lease or watchdog owned outside the dashboard/UI loop. If successful exchanges stop, fail open to local control within a documented bound no longer than the daemon’s broker-stale window.
-- Provide one reconciliation operation for local escape/lease expiry that asynchronously clears capture, releases remote held keys/buttons, and suppresses immediate edge recapture. BND-NEXT-31 invokes the same primitive during graceful tray shutdown.
-- Record one bounded safety transition with cause (`escape` or `lease_expired`) without logging keys or per-frame activity.
+- Detect the physical emergency gesture through the existing message-only Raw Input thread's keyboard stream, not solely through `WH_KEYBOARD_LL`. Use one authoritative detector when Raw Input is healthy so hook+raw duplicates cannot turn one Control tap into an escape.
+- Retain the low-level hook for blocking/forwarding, but health-check and recover hook loss or report the degraded state truthfully. Preserve the already-landed synchronous local unlock, lease expiry, reconciliation, held-input release, and recapture suppression.
+- Define left/right/generic Control state handling so incomplete or mixed key-up sequences cannot poison the next gesture; keep injected-loop filtering without discarding legitimate physical input.
+- Record one bounded privacy-safe detector/source transition (`raw_keyboard`, `keyboard_hook`, `escape`, or `lease_expired`) locally enough to survive daemon unavailability. Do not log individual key content.
 
 ### Acceptance criteria
 
 - Double-Control restores local mouse and keyboard within 100 ms while the broker RPC is stalled, daemon is unavailable, clipboard exchange has failed, event queues are full, or the dashboard is hung.
 - If no successful broker exchange occurs, the local hook lock releases automatically within three seconds without requiring Task Manager or process termination.
 - Normal escape and lease timeout clear the configured/active capture target, release remote held keys/buttons, and prevent immediate edge recapture.
-- The escape gesture remains reliable under realistic human tap timing while avoiding accidental single-Control unlocks; exact timing is covered by deterministic tests.
-- Installed Windows fault smoke proves local recovery during handoff with a deliberately stalled exchange and confirms the next handoff works without restart.
+- Physical left and right Double-Control pass with PowerToys Find My Mouse enabled and disabled; one tap never unlocks and hook+raw copies never double-count.
+- Simulated low-level keyboard-hook loss still unlocks through the raw/hardware lane; fresh tray, long-running tray, and post-forced-relaunch cases pass.
+- Healthy IPC, stalled IPC, and unavailable daemon cases pass separately, and one local detector-source event remains available even when daemon IPC cannot record reconciliation.
+- Installed Windows fault smoke proves local recovery during handoff and confirms the next handoff works without restart.
 
 ### Dependencies and scope boundary
 
@@ -135,7 +266,7 @@ Coordinate with BND-NEXT-24’s independent broker supervision. This story owns 
 
 ---
 
-## BND-NEXT-39 (P0, implementation candidate needs evidence): Carry laptop two-finger scrolling through remote input
+## BND-NEXT-39 (P0, released implementation needs evidence): Carry laptop two-finger scrolling through remote input
 
 Status: 06facb7 and dfeba9c implement and deduplicate Raw Input wheel data. The implementation remains evidence-gated until the EliteBook identifies that as its source path; add pointer input only if the physical trace requires it.
 
@@ -162,6 +293,42 @@ EliteBook-to-CODY control passed movement, buttons, typing, handoff, return, and
 ### Dependencies and scope boundary
 
 BND-NEXT-34 owns durable bounded stage counters. This story may use temporary targeted tracing or consume those counters, but must not add a second production telemetry system. Do not broaden into arbitrary three-/four-finger gesture sharing.
+
+---
+
+## BND-NEXT-40 (P1, v5.0.14 candidate needs physical evidence): Preserve numeric-keypad and Num Lock semantics across handoff
+
+**Category:** bug
+
+Status: reported on installed v5.0.13 and believed present in earlier versions. The v5.0.14 candidate preserves semantic key identity and source logical Num Lock through the broker, the keyboard identity introduced in protocol 4.3 and retained by final protocol 4.4, and Windows injection while retaining physical scan/E0 distinctions. The opposite-Num-Lock two-PC matrix remains pending.
+
+### Context and evidence
+
+Numeric-keypad input does not behave correctly on the peer. The active installed path is `user_session_broker`, not Session 0 polling. Windows supplies both `vkCode` and scan/extended flags to the low-level keyboard hook, but Boundless discards the virtual-key identity and emits only `{scan_code, state}`. Core input, broker protobuf, peer wire, and injection preserve only that reduced shape; injection forces scan-code mode with `wVk=0`.
+
+The confirmed loss is source logical Num Lock meaning for ambiguous non-E0 keypad digit/decimal scans. Numpad 7/Home share base scan `0x47`, 1/End share `0x4F`, 0/Insert share `0x52`, and decimal/Delete share `0x53`; the destination's Num Lock state can therefore reinterpret source intent. Boundless already preserves scan plus E0 on the installed hook path, so dedicated navigation versus keypad navigation and main Enter versus keypad Enter/divide remain physically distinguishable; cover them as regression cases rather than claiming they are already collapsed. The polling fallback has additional identity limitations when it maps virtual keys back to scans and omits `VK_SEPARATOR`. Existing tests cover ordinary and extended keys but no keypad/lock matrix.
+
+### What to build
+
+- Define one keyboard event model that preserves the existing physical scan/E0 information and state while adding source virtual-key identity plus the effective logical Num Lock semantics needed to reproduce intent.
+- Make Num Lock pressed during remote capture predictably change subsequent keypad behavior even though the source hook suppresses captured keys. Do not force Num Lock on or map every shared scan to a digit; intentional Num-Lock-off navigation must keep working.
+- Carry the new identity through user-session broker IPC, core input, peer wire, and Windows injection. `WireInputEvent::Key` is bincode-backed, so the clean wire change landed in protocol 4.3.0; older local config now migrates directly to final protocol 4.4 rather than using a compatibility shim.
+- Keep the existing keypad/main-cluster Enter, divide, and navigation distinctions intact while fixing decimal, digit, operator, Num Lock, repeat, and release semantics. Make polling preserve identity or report reduced support truthfully instead of silently changing meaning.
+- Add only bounded mode/capability diagnostics; do not retain individual key content or per-keystroke telemetry.
+
+### Acceptance criteria
+
+- With controller/peer Num Lock states on/on, on/off, off/on, and off/off, the peer follows the controller's intended keypad semantics in both directions.
+- `0–9`, decimal, `+`, `-`, `*`, `/`, keypad Enter, Num Lock, and the separate Home/End/arrows/Page/Insert/Delete cluster all pass; already-preserved scan/E0 distinctions do not regress.
+- Pressing Num Lock during an active remote capture changes subsequent keypad semantics predictably without requiring a handoff or restart.
+- Key down, repeat, and key up survive capture, broker IPC, wire encode/decode, and `SendInput` without duplicate or stuck keys.
+- User-session broker and direct-hook modes pass the matrix; polling either passes or surfaces its limitation before capture.
+- Protocol/config compatibility fails truthfully when 4.2/4.3 peers meet a 4.4 peer rather than decoding the changed bincode shape incorrectly.
+
+### Likely files and validation
+
+- `crates/platform-windows/src/input/hook_capture.rs`, `crates/platform-windows/src/input.rs`, `crates/core-input/`, `crates/ipc-api/proto/boundless.proto`, `crates/adapter-ipc-grpc/`, `crates/core-protocol/`, daemon config migration, and focused input round-trip tests.
+- Before coding, run the four Num Lock state combinations in Notepad both directions; if one peer-side Num Lock toggle immediately restores digits, record that as confirmation. After implementation, repeat the full matrix on CODY-PC and CODY-ELITEBOOK.
 
 ---
 
@@ -261,11 +428,11 @@ Machine-readable output (`--json`) for `daemon status`, `peer list`, `transport 
 
 Independent small items, one PR each or one sweep; all observed 2026-07-07:
 
-1. **Code complete; installed validation pending (5dc1521, 7a39d66).** `Boundless-Install.ps1` printed `boundless_install_exit_code=0` on a run where nothing was installed (wedged-mutex session). The helper now verifies Windows Installer registration, manifest/runtime versions, service identity/state, API health, and tray postconditions, and rejects stale evidence; prove those checks during the real 5.0.12→5.0.13 helper-driven upgrade.
+1. **Partial installed pass; lifecycle failure moved to BND-NEXT-41 (5dc1521, 7a39d66).** `Boundless-Install.ps1` previously printed `boundless_install_exit_code=0` on a run where nothing was installed. Both PCs ultimately reached 5.0.13 and a healthy service/API through the matching helper, but the user had to stop the service and retry after repeated Restart Manager prompts. Preserve postcondition verification and make the preflight first-try under BND-NEXT-41.
 2. **Code complete (5dc1521).** `scripts/release/package-windows.ps1` removes `packaging/windows/installer/obj` and `bin` before `dotnet build`, preventing the stale-output MSB3030 failure. Keep the packaging-script smoke in the release gate.
-3. **Open.** Same-version dogfood upgrades silently no-op (`MajorUpgrade` without `AllowSameVersionUpgrades`). Either add `AllowSameVersionUpgrades="yes"` or make the packaging script refuse to build an MSI whose version equals an already-published dogfood artifact. Decide and document in `packaging/windows/README.txt`.
-4. **Needs installed verification.** `boundlessctl daemon status` reported `daemon_version=5.0.0` on 5.0.10 installs. The workspace version bump in v5.0.11 (55c5f6b) likely resolves this — verify against the installed v5.0.13 package, and if the value still lags, wire the real package version through.
-5. **Code complete; installed validation pending (5dc1521, 7a39d66).** Double-clicking the released 5.0.12 MSI failed with Windows Installer error 1603 because `BOUNDLESS_ALLOWED_USER_SID` was absent; a later helper/property-driven install succeeded. The helper is now the documented primary entry point and verifies product/version registration, the service command’s allowed-user SID, service Running, daemon API health, and one responsive tray. Prove the UAC/helper path on both PCs; direct raw-MSI launch is not the supported entry point.
+3. **Code complete; needs installed evidence (5a0be2b).** WiX uses `AllowSameVersionUpgrades="yes"`, the packaging README documents replacement behavior, and packaging-script smoke enforces the contract. Run one same-version helper rebuild on installed hardware to prove the payload is replaced rather than silently no-oping.
+4. **Installed pass.** Both `boundlessctl --version` and `daemon status` report 5.0.13 after the helper-driven upgrade; the stale 5.0.0 runtime-version symptom did not recur.
+5. **Partial installed pass; lifecycle failure moved to BND-NEXT-41 (5dc1521, 7a39d66).** The matching helper resolved the desktop user, requested UAC, passed the SID property, and installed 5.0.13 on both PCs. It did not close running Boundless cleanly and required manual intervention. Direct raw-MSI launch remains unsupported; BND-NEXT-41 must make the primary helper path first-try.
 
 Tray single-instance ownership moved to standalone story BND-NEXT-31 because duplicate trays interfere with the backend connection and need their own runtime acceptance criteria.
 
@@ -273,15 +440,17 @@ Acceptance: each item has a targeted test or self-test where the surface allows;
 
 ---
 
-## BND-NEXT-31 (P1, needs installed evidence): Enforce one tray instance and a safe broker lifecycle per Windows user session
+## BND-NEXT-31 (P1, v5.0.14 candidate needs installed evidence): Enforce one tray instance and a safe broker lifecycle per Windows user session
 
-Status: single-instance ownership passed installed 5.0.12 dogfood. The v5.0.13 candidate implements bounded Quit/relaunch cleanup and broker replacement/stale-owner ordering (dacfad8, 6f1bd28, 68f42f1); installed active-capture lifecycle and upgrade evidence remain pending.
+Status: single-instance ownership and forced-termination recovery passed installed v5.0.13. The v5.0.14 candidate adds a true graceful Quit signal that fails input open, releases broker state, and exits instead of hiding the dashboard; active-capture Quit/relaunch and helper-driven upgrade still need installed proof.
 
 ### Context and evidence
 
 Dogfood can launch any number of `boundlesstray.exe` processes in the same desktop session. Duplicate trays each start their own dashboard and broker activity, then compete for or lose access to the same backend service. The resulting connection failures look like daemon, named-pipe, or service instability even though the initiating defect is duplicate UI ownership. Installer smoke detects an unexpected tray count after upgrade, but normal application launch has no single-instance guard.
 
 Repeated Start Menu launch three times left one tray/dashboard, proving the ownership guard on installed 5.0.12. Quit/relaunch then created a new tray and visually restored connection/trust/layout, but its first handoff trapped local input until force termination. That run produced the fourth Windows Application Hang 1002 since July 9 and left no graceful broker-detach event. Treat single-instance ownership as partial success, not story completion.
+
+Installed v5.0.13 strengthened the partial pass: three Start launches followed by three direct executable launches still left exactly one tray. The runbook's timed forced source-tray termination released local control; relaunch restored the existing connection and input without reset. However, the helper upgrade exposed a separate close-path defect: Windows Restart Manager could not shut down `boundless-tray` because an ordinary close is interpreted as hide-to-tray. BND-NEXT-41 owns installer orchestration, while this story retains the graceful broker-shutdown primitive and active-capture Quit evidence.
 
 ### Scope
 
@@ -303,7 +472,7 @@ Repeated Start Menu launch three times left one tray/dashboard, proving the owne
 - Different Windows users or interactive sessions do not block one another.
 - After clean exit or forced termination, the tray can be launched again without manual cleanup or reboot.
 - Quit/relaunch while connected and while actively captured leaves local input unlocked, clears stale capture ownership, and the first post-relaunch handoff plus emergency escape succeeds.
-- Upgrade-while-running and installer smoke still finish with exactly one tray process and a healthy daemon API connection.
+- Upgrade-while-running and installer smoke use the real graceful Quit path, finish with exactly one tray process and a healthy daemon API connection, and satisfy BND-NEXT-41's no-Restart-Manager-loop contract.
 - Focused tests cover lock acquisition, second-launch behavior, stale-owner recovery, and session scoping; a Windows runtime check proves the process-count behavior.
 
 ### Validation

@@ -1,12 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::io::AsyncWrite;
 use tracing::warn;
 
-use super::outbound::{
-    flush_outgoing_bulk_payloads_with_buffer, flush_outgoing_input_payloads_with_buffer,
-};
+use super::codec::{flush_transport_writer, write_transport_bytes};
+use super::outbound::flush_outgoing_input_payloads_with_buffer;
 use super::*;
-use peer_transport::{DEFAULT_TRANSPORT_TUNING, OutboundTransferFlows};
+use peer_transport::OutboundTransferFlows;
 
 pub(super) enum HelloHandling {
     Continue,
@@ -47,7 +46,7 @@ where
             frame_buffer,
         )
         .await;
-        let _ = tokio::io::AsyncWriteExt::flush(writer).await;
+        let _ = flush_transport_writer(writer, "flush hello identity rejection").await;
         return Ok(HelloHandling::TerminateSession);
     }
 
@@ -69,7 +68,7 @@ where
             frame_buffer,
         )
         .await;
-        let _ = tokio::io::AsyncWriteExt::flush(writer).await;
+        let _ = flush_transport_writer(writer, "flush hello protocol rejection").await;
         return Ok(HelloHandling::TerminateSession);
     }
 
@@ -87,7 +86,7 @@ where
         send_message(writer, &ack, frame_buffer).await?;
     }
 
-    flush_pending_after_control_frame(
+    flush_pending_input_after_control_frame(
         state,
         local_machine_id,
         remote_peer_id,
@@ -97,9 +96,7 @@ where
         frame_buffer,
     )
     .await?;
-    tokio::io::AsyncWriteExt::flush(writer)
-        .await
-        .context("flush hello/ack batch")?;
+    flush_transport_writer(writer, "flush hello/ack batch").await?;
     Ok(HelloHandling::Continue)
 }
 
@@ -124,7 +121,7 @@ where
         let _ = state.set_peer_connected(peer_id, true).await;
     }
 
-    flush_pending_after_control_frame(
+    flush_pending_input_after_control_frame(
         state,
         local_machine_id,
         remote_peer_id,
@@ -134,9 +131,7 @@ where
         frame_buffer,
     )
     .await?;
-    tokio::io::AsyncWriteExt::flush(writer)
-        .await
-        .context("flush hello-ack batch")?;
+    flush_transport_writer(writer, "flush hello-ack batch").await?;
     Ok(())
 }
 
@@ -158,7 +153,7 @@ pub(super) async fn handle_anti_idle_pulse_message(
     }
 }
 
-async fn flush_pending_after_control_frame<W>(
+async fn flush_pending_input_after_control_frame<W>(
     state: &AppState,
     local_machine_id: &str,
     remote_peer_id: Option<&str>,
@@ -181,17 +176,6 @@ where
             frame_buffer,
         )
         .await?;
-        flush_outgoing_bulk_payloads_with_buffer(
-            state,
-            local_machine_id,
-            remote_peer_id,
-            remote_protocol,
-            DEFAULT_TRANSPORT_TUNING.outgoing_bulk_max_payloads_per_flush,
-            outbound_transfer_flow,
-            writer,
-            frame_buffer,
-        )
-        .await?;
     }
 
     Ok(())
@@ -206,9 +190,5 @@ where
     W: AsyncWrite + Unpin,
 {
     encode_frame_to_vec(message, frame_buffer)?;
-    writer
-        .write_all(frame_buffer.as_slice())
-        .await
-        .context("write transport frame")?;
-    Ok(())
+    write_transport_bytes(writer, frame_buffer.as_slice(), "write transport frame").await
 }

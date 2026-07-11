@@ -12,7 +12,9 @@
     Compressed="yes">
 
     <SummaryInformation Description="Boundless Installer" Manufacturer="Boundless" />
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Boundless is already installed." />
+    <MajorUpgrade
+      AllowSameVersionUpgrades="yes"
+      DowngradeErrorMessage="A newer version of Boundless is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Icon Id="BoundlessIcon.ico" SourceFile="$(var.PayloadDir)\Boundless.ico" />
@@ -32,13 +34,6 @@
       Description="Boundless daemon"
       RebootPrompt="no"
       TerminateProcess="1" />
-    <util:CloseApplication
-      Id="CloseBoundlessService"
-      Target="boundless-service.exe"
-      Description="Boundless service"
-      RebootPrompt="no"
-      TerminateProcess="1" />
-
     <Property Id="BOUNDLESSLEGACYSCRIPTINSTALL">
       <DirectorySearch Id="LegacyScriptInstallDirSearch" Path="[LocalAppDataFolder]Programs\Boundless">
         <FileSearch Id="LegacyScriptInstallFileSearch" Name="Boundless-Install.ps1" />

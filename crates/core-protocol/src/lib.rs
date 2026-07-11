@@ -6,7 +6,7 @@ use thiserror::Error;
 pub const PROTOCOL_NAME: &str = "boundless";
 pub const PROTOCOL_CURRENT: ProtocolVersion = ProtocolVersion {
     major: 4,
-    minor: 2,
+    minor: 4,
     patch: 0,
 };
 pub const MAX_WIRE_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -90,6 +90,10 @@ pub enum WireMessage {
     ClipboardImageEnd {
         transfer_id: String,
     },
+    ClipboardImageChunkCredit {
+        transfer_id: String,
+        chunk_credits: u32,
+    },
     FileStart {
         machine_id: String,
         transfer_id: String,
@@ -124,12 +128,22 @@ pub enum WireMessage {
         transfer_id: String,
         reason: String,
     },
+    /// Releases the inbound side's queued startup bulk after the outbound
+    /// side has taken the first bulk turn. This prevents symmetric large
+    /// clipboard replay writes from filling both TCP send windows at once.
+    StartupSyncComplete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireKeyState {
     Down,
     Up,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireKeySemantics {
+    Physical,
+    Windows { virtual_key: u16, num_lock_on: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +176,7 @@ pub enum WireInputEvent {
     Key {
         scan_code: u16,
         state: WireKeyState,
+        semantics: WireKeySemantics,
     },
 }
 
@@ -356,6 +371,27 @@ mod tests {
     }
 
     #[test]
+    fn wire_message_clipboard_image_chunk_credit_round_trip() {
+        let original = WireMessage::ClipboardImageChunkCredit {
+            transfer_id: "clip-1".to_string(),
+            chunk_credits: 1,
+        };
+
+        let encoded = encode_frame(&original).expect("encode");
+        let decoded = decode_frame(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn wire_message_startup_sync_complete_round_trip() {
+        let original = WireMessage::StartupSyncComplete;
+
+        let encoded = encode_frame(&original).expect("encode");
+        let decoded = decode_frame(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
     fn wire_message_input_frame_round_trip() {
         let original = WireMessage::InputFrame {
             machine_id: "machine-a".to_string(),
@@ -366,6 +402,10 @@ mod tests {
                 WireInputEvent::Key {
                     scan_code: 30,
                     state: WireKeyState::Down,
+                    semantics: WireKeySemantics::Windows {
+                        virtual_key: 0x61,
+                        num_lock_on: true,
+                    },
                 },
             ],
         };

@@ -8,6 +8,8 @@ pub struct InputBrokerAttachOutcome {
     pub accepted: bool,
     pub broker_token: String,
     pub message: String,
+    pub protocol_revision: u32,
+    pub delivery_epoch: String,
 }
 
 #[derive(Debug, Default)]
@@ -17,6 +19,11 @@ pub struct InputBrokerExchangeOutcome {
     pub inject_frames: Vec<PendingInjectInputFrame>,
     pub lock_should_be_active: bool,
     pub capture_active: bool,
+    pub capture_forwarding_authorized: bool,
+    pub inject_batch_id: u64,
+    pub inject_batch_cancelled: bool,
+    pub inject_authorization_generation: u64,
+    pub held_input_authorized: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -50,10 +57,16 @@ pub struct InputBrokerExchangeObservations {
     pub cursor: Option<(i32, i32)>,
     pub virtual_bounds: Option<(i32, i32, i32, i32)>,
     pub escape_unlock_count: u32,
+    pub lease_expired_unlock_count: u32,
+    pub detector_unavailable_unlock_count: u32,
+    pub handoff_probe: Option<(i32, i32)>,
     pub lock_active: bool,
     pub dropped_event_count: u64,
     pub injected_frame_count: u32,
     pub inject_failure_count: u32,
+    pub inject_backpressure: bool,
+    pub acked_inject_batch_id: u64,
+    pub held_input_authorization_generation: u64,
     pub raw_device_wheel_event_count: u32,
     pub raw_system_wheel_event_count: u32,
     pub hook_wheel_event_count: u32,
@@ -143,17 +156,32 @@ impl AppState {
         });
     }
 
-    pub async fn attach_input_broker(
+    pub async fn attach_input_broker_versioned(
         &self,
         verified_client: Option<InputBrokerClientIdentity>,
         broker_version: String,
         lock_supported: bool,
+        protocol_revision: u32,
     ) -> InputBrokerAttachOutcome {
+        if protocol_revision != ipc_api::INPUT_BROKER_PROTOCOL_REVISION {
+            return InputBrokerAttachOutcome {
+                accepted: false,
+                broker_token: String::new(),
+                message: format!(
+                    "input broker protocol mismatch: remote={protocol_revision} expected={}",
+                    ipc_api::INPUT_BROKER_PROTOCOL_REVISION
+                ),
+                protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
+                delivery_epoch: String::new(),
+            };
+        }
         if !self.input_broker.service_session_input() {
             return InputBrokerAttachOutcome {
                 accepted: false,
                 broker_token: String::new(),
                 message: "input broker not required: this daemon owns interactive input in its own session".to_string(),
+                protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
+                delivery_epoch: String::new(),
             };
         }
         if let Some(reason) = self.input_broker_client_rejection(&verified_client) {
@@ -164,6 +192,8 @@ impl AppState {
                 message: format!(
                     "input broker attach denied ({reason}): the pipe client must be a verified interactive-session process of the allowed desktop user"
                 ),
+                protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
+                delivery_epoch: String::new(),
             };
         }
 
@@ -194,11 +224,24 @@ impl AppState {
                     broker_token: String::new(),
                     message: "input broker replacement deferred: authoritative releases could not be queued; retry attach"
                         .to_string(),
+                    protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
+                    delivery_epoch: String::new(),
                 };
             }
             self.input_broker.clear_pressed_state();
             self.requeue_broker_clipboard_inflight().await;
+            // A replacement broker cannot prove whether the previous tray
+            // process exited before reporting a local emergency unlock. End
+            // the outgoing capture at this process boundary so stale daemon
+            // state can never relock the replacement broker. Inject delivery
+            // receipts and incoming owner state remain daemon-owned below.
+            self.clear_input_capture_target().await;
+            let _ = self.input_broker.set_desired_lock_active(false);
         }
+        // Delivery state belongs to the daemon instance, not one broker token.
+        // Preserve the exact in-flight batch ID across replacement/stale
+        // reattach so a surviving tray receipt can acknowledge without
+        // re-injecting an already completed batch.
         self.input_broker.attach(InputBrokerAttachment {
             broker_token: broker_token.clone(),
             lock_supported,
@@ -224,13 +267,33 @@ impl AppState {
             broker_token,
             message: "input broker attached for the normal unlocked desktop of the allowed user"
                 .to_string(),
+            protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
+            delivery_epoch: self.input_broker.delivery_epoch(),
         }
+    }
+
+    #[cfg(test)]
+    pub async fn attach_input_broker(
+        &self,
+        verified_client: Option<InputBrokerClientIdentity>,
+        broker_version: String,
+        lock_supported: bool,
+    ) -> InputBrokerAttachOutcome {
+        self.attach_input_broker_versioned(
+            verified_client,
+            broker_version,
+            lock_supported,
+            ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
+        )
+        .await
     }
 
     pub async fn detach_input_broker(
         &self,
         verified_client: Option<InputBrokerClientIdentity>,
         broker_token: &str,
+        delivery_epoch: &str,
+        acked_inject_batch_id: u64,
     ) -> bool {
         if let Some(reason) = self.input_broker_client_rejection(&verified_client) {
             self.record_input_broker_rejection("detach", reason).await;
@@ -241,8 +304,26 @@ impl AppState {
         // or detach first so the capture pass observes an empty relay.
         let _capture_transition = self.input_capture_transition.lock().await;
         let capture_target = self.input_capture_target().await;
-        let detached = self.input_broker.detach(broker_token);
+        let detached = match self.input_broker.acknowledge_and_detach(
+            broker_token,
+            delivery_epoch,
+            acked_inject_batch_id,
+        ) {
+            Ok(detached) => detached,
+            Err(reason) => {
+                self.record_input_broker_rejection("detach", reason).await;
+                return false;
+            }
+        };
         if detached {
+            let unacked_inject_frames = self.input_broker.take_inflight_inject_frames();
+            // The daemon owns delivery until the tray acknowledges a batch.
+            // A cooperative detach/replacement therefore returns every
+            // unacknowledged frame to the queue before a new broker can drain.
+            // A hard daemon-process crash remains the explicit durability
+            // boundary; these in-memory input frames are not persisted.
+            self.requeue_pending_inject_input_frames_front(unacked_inject_frames)
+                .await;
             let release_events = self.input_broker.drain_release_events();
             let release_event_count = release_events.len();
             if let Some(peer_id) = capture_target.as_deref()
@@ -438,7 +519,6 @@ impl AppState {
                 ..Default::default()
             };
         }
-
         if observations.inject_failure_count > 0 {
             self.record_transport_event(TransportEventRecord {
                 timestamp: Utc::now(),
@@ -473,24 +553,157 @@ impl AppState {
             });
         }
 
+        let capture_active = self.active_input_capture_target().await.is_some();
+        let lock_should_be_active = self.input_broker.desired_lock_active();
+        let lock_report_authorizes_next_exchange = capture_active
+            && lock_should_be_active
+            && self.input_broker.lock_supported()
+            && observations.lock_active;
+        let safety_unlock_reported = observations.escape_unlock_count > 0
+            || observations.lease_expired_unlock_count > 0
+            || observations.detector_unavailable_unlock_count > 0;
+        let captured_events = if self.input_broker.capture_forwarding_authorized()
+            && lock_report_authorizes_next_exchange
+            && !safety_unlock_reported
+        {
+            observations.captured_events
+        } else {
+            Vec::new()
+        };
+        let accepted_handoff_probe = if capture_active {
+            None
+        } else {
+            observations.handoff_probe
+        };
+        let handoff_probe_reported =
+            accepted_handoff_probe.is_some_and(|(dx, dy)| dx != 0 || dy != 0);
+        let capture_forwarding_authorized =
+            lock_report_authorizes_next_exchange && !safety_unlock_reported;
         let queued = self.input_broker.push_broker_observations(
-            observations.captured_events,
+            captured_events,
             observations.cursor,
             observations.virtual_bounds,
             observations.escape_unlock_count,
+            observations.lease_expired_unlock_count,
+            observations.detector_unavailable_unlock_count,
+            accepted_handoff_probe,
             observations.lock_active,
             observations.dropped_event_count,
         );
-        if queued > 0 || observations.escape_unlock_count > 0 {
+        self.input_broker
+            .set_capture_forwarding_authorized(capture_forwarding_authorized);
+        if queued > 0 || safety_unlock_reported || handoff_probe_reported {
             self.notify_input_capture_wake("input_broker_exchange");
         }
 
-        let mut inject_frames = Vec::new();
-        let dequeued = self
-            .dequeue_pending_inject_input_frames_up_to(INPUT_BROKER_INJECT_MAX_FRAMES_PER_EXCHANGE)
-            .await;
+        let inflight_before_ack = self.input_broker.inflight_inject_batch();
+        if observations.inject_backpressure && inflight_before_ack.is_none() {
+            return InputBrokerExchangeOutcome {
+                accepted: false,
+                message: "input broker backpressure reported without an in-flight inject batch"
+                    .to_string(),
+                ..Default::default()
+            };
+        }
+
+        if observations.inject_backpressure
+            && observations.acked_inject_batch_id != 0
+            && inflight_before_ack
+                .as_ref()
+                .is_some_and(|batch| batch.batch_id == observations.acked_inject_batch_id)
+        {
+            return InputBrokerExchangeOutcome {
+                accepted: false,
+                message: "input broker cannot acknowledge an inject batch while reporting backpressure for it"
+                    .to_string(),
+                ..Default::default()
+            };
+        }
+
+        if let Err(reason) = self
+            .input_broker
+            .acknowledge_inject_batch(observations.acked_inject_batch_id)
+        {
+            return InputBrokerExchangeOutcome {
+                accepted: false,
+                message: format!("input broker inject acknowledgement rejected: {reason}"),
+                ..Default::default()
+            };
+        }
+
+        let existing_batch = self.input_broker.inflight_inject_batch();
+        let dequeued = if existing_batch.is_none() && !observations.inject_backpressure {
+            self.dequeue_pending_inject_input_frames_up_to(
+                INPUT_BROKER_INJECT_MAX_FRAMES_PER_EXCHANGE,
+            )
+            .await
+        } else {
+            Vec::new()
+        };
+
+        // Owner, sharing policy, and generation are one linearizable state.
+        // Hold its read guard through retained-batch validation or new-batch
+        // staging so an owner/policy writer cannot relabel frames between the
+        // authorization decision and the generation committed to the batch.
+        let authorization = self.input.control.authorization.read().await;
+        let held_input_authorized = authorization
+            .authorizes_held_generation(observations.held_input_authorization_generation);
+        let retained_authorization_changed = existing_batch.as_ref().is_some_and(|batch| {
+            !batch.cancelled
+                && (batch.authorization_generation != authorization.generation()
+                    || batch.frames.iter().any(|frame| {
+                        !authorization.authorizes_peer_generation(
+                            &frame.peer_id,
+                            frame.authorization_generation,
+                        )
+                    }))
+        });
+        let mut accepted = Vec::with_capacity(dequeued.len());
+        let mut rejected = Vec::new();
         for frame in dequeued {
-            if !self.input_injection_allowed_for_peer(&frame.peer_id).await {
+            if authorization
+                .authorizes_peer_generation(&frame.peer_id, frame.authorization_generation)
+            {
+                accepted.push(frame);
+            } else {
+                rejected.push(frame);
+            }
+        }
+        let staged_batch = (!accepted.is_empty()).then(|| {
+            self.input_broker
+                .stage_inject_batch(accepted, authorization.generation())
+        });
+        drop(authorization);
+
+        let batch = if let Some(mut batch) = existing_batch {
+            if retained_authorization_changed {
+                for frame in &batch.frames {
+                    self.record_input_inject_skipped(
+                        &frame.peer_id,
+                        frame.sequence,
+                        frame.events.len(),
+                        frame.timing(),
+                        "retained_batch_authorization_changed",
+                    )
+                    .await;
+                }
+                let Some(cancelled_batch) = self
+                    .input_broker
+                    .cancel_inflight_inject_batch(batch.batch_id)
+                else {
+                    return InputBrokerExchangeOutcome {
+                        accepted: false,
+                        message:
+                            "input broker inject batch changed during authorization revalidation"
+                                .to_string(),
+                        ..Default::default()
+                    };
+                };
+                batch = cancelled_batch;
+            }
+            Some(batch)
+        } else {
+            for frame in rejected {
                 self.record_input_inject_skipped(
                     &frame.peer_id,
                     frame.sequence,
@@ -499,26 +712,43 @@ impl AppState {
                     "owner_or_feature_changed",
                 )
                 .await;
-                continue;
             }
-            self.record_input_broker_inject_dispatched(
-                &frame.peer_id,
-                frame.sequence,
-                frame.events.len(),
-                frame.timing(),
-            )
-            .await;
-            inject_frames.push(frame);
-        }
-
-        let capture_active = self.active_input_capture_target().await.is_some();
+            if let Some(batch) = staged_batch.as_ref() {
+                for frame in &batch.frames {
+                    self.record_input_broker_inject_dispatched(
+                        &frame.peer_id,
+                        frame.sequence,
+                        frame.events.len(),
+                        frame.timing(),
+                    )
+                    .await;
+                }
+            }
+            staged_batch
+        };
+        let inject_batch_id = batch.as_ref().map_or(0, |batch| batch.batch_id);
+        let inject_batch_cancelled = batch.as_ref().is_some_and(|batch| batch.cancelled);
+        let inject_authorization_generation = batch
+            .as_ref()
+            .filter(|batch| !batch.cancelled)
+            .map_or(0, |batch| batch.authorization_generation);
+        let inject_frames = if observations.inject_backpressure || inject_batch_cancelled {
+            Vec::new()
+        } else {
+            batch.map_or_else(Vec::new, |batch| batch.frames)
+        };
 
         InputBrokerExchangeOutcome {
             accepted: true,
             message: String::new(),
             inject_frames,
-            lock_should_be_active: self.input_broker.desired_lock_active(),
+            lock_should_be_active,
             capture_active,
+            capture_forwarding_authorized,
+            inject_batch_id,
+            inject_batch_cancelled,
+            inject_authorization_generation,
+            held_input_authorized,
         }
     }
 

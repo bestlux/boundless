@@ -1,15 +1,16 @@
-use std::{collections::HashMap, time::Instant};
+use std::{cmp::Ordering, collections::HashMap, sync::Arc, time::Instant};
 
 use chrono::Utc;
 use peer_transport::{
-    DEFAULT_TRANSPORT_TUNING, InboundClipboardImageTransfer, InboundTransfer,
-    OutboundTransferFlows, apply_outbound_chunk_credits, reconnect_generation_advanced,
+    CLIPBOARD_IMAGE_INITIAL_CHUNK_CREDITS, DEFAULT_TRANSPORT_TUNING, InboundClipboardImageTransfer,
+    InboundTransfer, OutboundTransferFlows, OutboundTransferKind,
+    apply_outbound_chunk_credits_for_kind, reconnect_generation_advanced,
     remove_outbound_transfer_flow,
 };
 
-use crate::state::TransportEventRecord;
+use crate::state::{RuntimeWakeSignal, TransportEventRecord};
 
-use super::codec::now_millis;
+use super::codec::{flush_transport_writer, now_millis, write_transport_bytes};
 use super::control::{
     HelloHandling, handle_anti_idle_pulse_message, handle_heartbeat_message,
     handle_hello_ack_message, handle_hello_message,
@@ -25,10 +26,12 @@ use super::inbound_payload::{
 };
 use super::outbound::{
     flush_outgoing_bulk_payloads_with_buffer, flush_outgoing_input_payloads_with_buffer,
+    send_clipboard_image_chunk_credit,
 };
 use super::*;
 
 struct AuthenticatedSession {
+    session_id: u64,
     peer_id: String,
     remote_peer_id: Option<String>,
     is_outbound: bool,
@@ -37,9 +40,10 @@ struct AuthenticatedSession {
 }
 
 impl AuthenticatedSession {
-    async fn new(state: &AppState, peer_id: String, is_outbound: bool) -> Self {
+    async fn new(state: &AppState, session_id: u64, peer_id: String, is_outbound: bool) -> Self {
         let snapshot = state.snapshot().await;
         Self {
+            session_id,
             remote_peer_id: Some(peer_id.clone()),
             peer_id,
             is_outbound,
@@ -66,6 +70,7 @@ struct ActiveTransportSessionGuard {
     state: AppState,
     peer_id: String,
     session_id: u64,
+    armed: bool,
 }
 
 impl ActiveTransportSessionGuard {
@@ -74,14 +79,21 @@ impl ActiveTransportSessionGuard {
             state,
             peer_id,
             session_id,
+            armed: true,
         }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
 impl Drop for ActiveTransportSessionGuard {
     fn drop(&mut self) {
-        self.state
-            .clear_active_transport_session(&self.peer_id, self.session_id);
+        if self.armed {
+            self.state
+                .clear_active_transport_session(&self.peer_id, self.session_id);
+        }
     }
 }
 
@@ -91,11 +103,19 @@ enum SessionExitReason {
     PeerClosed,
     InvalidFrame,
     ProtocolRejected,
+    Superseded,
 }
 
 enum SessionBranchOutcome {
     Continue,
     Exit(SessionExitReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupBulkState {
+    AwaitingTurn,
+    AwaitingPeerCompletion,
+    Ready,
 }
 
 struct SessionRuntime {
@@ -104,9 +124,9 @@ struct SessionRuntime {
     inbound_transfers: HashMap<String, InboundTransfer>,
     inbound_clipboard_image_transfers: HashMap<String, InboundClipboardImageTransfer>,
     outbound_transfer_flow: OutboundTransferFlows,
-    frame_payload: Vec<u8>,
     write_frame_buffer: Vec<u8>,
     last_anti_idle_pulse_sent_at: Option<Instant>,
+    startup_bulk_state: StartupBulkState,
 }
 
 impl SessionRuntime {
@@ -117,10 +137,35 @@ impl SessionRuntime {
             inbound_transfers: HashMap::new(),
             inbound_clipboard_image_transfers: HashMap::new(),
             outbound_transfer_flow: HashMap::new(),
-            frame_payload: Vec::with_capacity(4096),
             write_frame_buffer,
             last_anti_idle_pulse_sent_at: None,
+            startup_bulk_state: StartupBulkState::AwaitingTurn,
         }
+    }
+
+    fn startup_bulk_ready(&self) -> bool {
+        self.startup_bulk_state == StartupBulkState::Ready
+    }
+
+    fn retire_inbound_clipboard_images(
+        &mut self,
+        state: &AppState,
+        peer_id: &str,
+        successor: &'static str,
+    ) {
+        let retired_transfers = self.inbound_clipboard_image_transfers.len();
+        if retired_transfers == 0 {
+            return;
+        }
+        self.inbound_clipboard_image_transfers.clear();
+        state.record_transport_event(TransportEventRecord {
+            timestamp: Utc::now(),
+            direction: "incoming".to_string(),
+            kind: "clipboard_image_superseded".to_string(),
+            peer_id: peer_id.to_string(),
+            detail: format!("payload_type=bmp disposition=superseded reason={successor}"),
+            size_bytes: 0,
+        });
     }
 
     async fn reconnect_requested_exit(
@@ -185,10 +230,12 @@ impl SessionRuntime {
         if let Some(remote_protocol) = self.remote_protocol {
             self.flush_outgoing_input(state, session, remote_protocol, writer)
                 .await?;
-            self.flush_outgoing_bulk(state, session, remote_protocol, writer)
-                .await?;
+            if self.startup_bulk_ready() {
+                self.flush_outgoing_bulk(state, session, remote_protocol, writer)
+                    .await?;
+            }
         }
-        writer.flush().await.context("flush heartbeat batch")?;
+        flush_transport_writer(writer, "flush heartbeat batch").await?;
         Ok(SessionBranchOutcome::Continue)
     }
 
@@ -225,7 +272,9 @@ impl SessionRuntime {
             return Ok(SessionBranchOutcome::Exit(exit_reason));
         }
 
-        if let Some(remote_protocol) = self.remote_protocol {
+        if self.startup_bulk_ready()
+            && let Some(remote_protocol) = self.remote_protocol
+        {
             self.flush_outgoing_bulk(state, session, remote_protocol, writer)
                 .await?;
         }
@@ -256,6 +305,7 @@ impl SessionRuntime {
         &mut self,
         state: &AppState,
         session: &AuthenticatedSession,
+        frame_payload: &[u8],
         read: Result<Option<usize>>,
         writer: &mut W,
     ) -> Result<SessionBranchOutcome>
@@ -273,7 +323,7 @@ impl SessionRuntime {
                     state,
                     &session.peer_id,
                     format!("reason=invalid_frame error={error:#}"),
-                    self.frame_payload.len() as u64,
+                    frame_payload.len() as u64,
                 )
                 .await;
                 warn!(
@@ -287,7 +337,7 @@ impl SessionRuntime {
             return Ok(SessionBranchOutcome::Exit(SessionExitReason::PeerClosed));
         };
 
-        let message = match decode_frame_payload(&self.frame_payload) {
+        let message = match decode_frame_payload(frame_payload) {
             Ok(message) => message,
             Err(error) => {
                 record_transport_frame_rejected(
@@ -320,26 +370,61 @@ impl SessionRuntime {
     where
         W: AsyncWrite + Unpin,
     {
+        if self.remote_protocol != Some(PROTOCOL_CURRENT)
+            && !matches!(
+                &message,
+                WireMessage::Hello { .. } | WireMessage::Error { .. }
+            )
+        {
+            record_transport_frame_rejected(
+                state,
+                &session.peer_id,
+                "reason=protocol_not_negotiated expected=initial_hello".to_string(),
+                0,
+            )
+            .await;
+            send_message(
+                writer,
+                &WireMessage::Error {
+                    message: "protocol not negotiated: initial Hello required".to_string(),
+                },
+                &mut self.write_frame_buffer,
+            )
+            .await?;
+            flush_transport_writer(writer, "flush pre-Hello protocol rejection").await?;
+            return Ok(SessionBranchOutcome::Exit(
+                SessionExitReason::ProtocolRejected,
+            ));
+        }
+
         match message {
             WireMessage::Hello {
                 machine_id,
                 protocol,
                 ..
             } => {
-                let handling = handle_hello_message(
-                    state,
-                    &session.peer_id,
-                    session.remote_peer_id(),
-                    session.is_outbound,
-                    &session.local_machine_id,
-                    machine_id,
-                    protocol,
-                    &mut self.remote_protocol,
-                    &mut self.outbound_transfer_flow,
-                    writer,
-                    &mut self.write_frame_buffer,
-                )
-                .await?;
+                let handling = {
+                    let Some(_egress) = state
+                        .acquire_transport_session_egress(&session.peer_id, session.session_id)
+                        .await
+                    else {
+                        return Ok(SessionBranchOutcome::Exit(SessionExitReason::Superseded));
+                    };
+                    handle_hello_message(
+                        state,
+                        &session.peer_id,
+                        session.remote_peer_id(),
+                        session.is_outbound,
+                        &session.local_machine_id,
+                        machine_id,
+                        protocol,
+                        &mut self.remote_protocol,
+                        &mut self.outbound_transfer_flow,
+                        writer,
+                        &mut self.write_frame_buffer,
+                    )
+                    .await?
+                };
                 if matches!(handling, HelloHandling::TerminateSession) {
                     return Ok(SessionBranchOutcome::Exit(
                         SessionExitReason::ProtocolRejected,
@@ -347,18 +432,74 @@ impl SessionRuntime {
                 }
             }
             WireMessage::HelloAck { accepted, .. } => {
-                handle_hello_ack_message(
-                    state,
-                    session.remote_peer_id(),
-                    &session.local_machine_id,
-                    self.remote_protocol,
-                    &mut self.outbound_transfer_flow,
-                    accepted,
-                    writer,
-                    &mut self.write_frame_buffer,
-                )
-                .await?;
+                {
+                    let Some(_egress) = state
+                        .acquire_transport_session_egress(&session.peer_id, session.session_id)
+                        .await
+                    else {
+                        return Ok(SessionBranchOutcome::Exit(SessionExitReason::Superseded));
+                    };
+                    handle_hello_ack_message(
+                        state,
+                        session.remote_peer_id(),
+                        &session.local_machine_id,
+                        self.remote_protocol,
+                        &mut self.outbound_transfer_flow,
+                        accepted,
+                        writer,
+                        &mut self.write_frame_buffer,
+                    )
+                    .await?;
+                }
+                if accepted
+                    && session.is_outbound
+                    && self.startup_bulk_state == StartupBulkState::AwaitingTurn
+                    && let Some(remote_protocol) = self.remote_protocol
+                {
+                    if !self
+                        .complete_startup_bulk_turn(
+                            state,
+                            session,
+                            remote_protocol,
+                            writer,
+                            "flush outbound startup bulk handoff",
+                        )
+                        .await?
+                    {
+                        return Ok(SessionBranchOutcome::Exit(SessionExitReason::Superseded));
+                    }
+                    self.startup_bulk_state = StartupBulkState::AwaitingPeerCompletion;
+                }
             }
+            WireMessage::StartupSyncComplete => match self.startup_bulk_state {
+                StartupBulkState::AwaitingTurn if !session.is_outbound => {
+                    if let Some(remote_protocol) = self.remote_protocol
+                        && !self
+                            .complete_startup_bulk_turn(
+                                state,
+                                session,
+                                remote_protocol,
+                                writer,
+                                "flush inbound startup bulk handoff",
+                            )
+                            .await?
+                    {
+                        return Ok(SessionBranchOutcome::Exit(SessionExitReason::Superseded));
+                    }
+                    self.startup_bulk_state = StartupBulkState::Ready;
+                }
+                StartupBulkState::AwaitingPeerCompletion if session.is_outbound => {
+                    self.startup_bulk_state = StartupBulkState::Ready;
+                }
+                state => {
+                    warn!(
+                        peer_id = %session.peer_id,
+                        is_outbound = session.is_outbound,
+                        startup_state = ?state,
+                        "ignoring unexpected startup bulk handoff"
+                    );
+                }
+            },
             WireMessage::Heartbeat { .. } => {
                 handle_heartbeat_message(state, session.remote_peer_id()).await;
             }
@@ -367,6 +508,9 @@ impl SessionRuntime {
                     .await;
             }
             WireMessage::ClipboardText { machine_id, text } => {
+                if machine_id == session.peer_id {
+                    self.retire_inbound_clipboard_images(state, &session.peer_id, "clipboard_text");
+                }
                 handle_clipboard_text_message(
                     state,
                     &session.peer_id,
@@ -377,6 +521,13 @@ impl SessionRuntime {
                 .await;
             }
             WireMessage::ClipboardImage { machine_id, data } => {
+                if machine_id == session.peer_id {
+                    self.retire_inbound_clipboard_images(
+                        state,
+                        &session.peer_id,
+                        "clipboard_image_inline",
+                    );
+                }
                 handle_clipboard_image_message(
                     state,
                     &session.peer_id,
@@ -393,7 +544,8 @@ impl SessionRuntime {
                 hash_hex,
                 ..
             } => {
-                handle_clipboard_image_start(
+                let credit_transfer_id = transfer_id.clone();
+                let accepted = handle_clipboard_image_start(
                     state,
                     &session.peer_id,
                     session.remote_peer_id(),
@@ -404,8 +556,24 @@ impl SessionRuntime {
                     &mut self.inbound_clipboard_image_transfers,
                 )
                 .await?;
+                if accepted {
+                    send_clipboard_image_chunk_credit(
+                        writer,
+                        &credit_transfer_id,
+                        CLIPBOARD_IMAGE_INITIAL_CHUNK_CREDITS,
+                        &mut self.write_frame_buffer,
+                    )
+                    .await?;
+                    flush_transport_writer(writer, "flush initial clipboard image chunk credit")
+                        .await?;
+                }
             }
             WireMessage::ClipboardImageChunk { transfer_id, data } => {
+                let credit_transfer_id = transfer_id.clone();
+                let previous_bytes_received = self
+                    .inbound_clipboard_image_transfers
+                    .get(&credit_transfer_id)
+                    .map(|transfer| transfer.bytes_received);
                 handle_clipboard_image_chunk(
                     state,
                     transfer_id,
@@ -413,6 +581,24 @@ impl SessionRuntime {
                     &mut self.inbound_clipboard_image_transfers,
                 )
                 .await?;
+                let should_replenish = self
+                    .inbound_clipboard_image_transfers
+                    .get(&credit_transfer_id)
+                    .is_some_and(|transfer| {
+                        previous_bytes_received
+                            .is_some_and(|previous| transfer.bytes_received > previous)
+                            && transfer.bytes_received < transfer.total_bytes
+                    });
+                if should_replenish {
+                    send_clipboard_image_chunk_credit(
+                        writer,
+                        &credit_transfer_id,
+                        1,
+                        &mut self.write_frame_buffer,
+                    )
+                    .await?;
+                    flush_transport_writer(writer, "flush clipboard image chunk credit").await?;
+                }
             }
             WireMessage::ClipboardImageEnd { transfer_id, .. } => {
                 handle_clipboard_image_end(
@@ -457,8 +643,29 @@ impl SessionRuntime {
                 transfer_id,
                 chunk_credits,
             } => {
-                self.handle_file_chunk_credit(state, session, writer, transfer_id, chunk_credits)
-                    .await?;
+                self.handle_chunk_credit(
+                    state,
+                    session,
+                    writer,
+                    transfer_id,
+                    chunk_credits,
+                    OutboundTransferKind::File,
+                )
+                .await?;
+            }
+            WireMessage::ClipboardImageChunkCredit {
+                transfer_id,
+                chunk_credits,
+            } => {
+                self.handle_chunk_credit(
+                    state,
+                    session,
+                    writer,
+                    transfer_id,
+                    chunk_credits,
+                    OutboundTransferKind::ClipboardImage,
+                )
+                .await?;
             }
             WireMessage::FileTransferRejected {
                 transfer_id,
@@ -508,19 +715,23 @@ impl SessionRuntime {
             }
             WireMessage::Error { message } => {
                 warn!(%message, "remote error frame");
+                return Ok(SessionBranchOutcome::Exit(
+                    SessionExitReason::ProtocolRejected,
+                ));
             }
         }
 
         Ok(SessionBranchOutcome::Continue)
     }
 
-    async fn handle_file_chunk_credit<W>(
+    async fn handle_chunk_credit<W>(
         &mut self,
         state: &AppState,
         session: &AuthenticatedSession,
         writer: &mut W,
         transfer_id: String,
         chunk_credits: u32,
+        expected_kind: OutboundTransferKind,
     ) -> Result<()>
     where
         W: AsyncWrite + Unpin,
@@ -529,26 +740,44 @@ impl SessionRuntime {
             return Ok(());
         }
 
-        let Some(_current_credits) = apply_outbound_chunk_credits(
+        if expected_kind == OutboundTransferKind::ClipboardImage
+            && !state
+                .has_outgoing_clipboard_image_cursor(&session.peer_id, &transfer_id)
+                .await
+        {
+            remove_outbound_transfer_flow(&mut self.outbound_transfer_flow, &transfer_id);
+            return Ok(());
+        }
+
+        let Some(_current_credits) = apply_outbound_chunk_credits_for_kind(
             &mut self.outbound_transfer_flow,
             &transfer_id,
             chunk_credits,
+            expected_kind,
         ) else {
             warn!(
                 transfer_id = %transfer_id,
                 chunk_credits,
-                "dropping file chunk credit for unknown outbound transfer"
+                "dropping chunk credit for unknown outbound transfer"
             );
             return Ok(());
         };
 
-        if let Some(remote_protocol) = self.remote_protocol {
+        if self.startup_bulk_ready()
+            && let Some(remote_protocol) = self.remote_protocol
+        {
             self.flush_outgoing_bulk(state, session, remote_protocol, writer)
                 .await?;
-            writer
-                .flush()
+            flush_transport_writer(writer, "flush outbound bulk after receiving chunk credit")
+                .await?;
+        }
+
+        if expected_kind == OutboundTransferKind::ClipboardImage
+            && !state
+                .has_outgoing_clipboard_image_cursor(&session.peer_id, &transfer_id)
                 .await
-                .context("flush outbound bulk after receiving file chunk credit")?;
+        {
+            remove_outbound_transfer_flow(&mut self.outbound_transfer_flow, &transfer_id);
         }
 
         Ok(())
@@ -564,6 +793,12 @@ impl SessionRuntime {
     where
         W: AsyncWrite + Unpin,
     {
+        let Some(_egress) = state
+            .acquire_transport_session_egress(&session.peer_id, session.session_id)
+            .await
+        else {
+            return Ok(());
+        };
         flush_outgoing_input_payloads_with_buffer(
             state,
             &session.local_machine_id,
@@ -586,6 +821,12 @@ impl SessionRuntime {
     where
         W: AsyncWrite + Unpin,
     {
+        let Some(_egress) = state
+            .acquire_transport_session_egress(&session.peer_id, session.session_id)
+            .await
+        else {
+            return Ok(());
+        };
         flush_outgoing_bulk_payloads_with_buffer(
             state,
             &session.local_machine_id,
@@ -597,6 +838,44 @@ impl SessionRuntime {
             &mut self.write_frame_buffer,
         )
         .await
+    }
+
+    async fn complete_startup_bulk_turn<W>(
+        &mut self,
+        state: &AppState,
+        session: &AuthenticatedSession,
+        remote_protocol: ProtocolVersion,
+        writer: &mut W,
+        flush_operation: &'static str,
+    ) -> Result<bool>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let Some(_egress) = state
+            .acquire_transport_session_egress(&session.peer_id, session.session_id)
+            .await
+        else {
+            return Ok(false);
+        };
+        flush_outgoing_bulk_payloads_with_buffer(
+            state,
+            &session.local_machine_id,
+            session.remote_peer_id(),
+            remote_protocol,
+            usize::MAX,
+            &mut self.outbound_transfer_flow,
+            writer,
+            &mut self.write_frame_buffer,
+        )
+        .await?;
+        send_message(
+            writer,
+            &WireMessage::StartupSyncComplete,
+            &mut self.write_frame_buffer,
+        )
+        .await?;
+        flush_transport_writer(writer, flush_operation).await?;
+        Ok(true)
     }
 
     async fn discard_inbound_state(self, state: &AppState) {
@@ -643,8 +922,9 @@ pub(super) async fn run_authenticated_outbound_session(
     state: AppState,
     peer_id: String,
     stream: tokio_rustls::TlsStream<TcpStream>,
+    session_registration_id: Option<u64>,
 ) -> Result<()> {
-    run_authenticated_session(state, peer_id, stream, true, None).await
+    run_authenticated_session(state, peer_id, stream, true, session_registration_id).await
 }
 
 async fn tcp_connect_with_timeout(address: &str) -> Result<TcpStream> {
@@ -807,16 +1087,50 @@ where
     let ownership_session_id = session_registration_id
         .filter(|session_id| *session_id != 0)
         .unwrap_or_else(|| state.allocate_transport_session_id());
-    match state.claim_transport_session(&authenticated_peer_id, ownership_session_id) {
+    let session = AuthenticatedSession::new(
+        &state,
+        ownership_session_id,
+        authenticated_peer_id,
+        is_outbound,
+    )
+    .await;
+    let preferred = transport_session_direction_is_preferred(
+        &session.local_machine_id,
+        &session.peer_id,
+        is_outbound,
+    );
+    let session_cancellation = Arc::new(RuntimeWakeSignal::default());
+    match state
+        .claim_transport_session(
+            &session.peer_id,
+            ownership_session_id,
+            preferred,
+            session_cancellation.clone(),
+        )
+        .await
+    {
         crate::state::TransportSessionClaim::Claimed => {
             state.record_transport_event(TransportEventRecord {
                 timestamp: Utc::now(),
                 direction: transport_session_direction(is_outbound).to_string(),
                 kind: "transport_session_authenticated".to_string(),
-                peer_id: authenticated_peer_id.clone(),
+                peer_id: session.peer_id.clone(),
                 detail: format!(
-                    "transport={} ownership=claimed",
-                    transport_initiation_label(is_outbound)
+                    "transport={} ownership=claimed preferred={preferred}",
+                    transport_initiation_label(is_outbound),
+                ),
+                size_bytes: 0,
+            });
+        }
+        crate::state::TransportSessionClaim::Replaced { active_session_id } => {
+            state.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: transport_session_direction(is_outbound).to_string(),
+                kind: "transport_session_replaced".to_string(),
+                peer_id: session.peer_id.clone(),
+                detail: format!(
+                    "transport={} ownership=replaced_nonpreferred active_session_id={active_session_id}",
+                    transport_initiation_label(is_outbound),
                 ),
                 size_bytes: 0,
             });
@@ -826,10 +1140,10 @@ where
                 timestamp: Utc::now(),
                 direction: transport_session_direction(is_outbound).to_string(),
                 kind: "transport_session_duplicate".to_string(),
-                peer_id: authenticated_peer_id,
+                peer_id: session.peer_id,
                 detail: format!(
-                    "transport={} ownership=duplicate active_session=present",
-                    transport_initiation_label(is_outbound)
+                    "transport={} ownership=duplicate active_session=present preferred={preferred}",
+                    transport_initiation_label(is_outbound),
                 ),
                 size_bytes: 0,
             });
@@ -839,16 +1153,16 @@ where
             bail!("transport session registry closed");
         }
     }
-    let _active_session_guard = ActiveTransportSessionGuard::new(
+    let mut active_session_guard = ActiveTransportSessionGuard::new(
         state.clone(),
-        authenticated_peer_id.clone(),
+        session.peer_id.clone(),
         ownership_session_id,
     );
 
     let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
-    let mut write_frame_buffer = Vec::<u8>::with_capacity(4096);
+    let write_frame_buffer = Vec::<u8>::with_capacity(4096);
     let mut heartbeat_interval = time::interval(DEFAULT_TRANSPORT_TUNING.heartbeat_interval);
     let mut outgoing_input_flush_interval =
         time::interval(DEFAULT_TRANSPORT_TUNING.outgoing_input_flush_interval);
@@ -859,19 +1173,33 @@ where
     outgoing_input_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     outgoing_bulk_flush_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
-    let session = AuthenticatedSession::new(&state, authenticated_peer_id, is_outbound).await;
     let local_hello = session.local_hello();
-
-    send_message(&mut writer, &local_hello, &mut write_frame_buffer).await?;
-    writer.flush().await.context("flush local hello")?;
-
     let observed_reconnect_generation = state.peer_reconnect_generation(&session.peer_id).await;
     let mut runtime = SessionRuntime::new(observed_reconnect_generation, write_frame_buffer);
+    let mut frame_reader = WireFrameReader::default();
 
     let session_result: Result<SessionExitReason> = {
         async {
+            send_message(
+                &mut writer,
+                &local_hello,
+                &mut runtime.write_frame_buffer,
+            )
+            .await?;
+            flush_transport_writer(&mut writer, "flush local hello").await?;
+
             loop {
+                let superseded = session_cancellation.notified();
+                tokio::pin!(superseded);
+                if session_cancellation.take_pending() {
+                    break Ok(SessionExitReason::Superseded);
+                }
         tokio::select! {
+            biased;
+            _ = &mut superseded => {
+                let _ = session_cancellation.take_pending();
+                break Ok(SessionExitReason::Superseded);
+            }
             _ = heartbeat_interval.tick() => {
                 if let SessionBranchOutcome::Exit(exit_reason) = runtime
                     .handle_heartbeat_tick(&state, &session, &mut writer)
@@ -888,7 +1216,7 @@ where
                     break Ok(exit_reason);
                 }
             }
-            _ = outgoing_bulk_flush_interval.tick(), if runtime.remote_protocol.is_some() => {
+            _ = outgoing_bulk_flush_interval.tick(), if runtime.remote_protocol.is_some() && runtime.startup_bulk_ready() => {
                 if let SessionBranchOutcome::Exit(exit_reason) = runtime
                     .handle_outgoing_bulk_flush_tick(&state, &session, &mut writer)
                     .await?
@@ -908,9 +1236,15 @@ where
                     break Ok(exit_reason);
                 }
             }
-            read = read_wire_frame_payload(&mut reader, &mut runtime.frame_payload) => {
+            read = frame_reader.read_next(&mut reader) => {
                 if let SessionBranchOutcome::Exit(exit_reason) = runtime
-                    .handle_inbound_read_result(&state, &session, read, &mut writer)
+                    .handle_inbound_read_result(
+                        &state,
+                        &session,
+                        frame_reader.payload(),
+                        read,
+                        &mut writer,
+                    )
                     .await?
                 {
                     break Ok(exit_reason);
@@ -923,12 +1257,24 @@ where
     };
 
     runtime.discard_inbound_state(&state).await;
-
-    if let Some(peer_id) = session.remote_peer_id() {
-        let _ = state.set_peer_connected(peer_id, false).await;
-    }
+    let _was_current = state
+        .close_active_transport_session(&session.peer_id, session.session_id)
+        .await;
+    active_session_guard.disarm();
 
     session_result.map(|_| ())
+}
+
+fn transport_session_direction_is_preferred(
+    local_machine_id: &str,
+    remote_machine_id: &str,
+    is_outbound: bool,
+) -> bool {
+    match local_machine_id.cmp(remote_machine_id) {
+        Ordering::Less => is_outbound,
+        Ordering::Greater => !is_outbound,
+        Ordering::Equal => is_outbound,
+    }
 }
 
 fn transport_session_direction(is_outbound: bool) -> &'static str {
@@ -1009,42 +1355,89 @@ where
     W: AsyncWrite + Unpin,
 {
     encode_frame_to_vec(message, frame_buffer)?;
-    writer
-        .write_all(frame_buffer.as_slice())
-        .await
-        .context("write transport frame")?;
-    Ok(())
+    write_transport_bytes(writer, frame_buffer.as_slice(), "write transport frame").await
 }
 
-async fn read_wire_frame_payload<R>(reader: &mut R, payload: &mut Vec<u8>) -> Result<Option<usize>>
-where
-    R: AsyncRead + Unpin,
-{
-    payload.clear();
-    let mut length_prefix = [0u8; WIRE_FRAME_LENGTH_PREFIX_BYTES];
-    match reader.read_exact(&mut length_prefix).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(anyhow::Error::from(error).context("read transport frame header")),
+/// Cancellation-safe framed reader for the session `select!` loop.
+///
+/// Timer and queue branches may cancel `read_next` after any socket read. The
+/// offsets therefore live on the session instead of inside one future; the
+/// next call resumes the same header or payload rather than treating the
+/// remaining bytes as a new frame.
+#[derive(Default)]
+pub(super) struct WireFrameReader {
+    length_prefix: [u8; WIRE_FRAME_LENGTH_PREFIX_BYTES],
+    length_prefix_read: usize,
+    declared_len: Option<usize>,
+    payload: Vec<u8>,
+    payload_read: usize,
+}
+
+impl WireFrameReader {
+    pub(super) fn payload(&self) -> &[u8] {
+        &self.payload
     }
 
-    let declared_len = u32::from_be_bytes(length_prefix) as usize;
-    if declared_len > MAX_WIRE_FRAME_BYTES {
-        bail!(
-            "wire frame exceeds max payload length: {} > {}",
-            declared_len,
-            MAX_WIRE_FRAME_BYTES
-        );
+    fn finish_frame(&mut self) {
+        self.length_prefix_read = 0;
+        self.declared_len = None;
+        self.payload_read = 0;
     }
 
-    payload.clear();
-    payload.resize(declared_len, 0);
-    reader
-        .read_exact(payload)
-        .await
-        .context("read transport frame payload")?;
+    pub(super) async fn read_next<R>(&mut self, reader: &mut R) -> Result<Option<usize>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        loop {
+            if self.declared_len.is_none() {
+                let read = reader
+                    .read(&mut self.length_prefix[self.length_prefix_read..])
+                    .await
+                    .context("read transport frame header")?;
+                if read == 0 {
+                    if self.length_prefix_read == 0 {
+                        return Ok(None);
+                    }
+                    bail!("transport closed during frame header");
+                }
+                self.length_prefix_read += read;
+                if self.length_prefix_read < WIRE_FRAME_LENGTH_PREFIX_BYTES {
+                    continue;
+                }
 
-    Ok(Some(declared_len))
+                let declared_len = u32::from_be_bytes(self.length_prefix) as usize;
+                if declared_len > MAX_WIRE_FRAME_BYTES {
+                    bail!(
+                        "wire frame exceeds max payload length: {} > {}",
+                        declared_len,
+                        MAX_WIRE_FRAME_BYTES
+                    );
+                }
+                self.payload.clear();
+                self.payload.resize(declared_len, 0);
+                self.payload_read = 0;
+                self.declared_len = Some(declared_len);
+                if declared_len == 0 {
+                    self.finish_frame();
+                    return Ok(Some(0));
+                }
+            }
+
+            let declared_len = self.declared_len.expect("declared frame length");
+            let read = reader
+                .read(&mut self.payload[self.payload_read..declared_len])
+                .await
+                .context("read transport frame payload")?;
+            if read == 0 {
+                bail!("transport closed during frame payload");
+            }
+            self.payload_read += read;
+            if self.payload_read == declared_len {
+                self.finish_frame();
+                return Ok(Some(declared_len));
+            }
+        }
+    }
 }
 
 async fn record_transport_frame_rejected(

@@ -52,9 +52,23 @@ impl InputCaptureBackend for BrokerRelayCaptureBackend {
     }
 
     fn drain_control_actions(&mut self) -> Vec<CaptureControlAction> {
-        (0..self.relay.take_escape_unlock_count())
-            .map(|_| CaptureControlAction::EscapeUnlock)
-            .collect()
+        let counts = self.relay.take_safety_unlock_counts();
+        let mut actions = Vec::with_capacity(
+            counts
+                .escape
+                .saturating_add(counts.lease_expired)
+                .saturating_add(counts.detector_unavailable) as usize,
+        );
+        actions.extend((0..counts.escape).map(|_| CaptureControlAction::Escape));
+        actions.extend((0..counts.lease_expired).map(|_| CaptureControlAction::LeaseExpired));
+        actions.extend(
+            (0..counts.detector_unavailable).map(|_| CaptureControlAction::DetectorUnavailable),
+        );
+        actions
+    }
+
+    fn poll_handoff_probe(&mut self) -> Option<InputEvent> {
+        self.relay.drain_handoff_probe()
     }
 
     fn set_lock_active(&mut self, active: bool) -> Result<bool> {
@@ -132,17 +146,23 @@ impl InputCaptureBackend for NoopCaptureBackend {
 #[cfg(windows)]
 impl InputBackend for WindowsInputBackend {
     fn apply(&mut self, event: &InputEvent) -> Result<()> {
-        let records = input_records_for_event(event);
-        send_input_records(&records)
-            .with_context(|| format!("SendInput failed for {}", input_event_kind(event)))
+        let outcome = self.input.send_events(std::slice::from_ref(event));
+        match outcome.error {
+            Some(error) => Err(error)
+                .with_context(|| format!("SendInput failed for {}", input_event_kind(event))),
+            None => Ok(()),
+        }
     }
 
-    fn apply_frame(&mut self, events: &[InputEvent]) -> Result<()> {
-        let mut records = Vec::new();
-        for event in events {
-            records.extend(input_records_for_event(event));
+    fn apply_frame(&mut self, events: &[InputEvent]) -> InputApplyOutcome {
+        let outcome = self.input.send_events(events);
+        InputApplyOutcome {
+            committed_event_count: outcome.committed_event_count,
+            remaining_events: outcome.remaining_events,
+            error: outcome
+                .error
+                .map(|error| error.context("SendInput failed for frame batch")),
         }
-        send_input_records(&records).context("SendInput failed for frame batch")
     }
 }
 
@@ -169,14 +189,19 @@ impl InputCaptureBackend for WindowsPollingCaptureBackend {
         let mut pressed_keys = self
             .last_key_down
             .iter()
-            .filter_map(|(vk, down)| if *down { Some(*vk) } else { None })
+            .filter_map(
+                |(vk, (down, semantics))| {
+                    if *down { Some((*vk, *semantics)) } else { None }
+                },
+            )
             .collect::<Vec<_>>();
-        pressed_keys.sort_unstable();
-        for vk in pressed_keys {
+        pressed_keys.sort_unstable_by_key(|(vk, _)| *vk);
+        for (vk, semantics) in pressed_keys {
             if let Some(scan_code) = vk_to_scan_code(vk) {
                 events.push(InputEvent::Key {
                     scan_code,
                     state: core_input::KeyState::Up,
+                    semantics,
                 });
             }
         }
@@ -222,10 +247,43 @@ impl InputCaptureBackend for WindowsPollingCaptureBackend {
 
         for &vk in captured_key_virtual_keys() {
             let down = is_virtual_key_down(vk);
-            if let Some(last) = self.last_key_down.insert(vk, down)
-                && last != down
-                && let Some(scan_code) = vk_to_scan_code(vk)
-            {
+            let prior = self.last_key_down.get(&vk).copied();
+            let Some((was_down, _)) = prior else {
+                self.last_key_down.insert(
+                    vk,
+                    (
+                        down,
+                        KeySemantics::Windows {
+                            virtual_key: vk,
+                            num_lock_on: self.num_lock_state.is_on(),
+                        },
+                    ),
+                );
+                continue;
+            };
+            if was_down == down {
+                continue;
+            }
+
+            let num_lock_on = if vk == VK_NUMLOCK_CODE && down {
+                self.num_lock_state.toggle()
+            } else {
+                self.num_lock_state.is_on()
+            };
+            let observed_semantics = KeySemantics::Windows {
+                virtual_key: vk,
+                num_lock_on,
+            };
+            let event_semantics = if down {
+                observed_semantics
+            } else {
+                prior
+                    .filter(|(pressed, _)| *pressed)
+                    .map(|(_, semantics)| semantics)
+                    .unwrap_or(observed_semantics)
+            };
+            self.last_key_down.insert(vk, (down, event_semantics));
+            if let Some(scan_code) = vk_to_scan_code(vk) {
                 events.push(InputEvent::Key {
                     scan_code,
                     state: if down {
@@ -233,6 +291,7 @@ impl InputCaptureBackend for WindowsPollingCaptureBackend {
                     } else {
                         core_input::KeyState::Up
                     },
+                    semantics: event_semantics,
                 });
             }
         }
@@ -258,5 +317,9 @@ impl InputCaptureBackend for WindowsPollingCaptureBackend {
 
     fn cursor_position(&self) -> Option<(i32, i32)> {
         self.last_cursor
+    }
+
+    fn windows_num_lock_state(&self) -> Option<WindowsNumLockState> {
+        Some(self.num_lock_state.clone())
     }
 }

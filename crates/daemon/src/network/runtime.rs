@@ -109,11 +109,14 @@ pub(super) async fn supervisor_loop(state: AppState) {
             let worker_state = state.clone();
             let registration_state = state.clone();
             let peer_id = peer.peer_id.clone();
+            let (session_id_tx, session_id_rx) = oneshot::channel::<u64>();
             let handle = tokio::spawn(async move {
-                peer_worker(worker_state, peer_id).await;
+                let session_id = session_id_rx.await.ok();
+                peer_worker(worker_state, peer_id, session_id).await;
             });
             let session_id = registration_state
                 .register_transport_session_for_peer(&peer.peer_id, handle.abort_handle());
+            let _ = session_id_tx.send(session_id);
             workers.insert(peer.peer_id.clone(), handle);
             worker_session_ids.insert(peer.peer_id, session_id);
         }
@@ -133,7 +136,7 @@ pub(super) async fn supervisor_loop(state: AppState) {
     }
 }
 
-async fn peer_worker(state: AppState, peer_id: String) {
+async fn peer_worker(state: AppState, peer_id: String, session_registration_id: Option<u64>) {
     let mut backoff_secs: u64 = 1;
     let reconcile_wake = state.peer_reconcile_wake_signal();
 
@@ -157,9 +160,13 @@ async fn peer_worker(state: AppState, peer_id: String) {
             continue;
         }
 
-        if let Err(error) =
-            connect_and_run_outbound_to_candidates(state.clone(), &peer_id, &target_candidates)
-                .await
+        if let Err(error) = connect_and_run_outbound_to_candidates(
+            state.clone(),
+            &peer_id,
+            &target_candidates,
+            session_registration_id,
+        )
+        .await
         {
             state.record_transport_event(crate::state::TransportEventRecord {
                 timestamp: chrono::Utc::now(),
@@ -187,8 +194,22 @@ async fn peer_worker(state: AppState, peer_id: String) {
                     peer_id = %peer_id,
                     "outbound connect failed but recent connected session state is preserved"
                 );
-            } else if let Err(mark_error) = state.set_peer_connected(&peer_id, false).await {
-                warn!(%mark_error, "failed to mark peer disconnected");
+            } else {
+                match state
+                    .mark_peer_disconnected_if_no_active_transport_session(&peer_id)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        info!(
+                            peer_id = %peer_id,
+                            "stale outbound failure cannot disconnect the active reverse session"
+                        );
+                    }
+                    Err(mark_error) => {
+                        warn!(%mark_error, "failed to mark peer disconnected");
+                    }
+                }
             }
 
             wait_for_reconcile_or_backoff(&reconcile_wake, Duration::from_secs(backoff_secs)).await;
@@ -203,6 +224,7 @@ async fn connect_and_run_outbound_to_candidates(
     state: AppState,
     peer_id: &str,
     target_candidates: &[TcpEndpointCandidate],
+    session_registration_id: Option<u64>,
 ) -> Result<()> {
     let (stream, selected) =
         connect_first_authenticated_outbound_candidate(state.clone(), peer_id, target_candidates)
@@ -218,7 +240,8 @@ async fn connect_and_run_outbound_to_candidates(
         ),
         size_bytes: 0,
     });
-    run_authenticated_outbound_session(state, peer_id.to_string(), stream).await
+    run_authenticated_outbound_session(state, peer_id.to_string(), stream, session_registration_id)
+        .await
 }
 
 async fn connect_first_authenticated_outbound_candidate(
@@ -521,6 +544,80 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn stale_outbound_failure_preserves_active_reverse_session_state() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-stale-outbound-failure-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state =
+            AppState::load_or_create_with_paths(root.join("config.json"), root.join("security"))
+                .expect("load state");
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("reverse-owner".to_string()),
+            )
+            .await
+            .expect("join peer");
+        let session_id = state.allocate_transport_session_id();
+        assert_eq!(
+            state
+                .claim_transport_session(
+                    &peer_id,
+                    session_id,
+                    false,
+                    std::sync::Arc::new(crate::state::RuntimeWakeSignal::default()),
+                )
+                .await,
+            crate::state::TransportSessionClaim::Claimed
+        );
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("mark reverse owner connected");
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim input owner")
+        );
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set capture target");
+
+        assert!(
+            !state
+                .mark_peer_disconnected_if_no_active_transport_session(&peer_id)
+                .await
+                .expect("process stale outbound failure"),
+            "an outbound failure that started before the reverse claim must not disconnect it"
+        );
+        assert!(
+            state
+                .snapshot()
+                .await
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == peer_id && peer.connected)
+        );
+        assert_eq!(state.input_owner().await.as_deref(), Some(peer_id.as_str()));
+        assert_eq!(
+            state.input_capture_target().await.as_deref(),
+            Some(peer_id.as_str())
+        );
+
+        assert!(
+            state
+                .close_active_transport_session(&peer_id, session_id)
+                .await
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn transport_error_summary_redacts_endpoint_context() {
         let error = Err::<(), _>(std::io::Error::new(
@@ -595,7 +692,7 @@ mod tests {
             )
             .await;
 
-        let worker = tokio::spawn(peer_worker(state.clone(), peer_id.clone()));
+        let worker = tokio::spawn(peer_worker(state.clone(), peer_id.clone(), None));
         let event = time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some(event) = state.transport_events().await.into_iter().find(|event| {

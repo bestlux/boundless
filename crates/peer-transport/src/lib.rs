@@ -64,18 +64,33 @@ pub const DEFAULT_TRANSPORT_TUNING: TransportTuning = TransportTuning::new(
     4,
 );
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundTransferKind {
+    File,
+    ClipboardImage,
+}
+
+#[derive(Debug)]
 pub struct OutboundTransferFlow {
     pub available_chunk_credits: u32,
+    pub kind: OutboundTransferKind,
 }
 
 pub type OutboundTransferFlows = HashMap<String, OutboundTransferFlow>;
 
 pub const FILE_TRANSFER_INITIAL_CHUNK_CREDITS: u32 = 8;
 pub const FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS: u32 = 256;
-pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 255 * 1024;
 pub const MAX_INBOUND_TRANSFERS_PER_PEER: usize = 4;
-pub const CLIPBOARD_IMAGE_CHUNK_BYTES: usize = 128 * 1024;
+// Keep each credited clipboard write comfortably below typical TCP send
+// buffers. A session processes at most one credited chunk before returning to
+// its read loop, so two peers replaying images simultaneously cannot fill both
+// directions and wait forever for the other side to read.
+pub const CLIPBOARD_IMAGE_CHUNK_BYTES: usize = 8 * 1024;
+pub const CLIPBOARD_IMAGE_INLINE_MAX_BYTES: usize = 8 * 1024;
+pub const CLIPBOARD_IMAGE_INITIAL_CHUNK_CREDITS: u32 = 1;
+pub const TRANSPORT_EGRESS_IO_TIMEOUT: Duration = Duration::from_secs(2);
+pub const TRANSPORT_EGRESS_BATCH_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_TRANSPORT_EVENTS: usize = 512;
 const MAX_ACTIVITY_EVENT_SUMMARIES: usize = 64;
 const MAX_DIAGNOSTIC_EVENT_SUMMARIES: usize = 128;
@@ -87,6 +102,11 @@ pub enum OutboundPayload {
     },
     ClipboardImage {
         image_bmp: Vec<u8>,
+    },
+    ClipboardImageCursor {
+        transfer_id: String,
+        image_bmp: Arc<[u8]>,
+        offset_bytes: usize,
     },
     FileStart {
         transfer_id: String,
@@ -141,6 +161,20 @@ pub fn register_outbound_transfer_flow(
         transfer_id,
         OutboundTransferFlow {
             available_chunk_credits: 0,
+            kind: OutboundTransferKind::File,
+        },
+    );
+}
+
+pub fn register_outbound_clipboard_transfer_flow(
+    outbound_transfer_flow: &mut OutboundTransferFlows,
+    transfer_id: String,
+) {
+    outbound_transfer_flow.insert(
+        transfer_id,
+        OutboundTransferFlow {
+            available_chunk_credits: 0,
+            kind: OutboundTransferKind::ClipboardImage,
         },
     );
 }
@@ -183,6 +217,23 @@ pub fn apply_outbound_chunk_credits(
     Some(flow.available_chunk_credits)
 }
 
+pub fn apply_outbound_chunk_credits_for_kind(
+    outbound_transfer_flow: &mut OutboundTransferFlows,
+    transfer_id: &str,
+    chunk_credits: u32,
+    expected_kind: OutboundTransferKind,
+) -> Option<u32> {
+    let flow = outbound_transfer_flow.get_mut(transfer_id)?;
+    if flow.kind != expected_kind {
+        return None;
+    }
+    flow.available_chunk_credits = flow
+        .available_chunk_credits
+        .saturating_add(chunk_credits)
+        .min(FILE_TRANSFER_MAX_TRACKED_CHUNK_CREDITS);
+    Some(flow.available_chunk_credits)
+}
+
 pub fn restore_outbound_chunk_credits_for_payloads(
     outbound_transfer_flow: &mut OutboundTransferFlows,
     payloads: &[OutboundPayload],
@@ -190,7 +241,8 @@ pub fn restore_outbound_chunk_credits_for_payloads(
     for payload in payloads {
         let transfer_id = match payload {
             OutboundPayload::FileChunk { transfer_id, .. }
-            | OutboundPayload::FileTransferCursor { transfer_id } => transfer_id,
+            | OutboundPayload::FileTransferCursor { transfer_id }
+            | OutboundPayload::ClipboardImageCursor { transfer_id, .. } => transfer_id,
             _ => continue,
         };
         let Some(flow) = outbound_transfer_flow.get_mut(transfer_id) else {
@@ -471,12 +523,20 @@ pub struct TransportSessionRegistry {
     closed: bool,
     pending_abort_handles: HashMap<u64, AbortHandle>,
     abort_handles_by_peer: HashMap<String, HashMap<u64, AbortHandle>>,
-    active_session_by_peer: HashMap<String, u64>,
+    active_session_by_peer: HashMap<String, ActiveTransportSession>,
+}
+
+#[derive(Debug)]
+struct ActiveTransportSession {
+    session_id: u64,
+    preferred: bool,
+    cancellation: Arc<RuntimeWakeSignal>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportSessionClaim {
     Claimed,
+    Replaced { active_session_id: u64 },
     Duplicate { active_session_id: u64 },
     Closed,
 }
@@ -680,19 +740,50 @@ impl TransportRuntimeState {
         session_id
     }
 
-    pub fn claim_transport_session(&self, peer_id: &str, session_id: u64) -> TransportSessionClaim {
+    pub fn claim_transport_session(
+        &self,
+        peer_id: &str,
+        session_id: u64,
+        preferred: bool,
+        cancellation: Arc<RuntimeWakeSignal>,
+    ) -> TransportSessionClaim {
         let Ok(mut registry) = self.transport_session_registry.lock() else {
             return TransportSessionClaim::Closed;
         };
         if registry.closed {
             return TransportSessionClaim::Closed;
         }
-        if let Some(active_session_id) = registry.active_session_by_peer.get(peer_id).copied() {
-            return TransportSessionClaim::Duplicate { active_session_id };
+        if let Some(active) = registry.active_session_by_peer.get(peer_id) {
+            if !preferred || active.preferred {
+                return TransportSessionClaim::Duplicate {
+                    active_session_id: active.session_id,
+                };
+            }
+
+            let active_session_id = active.session_id;
+            let active_cancellation = active.cancellation.clone();
+            registry.active_session_by_peer.insert(
+                peer_id.to_string(),
+                ActiveTransportSession {
+                    session_id,
+                    preferred,
+                    cancellation,
+                },
+            );
+            drop(registry);
+            if active_cancellation.trigger() {
+                active_cancellation.notify_one();
+            }
+            return TransportSessionClaim::Replaced { active_session_id };
         }
-        registry
-            .active_session_by_peer
-            .insert(peer_id.to_string(), session_id);
+        registry.active_session_by_peer.insert(
+            peer_id.to_string(),
+            ActiveTransportSession {
+                session_id,
+                preferred,
+                cancellation,
+            },
+        );
         TransportSessionClaim::Claimed
     }
 
@@ -703,7 +794,7 @@ impl TransportRuntimeState {
         if registry
             .active_session_by_peer
             .get(peer_id)
-            .is_some_and(|active_session_id| *active_session_id == session_id)
+            .is_some_and(|active| active.session_id == session_id)
         {
             registry.active_session_by_peer.remove(peer_id);
             return true;
@@ -715,6 +806,17 @@ impl TransportRuntimeState {
         self.transport_session_registry
             .lock()
             .is_ok_and(|registry| registry.active_session_by_peer.contains_key(peer_id))
+    }
+
+    pub fn is_active_transport_session(&self, peer_id: &str, session_id: u64) -> bool {
+        self.transport_session_registry
+            .lock()
+            .is_ok_and(|registry| {
+                registry
+                    .active_session_by_peer
+                    .get(peer_id)
+                    .is_some_and(|active| active.session_id == session_id)
+            })
     }
 
     pub fn register_transport_session_for_peer(
@@ -781,7 +883,7 @@ impl TransportRuntimeState {
         }
         registry
             .active_session_by_peer
-            .retain(|_, active_session_id| *active_session_id != session_id);
+            .retain(|_, active| active.session_id != session_id);
     }
 
     pub async fn abort_transport_sessions_for_peer(&self, peer_id: &str) -> usize {
@@ -1096,6 +1198,40 @@ fn transport_event_token_is_volatile(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_credits_cannot_cross_transfer_kinds() {
+        let mut flows = OutboundTransferFlows::new();
+        register_outbound_clipboard_transfer_flow(&mut flows, "clip-1".to_string());
+
+        assert_eq!(
+            apply_outbound_chunk_credits_for_kind(
+                &mut flows,
+                "clip-1",
+                8,
+                OutboundTransferKind::File,
+            ),
+            None
+        );
+        assert_eq!(flows["clip-1"].available_chunk_credits, 0);
+        assert_eq!(
+            apply_outbound_chunk_credits_for_kind(
+                &mut flows,
+                "clip-1",
+                1,
+                OutboundTransferKind::ClipboardImage,
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn wire_clipboard_text_cap_matches_default_clipboard_policy() {
+        assert_eq!(
+            MAX_CLIPBOARD_TEXT_BYTES,
+            core_clipboard::ClipboardPolicy::default().max_text_bytes
+        );
+    }
 
     fn test_event(
         timestamp: DateTime<Utc>,
@@ -1733,16 +1869,26 @@ mod tests {
     }
 
     #[test]
-    fn first_transport_session_claim_wins_until_cleared() {
+    fn preferred_transport_session_claim_wins_until_cleared() {
         let state = TransportRuntimeState::default();
 
         assert_eq!(
-            state.claim_transport_session("peer-a", 10),
+            state.claim_transport_session(
+                "peer-a",
+                10,
+                true,
+                Arc::new(RuntimeWakeSignal::default()),
+            ),
             TransportSessionClaim::Claimed
         );
         assert!(state.has_active_transport_session("peer-a"));
         assert_eq!(
-            state.claim_transport_session("peer-a", 11),
+            state.claim_transport_session(
+                "peer-a",
+                11,
+                false,
+                Arc::new(RuntimeWakeSignal::default()),
+            ),
             TransportSessionClaim::Duplicate {
                 active_session_id: 10
             }
@@ -1754,9 +1900,121 @@ mod tests {
         assert!(state.clear_active_transport_session("peer-a", 10));
         assert!(!state.has_active_transport_session("peer-a"));
         assert_eq!(
-            state.claim_transport_session("peer-a", 12),
+            state.claim_transport_session(
+                "peer-a",
+                12,
+                false,
+                Arc::new(RuntimeWakeSignal::default()),
+            ),
             TransportSessionClaim::Claimed
         );
+    }
+
+    #[test]
+    fn crossed_claim_permutations_converge_on_the_same_preferred_connection() {
+        for local_outbound_finishes_first in [false, true] {
+            let endpoint_a = TransportRuntimeState::default();
+            let endpoint_b = TransportRuntimeState::default();
+            let pair_one_a = Arc::new(RuntimeWakeSignal::default());
+            let pair_one_b = Arc::new(RuntimeWakeSignal::default());
+            let pair_two_a = Arc::new(RuntimeWakeSignal::default());
+            let pair_two_b = Arc::new(RuntimeWakeSignal::default());
+
+            if local_outbound_finishes_first {
+                assert_eq!(
+                    endpoint_a.claim_transport_session("peer-b", 10, true, pair_one_a.clone()),
+                    TransportSessionClaim::Claimed
+                );
+                assert_eq!(
+                    endpoint_b.claim_transport_session("peer-a", 21, false, pair_two_b.clone()),
+                    TransportSessionClaim::Claimed
+                );
+                assert_eq!(
+                    endpoint_b.claim_transport_session("peer-a", 20, true, pair_one_b.clone()),
+                    TransportSessionClaim::Replaced {
+                        active_session_id: 21
+                    }
+                );
+                assert_eq!(
+                    endpoint_a.claim_transport_session("peer-b", 11, false, pair_two_a.clone()),
+                    TransportSessionClaim::Duplicate {
+                        active_session_id: 10
+                    }
+                );
+                assert!(pair_two_b.take_pending());
+            } else {
+                assert_eq!(
+                    endpoint_a.claim_transport_session("peer-b", 11, false, pair_two_a.clone()),
+                    TransportSessionClaim::Claimed
+                );
+                assert_eq!(
+                    endpoint_b.claim_transport_session("peer-a", 20, true, pair_one_b.clone()),
+                    TransportSessionClaim::Claimed
+                );
+                assert_eq!(
+                    endpoint_a.claim_transport_session("peer-b", 10, true, pair_one_a.clone()),
+                    TransportSessionClaim::Replaced {
+                        active_session_id: 11
+                    }
+                );
+                assert_eq!(
+                    endpoint_b.claim_transport_session("peer-a", 21, false, pair_two_b.clone()),
+                    TransportSessionClaim::Duplicate {
+                        active_session_id: 20
+                    }
+                );
+                assert!(pair_two_a.take_pending());
+            }
+
+            assert!(endpoint_a.clear_active_transport_session("peer-b", 10));
+            assert!(endpoint_b.clear_active_transport_session("peer-a", 20));
+            assert!(!endpoint_a.clear_active_transport_session("peer-b", 11));
+            assert!(!endpoint_b.clear_active_transport_session("peer-a", 21));
+            assert!(!pair_one_a.take_pending());
+            assert!(!pair_one_b.take_pending());
+        }
+    }
+
+    #[tokio::test]
+    async fn preferred_claim_signals_registered_nonpreferred_owner_without_hard_abort() {
+        let state = TransportRuntimeState::default();
+        let child = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let nonpreferred_id =
+            state.register_transport_session_for_peer("peer-a", child.abort_handle());
+        let nonpreferred_cancellation = Arc::new(RuntimeWakeSignal::default());
+        assert_eq!(
+            state.claim_transport_session(
+                "peer-a",
+                nonpreferred_id,
+                false,
+                nonpreferred_cancellation.clone(),
+            ),
+            TransportSessionClaim::Claimed
+        );
+        assert_eq!(
+            state.claim_transport_session(
+                "peer-a",
+                99,
+                true,
+                Arc::new(RuntimeWakeSignal::default()),
+            ),
+            TransportSessionClaim::Replaced {
+                active_session_id: nonpreferred_id
+            }
+        );
+        assert!(nonpreferred_cancellation.take_pending());
+        assert!(
+            !child.is_finished(),
+            "replacement must not hard-abort a task that may own drained payloads"
+        );
+        assert_eq!(state.abort_transport_sessions_for_peer("peer-a").await, 1);
+        let join_error = child
+            .await
+            .expect_err("explicit peer abort should still cancel the registered owner");
+        assert!(join_error.is_cancelled());
+        assert!(!state.has_active_transport_session("peer-a"));
     }
 
     #[tokio::test]
@@ -1767,7 +2025,12 @@ mod tests {
         });
         let session_id = state.register_transport_session_for_peer("peer-a", child.abort_handle());
         assert_eq!(
-            state.claim_transport_session("peer-a", session_id),
+            state.claim_transport_session(
+                "peer-a",
+                session_id,
+                true,
+                Arc::new(RuntimeWakeSignal::default()),
+            ),
             TransportSessionClaim::Claimed
         );
 

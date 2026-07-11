@@ -36,8 +36,10 @@ mod windows_app {
     };
     use platform_windows::{
         input::current_process_session_id,
-        runtime::{current_user_sid_string, process_id_user_sid_string},
-        single_instance::{SingleInstanceAcquire, SingleInstanceGuard},
+        runtime::{
+            current_user_sid_string, process_id_user_sid_string, validate_allowed_user_sid_shape,
+        },
+        single_instance::{ServiceStartOriginGuard, SingleInstanceAcquire, SingleInstanceGuard},
     };
     use serde::Deserialize;
     use std::{
@@ -75,6 +77,16 @@ mod windows_app {
         start_daemon: bool,
         #[arg(long, hide = true, default_value_t = false)]
         start_service_elevated: bool,
+        #[arg(long, hide = true)]
+        service_start_origin_sid: Option<String>,
+        #[arg(long, hide = true)]
+        service_start_origin_session: Option<u32>,
+        #[arg(long, hide = true)]
+        service_start_origin_nonce: Option<String>,
+        /// Ask the existing tray in this user session to follow its normal
+        /// fail-open Quit path, then exit this control process.
+        #[arg(long, default_value_t = false)]
+        quit: bool,
     }
 
     #[derive(Debug)]
@@ -1793,6 +1805,58 @@ mod windows_app {
             assert!(first.starts_with("Local\\Boundless.Tray.SingleInstance.v1."));
             assert_ne!(first, other_session);
             assert_ne!(first, other_user);
+        }
+
+        #[test]
+        fn tray_upgrade_quiescence_name_matches_installer_contract() {
+            let first = tray_upgrade_quiescence_sentinel_name("S-1-5-21-1-2-3-1001", 1);
+            let other_session = tray_upgrade_quiescence_sentinel_name("S-1-5-21-1-2-3-1001", 2);
+            let other_user = tray_upgrade_quiescence_sentinel_name("S-1-5-21-1-2-3-1002", 1);
+
+            assert_eq!(
+                first,
+                "Local\\Boundless.Tray.UpgradeQuiescence.v1.S-1-5-21-1-2-3-1001.1"
+            );
+            assert_ne!(first, other_session);
+            assert_ne!(first, other_user);
+        }
+
+        #[test]
+        fn quit_control_mode_does_not_enable_service_start() {
+            let cli = Cli::try_parse_from(["boundlesstray", "--quit"])
+                .expect("quit control mode should parse");
+
+            assert!(cli.quit);
+            assert!(!cli.start_service_elevated);
+            assert!(cli.service_start_origin_sid.is_none());
+            assert!(cli.service_start_origin_session.is_none());
+            assert!(cli.service_start_origin_nonce.is_none());
+        }
+
+        #[test]
+        fn privileged_service_start_identity_arguments_parse_as_one_contract() {
+            let cli = Cli::try_parse_from([
+                "boundlesstray",
+                "--start-service-elevated",
+                "--service-start-origin-sid",
+                "S-1-5-21-1-2-3-1001",
+                "--service-start-origin-session",
+                "7",
+                "--service-start-origin-nonce",
+                "0123456789abcdef0123456789abcdef",
+            ])
+            .expect("privileged service-start identity arguments should parse");
+
+            assert!(cli.start_service_elevated);
+            assert_eq!(
+                cli.service_start_origin_sid.as_deref(),
+                Some("S-1-5-21-1-2-3-1001")
+            );
+            assert_eq!(cli.service_start_origin_session, Some(7));
+            assert_eq!(
+                cli.service_start_origin_nonce.as_deref(),
+                Some("0123456789abcdef0123456789abcdef")
+            );
         }
     }
 }

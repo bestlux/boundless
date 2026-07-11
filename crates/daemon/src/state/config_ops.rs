@@ -477,7 +477,9 @@ impl AppState {
         .await?;
 
         if name == "share_input" {
-            self.input.control.router.write().await.set_enabled(enabled);
+            let mut authorization = self.input.control.authorization.write().await;
+            authorization.set_enabled(enabled);
+            drop(authorization);
             self.notify_input_inject_wake("share_input_toggled");
             self.notify_input_capture_wake("share_input_toggled");
         } else if name == "share_clipboard" && !enabled {

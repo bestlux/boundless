@@ -76,6 +76,8 @@ pub struct InputBrokerAttachSnapshot {
     pub accepted: bool,
     pub broker_token: String,
     pub message: String,
+    pub protocol_revision: u32,
+    pub delivery_epoch: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +94,11 @@ pub struct InputBrokerExchangeSnapshot {
     pub inject_frames: Vec<InputBrokerInjectFrameSnapshot>,
     pub lock_should_be_active: bool,
     pub capture_active: bool,
+    pub capture_forwarding_authorized: bool,
+    pub inject_batch_id: u64,
+    pub inject_batch_cancelled: bool,
+    pub inject_authorization_generation: u64,
+    pub held_input_authorized: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

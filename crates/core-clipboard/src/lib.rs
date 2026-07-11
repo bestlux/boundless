@@ -19,7 +19,10 @@ impl Default for ClipboardPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_text_bytes: 256 * 1024,
+            // Leave bounded framing overhead below the 256 KiB wire payload
+            // ceiling; accepting an exact 256 KiB string would otherwise pass
+            // clipboard validation and be dropped during wire encoding.
+            max_text_bytes: 255 * 1024,
             max_image_bytes: 8 * 1024 * 1024,
         }
     }
@@ -124,6 +127,7 @@ fn sanitize_clipboard_metadata_token(
                 | "disabled"
                 | "deduped"
                 | "replayed"
+                | "superseded"
                 | "apply_failed"
                 | "unmatched_apply_report"
         ),
@@ -142,6 +146,8 @@ fn sanitize_clipboard_metadata_token(
                 | "chunk_exceeds_total"
                 | "size_mismatch"
                 | "hash_mismatch"
+                | "clipboard_text"
+                | "clipboard_image_inline"
                 | "unknown"
         ),
         "applied" | "metadata_only" => matches!(value, "true" | "false"),
@@ -323,6 +329,24 @@ mod tests {
     }
 
     #[test]
+    fn default_text_limit_reserves_wire_framing_overhead() {
+        let policy = ClipboardPolicy::default();
+        assert_eq!(policy.max_text_bytes, 255 * 1024);
+        validate_payload(
+            policy,
+            &ClipboardPayload::Text("x".repeat(policy.max_text_bytes)),
+        )
+        .expect("exact default limit remains valid");
+        assert!(matches!(
+            validate_payload(
+                policy,
+                &ClipboardPayload::Text("x".repeat(policy.max_text_bytes + 1)),
+            ),
+            Err(ClipboardPolicyError::TextTooLarge { .. })
+        ));
+    }
+
+    #[test]
     fn text_hash_is_stable() {
         let one = text_hash_hex("hello");
         let two = text_hash_hex("hello");
@@ -364,6 +388,14 @@ mod tests {
         assert!(!sanitized.contains(SECRET));
         assert!(!sanitized.contains("expected="));
         assert!(!sanitized.contains("actual="));
+
+        assert_eq!(
+            sanitize_clipboard_event_detail(
+                "clipboard_image_superseded",
+                "payload_type=bmp disposition=superseded reason=clipboard_image_inline",
+            ),
+            "payload_type=bmp disposition=superseded reason=clipboard_image_inline"
+        );
     }
 
     #[test]

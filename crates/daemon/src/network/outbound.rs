@@ -1,15 +1,16 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use crate::state::TransportEventRecord;
 use chrono::Utc;
 use core_clipboard::image_hash_hex;
 use peer_transport::{
-    CLIPBOARD_IMAGE_CHUNK_BYTES, OutboundTransferFlows, consume_outbound_chunk_credit,
-    has_available_outbound_chunk_credit, register_outbound_transfer_flow,
+    CLIPBOARD_IMAGE_CHUNK_BYTES, CLIPBOARD_IMAGE_INLINE_MAX_BYTES, OutboundTransferFlows,
+    OutboundTransferKind, consume_outbound_chunk_credit, has_available_outbound_chunk_credit,
+    register_outbound_clipboard_transfer_flow, register_outbound_transfer_flow,
     remove_outbound_transfer_flow, restore_outbound_chunk_credits_for_payloads,
 };
 
-use super::codec::input_events_to_wire;
+use super::codec::{flush_transport_writer, input_events_to_wire, write_transport_bytes};
 use super::*;
 
 #[derive(Debug)]
@@ -18,6 +19,10 @@ enum SendPayloadOutcome {
     SentCursor {
         post_flush: CursorPostFlushAction,
         requeue: Option<OutboundPayload>,
+    },
+    SentClipboardCursor {
+        requeue: Option<OutboundPayload>,
+        completed: Option<ClipboardCursorCompletion>,
     },
     Dropped,
     DeferredForBackpressure,
@@ -29,6 +34,12 @@ struct CursorPostFlushAction {
     offset_bytes: u64,
     length_bytes: usize,
     finished: bool,
+}
+
+#[derive(Debug)]
+struct ClipboardCursorCompletion {
+    transfer_id: String,
+    size_bytes: usize,
 }
 
 struct OutboundPayloadWriter<'a, W> {
@@ -129,12 +140,14 @@ where
         return Ok(());
     };
     let pending = state.drain_outgoing_bulk(peer_id, max_payloads).await;
+    let pending =
+        coalesce_pending_clipboard_payloads(state, peer_id, pending, outbound_transfer_flow).await;
     let mut writer_ctx = OutboundPayloadWriter {
         outbound_transfer_flow,
         writer,
         frame_buffer,
     };
-    flush_pending_payloads_with_buffer(
+    let result = flush_pending_payloads_with_buffer(
         state,
         local_machine_id,
         peer_id,
@@ -142,7 +155,61 @@ where
         pending,
         &mut writer_ctx,
     )
-    .await
+    .await;
+    prune_orphaned_clipboard_transfer_flows(state, peer_id, writer_ctx.outbound_transfer_flow)
+        .await;
+    result
+}
+
+fn outbound_payload_is_clipboard(payload: &OutboundPayload) -> bool {
+    matches!(
+        payload,
+        OutboundPayload::ClipboardText { .. }
+            | OutboundPayload::ClipboardImage { .. }
+            | OutboundPayload::ClipboardImageCursor { .. }
+    )
+}
+
+async fn coalesce_pending_clipboard_payloads(
+    state: &AppState,
+    peer_id: &str,
+    pending: Vec<OutboundPayload>,
+    outbound_transfer_flow: &mut OutboundTransferFlows,
+) -> Vec<OutboundPayload> {
+    let latest_clipboard_index = if state.has_queued_outgoing_clipboard_payload(peer_id).await {
+        None
+    } else {
+        pending.iter().rposition(outbound_payload_is_clipboard)
+    };
+
+    pending
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, payload)| {
+            let keep = !outbound_payload_is_clipboard(&payload)
+                || latest_clipboard_index.is_some_and(|latest| latest == index);
+            if keep {
+                return Some(payload);
+            }
+            if let OutboundPayload::ClipboardImageCursor { transfer_id, .. } = &payload {
+                remove_outbound_transfer_flow(outbound_transfer_flow, transfer_id);
+            }
+            None
+        })
+        .collect()
+}
+
+async fn prune_orphaned_clipboard_transfer_flows(
+    state: &AppState,
+    peer_id: &str,
+    outbound_transfer_flow: &mut OutboundTransferFlows,
+) {
+    let active_cursor_ids: HashSet<String> = state
+        .outgoing_clipboard_image_cursor_transfer_ids(peer_id)
+        .await;
+    outbound_transfer_flow.retain(|transfer_id, flow| {
+        flow.kind != OutboundTransferKind::ClipboardImage || active_cursor_ids.contains(transfer_id)
+    });
 }
 
 async fn flush_pending_payloads_with_buffer<W>(
@@ -164,8 +231,27 @@ where
     let mut sent_for_flush = Vec::<OutboundPayload>::new();
     let mut requeue_after_flush = Vec::<OutboundPayload>::new();
     let mut cursor_post_flush = Vec::<CursorPostFlushAction>::new();
+    let mut clipboard_completions = Vec::<ClipboardCursorCompletion>::new();
     let mut sent_any = false;
+    let batch_started = std::time::Instant::now();
     while let Some(payload) = pending.pop_front() {
+        if batch_started.elapsed() >= peer_transport::TRANSPORT_EGRESS_BATCH_TIMEOUT {
+            if !sent_for_flush.is_empty() {
+                restore_outbound_chunk_credits_for_payloads(
+                    writer_ctx.outbound_transfer_flow,
+                    &sent_for_flush,
+                );
+            }
+            let mut retry = Vec::with_capacity(sent_for_flush.len() + pending.len() + 1);
+            retry.extend(sent_for_flush);
+            retry.push(payload);
+            retry.extend(pending);
+            state.requeue_outgoing_front(peer_id, retry).await;
+            bail!(
+                "outbound payload batch exceeded {} ms ownership window",
+                peer_transport::TRANSPORT_EGRESS_BATCH_TIMEOUT.as_millis()
+            );
+        }
         match send_outbound_payload(
             state,
             local_machine_id,
@@ -191,6 +277,16 @@ where
                     requeue_after_flush.push(requeue_payload);
                 }
             }
+            Ok(SendPayloadOutcome::SentClipboardCursor { requeue, completed }) => {
+                sent_any = true;
+                sent_for_flush.push(payload);
+                if let Some(requeue_payload) = requeue {
+                    requeue_after_flush.push(requeue_payload);
+                }
+                if let Some(completed) = completed {
+                    clipboard_completions.push(completed);
+                }
+            }
             Ok(SendPayloadOutcome::Dropped) => {}
             Ok(SendPayloadOutcome::DeferredForBackpressure) => {
                 let mut unsent = Vec::with_capacity(pending.len() + 1);
@@ -200,27 +296,25 @@ where
                 break;
             }
             Err(error) => {
-                let mut unsent = Vec::with_capacity(pending.len() + 1);
-                unsent.push(payload);
-                unsent.extend(pending);
-                state.requeue_outgoing_front(peer_id, unsent).await;
                 if !sent_for_flush.is_empty() {
                     restore_outbound_chunk_credits_for_payloads(
                         writer_ctx.outbound_transfer_flow,
                         &sent_for_flush,
                     );
                 }
+                let mut retry = Vec::with_capacity(sent_for_flush.len() + pending.len() + 1);
+                retry.extend(sent_for_flush);
+                retry.push(payload);
+                retry.extend(pending);
+                state.requeue_outgoing_front(peer_id, retry).await;
                 return Err(error);
             }
         }
     }
 
     if sent_any {
-        if let Err(error) = writer_ctx
-            .writer
-            .flush()
-            .await
-            .context("flush outbound payload batch")
+        if let Err(error) =
+            flush_transport_writer(writer_ctx.writer, "flush outbound payload batch").await
         {
             if !sent_for_flush.is_empty() {
                 restore_outbound_chunk_credits_for_payloads(
@@ -234,6 +328,16 @@ where
 
         for action in cursor_post_flush {
             apply_cursor_post_flush_action(state, peer_id, writer_ctx, action).await;
+        }
+
+        for completion in clipboard_completions {
+            remove_outbound_transfer_flow(
+                writer_ctx.outbound_transfer_flow,
+                &completion.transfer_id,
+            );
+            state
+                .record_outgoing_clipboard_image(peer_id, completion.size_bytes)
+                .await;
         }
 
         if !requeue_after_flush.is_empty() {
@@ -359,21 +463,24 @@ where
                 );
                 return Ok(SendPayloadOutcome::Dropped);
             }
-            writer_ctx
-                .writer
-                .write_all(writer_ctx.frame_buffer.as_slice())
-                .await
-                .context("write transport frame")?;
+            write_transport_bytes(
+                writer_ctx.writer,
+                writer_ctx.frame_buffer.as_slice(),
+                "write transport frame",
+            )
+            .await?;
             state.record_outgoing_clipboard_text(peer_id, text).await;
             Ok(SendPayloadOutcome::Sent)
         }
         OutboundPayload::ClipboardImage { image_bmp } => {
-            if image_bmp.len() >= MAX_WIRE_FRAME_BYTES {
-                send_chunked_clipboard_image(
+            if image_bmp.len() <= CLIPBOARD_IMAGE_INLINE_MAX_BYTES {
+                send_message(
                     writer_ctx.writer,
+                    &WireMessage::ClipboardImage {
+                        machine_id: local_machine_id.to_string(),
+                        data: image_bmp.clone(),
+                    },
                     writer_ctx.frame_buffer,
-                    local_machine_id,
-                    image_bmp,
                 )
                 .await?;
                 state
@@ -382,52 +489,110 @@ where
                 return Ok(SendPayloadOutcome::Sent);
             }
 
-            let message = WireMessage::ClipboardImage {
-                machine_id: local_machine_id.to_string(),
-                data: image_bmp.clone(),
-            };
-            if let Err(error) = encode_frame_to_vec(&message, writer_ctx.frame_buffer) {
-                if matches!(error, WireCodecError::FrameTooLargeToEncode { .. }) {
-                    send_chunked_clipboard_image(
-                        writer_ctx.writer,
-                        writer_ctx.frame_buffer,
-                        local_machine_id,
-                        image_bmp,
-                    )
-                    .await?;
-                    state
-                        .record_outgoing_clipboard_image(peer_id, image_bmp.len())
-                        .await;
-                    return Ok(SendPayloadOutcome::Sent);
-                }
-                return Err(anyhow::Error::from(error));
-            }
-            let payload_bytes = writer_ctx
-                .frame_buffer
-                .len()
-                .saturating_sub(WIRE_FRAME_LENGTH_PREFIX_BYTES);
-            if payload_bytes > MAX_WIRE_FRAME_BYTES {
-                send_chunked_clipboard_image(
+            let transfer_id = uuid::Uuid::new_v4().to_string();
+            send_clipboard_image_start(
+                writer_ctx.writer,
+                writer_ctx.frame_buffer,
+                local_machine_id,
+                &transfer_id,
+                image_bmp,
+            )
+            .await?;
+            register_outbound_clipboard_transfer_flow(
+                writer_ctx.outbound_transfer_flow,
+                transfer_id.clone(),
+            );
+            Ok(SendPayloadOutcome::SentClipboardCursor {
+                requeue: Some(OutboundPayload::ClipboardImageCursor {
+                    transfer_id,
+                    image_bmp: std::sync::Arc::from(image_bmp.clone()),
+                    offset_bytes: 0,
+                }),
+                completed: None,
+            })
+        }
+        OutboundPayload::ClipboardImageCursor {
+            transfer_id,
+            image_bmp,
+            offset_bytes,
+        } => {
+            let Some(has_credit) =
+                has_available_outbound_chunk_credit(writer_ctx.outbound_transfer_flow, transfer_id)
+            else {
+                // Flow-control state is session-local. If ownership moved to a
+                // replacement session, restart the replay from a fresh Start
+                // frame instead of dropping or resuming an orphaned cursor.
+                let replacement_transfer_id = uuid::Uuid::new_v4().to_string();
+                send_clipboard_image_start(
                     writer_ctx.writer,
                     writer_ctx.frame_buffer,
                     local_machine_id,
+                    &replacement_transfer_id,
                     image_bmp,
                 )
                 .await?;
-                state
-                    .record_outgoing_clipboard_image(peer_id, image_bmp.len())
-                    .await;
-                return Ok(SendPayloadOutcome::Sent);
+                register_outbound_clipboard_transfer_flow(
+                    writer_ctx.outbound_transfer_flow,
+                    replacement_transfer_id.clone(),
+                );
+                return Ok(SendPayloadOutcome::SentClipboardCursor {
+                    requeue: Some(OutboundPayload::ClipboardImageCursor {
+                        transfer_id: replacement_transfer_id,
+                        image_bmp: image_bmp.clone(),
+                        offset_bytes: 0,
+                    }),
+                    completed: None,
+                });
+            };
+
+            if !has_credit {
+                return Ok(SendPayloadOutcome::DeferredForBackpressure);
             }
-            writer_ctx
-                .writer
-                .write_all(writer_ctx.frame_buffer.as_slice())
-                .await
-                .context("write transport frame")?;
-            state
-                .record_outgoing_clipboard_image(peer_id, image_bmp.len())
-                .await;
-            Ok(SendPayloadOutcome::Sent)
+            if *offset_bytes >= image_bmp.len() {
+                remove_outbound_transfer_flow(writer_ctx.outbound_transfer_flow, transfer_id);
+                return Ok(SendPayloadOutcome::Dropped);
+            }
+
+            let next_offset = offset_bytes
+                .saturating_add(CLIPBOARD_IMAGE_CHUNK_BYTES)
+                .min(image_bmp.len());
+            send_message(
+                writer_ctx.writer,
+                &WireMessage::ClipboardImageChunk {
+                    transfer_id: transfer_id.clone(),
+                    data: image_bmp[*offset_bytes..next_offset].to_vec(),
+                },
+                writer_ctx.frame_buffer,
+            )
+            .await?;
+            consume_outbound_chunk_credit(writer_ctx.outbound_transfer_flow, transfer_id);
+
+            if next_offset == image_bmp.len() {
+                send_message(
+                    writer_ctx.writer,
+                    &WireMessage::ClipboardImageEnd {
+                        transfer_id: transfer_id.clone(),
+                    },
+                    writer_ctx.frame_buffer,
+                )
+                .await?;
+                Ok(SendPayloadOutcome::SentClipboardCursor {
+                    requeue: None,
+                    completed: Some(ClipboardCursorCompletion {
+                        transfer_id: transfer_id.clone(),
+                        size_bytes: image_bmp.len(),
+                    }),
+                })
+            } else {
+                Ok(SendPayloadOutcome::SentClipboardCursor {
+                    requeue: Some(OutboundPayload::ClipboardImageCursor {
+                        transfer_id: transfer_id.clone(),
+                        image_bmp: image_bmp.clone(),
+                        offset_bytes: next_offset,
+                    }),
+                    completed: None,
+                })
+            }
         }
         OutboundPayload::FileStart {
             transfer_id,
@@ -707,44 +872,49 @@ where
     }
 }
 
-async fn send_chunked_clipboard_image<W>(
+async fn send_clipboard_image_start<W>(
     writer: &mut W,
     frame_buffer: &mut Vec<u8>,
     local_machine_id: &str,
+    transfer_id: &str,
     image_bmp: &[u8],
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let transfer_id = uuid::Uuid::new_v4().to_string();
     let hash_hex = image_hash_hex(image_bmp);
     send_message(
         writer,
         &WireMessage::ClipboardImageStart {
             machine_id: local_machine_id.to_string(),
-            transfer_id: transfer_id.clone(),
+            transfer_id: transfer_id.to_string(),
             total_bytes: image_bmp.len() as u64,
             hash_hex,
         },
         frame_buffer,
     )
-    .await?;
+    .await
+}
 
-    for chunk in image_bmp.chunks(CLIPBOARD_IMAGE_CHUNK_BYTES) {
-        send_message(
-            writer,
-            &WireMessage::ClipboardImageChunk {
-                transfer_id: transfer_id.clone(),
-                data: chunk.to_vec(),
-            },
-            frame_buffer,
-        )
-        .await?;
+pub(super) async fn send_clipboard_image_chunk_credit<W>(
+    writer: &mut W,
+    transfer_id: &str,
+    chunk_credits: u32,
+    frame_buffer: &mut Vec<u8>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if chunk_credits == 0 {
+        return Ok(());
     }
 
     send_message(
         writer,
-        &WireMessage::ClipboardImageEnd { transfer_id },
+        &WireMessage::ClipboardImageChunkCredit {
+            transfer_id: transfer_id.to_string(),
+            chunk_credits,
+        },
         frame_buffer,
     )
     .await
@@ -783,9 +953,5 @@ where
     W: AsyncWrite + Unpin,
 {
     encode_frame_to_vec(message, frame_buffer)?;
-    writer
-        .write_all(frame_buffer.as_slice())
-        .await
-        .context("write transport frame")?;
-    Ok(())
+    write_transport_bytes(writer, frame_buffer.as_slice(), "write transport frame").await
 }

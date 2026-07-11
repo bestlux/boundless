@@ -10,8 +10,10 @@
       ICE43/ICE57 expect non-advertised shortcuts to use an HKCU key path.
       This machine-wide skeleton intentionally creates common Start Menu/Desktop
       shortcuts with HKLM component key paths and no Startup shortcut.
+      ICE61 rejects an upgrade range whose maximum equals the current version;
+      that equality is intentional for private same-version dogfood rebuilds.
     -->
-    <SuppressIces>ICE43;ICE57;ICE64;ICE91</SuppressIces>
+    <SuppressIces>ICE43;ICE57;ICE61;ICE64;ICE91</SuppressIces>
   </PropertyGroup>
 
   <ItemGroup>

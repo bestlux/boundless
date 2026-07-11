@@ -126,10 +126,24 @@ impl DashboardApp {
         let activation_requested = Arc::new(AtomicBool::new(false));
         let activation_requested_signal = activation_requested.clone();
         let activation_ctx = cc.egui_ctx.clone();
-        single_instance_guard.start_activation_listener(move || {
-            activation_requested_signal.store(true, Ordering::SeqCst);
-            activation_ctx.request_repaint();
-        })?;
+        let shutdown_broker = input_broker_shutdown.clone();
+        let shutdown_exit_requested = exit_requested_signal.clone();
+        let shutdown_ctx = cc.egui_ctx.clone();
+        let shutdown_window_handle = native_window_handle;
+        single_instance_guard.start_listener(
+            move || {
+                activation_requested_signal.store(true, Ordering::SeqCst);
+                activation_ctx.request_repaint();
+            },
+            move || {
+                shutdown_broker.request();
+                request_dashboard_exit(
+                    shutdown_window_handle,
+                    &shutdown_ctx,
+                    &shutdown_exit_requested,
+                );
+            },
+        )?;
 
         DashboardTaskRunner::spawn_snapshot_watch(
             app_ctx.clone(),
