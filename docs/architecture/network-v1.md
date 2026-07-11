@@ -60,7 +60,7 @@ Related design notes:
 - A trusted peer may reach the daemon through either a locally initiated outbound connection or a reverse-initiated inbound connection. A nonpreferred direction is accepted when it is the only authenticated route, preserving one-sided LAN reachability.
 - When both physical directions race, both peers derive the same preferred connection: the lexicographically smaller machine id initiates it. The preferred authenticated session replaces and cancels an already claimed nonpreferred session; later nonpreferred duplicates cannot displace it.
 - Outbound worker registration ids and inbound task registration ids are also the ownership ids used by the session registry, so replacement can cancel the exact displaced task instead of aborting an unrelated peer session.
-- Session claim and close transitions are serialized. A superseded session may clean up its private transfer state, but only the session that still owns the registry claim can publish `connected=false`; stale teardown cannot disconnect or clear a replacement session.
+- Session claim, close, and outbound-failure transitions are serialized. A superseded session may clean up its private transfer state, but only the session that still owns the registry claim can publish `connected=false`; stale teardown or a delayed failed dial cannot disconnect or clear a replacement session.
 - Input and bulk queues remain peer-owned rather than direction-owned. Either the preferred connection or a sole-reachable nonpreferred connection must flush payloads after `Hello` negotiation.
 
 ## Slice 1 regression focus

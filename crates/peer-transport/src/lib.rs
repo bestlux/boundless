@@ -718,23 +718,9 @@ impl TransportRuntimeState {
                     cancellation,
                 },
             );
-            let abort_handle = registry
-                .abort_handles_by_peer
-                .get_mut(peer_id)
-                .and_then(|sessions| sessions.remove(&active_session_id));
-            if registry
-                .abort_handles_by_peer
-                .get(peer_id)
-                .is_some_and(HashMap::is_empty)
-            {
-                registry.abort_handles_by_peer.remove(peer_id);
-            }
             drop(registry);
             if active_cancellation.trigger() {
                 active_cancellation.notify_one();
-            }
-            if let Some(abort_handle) = abort_handle {
-                abort_handle.abort();
             }
             return TransportSessionClaim::Replaced { active_session_id };
         }
@@ -1893,19 +1879,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preferred_claim_aborts_registered_nonpreferred_owner() {
+    async fn preferred_claim_signals_registered_nonpreferred_owner_without_hard_abort() {
         let state = TransportRuntimeState::default();
         let child = tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
         let nonpreferred_id =
             state.register_transport_session_for_peer("peer-a", child.abort_handle());
+        let nonpreferred_cancellation = Arc::new(RuntimeWakeSignal::default());
         assert_eq!(
             state.claim_transport_session(
                 "peer-a",
                 nonpreferred_id,
                 false,
-                Arc::new(RuntimeWakeSignal::default()),
+                nonpreferred_cancellation.clone(),
             ),
             TransportSessionClaim::Claimed
         );
@@ -1920,11 +1907,17 @@ mod tests {
                 active_session_id: nonpreferred_id
             }
         );
+        assert!(nonpreferred_cancellation.take_pending());
+        assert!(
+            !child.is_finished(),
+            "replacement must not hard-abort a task that may own drained payloads"
+        );
+        assert_eq!(state.abort_transport_sessions_for_peer("peer-a").await, 1);
         let join_error = child
             .await
-            .expect_err("registered nonpreferred owner should be aborted");
+            .expect_err("explicit peer abort should still cancel the registered owner");
         assert!(join_error.is_cancelled());
-        assert!(state.clear_active_transport_session("peer-a", 99));
+        assert!(!state.has_active_transport_session("peer-a"));
     }
 
     #[tokio::test]

@@ -113,6 +113,18 @@ impl AppState {
         true
     }
 
+    pub async fn mark_peer_disconnected_if_no_active_transport_session(
+        &self,
+        peer_id: &str,
+    ) -> Result<bool> {
+        let _transition = self.transport_session_transition.lock().await;
+        if self.transport.has_active_transport_session(peer_id) {
+            return Ok(false);
+        }
+        self.set_peer_connected(peer_id, false).await?;
+        Ok(true)
+    }
+
     pub fn has_active_transport_session(&self, peer_id: &str) -> bool {
         self.transport.has_active_transport_session(peer_id)
     }

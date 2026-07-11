@@ -194,8 +194,22 @@ async fn peer_worker(state: AppState, peer_id: String, session_registration_id: 
                     peer_id = %peer_id,
                     "outbound connect failed but recent connected session state is preserved"
                 );
-            } else if let Err(mark_error) = state.set_peer_connected(&peer_id, false).await {
-                warn!(%mark_error, "failed to mark peer disconnected");
+            } else {
+                match state
+                    .mark_peer_disconnected_if_no_active_transport_session(&peer_id)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        info!(
+                            peer_id = %peer_id,
+                            "stale outbound failure cannot disconnect the active reverse session"
+                        );
+                    }
+                    Err(mark_error) => {
+                        warn!(%mark_error, "failed to mark peer disconnected");
+                    }
+                }
             }
 
             wait_for_reconcile_or_backoff(&reconcile_wake, Duration::from_secs(backoff_secs)).await;
@@ -528,6 +542,80 @@ mod tests {
         assert!(!should_preserve_connected_after_outbound_failure(
             &recent_disconnected
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_outbound_failure_preserves_active_reverse_session_state() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-stale-outbound-failure-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state =
+            AppState::load_or_create_with_paths(root.join("config.json"), root.join("security"))
+                .expect("load state");
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.1:15100".to_string(),
+                Some("reverse-owner".to_string()),
+            )
+            .await
+            .expect("join peer");
+        let session_id = state.allocate_transport_session_id();
+        assert_eq!(
+            state
+                .claim_transport_session(
+                    &peer_id,
+                    session_id,
+                    false,
+                    std::sync::Arc::new(crate::state::RuntimeWakeSignal::default()),
+                )
+                .await,
+            crate::state::TransportSessionClaim::Claimed
+        );
+        state
+            .set_peer_connected(&peer_id, true)
+            .await
+            .expect("mark reverse owner connected");
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("claim input owner")
+        );
+        state
+            .set_input_capture_target(Some(&peer_id))
+            .await
+            .expect("set capture target");
+
+        assert!(
+            !state
+                .mark_peer_disconnected_if_no_active_transport_session(&peer_id)
+                .await
+                .expect("process stale outbound failure"),
+            "an outbound failure that started before the reverse claim must not disconnect it"
+        );
+        assert!(
+            state
+                .snapshot()
+                .await
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == peer_id && peer.connected)
+        );
+        assert_eq!(state.input_owner().await.as_deref(), Some(peer_id.as_str()));
+        assert_eq!(
+            state.input_capture_target().await.as_deref(),
+            Some(peer_id.as_str())
+        );
+
+        assert!(
+            state
+                .close_active_transport_session(&peer_id, session_id)
+                .await
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
