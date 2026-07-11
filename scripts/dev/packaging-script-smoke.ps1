@@ -126,7 +126,19 @@ foreach ($requiredInstallContract in @(
         'Boundless-install.log',
         'Copy-BoundlessInstallerLogHandoff',
         'ElevatedInstallCancelEvent',
-        'caller_privilege_log_handoff_fixture'
+        'caller_privilege_log_handoff_fixture',
+        'BoundlessOwnedProcessBoundary',
+        'BoundlessElevatedJob',
+        'coordinator_death_cancellation_fixture',
+        'failed_drain_quiescence_fixture',
+        'kernel_object_acl_fixture',
+        'blocking_service_stop_fixture',
+        'failed_msi_service_recovery_fixture',
+        'Start-BoundlessTrayQuiescenceSentinelOwner',
+        'ElevatedInstallCoordinatorProcessId',
+        'Get-BoundlessServiceStatusBounded',
+        'Boundless-install-result.txt',
+        '(A;;RC;;;OW)'
     )) {
     if ($installScriptText -notmatch [regex]::Escape($requiredInstallContract)) {
         throw "Boundless-Install.ps1 is missing the upgrade safety contract: $requiredInstallContract"
@@ -164,9 +176,43 @@ $invokeMsiSource = Get-PowerShellFunctionSource `
     -Name 'Invoke-BoundlessMsi'
 if (
     $invokeMsiSource -notmatch 'Wait-BoundlessElevatedInstallSupervised' -or
-    $invokeMsiSource -notmatch 'Copy-BoundlessInstallerLogHandoff'
+    $invokeMsiSource -notmatch 'Copy-BoundlessInstallerLogHandoff' -or
+    $invokeMsiSource -notmatch 'CompletionEvent' -or
+    $invokeMsiSource -notmatch 'TreeJobName' -or
+    $invokeMsiSource -notmatch 'TreeClosureState'
 ) {
-    throw "Installer parent must supervise elevation and copy the completed staged log itself."
+    throw "Installer parent must supervise elevation/tree completion and copy the completed staged log itself."
+}
+$elevatedCommandSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'New-BoundlessElevatedInstallCommand'
+if (
+    $elevatedCommandSource -notmatch 'TerminateJobObject' -or
+    $elevatedCommandSource -notmatch 'StartOwned' -or
+    $elevatedCommandSource -notmatch 'StartGate' -or
+    $elevatedCommandSource -notmatch 'Get-CancellationReason'
+) {
+    throw "Elevated installer helper must own a gated kill-on-close process tree and liveness boundary."
+}
+$serviceStopSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Stop-BoundlessServiceForUpgrade'
+if (
+    $serviceStopSource -match '\$service\.Stop\(\)' -or
+    $serviceStopSource -notmatch 'Wait-BoundlessServiceTransition' -or
+    $serviceStopSource -notmatch 'The MSI was not started'
+) {
+    throw "Upgrade service stop must supervise the blocking SCM request outside the installer process."
+}
+$serviceRecoverySource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Invoke-BoundlessMsiWithServiceRecovery'
+if (
+    $serviceRecoverySource -notmatch 'definitive_failure' -or
+    $serviceRecoverySource -notmatch 'initial_status -eq "Running"' -or
+    $serviceRecoverySource -notmatch 'BoundlessServiceRecoveryError'
+) {
+    throw "Failed MSI recovery must restart only an originally running service after a definitive boundary."
 }
 
 $serviceRecovery = Join-Path $RepoRoot 'crates\tray\src\service_recovery.rs'
