@@ -64,11 +64,17 @@ Incoming (peer frame -> local injection):
    frame completes.
 4. The daemon assigns one random delivery epoch for its in-memory relay and
    retains an in-flight batch under the same ID across replacement or stale
-   re-attach. The tray keeps completed receipts and partial suffix state across
-   its supervisor sessions, but accepts them only when the new attach reports
-   the same epoch. A lost acknowledgment followed by a transient same-process
-   re-attach therefore acknowledges the repeated ID without another
-   `SendInput` call.
+   re-attach. The tray keeps completed receipts, partial suffix state, and the
+   intended held key/button state across its supervisor sessions, but accepts
+   them only when the new attach reports the same epoch. Session failure first
+   releases committed holds locally so input fails open. After same-epoch
+   re-attach, the tray waits for a successful exchange to revalidate the
+   retained batch, restores those holds, and only then resumes the payload
+   suffix. A partial restore retains its exact uncommitted suffix and makes at
+   most one native restore attempt per authorized exchange. Cancellation or a
+   new delivery epoch discards the restore intent. A lost acknowledgment
+   followed by a transient same-process re-attach therefore acknowledges the
+   repeated ID without another payload `SendInput` call.
 5. Cooperative detach carries the tray's latest completed batch ID and delivery
    epoch. Under the capture-transition lock, the daemon validates the broker
    token and epoch, acknowledges that exact batch, and only then returns any
@@ -156,7 +162,10 @@ Clipboard (service mode with broker attached):
   deliberately keeps and replays its unacknowledged in-flight batch on the next
   attach (at-least-once), so input that completed immediately before the crash
   can be applied twice. Persisting receipts would be required to close that
-  boundary. Abrupt broker death can also leave keys held on a remote peer until
-  release synthesis runs on the next capture-target transition.
+  boundary. The tray's locally injected held-state snapshot is process-local as
+  well: if the tray hard-crashes after a key/button Down and authorization is
+  revoked before a matching Up can be replayed, that input can remain held on
+  the receiving PC. Abrupt broker death can also leave keys held on a remote
+  peer until release synthesis runs on the next capture-target transition.
 - Real two-PC dogfood evidence is still required before the parity matrix rows
   can move; nothing here upgrades BND-NEXT-9C claims.

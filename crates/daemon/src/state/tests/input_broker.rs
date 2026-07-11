@@ -1248,6 +1248,80 @@ async fn stale_reattach_accepts_completed_receipt_without_replaying_inject_batch
 }
 
 #[tokio::test]
+async fn stale_reattach_reauthorizes_partial_batch_without_replaying_full_frames() {
+    let (state, root) = service_mode_broker_state("boundless-broker-partial-reattach-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let first_attach = state
+        .attach_input_broker(allowed_client(), "first-broker".to_string(), true)
+        .await;
+    assert!(first_attach.accepted);
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("claim owner")
+    );
+    state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id.clone(),
+                sequence: 42,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![
+                    InputEvent::Key {
+                        scan_code: 29,
+                        state: KeyState::Down,
+                        semantics: core_input::KeySemantics::Physical,
+                    },
+                    InputEvent::Key {
+                        scan_code: 46,
+                        state: KeyState::Down,
+                        semantics: core_input::KeySemantics::Physical,
+                    },
+                ],
+            },
+        )
+        .await
+        .expect("route chord frame");
+    let dispatched = state
+        .exchange_input_broker(
+            allowed_client(),
+            &first_attach.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert_eq!(dispatched.inject_frames.len(), 1);
+    assert_ne!(dispatched.inject_batch_id, 0);
+
+    state.input_broker_relay().expire_attachment_for_test();
+    let replacement = state
+        .attach_input_broker(allowed_client(), "replacement-broker".to_string(), true)
+        .await;
+    assert!(replacement.accepted);
+    assert_eq!(replacement.delivery_epoch, first_attach.delivery_epoch);
+    let recovered = state
+        .exchange_input_broker(
+            allowed_client(),
+            &replacement.broker_token,
+            InputBrokerExchangeObservations {
+                inject_backpressure: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(recovered.accepted);
+    assert_eq!(recovered.inject_batch_id, dispatched.inject_batch_id);
+    assert!(!recovered.inject_batch_cancelled);
+    assert!(
+        recovered.inject_frames.is_empty(),
+        "the surviving tray owns the exact suffix, so reauthorization must not replay full frames"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn detach_acknowledges_completed_inject_batch_before_requeue() {
     let (state, root) = service_mode_broker_state("boundless-broker-detach-ack-test").await;
     let peer_id = join_connected_peer(&state).await;

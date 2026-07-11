@@ -87,6 +87,14 @@ struct BrokerInjectBatchState {
     active_batch_id: Option<u64>,
     frames: std::collections::VecDeque<Vec<core_input::InputEvent>>,
     last_completed_batch_id: u64,
+    held_input_resume: Option<BrokerHeldInputResume>,
+}
+
+#[derive(Debug)]
+struct BrokerHeldInputResume {
+    batch_id: u64,
+    intended_downs: Vec<core_input::InputEvent>,
+    pending_restore: Vec<core_input::InputEvent>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -111,6 +119,7 @@ impl BrokerInjectBatchState {
         self.active_batch_id = None;
         self.frames.clear();
         self.last_completed_batch_id = 0;
+        self.held_input_resume = None;
         Ok(())
     }
 
@@ -153,6 +162,7 @@ impl BrokerInjectBatchState {
         self.frames.clear();
         self.active_batch_id = None;
         self.last_completed_batch_id = batch_id;
+        self.held_input_resume = None;
         Ok(true)
     }
 
@@ -193,9 +203,34 @@ impl BrokerInjectBatchState {
         if frames.is_empty() {
             bail!("input broker announced new inject batch {batch_id} without frames");
         }
+        self.held_input_resume = None;
         self.active_batch_id = Some(batch_id);
         self.frames.extend(frames);
         Ok(())
+    }
+
+    fn prepare_held_input_resume(&mut self, injected_state: &InjectedInputState) {
+        let Some(batch_id) = self.active_batch_id else {
+            self.held_input_resume = None;
+            return;
+        };
+        let intended_downs = match self.held_input_resume.take() {
+            Some(resume) if resume.batch_id == batch_id => resume.intended_downs,
+            // An ID mismatch is an internal invariant failure, but fail-open
+            // cleanup still has to release the state this session actually
+            // committed instead of returning early with local input held.
+            Some(_) => injected_state.held_down_events(),
+            None => injected_state.held_down_events(),
+        };
+        self.held_input_resume = (!intended_downs.is_empty()).then(|| BrokerHeldInputResume {
+            batch_id,
+            pending_restore: intended_downs.clone(),
+            intended_downs,
+        });
+    }
+
+    fn clear_held_input_resume(&mut self) {
+        self.held_input_resume = None;
     }
 
     fn process(&mut self, injected_state: &mut InjectedInputState) -> BrokerInjectProgress {
@@ -211,6 +246,24 @@ impl BrokerInjectBatchState {
         F: FnMut(&[core_input::InputEvent], &mut InjectedInputState) -> InputSendOutcome,
     {
         let mut progress = BrokerInjectProgress::default();
+        if let Some(resume) = self.held_input_resume.as_mut() {
+            if self.active_batch_id != Some(resume.batch_id) {
+                progress.failed_attempts = progress.failed_attempts.saturating_add(1);
+                return progress;
+            }
+            if resume.pending_restore.is_empty() {
+                self.held_input_resume = None;
+            } else {
+                let restore_events = resume.pending_restore.clone();
+                let outcome = apply(&restore_events, injected_state);
+                if outcome.error.is_some() {
+                    resume.pending_restore = outcome.remaining_events;
+                    progress.failed_attempts = progress.failed_attempts.saturating_add(1);
+                    return progress;
+                }
+                self.held_input_resume = None;
+            }
+        }
         while let Some(events) = self.frames.front().cloned() {
             let outcome = apply(&events, injected_state);
             if outcome.error.is_none() {
@@ -280,6 +333,27 @@ impl InjectedInputState {
                 | core_input::InputEvent::MouseWheel { .. } => {}
             }
         }
+    }
+
+    fn held_down_events(&self) -> Vec<core_input::InputEvent> {
+        // Restore keys before buttons so a modifier remains effective for a
+        // resumed drag/click. Preserve first-down order within each class.
+        let mut held = self
+            .pressed_keys
+            .iter()
+            .map(|(scan_code, semantics)| core_input::InputEvent::Key {
+                scan_code: *scan_code,
+                state: core_input::KeyState::Down,
+                semantics: *semantics,
+            })
+            .collect::<Vec<_>>();
+        held.extend(self.pressed_buttons.iter().map(|button| {
+            core_input::InputEvent::MouseButton {
+                button: *button,
+                state: core_input::KeyState::Down,
+            }
+        }));
+        held
     }
 
     #[cfg(test)]
@@ -792,9 +866,22 @@ async fn run_input_broker_session(
     clipboard_task.abort();
     let _ = clipboard_task.await;
 
+    // Preserve the intended held state before fail-open cleanup. A later
+    // same-epoch session restores it only after the daemon reauthorizes the
+    // retained batch, then continues with the exact payload suffix.
+    if matches!(session_end, BrokerSessionEnd::Detached)
+        && inject_batches.backpressure_active()
+    {
+        inject_batches.prepare_held_input_resume(&injected_state);
+    } else {
+        inject_batches.clear_held_input_resume();
+    }
+
     // Unlock and locally release injected state before any cleanup IPC.
     let _ = pump.set_lock_active(false);
-    let _ = injected_state.release_local();
+    if let Err(error) = injected_state.release_local() {
+        eprintln!("boundless input broker failed to release local injected input: {error:#}");
+    }
 
     // Do not submit synthetic captured releases through the ordinary exchange:
     // that would consume the daemon relay's authoritative pressed-state before
@@ -1128,6 +1215,386 @@ mod input_broker_tests {
         });
         assert_eq!(replay, BrokerInjectProgress::default());
         assert_eq!(batch.acked_batch_id(), 7);
+    }
+
+    #[test]
+    fn partial_ctrl_chord_reattach_restores_modifier_before_suffix() {
+        let ctrl_down = core_input::InputEvent::Key {
+            scan_code: 29,
+            state: core_input::KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let ctrl_up = core_input::InputEvent::Key {
+            scan_code: 29,
+            state: core_input::KeyState::Up,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let c_down = core_input::InputEvent::Key {
+            scan_code: 46,
+            state: core_input::KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let c_up = core_input::InputEvent::Key {
+            scan_code: 46,
+            state: core_input::KeyState::Up,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let suffix = vec![c_down, c_up, ctrl_up.clone()];
+        let mut batch = BrokerInjectBatchState::default();
+        batch
+            .begin_delivery_epoch("daemon-epoch")
+            .expect("begin first broker session");
+        batch
+            .accept_batch(
+                7,
+                vec![std::iter::once(ctrl_down.clone())
+                    .chain(suffix.clone())
+                    .collect()],
+            )
+            .expect("stage chord batch");
+        let mut first_session = InjectedInputState::new(WindowsNumLockState::new(false));
+        let first = batch.process_with(&mut first_session, |events, state| {
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: 1,
+                    remaining_events: suffix.clone(),
+                    error: Some(anyhow::anyhow!("scripted suffix failure")),
+                },
+            )
+        });
+        assert_eq!(first.failed_attempts, 1);
+        batch.prepare_held_input_resume(&first_session);
+        assert_eq!(first_session.drain_release_events(), vec![ctrl_up]);
+
+        batch
+            .begin_delivery_epoch("daemon-epoch")
+            .expect("reattach to same daemon");
+        batch
+            .accept_batch(7, Vec::new())
+            .expect("daemon reauthorizes retained batch under backpressure");
+        let mut second_session = InjectedInputState::new(WindowsNumLockState::new(false));
+        let mut attempts = Vec::new();
+        batch.process_with(&mut second_session, |events, state| {
+            attempts.push(events.to_vec());
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: events.len(),
+                    remaining_events: Vec::new(),
+                    error: None,
+                },
+            )
+        });
+
+        assert_eq!(attempts, vec![vec![ctrl_down], suffix]);
+    }
+
+    #[test]
+    fn partial_drag_reattach_restores_button_before_motion_suffix() {
+        let mouse_down = core_input::InputEvent::MouseButton {
+            button: core_input::MouseButton::Left,
+            state: core_input::KeyState::Down,
+        };
+        let mouse_up = core_input::InputEvent::MouseButton {
+            button: core_input::MouseButton::Left,
+            state: core_input::KeyState::Up,
+        };
+        let suffix = vec![
+            core_input::InputEvent::MouseMove { dx: 8, dy: 2 },
+            mouse_up.clone(),
+        ];
+        let mut batch = BrokerInjectBatchState::default();
+        batch
+            .begin_delivery_epoch("daemon-epoch")
+            .expect("begin first broker session");
+        batch
+            .accept_batch(
+                9,
+                vec![std::iter::once(mouse_down.clone())
+                    .chain(suffix.clone())
+                    .collect()],
+            )
+            .expect("stage drag batch");
+        let mut first_session = InjectedInputState::new(WindowsNumLockState::new(false));
+        let first = batch.process_with(&mut first_session, |events, state| {
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: 1,
+                    remaining_events: suffix.clone(),
+                    error: Some(anyhow::anyhow!("scripted drag suffix failure")),
+                },
+            )
+        });
+        assert_eq!(first.failed_attempts, 1);
+        batch.prepare_held_input_resume(&first_session);
+        assert_eq!(first_session.drain_release_events(), vec![mouse_up]);
+
+        batch
+            .begin_delivery_epoch("daemon-epoch")
+            .expect("reattach to same daemon");
+        batch
+            .accept_batch(9, Vec::new())
+            .expect("daemon reauthorizes retained drag batch");
+        let mut second_session = InjectedInputState::new(WindowsNumLockState::new(false));
+        let mut attempts = Vec::new();
+        let completed = batch.process_with(&mut second_session, |events, state| {
+            attempts.push(events.to_vec());
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: events.len(),
+                    remaining_events: Vec::new(),
+                    error: None,
+                },
+            )
+        });
+
+        assert_eq!(attempts, vec![vec![mouse_down], suffix]);
+        assert_eq!(completed.completed_frames, 1);
+        assert!(second_session.drain_release_events().is_empty());
+    }
+
+    #[test]
+    fn cancellation_before_reattach_restore_discards_held_intent() {
+        let ctrl_down = core_input::InputEvent::Key {
+            scan_code: 29,
+            state: core_input::KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let ctrl_up = core_input::InputEvent::Key {
+            scan_code: 29,
+            state: core_input::KeyState::Up,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let suffix = vec![core_input::InputEvent::Key {
+            scan_code: 46,
+            state: core_input::KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        }];
+        let mut batch = BrokerInjectBatchState::default();
+        batch
+            .begin_delivery_epoch("daemon-epoch")
+            .expect("begin broker session");
+        batch
+            .accept_batch(
+                11,
+                vec![std::iter::once(ctrl_down).chain(suffix.clone()).collect()],
+            )
+            .expect("stage chord batch");
+        let mut first_session = InjectedInputState::new(WindowsNumLockState::new(false));
+        batch.process_with(&mut first_session, |events, state| {
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: 1,
+                    remaining_events: suffix.clone(),
+                    error: Some(anyhow::anyhow!("scripted suffix failure")),
+                },
+            )
+        });
+        batch.prepare_held_input_resume(&first_session);
+        assert_eq!(first_session.drain_release_events(), vec![ctrl_up]);
+
+        batch
+            .begin_delivery_epoch("daemon-epoch")
+            .expect("reattach to same daemon");
+        assert!(
+            batch
+                .accept_reply(11, true, Vec::new())
+                .expect("daemon cancellation")
+        );
+        let mut second_session = InjectedInputState::new(WindowsNumLockState::new(false));
+        let progress = batch.process_with(&mut second_session, |_events, _state| {
+            panic!("cancelled batch must not restore held input or retry its suffix")
+        });
+        assert_eq!(progress, BrokerInjectProgress::default());
+        assert_eq!(batch.acked_batch_id(), 11);
+    }
+
+    #[test]
+    fn new_epoch_discards_old_held_intent_before_new_batch() {
+        let old_down = core_input::InputEvent::MouseButton {
+            button: core_input::MouseButton::Left,
+            state: core_input::KeyState::Down,
+        };
+        let old_up = core_input::InputEvent::MouseButton {
+            button: core_input::MouseButton::Left,
+            state: core_input::KeyState::Up,
+        };
+        let old_suffix = vec![core_input::InputEvent::MouseMove { dx: 5, dy: 0 }];
+        let new_event = core_input::InputEvent::MouseMove { dx: 1, dy: 0 };
+        let mut batch = BrokerInjectBatchState::default();
+        batch
+            .begin_delivery_epoch("old-epoch")
+            .expect("begin old daemon epoch");
+        batch
+            .accept_batch(
+                13,
+                vec![std::iter::once(old_down)
+                    .chain(old_suffix.clone())
+                    .collect()],
+            )
+            .expect("stage old drag batch");
+        let mut old_session = InjectedInputState::new(WindowsNumLockState::new(false));
+        batch.process_with(&mut old_session, |events, state| {
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: 1,
+                    remaining_events: old_suffix.clone(),
+                    error: Some(anyhow::anyhow!("scripted old suffix failure")),
+                },
+            )
+        });
+        batch.prepare_held_input_resume(&old_session);
+        assert_eq!(old_session.drain_release_events(), vec![old_up]);
+
+        batch
+            .begin_delivery_epoch("new-epoch")
+            .expect("start replacement daemon epoch");
+        batch
+            .accept_batch(1, vec![vec![new_event.clone()]])
+            .expect("stage new daemon batch");
+        let mut new_session = InjectedInputState::new(WindowsNumLockState::new(false));
+        let mut attempts = Vec::new();
+        batch.process_with(&mut new_session, |events, state| {
+            attempts.push(events.to_vec());
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: events.len(),
+                    remaining_events: Vec::new(),
+                    error: None,
+                },
+            )
+        });
+        assert_eq!(attempts, vec![vec![new_event]]);
+        assert_eq!(batch.acked_batch_id(), 1);
+    }
+
+    #[test]
+    fn partial_held_restore_retains_exact_suffix_and_defers_payload() {
+        let ctrl_down = core_input::InputEvent::Key {
+            scan_code: 29,
+            state: core_input::KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let shift_down = core_input::InputEvent::Key {
+            scan_code: 42,
+            state: core_input::KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let ctrl_up = core_input::InputEvent::Key {
+            scan_code: 29,
+            state: core_input::KeyState::Up,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let shift_up = core_input::InputEvent::Key {
+            scan_code: 42,
+            state: core_input::KeyState::Up,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let payload_suffix = vec![
+            core_input::InputEvent::MouseMove { dx: 2, dy: 0 },
+            shift_up.clone(),
+            ctrl_up.clone(),
+        ];
+        let mut batch = BrokerInjectBatchState::default();
+        batch
+            .begin_delivery_epoch("daemon-epoch")
+            .expect("begin first broker session");
+        batch
+            .accept_batch(
+                15,
+                vec![vec![ctrl_down.clone(), shift_down.clone()]
+                    .into_iter()
+                    .chain(payload_suffix.clone())
+                    .collect::<Vec<_>>()],
+            )
+            .expect("stage held-state batch");
+        let mut first_session = InjectedInputState::new(WindowsNumLockState::new(false));
+        batch.process_with(&mut first_session, |events, state| {
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: 2,
+                    remaining_events: payload_suffix.clone(),
+                    error: Some(anyhow::anyhow!("scripted payload suffix failure")),
+                },
+            )
+        });
+        batch.prepare_held_input_resume(&first_session);
+        assert_eq!(
+            first_session.drain_release_events(),
+            vec![ctrl_up, shift_up]
+        );
+
+        batch
+            .begin_delivery_epoch("daemon-epoch")
+            .expect("reattach to same daemon");
+        batch
+            .accept_batch(15, Vec::new())
+            .expect("first retained-batch reauthorization");
+        let mut second_session = InjectedInputState::new(WindowsNumLockState::new(false));
+        let mut attempts = Vec::new();
+        let first_restore = batch.process_with(&mut second_session, |events, state| {
+            attempts.push(events.to_vec());
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: 1,
+                    remaining_events: vec![shift_down.clone()],
+                    error: Some(anyhow::anyhow!("scripted restore suffix failure")),
+                },
+            )
+        });
+        assert_eq!(
+            first_restore,
+            BrokerInjectProgress {
+                completed_frames: 0,
+                failed_attempts: 1,
+            }
+        );
+        assert_eq!(attempts, vec![vec![ctrl_down.clone(), shift_down.clone()]]);
+
+        batch
+            .accept_batch(15, Vec::new())
+            .expect("second retained-batch reauthorization");
+        let second_restore = batch.process_with(&mut second_session, |events, state| {
+            attempts.push(events.to_vec());
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: events.len(),
+                    remaining_events: Vec::new(),
+                    error: None,
+                },
+            )
+        });
+        assert_eq!(second_restore.completed_frames, 1);
+        assert_eq!(second_restore.failed_attempts, 0);
+        assert_eq!(
+            attempts,
+            vec![
+                vec![ctrl_down, shift_down.clone()],
+                vec![shift_down],
+                payload_suffix,
+            ]
+        );
+        assert_eq!(batch.acked_batch_id(), 15);
+        assert!(second_session.drain_release_events().is_empty());
     }
 
     #[test]
