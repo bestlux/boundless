@@ -142,6 +142,10 @@ foreach ($requiredInstallContract in @(
         'stalled_monitor_takeover_fixture',
         'hard_kill_parent_service_recovery_fixture',
         'hard_kill_recovery_failure_fixture',
+        'bounded_recovery_elevation_launch_fixture',
+        'msi_started_deferred_recovery_fixture',
+        'deferred_recovery_idle_race_fixture',
+        'native_type_upgrade_compatibility_fixture',
         'Start-BoundlessTrayQuiescenceSentinelOwner',
         'ElevatedInstallCoordinatorProcessId',
         'Get-BoundlessServiceStatusBounded',
@@ -178,11 +182,17 @@ $nativeInstallSource = Get-PowerShellFunctionSource `
     -Name 'Initialize-BoundlessInstallNativeMethods'
 if (
     $ownerLookupSource -match 'Get-CimInstance|Invoke-CimMethod' -or
-    $ownerLookupSource -notmatch 'BoundlessInstallNativeMethods' -or
+    $ownerLookupSource -notmatch 'BoundlessInstallNativeMethodsV2' -or
     $nativeInstallSource -notmatch 'GetTokenInformation' -or
     $nativeInstallSource -notmatch 'ConvertSidToStringSidW'
 ) {
     throw "Tray owner verification must use direct process-token SID lookup without CIM/WMI."
+}
+if (
+    $nativeInstallSource -notmatch 'BoundlessInstallNativeMethodsV2' -or
+    $nativeInstallSource -match 'public static class BoundlessInstallNativeMethods\s'
+) {
+    throw "Installer native methods must use a versioned type that cannot reuse the v5.0.13 class."
 }
 $postInstallSource = Get-PowerShellFunctionSource `
     -Path $installScript `
@@ -224,6 +234,21 @@ if (
     $supervisedInstallSource -notmatch 'Parent service recovery after the hard kill also failed'
 ) {
     throw "Parent hard-kill recovery must make one bounded attempt and preserve its failure with the original supervision error."
+}
+$parentRecoverySource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Restore-BoundlessServiceAfterHardKilledElevatedInstall'
+$recoveryLauncherSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Invoke-BoundlessRecoveryLauncherBounded'
+if (
+    $parentRecoverySource -notmatch 'ElevatedBootstrapMsiIdleServiceRecovery' -or
+    $parentRecoverySource -notmatch 'msi_definitive_completion_event' -or
+    $parentRecoverySource -notmatch 'msi_idle_proven_event' -or
+    $recoveryLauncherSource -notmatch 'WaitForExit\(\$TimeoutMilliseconds\)' -or
+    $recoveryLauncherSource -notmatch 'Stop-BoundlessProcessBoundary'
+) {
+    throw "Parent recovery must bound elevation launch and defer post-MSI service start through definitive or idle proof."
 }
 $elevatedCommandSource = Get-PowerShellFunctionSource `
     -Path $installScript `
