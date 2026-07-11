@@ -12,6 +12,10 @@ param(
     [Parameter(DontShow = $true)]
     [switch]$ElevatedInstall,
     [Parameter(DontShow = $true)]
+    [switch]$ElevatedBootstrapServiceRecovery,
+    [Parameter(DontShow = $true)]
+    [switch]$ElevatedBootstrapMsiIdleProof,
+    [Parameter(DontShow = $true)]
     [string]$ExpectedInstallerSha256 = "",
     [Parameter(DontShow = $true)]
     [string]$ElevatedInstallCancelEvent = "",
@@ -25,6 +29,14 @@ param(
     [string]$ElevatedInstallStartGate = "",
     [Parameter(DontShow = $true)]
     [string]$ElevatedInstallResultPath = "",
+    [Parameter(DontShow = $true)]
+    [string]$ElevatedInstallServiceInitialRunningEvent = "",
+    [Parameter(DontShow = $true)]
+    [string]$ElevatedInstallMsiMayHaveStartedEvent = "",
+    [Parameter(DontShow = $true)]
+    [string]$ElevatedInstallMsiDefinitiveCompletionEvent = "",
+    [Parameter(DontShow = $true)]
+    [string]$ElevatedInstallMsiIdleProvenEvent = "",
     [Parameter(DontShow = $true)]
     [int]$ElevatedInstallTimeoutSeconds = 900
 )
@@ -816,6 +828,8 @@ function Invoke-BoundlessMsiElevated {
         [int]$CoordinatorProcessId,
         [long]$CoordinatorStartTicks,
         [string]$MonitorMutexName,
+        [Threading.EventWaitHandle]$MsiMayHaveStartedEvent,
+        [Threading.EventWaitHandle]$MsiDefinitiveCompletionEvent,
         [int]$TimeoutSeconds
     )
 
@@ -839,6 +853,12 @@ function Invoke-BoundlessMsiElevated {
                 -CompletionState "not_started"
         }
         $arguments = New-BoundlessMsiArguments -ResolvedInstallerPath $ResolvedInstallerPath -Sid $Sid
+        # Publish the conservative boundary before CreateProcess. If this helper
+        # is hard-killed after this Set(), the bootstrap must assume Windows
+        # Installer may own work even when no client remains to report it.
+        if (-not $MsiMayHaveStartedEvent.Set()) {
+            throw "Could not publish the MSI may-have-started boundary."
+        }
         try {
             $process = Start-BoundlessOwnedProcessBoundary `
                 -FilePath "msiexec.exe" `
@@ -846,6 +866,16 @@ function Invoke-BoundlessMsiElevated {
             $msiStarted = $true
         }
         catch {
+            if ($_.Exception.Message -match 'cleanup could not be proven') {
+                Throw-BoundlessMsiFailure `
+                    -Message "msiexec.exe launch failed without proven child cleanup. $($_.Exception.Message)" `
+                    -CompletionState "uncertain"
+            }
+            # A returned CreateProcess failure is definitive. The pre-MSI
+            # service recovery path can safely restore an originally-running
+            # service while the bootstrap observes a non-uncertain boundary.
+            [void]$MsiMayHaveStartedEvent.Reset()
+            [void]$MsiDefinitiveCompletionEvent.Set()
             Throw-BoundlessMsiFailure `
                 -Message "msiexec.exe could not be started. $($_.Exception.Message)" `
                 -CompletionState "not_started"
@@ -873,6 +903,14 @@ function Invoke-BoundlessMsiElevated {
                 -CompletionState "uncertain"
         }
         $exitCode = $process.ExitCode
+        if ($exitCode -notin @(0, 3010)) {
+            [void]$MsiMayHaveStartedEvent.Reset()
+        }
+        if (-not $MsiDefinitiveCompletionEvent.Set()) {
+            Throw-BoundlessMsiFailure `
+                -Message "msiexec.exe exited but definitive completion evidence could not be published." `
+                -CompletionState "uncertain"
+        }
         if ($exitCode -notin @(0, 3010)) {
             Throw-BoundlessMsiFailure `
                 -Message "msiexec.exe failed with exit code $exitCode after the transaction client completed." `
@@ -1135,6 +1173,191 @@ function New-BoundlessInstallerCompletionEvent {
     }
 }
 
+function Get-BoundlessInstallerPhaseEventPrefix {
+    param(
+        [ValidateSet(
+            "ServiceInitialRunning",
+            "MsiMayHaveStarted",
+            "MsiDefinitiveCompletion",
+            "MsiIdleProven"
+        )]
+        [string]$Phase
+    )
+
+    return "Boundless.Installer.$Phase.v1"
+}
+
+function New-BoundlessInstallerPhaseEvent {
+    param(
+        [string]$UserSid,
+        [ValidateSet(
+            "ServiceInitialRunning",
+            "MsiMayHaveStarted",
+            "MsiDefinitiveCompletion",
+            "MsiIdleProven"
+        )]
+        [string]$Phase,
+        [string]$InstanceId = ""
+    )
+
+    Assert-AllowedUserSid -Sid $UserSid
+    if ([string]::IsNullOrWhiteSpace($InstanceId)) {
+        $InstanceId = [guid]::NewGuid().ToString('N')
+    }
+    elseif ($InstanceId -notmatch '^[0-9a-f]{32}$') {
+        throw "Installer phase instance id was invalid."
+    }
+    $prefix = Get-BoundlessInstallerPhaseEventPrefix -Phase $Phase
+    $name = "Local\$prefix.$InstanceId"
+    $security = [Security.AccessControl.EventWaitHandleSecurity]::new()
+    # The desktop user and monitor can only observe phase evidence. Only the
+    # creating coordinator handle, SYSTEM, or an elevated administrator can
+    # mutate the authoritative service/MSI state.
+    $security.SetSecurityDescriptorSddlForm(
+        "D:P(A;;RC;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100000;;;$UserSid)"
+    )
+    $arguments = [object[]]@(
+        $false,
+        [Threading.EventResetMode]::ManualReset,
+        $name,
+        $false,
+        $security
+    )
+    $eventAclType = "System.Threading.EventWaitHandleAcl" -as [type]
+    if ($null -ne $eventAclType) {
+        $createMethod = $eventAclType.GetMethods() |
+            Where-Object { $_.Name -eq "Create" -and $_.GetParameters().Count -eq 5 } |
+            Select-Object -First 1
+        if ($null -eq $createMethod) {
+            throw "Could not resolve EventWaitHandleAcl.Create for installer phase evidence."
+        }
+        $event = $createMethod.Invoke($null, $arguments)
+    }
+    else {
+        $constructor = [Threading.EventWaitHandle].GetConstructors() |
+            Where-Object { $_.GetParameters().Count -eq 5 } |
+            Select-Object -First 1
+        if ($null -eq $constructor) {
+            throw "Could not resolve the secured EventWaitHandle constructor for installer phase evidence."
+        }
+        $event = $constructor.Invoke($arguments)
+    }
+    if (-not [bool]$arguments[3]) {
+        $event.Dispose()
+        throw "Could not create a unique installer $Phase phase event."
+    }
+    return [pscustomobject]@{
+        event = $event
+        name = $name
+        phase = $Phase
+        created_new = $true
+    }
+}
+
+function Open-BoundlessInstallerPhaseEvent {
+    param(
+        [string]$Name,
+        [ValidateSet(
+            "ServiceInitialRunning",
+            "MsiMayHaveStarted",
+            "MsiDefinitiveCompletion",
+            "MsiIdleProven"
+        )]
+        [string]$Phase
+    )
+
+    $prefix = [regex]::Escape((Get-BoundlessInstallerPhaseEventPrefix -Phase $Phase))
+    if ($Name -notmatch "^Local\\$prefix\.[0-9a-f]{32}$") {
+        throw "Installer $Phase phase event name was invalid."
+    }
+    return [Threading.EventWaitHandle]::OpenExisting($Name)
+}
+
+function Update-BoundlessInstallerPhaseEvidence {
+    param([object]$Lease)
+
+    $mayHaveStarted = $Lease.msi_may_have_started_event.WaitOne(0)
+    $definitive = $Lease.msi_definitive_completion_event.WaitOne(0)
+    $idleProven = $Lease.msi_idle_proven_event.WaitOne(0)
+    $completionState = if ($definitive) {
+        "definitive"
+    }
+    elseif (-not $mayHaveStarted) {
+        "not_started"
+    }
+    else {
+        "uncertain"
+    }
+    $Lease.evidence.installer_completion_state = $completionState
+    $Lease.evidence.msi_may_have_started = $mayHaveStarted
+    $Lease.evidence.msi_definitive_completion = $definitive
+    $Lease.evidence.msi_transaction_idle_proven = $idleProven
+    return $completionState
+}
+
+function Test-BoundlessNormalQuiescenceReleaseAllowed {
+    param(
+        [bool]$InstallerTreeClosed,
+        [ValidateSet("not_started", "definitive", "uncertain")]
+        [string]$CompletionState,
+        [bool]$MsiTransactionIdleProven
+    )
+
+    return (
+        $InstallerTreeClosed -and
+        ($CompletionState -ne "uncertain" -or $MsiTransactionIdleProven)
+    )
+}
+
+function Wait-BoundlessWindowsInstallerTransactionIdleProof {
+    param(
+        [int]$TimeoutMilliseconds = 15000,
+        [string]$MutexName = "Global\_MSIExecute"
+    )
+
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMilliseconds)
+    do {
+        $mutex = $null
+        $owned = $false
+        $created = $false
+        try {
+            $mutex = [Threading.Mutex]::new($true, $MutexName, [ref]$created)
+            $owned = $created
+            if (-not $owned) {
+                try { $owned = $mutex.WaitOne(0) }
+                catch [Threading.AbandonedMutexException] { $owned = $true }
+            }
+            if ($owned) { return $true }
+        }
+        catch { }
+        finally {
+            if ($owned -and $null -ne $mutex) {
+                try { $mutex.ReleaseMutex() } catch { }
+            }
+            if ($null -ne $mutex) { $mutex.Dispose() }
+        }
+        Start-Sleep -Milliseconds 50
+    } while ((Get-Date) -lt $deadline)
+    return $false
+}
+
+function Dispose-BoundlessInstallerPhaseEvidence {
+    param([object]$Lease)
+
+    foreach ($propertyName in @(
+            "service_initial_running_event",
+            "msi_may_have_started_event",
+            "msi_definitive_completion_event",
+            "msi_idle_proven_event"
+        )) {
+        $property = $Lease.PSObject.Properties[$propertyName]
+        if ($null -ne $property -and $null -ne $property.Value) {
+            $property.Value.Dispose()
+            $property.Value = $null
+        }
+    }
+}
+
 function New-BoundlessPrivilegedLivenessMutex {
     param([string]$Name)
 
@@ -1258,6 +1481,11 @@ function New-BoundlessTrayQuiescenceMonitorCommand {
         [string]$MonitorMutexName,
         [string]$TreeJobName,
         [string]$CompletionEventName,
+        [string]$HeartbeatEventName,
+        [string]$MsiMayHaveStartedEventName = "",
+        [string]$MsiDefinitiveCompletionEventName = "",
+        [string]$MsiIdleProvenEventName = "",
+        [string]$InstallerTransactionMutexName = "Global\_MSIExecute",
         [int]$StableMilliseconds = 500,
         [int]$FixtureProcessId = 0,
         [string]$FixtureProcessName = ""
@@ -1269,6 +1497,23 @@ function New-BoundlessTrayQuiescenceMonitorCommand {
     ) {
         throw "Tray quiescence monitor received an invalid fixture process name."
     }
+    if ($HeartbeatEventName -notmatch '^Local\\Boundless\.Tray\.UpgradeMonitorHeartbeat\.v1\.[0-9a-f]{32}$') {
+        throw "Tray quiescence monitor received an invalid heartbeat event."
+    }
+    if ($InstallerTransactionMutexName -notmatch '^Global\\(?:_MSIExecute|Boundless\.Test\.MsiExecute\.[0-9a-f]{32})$') {
+        throw "Tray quiescence monitor received an invalid Windows Installer transaction mutex."
+    }
+    foreach ($phaseEvent in @(
+            [pscustomobject]@{ name = $MsiMayHaveStartedEventName; phase = "MsiMayHaveStarted" },
+            [pscustomobject]@{ name = $MsiDefinitiveCompletionEventName; phase = "MsiDefinitiveCompletion" },
+            [pscustomobject]@{ name = $MsiIdleProvenEventName; phase = "MsiIdleProven" }
+        )) {
+        if ([string]::IsNullOrWhiteSpace($phaseEvent.name)) { continue }
+        $prefix = [regex]::Escape((Get-BoundlessInstallerPhaseEventPrefix -Phase $phaseEvent.phase))
+        if ($phaseEvent.name -notmatch "^Local\\$prefix\.[0-9a-f]{32}$") {
+            throw "Tray quiescence monitor received an invalid $($phaseEvent.phase) event."
+        }
+    }
 
     $payload = [ordered]@{
         expected_owner_sid = $ExpectedOwnerSid
@@ -1279,6 +1524,11 @@ function New-BoundlessTrayQuiescenceMonitorCommand {
         monitor_mutex_name = $MonitorMutexName
         tree_job_name = $TreeJobName
         completion_event_name = $CompletionEventName
+        heartbeat_event_name = $HeartbeatEventName
+        msi_may_have_started_event_name = $MsiMayHaveStartedEventName
+        msi_definitive_completion_event_name = $MsiDefinitiveCompletionEventName
+        msi_idle_proven_event_name = $MsiIdleProvenEventName
+        installer_transaction_mutex_name = $InstallerTransactionMutexName
         stable_milliseconds = $StableMilliseconds
         fixture_process_id = $FixtureProcessId
         fixture_process_name = $FixtureProcessName
@@ -1296,8 +1546,11 @@ using System.Runtime.InteropServices;
 public static class BoundlessUpgradeMonitorNativeMethods
 {
     private const uint JOB_OBJECT_QUERY = 0x0004;
+    private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    private const uint TOKEN_QUERY = 0x0008;
     private const int JobObjectBasicAccountingInformation = 1;
     private const int ERROR_FILE_NOT_FOUND = 2;
+    private const int ERROR_INVALID_PARAMETER = 87;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
@@ -1310,6 +1563,19 @@ public static class BoundlessUpgradeMonitorNativeMethods
         public uint TotalProcesses;
         public uint ActiveProcesses;
         public uint TotalTerminatedProcesses;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SID_AND_ATTRIBUTES
+    {
+        public IntPtr Sid;
+        public uint Attributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TOKEN_USER
+    {
+        public SID_AND_ATTRIBUTES User;
     }
 
     [DllImport("user32.dll", SetLastError = true)]
@@ -1333,6 +1599,26 @@ public static class BoundlessUpgradeMonitorNativeMethods
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetTokenInformation(
+        IntPtr tokenHandle,
+        int tokenInformationClass,
+        IntPtr tokenInformation,
+        int tokenInformationLength,
+        out int returnLength);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool ConvertSidToStringSidW(IntPtr sid, out IntPtr stringSid);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
 
     public static int GetNamedJobActiveProcessCount(string name)
     {
@@ -1359,6 +1645,44 @@ public static class BoundlessUpgradeMonitorNativeMethods
         }
         finally { CloseHandle(job); }
     }
+
+    public static string GetProcessOwnerSid(int processId)
+    {
+        IntPtr process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
+        if (process == IntPtr.Zero)
+        {
+            int error = Marshal.GetLastWin32Error();
+            if (error == ERROR_INVALID_PARAMETER) { return String.Empty; }
+            throw new Win32Exception(error, "OpenProcess(owner lookup) failed");
+        }
+        IntPtr token = IntPtr.Zero;
+        IntPtr buffer = IntPtr.Zero;
+        IntPtr sidText = IntPtr.Zero;
+        try
+        {
+            if (!OpenProcessToken(process, TOKEN_QUERY, out token))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "OpenProcessToken failed");
+            int required;
+            GetTokenInformation(token, 1, IntPtr.Zero, 0, out required);
+            int sizeError = Marshal.GetLastWin32Error();
+            if (required <= 0 || sizeError != 122)
+                throw new Win32Exception(sizeError, "GetTokenInformation(size) failed");
+            buffer = Marshal.AllocHGlobal(required);
+            if (!GetTokenInformation(token, 1, buffer, required, out required))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "GetTokenInformation(TokenUser) failed");
+            TOKEN_USER user = (TOKEN_USER)Marshal.PtrToStructure(buffer, typeof(TOKEN_USER));
+            if (!ConvertSidToStringSidW(user.User.Sid, out sidText))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "ConvertSidToStringSid failed");
+            return Marshal.PtrToStringUni(sidText);
+        }
+        finally
+        {
+            if (sidText != IntPtr.Zero) LocalFree(sidText);
+            if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+            if (token != IntPtr.Zero) CloseHandle(token);
+            CloseHandle(process);
+        }
+    }
 }
 "@
 function New-BoundlessPrivilegedLivenessMutex {
@@ -1367,12 +1691,14 @@ __PRIVILEGED_LIVENESS_MUTEX_FUNCTION__
 function Wait-InstallerTreeClosureAfterCoordinatorDeath {
     param(
         [Threading.EventWaitHandle]$CompletionEvent,
+        [Threading.EventWaitHandle]$HeartbeatEvent,
         [string]$TreeJobName,
         [object]$Payload
     )
     $jobObserved = $false
     $missingSince = $null
     while ($true) {
+        [void]$HeartbeatEvent.Set()
         # The currently installed tray may predate the upgrade sentinel check.
         # Keep closing replacement trays until the elevated tree has drained.
         [void](Stop-ReplacementTrays -Payload $Payload)
@@ -1411,26 +1737,55 @@ function Open-SynchronizeEvent {
     }
     return [Threading.EventWaitHandle]::OpenExisting($Name, $rights)
 }
-function Get-OwnerSid {
-    param([int]$ProcessId)
+function Test-WindowsInstallerTransactionIdle {
+    param([string]$MutexName)
+    $mutex = $null
+    $owned = $false
+    $created = $false
     try {
-        $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop |
-            Select-Object -First 1
+        # Creating-or-opening and then acquiring the authoritative Windows
+        # Installer execution mutex closes the missing-object race. Merely
+        # observing the msiexec client tree as empty is not transaction proof.
+        $mutex = [Threading.Mutex]::new($true, $MutexName, [ref]$created)
+        $owned = $created
+        if (-not $owned) {
+            try { $owned = $mutex.WaitOne(0) }
+            catch [Threading.AbandonedMutexException] { $owned = $true }
+        }
+        return $owned
     }
     catch {
-        if ($null -eq (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
-            return ""
+        return $false
+    }
+    finally {
+        if ($owned -and $null -ne $mutex) {
+            try { $mutex.ReleaseMutex() } catch { }
         }
-        throw
+        if ($null -ne $mutex) { $mutex.Dispose() }
     }
-    if ($null -eq $process) {
-        return ""
+}
+function Wait-WindowsInstallerTransactionIdleFailClosed {
+    param(
+        [Threading.EventWaitHandle]$HeartbeatEvent,
+        [object]$Payload
+    )
+    while (-not (Test-WindowsInstallerTransactionIdle `
+        -MutexName ([string]$Payload.installer_transaction_mutex_name))) {
+        [void]$HeartbeatEvent.Set()
+        [void](Stop-ReplacementTrays -Payload $Payload)
+        Start-Sleep -Milliseconds 100
     }
-    $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop
-    if ($owner.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace($owner.Sid)) {
-        throw "Could not prove owner SID for replacement tray PID $ProcessId."
+}
+function Hold-QuiescenceAfterGuardianFailure {
+    param(
+        [Threading.EventWaitHandle]$HeartbeatEvent,
+        [object]$Payload
+    )
+    while ($true) {
+        try { [void]$HeartbeatEvent.Set() } catch { }
+        try { [void](Stop-ReplacementTrays -Payload $Payload) } catch { }
+        [Threading.Thread]::Sleep(100)
     }
-    return $owner.Sid
 }
 function Stop-ReplacementTrays {
     param([object]$Payload)
@@ -1450,7 +1805,7 @@ function Stop-ReplacementTrays {
     )
     foreach ($target in $targets) {
         try {
-            $ownerSid = Get-OwnerSid -ProcessId $target.Id
+            $ownerSid = [BoundlessUpgradeMonitorNativeMethods]::GetProcessOwnerSid($target.Id)
         }
         catch {
             if ($null -eq (Get-Process -Id $target.Id -ErrorAction SilentlyContinue)) {
@@ -1490,15 +1845,36 @@ $payloadJson = [Text.Encoding]::UTF8.GetString(
 $payload = $payloadJson | ConvertFrom-Json
 $ready = [Threading.EventWaitHandle]::OpenExisting([string]$payload.ready_event_name)
 $handoff = [Threading.EventWaitHandle]::OpenExisting([string]$payload.handoff_event_name)
+$heartbeat = [Threading.EventWaitHandle]::OpenExisting([string]$payload.heartbeat_event_name)
 $completion = Open-SynchronizeEvent -Name ([string]$payload.completion_event_name)
+$msiMayHaveStarted = if ([string]::IsNullOrWhiteSpace([string]$payload.msi_may_have_started_event_name)) {
+    $null
+}
+else {
+    Open-SynchronizeEvent -Name ([string]$payload.msi_may_have_started_event_name)
+}
+$msiDefinitiveCompletion = if ([string]::IsNullOrWhiteSpace([string]$payload.msi_definitive_completion_event_name)) {
+    $null
+}
+else {
+    Open-SynchronizeEvent -Name ([string]$payload.msi_definitive_completion_event_name)
+}
+$msiIdleProven = if ([string]::IsNullOrWhiteSpace([string]$payload.msi_idle_proven_event_name)) {
+    $null
+}
+else {
+    Open-SynchronizeEvent -Name ([string]$payload.msi_idle_proven_event_name)
+}
 $sentinel = [Threading.Mutex]::OpenExisting([string]$payload.sentinel_name)
 $liveness = New-BoundlessPrivilegedLivenessMutex -Name ([string]$payload.monitor_mutex_name)
 $sentinelOwned = $false
+$sentinelReleaseAuthorized = $false
 $livenessOwned = $true
 try {
     $stableSince = $null
     $readySignaled = $false
     while ($true) {
+        [void]$heartbeat.Set()
         $coordinatorEnded = $false
         $coordinatorAbandoned = $false
         try {
@@ -1514,13 +1890,36 @@ try {
         }
         if ($coordinatorEnded) {
             if ($coordinatorAbandoned) {
-                $liveness.mutex.ReleaseMutex()
-                $livenessOwned = $false
-                [void]$handoff.Set()
-                Wait-InstallerTreeClosureAfterCoordinatorDeath `
-                    -CompletionEvent $completion `
-                    -TreeJobName ([string]$payload.tree_job_name) `
-                    -Payload $payload
+                try {
+                    $liveness.mutex.ReleaseMutex()
+                    $livenessOwned = $false
+                    [void]$handoff.Set()
+                    Wait-InstallerTreeClosureAfterCoordinatorDeath `
+                        -CompletionEvent $completion `
+                        -HeartbeatEvent $heartbeat `
+                        -TreeJobName ([string]$payload.tree_job_name) `
+                        -Payload $payload
+                    $uncertainTransaction = (
+                        $null -ne $msiMayHaveStarted -and
+                        $msiMayHaveStarted.WaitOne(0) -and
+                        ($null -eq $msiDefinitiveCompletion -or -not $msiDefinitiveCompletion.WaitOne(0)) -and
+                        ($null -eq $msiIdleProven -or -not $msiIdleProven.WaitOne(0))
+                    )
+                    if ($uncertainTransaction) {
+                        Wait-WindowsInstallerTransactionIdleFailClosed `
+                            -HeartbeatEvent $heartbeat `
+                            -Payload $payload
+                    }
+                    $sentinelReleaseAuthorized = $true
+                }
+                catch {
+                    Hold-QuiescenceAfterGuardianFailure `
+                        -HeartbeatEvent $heartbeat `
+                        -Payload $payload
+                }
+            }
+            else {
+                $sentinelReleaseAuthorized = $true
             }
             break
         }
@@ -1544,7 +1943,7 @@ try {
     }
 }
 finally {
-    if ($sentinelOwned) {
+    if ($sentinelOwned -and $sentinelReleaseAuthorized) {
         try { $sentinel.ReleaseMutex() } catch { }
     }
     if ($livenessOwned) {
@@ -1552,7 +1951,11 @@ finally {
     }
     $liveness.mutex.Dispose()
     $sentinel.Dispose()
+    if ($null -ne $msiIdleProven) { $msiIdleProven.Dispose() }
+    if ($null -ne $msiDefinitiveCompletion) { $msiDefinitiveCompletion.Dispose() }
+    if ($null -ne $msiMayHaveStarted) { $msiMayHaveStarted.Dispose() }
     $completion.Dispose()
+    $heartbeat.Dispose()
     $handoff.Dispose()
     $ready.Dispose()
 }
@@ -1579,6 +1982,10 @@ function Start-BoundlessTrayQuiescenceMonitor {
         [string]$SentinelName,
         [string]$TreeJobName,
         [string]$CompletionEventName,
+        [string]$MsiMayHaveStartedEventName = "",
+        [string]$MsiDefinitiveCompletionEventName = "",
+        [string]$MsiIdleProvenEventName = "",
+        [string]$InstallerTransactionMutexName = "Global\_MSIExecute",
         [int]$FixtureProcessId = 0,
         [string]$FixtureProcessName = ""
     )
@@ -1589,6 +1996,15 @@ function Start-BoundlessTrayQuiescenceMonitor {
     $handoff = New-BoundlessSentinelOwnerEvent `
         -Prefix "Boundless.Tray.MonitorHandoff.v1" `
         -UserSid $ExpectedOwnerSid
+    try {
+        $heartbeat = New-BoundlessSentinelOwnerEvent `
+            -Prefix "Boundless.Tray.UpgradeMonitorHeartbeat.v1" `
+            -UserSid $ExpectedOwnerSid
+    }
+    catch {
+        $handoff.event.Dispose()
+        throw
+    }
     $readyCreated = $false
     $readyEvent = [Threading.EventWaitHandle]::new(
         $false,
@@ -1598,6 +2014,8 @@ function Start-BoundlessTrayQuiescenceMonitor {
     )
     if (-not $readyCreated) {
         $readyEvent.Dispose()
+        $heartbeat.event.Dispose()
+        $handoff.event.Dispose()
         throw "Could not create a unique tray quiescence monitor handshake."
     }
     try {
@@ -1610,6 +2028,11 @@ function Start-BoundlessTrayQuiescenceMonitor {
             -MonitorMutexName $monitorMutexName `
             -TreeJobName $TreeJobName `
             -CompletionEventName $CompletionEventName `
+            -HeartbeatEventName $heartbeat.name `
+            -MsiMayHaveStartedEventName $MsiMayHaveStartedEventName `
+            -MsiDefinitiveCompletionEventName $MsiDefinitiveCompletionEventName `
+            -MsiIdleProvenEventName $MsiIdleProvenEventName `
+            -InstallerTransactionMutexName $InstallerTransactionMutexName `
             -FixtureProcessId $FixtureProcessId `
             -FixtureProcessName $FixtureProcessName
         $arguments = @("-NoProfile", "-EncodedCommand", $encodedCommand)
@@ -1622,7 +2045,9 @@ function Start-BoundlessTrayQuiescenceMonitor {
             process = $process
             ready_event = $readyEvent
             handoff_event = $handoff.event
+            heartbeat_event = $heartbeat.event
             ready_event_name = $readyEventName
+            heartbeat_event_name = $heartbeat.name
             liveness_mutex_name = $monitorMutexName
             stable_milliseconds = 500
         }
@@ -1630,6 +2055,7 @@ function Start-BoundlessTrayQuiescenceMonitor {
     catch {
         $readyEvent.Dispose()
         $handoff.event.Dispose()
+        $heartbeat.event.Dispose()
         throw
     }
 }
@@ -1674,6 +2100,7 @@ function Complete-BoundlessTrayQuiescenceMonitor {
     }
     finally {
         $Monitor.handoff_event.Dispose()
+        $Monitor.heartbeat_event.Dispose()
         $Monitor.ready_event.Dispose()
         $Monitor.process.Dispose()
     }
@@ -1890,7 +2317,12 @@ function Enter-BoundlessTrayQuiescence {
         -SessionId $ExpectedSessionId
     $sentinelName = $sentinelOwner.sentinel_name
     $treeJobName = "Local\Boundless.Installer.Tree.v1.$([guid]::NewGuid().ToString('N'))"
+    $phaseInstanceId = [guid]::NewGuid().ToString('N')
     $completion = $null
+    $serviceInitialRunning = $null
+    $msiMayHaveStarted = $null
+    $msiDefinitiveCompletion = $null
+    $msiIdleProven = $null
     $monitor = $null
     $ownerLease = $null
     $completed = $false
@@ -1898,12 +2330,31 @@ function Enter-BoundlessTrayQuiescence {
     $attempts = 0
     try {
         $completion = New-BoundlessInstallerCompletionEvent -UserSid $ExpectedOwnerSid
+        $serviceInitialRunning = New-BoundlessInstallerPhaseEvent `
+            -UserSid $ExpectedOwnerSid `
+            -Phase "ServiceInitialRunning" `
+            -InstanceId $phaseInstanceId
+        $msiMayHaveStarted = New-BoundlessInstallerPhaseEvent `
+            -UserSid $ExpectedOwnerSid `
+            -Phase "MsiMayHaveStarted" `
+            -InstanceId $phaseInstanceId
+        $msiDefinitiveCompletion = New-BoundlessInstallerPhaseEvent `
+            -UserSid $ExpectedOwnerSid `
+            -Phase "MsiDefinitiveCompletion" `
+            -InstanceId $phaseInstanceId
+        $msiIdleProven = New-BoundlessInstallerPhaseEvent `
+            -UserSid $ExpectedOwnerSid `
+            -Phase "MsiIdleProven" `
+            -InstanceId $phaseInstanceId
         $monitor = Start-BoundlessTrayQuiescenceMonitor `
             -ExpectedOwnerSid $ExpectedOwnerSid `
             -ExpectedSessionId $ExpectedSessionId `
             -SentinelName $sentinelName `
             -TreeJobName $treeJobName `
-            -CompletionEventName $completion.name
+            -CompletionEventName $completion.name `
+            -MsiMayHaveStartedEventName $msiMayHaveStarted.name `
+            -MsiDefinitiveCompletionEventName $msiDefinitiveCompletion.name `
+            -MsiIdleProvenEventName $msiIdleProven.name
         do {
             $attempts += 1
             $shutdownArgs = @{
@@ -1941,7 +2392,18 @@ function Enter-BoundlessTrayQuiescence {
             monitor = $monitor
             completion_event = $completion.event
             completion_event_name = $completion.name
+            service_initial_running_event = $serviceInitialRunning.event
+            service_initial_running_event_name = $serviceInitialRunning.name
+            msi_may_have_started_event = $msiMayHaveStarted.event
+            msi_may_have_started_event_name = $msiMayHaveStarted.name
+            msi_definitive_completion_event = $msiDefinitiveCompletion.event
+            msi_definitive_completion_event_name = $msiDefinitiveCompletion.name
+            msi_idle_proven_event = $msiIdleProven.event
+            msi_idle_proven_event_name = $msiIdleProven.name
+            installer_transaction_mutex_name = "Global\_MSIExecute"
             tree_job_name = $treeJobName
+            expected_owner_sid = $ExpectedOwnerSid
+            expected_session_id = $ExpectedSessionId
             elevated_process = $null
             evidence = [pscustomobject]@{
                 name = $mutexName
@@ -1958,6 +2420,10 @@ function Enter-BoundlessTrayQuiescence {
                 monitor_exit_code = $null
                 spans_elevation_and_msi = $true
                 installer_tree_closed = $false
+                installer_completion_state = "not_started"
+                msi_may_have_started = $false
+                msi_definitive_completion = $false
+                msi_transaction_idle_proven = $false
                 quiescence_abandoned_to_monitor = $false
             }
         }
@@ -1979,6 +2445,14 @@ function Enter-BoundlessTrayQuiescence {
                 }
                 if ($null -ne $completion) {
                     $completion.event.Dispose()
+                }
+                foreach ($phase in @(
+                        $serviceInitialRunning,
+                        $msiMayHaveStarted,
+                        $msiDefinitiveCompletion,
+                        $msiIdleProven
+                    )) {
+                    if ($null -ne $phase) { $phase.event.Dispose() }
                 }
             }
         }
@@ -2007,10 +2481,113 @@ function Exit-BoundlessTrayQuiescence {
     finally {
         try { $Lease.mutex.ReleaseMutex() } finally { $Lease.mutex.Dispose() }
         $Lease.completion_event.Dispose()
+        Dispose-BoundlessInstallerPhaseEvidence -Lease $Lease
     }
     $Lease.evidence.monitor_completed = $monitorResult.completed
     $Lease.evidence.monitor_exit_code = $monitorResult.exit_code
     return $monitorResult
+}
+
+function Hold-BoundlessSynchronousTrayQuiescenceFailClosed {
+    param(
+        [object]$Lease,
+        [string]$Reason
+    )
+
+    Write-Warning "$Reason Retaining tray quiescence fail-closed."
+    while ($true) {
+        try {
+            Stop-BoundlessTrayForUpgrade `
+                -ExpectedOwnerSid $Lease.expected_owner_sid `
+                -ExpectedSessionId $Lease.expected_session_id `
+                -TimeoutSeconds 2 | Out-Null
+        }
+        catch { }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+function Stop-BoundlessTrayQuiescenceMonitorProcess {
+    param([object]$Monitor)
+
+    if ($null -eq $Monitor) { return }
+    try {
+        if (-not $Monitor.process.HasExited) {
+            Stop-BoundlessProcessBoundary -Process $Monitor.process -TimeoutMilliseconds 5000
+        }
+    }
+    finally {
+        $Monitor.handoff_event.Dispose()
+        $Monitor.heartbeat_event.Dispose()
+        $Monitor.ready_event.Dispose()
+        $Monitor.process.Dispose()
+    }
+}
+
+function Close-BoundlessTrayQuiescenceMonitorHandles {
+    param([object]$Monitor)
+
+    if ($null -eq $Monitor) { return }
+    $Monitor.handoff_event.Dispose()
+    $Monitor.heartbeat_event.Dispose()
+    $Monitor.ready_event.Dispose()
+    $Monitor.process.Dispose()
+}
+
+function Start-BoundlessTrayQuiescenceTakeoverMonitor {
+    param(
+        [object]$Lease,
+        [bool]$WaitForReady = $true
+    )
+
+    while ($true) {
+        $monitor = $null
+        try {
+            $monitor = Start-BoundlessTrayQuiescenceMonitor `
+                -ExpectedOwnerSid $Lease.expected_owner_sid `
+                -ExpectedSessionId $Lease.expected_session_id `
+                -SentinelName $Lease.evidence.sentinel_name `
+                -TreeJobName $Lease.tree_job_name `
+                -CompletionEventName $Lease.completion_event_name `
+                -MsiMayHaveStartedEventName $Lease.msi_may_have_started_event_name `
+                -MsiDefinitiveCompletionEventName $Lease.msi_definitive_completion_event_name `
+                -MsiIdleProvenEventName $Lease.msi_idle_proven_event_name `
+                -InstallerTransactionMutexName $Lease.installer_transaction_mutex_name
+            if ($WaitForReady) {
+                Wait-BoundlessTrayQuiescenceMonitorReady -Monitor $monitor -TimeoutSeconds 10
+            }
+            else {
+                $deadline = (Get-Date).AddSeconds(10)
+                while (-not $monitor.heartbeat_event.WaitOne(50)) {
+                    if ($monitor.process.HasExited -or (Get-Date) -ge $deadline) {
+                        $exitDetail = if ($monitor.process.HasExited) {
+                            $monitor.process.ExitCode
+                        }
+                        else {
+                            "running"
+                        }
+                        throw "Tray quiescence takeover monitor did not open the sentinel; exit=$exitDetail."
+                    }
+                }
+                [void]$monitor.heartbeat_event.Reset()
+            }
+            return $monitor
+        }
+        catch {
+            if ($null -ne $monitor) {
+                Stop-BoundlessTrayQuiescenceMonitorProcess -Monitor $monitor
+            }
+            Write-Warning "Could not pre-arm an independent tray quiescence takeover monitor: $($_.Exception.Message)"
+            try {
+                Stop-BoundlessTrayForUpgrade `
+                    -ExpectedOwnerSid $Lease.expected_owner_sid `
+                    -ExpectedSessionId $Lease.expected_session_id `
+                    -TimeoutSeconds 2 | Out-Null
+            }
+            catch { }
+            Start-Sleep -Milliseconds 250
+        }
+    }
 }
 
 function Resolve-BoundlessUnconfirmedTreeAndQuiescence {
@@ -2020,26 +2597,72 @@ function Resolve-BoundlessUnconfirmedTreeAndQuiescence {
         return
     }
     $monitorAvailable = -not $Lease.monitor.process.HasExited
-    if ($null -ne $Lease.PSObject.Properties["sentinel_owner"]) {
-        Stop-BoundlessTrayQuiescenceSentinelOwner `
-            -Owner $Lease.sentinel_owner `
-            -Abandon
-        $Lease.sentinel_owner = $null
-    }
-    elseif ($null -ne $Lease.sentinel_mutex) {
-        # Fixture-only direct ownership cannot be transferred while this thread
-        # remains alive, so it must use the synchronous fail-closed path below.
-        $monitorAvailable = $false
-    }
+    $hasTransferMetadata = (
+        $null -ne $Lease.PSObject.Properties["sentinel_owner"] -and
+        $null -ne $Lease.sentinel_owner -and
+        $null -ne $Lease.PSObject.Properties["completion_event_name"] -and
+        $null -ne $Lease.PSObject.Properties["msi_may_have_started_event_name"] -and
+        $null -ne $Lease.PSObject.Properties["msi_definitive_completion_event_name"] -and
+        $null -ne $Lease.PSObject.Properties["msi_idle_proven_event_name"] -and
+        $null -ne $Lease.PSObject.Properties["installer_transaction_mutex_name"] -and
+        $null -ne $Lease.PSObject.Properties["expected_owner_sid"] -and
+        $null -ne $Lease.PSObject.Properties["expected_session_id"] -and
+        $null -ne $Lease.evidence.PSObject.Properties["sentinel_name"]
+    )
+    if ($hasTransferMetadata) {
+        # The independent sentinel owner remains alive while the old monitor is
+        # removed and a fresh monitor proves that it opened the sentinel. Only
+        # then may the owner be abandoned. After that point this function never
+        # falls back to process-local quiescence: a fresh independent monitor is
+        # always armed before a stalled predecessor is stopped.
+        Stop-BoundlessTrayQuiescenceMonitorProcess -Monitor $Lease.monitor
+        $Lease.monitor = Start-BoundlessTrayQuiescenceTakeoverMonitor `
+            -Lease $Lease `
+            -WaitForReady $true
+        $sentinelKeepAlive = [Threading.Mutex]::OpenExisting(
+            [string]$Lease.evidence.sentinel_name
+        )
+        try {
+            Stop-BoundlessTrayQuiescenceSentinelOwner `
+                -Owner $Lease.sentinel_owner `
+                -Abandon
+            $Lease.sentinel_owner = $null
 
-    if ($monitorAvailable -and $Lease.monitor.handoff_event.WaitOne(5000)) {
-        if (-not $Lease.monitor.process.HasExited) {
+            [void]$Lease.monitor.heartbeat_event.Reset()
+            $lastHeartbeat = Get-Date
+            while ($true) {
+                if (
+                    $Lease.monitor.handoff_event.WaitOne(0) -and
+                    -not $Lease.monitor.process.HasExited
+                ) {
+                    break
+                }
+                if ($Lease.monitor.heartbeat_event.WaitOne(0)) {
+                    [void]$Lease.monitor.heartbeat_event.Reset()
+                    $lastHeartbeat = Get-Date
+                }
+                $monitorStalled = (
+                    $Lease.monitor.process.HasExited -or
+                    ((Get-Date) - $lastHeartbeat).TotalMilliseconds -ge 5000
+                )
+                if ($monitorStalled) {
+                    $replacement = Start-BoundlessTrayQuiescenceTakeoverMonitor `
+                        -Lease $Lease `
+                        -WaitForReady $false
+                    Stop-BoundlessTrayQuiescenceMonitorProcess -Monitor $Lease.monitor
+                    $Lease.monitor = $replacement
+                    $lastHeartbeat = Get-Date
+                    continue
+                }
+                Start-Sleep -Milliseconds 25
+            }
+
+            $Lease.evidence.quiescence_guardian_process_id = $Lease.monitor.process.Id
             try { $Lease.mutex.ReleaseMutex() } finally { $Lease.mutex.Dispose() }
             $Lease.mutex = $null
-            $Lease.monitor.handoff_event.Dispose()
-            $Lease.monitor.ready_event.Dispose()
-            $Lease.monitor.process.Dispose()
+            Close-BoundlessTrayQuiescenceMonitorHandles -Monitor $Lease.monitor
             $Lease.completion_event.Dispose()
+            Dispose-BoundlessInstallerPhaseEvidence -Lease $Lease
             if ($null -ne $Lease.PSObject.Properties["elevated_process"] -and
                 $null -ne $Lease.elevated_process) {
                 $Lease.elevated_process.Dispose()
@@ -2048,29 +2671,87 @@ function Resolve-BoundlessUnconfirmedTreeAndQuiescence {
             $Lease.evidence.quiescence_abandoned_to_monitor = $true
             return
         }
+        finally {
+            $sentinelKeepAlive.Dispose()
+        }
+    }
+    elseif ($null -ne $Lease.sentinel_mutex) {
+        # Fixture-only direct ownership cannot be transferred while this thread
+        # remains alive, so it must use the synchronous fail-closed path below.
+        $monitorAvailable = $false
     }
 
     # Without an acknowledged monitor handoff, keep the owner mutex held and
     # synchronously stop the elevated root, then wait until its private job is
     # empty or absent. A same-SID query-handle pin can prolong this wait, but it
     # cannot make an active installer tree look drained.
-    if ($null -ne $Lease.PSObject.Properties["elevated_process"] -and
-        $null -ne $Lease.elevated_process) {
-        if (-not $Lease.elevated_process.HasExited) {
-            Stop-BoundlessProcessBoundary `
-                -Process $Lease.elevated_process `
-                -TimeoutMilliseconds 5000
+    try {
+        if ($null -ne $Lease.PSObject.Properties["elevated_process"] -and
+            $null -ne $Lease.elevated_process) {
+            if (-not $Lease.elevated_process.HasExited) {
+                Stop-BoundlessProcessBoundary `
+                    -Process $Lease.elevated_process `
+                    -TimeoutMilliseconds 5000
+            }
+        }
+        Initialize-BoundlessProcessTreeNativeMethods
+        while ($true) {
+            $active = [BoundlessProcessTreeNativeMethods]::GetNamedJobActiveProcessCount(
+                $Lease.tree_job_name
+            )
+            if ($active -le 0) {
+                break
+            }
+            Start-Sleep -Milliseconds 50
         }
     }
-    Initialize-BoundlessProcessTreeNativeMethods
-    while ($true) {
-        $active = [BoundlessProcessTreeNativeMethods]::GetNamedJobActiveProcessCount(
-            $Lease.tree_job_name
+    catch {
+        Hold-BoundlessSynchronousTrayQuiescenceFailClosed `
+            -Lease $Lease `
+            -Reason "Installer process-tree closure could not be proved: $($_.Exception.Message)"
+    }
+    try {
+        $hasPhaseEvidence = (
+            $null -ne $Lease.PSObject.Properties["msi_may_have_started_event"] -and
+            $null -ne $Lease.PSObject.Properties["msi_definitive_completion_event"] -and
+            $null -ne $Lease.PSObject.Properties["msi_idle_proven_event"]
         )
-        if ($active -le 0) {
-            break
+        if ($hasPhaseEvidence) {
+            $completionState = Update-BoundlessInstallerPhaseEvidence -Lease $Lease
+            if (
+                $completionState -eq "uncertain" -and
+                -not $Lease.evidence.msi_transaction_idle_proven
+            ) {
+                $idleProven = Wait-BoundlessWindowsInstallerTransactionIdleProof `
+                    -TimeoutMilliseconds 15000
+                if ($idleProven) {
+                    [void]$Lease.msi_idle_proven_event.Set()
+                    [void](Update-BoundlessInstallerPhaseEvidence -Lease $Lease)
+                }
+                else {
+                    Hold-BoundlessSynchronousTrayQuiescenceFailClosed `
+                        -Lease $Lease `
+                        -Reason "Windows Installer transaction idle remained unproven."
+                }
+            }
         }
-        Start-Sleep -Milliseconds 50
+    }
+    catch {
+        Hold-BoundlessSynchronousTrayQuiescenceFailClosed `
+            -Lease $Lease `
+            -Reason "Installer completion evidence could not be resolved: $($_.Exception.Message)"
+    }
+    try {
+        if ($null -ne $Lease.PSObject.Properties["sentinel_owner"] -and
+            $null -ne $Lease.sentinel_owner) {
+            Stop-BoundlessTrayQuiescenceSentinelOwner -Owner $Lease.sentinel_owner
+            $Lease.sentinel_owner = $null
+        }
+    }
+    catch {
+        Hold-BoundlessSynchronousTrayQuiescenceFailClosed `
+            -Lease $Lease `
+            -Reason "Tray quiescence sentinel could not be released safely: $($_.Exception.Message)"
     }
     try { $Lease.mutex.ReleaseMutex() } finally { $Lease.mutex.Dispose() }
     if ($null -ne $Lease.sentinel_mutex) {
@@ -2078,9 +2759,11 @@ function Resolve-BoundlessUnconfirmedTreeAndQuiescence {
         finally { $Lease.sentinel_mutex.Dispose() }
     }
     $Lease.monitor.handoff_event.Dispose()
+    $Lease.monitor.heartbeat_event.Dispose()
     $Lease.monitor.ready_event.Dispose()
     $Lease.monitor.process.Dispose()
     $Lease.completion_event.Dispose()
+    Dispose-BoundlessInstallerPhaseEvidence -Lease $Lease
     if ($null -ne $Lease.PSObject.Properties["elevated_process"] -and
         $null -ne $Lease.elevated_process) {
         $Lease.elevated_process.Dispose()
@@ -2186,14 +2869,23 @@ function Wait-BoundlessElevatedInstallSupervised {
         [string]$TreeJobName,
         [object]$TreeClosureState,
         [int]$TimeoutSeconds = 900,
-        [int]$CancellationGraceMilliseconds = 10000
+        [int]$CancellationGraceMilliseconds = 30000,
+        [int]$HeartbeatTimeoutMilliseconds = 5000
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lastHeartbeat = Get-Date
     while (-not $InstallerProcess.WaitForExit(50)) {
+        if ($Monitor.heartbeat_event.WaitOne(0)) {
+            [void]$Monitor.heartbeat_event.Reset()
+            $lastHeartbeat = Get-Date
+        }
         $failure = ""
         if ($Monitor.process.HasExited) {
             $failure = "Tray quiescence monitor exited during the elevated install; exit=$($Monitor.process.ExitCode)."
+        }
+        elseif (((Get-Date) - $lastHeartbeat).TotalMilliseconds -ge $HeartbeatTimeoutMilliseconds) {
+            $failure = "Tray quiescence monitor heartbeat stalled during the elevated install."
         }
         elseif ((Get-Date) -ge $deadline) {
             $failure = "Elevated Boundless install exceeded the bounded $TimeoutSeconds second window."
@@ -2643,6 +3335,10 @@ function Invoke-ElevatedInstallPhase {
         [int]$CoordinatorProcessId,
         [long]$CoordinatorStartTicks,
         [string]$MonitorMutexName,
+        [string]$ServiceInitialRunningEventName,
+        [string]$MsiMayHaveStartedEventName,
+        [string]$MsiDefinitiveCompletionEventName,
+        [string]$MsiIdleProvenEventName,
         [int]$TimeoutSeconds
     )
 
@@ -2664,34 +3360,57 @@ function Invoke-ElevatedInstallPhase {
         throw "Immutable staged MSI hash verification failed."
     }
 
-    # The request and status polling are bounded independently. A blocked
-    # ServiceController call remains inside an owned child process tree that is
-    # drained before this function can return or allow MSI to start.
-    $serviceShutdown = Stop-BoundlessServiceBeforeMsi
-    $msiArgs = @{
-        ResolvedInstallerPath = $ResolvedInstallerPath
-        Sid = $Sid
-        CancellationEventName = $CancellationEventName
-        CoordinatorProcessId = $CoordinatorProcessId
-        CoordinatorStartTicks = $CoordinatorStartTicks
-        MonitorMutexName = $MonitorMutexName
-        TimeoutSeconds = $TimeoutSeconds
-    }
-    $exitCode = Invoke-BoundlessMsiWithServiceRecovery `
-        -ServiceShutdown $serviceShutdown `
-        -MsiAction { Invoke-BoundlessMsiElevated @msiArgs } `
-        -RestartAction { Start-BoundlessServiceAfterFailedInstall }
-
-    return [pscustomobject]@{
-        status = "passed"
-        msi_exit_code = $exitCode
-        service_shutdown = $serviceShutdown
-        installer_stage = [pscustomobject]@{
-            admin_only = $true
-            hash_verified = $true
-            staged_copy_used = $true
-            cleaned = $false
+    $serviceInitialRunning = Open-BoundlessInstallerPhaseEvent `
+        -Name $ServiceInitialRunningEventName `
+        -Phase "ServiceInitialRunning"
+    $msiMayHaveStarted = Open-BoundlessInstallerPhaseEvent `
+        -Name $MsiMayHaveStartedEventName `
+        -Phase "MsiMayHaveStarted"
+    $msiDefinitiveCompletion = Open-BoundlessInstallerPhaseEvent `
+        -Name $MsiDefinitiveCompletionEventName `
+        -Phase "MsiDefinitiveCompletion"
+    $msiIdleProven = Open-BoundlessInstallerPhaseEvent `
+        -Name $MsiIdleProvenEventName `
+        -Phase "MsiIdleProven"
+    try {
+        # The request and status polling are bounded independently. A blocked
+        # ServiceController call remains inside an owned child process tree that is
+        # drained before this function can return or allow MSI to start.
+        $serviceShutdown = Stop-BoundlessServiceBeforeMsi `
+            -InitialRunningEvent $serviceInitialRunning
+        $msiArgs = @{
+            ResolvedInstallerPath = $ResolvedInstallerPath
+            Sid = $Sid
+            CancellationEventName = $CancellationEventName
+            CoordinatorProcessId = $CoordinatorProcessId
+            CoordinatorStartTicks = $CoordinatorStartTicks
+            MonitorMutexName = $MonitorMutexName
+            MsiMayHaveStartedEvent = $msiMayHaveStarted
+            MsiDefinitiveCompletionEvent = $msiDefinitiveCompletion
+            TimeoutSeconds = $TimeoutSeconds
         }
+        $exitCode = Invoke-BoundlessMsiWithServiceRecovery `
+            -ServiceShutdown $serviceShutdown `
+            -MsiAction { Invoke-BoundlessMsiElevated @msiArgs } `
+            -RestartAction { Start-BoundlessServiceAfterFailedInstall }
+
+        return [pscustomobject]@{
+            status = "passed"
+            msi_exit_code = $exitCode
+            service_shutdown = $serviceShutdown
+            installer_stage = [pscustomobject]@{
+                admin_only = $true
+                hash_verified = $true
+                staged_copy_used = $true
+                cleaned = $false
+            }
+        }
+    }
+    finally {
+        $msiIdleProven.Dispose()
+        $msiDefinitiveCompletion.Dispose()
+        $msiMayHaveStarted.Dispose()
+        $serviceInitialRunning.Dispose()
     }
 }
 
@@ -2706,6 +3425,10 @@ function New-BoundlessElevatedInstallCommand {
         [string]$MonitorMutexName,
         [string]$TreeJobName,
         [string]$CompletionEventName,
+        [string]$ServiceInitialRunningEventName,
+        [string]$MsiMayHaveStartedEventName,
+        [string]$MsiDefinitiveCompletionEventName,
+        [string]$MsiIdleProvenEventName,
         [int]$TimeoutSeconds = 900,
         [bool]$LogRequested = (-not [string]::IsNullOrWhiteSpace($LogPath))
     )
@@ -2730,6 +3453,22 @@ function New-BoundlessElevatedInstallCommand {
     if ($CompletionEventName -notmatch '^Local\\Boundless\.Installer\.TreeComplete\.v1\.[0-9a-f]{32}$') {
         throw "Elevated install command received an invalid completion event."
     }
+    $phaseInstanceIds = @()
+    foreach ($phaseEvent in @(
+            [pscustomobject]@{ name = $ServiceInitialRunningEventName; phase = "ServiceInitialRunning" },
+            [pscustomobject]@{ name = $MsiMayHaveStartedEventName; phase = "MsiMayHaveStarted" },
+            [pscustomobject]@{ name = $MsiDefinitiveCompletionEventName; phase = "MsiDefinitiveCompletion" },
+            [pscustomobject]@{ name = $MsiIdleProvenEventName; phase = "MsiIdleProven" }
+        )) {
+        $prefix = [regex]::Escape((Get-BoundlessInstallerPhaseEventPrefix -Phase $phaseEvent.phase))
+        if ($phaseEvent.name -notmatch "^Local\\$prefix\.[0-9a-f]{32}$") {
+            throw "Elevated install command received an invalid $($phaseEvent.phase) event."
+        }
+        $phaseInstanceIds += ($phaseEvent.name -split '\.')[-1]
+    }
+    if (@($phaseInstanceIds | Select-Object -Unique).Count -ne 1) {
+        throw "Elevated install command received phase events from different instances."
+    }
     $stageLeaf = "BoundlessInstaller-$([guid]::NewGuid().ToString('N'))"
     $programData = Get-BoundlessProgramDataRoot
     $stageRoot = Join-Path $programData $stageLeaf
@@ -2750,6 +3489,7 @@ function New-BoundlessElevatedInstallCommand {
         monitor_mutex_name = $MonitorMutexName
         tree_job_name = $TreeJobName
         completion_event_name = $CompletionEventName
+        phase_instance_id = $phaseInstanceIds[0]
         install_timeout_seconds = $TimeoutSeconds
         stage_sddl = Get-BoundlessAdminOnlyStageSddl
         tree_job_sddl = Get-BoundlessOwnedTreeSddl -UserSid $Sid
@@ -2884,6 +3624,82 @@ function Wait-JobEmpty {
     }
     return $Job.Active -eq 0
 }
+function Restore-BootstrapServiceBeforeMsiFailure {
+    param(
+        [string]$TreeJobSddl,
+        [string]$StagedHelperPath = "",
+        [string]$ServiceInitialRunningEventName = "",
+        [string]$MsiMayHaveStartedEventName = "",
+        [string]$MsiDefinitiveCompletionEventName = "",
+        [string]$MsiIdleProvenEventName = "",
+        [ValidateSet("ServiceRecovery", "MsiIdleProof")]
+        [string]$WorkerMode = "ServiceRecovery",
+        [int]$TimeoutMilliseconds = 25000,
+        [string]$FixtureWorkerSource = ""
+    )
+    $j = $null
+    $p = $null
+    try {
+        $j = [BoundlessElevatedJob]::Create(
+            "Local\Boundless.Installer.Recovery.v1.$([guid]::NewGuid().ToString('N'))",
+            $TreeJobSddl
+        )
+        $hostPath = (Get-Process -Id $PID -ErrorAction Stop).Path
+        $a = if (-not [string]::IsNullOrWhiteSpace($FixtureWorkerSource)) {
+            @(
+                "-NoProfile",
+                "-EncodedCommand",
+                [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($FixtureWorkerSource))
+            )
+        }
+        else {
+            $workerSwitch = if ($WorkerMode -eq "ServiceRecovery") {
+                "-ElevatedBootstrapServiceRecovery"
+            }
+            else {
+                "-ElevatedBootstrapMsiIdleProof"
+            }
+            @(
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $StagedHelperPath,
+                $workerSwitch,
+                "-ElevatedInstallServiceInitialRunningEvent", $ServiceInitialRunningEventName,
+                "-ElevatedInstallMsiMayHaveStartedEvent", $MsiMayHaveStartedEventName,
+                "-ElevatedInstallMsiDefinitiveCompletionEvent", $MsiDefinitiveCompletionEventName,
+                "-ElevatedInstallMsiIdleProvenEvent", $MsiIdleProvenEventName
+            )
+        }
+        $line = @(
+            Quote-Argument $hostPath
+            @($a | ForEach-Object { Quote-Argument $_ })
+        ) -join " "
+        $p = $j.StartOwned($hostPath, $line)
+        if (-not $p.WaitForExit($TimeoutMilliseconds)) {
+            $j.Terminate()
+            [void](Wait-JobEmpty -Job $j -TimeoutMilliseconds 5000)
+            return "mode=$WorkerMode;status=timeout"
+        }
+        if (-not (Wait-JobEmpty -Job $j -TimeoutMilliseconds 5000)) {
+            $j.Terminate()
+            [void](Wait-JobEmpty -Job $j -TimeoutMilliseconds 5000)
+            return "mode=$WorkerMode;status=tree_not_drained"
+        }
+        $p.WaitForExit()
+        if ($p.ExitCode -eq 0) {
+            return "mode=$WorkerMode;status=completed"
+        }
+        return "mode=$WorkerMode;status=failed"
+    }
+    catch {
+        return "mode=$WorkerMode;status=error;message=$($_.Exception.Message)"
+    }
+    finally {
+        if ($null -ne $j) {
+            try { if ($j.Active -gt 0) { $j.Terminate() } } catch { }
+            $j.Dispose()
+        }
+        if ($null -ne $p) { $p.Dispose() }
+    }
+}
 function New-AdminEvent {
     param([string]$Name)
     $security = [Security.AccessControl.EventWaitHandleSecurity]::new()
@@ -2911,6 +3727,12 @@ $payloadJson = [Text.Encoding]::UTF8.GetString(
     [Convert]::FromBase64String("__PAYLOAD_BASE64__")
 )
 $payload = $payloadJson | ConvertFrom-Json
+$phaseInstanceId = [string]$payload.phase_instance_id
+if ($phaseInstanceId -notmatch '^[0-9a-f]{32}$') { throw "invalid phase instance" }
+$service_initial_running_event = "Local\Boundless.Installer.ServiceInitialRunning.v1.$phaseInstanceId"
+$msi_may_have_started_event = "Local\Boundless.Installer.MsiMayHaveStarted.v1.$phaseInstanceId"
+$msi_definitive_completion_event = "Local\Boundless.Installer.MsiDefinitiveCompletion.v1.$phaseInstanceId"
+$msi_idle_proven_event = "Local\Boundless.Installer.MsiIdleProven.v1.$phaseInstanceId"
 $programDataKnownFolder = [Environment]::GetFolderPath(
     [Environment+SpecialFolder]::CommonApplicationData
 )
@@ -2930,6 +3752,19 @@ $job = $null
 $child = $null
 $startGate = $null
 $completion = [Threading.EventWaitHandle]::OpenExisting([string]$payload.completion_event_name)
+$serviceInitialRunning = [Threading.EventWaitHandle]::OpenExisting(
+    $service_initial_running_event
+)
+$msiMayHaveStarted = [Threading.EventWaitHandle]::OpenExisting(
+    $msi_may_have_started_event
+)
+$msiDefinitiveCompletion = [Threading.EventWaitHandle]::OpenExisting(
+    $msi_definitive_completion_event
+)
+$msiIdleProven = [Threading.EventWaitHandle]::OpenExisting(
+    $msi_idle_proven_event
+)
+$bootstrapRecoveryEvidence = "not_evaluated"
 $cancellation = [pscustomobject]@{
     event = [Threading.EventWaitHandle]::OpenExisting([string]$payload.cancellation_event_name)
     coordinator = Get-Process -Id ([int]$payload.coordinator_process_id) -ErrorAction Stop
@@ -2990,6 +3825,10 @@ try {
         "-ElevatedInstallMonitorMutex", $payload.monitor_mutex_name,
         "-ElevatedInstallStartGate", $startGateName,
         "-ElevatedInstallResultPath", $stagedResult,
+        "-ElevatedInstallServiceInitialRunningEvent", $service_initial_running_event,
+        "-ElevatedInstallMsiMayHaveStartedEvent", $msi_may_have_started_event,
+        "-ElevatedInstallMsiDefinitiveCompletionEvent", $msi_definitive_completion_event,
+        "-ElevatedInstallMsiIdleProvenEvent", $msi_idle_proven_event,
         "-ElevatedInstallTimeoutSeconds", ([string]$payload.install_timeout_seconds)
     )
     if ([bool]$payload.quiet) { $arguments += "-Quiet" }
@@ -3100,6 +3939,47 @@ finally {
         $treeClosed = $false
         if ($null -ne $job) { $job.Dispose(); $job = $null }
     }
+    if ($treeClosed) {
+        if (
+            $serviceInitialRunning.WaitOne(0) -and
+            -not $msiMayHaveStarted.WaitOne(0)
+        ) {
+            $bootstrapRecoveryEvidence = Restore-BootstrapServiceBeforeMsiFailure `
+                -TreeJobSddl ([string]$payload.tree_job_sddl) `
+                -StagedHelperPath $stagedHelper `
+                -ServiceInitialRunningEventName $service_initial_running_event `
+                -MsiMayHaveStartedEventName $msi_may_have_started_event `
+                -MsiDefinitiveCompletionEventName $msi_definitive_completion_event `
+                -MsiIdleProvenEventName $msi_idle_proven_event
+        }
+        elseif ($msiMayHaveStarted.WaitOne(0)) {
+            $bootstrapRecoveryEvidence = "start_requested=False;reason=msi_may_have_started"
+        }
+        else {
+            $bootstrapRecoveryEvidence = "start_requested=False;reason=original_service_not_running_or_unproven"
+        }
+        Write-Host "boundless_install_bootstrap_service_recovery=$bootstrapRecoveryEvidence"
+        if (
+            $msiMayHaveStarted.WaitOne(0) -and
+            -not $msiDefinitiveCompletion.WaitOne(0) -and
+            -not $msiIdleProven.WaitOne(0)
+        ) {
+            $idleEvidence = Restore-BootstrapServiceBeforeMsiFailure `
+                -TreeJobSddl ([string]$payload.tree_job_sddl) `
+                -StagedHelperPath $stagedHelper `
+                -ServiceInitialRunningEventName $service_initial_running_event `
+                -MsiMayHaveStartedEventName $msi_may_have_started_event `
+                -MsiDefinitiveCompletionEventName $msi_definitive_completion_event `
+                -MsiIdleProvenEventName $msi_idle_proven_event `
+                -WorkerMode "MsiIdleProof" `
+                -TimeoutMilliseconds 20000
+            Write-Host "boundless_install_msi_idle_worker=$idleEvidence"
+            Write-Host "boundless_install_msi_transaction_idle_proven=$($msiIdleProven.WaitOne(0).ToString().ToLowerInvariant())"
+        }
+    }
+    else {
+        Write-Host "boundless_install_bootstrap_service_recovery=start_requested=False;reason=installer_tree_not_closed"
+    }
     if ($null -ne $startGate) { $startGate.Dispose() }
     $cancellation.monitor.Dispose()
     $cancellation.coordinator.Dispose()
@@ -3122,6 +4002,10 @@ finally {
         Assert-AdminAcl -Path $resolved -RequireProtected $true
         Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction Stop
     }
+    $msiIdleProven.Dispose()
+    $msiDefinitiveCompletion.Dispose()
+    $msiMayHaveStarted.Dispose()
+    $serviceInitialRunning.Dispose()
     if ($null -ne $treeCleanupFailure) { throw $treeCleanupFailure }
 }
 exit $exitCode
@@ -3133,7 +4017,7 @@ exit $exitCode
     $source = $source.Replace("__PAYLOAD_BASE64__", $payloadBase64)
     $encodedCommand = ConvertTo-BoundlessCompressedEncodedCommand -Source $source
     if ($encodedCommand.Length -gt 30000) {
-        throw "The bounded elevated install command exceeded the safe Windows command-line budget."
+        throw "The bounded elevated install command exceeded the safe Windows command-line budget ($($encodedCommand.Length) > 30000)."
     }
     return [pscustomobject]@{
         source = $source
@@ -3184,6 +4068,10 @@ function Invoke-BoundlessMsi {
             MonitorMutexName = $QuiescenceLease.monitor.liveness_mutex_name
             TreeJobName = $QuiescenceLease.tree_job_name
             CompletionEventName = $QuiescenceLease.completion_event_name
+            ServiceInitialRunningEventName = $QuiescenceLease.service_initial_running_event_name
+            MsiMayHaveStartedEventName = $QuiescenceLease.msi_may_have_started_event_name
+            MsiDefinitiveCompletionEventName = $QuiescenceLease.msi_definitive_completion_event_name
+            MsiIdleProvenEventName = $QuiescenceLease.msi_idle_proven_event_name
             TimeoutSeconds = $TimeoutSeconds
         }
         $elevatedCommand = New-BoundlessElevatedInstallCommand @elevatedCommandArgs
@@ -3255,6 +4143,7 @@ function Invoke-BoundlessMsi {
             $treeClosureState.confirmed = $true
         }
         $QuiescenceLease.evidence.installer_tree_closed = $treeClosureState.confirmed
+        [void](Update-BoundlessInstallerPhaseEvidence -Lease $QuiescenceLease)
         if ($null -ne $process) {
             if ($treeClosureState.confirmed) {
                 $process.Dispose()
@@ -3613,6 +4502,7 @@ function Stop-BoundlessServiceForUpgrade {
         [int]$TimeoutSeconds = 15,
         [scriptblock]$StatusProbe = $null,
         [scriptblock]$WorkerFactory = $null,
+        [Threading.EventWaitHandle]$InitialRunningEvent = $null,
         [switch]$SkipAdministratorCheck
     )
 
@@ -3625,6 +4515,11 @@ function Stop-BoundlessServiceForUpgrade {
         }
     }
     $initialStatus = & $StatusProbe
+    if ($initialStatus -eq "Running" -and $null -ne $InitialRunningEvent) {
+        if (-not $InitialRunningEvent.Set()) {
+            throw "Could not publish the originally-running BoundlessService boundary before stop."
+        }
+    }
     if ($initialStatus -eq "Missing") {
         return [pscustomobject]@{
             initial_status = "NotInstalled"
@@ -3700,6 +4595,7 @@ function Stop-BoundlessServiceBeforeMsi {
         [scriptblock]$WorkerFactory = $null,
         [scriptblock]$RecoveryStatusProbe = $null,
         [scriptblock]$RecoveryWorkerFactory = $null,
+        [Threading.EventWaitHandle]$InitialRunningEvent = $null,
         [switch]$SkipAdministratorCheck
     )
 
@@ -3707,6 +4603,7 @@ function Stop-BoundlessServiceBeforeMsi {
         TimeoutSeconds = $TimeoutSeconds
         StatusProbe = $StatusProbe
         WorkerFactory = $WorkerFactory
+        InitialRunningEvent = $InitialRunningEvent
         SkipAdministratorCheck = $SkipAdministratorCheck
     }
     try {
@@ -4475,6 +5372,10 @@ function Invoke-BoundlessInstallerSupervisionFixture {
     $treeJobName = "Local\Boundless.Installer.Tree.v1.$([guid]::NewGuid().ToString('N'))"
     $installer = $null
     $monitorProcess = $null
+    $heartbeat = [Threading.EventWaitHandle]::new(
+        $true,
+        [Threading.EventResetMode]::ManualReset
+    )
     try {
         $installerSource = 'Start-Sleep -Seconds 30'
         $monitorSource = 'Start-Sleep -Milliseconds 500; exit 17'
@@ -4496,7 +5397,10 @@ function Invoke-BoundlessInstallerSupervisionFixture {
             ) `
             -WindowStyle Hidden `
             -PassThru
-        $monitor = [pscustomobject]@{ process = $monitorProcess }
+        $monitor = [pscustomobject]@{
+            process = $monitorProcess
+            heartbeat_event = $heartbeat
+        }
         $stopwatch = [Diagnostics.Stopwatch]::StartNew()
         $failure = $null
         $treeClosureState = [pscustomobject]@{ confirmed = $false }
@@ -4541,6 +5445,77 @@ function Invoke-BoundlessInstallerSupervisionFixture {
         }
         $control.event.Dispose()
         $completion.event.Dispose()
+        $heartbeat.Dispose()
+    }
+}
+
+function Invoke-BoundlessInstallerHeartbeatStallFixture {
+    param([string]$UserSid)
+
+    $control = New-BoundlessInstallerControlEvent -UserSid $UserSid
+    $completion = New-BoundlessInstallerCompletionEvent -UserSid $UserSid
+    $heartbeat = [Threading.EventWaitHandle]::new(
+        $false,
+        [Threading.EventResetMode]::ManualReset
+    )
+    $installer = $null
+    $monitorProcess = $null
+    try {
+        $sleepCommand = [Convert]::ToBase64String(
+            [Text.Encoding]::Unicode.GetBytes('Start-Sleep -Seconds 30')
+        )
+        $installer = Start-Process `
+            -FilePath (Resolve-CurrentPowerShellExecutable) `
+            -ArgumentList @("-NoProfile", "-EncodedCommand", $sleepCommand) `
+            -WindowStyle Hidden `
+            -PassThru
+        $monitorProcess = Start-Process `
+            -FilePath (Resolve-CurrentPowerShellExecutable) `
+            -ArgumentList @("-NoProfile", "-EncodedCommand", $sleepCommand) `
+            -WindowStyle Hidden `
+            -PassThru
+        $treeClosureState = [pscustomobject]@{ confirmed = $false }
+        $failure = $null
+        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            Wait-BoundlessElevatedInstallSupervised `
+                -InstallerProcess $installer `
+                -Monitor ([pscustomobject]@{
+                    process = $monitorProcess
+                    heartbeat_event = $heartbeat
+                }) `
+                -CancellationEvent $control.event `
+                -CompletionEvent $completion.event `
+                -TreeJobName "Local\Boundless.Installer.Tree.v1.$([guid]::NewGuid().ToString('N'))" `
+                -TreeClosureState $treeClosureState `
+                -TimeoutSeconds 15 `
+                -CancellationGraceMilliseconds 500 `
+                -HeartbeatTimeoutMilliseconds 300 | Out-Null
+        }
+        catch {
+            $failure = $_
+        }
+        $stopwatch.Stop()
+        if (
+            $null -eq $failure -or
+            $failure.Exception.Message -notmatch 'heartbeat stalled' -or
+            -not $control.event.WaitOne(0) -or
+            -not $installer.HasExited -or
+            -not $treeClosureState.confirmed -or
+            $stopwatch.ElapsedMilliseconds -gt 7000
+        ) {
+            throw "Installer heartbeat-stall fixture did not cancel and drain its root fail-closed."
+        }
+    }
+    finally {
+        foreach ($process in @($installer, $monitorProcess)) {
+            if ($null -eq $process) { continue }
+            if (-not $process.HasExited) { Stop-BoundlessProcessBoundary -Process $process }
+            $process.Dispose()
+        }
+        $heartbeat.Dispose()
+        $completion.event.Dispose()
+        $control.event.Dispose()
     }
 }
 
@@ -4615,6 +5590,9 @@ function Invoke-BoundlessKernelObjectAclFixture {
 
     $control = New-BoundlessInstallerControlEvent -UserSid $UserSid
     $completion = New-BoundlessInstallerCompletionEvent -UserSid $UserSid
+    $phase = New-BoundlessInstallerPhaseEvent `
+        -UserSid $UserSid `
+        -Phase "MsiMayHaveStarted"
     $liveness = New-BoundlessPrivilegedLivenessMutex `
         -Name "Local\Boundless.Installer.Monitor.v1.$([guid]::NewGuid().ToString('N'))"
     try {
@@ -4622,7 +5600,7 @@ function Invoke-BoundlessKernelObjectAclFixture {
         [void]$completion.event.Set()
         $payload = [Convert]::ToBase64String(
             [Text.Encoding]::UTF8.GetBytes(
-                "$($control.name)`n$($completion.name)`n$($liveness.name)"
+                "$($control.name)`n$($completion.name)`n$($liveness.name)`n$($phase.name)"
             )
         )
         $source = @'
@@ -4653,10 +5631,15 @@ $sync = Open-EventWithRights `
     -Name $names[1] `
     -Rights ([Security.AccessControl.EventWaitHandleRights]::Synchronize)
 $sync.Dispose()
+$phaseSync = Open-EventWithRights `
+    -Name $names[3] `
+    -Rights ([Security.AccessControl.EventWaitHandleRights]::Synchronize)
+$phaseSync.Dispose()
 foreach ($probe in @(
         { Open-EventWithRights -Name $names[0] -Rights ([Security.AccessControl.EventWaitHandleRights]::ChangePermissions) },
         { Open-EventWithRights -Name $names[1] -Rights ([Security.AccessControl.EventWaitHandleRights]::ChangePermissions) },
-        { Open-MutexWithRights -Name $names[2] -Rights ([Security.AccessControl.MutexRights]::ChangePermissions) }
+        { Open-MutexWithRights -Name $names[2] -Rights ([Security.AccessControl.MutexRights]::ChangePermissions) },
+        { Open-EventWithRights -Name $names[3] -Rights ([Security.AccessControl.EventWaitHandleRights]::Modify) }
     )) {
     $opened = $null
     try { $opened = & $probe }
@@ -4682,6 +5665,7 @@ exit 0
         try { $liveness.mutex.ReleaseMutex() } catch { }
         $liveness.mutex.Dispose()
         $completion.event.Dispose()
+        $phase.event.Dispose()
         $control.event.Dispose()
     }
 }
@@ -4767,6 +5751,13 @@ finally { $gate.Dispose() }
         $job.Terminate()
         $deadline = (Get-Date).AddSeconds(5)
         while ($job.Active -gt 0 -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 20
+        }
+        $processDeadline = (Get-Date).AddSeconds(2)
+        while (
+            $null -ne (Get-Process -Id $childPid -ErrorAction SilentlyContinue) -and
+            (Get-Date) -lt $processDeadline
+        ) {
             Start-Sleep -Milliseconds 20
         }
         if (
@@ -4971,6 +5962,7 @@ finally { $ready.Dispose() }
                 Stop-BoundlessProcessBoundary -Process $monitor.process
             }
             $monitor.handoff_event.Dispose()
+            $monitor.heartbeat_event.Dispose()
             $monitor.ready_event.Dispose()
             $monitor.process.Dispose()
         }
@@ -5268,16 +6260,26 @@ function Invoke-BoundlessFailedDrainQuiescenceFixture {
             sentinel_owner = $sentinelOwner
             monitor = $monitor
             completion_event = $completion.event
+            completion_event_name = $completion.name
             tree_job_name = $treeJobName
             elevated_process = $null
+            expected_owner_sid = $UserSid
+            expected_session_id = $sessionId
+            msi_may_have_started_event_name = ""
+            msi_definitive_completion_event_name = ""
+            msi_idle_proven_event_name = ""
+            installer_transaction_mutex_name = "Global\_MSIExecute"
             evidence = [pscustomobject]@{
+                sentinel_name = $sentinelName
                 installer_tree_closed = $false
                 quiescence_abandoned_to_monitor = $false
+                quiescence_guardian_process_id = $null
             }
         }
         Resolve-BoundlessUnconfirmedTreeAndQuiescence -Lease $lease
         $transferred = $true
         $completionDisposed = $true
+        $monitorPid = [int]$lease.evidence.quiescence_guardian_process_id
         if (
             -not $lease.evidence.quiescence_abandoned_to_monitor -or
             $tree.ActiveProcessCount -lt 1 -or
@@ -5313,12 +6315,408 @@ function Invoke-BoundlessFailedDrainQuiescenceFixture {
             if ($null -ne $monitor) {
                 if (-not $monitor.process.HasExited) { [void]$completion.event.Set() }
                 $monitor.handoff_event.Dispose()
+                $monitor.heartbeat_event.Dispose()
                 $monitor.ready_event.Dispose()
                 if (-not $monitor.process.HasExited) { Stop-BoundlessProcessBoundary -Process $monitor.process }
                 $monitor.process.Dispose()
             }
         }
         if (-not $completionDisposed) { $completion.event.Dispose() }
+    }
+}
+
+function Invoke-BoundlessHardCancelBeforeMsiRecoveryFixture {
+    param(
+        [string]$Source,
+        [string]$UserSid
+    )
+
+    $tokens = $null
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput(
+        $Source,
+        [ref]$tokens,
+        [ref]$errors
+    )
+    if ($errors.Count -ne 0) {
+        throw "Hard-cancel recovery fixture could not parse the elevated bootstrap source."
+    }
+    foreach ($functionName in @("Wait-JobEmpty", "Restore-BootstrapServiceBeforeMsiFailure")) {
+        $definition = $ast.FindAll(
+            {
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq $functionName
+            },
+            $true
+        ) | Select-Object -First 1
+        if ($null -eq $definition) {
+            throw "Hard-cancel recovery fixture could not find bootstrap function $functionName."
+        }
+        Invoke-Expression $definition.Extent.Text
+    }
+    function Quote-Argument {
+        param([string]$Value)
+        return ConvertTo-ProcessArgument -Value $Value
+    }
+
+    $initialEventName = "Local\Boundless.Test.ServiceStoppedBeforeMsi.$([guid]::NewGuid().ToString('N'))"
+    $initialCreated = $false
+    $initialRunning = [Threading.EventWaitHandle]::new(
+        $false,
+        [Threading.EventResetMode]::ManualReset,
+        $initialEventName,
+        [ref]$initialCreated
+    )
+    $mayHaveStarted = [Threading.EventWaitHandle]::new(
+        $false,
+        [Threading.EventResetMode]::ManualReset
+    )
+    $definitive = [Threading.EventWaitHandle]::new(
+        $false,
+        [Threading.EventResetMode]::ManualReset
+    )
+    $recoveryEventName = "Local\Boundless.Test.BootstrapRecoveryRan.$([guid]::NewGuid().ToString('N'))"
+    $recoveryCreated = $false
+    $recoveryRan = [Threading.EventWaitHandle]::new(
+        $false,
+        [Threading.EventResetMode]::ManualReset,
+        $recoveryEventName,
+        [ref]$recoveryCreated
+    )
+    $canceledJob = $null
+    $canceledRoot = $null
+    try {
+        if (-not $initialCreated -or -not $recoveryCreated) {
+            throw "Hard-cancel recovery fixture collided with its phase event."
+        }
+        $eventPayload = [Convert]::ToBase64String(
+            [Text.Encoding]::UTF8.GetBytes($initialEventName)
+        )
+        $canceledSource = @'
+$name = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("__EVENT__"))
+$event = [Threading.EventWaitHandle]::OpenExisting($name)
+try {
+    [void]$event.Set()
+    Start-Sleep -Seconds 30
+}
+finally { $event.Dispose() }
+'@.Replace("__EVENT__", $eventPayload)
+        $canceledJob = [BoundlessElevatedJob]::Create(
+            "Local\Boundless.Installer.Tree.v1.$([guid]::NewGuid().ToString('N'))",
+            (Get-BoundlessOwnedTreeSddl -UserSid $UserSid)
+        )
+        $hostPath = Resolve-CurrentPowerShellExecutable
+        $rootArgs = @(
+            "-NoProfile",
+            "-EncodedCommand",
+            [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($canceledSource))
+        )
+        $rootLine = @(
+            ConvertTo-ProcessArgument -Value $hostPath
+            @($rootArgs | ForEach-Object { ConvertTo-ProcessArgument -Value $_ })
+        ) -join " "
+        $canceledRoot = $canceledJob.StartOwned($hostPath, $rootLine)
+        if (-not $initialRunning.WaitOne(10000)) {
+            throw "Hard-cancel recovery fixture did not publish its originally-running service evidence."
+        }
+        $canceledJob.Terminate()
+        if (-not (Wait-JobEmpty -Job $canceledJob -TimeoutMilliseconds 5000)) {
+            throw "Hard-cancel recovery fixture did not drain the canceled pre-MSI helper."
+        }
+        if (-not $canceledRoot.WaitForExit(5000)) {
+            throw "Hard-cancel recovery fixture root did not terminate with its job."
+        }
+
+        $recoveryPayload = [Convert]::ToBase64String(
+            [Text.Encoding]::UTF8.GetBytes($recoveryEventName)
+        )
+        $recoverySource = @'
+$name = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("__EVENT__"))
+$event = [Threading.EventWaitHandle]::OpenExisting($name)
+try { [void]$event.Set() } finally { $event.Dispose() }
+'@.Replace("__EVENT__", $recoveryPayload)
+        $recovery = Restore-BootstrapServiceBeforeMsiFailure `
+            -TreeJobSddl (Get-BoundlessOwnedTreeSddl -UserSid $UserSid) `
+            -TimeoutMilliseconds 5000 `
+            -FixtureWorkerSource $recoverySource
+        if (
+            -not $recoveryRan.WaitOne(0) -or
+            $recovery -match 'status=(timeout|tree_not_drained|error)'
+        ) {
+            throw "Hard-cancel recovery fixture did not restore after proven pre-MSI cancellation: $recovery"
+        }
+
+        [void]$mayHaveStarted.Set()
+        [void]$definitive.Set()
+        [void]$mayHaveStarted.Reset()
+        [void]$recoveryRan.Reset()
+        if (-not $definitive.WaitOne(0) -or $mayHaveStarted.WaitOne(0)) {
+            throw "Hard-cancel recovery fixture lost returned non-success evidence."
+        }
+        $retry = Restore-BootstrapServiceBeforeMsiFailure `
+            -TreeJobSddl (Get-BoundlessOwnedTreeSddl -UserSid $UserSid) `
+            -TimeoutMilliseconds 5000 `
+            -FixtureWorkerSource $recoverySource
+        if (-not $recoveryRan.WaitOne(0) -or $retry -match 'status=(timeout|tree_not_drained|error)') {
+            throw "Hard-cancel recovery fixture did not restore after a definitive non-success: $retry"
+        }
+        [void]$mayHaveStarted.Set()
+        if (-not $mayHaveStarted.WaitOne(0)) {
+            throw "Hard-cancel recovery fixture lost the successful/uncertain MSI exclusion."
+        }
+    }
+    finally {
+        if ($null -ne $canceledJob) {
+            if ($canceledJob.Active -gt 0) { $canceledJob.Terminate() }
+            $canceledJob.Dispose()
+        }
+        if ($null -ne $canceledRoot) {
+            if (-not $canceledRoot.HasExited) { Stop-BoundlessProcessBoundary -Process $canceledRoot }
+            $canceledRoot.Dispose()
+        }
+        $mayHaveStarted.Dispose()
+        $definitive.Dispose()
+        $recoveryRan.Dispose()
+        $initialRunning.Dispose()
+    }
+}
+
+function Invoke-BoundlessUncertainTransactionGuardianFixture {
+    param([string]$UserSid)
+
+    $fixtureId = [guid]::NewGuid().ToString('N')
+    $sessionId = 2147482003
+    $transactionMutexName = "Global\Boundless.Test.MsiExecute.$fixtureId"
+    $holderReadyName = "Local\Boundless.Test.MsiExecuteReady.$fixtureId"
+    $holderReleaseName = "Local\Boundless.Test.MsiExecuteRelease.$fixtureId"
+    $holderReadyCreated = $false
+    $holderReleaseCreated = $false
+    $holderReady = [Threading.EventWaitHandle]::new(
+        $false,
+        [Threading.EventResetMode]::ManualReset,
+        $holderReadyName,
+        [ref]$holderReadyCreated
+    )
+    $holderRelease = [Threading.EventWaitHandle]::new(
+        $false,
+        [Threading.EventResetMode]::ManualReset,
+        $holderReleaseName,
+        [ref]$holderReleaseCreated
+    )
+    $owner = New-BoundlessNamedMutex `
+        -Name "Local\Boundless.Test.UncertainTransaction.Owner.$fixtureId" `
+        -UserSid $UserSid `
+        -InitiallyOwned $true
+    $sentinelOwner = Start-BoundlessTrayQuiescenceSentinelOwner `
+        -UserSid $UserSid `
+        -SessionId $sessionId
+    $completion = New-BoundlessInstallerCompletionEvent -UserSid $UserSid
+    $serviceInitial = New-BoundlessInstallerPhaseEvent `
+        -UserSid $UserSid `
+        -Phase "ServiceInitialRunning"
+    $mayHaveStarted = New-BoundlessInstallerPhaseEvent `
+        -UserSid $UserSid `
+        -Phase "MsiMayHaveStarted"
+    $definitive = New-BoundlessInstallerPhaseEvent `
+        -UserSid $UserSid `
+        -Phase "MsiDefinitiveCompletion"
+    $idleProven = New-BoundlessInstallerPhaseEvent `
+        -UserSid $UserSid `
+        -Phase "MsiIdleProven"
+    $monitor = $null
+    $holder = $null
+    $transferred = $false
+    try {
+        if (-not $holderReadyCreated -or -not $holderReleaseCreated -or -not $owner.created_new) {
+            throw "Uncertain-transaction guardian fixture collided with a kernel object."
+        }
+        [void]$serviceInitial.event.Set()
+        [void]$mayHaveStarted.event.Set()
+        [void]$completion.event.Set()
+        if (Test-BoundlessNormalQuiescenceReleaseAllowed `
+            -InstallerTreeClosed $true `
+            -CompletionState "uncertain" `
+            -MsiTransactionIdleProven $false) {
+            throw "Uncertain-transaction fixture treated client-tree drain as normal completion."
+        }
+
+        $holderPayload = [Convert]::ToBase64String(
+            [Text.Encoding]::UTF8.GetBytes(
+                "$transactionMutexName`n$holderReadyName`n$holderReleaseName"
+            )
+        )
+        $holderSource = @'
+$names = [Text.Encoding]::UTF8.GetString(
+    [Convert]::FromBase64String("__PAYLOAD__")
+) -split "`n"
+$ready = [Threading.EventWaitHandle]::OpenExisting($names[1])
+$release = [Threading.EventWaitHandle]::OpenExisting($names[2])
+$created = $false
+$mutex = [Threading.Mutex]::new($true, $names[0], [ref]$created)
+try {
+    if (-not $created) { exit 61 }
+    [void]$ready.Set()
+    if (-not $release.WaitOne(30000)) { exit 62 }
+    $mutex.ReleaseMutex()
+}
+finally {
+    $mutex.Dispose()
+    $release.Dispose()
+    $ready.Dispose()
+}
+'@.Replace("__PAYLOAD__", $holderPayload)
+        $holder = Start-Process `
+            -FilePath (Resolve-CurrentPowerShellExecutable) `
+            -ArgumentList @(
+                "-NoProfile",
+                "-EncodedCommand",
+                [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($holderSource))
+            ) `
+            -WindowStyle Hidden `
+            -PassThru
+        if (-not $holderReady.WaitOne(10000)) {
+            throw "Uncertain-transaction fixture did not acquire its transaction mutex."
+        }
+
+        $treeJobName = "Local\Boundless.Installer.Tree.v1.$fixtureId"
+        $stalledProcess = Start-Process `
+            -FilePath (Resolve-CurrentPowerShellExecutable) `
+            -ArgumentList @(
+                "-NoProfile",
+                "-EncodedCommand",
+                [Convert]::ToBase64String(
+                    [Text.Encoding]::Unicode.GetBytes('Start-Sleep -Seconds 30')
+                )
+            ) `
+            -WindowStyle Hidden `
+            -PassThru
+        $monitor = [pscustomobject]@{
+            process = $stalledProcess
+            ready_event = [Threading.EventWaitHandle]::new(
+                $false,
+                [Threading.EventResetMode]::ManualReset
+            )
+            handoff_event = [Threading.EventWaitHandle]::new(
+                $false,
+                [Threading.EventResetMode]::ManualReset
+            )
+            heartbeat_event = [Threading.EventWaitHandle]::new(
+                $false,
+                [Threading.EventResetMode]::ManualReset
+            )
+            stable_milliseconds = 500
+        }
+        $stalledMonitorPid = $monitor.process.Id
+        $lease = [pscustomobject]@{
+            mutex = $owner.mutex
+            sentinel_mutex = $null
+            sentinel_owner = $sentinelOwner
+            monitor = $monitor
+            completion_event = $completion.event
+            completion_event_name = $completion.name
+            tree_job_name = $treeJobName
+            elevated_process = $null
+            expected_owner_sid = $UserSid
+            expected_session_id = $sessionId
+            service_initial_running_event = $serviceInitial.event
+            service_initial_running_event_name = $serviceInitial.name
+            msi_may_have_started_event = $mayHaveStarted.event
+            msi_may_have_started_event_name = $mayHaveStarted.name
+            msi_definitive_completion_event = $definitive.event
+            msi_definitive_completion_event_name = $definitive.name
+            msi_idle_proven_event = $idleProven.event
+            msi_idle_proven_event_name = $idleProven.name
+            installer_transaction_mutex_name = $transactionMutexName
+            evidence = [pscustomobject]@{
+                sentinel_name = $sentinelOwner.sentinel_name
+                installer_tree_closed = $true
+                installer_completion_state = "uncertain"
+                msi_transaction_idle_proven = $false
+                quiescence_abandoned_to_monitor = $false
+                quiescence_guardian_process_id = $null
+            }
+        }
+        Resolve-BoundlessUnconfirmedTreeAndQuiescence -Lease $lease
+        $transferred = $true
+        $monitorPid = [int]$lease.evidence.quiescence_guardian_process_id
+        Start-Sleep -Milliseconds 500
+        if (
+            -not $lease.evidence.quiescence_abandoned_to_monitor -or
+            $monitorPid -le 0 -or
+            $null -ne (Get-Process -Id $stalledMonitorPid -ErrorAction SilentlyContinue) -or
+            $null -eq (Get-Process -Id $monitorPid -ErrorAction SilentlyContinue)
+        ) {
+            throw "Uncertain-transaction takeover did not replace the stalled monitor with an acknowledged guardian."
+        }
+        $sentinelProbe = [Threading.Mutex]::OpenExisting($sentinelOwner.sentinel_name)
+        try {
+            $probeAcquired = $false
+            try {
+                $probeAcquired = $sentinelProbe.WaitOne(0)
+            }
+            catch [Threading.AbandonedMutexException] {
+                throw "Uncertain-transaction takeover left the tray sentinel abandoned."
+            }
+            if ($probeAcquired) {
+                $sentinelProbe.ReleaseMutex()
+                throw "Uncertain-transaction takeover returned before the independent guardian owned the tray sentinel."
+            }
+        }
+        finally {
+            $sentinelProbe.Dispose()
+        }
+        [void]$holderRelease.Set()
+        if (-not $holder.WaitForExit(5000) -or $holder.ExitCode -ne 0) {
+            throw "Uncertain-transaction fixture transaction holder did not release normally."
+        }
+        $deadline = (Get-Date).AddSeconds(7)
+        while (
+            $null -ne (Get-Process -Id $monitorPid -ErrorAction SilentlyContinue) -and
+            (Get-Date) -lt $deadline
+        ) {
+            Start-Sleep -Milliseconds 50
+        }
+        if ($null -ne (Get-Process -Id $monitorPid -ErrorAction SilentlyContinue)) {
+            throw "Uncertain-transaction guardian did not release after authoritative transaction-idle proof."
+        }
+        if (-not (Test-BoundlessNormalQuiescenceReleaseAllowed `
+            -InstallerTreeClosed $true `
+            -CompletionState "uncertain" `
+            -MsiTransactionIdleProven $true)) {
+            throw "Uncertain-transaction fixture rejected authoritative transaction-idle proof."
+        }
+    }
+    finally {
+        if ($null -ne $holder) {
+            if (-not $holder.HasExited) {
+                [void]$holderRelease.Set()
+                if (-not $holder.WaitForExit(1000)) {
+                    Stop-BoundlessProcessBoundary -Process $holder
+                }
+            }
+            $holder.Dispose()
+        }
+        if (-not $transferred) {
+            if ($owner.created_new) {
+                try { $owner.mutex.ReleaseMutex() } catch { }
+                $owner.mutex.Dispose()
+            }
+            Stop-BoundlessTrayQuiescenceSentinelOwner -Owner $sentinelOwner
+            if ($null -ne $monitor) {
+                if (-not $monitor.process.HasExited) { Stop-BoundlessProcessBoundary -Process $monitor.process }
+                $monitor.handoff_event.Dispose()
+                $monitor.heartbeat_event.Dispose()
+                $monitor.ready_event.Dispose()
+                $monitor.process.Dispose()
+            }
+            $completion.event.Dispose()
+            foreach ($phase in @($serviceInitial, $mayHaveStarted, $definitive, $idleProven)) {
+                $phase.event.Dispose()
+            }
+        }
+        $holderRelease.Dispose()
+        $holderReady.Dispose()
     }
 }
 
@@ -5871,10 +7269,12 @@ function Invoke-InstallHelperSelfTest {
     }
     Invoke-BoundlessReplacementTrayWindowFixture -UserSid $currentIdentitySid
     Invoke-BoundlessInstallerSupervisionFixture -UserSid $currentIdentitySid
+    Invoke-BoundlessInstallerHeartbeatStallFixture -UserSid $currentIdentitySid
     Invoke-BoundlessOwnedProcessTreeFixture
     Invoke-BoundlessKernelObjectAclFixture -UserSid $currentIdentitySid
     Invoke-BoundlessCoordinatorDeathFixture -UserSid $currentIdentitySid
     Invoke-BoundlessFailedDrainQuiescenceFixture -UserSid $currentIdentitySid
+    Invoke-BoundlessUncertainTransactionGuardianFixture -UserSid $currentIdentitySid
     Invoke-BoundlessBlockingServiceStopFixture
     Invoke-BoundlessFailedMsiServiceRecoveryFixture
     Invoke-BoundlessLogHandoffFixture -SelectedUserSid $validSid
@@ -5963,6 +7363,7 @@ function Invoke-InstallHelperSelfTest {
         product_version = "5.0.13"
         product_code = "{00000000-0000-0000-0000-000000000013}"
     }
+    $selfTestPhaseId = [guid]::NewGuid().ToString('N')
     $elevatedCommandArgs = @{
         ResolvedInstallerPath = $PSCommandPath
         Sid = $validSid
@@ -5975,6 +7376,10 @@ function Invoke-InstallHelperSelfTest {
         MonitorMutexName = "Local\Boundless.Installer.Monitor.v1.$([guid]::NewGuid().ToString('N'))"
         TreeJobName = "Local\Boundless.Installer.Tree.v1.$([guid]::NewGuid().ToString('N'))"
         CompletionEventName = "Local\Boundless.Installer.TreeComplete.v1.$([guid]::NewGuid().ToString('N'))"
+        ServiceInitialRunningEventName = "Local\Boundless.Installer.ServiceInitialRunning.v1.$selfTestPhaseId"
+        MsiMayHaveStartedEventName = "Local\Boundless.Installer.MsiMayHaveStarted.v1.$selfTestPhaseId"
+        MsiDefinitiveCompletionEventName = "Local\Boundless.Installer.MsiDefinitiveCompletion.v1.$selfTestPhaseId"
+        MsiIdleProvenEventName = "Local\Boundless.Installer.MsiIdleProven.v1.$selfTestPhaseId"
         LogRequested = $true
     }
     $selfTestControlEvent = New-BoundlessInstallerControlEvent -UserSid $currentIdentitySid
@@ -6051,6 +7456,9 @@ function Invoke-InstallHelperSelfTest {
     Invoke-BoundlessElevatedJobSourceFixture `
         -Source $decodedElevatedCommand `
         -UserSid $currentIdentitySid
+    Invoke-BoundlessHardCancelBeforeMsiRecoveryFixture `
+        -Source $decodedElevatedCommand `
+        -UserSid $currentIdentitySid
 
     $msiPropertyFixture = "skipped"
     if (-not [string]::IsNullOrWhiteSpace($InstallerPath)) {
@@ -6108,11 +7516,15 @@ function Invoke-InstallHelperSelfTest {
         tray_quiescence_monitor_fixture = "passed"
         replacement_tray_window_fixture = "passed"
         supervised_installer_cancellation_fixture = "passed"
+        stalled_monitor_heartbeat_fixture = "passed"
         coordinator_death_cancellation_fixture = "passed"
         failed_drain_quiescence_fixture = "passed"
+        uncertain_transaction_guardian_fixture = "passed"
+        stalled_monitor_takeover_fixture = "passed"
         owned_process_tree_fixture = "passed"
         kernel_object_acl_fixture = "passed"
         elevated_process_job_fixture = "passed"
+        hard_cancel_before_msi_recovery_fixture = "passed"
         admin_only_stage_fixture = "passed"
         program_data_known_folder_fixture = "passed"
         staging_child_process_probe_hosts = $stagingProbeHosts
@@ -6131,6 +7543,69 @@ function Invoke-InstallHelperSelfTest {
 if ($SelfTest) {
     Invoke-InstallHelperSelfTest
     return
+}
+
+if ($ElevatedBootstrapServiceRecovery -or $ElevatedBootstrapMsiIdleProof) {
+    $serviceInitialRunning = $null
+    $msiMayHaveStarted = $null
+    $msiDefinitiveCompletion = $null
+    $msiIdleProven = $null
+    try {
+        if (-not (Test-IsAdministrator)) {
+            throw "Bootstrap service recovery did not receive an elevated token."
+        }
+        $stageRoot = Split-Path -Parent $PSCommandPath
+        if (-not (Test-BoundlessInstallerStagePath -Path $stageRoot)) {
+            throw "Bootstrap service recovery was not running from an immutable installer stage."
+        }
+        Assert-BoundlessAdminOnlyAcl -Path $PSCommandPath | Out-Null
+        $serviceInitialRunning = Open-BoundlessInstallerPhaseEvent `
+            -Name $ElevatedInstallServiceInitialRunningEvent `
+            -Phase "ServiceInitialRunning"
+        $msiMayHaveStarted = Open-BoundlessInstallerPhaseEvent `
+            -Name $ElevatedInstallMsiMayHaveStartedEvent `
+            -Phase "MsiMayHaveStarted"
+        $msiDefinitiveCompletion = Open-BoundlessInstallerPhaseEvent `
+            -Name $ElevatedInstallMsiDefinitiveCompletionEvent `
+            -Phase "MsiDefinitiveCompletion"
+        $msiIdleProven = Open-BoundlessInstallerPhaseEvent `
+            -Name $ElevatedInstallMsiIdleProvenEvent `
+            -Phase "MsiIdleProven"
+        if ($ElevatedBootstrapServiceRecovery) {
+            if (
+                -not $serviceInitialRunning.WaitOne(0) -or
+                $msiMayHaveStarted.WaitOne(0)
+            ) {
+                throw "Bootstrap service recovery evidence no longer permits a service start."
+            }
+            $recovery = Start-BoundlessServiceAfterFailedInstall -TimeoutSeconds 10
+            Write-Host "boundless_install_bootstrap_recovery_start_requested=$($recovery.start_requested)"
+            Write-Host "boundless_install_bootstrap_recovery_final_status=$($recovery.final_status)"
+        }
+        else {
+            if (
+                -not $msiMayHaveStarted.WaitOne(0) -or
+                $msiDefinitiveCompletion.WaitOne(0)
+            ) {
+                throw "Bootstrap MSI-idle proof was requested without an uncertain transaction."
+            }
+            if (-not (Wait-BoundlessWindowsInstallerTransactionIdleProof)) {
+                throw "Windows Installer transaction idle could not be proved within the bounded window."
+            }
+            [void]$msiIdleProven.Set()
+        }
+        exit 0
+    }
+    catch {
+        Write-Error $_
+        exit 1
+    }
+    finally {
+        if ($null -ne $msiIdleProven) { $msiIdleProven.Dispose() }
+        if ($null -ne $msiDefinitiveCompletion) { $msiDefinitiveCompletion.Dispose() }
+        if ($null -ne $msiMayHaveStarted) { $msiMayHaveStarted.Dispose() }
+        if ($null -ne $serviceInitialRunning) { $serviceInitialRunning.Dispose() }
+    }
 }
 
 if ($ElevatedInstall) {
@@ -6196,6 +7671,10 @@ if ($ElevatedInstall) {
             CoordinatorProcessId = $ElevatedInstallCoordinatorProcessId
             CoordinatorStartTicks = $ElevatedInstallCoordinatorStartTicks
             MonitorMutexName = $ElevatedInstallMonitorMutex
+            ServiceInitialRunningEventName = $ElevatedInstallServiceInitialRunningEvent
+            MsiMayHaveStartedEventName = $ElevatedInstallMsiMayHaveStartedEvent
+            MsiDefinitiveCompletionEventName = $ElevatedInstallMsiDefinitiveCompletionEvent
+            MsiIdleProvenEventName = $ElevatedInstallMsiIdleProvenEvent
             TimeoutSeconds = $ElevatedInstallTimeoutSeconds
         }
         try {
@@ -6278,7 +7757,12 @@ try {
         -QuiescenceLease $trayQuiescence
 }
 finally {
-    if ($trayQuiescence.evidence.installer_tree_closed) {
+    $completionState = Update-BoundlessInstallerPhaseEvidence -Lease $trayQuiescence
+    $normalQuiescenceReleaseAllowed = Test-BoundlessNormalQuiescenceReleaseAllowed `
+        -InstallerTreeClosed $trayQuiescence.evidence.installer_tree_closed `
+        -CompletionState $completionState `
+        -MsiTransactionIdleProven $trayQuiescence.evidence.msi_transaction_idle_proven
+    if ($normalQuiescenceReleaseAllowed) {
         Exit-BoundlessTrayQuiescence -Lease $trayQuiescence
     }
     else {

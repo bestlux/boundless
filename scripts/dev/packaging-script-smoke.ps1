@@ -30,12 +30,13 @@ function Resolve-PowerShellExecutable {
 function Invoke-PackagingScript {
     param(
         [string]$ScriptPath,
-        [string[]]$Arguments
+        [string[]]$Arguments,
+        [string]$PowerShellExe = $script:PowerShellExe
     )
 
-    Write-Host "[packaging-script-smoke] $([IO.Path]::GetFileName($ScriptPath)) $($Arguments -join ' ')"
+    Write-Host "[packaging-script-smoke] $([IO.Path]::GetFileName($PowerShellExe)) $([IO.Path]::GetFileName($ScriptPath)) $($Arguments -join ' ')"
     $global:LASTEXITCODE = 0
-    $output = @(& $script:PowerShellExe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath @Arguments 2>&1)
+    $output = @(& $PowerShellExe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath @Arguments 2>&1)
     $exitCode = if ($null -eq $global:LASTEXITCODE) { 0 } else { $global:LASTEXITCODE }
     foreach ($line in $output) {
         Write-Host $line
@@ -134,6 +135,10 @@ foreach ($requiredInstallContract in @(
         'kernel_object_acl_fixture',
         'blocking_service_stop_fixture',
         'failed_msi_service_recovery_fixture',
+        'hard_cancel_before_msi_recovery_fixture',
+        'uncertain_transaction_guardian_fixture',
+        'stalled_monitor_heartbeat_fixture',
+        'stalled_monitor_takeover_fixture',
         'Start-BoundlessTrayQuiescenceSentinelOwner',
         'ElevatedInstallCoordinatorProcessId',
         'Get-BoundlessServiceStatusBounded',
@@ -190,9 +195,35 @@ if (
     $elevatedCommandSource -notmatch 'TerminateJobObject' -or
     $elevatedCommandSource -notmatch 'StartOwned' -or
     $elevatedCommandSource -notmatch 'StartGate' -or
-    $elevatedCommandSource -notmatch 'Get-CancellationReason'
+    $elevatedCommandSource -notmatch 'Get-CancellationReason' -or
+    $elevatedCommandSource -notmatch 'service_initial_running_event' -or
+    $elevatedCommandSource -notmatch 'msi_may_have_started_event' -or
+    $elevatedCommandSource -notmatch 'Restore-BootstrapServiceBeforeMsiFailure'
 ) {
-    throw "Elevated installer helper must own a gated kill-on-close process tree and liveness boundary."
+    throw "Elevated installer helper must own gated process, phase-evidence, and pre-MSI recovery boundaries."
+}
+$msiElevatedSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Invoke-BoundlessMsiElevated'
+if (
+    $msiElevatedSource -notmatch 'MsiMayHaveStartedEvent\.Reset\(\)' -or
+    $msiElevatedSource -notmatch 'cleanup could not be proven' -or
+    $msiElevatedSource -notmatch '\$exitCode -notin @\(0, 3010\)'
+) {
+    throw "Returned non-start and definitive MSI failures must publish bootstrap recovery eligibility."
+}
+$monitorCommandSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'New-BoundlessTrayQuiescenceMonitorCommand'
+if (
+    $monitorCommandSource -match 'Get-CimInstance|Invoke-CimMethod' -or
+    $monitorCommandSource -notmatch 'GetTokenInformation' -or
+    $monitorCommandSource -notmatch 'heartbeat_event_name' -or
+    $monitorCommandSource -notmatch 'sentinelReleaseAuthorized' -or
+    $monitorCommandSource -notmatch 'Hold-QuiescenceAfterGuardianFailure' -or
+    $monitorCommandSource -notmatch '_MSIExecute'
+) {
+    throw "Tray quiescence monitoring must use direct token identity, heartbeat, and authoritative MSI-idle evidence."
 }
 $serviceStopSource = Get-PowerShellFunctionSource `
     -Path $installScript `
@@ -302,6 +333,19 @@ foreach ($scriptFile in $selfTestScripts) {
     Invoke-PackagingScript -ScriptPath $scriptFile.FullName -Arguments @("-SelfTest") | Out-Null
 }
 
+$fixtureHosts = @()
+foreach ($hostName in @("powershell.exe", "pwsh.exe")) {
+    $hostCommand = Get-Command $hostName -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $hostCommand) { continue }
+    $fixtureHosts += $hostName
+    if (-not $hostCommand.Source.Equals($script:PowerShellExe, [StringComparison]::OrdinalIgnoreCase)) {
+        Invoke-PackagingScript `
+            -ScriptPath $installScript `
+            -Arguments @("-SelfTest") `
+            -PowerShellExe $hostCommand.Source | Out-Null
+    }
+}
+
 $smokeSid = "S-1-5-21-1000-1000-1000-1001"
 $installResult = Invoke-PackagingScript -ScriptPath $installScript -Arguments @(
     "-ResolveOnly",
@@ -316,4 +360,4 @@ if ($summary.selected_user_sid -ne $smokeSid) {
     throw "Boundless-Install.ps1 -ResolveOnly resolved unexpected SID: $($summary.selected_user_sid)"
 }
 
-Write-Host "packaging_script_smoke=passed self_tests=$($selfTestScripts.Count) install_resolve_only=passed wix_upgrade_contract=passed helper_upgrade_contract=passed"
+Write-Host "packaging_script_smoke=passed self_tests=$($selfTestScripts.Count) install_fixture_hosts=$($fixtureHosts -join ',') install_resolve_only=passed wix_upgrade_contract=passed helper_upgrade_contract=passed"
