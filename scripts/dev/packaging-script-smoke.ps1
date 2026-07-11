@@ -134,11 +134,13 @@ foreach ($requiredInstallContract in @(
         'failed_drain_quiescence_fixture',
         'kernel_object_acl_fixture',
         'blocking_service_stop_fixture',
+        'start_pending_service_recovery_fixture',
         'failed_msi_service_recovery_fixture',
         'hard_cancel_before_msi_recovery_fixture',
         'uncertain_transaction_guardian_fixture',
         'stalled_monitor_heartbeat_fixture',
         'stalled_monitor_takeover_fixture',
+        'hard_kill_parent_service_recovery_fixture',
         'Start-BoundlessTrayQuiescenceSentinelOwner',
         'ElevatedInstallCoordinatorProcessId',
         'Get-BoundlessServiceStatusBounded',
@@ -157,6 +159,29 @@ $stopTraySource = Get-PowerShellFunctionSource `
     -Name 'Stop-BoundlessTrayForUpgrade'
 if ($stopTraySource -match 'Invoke-BoundedProcess' -or $stopTraySource -match '--quit') {
     throw "Boundless-Install.ps1 must not execute a tray image discovered from a user process."
+}
+$stopwatchIndex = $stopTraySource.IndexOf('[Diagnostics.Stopwatch]::StartNew')
+$targetDiscoveryIndex = $stopTraySource.IndexOf('Get-BoundlessTrayProcessesForCurrentSession')
+if (
+    $stopwatchIndex -lt 0 -or
+    $targetDiscoveryIndex -lt 0 -or
+    $stopwatchIndex -gt $targetDiscoveryIndex
+) {
+    throw "Tray shutdown timeout must include target discovery and owner verification."
+}
+$ownerLookupSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Get-ProcessOwnerSid'
+$nativeInstallSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Initialize-BoundlessInstallNativeMethods'
+if (
+    $ownerLookupSource -match 'Get-CimInstance|Invoke-CimMethod' -or
+    $ownerLookupSource -notmatch 'BoundlessInstallNativeMethods' -or
+    $nativeInstallSource -notmatch 'GetTokenInformation' -or
+    $nativeInstallSource -notmatch 'ConvertSidToStringSidW'
+) {
+    throw "Tray owner verification must use direct process-token SID lookup without CIM/WMI."
 }
 $postInstallSource = Get-PowerShellFunctionSource `
     -Path $installScript `
@@ -184,9 +209,11 @@ if (
     $invokeMsiSource -notmatch 'Copy-BoundlessInstallerLogHandoff' -or
     $invokeMsiSource -notmatch 'CompletionEvent' -or
     $invokeMsiSource -notmatch 'TreeJobName' -or
-    $invokeMsiSource -notmatch 'TreeClosureState'
+    $invokeMsiSource -notmatch 'TreeClosureState' -or
+    $invokeMsiSource -notmatch 'HardKillRecoveryAction' -or
+    $invokeMsiSource -notmatch 'Restore-BoundlessServiceAfterHardKilledElevatedInstall'
 ) {
-    throw "Installer parent must supervise elevation/tree completion and copy the completed staged log itself."
+    throw "Installer parent must supervise elevation/tree completion, hard-kill recovery, and completed staged-log handoff."
 }
 $elevatedCommandSource = Get-PowerShellFunctionSource `
     -Path $installScript `
@@ -232,7 +259,8 @@ if (
     $serviceStopSource -match '\$service\.Stop\(\)' -or
     $serviceStopSource -notmatch 'Wait-BoundlessServiceTransition' -or
     $serviceStopSource -notmatch 'The MSI was not started' -or
-    $serviceStopSource -notmatch 'BoundlessServiceStopInitialStatus'
+    $serviceStopSource -notmatch 'BoundlessServiceStopInitialStatus' -or
+    $serviceStopSource -notmatch '"StartPending"'
 ) {
     throw "Upgrade service stop must supervise the blocking SCM request outside the installer process."
 }
@@ -258,7 +286,7 @@ $serviceRecoverySource = Get-PowerShellFunctionSource `
     -Name 'Invoke-BoundlessMsiWithServiceRecovery'
 if (
     $serviceRecoverySource -notmatch 'definitive_failure' -or
-    $serviceRecoverySource -notmatch 'initial_status -eq "Running"' -or
+    $serviceRecoverySource -notmatch 'initial_status -in @\("Running", "StartPending"\)' -or
     $serviceRecoverySource -notmatch 'BoundlessServiceRecoveryError'
 ) {
     throw "Failed MSI recovery must restart only an originally running service after a definitive boundary."

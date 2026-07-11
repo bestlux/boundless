@@ -2425,6 +2425,10 @@ function Enter-BoundlessTrayQuiescence {
                 msi_definitive_completion = $false
                 msi_transaction_idle_proven = $false
                 quiescence_abandoned_to_monitor = $false
+                quiescence_guardian_process_id = $null
+                elevated_wrapper_hard_kill_used = $false
+                parent_service_recovery_reconciled = $false
+                parent_service_recovery_status = ""
             }
         }
     }
@@ -2860,6 +2864,110 @@ function Wait-BoundlessInstallerTreeBoundaryClosed {
     throw "Elevated installer process tree did not close within $TimeoutMilliseconds ms; active=$active."
 }
 
+function Restore-BoundlessServiceAfterHardKilledElevatedInstall {
+    param(
+        [object]$QuiescenceLease,
+        [string]$StagedHelperPath,
+        [int]$TimeoutMilliseconds = 30000,
+        [scriptblock]$RecoveryProcessFactory = $null,
+        [scriptblock]$ServiceStatusProbe = $null
+    )
+
+    if (
+        $null -eq $QuiescenceLease.service_initial_running_event -or
+        $null -eq $QuiescenceLease.msi_may_have_started_event
+    ) {
+        throw "Parent service recovery did not receive protected installer phase evidence."
+    }
+    if (-not $QuiescenceLease.service_initial_running_event.WaitOne(0)) {
+        return [pscustomobject]@{
+            required = $false
+            status = "original_service_not_running_or_starting"
+        }
+    }
+    if ($QuiescenceLease.msi_may_have_started_event.WaitOne(0)) {
+        return [pscustomobject]@{
+            required = $false
+            status = "msi_may_have_started"
+        }
+    }
+
+    if ($null -eq $ServiceStatusProbe) {
+        $ServiceStatusProbe = {
+            Get-BoundlessServiceStatusBounded -TimeoutSeconds 2
+        }
+    }
+    $statusBeforeRecovery = & $ServiceStatusProbe
+    if ($statusBeforeRecovery -in @("Running", "StartPending")) {
+        return [pscustomobject]@{
+            required = $true
+            status = "already_running_or_starting"
+        }
+    }
+    if ($statusBeforeRecovery -notin @("Stopped", "StopPending")) {
+        throw "Parent service recovery found ineligible BoundlessService state $statusBeforeRecovery."
+    }
+
+    $process = $null
+    try {
+        $process = if ($null -ne $RecoveryProcessFactory) {
+            & $RecoveryProcessFactory
+        }
+        else {
+            $arguments = @(
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                $StagedHelperPath,
+                "-ElevatedBootstrapServiceRecovery",
+                "-ElevatedInstallServiceInitialRunningEvent",
+                $QuiescenceLease.service_initial_running_event_name,
+                "-ElevatedInstallMsiMayHaveStartedEvent",
+                $QuiescenceLease.msi_may_have_started_event_name,
+                "-ElevatedInstallMsiDefinitiveCompletionEvent",
+                $QuiescenceLease.msi_definitive_completion_event_name,
+                "-ElevatedInstallMsiIdleProvenEvent",
+                $QuiescenceLease.msi_idle_proven_event_name
+            )
+            $startArguments = @{
+                FilePath = Resolve-CurrentPowerShellExecutable
+                ArgumentList = (@(
+                    $arguments | ForEach-Object { ConvertTo-ProcessArgument -Value $_ }
+                ) -join " ")
+                WindowStyle = "Hidden"
+                PassThru = $true
+            }
+            if (-not (Test-IsAdministrator)) {
+                $startArguments.Verb = "RunAs"
+            }
+            Start-Process @startArguments
+        }
+        if ($null -eq $process) {
+            throw "Parent service recovery did not start an elevated recovery process."
+        }
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            Stop-BoundlessProcessBoundary -Process $process -TimeoutMilliseconds 5000
+            throw "Parent service recovery exceeded $TimeoutMilliseconds milliseconds."
+        }
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            throw "Parent service recovery failed with exit code $($process.ExitCode)."
+        }
+        $statusAfterRecovery = & $ServiceStatusProbe
+        if ($statusAfterRecovery -notin @("Running", "StartPending")) {
+            throw "Parent service recovery process exited successfully but BoundlessService remained $statusAfterRecovery."
+        }
+        return [pscustomobject]@{
+            required = $true
+            status = "restored"
+        }
+    }
+    finally {
+        if ($null -ne $process) { $process.Dispose() }
+    }
+}
+
 function Wait-BoundlessElevatedInstallSupervised {
     param(
         [Diagnostics.Process]$InstallerProcess,
@@ -2868,6 +2976,7 @@ function Wait-BoundlessElevatedInstallSupervised {
         [Threading.EventWaitHandle]$CompletionEvent,
         [string]$TreeJobName,
         [object]$TreeClosureState,
+        [scriptblock]$HardKillRecoveryAction = $null,
         [int]$TimeoutSeconds = 900,
         [int]$CancellationGraceMilliseconds = 30000,
         [int]$HeartbeatTimeoutMilliseconds = 5000
@@ -2897,7 +3006,13 @@ function Wait-BoundlessElevatedInstallSupervised {
         if (-not $CancellationEvent.Set()) {
             throw "$failure Installer cancellation signaling failed."
         }
+        $hardKillUsed = $false
         if (-not $InstallerProcess.WaitForExit($CancellationGraceMilliseconds)) {
+            $hardKillUsed = $true
+            $TreeClosureState | Add-Member `
+                -NotePropertyName hard_kill_used `
+                -NotePropertyValue $true `
+                -Force
             Stop-BoundlessProcessBoundary `
                 -Process $InstallerProcess `
                 -TimeoutMilliseconds 5000
@@ -2907,6 +3022,29 @@ function Wait-BoundlessElevatedInstallSupervised {
             -CompletionEvent $CompletionEvent `
             -TreeJobName $TreeJobName
         $TreeClosureState.confirmed = $true
+        if ($hardKillUsed -and $null -ne $HardKillRecoveryAction) {
+            while ($true) {
+                try {
+                    $recovery = & $HardKillRecoveryAction
+                    $TreeClosureState | Add-Member `
+                        -NotePropertyName parent_service_recovery_reconciled `
+                        -NotePropertyValue $true `
+                        -Force
+                    $TreeClosureState | Add-Member `
+                        -NotePropertyName parent_service_recovery_status `
+                        -NotePropertyValue ([string]$recovery.status) `
+                        -Force
+                    break
+                }
+                catch {
+                    Write-Warning (
+                        "Parent recovery after hard-killing the elevated installer failed; " +
+                        "tray quiescence remains held and recovery will retry. $($_.Exception.Message)"
+                    )
+                    Start-Sleep -Seconds 1
+                }
+            }
+        }
         throw "$failure The staged installer process boundary was canceled."
     }
     Wait-BoundlessInstallerTreeBoundaryClosed `
@@ -3308,7 +3446,7 @@ function Invoke-BoundlessMsiWithServiceRecovery {
         $originalError = $_
         $completionState = [string]$originalError.Exception.Data["BoundlessMsiCompletionState"]
         if (
-            $ServiceShutdown.initial_status -eq "Running" -and
+            $ServiceShutdown.initial_status -in @("Running", "StartPending") -and
             $completionState -in @("definitive_failure", "not_started")
         ) {
             try {
@@ -4104,6 +4242,13 @@ function Invoke-BoundlessMsi {
                 -CompletionEvent $QuiescenceLease.completion_event `
                 -TreeJobName $QuiescenceLease.tree_job_name `
                 -TreeClosureState $treeClosureState `
+                -HardKillRecoveryAction {
+                    Restore-BoundlessServiceAfterHardKilledElevatedInstall `
+                        -QuiescenceLease $QuiescenceLease `
+                        -StagedHelperPath (Join-Path `
+                            $elevatedCommand.stage_path `
+                            "Boundless-Install.ps1")
+                } `
                 -TimeoutSeconds $TimeoutSeconds
         }
         catch {
@@ -4143,6 +4288,19 @@ function Invoke-BoundlessMsi {
             $treeClosureState.confirmed = $true
         }
         $QuiescenceLease.evidence.installer_tree_closed = $treeClosureState.confirmed
+        if ($null -ne $treeClosureState.PSObject.Properties["hard_kill_used"]) {
+            $QuiescenceLease.evidence.elevated_wrapper_hard_kill_used = (
+                [bool]$treeClosureState.hard_kill_used
+            )
+        }
+        if ($null -ne $treeClosureState.PSObject.Properties["parent_service_recovery_reconciled"]) {
+            $QuiescenceLease.evidence.parent_service_recovery_reconciled = (
+                [bool]$treeClosureState.parent_service_recovery_reconciled
+            )
+            $QuiescenceLease.evidence.parent_service_recovery_status = (
+                [string]$treeClosureState.parent_service_recovery_status
+            )
+        }
         [void](Update-BoundlessInstallerPhaseEvidence -Lease $QuiescenceLease)
         if ($null -ne $process) {
             if ($treeClosureState.confirmed) {
@@ -4515,7 +4673,7 @@ function Stop-BoundlessServiceForUpgrade {
         }
     }
     $initialStatus = & $StatusProbe
-    if ($initialStatus -eq "Running" -and $null -ne $InitialRunningEvent) {
+    if ($initialStatus -in @("Running", "StartPending") -and $null -ne $InitialRunningEvent) {
         if (-not $InitialRunningEvent.Set()) {
             throw "Could not publish the originally-running BoundlessService boundary before stop."
         }
@@ -4617,7 +4775,7 @@ function Stop-BoundlessServiceBeforeMsi {
         $stopRequested = [bool]$originalError.Exception.Data[
             "BoundlessServiceStopRequested"
         ]
-        if ($initialStatus -ne "Running" -or -not $stopRequested) {
+        if ($initialStatus -notin @("Running", "StartPending") -or -not $stopRequested) {
             $originalError.Exception.Data["BoundlessServiceRecovery"] = (
                 "start_requested=False;reason=original_service_not_running_or_stop_not_requested"
             )
@@ -4735,16 +4893,12 @@ function Start-BoundlessServiceAfterFailedInstall {
 function Get-ProcessOwnerSid {
     param([int]$ProcessId)
 
-    $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop |
-        Select-Object -First 1
-    if ($null -eq $process) {
+    Initialize-BoundlessInstallNativeMethods
+    $ownerSid = [BoundlessInstallNativeMethods]::GetProcessOwnerSid($ProcessId)
+    if ([string]::IsNullOrWhiteSpace($ownerSid)) {
         throw "Process $ProcessId exited before its owner could be verified."
     }
-    $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop
-    if ($owner.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace($owner.Sid)) {
-        throw "Could not prove the owner SID for Boundless tray process $ProcessId; return=$($owner.ReturnValue)."
-    }
-    return $owner.Sid
+    return $ownerSid
 }
 
 function Assert-BoundlessTrayShutdownTargets {
@@ -4772,10 +4926,27 @@ function Initialize-BoundlessInstallNativeMethods {
 
     Add-Type -TypeDefinition @"
 using System;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 
 public static class BoundlessInstallNativeMethods
 {
+    private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    private const uint TOKEN_QUERY = 0x0008;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SID_AND_ATTRIBUTES
+    {
+        public IntPtr Sid;
+        public uint Attributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TOKEN_USER
+    {
+        public SID_AND_ATTRIBUTES User;
+    }
+
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool PostThreadMessage(
@@ -4783,6 +4954,67 @@ public static class BoundlessInstallNativeMethods
         uint message,
         UIntPtr wParam,
         IntPtr lParam);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetTokenInformation(
+        IntPtr tokenHandle,
+        int tokenInformationClass,
+        IntPtr tokenInformation,
+        int tokenInformationLength,
+        out int returnLength);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool ConvertSidToStringSidW(IntPtr sid, out IntPtr stringSid);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
+
+    public static string GetProcessOwnerSid(int processId)
+    {
+        IntPtr process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
+        if (process == IntPtr.Zero)
+        {
+            int error = Marshal.GetLastWin32Error();
+            if (error == 87) { return String.Empty; }
+            throw new Win32Exception(error, "OpenProcess(owner lookup) failed");
+        }
+        IntPtr token = IntPtr.Zero;
+        IntPtr buffer = IntPtr.Zero;
+        IntPtr sidText = IntPtr.Zero;
+        try
+        {
+            if (!OpenProcessToken(process, TOKEN_QUERY, out token))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "OpenProcessToken failed");
+            int required;
+            GetTokenInformation(token, 1, IntPtr.Zero, 0, out required);
+            int sizeError = Marshal.GetLastWin32Error();
+            if (required <= 0 || sizeError != 122)
+                throw new Win32Exception(sizeError, "GetTokenInformation(size) failed");
+            buffer = Marshal.AllocHGlobal(required);
+            if (!GetTokenInformation(token, 1, buffer, required, out required))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "GetTokenInformation(TokenUser) failed");
+            TOKEN_USER user = (TOKEN_USER)Marshal.PtrToStructure(buffer, typeof(TOKEN_USER));
+            if (!ConvertSidToStringSidW(user.User.Sid, out sidText))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "ConvertSidToStringSid failed");
+            return Marshal.PtrToStringUni(sidText);
+        }
+        finally
+        {
+            if (sidText != IntPtr.Zero) LocalFree(sidText);
+            if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+            if (token != IntPtr.Zero) CloseHandle(token);
+            CloseHandle(process);
+        }
+    }
 }
 "@
 }
@@ -4849,6 +5081,7 @@ function Stop-BoundlessTrayForUpgrade {
         [int]$TimeoutSeconds = 8
     )
 
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     $currentSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
     if ($ExpectedSessionId -lt 0) {
         $ExpectedSessionId = $currentSessionId
@@ -4871,7 +5104,6 @@ function Stop-BoundlessTrayForUpgrade {
         }
     }
 
-    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     $processIds = @($targets | Select-Object -ExpandProperty id)
     # Never execute an image path discovered from a user-owned process while
     # this helper may already be elevated. New trays expose a trusted named
@@ -5369,6 +5601,18 @@ function Invoke-BoundlessInstallerSupervisionFixture {
 
     $control = New-BoundlessInstallerControlEvent -UserSid $UserSid
     $completion = New-BoundlessInstallerCompletionEvent -UserSid $UserSid
+    $serviceInitial = New-BoundlessInstallerPhaseEvent `
+        -UserSid $UserSid `
+        -Phase "ServiceInitialRunning"
+    $msiMayHaveStarted = New-BoundlessInstallerPhaseEvent `
+        -UserSid $UserSid `
+        -Phase "MsiMayHaveStarted"
+    $recoverySignal = New-BoundlessSentinelOwnerEvent `
+        -Prefix "Boundless.Test.ParentHardKillRecovery.v1" `
+        -UserSid $UserSid
+    $serviceStoppedSignal = New-BoundlessSentinelOwnerEvent `
+        -Prefix "Boundless.Test.ParentHardKillServiceStopped.v1" `
+        -UserSid $UserSid
     $treeJobName = "Local\Boundless.Installer.Tree.v1.$([guid]::NewGuid().ToString('N'))"
     $installer = $null
     $monitorProcess = $null
@@ -5377,7 +5621,16 @@ function Invoke-BoundlessInstallerSupervisionFixture {
         [Threading.EventResetMode]::ManualReset
     )
     try {
-        $installerSource = 'Start-Sleep -Seconds 30'
+        [void]$serviceInitial.event.Set()
+        $stoppedPayload = [Convert]::ToBase64String(
+            [Text.Encoding]::UTF8.GetBytes($serviceStoppedSignal.name)
+        )
+        $installerSource = @'
+$name = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("__EVENT__"))
+$event = [Threading.EventWaitHandle]::OpenExisting($name)
+try { [void]$event.Set() } finally { $event.Dispose() }
+Start-Sleep -Seconds 30
+'@.Replace("__EVENT__", $stoppedPayload)
         $monitorSource = 'Start-Sleep -Milliseconds 500; exit 17'
         $installer = Start-Process `
             -FilePath (Resolve-CurrentPowerShellExecutable) `
@@ -5388,6 +5641,9 @@ function Invoke-BoundlessInstallerSupervisionFixture {
             ) `
             -WindowStyle Hidden `
             -PassThru
+        if (-not $serviceStoppedSignal.event.WaitOne(5000)) {
+            throw "Installer supervision fixture wrapper did not publish its simulated service stop."
+        }
         $monitorProcess = Start-Process `
             -FilePath (Resolve-CurrentPowerShellExecutable) `
             -ArgumentList @(
@@ -5404,6 +5660,13 @@ function Invoke-BoundlessInstallerSupervisionFixture {
         $stopwatch = [Diagnostics.Stopwatch]::StartNew()
         $failure = $null
         $treeClosureState = [pscustomobject]@{ confirmed = $false }
+        $recoveryPayload = [Convert]::ToBase64String(
+            [Text.Encoding]::UTF8.GetBytes($recoverySignal.name)
+        )
+        $fixtureLease = [pscustomobject]@{
+            service_initial_running_event = $serviceInitial.event
+            msi_may_have_started_event = $msiMayHaveStarted.event
+        }
         try {
             Wait-BoundlessElevatedInstallSupervised `
                 -InstallerProcess $installer `
@@ -5412,6 +5675,35 @@ function Invoke-BoundlessInstallerSupervisionFixture {
                 -CompletionEvent $completion.event `
                 -TreeJobName $treeJobName `
                 -TreeClosureState $treeClosureState `
+                -HardKillRecoveryAction {
+                    Restore-BoundlessServiceAfterHardKilledElevatedInstall `
+                        -QuiescenceLease $fixtureLease `
+                        -StagedHelperPath "fixture" `
+                        -TimeoutMilliseconds 5000 `
+                        -ServiceStatusProbe {
+                            if ($recoverySignal.event.WaitOne(0)) { return "Running" }
+                            if ($serviceStoppedSignal.event.WaitOne(0)) { return "Stopped" }
+                            return "Unknown"
+                        } `
+                        -RecoveryProcessFactory {
+                            $source = @'
+$name = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("__EVENT__"))
+$event = [Threading.EventWaitHandle]::OpenExisting($name)
+try { [void]$event.Set() } finally { $event.Dispose() }
+'@.Replace("__EVENT__", $recoveryPayload)
+                            Start-Process `
+                                -FilePath (Resolve-CurrentPowerShellExecutable) `
+                                -ArgumentList @(
+                                    "-NoProfile",
+                                    "-EncodedCommand",
+                                    [Convert]::ToBase64String(
+                                        [Text.Encoding]::Unicode.GetBytes($source)
+                                    )
+                                ) `
+                                -WindowStyle Hidden `
+                                -PassThru
+                        }
+                } `
                 -TimeoutSeconds 15 `
                 -CancellationGraceMilliseconds 500 | Out-Null
         }
@@ -5425,9 +5717,13 @@ function Invoke-BoundlessInstallerSupervisionFixture {
             -not $control.event.WaitOne(0) -or
             -not $installer.HasExited -or
             -not $treeClosureState.confirmed -or
+            -not $treeClosureState.hard_kill_used -or
+            -not $treeClosureState.parent_service_recovery_reconciled -or
+            $treeClosureState.parent_service_recovery_status -ne "restored" -or
+            -not $recoverySignal.event.WaitOne(0) -or
             $stopwatch.ElapsedMilliseconds -gt 7000
         ) {
-            throw "Installer supervision fixture did not promptly cancel its long-running process after monitor death."
+            throw "Installer supervision fixture did not hard-kill its wrapper and reconcile parent-owned service recovery before returning."
         }
     }
     finally {
@@ -5445,6 +5741,10 @@ function Invoke-BoundlessInstallerSupervisionFixture {
         }
         $control.event.Dispose()
         $completion.event.Dispose()
+        $msiMayHaveStarted.event.Dispose()
+        $serviceInitial.event.Dispose()
+        $recoverySignal.event.Dispose()
+        $serviceStoppedSignal.event.Dispose()
         $heartbeat.Dispose()
     }
 }
@@ -6086,6 +6386,59 @@ Start-Sleep -Seconds 30
             $recoveryState.service -ne "Running"
         ) {
             throw "Pre-MSI partial-stop fixture did not restore the originally running service exactly once while preserving the stop error."
+        }
+
+        $startPendingOrigin = [Threading.EventWaitHandle]::new(
+            $false,
+            [Threading.EventResetMode]::ManualReset
+        )
+        try {
+            $startPendingState = [pscustomobject]@{
+                service = "StartPending"
+                status_calls = 0
+                start_requests = 0
+            }
+            $startPendingError = $null
+            try {
+                Stop-BoundlessServiceBeforeMsi `
+                    -TimeoutSeconds 2 `
+                    -StatusProbe {
+                        $startPendingState.status_calls += 1
+                        if ($startPendingState.status_calls -eq 1) { return "StartPending" }
+                        if ($startPendingState.status_calls -eq 2) {
+                            throw "fixture StartPending post-stop failure"
+                        }
+                        return $startPendingState.service
+                    } `
+                    -WorkerFactory {
+                        $startPendingState.service = "Stopped"
+                        Start-BoundlessServiceControlWorker -Action "stop" -FixtureSource "exit 0"
+                    } `
+                    -RecoveryWorkerFactory {
+                        $startPendingState.start_requests += 1
+                        $startPendingState.service = "Running"
+                        Start-BoundlessServiceControlWorker -Action "start" -FixtureSource "exit 0"
+                    } `
+                    -InitialRunningEvent $startPendingOrigin `
+                    -SkipAdministratorCheck | Out-Null
+            }
+            catch {
+                $startPendingError = $_
+            }
+            if (
+                $null -eq $startPendingError -or
+                $startPendingError.Exception.Message -notmatch 'StartPending post-stop failure' -or
+                -not $startPendingOrigin.WaitOne(0) -or
+                [string]$startPendingError.Exception.Data["BoundlessServiceRecovery"] -notmatch
+                    'start_requested=True;final_status=Running' -or
+                $startPendingState.start_requests -ne 1 -or
+                $startPendingState.service -ne "Running"
+            ) {
+                throw "Pre-MSI StartPending fixture did not publish restart eligibility and restore the service after stopping it."
+            }
+        }
+        finally {
+            $startPendingOrigin.Dispose()
         }
 
         $pendingState = [pscustomobject]@{
@@ -7516,6 +7869,7 @@ function Invoke-InstallHelperSelfTest {
         tray_quiescence_monitor_fixture = "passed"
         replacement_tray_window_fixture = "passed"
         supervised_installer_cancellation_fixture = "passed"
+        hard_kill_parent_service_recovery_fixture = "passed"
         stalled_monitor_heartbeat_fixture = "passed"
         coordinator_death_cancellation_fixture = "passed"
         failed_drain_quiescence_fixture = "passed"
@@ -7530,6 +7884,7 @@ function Invoke-InstallHelperSelfTest {
         staging_child_process_probe_hosts = $stagingProbeHosts
         bounded_service_stop_fixture = "passed"
         blocking_service_stop_fixture = "passed"
+        start_pending_service_recovery_fixture = "passed"
         failed_msi_service_recovery_fixture = "passed"
         elevated_install_result_fixture = "passed"
         elevated_in_memory_command_fixture = "passed"
