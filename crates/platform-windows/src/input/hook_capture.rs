@@ -893,13 +893,19 @@ fn windows_key_semantics(
     capture_num_lock_on: bool,
     actual_num_lock_on: bool,
 ) -> KeySemantics {
-    let virtual_key = match ambiguous_keypad_virtual_key(scan_code, actual_num_lock_on) {
-        Some(actual_virtual_key) if raw_vk_code == actual_virtual_key => {
+    let virtual_key = match (
+        ambiguous_keypad_virtual_key(scan_code, actual_num_lock_on),
+        ambiguous_keypad_virtual_key(scan_code, !actual_num_lock_on),
+    ) {
+        (Some(actual_virtual_key), _) if raw_vk_code == actual_virtual_key => {
             ambiguous_keypad_virtual_key(scan_code, capture_num_lock_on).unwrap_or(raw_vk_code)
         }
-        // A mismatch from the actual-OS projection is a temporary modifier
-        // override reported by KBDLLHOOKSTRUCT (for example Shift turning
-        // Numpad1 into End). Preserve that first-down identity.
+        (_, Some(inverted_virtual_key)) if raw_vk_code == inverted_virtual_key => {
+            // Shift temporarily inverts the actual OS projection. Apply the
+            // same inversion to the capture-logical projection, which may
+            // differ after Boundless suppresses a Num Lock toggle.
+            ambiguous_keypad_virtual_key(scan_code, !capture_num_lock_on).unwrap_or(raw_vk_code)
+        }
         _ => raw_vk_code,
     };
     KeySemantics::Windows {
@@ -2573,6 +2579,125 @@ mod tests {
     }
 
     #[test]
+    fn keypad_projection_preserves_modifier_role_across_num_lock_cross_product() {
+        const NUMPAD1_SCAN: u16 = 0x4F;
+
+        for actual_num_lock_on in [false, true] {
+            for capture_num_lock_on in [false, true] {
+                for modifier_inverted in [false, true] {
+                    let raw_num_lock_on = actual_num_lock_on ^ modifier_inverted;
+                    let expected_num_lock_on = capture_num_lock_on ^ modifier_inverted;
+                    let raw_virtual_key =
+                        ambiguous_keypad_virtual_key(NUMPAD1_SCAN, raw_num_lock_on)
+                            .expect("Numpad1 raw projection");
+                    let expected_virtual_key =
+                        ambiguous_keypad_virtual_key(NUMPAD1_SCAN, expected_num_lock_on)
+                            .expect("Numpad1 capture projection");
+
+                    assert_eq!(
+                        windows_key_semantics(
+                            NUMPAD1_SCAN,
+                            raw_virtual_key,
+                            capture_num_lock_on,
+                            actual_num_lock_on,
+                        ),
+                        KeySemantics::Windows {
+                            virtual_key: expected_virtual_key,
+                            num_lock_on: capture_num_lock_on,
+                        },
+                        "actual={actual_num_lock_on} capture={capture_num_lock_on} modifier_inverted={modifier_inverted}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shift_inverted_numpad1_survives_repeat_when_capture_on_actual_off() {
+        const VK_END: u16 = 0x23;
+        const VK_NUMPAD1: u16 = 0x61;
+        const VK_LSHIFT: u16 = 0xA0;
+
+        let _guard = registry_test_guard().lock().expect("test guard");
+        reset_active_runtime_for_test();
+        let core = test_runtime_core();
+        activate_capture_runtime(&core).expect("activate runtime");
+        set_hook_lock_active_for(&core, true).expect("lock capture");
+
+        let _ = key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Down, true);
+        let _ = key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Up, true);
+        assert!(!core.actual_num_lock_state.is_on());
+        let _ = key_semantics_for_hook_event(0x2A, VK_LSHIFT, KeyState::Down, true);
+
+        let expected = KeySemantics::Windows {
+            virtual_key: VK_END,
+            num_lock_on: true,
+        };
+        assert_eq!(
+            key_semantics_for_hook_event(0x4F, VK_NUMPAD1, KeyState::Down, true),
+            expected,
+            "Shift-inverted actual-off input must project through capture-logical Num Lock on"
+        );
+        let _ = key_semantics_for_hook_event(0x2A, VK_LSHIFT, KeyState::Up, true);
+        assert_eq!(
+            key_semantics_for_hook_event(0x4F, VK_END, KeyState::Down, true),
+            expected,
+            "repeat after Shift release must retain the first-down projection"
+        );
+        assert_eq!(
+            key_semantics_for_hook_event(0x4F, VK_END, KeyState::Up, true),
+            expected,
+            "release must retain the first-down projection"
+        );
+
+        set_hook_lock_active_for(&core, false).expect("unlock capture");
+        clear_active_capture_runtime(&core).expect("cleanup runtime");
+    }
+
+    #[test]
+    fn shift_inverted_numpad1_survives_repeat_when_capture_off_actual_on() {
+        const VK_END: u16 = 0x23;
+        const VK_NUMPAD1: u16 = 0x61;
+        const VK_LSHIFT: u16 = 0xA0;
+
+        let _guard = registry_test_guard().lock().expect("test guard");
+        reset_active_runtime_for_test();
+        let core = test_runtime_core();
+        core.actual_num_lock_state.set(true);
+        activate_capture_runtime(&core).expect("activate runtime");
+        set_hook_lock_active_for(&core, true).expect("lock capture");
+
+        let _ = key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Down, true);
+        let _ = key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Up, true);
+        assert!(core.actual_num_lock_state.is_on());
+        let _ = key_semantics_for_hook_event(0x2A, VK_LSHIFT, KeyState::Down, true);
+
+        let expected = KeySemantics::Windows {
+            virtual_key: VK_NUMPAD1,
+            num_lock_on: false,
+        };
+        assert_eq!(
+            key_semantics_for_hook_event(0x4F, VK_END, KeyState::Down, true),
+            expected,
+            "Shift-inverted actual-on input must project through capture-logical Num Lock off"
+        );
+        let _ = key_semantics_for_hook_event(0x2A, VK_LSHIFT, KeyState::Up, true);
+        assert_eq!(
+            key_semantics_for_hook_event(0x4F, VK_NUMPAD1, KeyState::Down, true),
+            expected,
+            "repeat after Shift release must retain the first-down projection"
+        );
+        assert_eq!(
+            key_semantics_for_hook_event(0x4F, VK_NUMPAD1, KeyState::Up, true),
+            expected,
+            "release must retain the first-down projection"
+        );
+
+        set_hook_lock_active_for(&core, false).expect("unlock capture");
+        clear_active_capture_runtime(&core).expect("cleanup runtime");
+    }
+
+    #[test]
     fn suppressed_num_lock_preserves_numpad1_hold_identity_across_toggle() {
         let _guard = registry_test_guard().lock().expect("test guard");
         reset_active_runtime_for_test();
@@ -2744,14 +2869,14 @@ mod tests {
         );
 
         assert_eq!(
-            key_semantics_for_hook_event(0x4F, VK_END, KeyState::Down, true),
+            key_semantics_for_hook_event(0x4F, VK_NUMPAD1, KeyState::Down, true),
             KeySemantics::Windows {
                 virtual_key: VK_END,
                 num_lock_on: false,
             },
-            "a new press after release must observe the current hook identity and Num Lock metadata"
+            "a new press after release must project the actual hook identity through capture-logical Num Lock"
         );
-        let _ = key_semantics_for_hook_event(0x4F, VK_END, KeyState::Up, true);
+        let _ = key_semantics_for_hook_event(0x4F, VK_NUMPAD1, KeyState::Up, true);
 
         set_hook_lock_active_for(&core, false).expect("unlock capture");
         clear_active_capture_runtime(&core).expect("cleanup runtime");
@@ -2777,7 +2902,7 @@ mod tests {
 
         set_hook_lock_active_for(&core, true).expect("redundant active update");
         assert_eq!(
-            key_semantics_for_hook_event(0x4F, 0x61, KeyState::Down, true),
+            key_semantics_for_hook_event(0x4F, 0x23, KeyState::Down, true),
             KeySemantics::Windows {
                 virtual_key: 0x61,
                 num_lock_on: true,
