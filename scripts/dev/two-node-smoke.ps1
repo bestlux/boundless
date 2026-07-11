@@ -91,6 +91,42 @@ function Wait-ForTransportEvent {
     throw "Timed out waiting for transport event '$Pattern' at $Endpoint"
 }
 
+function Save-FailureDiagnostics {
+    param(
+        [string]$Name,
+        [string]$Endpoint,
+        [System.Diagnostics.Process]$Process,
+        [string]$DestinationRoot
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Endpoint) -or $null -eq $Process -or $Process.HasExited) {
+        return
+    }
+
+    $sections = [System.Collections.Generic.List[string]]::new()
+    foreach ($command in @(
+            @("transport", "events", "--limit", "512"),
+            @("daemon", "status"),
+            @("peer", "list"),
+            @("input", "owner")
+        )) {
+        try {
+            $rendered = $command -join " "
+            $output = Invoke-Cli -Endpoint $Endpoint -CommandArgs $command
+            $exitCode = $LASTEXITCODE
+            $sections.Add("=== $rendered (exit=$exitCode) ===")
+            $sections.Add(($output -join [Environment]::NewLine))
+        }
+        catch {
+            $sections.Add("=== $($command -join ' ') ===")
+            $sections.Add("diagnostic query failed: $($_.Exception.Message)")
+        }
+    }
+
+    $path = Join-Path $DestinationRoot "$Name-failure-diagnostics.txt"
+    [System.IO.File]::WriteAllLines($path, $sections, [System.Text.UTF8Encoding]::new($false))
+}
+
 function Get-TransportEventMatchCount {
     param(
         [string]$Endpoint,
@@ -549,6 +585,8 @@ try {
 catch {
     $shouldKeepArtifacts = $true
     if (Test-Path $runRoot) {
+        Save-FailureDiagnostics -Name "node1" -Endpoint $node1Endpoint -Process $node1 -DestinationRoot $runRoot
+        Save-FailureDiagnostics -Name "node2" -Endpoint $node2Endpoint -Process $node2 -DestinationRoot $runRoot
         Write-Host "[smoke] failure artifacts kept at: $runRoot"
         $reportedFailureArtifacts = $true
     }
