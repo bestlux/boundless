@@ -840,6 +840,7 @@ impl ControlPlaneService for ControlPlaneApi {
             capture_active: reply.capture_active,
             capture_forwarding_authorized: reply.capture_forwarding_authorized,
             inject_batch_id: reply.inject_batch_id,
+            inject_batch_cancelled: reply.inject_batch_cancelled,
         }))
     }
 

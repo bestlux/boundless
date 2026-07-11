@@ -63,6 +63,7 @@ struct InputBrokerRelayInner {
 pub(crate) struct InputBrokerInjectBatch {
     pub batch_id: u64,
     pub frames: Vec<PendingInjectInputFrame>,
+    pub cancelled: bool,
 }
 
 /// Session-neutral relay between the LocalSystem service daemon and the
@@ -406,15 +407,30 @@ impl InputBrokerRelay {
         let batch = InputBrokerInjectBatch {
             batch_id: inner.next_inject_batch_id,
             frames,
+            cancelled: false,
         };
         inner.inflight_inject_batch = Some(batch.clone());
         batch
+    }
+
+    pub(crate) fn cancel_inflight_inject_batch(
+        &self,
+        batch_id: u64,
+    ) -> Option<InputBrokerInjectBatch> {
+        let mut inner = self.lock();
+        let batch = inner.inflight_inject_batch.as_mut()?;
+        if batch.batch_id != batch_id {
+            return None;
+        }
+        batch.cancelled = true;
+        Some(batch.clone())
     }
 
     pub(crate) fn take_inflight_inject_frames(&self) -> Vec<PendingInjectInputFrame> {
         self.lock()
             .inflight_inject_batch
             .take()
+            .filter(|batch| !batch.cancelled)
             .map(|batch| batch.frames)
             .unwrap_or_default()
     }

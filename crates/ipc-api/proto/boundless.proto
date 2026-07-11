@@ -502,6 +502,7 @@ message InputBrokerExchangeReply {
   bool capture_active = 5;
   bool capture_forwarding_authorized = 6;
   uint64 inject_batch_id = 7;
+  bool inject_batch_cancelled = 8;
 }
 
 message ClipboardBrokerPayload {

@@ -55,10 +55,16 @@ Incoming (peer frame -> local injection):
    assigns a batch ID, and retains that batch until its exact acknowledgment.
 3. The broker injects frames in FIFO order with `SendInput` in the user session.
    A partial native send retains the exact uncommitted event suffix and applies
-   request-side backpressure, so later frames cannot overtake it. The next
-   exchange acknowledges a batch only after every frame completes.
+   request-side backpressure, so later frames cannot overtake it. Before any
+   suffix retry, another successful exchange revalidates every retained frame's
+   owner/share-input authority. Revocation latches a whole-batch cancellation
+   under the same ID; the daemon repeats it across response loss until the tray
+   drops its local remainder, releases any locally held keys/buttons, and
+   acknowledges that ID. A batch is otherwise acknowledged only after every
+   frame completes.
 4. Cooperative detach, replacement, or stale re-attach returns any
-   unacknowledged daemon-owned batch to the front of the pending queue.
+   unacknowledged, non-cancelled daemon-owned batch to the front of the pending
+   queue; a latched cancellation is never resurrected.
 
 Clipboard (service mode with broker attached):
 

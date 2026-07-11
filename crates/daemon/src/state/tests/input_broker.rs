@@ -1052,6 +1052,117 @@ async fn inject_batch_backpressure_preserves_fifo_until_exact_ack() {
 }
 
 #[tokio::test]
+async fn retained_inject_batch_cancellation_replays_until_ack_and_unblocks_later_work() {
+    let (state, root) = service_mode_broker_state("boundless-broker-inject-cancel-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("claim owner")
+    );
+    state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id.clone(),
+                sequence: 1,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
+                }],
+            },
+        )
+        .await
+        .expect("route first frame");
+
+    let first = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert!(first.accepted);
+    assert!(!first.inject_batch_cancelled);
+    assert_eq!(first.inject_frames[0].sequence, 1);
+    assert!(state.release_input_owner(&peer_id).await, "revoke owner");
+
+    let cancellation_observation = InputBrokerExchangeObservations {
+        inject_backpressure: true,
+        ..Default::default()
+    };
+    let cancelled = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            cancellation_observation.clone(),
+        )
+        .await;
+    assert!(cancelled.accepted);
+    assert_eq!(cancelled.inject_batch_id, first.inject_batch_id);
+    assert!(cancelled.inject_batch_cancelled);
+    assert!(cancelled.inject_frames.is_empty());
+
+    let replayed = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            cancellation_observation,
+        )
+        .await;
+    assert!(replayed.accepted);
+    assert_eq!(replayed.inject_batch_id, first.inject_batch_id);
+    assert!(replayed.inject_batch_cancelled);
+    assert!(replayed.inject_frames.is_empty());
+
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("restore owner")
+    );
+    state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id.clone(),
+                sequence: 2,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::Key {
+                    scan_code: 31,
+                    state: KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
+                }],
+            },
+        )
+        .await
+        .expect("route later frame");
+    let next = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                acked_inject_batch_id: first.inject_batch_id,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(next.accepted);
+    assert!(!next.inject_batch_cancelled);
+    assert_ne!(next.inject_batch_id, first.inject_batch_id);
+    assert_eq!(next.inject_frames[0].sequence, 2);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn stale_reattach_requeues_unacknowledged_inject_batch() {
     let (state, root) = service_mode_broker_state("boundless-broker-stale-inject-test").await;
     let peer_id = join_connected_peer(&state).await;

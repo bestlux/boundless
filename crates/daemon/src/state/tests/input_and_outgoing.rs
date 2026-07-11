@@ -1002,6 +1002,78 @@ async fn pending_input_injection_queue_drops_new_move_when_full_of_non_move_fram
 }
 
 #[tokio::test]
+async fn front_requeue_never_evicts_retained_mixed_frames_from_a_full_queue() {
+    let (state, peer_id, root) = state_with_transfer_peer("boundless-inject-front-requeue").await;
+    let pending = |sequence, events| PendingInjectInputFrame {
+        peer_id: peer_id.clone(),
+        sequence,
+        capture_timestamp_unix_ms: sequence as i64,
+        received_timestamp_unix_ms: sequence as i64,
+        queued_timestamp_unix_ms: sequence as i64,
+        retry_count: 0,
+        next_retry_at: None,
+        events,
+    };
+    let newer = (1_000..1_000 + MAX_PENDING_INJECT_INPUT_FRAMES as u64)
+        .map(|sequence| {
+            pending(
+                sequence,
+                vec![InputEvent::Key {
+                    scan_code: (sequence % 64) as u16 + 1,
+                    state: KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
+                }],
+            )
+        })
+        .collect();
+    state.requeue_pending_inject_input_frames_back(newer).await;
+
+    state
+        .requeue_pending_inject_input_frames_front(vec![
+            pending(
+                10,
+                vec![InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
+                }],
+            ),
+            pending(11, vec![InputEvent::MouseMove { dx: 5, dy: -3 }]),
+        ])
+        .await;
+
+    let queued = state
+        .dequeue_pending_inject_input_frames_up_to(usize::MAX)
+        .await;
+    assert_eq!(queued.len(), MAX_PENDING_INJECT_INPUT_FRAMES);
+    assert_eq!(
+        queued
+            .iter()
+            .map(|frame| frame.sequence)
+            .take(3)
+            .collect::<Vec<_>>(),
+        vec![10, 11, 1_000],
+        "retained key/move frames must stay FIFO ahead of pre-existing newer work"
+    );
+    assert!(matches!(
+        queued[1].events.as_slice(),
+        [InputEvent::MouseMove { dx: 5, dy: -3 }]
+    ));
+    assert_eq!(
+        queued.last().map(|frame| frame.sequence),
+        Some(1_000 + MAX_PENDING_INJECT_INPUT_FRAMES as u64 - 3),
+        "overflow must evict the newest pre-existing work"
+    );
+    assert!(state.transport_events().await.iter().all(|event| {
+        event.kind != "input_queue_overflow_drop"
+            || !(event.detail.contains("sequence=10 reason=")
+                || event.detail.contains("sequence=11 reason="))
+    }));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn queue_input_events_validates_size_and_increments_sequence() {
     let root = std::env::temp_dir().join(format!(
         "boundless-queue-input-events-test-{}",

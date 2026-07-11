@@ -103,6 +103,40 @@ impl BrokerInjectBatchState {
         self.last_completed_batch_id
     }
 
+    fn accept_reply(
+        &mut self,
+        batch_id: u64,
+        cancelled: bool,
+        frames: Vec<Vec<core_input::InputEvent>>,
+    ) -> Result<bool> {
+        if !cancelled {
+            self.accept_batch(batch_id, frames)?;
+            return Ok(false);
+        }
+        if batch_id == 0 {
+            bail!("input broker cancelled an inject batch without a batch id");
+        }
+        if !frames.is_empty() {
+            bail!("input broker cancelled inject batch {batch_id} while also returning frames");
+        }
+        if self.last_completed_batch_id == batch_id {
+            // A lost response can replay the cancellation until its ack is
+            // observed by the daemon.
+            return Ok(false);
+        }
+        if let Some(active_batch_id) = self.active_batch_id
+            && active_batch_id != batch_id
+        {
+            bail!(
+                "input broker cancelled batch {batch_id} while {active_batch_id} remained pending"
+            );
+        }
+        self.frames.clear();
+        self.active_batch_id = None;
+        self.last_completed_batch_id = batch_id;
+        Ok(true)
+    }
+
     fn accept_batch(
         &mut self,
         batch_id: u64,
@@ -229,27 +263,35 @@ impl InjectedInputState {
         }
     }
 
+    #[cfg(test)]
     fn drain_release_events(&mut self) -> Vec<core_input::InputEvent> {
-        self.pressed_buttons.sort_by_key(|button| match button {
+        let releases = self.release_events_snapshot();
+        self.pressed_buttons.clear();
+        self.pressed_keys.clear();
+        releases
+    }
+
+    fn release_events_snapshot(&self) -> Vec<core_input::InputEvent> {
+        let mut pressed_buttons = self.pressed_buttons.clone();
+        pressed_buttons.sort_by_key(|button| match button {
             core_input::MouseButton::Left => 0,
             core_input::MouseButton::Right => 1,
             core_input::MouseButton::Middle => 2,
             core_input::MouseButton::X1 => 3,
             core_input::MouseButton::X2 => 4,
         });
-        self.pressed_keys
-            .sort_unstable_by_key(|(scan_code, _)| *scan_code);
-        let mut releases = self
-            .pressed_buttons
-            .drain(..)
+        let mut pressed_keys = self.pressed_keys.clone();
+        pressed_keys.sort_unstable_by_key(|(scan_code, _)| *scan_code);
+        let mut releases = pressed_buttons
+            .into_iter()
             .map(|button| core_input::InputEvent::MouseButton {
                 button,
                 state: core_input::KeyState::Up,
             })
             .collect::<Vec<_>>();
         releases.extend(
-            self.pressed_keys
-                .drain(..)
+            pressed_keys
+                .into_iter()
                 .map(|(scan_code, semantics)| core_input::InputEvent::Key {
                     scan_code,
                     state: core_input::KeyState::Up,
@@ -260,11 +302,11 @@ impl InjectedInputState {
     }
 
     fn release_local(&mut self) -> Result<()> {
-        let releases = self.drain_release_events();
-        self.windows_input
-            .send_events(&releases)
-            .into_result()
-            .map(|_| ())
+        let releases = self.release_events_snapshot();
+        let outcome = self.windows_input.send_events(&releases);
+        let committed = outcome.committed_event_count.min(releases.len());
+        self.observe(&releases[..committed]);
+        outcome.into_result().map(|_| ())
     }
 }
 
@@ -748,11 +790,6 @@ async fn input_broker_exchange_loop(
     let mut inject_batches = BrokerInjectBatchState::default();
 
     loop {
-        let inject_progress = inject_batches.process(injected_state);
-        injected_frame_count = injected_frame_count
-            .saturating_add(inject_progress.completed_frames);
-        inject_failure_count = inject_failure_count
-            .saturating_add(inject_progress.failed_attempts);
         safety_unlock.observe(pump.drain_control_actions());
         let observed_events = pump.poll_events();
         let observed_event_count = observed_events.len();
@@ -861,7 +898,25 @@ async fn input_broker_exchange_loop(
             }
             decoded_inject_frames.push(events);
         }
-        inject_batches.accept_batch(reply.inject_batch_id, decoded_inject_frames)?;
+        let inject_batch_cancelled_now = inject_batches.accept_reply(
+            reply.inject_batch_id,
+            reply.inject_batch_cancelled,
+            decoded_inject_frames,
+        )?;
+        if inject_batch_cancelled_now {
+            injected_state
+                .release_local()
+                .context("release locally held input after daemon batch cancellation")?;
+        }
+        // Native injection happens only after this exchange has successfully
+        // re-authorized (or cancelled) the retained batch. A response loss
+        // therefore cannot trigger a suffix retry under stale owner/feature
+        // state.
+        let inject_progress = inject_batches.process(injected_state);
+        injected_frame_count = injected_frame_count
+            .saturating_add(inject_progress.completed_frames);
+        inject_failure_count = inject_failure_count
+            .saturating_add(inject_progress.failed_attempts);
 
         let poll = if reply.capture_active || had_inject_frames || observed_event_count > 0 {
             INPUT_BROKER_ACTIVE_POLL
@@ -985,6 +1040,91 @@ mod input_broker_tests {
             .accept_batch(7, vec![vec![core_input::InputEvent::MouseMove { dx: 1, dy: 0 }]])
             .expect("completed batch replay is deduplicated");
         assert!(!batch.backpressure_active());
+    }
+
+    #[test]
+    fn cancelled_batch_drops_partial_suffix_before_retry_and_allows_later_batch() {
+        let key_down = core_input::InputEvent::Key {
+            scan_code: 30,
+            state: core_input::KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let mouse_down = core_input::InputEvent::MouseButton {
+            button: core_input::MouseButton::Left,
+            state: core_input::KeyState::Down,
+        };
+        let later = core_input::InputEvent::Key {
+            scan_code: 31,
+            state: core_input::KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let mut batch = BrokerInjectBatchState::default();
+        batch
+            .accept_reply(
+                7,
+                false,
+                vec![vec![key_down.clone(), mouse_down.clone()]],
+            )
+            .expect("stage authorized batch");
+        let mut injected = InjectedInputState::new(WindowsNumLockState::new(false));
+        let first = batch.process_with(&mut injected, |events, state| {
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: 1,
+                    remaining_events: vec![mouse_down.clone()],
+                    error: Some(anyhow::anyhow!("scripted suffix failure")),
+                },
+            )
+        });
+        assert_eq!(first.failed_attempts, 1);
+        assert!(batch.backpressure_active());
+
+        let cancelled_now = batch
+            .accept_reply(7, true, Vec::new())
+            .expect("owner revocation cancels retained suffix");
+        assert!(cancelled_now);
+        assert_eq!(
+            injected.drain_release_events(),
+            vec![core_input::InputEvent::Key {
+                scan_code: 30,
+                state: core_input::KeyState::Up,
+                semantics: core_input::KeySemantics::Physical,
+            }],
+            "cancelling a partially committed batch must release held local input"
+        );
+        let after_cancel = batch.process_with(&mut injected, |_events, _state| {
+            panic!("cancelled input suffix must not be retried")
+        });
+        assert_eq!(after_cancel, BrokerInjectProgress::default());
+        assert!(!batch.backpressure_active());
+        assert_eq!(batch.acked_batch_id(), 7);
+
+        assert!(
+            !batch
+            .accept_reply(7, true, Vec::new())
+            .expect("lost cancellation response replays idempotently")
+        );
+        batch
+            .accept_reply(8, false, vec![vec![later.clone()]])
+            .expect("later authorized batch proceeds");
+        let mut attempted = Vec::new();
+        let later_progress = batch.process_with(&mut injected, |events, state| {
+            attempted.extend_from_slice(events);
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: events.len(),
+                    remaining_events: Vec::new(),
+                    error: None,
+                },
+            )
+        });
+        assert_eq!(later_progress.completed_frames, 1);
+        assert_eq!(attempted, vec![later]);
+        assert_eq!(batch.acked_batch_id(), 8);
     }
 
     #[test]

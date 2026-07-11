@@ -619,6 +619,7 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             capture_active: outcome.capture_active,
             capture_forwarding_authorized: outcome.capture_forwarding_authorized,
             inject_batch_id: outcome.inject_batch_id,
+            inject_batch_cancelled: outcome.inject_batch_cancelled,
         })
     }
 

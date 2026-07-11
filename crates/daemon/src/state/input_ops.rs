@@ -500,19 +500,30 @@ impl AppState {
 
         let mut dropped = Vec::new();
         let mut queue = self.input.inject.pending_inject_frames.write().await;
-        for frame in frames.into_iter().rev() {
-            if queue.len() >= MAX_PENDING_INJECT_INPUT_FRAMES {
-                let dropped_frame = remove_newest_coalescible_pending_inject_frame(&mut queue)
-                    .map(|frame| (frame, "evict_newest_move"))
-                    .or_else(|| {
-                        queue
-                            .pop_back()
-                            .map(|frame| (frame, "evict_newest_fallback"))
-                    });
-                if let Some((dropped_frame, reason)) = dropped_frame {
-                    dropped.push((dropped_frame.peer_id, dropped_frame.sequence, reason));
-                }
+        // Every caller returns a bounded drain (currently at most 64 frames)
+        // into a larger 128-frame queue. Reserve the retained slice's full
+        // capacity before inserting any of it so overflow eviction can inspect
+        // only pre-existing, newer work. Otherwise a retained move inserted
+        // first by the reverse/prepend loop can evict itself on the next frame.
+        assert!(
+            frames.len() <= MAX_PENDING_INJECT_INPUT_FRAMES,
+            "retained inject slice must fit the bounded pending queue"
+        );
+        let retained_capacity = frames.len();
+        let newer_capacity = MAX_PENDING_INJECT_INPUT_FRAMES.saturating_sub(retained_capacity);
+        while queue.len() > newer_capacity {
+            let dropped_frame = remove_newest_coalescible_pending_inject_frame(&mut queue)
+                .map(|frame| (frame, "evict_newest_move"))
+                .or_else(|| {
+                    queue
+                        .pop_back()
+                        .map(|frame| (frame, "evict_newest_fallback"))
+                });
+            if let Some((dropped_frame, reason)) = dropped_frame {
+                dropped.push((dropped_frame.peer_id, dropped_frame.sequence, reason));
             }
+        }
+        for frame in frames.into_iter().rev() {
             queue.push_front(frame);
         }
         let depth = queue.len();

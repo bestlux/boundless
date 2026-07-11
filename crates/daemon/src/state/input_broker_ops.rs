@@ -20,6 +20,7 @@ pub struct InputBrokerExchangeOutcome {
     pub capture_active: bool,
     pub capture_forwarding_authorized: bool,
     pub inject_batch_id: u64,
+    pub inject_batch_cancelled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -606,7 +607,39 @@ impl AppState {
         }
 
         let existing_batch = self.input_broker.inflight_inject_batch();
-        let batch = if let Some(batch) = existing_batch {
+        let batch = if let Some(mut batch) = existing_batch {
+            if !batch.cancelled {
+                let mut authorization_changed = false;
+                for frame in &batch.frames {
+                    if !self.input_injection_allowed_for_peer(&frame.peer_id).await {
+                        authorization_changed = true;
+                    }
+                }
+                if authorization_changed {
+                    for frame in &batch.frames {
+                        self.record_input_inject_skipped(
+                            &frame.peer_id,
+                            frame.sequence,
+                            frame.events.len(),
+                            frame.timing(),
+                            "retained_batch_authorization_changed",
+                        )
+                        .await;
+                    }
+                    let Some(cancelled_batch) = self
+                        .input_broker
+                        .cancel_inflight_inject_batch(batch.batch_id)
+                    else {
+                        return InputBrokerExchangeOutcome {
+                            accepted: false,
+                            message: "input broker inject batch changed during authorization revalidation"
+                                .to_string(),
+                            ..Default::default()
+                        };
+                    };
+                    batch = cancelled_batch;
+                }
+            }
             Some(batch)
         } else if observations.inject_backpressure {
             None
@@ -641,7 +674,8 @@ impl AppState {
             (!accepted.is_empty()).then(|| self.input_broker.stage_inject_batch(accepted))
         };
         let inject_batch_id = batch.as_ref().map_or(0, |batch| batch.batch_id);
-        let inject_frames = if observations.inject_backpressure {
+        let inject_batch_cancelled = batch.as_ref().is_some_and(|batch| batch.cancelled);
+        let inject_frames = if observations.inject_backpressure || inject_batch_cancelled {
             Vec::new()
         } else {
             batch.map_or_else(Vec::new, |batch| batch.frames)
@@ -655,6 +689,7 @@ impl AppState {
             capture_active,
             capture_forwarding_authorized,
             inject_batch_id,
+            inject_batch_cancelled,
         }
     }
 
