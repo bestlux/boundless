@@ -913,6 +913,12 @@ fn input_broker_supervisor_loop(
         // future/session. That closes the response-loss window between the
         // final SendInput call and the next exchange acknowledgement.
         let mut inject_batches = BrokerInjectBatchState::default();
+        // A local safety unlock must likewise outlive the broker session that
+        // observed it. If the reporting RPC fails before the daemon receives
+        // the count, a replacement session must remain unlocked and retry the
+        // same reconciliation instead of accepting the daemon's stale lock
+        // request.
+        let mut safety_unlock = SafetyUnlockReconciler::default();
         loop {
             if inject_batches.local_cleanup_pending()
                 && !retry_pending_local_cleanup(&mut inject_batches)
@@ -930,6 +936,7 @@ fn input_broker_supervisor_loop(
                 &endpoint,
                 shutdown_rx.clone(),
                 &mut inject_batches,
+                &mut safety_unlock,
             )
             .await
             {
@@ -988,6 +995,7 @@ async fn run_input_broker_session(
     endpoint: &str,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     inject_batches: &mut BrokerInjectBatchState,
+    safety_unlock: &mut SafetyUnlockReconciler,
 ) -> Result<BrokerSessionEnd> {
     // Fail closed: never broker interactive input from a non-interactive
     // (session 0) process, even if a daemon would accept it.
@@ -1067,6 +1075,7 @@ async fn run_input_broker_session(
             &mut pump,
             &mut injected_state,
             inject_batches,
+            safety_unlock,
         ) => (result, BrokerSessionEnd::Detached),
         _ = wait_for_broker_shutdown(&mut shutdown_rx) => (Ok(()), BrokerSessionEnd::Shutdown),
     };
@@ -1084,6 +1093,12 @@ async fn run_input_broker_session(
     } else {
         inject_batches.clear_held_input_resume();
     }
+
+    // The escape gesture or lease watchdog can fire after the last exchange
+    // request was assembled, including while that RPC is failing. Retain
+    // those final actions in supervisor-owned state before this pump drops so
+    // the next attachment reports them and refuses stale relock authority.
+    safety_unlock.observe(pump.drain_control_actions());
 
     // Unlock and locally release injected state before any cleanup IPC.
     let _ = pump.set_lock_active(false);
@@ -1138,10 +1153,10 @@ async fn input_broker_exchange_loop(
     pump: &mut HookInputPump,
     injected_state: &mut InjectedInputState,
     inject_batches: &mut BrokerInjectBatchState,
+    safety_unlock: &mut SafetyUnlockReconciler,
 ) -> Result<()> {
     let mut injected_frame_count = 0u32;
     let mut inject_failure_count = 0u32;
-    let mut safety_unlock = SafetyUnlockReconciler::default();
     let mut capture_forwarding = BrokerCaptureForwardingGate::default();
     loop {
         safety_unlock.observe(pump.drain_control_actions());
@@ -2376,6 +2391,46 @@ mod input_broker_tests {
         state.observe(vec![HookControlAction::LeaseExpiredUnlock]);
         assert_eq!(state.report_counts(), (0, 1, 0));
         assert!(!state.lock_should_be_active(true, true));
+    }
+
+    #[test]
+    fn failed_exchange_preserves_safety_unlock_for_reattached_session() {
+        // This value models the supervisor-owned reconciler shared by two
+        // successive broker sessions. The first session submits an escape but
+        // loses the RPC response before it can mark the report delivered.
+        let mut supervisor_state = SafetyUnlockReconciler::default();
+        {
+            let first_session = &mut supervisor_state;
+            first_session.observe(vec![HookControlAction::EscapeUnlock]);
+            assert_eq!(first_session.report_counts(), (1, 0, 0));
+            assert!(!first_session.lock_should_be_active(true, true));
+        }
+
+        // Reattachment must retry the exact pending cause and remain unlocked
+        // through both the stale lock reply and the later daemon release.
+        {
+            let reattached_session = &mut supervisor_state;
+            assert_eq!(reattached_session.report_counts(), (1, 0, 0));
+            assert!(!reattached_session.should_forward_captured_events());
+            assert!(!reattached_session.lock_should_be_active(true, true));
+            reattached_session.mark_report_delivered();
+            assert!(!reattached_session.lock_should_be_active(false, false));
+            assert!(reattached_session.should_forward_captured_events());
+        }
+    }
+
+    #[test]
+    fn session_teardown_actions_join_unacknowledged_safety_report() {
+        let mut supervisor_state = SafetyUnlockReconciler::default();
+        supervisor_state.observe(vec![HookControlAction::EscapeUnlock]);
+        let submitted_before_rpc_failure = supervisor_state.report_counts();
+        assert_eq!(submitted_before_rpc_failure, (1, 0, 0));
+
+        // The lease can expire while the failed exchange future is unwinding.
+        // Teardown drains that final pump action into the same durable state.
+        supervisor_state.observe(vec![HookControlAction::LeaseExpiredUnlock]);
+        assert_eq!(supervisor_state.report_counts(), (1, 1, 0));
+        assert!(!supervisor_state.lock_should_be_active(true, true));
     }
 
     #[test]
