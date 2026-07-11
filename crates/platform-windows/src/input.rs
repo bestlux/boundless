@@ -117,6 +117,7 @@ struct PreparedInputRecords {
     records: Vec<INPUT>,
     authority_after_record: Vec<PreparedNumLockAuthority>,
     committed_events_after_record: Vec<usize>,
+    event_record_ranges: Vec<(usize, usize)>,
     committed_events_before_first_record: usize,
     committed_events: usize,
 }
@@ -158,6 +159,7 @@ impl PreparedInputRecords {
 #[derive(Debug)]
 pub struct InputSendOutcome {
     pub committed_event_count: usize,
+    pub remaining_events: Vec<InputEvent>,
     pub error: Option<anyhow::Error>,
 }
 
@@ -166,13 +168,19 @@ impl InputSendOutcome {
     fn success(committed_event_count: usize) -> Self {
         Self {
             committed_event_count,
+            remaining_events: Vec::new(),
             error: None,
         }
     }
 
-    fn failure(committed_event_count: usize, error: anyhow::Error) -> Self {
+    fn failure(
+        committed_event_count: usize,
+        remaining_events: Vec<InputEvent>,
+        error: anyhow::Error,
+    ) -> Self {
         Self {
             committed_event_count,
+            remaining_events,
             error: Some(error),
         }
     }
@@ -219,10 +227,10 @@ impl WindowsInputState {
         if let Err(error) = release_pending_boundless_num_lock(&mut authority, &mut sender)
             .context("release pending Boundless Num Lock key before input batch")
         {
-            return InputSendOutcome::failure(0, error);
+            return InputSendOutcome::failure(0, events.to_vec(), error);
         }
         let prepared = prepare_input_records(events, authority.on);
-        send_prepared_input_records(&prepared, &mut authority, &mut sender)
+        send_prepared_input_records(events, &prepared, &mut authority, &mut sender)
     }
 }
 
@@ -382,6 +390,9 @@ fn prepare_input_records(events: &[InputEvent], initial_num_lock_on: bool) -> Pr
         let first_record_index = prepared.records.len();
         append_input_records_for_event(event, &mut authority, &mut prepared);
         prepared.finish_event(first_record_index);
+        prepared
+            .event_record_ranges
+            .push((first_record_index, prepared.records.len()));
     }
     prepared
 }
@@ -560,6 +571,7 @@ fn keyboard_virtual_key_input(virtual_key: u16, key_up: bool) -> INPUT {
 
 #[cfg(windows)]
 fn send_prepared_input_records<F>(
+    events: &[InputEvent],
     prepared: &PreparedInputRecords,
     authority: &mut WindowsNumLockAuthority,
     sender: &mut F,
@@ -571,27 +583,50 @@ where
     let mut committed_event_count = prepared.committed_events_before_first_record;
     while offset < prepared.records.len() {
         let chunk = &prepared.records[offset..];
-        let sent = match sender(chunk)
-            .with_context(|| format!("send input record at index {offset}"))
-        {
-            Ok(sent) => sent as usize,
-            Err(error) => {
-                return finish_failed_input_send(error, committed_event_count, authority, sender);
-            }
-        };
+        let sent =
+            match sender(chunk).with_context(|| format!("send input record at index {offset}")) {
+                Ok(sent) => sent as usize,
+                Err(error) => {
+                    let remaining_events =
+                        exact_remaining_events(events, prepared, offset, committed_event_count);
+                    return finish_failed_input_send(
+                        error,
+                        committed_event_count,
+                        remaining_events,
+                        authority,
+                        sender,
+                    );
+                }
+            };
         if sent == 0 {
             let error = anyhow::anyhow!(
                 "partial send at index {offset}: sent 0 / {} input records",
                 chunk.len()
             );
-            return finish_failed_input_send(error, committed_event_count, authority, sender);
+            let remaining_events =
+                exact_remaining_events(events, prepared, offset, committed_event_count);
+            return finish_failed_input_send(
+                error,
+                committed_event_count,
+                remaining_events,
+                authority,
+                sender,
+            );
         }
         if sent > chunk.len() {
             let error = anyhow::anyhow!(
                 "invalid send count at index {offset}: sent {sent} / {} input records",
                 chunk.len()
             );
-            return finish_failed_input_send(error, committed_event_count, authority, sender);
+            let remaining_events =
+                exact_remaining_events(events, prepared, offset, committed_event_count);
+            return finish_failed_input_send(
+                error,
+                committed_event_count,
+                remaining_events,
+                authority,
+                sender,
+            );
         }
 
         for (next, next_committed_event_count) in prepared.authority_after_record
@@ -609,9 +644,45 @@ where
 }
 
 #[cfg(windows)]
+fn exact_remaining_events(
+    events: &[InputEvent],
+    prepared: &PreparedInputRecords,
+    sent_record_count: usize,
+    committed_event_count: usize,
+) -> Vec<InputEvent> {
+    let committed_event_count = committed_event_count.min(events.len());
+    let mut remaining = events[committed_event_count..].to_vec();
+    let Some(InputEvent::MouseWheel { delta_x, delta_y }) = remaining.first_mut() else {
+        return remaining;
+    };
+    let Some((record_start, record_end)) = prepared
+        .event_record_ranges
+        .get(committed_event_count)
+        .copied()
+    else {
+        return remaining;
+    };
+    let mut sent_in_event = sent_record_count
+        .saturating_sub(record_start)
+        .min(record_end.saturating_sub(record_start));
+    if *delta_y != 0 && sent_in_event > 0 {
+        *delta_y = 0;
+        sent_in_event -= 1;
+    }
+    if *delta_x != 0 && sent_in_event > 0 {
+        *delta_x = 0;
+    }
+    if *delta_x == 0 && *delta_y == 0 {
+        remaining.remove(0);
+    }
+    remaining
+}
+
+#[cfg(windows)]
 fn finish_failed_input_send<F>(
     error: anyhow::Error,
     committed_event_count: usize,
+    remaining_events: Vec<InputEvent>,
     authority: &mut WindowsNumLockAuthority,
     sender: &mut F,
 ) -> InputSendOutcome
@@ -619,9 +690,10 @@ where
     F: FnMut(&[INPUT]) -> Result<u32>,
 {
     match release_pending_boundless_num_lock(authority, sender) {
-        Ok(()) => InputSendOutcome::failure(committed_event_count, error),
+        Ok(()) => InputSendOutcome::failure(committed_event_count, remaining_events, error),
         Err(cleanup_error) => InputSendOutcome::failure(
             committed_event_count,
+            remaining_events,
             anyhow::anyhow!(
                 "{error:#}; Boundless Num Lock key-up cleanup failed: {cleanup_error:#}"
             ),
@@ -951,9 +1023,56 @@ mod tests {
         });
 
         assert_eq!(outcome.committed_event_count, 1);
+        assert_eq!(outcome.remaining_events, vec![events[1].clone()]);
         let error = outcome.error.expect("partial send must preserve its error");
         assert!(format!("{error:#}").contains("scripted mouse injection failure"));
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn partial_dual_axis_wheel_retry_contains_only_uncommitted_axis() {
+        let input = WindowsInputState::new(WindowsNumLockState::new(false));
+        let events = vec![InputEvent::MouseWheel {
+            delta_x: 40,
+            delta_y: 120,
+        }];
+        let mut calls = 0usize;
+        let outcome = input.send_events_with_sender(&events, |records| {
+            calls += 1;
+            match calls {
+                1 => {
+                    assert_eq!(records.len(), 2);
+                    assert_eq!(
+                        unsafe { records[0].Anonymous.mi }.dwFlags,
+                        MOUSEEVENTF_WHEEL
+                    );
+                    Ok(1)
+                }
+                2 => Err(anyhow::anyhow!("scripted horizontal failure")),
+                _ => panic!("unexpected send attempt {calls}"),
+            }
+        });
+
+        assert_eq!(outcome.committed_event_count, 0);
+        assert_eq!(
+            outcome.remaining_events,
+            vec![InputEvent::MouseWheel {
+                delta_x: 40,
+                delta_y: 0,
+            }]
+        );
+        assert!(outcome.error.is_some());
+
+        input
+            .send_events_with_sender(&outcome.remaining_events, |records| {
+                assert_eq!(records.len(), 1);
+                let horizontal = unsafe { records[0].Anonymous.mi };
+                assert_eq!(horizontal.dwFlags, MOUSEEVENTF_HWHEEL);
+                assert_eq!(horizontal.mouseData as i32, 40);
+                Ok(1)
+            })
+            .into_result()
+            .expect("retry only horizontal suffix");
     }
 
     #[test]

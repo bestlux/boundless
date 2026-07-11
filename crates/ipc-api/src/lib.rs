@@ -7,6 +7,11 @@ pub mod boundless {
 pub mod broker_events;
 pub mod client_identity;
 
+/// Exact protocol revision for the out-of-process input broker contract.
+/// Protobuf's default zero represents an unversioned/older peer and is always
+/// rejected; tray and daemon must negotiate this value before local locking.
+pub const INPUT_BROKER_PROTOCOL_REVISION: u32 = 1;
+
 /// The clipboard policy permits 8 MiB bitmap payloads. Reserve another MiB
 /// for the broker token, protobuf framing, and future envelope fields so a
 /// policy-valid image cannot trip tonic's 4 MiB unary default.

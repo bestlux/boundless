@@ -996,6 +996,75 @@ mod tests {
         }
     }
 
+    async fn assert_pre_hello_message_is_rejected(message: WireMessage) {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let (stream, mut remote) = TransportFaultHarness::pair();
+        let session = tokio::spawn(run_authenticated_session(
+            state.clone(),
+            peer_id.clone(),
+            stream,
+            true,
+            None,
+        ));
+
+        remote
+            .read_until("local hello", |frame| {
+                matches!(frame, WireMessage::Hello { .. })
+            })
+            .await;
+        remote.send_frame(message).await;
+
+        let rejection = remote
+            .read_until("pre-Hello protocol rejection", |frame| {
+                matches!(frame, WireMessage::Error { .. })
+            })
+            .await;
+        assert!(matches!(
+            rejection,
+            WireMessage::Error { message }
+                if message.contains("protocol not negotiated")
+                    && message.contains("initial Hello required")
+        ));
+        session
+            .await
+            .expect("session task joins")
+            .expect("protocol rejection closes session cleanly");
+
+        assert_eq!(
+            state.pending_inject_input_frame_count().await,
+            0,
+            "pre-Hello payload must not reach input injection"
+        );
+        assert!(state.transport_events().await.iter().any(|event| {
+            event.kind == "transport_frame_rejected"
+                && event.peer_id == peer_id
+                && event.detail.contains("reason=protocol_not_negotiated")
+                && event.detail.contains("expected=initial_hello")
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn pre_hello_input_frame_is_rejected_before_dispatch() {
+        assert_pre_hello_message_is_rejected(WireMessage::InputFrame {
+            machine_id: "remote-machine".to_string(),
+            sequence: 1,
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+            events: vec![WireInputEvent::MouseMove { dx: 7, dy: -3 }],
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pre_hello_ack_is_rejected_before_dispatch() {
+        assert_pre_hello_message_is_rejected(WireMessage::HelloAck {
+            machine_id: "remote-machine".to_string(),
+            accepted: true,
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn fault_harness_injects_read_write_flush_and_disconnect() {
         let (mut stream, mut remote) = TransportFaultHarness::pair();

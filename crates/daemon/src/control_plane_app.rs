@@ -559,16 +559,18 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
     ) -> Result<InputBrokerAttachSnapshot> {
         let outcome = self
             .state
-            .attach_input_broker(
+            .attach_input_broker_versioned(
                 broker_client_identity(command.verified_client),
                 command.broker_version,
                 command.lock_supported,
+                command.protocol_revision,
             )
             .await;
         Ok(InputBrokerAttachSnapshot {
             accepted: outcome.accepted,
             broker_token: outcome.broker_token,
             message: outcome.message,
+            protocol_revision: outcome.protocol_revision,
         })
     }
 
@@ -593,6 +595,8 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
                     dropped_event_count: command.dropped_event_count,
                     injected_frame_count: command.injected_frame_count,
                     inject_failure_count: command.inject_failure_count,
+                    inject_backpressure: command.inject_backpressure,
+                    acked_inject_batch_id: command.acked_inject_batch_id,
                     raw_device_wheel_event_count: command.raw_device_wheel_event_count,
                     raw_system_wheel_event_count: command.raw_system_wheel_event_count,
                     hook_wheel_event_count: command.hook_wheel_event_count,
@@ -614,6 +618,7 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             lock_should_be_active: outcome.lock_should_be_active,
             capture_active: outcome.capture_active,
             capture_forwarding_authorized: outcome.capture_forwarding_authorized,
+            inject_batch_id: outcome.inject_batch_id,
         })
     }
 

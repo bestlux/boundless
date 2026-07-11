@@ -50,10 +50,15 @@ Incoming (peer frame -> local injection):
 1. Peer transport routes frames through the unchanged `InputRouter`
    owner/policy checks into the pending inject queue.
 2. While a fresh broker is attached, the service inject loop leaves the queue
-   alone; each `ExchangeInputBroker` drains up to 64 frames, re-checking
-   `input_injection_allowed_for_peer` per frame.
-3. The broker injects returned frames with `SendInput` in the user session and
-   reports applied/failed counts on the next exchange.
+   alone. `ExchangeInputBroker` drains up to 64 frames only when no earlier
+   batch is in flight, re-checks `input_injection_allowed_for_peer` per frame,
+   assigns a batch ID, and retains that batch until its exact acknowledgment.
+3. The broker injects frames in FIFO order with `SendInput` in the user session.
+   A partial native send retains the exact uncommitted event suffix and applies
+   request-side backpressure, so later frames cannot overtake it. The next
+   exchange acknowledges a batch only after every frame completes.
+4. Cooperative detach, replacement, or stale re-attach returns any
+   unacknowledged daemon-owned batch to the front of the pending queue.
 
 Clipboard (service mode with broker attached):
 
@@ -91,6 +96,9 @@ Clipboard (service mode with broker attached):
 - Attach is rejected unless the daemon was started in service-session mode
   (`InputRuntimeMode::ServiceSessionUnsupported`); a user-session daemon owns
   capture directly and a broker would double-capture.
+- Attach also negotiates an exact broker protocol revision. An older tray is
+  rejected before it can lock input; a newer tray rejects an unversioned older
+  daemon and performs bounded cleanup if that daemon already issued a token.
 - The broker adds a per-attachment token, and exchanges with a stale or
   replaced token are rejected.
 - Clipboard broker exchange uses the same attachment token and verified-client
@@ -121,6 +129,9 @@ Clipboard (service mode with broker attached):
 - Poll-based exchange (8 ms active / 40 ms idle) adds up to one poll interval
   of latency per direction; a streaming exchange is a candidate follow-up if
   two-PC latency evidence warrants it.
+- Pending and in-flight injection queues are intentionally in-memory. Normal
+  detach/replacement/stale-recovery requeues unacknowledged work, but a hard
+  daemon-process crash is the durability boundary and can lose those frames.
 - Abrupt broker death (kill -9 of the tray) can leave keys held on a remote
   peer until the release synthesis runs on the next capture-target transition.
 - Real two-PC dogfood evidence is still required before the parity matrix rows

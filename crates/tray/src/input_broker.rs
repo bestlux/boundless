@@ -11,8 +11,8 @@
 
 use ipc_api::boundless::v1::{
     ClipboardBrokerApplyReport, ClipboardBrokerExchangeRequest, ClipboardBrokerPayload,
-    ClipboardBrokerLocalPayloadDisposition, InputBrokerAttachRequest, InputBrokerDetachRequest,
-    InputBrokerExchangeRequest,
+    ClipboardBrokerLocalPayloadDisposition, InputBrokerAttachReply, InputBrokerAttachRequest,
+    InputBrokerDetachRequest, InputBrokerExchangeRequest,
     clipboard_broker_payload, control_plane_service_client::ControlPlaneServiceClient,
 };
 use ipc_api::broker_events::{broker_events_from_input_events, input_events_from_broker_events};
@@ -29,6 +29,7 @@ const INPUT_BROKER_ACTIVE_POLL: Duration = Duration::from_millis(8);
 const INPUT_BROKER_IDLE_POLL: Duration = Duration::from_millis(40);
 const INPUT_BROKER_LOCK_LEASE: Duration = Duration::from_secs(2);
 const INPUT_BROKER_CAPTURE_STAGING_CAP: usize = 4096;
+const INPUT_BROKER_INJECT_BATCH_CAP: usize = 64;
 const CLIPBOARD_BROKER_POLL: Duration = Duration::from_millis(200);
 const CLIPBOARD_BROKER_RETRY: Duration = Duration::from_secs(3);
 
@@ -78,6 +79,106 @@ struct InjectedInputState {
     windows_input: WindowsInputState,
     pressed_keys: Vec<(u16, core_input::KeySemantics)>,
     pressed_buttons: Vec<core_input::MouseButton>,
+}
+
+#[derive(Debug, Default)]
+struct BrokerInjectBatchState {
+    active_batch_id: Option<u64>,
+    frames: std::collections::VecDeque<Vec<core_input::InputEvent>>,
+    last_completed_batch_id: u64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BrokerInjectProgress {
+    completed_frames: u32,
+    failed_attempts: u32,
+}
+
+impl BrokerInjectBatchState {
+    fn backpressure_active(&self) -> bool {
+        self.active_batch_id.is_some()
+    }
+
+    fn acked_batch_id(&self) -> u64 {
+        self.last_completed_batch_id
+    }
+
+    fn accept_batch(
+        &mut self,
+        batch_id: u64,
+        frames: Vec<Vec<core_input::InputEvent>>,
+    ) -> Result<()> {
+        if batch_id == 0 {
+            if frames.is_empty() {
+                return Ok(());
+            }
+            bail!("input broker inject reply carried frames without a batch id");
+        }
+        if frames.len() > INPUT_BROKER_INJECT_BATCH_CAP {
+            bail!(
+                "input broker inject batch {batch_id} exceeded bounded frame cap: {} > {}",
+                frames.len(),
+                INPUT_BROKER_INJECT_BATCH_CAP
+            );
+        }
+        if self.last_completed_batch_id == batch_id {
+            // A lost acknowledgement response can replay a completed ID. The
+            // server retains IDs, so acknowledge again without reinjection.
+            return Ok(());
+        }
+        if let Some(active_batch_id) = self.active_batch_id {
+            if active_batch_id != batch_id {
+                bail!(
+                    "input broker inject batch advanced while {active_batch_id} remained pending: received {batch_id}"
+                );
+            }
+            if !frames.is_empty() {
+                bail!("input broker replayed active batch {batch_id} while backpressure was set");
+            }
+            return Ok(());
+        }
+        if frames.is_empty() {
+            bail!("input broker announced new inject batch {batch_id} without frames");
+        }
+        self.active_batch_id = Some(batch_id);
+        self.frames.extend(frames);
+        Ok(())
+    }
+
+    fn process(&mut self, injected_state: &mut InjectedInputState) -> BrokerInjectProgress {
+        self.process_with(injected_state, apply_injected_input_events)
+    }
+
+    fn process_with<F>(
+        &mut self,
+        injected_state: &mut InjectedInputState,
+        mut apply: F,
+    ) -> BrokerInjectProgress
+    where
+        F: FnMut(&[core_input::InputEvent], &mut InjectedInputState) -> InputSendOutcome,
+    {
+        let mut progress = BrokerInjectProgress::default();
+        while let Some(events) = self.frames.front().cloned() {
+            let outcome = apply(&events, injected_state);
+            if outcome.error.is_none() {
+                self.frames.pop_front();
+                progress.completed_frames = progress.completed_frames.saturating_add(1);
+                continue;
+            }
+            self.frames
+                .front_mut()
+                .expect("front frame remains present")
+                .clone_from(&outcome.remaining_events);
+            progress.failed_attempts = progress.failed_attempts.saturating_add(1);
+            break;
+        }
+        if self.frames.is_empty()
+            && let Some(batch_id) = self.active_batch_id.take()
+        {
+            self.last_completed_batch_id = batch_id;
+        }
+        progress
+    }
 }
 
 impl InjectedInputState {
@@ -400,6 +501,24 @@ enum BrokerSessionEnd {
     Shutdown,
 }
 
+fn validate_input_broker_attach_revision(attach: &InputBrokerAttachReply) -> Result<()> {
+    if attach.protocol_revision == ipc_api::INPUT_BROKER_PROTOCOL_REVISION {
+        return Ok(());
+    }
+    bail!(
+        "input broker protocol mismatch: daemon={} expected={}",
+        attach.protocol_revision,
+        ipc_api::INPUT_BROKER_PROTOCOL_REVISION
+    )
+}
+
+fn mismatched_attach_cleanup_token(attach: &InputBrokerAttachReply) -> Option<&str> {
+    (attach.protocol_revision != ipc_api::INPUT_BROKER_PROTOCOL_REVISION
+        && attach.accepted
+        && !attach.broker_token.is_empty())
+    .then_some(attach.broker_token.as_str())
+}
+
 const INPUT_BROKER_CLEANUP_RPC_TIMEOUT: Duration = Duration::from_millis(500);
 const INPUT_BROKER_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -549,10 +668,26 @@ async fn run_input_broker_session(
         result = client.attach_input_broker(InputBrokerAttachRequest {
                 broker_version: env!("CARGO_PKG_VERSION").to_string(),
                 lock_supported: true,
+                protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
             }) => result?,
         _ = wait_for_broker_shutdown(&mut shutdown_rx) => return Ok(BrokerSessionEnd::Shutdown),
     }
     .into_inner();
+    if validate_input_broker_attach_revision(&attach).is_err() {
+        if let Some(stale_token) = mismatched_attach_cleanup_token(&attach) {
+            // An older daemon ignores the request revision and may issue a
+            // token in an unversioned reply. Clean that token before refusing
+            // to enter the lock/exchange loop.
+            let _ = tokio::time::timeout(
+                INPUT_BROKER_CLEANUP_RPC_TIMEOUT,
+                client.detach_input_broker(InputBrokerDetachRequest {
+                    broker_token: stale_token.to_string(),
+                }),
+            )
+            .await;
+        }
+        validate_input_broker_attach_revision(&attach)?;
+    }
     if !attach.accepted {
         eprintln!("boundless input broker attach rejected: {}", attach.message);
         return Ok(BrokerSessionEnd::NotNeeded);
@@ -610,8 +745,14 @@ async fn input_broker_exchange_loop(
     let mut inject_failure_count = 0u32;
     let mut safety_unlock = SafetyUnlockReconciler::default();
     let mut capture_forwarding = BrokerCaptureForwardingGate::default();
+    let mut inject_batches = BrokerInjectBatchState::default();
 
     loop {
+        let inject_progress = inject_batches.process(injected_state);
+        injected_frame_count = injected_frame_count
+            .saturating_add(inject_progress.completed_frames);
+        inject_failure_count = inject_failure_count
+            .saturating_add(inject_progress.failed_attempts);
         safety_unlock.observe(pump.drain_control_actions());
         let observed_events = pump.poll_events();
         let observed_event_count = observed_events.len();
@@ -654,6 +795,8 @@ async fn input_broker_exchange_loop(
                 dropped_event_count,
                 injected_frame_count,
                 inject_failure_count,
+                inject_backpressure: inject_batches.backpressure_active(),
+                acked_inject_batch_id: inject_batches.acked_batch_id(),
                 raw_device_wheel_event_count: wheel_sources.raw_device,
                 raw_system_wheel_event_count: wheel_sources.raw_system,
                 hook_wheel_event_count: wheel_sources.hook,
@@ -705,15 +848,20 @@ async fn input_broker_exchange_loop(
             safety_unlock.should_forward_captured_events(),
         );
 
-        let had_inject_frames = !reply.inject_frames.is_empty();
+        let had_inject_frames = reply.inject_batch_id != 0;
+        let mut decoded_inject_frames = Vec::with_capacity(reply.inject_frames.len());
         for frame in &reply.inject_frames {
             let (events, undecodable) = input_events_from_broker_events(&frame.events);
-            if undecodable > 0 || inject_input_events(&events, injected_state).is_err() {
-                inject_failure_count = inject_failure_count.saturating_add(1);
-            } else {
-                injected_frame_count = injected_frame_count.saturating_add(1);
+            if undecodable > 0 {
+                bail!(
+                    "input broker inject batch {} frame {} contained {undecodable} undecodable events",
+                    reply.inject_batch_id,
+                    frame.sequence
+                );
             }
+            decoded_inject_frames.push(events);
         }
+        inject_batches.accept_batch(reply.inject_batch_id, decoded_inject_frames)?;
 
         let poll = if reply.capture_active || had_inject_frames || observed_event_count > 0 {
             INPUT_BROKER_ACTIVE_POLL
@@ -727,6 +875,117 @@ async fn input_broker_exchange_loop(
 #[cfg(test)]
 mod input_broker_tests {
     use super::*;
+
+    #[test]
+    fn unversioned_accepted_attach_is_rejected_and_scheduled_for_cleanup() {
+        let old_daemon_reply = InputBrokerAttachReply {
+            accepted: true,
+            broker_token: "stale-token".to_string(),
+            message: String::new(),
+            protocol_revision: 0,
+        };
+
+        let error = validate_input_broker_attach_revision(&old_daemon_reply)
+            .expect_err("new tray must reject an unversioned daemon");
+        assert!(error.to_string().contains("daemon=0"));
+        assert_eq!(
+            mismatched_attach_cleanup_token(&old_daemon_reply),
+            Some("stale-token")
+        );
+
+        let current = InputBrokerAttachReply {
+            protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
+            ..old_daemon_reply
+        };
+        validate_input_broker_attach_revision(&current).expect("current daemon revision");
+        assert_eq!(mismatched_attach_cleanup_token(&current), None);
+    }
+
+    #[test]
+    fn inject_batch_retries_exact_suffix_before_later_frames_and_then_acks() {
+        let key_down = core_input::InputEvent::Key {
+            scan_code: 30,
+            state: core_input::KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let mouse_down = core_input::InputEvent::MouseButton {
+            button: core_input::MouseButton::Left,
+            state: core_input::KeyState::Down,
+        };
+        let key_up = core_input::InputEvent::Key {
+            scan_code: 30,
+            state: core_input::KeyState::Up,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let mut batch = BrokerInjectBatchState::default();
+        batch
+            .accept_batch(
+                7,
+                vec![
+                    vec![key_down.clone(), mouse_down.clone()],
+                    vec![key_up.clone()],
+                ],
+            )
+            .expect("stage batch");
+        let mut injected = InjectedInputState::new(WindowsNumLockState::new(false));
+        let mut attempts = Vec::new();
+        let first = batch.process_with(&mut injected, |events, state| {
+            attempts.push(events.to_vec());
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: 1,
+                    remaining_events: vec![mouse_down.clone()],
+                    error: Some(anyhow::anyhow!("scripted suffix failure")),
+                },
+            )
+        });
+        assert_eq!(
+            first,
+            BrokerInjectProgress {
+                completed_frames: 0,
+                failed_attempts: 1,
+            }
+        );
+        assert!(batch.backpressure_active());
+        assert_eq!(batch.acked_batch_id(), 0);
+
+        let second = batch.process_with(&mut injected, |events, state| {
+            attempts.push(events.to_vec());
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: events.len(),
+                    remaining_events: Vec::new(),
+                    error: None,
+                },
+            )
+        });
+        assert_eq!(
+            second,
+            BrokerInjectProgress {
+                completed_frames: 2,
+                failed_attempts: 0,
+            }
+        );
+        assert_eq!(
+            attempts,
+            vec![
+                vec![key_down, mouse_down.clone()],
+                vec![mouse_down],
+                vec![key_up],
+            ]
+        );
+        assert!(!batch.backpressure_active());
+        assert_eq!(batch.acked_batch_id(), 7);
+
+        batch
+            .accept_batch(7, vec![vec![core_input::InputEvent::MouseMove { dx: 1, dy: 0 }]])
+            .expect("completed batch replay is deduplicated");
+        assert!(!batch.backpressure_active());
+    }
 
     #[test]
     fn safety_unlock_suppresses_stale_relock_until_daemon_reconciles() {
@@ -1154,7 +1413,8 @@ mod input_broker_tests {
                 }
             });
 
-        reconcile_injected_input_outcome(&events, &mut state, outcome)
+        observe_injected_input_outcome(&events, &mut state, outcome)
+            .into_result()
             .expect_err("partial injection must retain its failure");
         assert_eq!(
             state.drain_release_events(),
@@ -1214,22 +1474,22 @@ mod input_broker_tests {
     }
 }
 
-fn inject_input_events(
+fn apply_injected_input_events(
     events: &[core_input::InputEvent],
     injected_state: &mut InjectedInputState,
-) -> Result<()> {
+) -> InputSendOutcome {
     let outcome = injected_state.windows_input.send_events(events);
-    reconcile_injected_input_outcome(events, injected_state, outcome)
+    observe_injected_input_outcome(events, injected_state, outcome)
 }
 
-fn reconcile_injected_input_outcome(
+fn observe_injected_input_outcome(
     events: &[core_input::InputEvent],
     injected_state: &mut InjectedInputState,
     outcome: InputSendOutcome,
-) -> Result<()> {
+) -> InputSendOutcome {
     let committed_event_count = outcome.committed_event_count.min(events.len());
     injected_state.observe(&events[..committed_event_count]);
-    outcome.into_result().map(|_| ())
+    outcome
 }
 
 async fn clipboard_broker_supervisor_loop(

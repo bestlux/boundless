@@ -397,18 +397,22 @@ impl CaptureRuntime {
                 self.raw_input_enabled = true;
                 set_raw_keyboard_escape_enabled_for(&self.core, true);
             }
-            Ok(false) => match register_raw_input_devices(hwnd) {
-                Ok(()) => {
-                    self.raw_input_enabled = true;
-                    set_raw_keyboard_escape_enabled_for(&self.core, true);
-                    warn!("raw input registration was replaced and has been reclaimed");
+            Ok(false) => {
+                self.raw_input_enabled = false;
+                match reclaim_raw_input_registration_after_loss(&self.core, || {
+                    register_raw_input_devices(hwnd)
+                }) {
+                    Ok(()) => {
+                        self.raw_input_enabled = true;
+                        warn!("raw input registration was replaced and has been reclaimed");
+                    }
+                    Err(error) => {
+                        self.raw_input_enabled = false;
+                        set_raw_keyboard_escape_enabled_for(&self.core, false);
+                        warn!(error = ?error, "failed to reclaim raw input registration");
+                    }
                 }
-                Err(error) => {
-                    self.raw_input_enabled = false;
-                    set_raw_keyboard_escape_enabled_for(&self.core, false);
-                    warn!(error = ?error, "failed to reclaim raw input registration");
-                }
-            },
+            }
             Err(error) => {
                 self.raw_input_enabled = false;
                 set_raw_keyboard_escape_enabled_for(&self.core, false);
@@ -684,6 +688,23 @@ fn set_raw_keyboard_escape_enabled_for(runtime: &CaptureRuntimeCore, enabled: bo
     }
 
     fail_open_if_escape_detector_unavailable(runtime);
+}
+
+fn reclaim_raw_input_registration_after_loss(
+    runtime: &CaptureRuntimeCore,
+    register: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    // Fail open before attempting reclaim. RegisterRawInputDevices can block
+    // or fail, and the already elapsed blind interval may have contained a
+    // complete escape gesture.
+    set_raw_keyboard_escape_enabled_for(runtime, false);
+    register()?;
+    set_raw_keyboard_escape_enabled_for(runtime, true);
+    Ok(())
+}
+
+fn mark_raw_input_processing_failed(runtime: &CaptureRuntimeCore) {
+    set_raw_keyboard_escape_enabled_for(runtime, false);
 }
 
 fn record_keyboard_hook_observation(
@@ -991,6 +1012,7 @@ fn set_hook_lock_active_for(core: &Arc<CaptureRuntimeCore>, active: bool) -> Res
 }
 
 fn set_hook_lock_active_for_arc(core: &CaptureRuntimeCore, active: bool) -> Result<bool> {
+    let was_active = core.lock_active.load(Ordering::Acquire);
     let mut state = match core.escape_detector_state.lock() {
         Ok(state) => state,
         Err(error) => {
@@ -1023,7 +1045,9 @@ fn set_hook_lock_active_for_arc(core: &CaptureRuntimeCore, active: bool) -> Resu
     // Captured Num Lock may diverge while its physical toggle is suppressed.
     // Every lock boundary discards that capture-only projection and starts
     // from truthful local/destination OS authority; never copy it backwards.
-    if let Ok(mut keyboard_state) = core.keyboard_state.lock() {
+    if was_active != active
+        && let Ok(mut keyboard_state) = core.keyboard_state.lock()
+    {
         keyboard_state.capture_num_lock_on = core.actual_num_lock_state.is_on();
     }
 
@@ -1427,6 +1451,9 @@ unsafe fn run_raw_input_message_loop() -> Result<()> {
             match process_raw_input_message(msg.lParam, msg.time) {
                 Ok(()) => warned_once = false,
                 Err(error) => {
+                    let _ = with_active_capture_runtime(|runtime| {
+                        mark_raw_input_processing_failed(runtime)
+                    });
                     if !warned_once {
                         warn!(error = ?error, "raw input message processing failed");
                         warned_once = true;
@@ -2198,6 +2225,57 @@ mod tests {
     }
 
     #[test]
+    fn registration_reclaim_fails_open_before_recovery_is_attempted() {
+        let core = test_runtime_core();
+        set_raw_keyboard_escape_enabled_for(&core, true);
+        assert!(set_hook_lock_active_for(&core, true).expect("lock with raw detector"));
+        let generation = core.safety_unlock_generation.load(Ordering::SeqCst);
+
+        reclaim_raw_input_registration_after_loss(&core, || {
+            assert!(
+                !core.lock_active.load(Ordering::Acquire),
+                "known detector loss must unlock before RegisterRawInputDevices is called"
+            );
+            Ok(())
+        })
+        .expect("reclaim detector");
+
+        assert!(!core.lock_active.load(Ordering::Acquire));
+        assert_eq!(
+            core.detector_unavailable_unlock_pending
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(
+            core.safety_unlock_generation.load(Ordering::SeqCst) > generation,
+            "recovery must retain the stale-relock fence"
+        );
+        assert_eq!(
+            escape_detector_source(&core),
+            Some(EscapeDetectorSource::RawKeyboard)
+        );
+    }
+
+    #[test]
+    fn raw_message_processing_failure_marks_detector_unavailable() {
+        let core = test_runtime_core();
+        set_raw_keyboard_escape_enabled_for(&core, true);
+        assert!(set_hook_lock_active_for(&core, true).expect("lock with raw detector"));
+
+        mark_raw_input_processing_failed(&core);
+
+        assert!(!core.lock_active.load(Ordering::Acquire));
+        assert_eq!(
+            core.detector_unavailable_unlock_pending
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(
+            !set_hook_lock_active_for(&core, true).expect("unhealthy fallback must refuse relock")
+        );
+    }
+
+    #[test]
     fn switching_detector_source_discards_partial_gesture() {
         let core = test_runtime_core();
         set_hook_lock_active_for(&core, true).expect("lock");
@@ -2533,6 +2611,39 @@ mod tests {
                 .expect("keyboard state")
                 .capture_num_lock_on
         );
+        clear_active_capture_runtime(&core).expect("cleanup runtime");
+    }
+
+    #[test]
+    fn redundant_active_lock_update_preserves_capture_logical_num_lock() {
+        let _guard = registry_test_guard().lock().expect("test guard");
+        reset_active_runtime_for_test();
+        let core = test_runtime_core();
+        activate_capture_runtime(&core).expect("activate runtime");
+        set_raw_keyboard_escape_enabled_for(&core, true);
+        set_hook_lock_active_for(&core, true).expect("lock capture");
+
+        assert_eq!(
+            key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Down, true),
+            KeySemantics::Windows {
+                virtual_key: VK_NUMLOCK_CODE,
+                num_lock_on: true,
+            }
+        );
+        assert!(!core.actual_num_lock_state.is_on());
+
+        set_hook_lock_active_for(&core, true).expect("redundant active update");
+        assert_eq!(
+            key_semantics_for_hook_event(0x4F, 0x23, KeyState::Down, true),
+            KeySemantics::Windows {
+                virtual_key: 0x61,
+                num_lock_on: true,
+            },
+            "a capture pass that renews an existing lock must not erase the suppressed toggle"
+        );
+        assert!(!core.actual_num_lock_state.is_on());
+
+        set_hook_lock_active_for(&core, false).expect("unlock capture");
         clear_active_capture_runtime(&core).expect("cleanup runtime");
     }
 

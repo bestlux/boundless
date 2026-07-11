@@ -113,6 +113,32 @@ async fn attach_fails_closed_when_daemon_owns_interactive_input() {
 }
 
 #[tokio::test]
+async fn versioned_daemon_rejects_unversioned_or_old_broker_before_attach() {
+    let (state, root) = service_mode_broker_state("boundless-broker-protocol-skew-test").await;
+
+    for revision in [0, ipc_api::INPUT_BROKER_PROTOCOL_REVISION + 1] {
+        let outcome = state
+            .attach_input_broker_versioned(
+                allowed_client(),
+                "old-broker".to_string(),
+                true,
+                revision,
+            )
+            .await;
+        assert!(!outcome.accepted);
+        assert!(outcome.broker_token.is_empty());
+        assert_eq!(
+            outcome.protocol_revision,
+            ipc_api::INPUT_BROKER_PROTOCOL_REVISION
+        );
+        assert!(outcome.message.contains("protocol mismatch"));
+        assert!(!state.input_broker_route_active());
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn attach_fails_closed_without_verified_client_identity() {
     let (state, root) = service_mode_broker_state("boundless-broker-attach-unverified-test").await;
 
@@ -850,6 +876,7 @@ async fn exchange_returns_inject_frames_only_for_current_input_owner() {
         "owner frame must be dispatched to the broker"
     );
     assert_eq!(outcome.inject_frames[0].peer_id, peer_id);
+    let first_batch_id = outcome.inject_batch_id;
 
     state
         .route_incoming_input_frame(
@@ -873,7 +900,10 @@ async fn exchange_returns_inject_frames_only_for_current_input_owner() {
         .exchange_input_broker(
             allowed_client(),
             &attach.broker_token,
-            InputBrokerExchangeObservations::default(),
+            InputBrokerExchangeObservations {
+                acked_inject_batch_id: first_batch_id,
+                ..Default::default()
+            },
         )
         .await;
     assert!(outcome.accepted);
@@ -888,6 +918,191 @@ async fn exchange_returns_inject_frames_only_for_current_input_owner() {
             .any(|event| event.kind == "input_inject_skipped" && event.peer_id == peer_id),
         "skipped dispatch should be recorded truthfully"
     );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn inject_batch_backpressure_preserves_fifo_until_exact_ack() {
+    let (state, root) = service_mode_broker_state("boundless-broker-inject-batch-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("claim owner")
+    );
+
+    state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id.clone(),
+                sequence: 1,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::Key {
+                    scan_code: 1,
+                    state: KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
+                }],
+            },
+        )
+        .await
+        .expect("route first frame");
+
+    let first = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert!(first.accepted);
+    assert_ne!(first.inject_batch_id, 0);
+    assert_eq!(
+        first
+            .inject_frames
+            .iter()
+            .map(|frame| frame.sequence)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+
+    state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id.clone(),
+                sequence: 2,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::Key {
+                    scan_code: 2,
+                    state: KeyState::Up,
+                    semantics: core_input::KeySemantics::Physical,
+                }],
+            },
+        )
+        .await
+        .expect("route later frame");
+
+    let blocked = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                inject_backpressure: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(blocked.accepted);
+    assert_eq!(blocked.inject_batch_id, first.inject_batch_id);
+    assert!(blocked.inject_frames.is_empty());
+
+    let acknowledged = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                acked_inject_batch_id: first.inject_batch_id,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(acknowledged.accepted);
+    assert_ne!(acknowledged.inject_batch_id, 0);
+    assert_ne!(acknowledged.inject_batch_id, first.inject_batch_id);
+    assert_eq!(acknowledged.inject_frames[0].sequence, 2);
+
+    let duplicate_ack = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                acked_inject_batch_id: first.inject_batch_id,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        duplicate_ack.accepted,
+        "lost ack replies must be idempotent"
+    );
+    assert_eq!(duplicate_ack.inject_batch_id, acknowledged.inject_batch_id);
+    assert_eq!(duplicate_ack.inject_frames[0].sequence, 2);
+
+    let final_ack = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                acked_inject_batch_id: acknowledged.inject_batch_id,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(final_ack.accepted);
+    assert_eq!(final_ack.inject_batch_id, 0);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn stale_reattach_requeues_unacknowledged_inject_batch() {
+    let (state, root) = service_mode_broker_state("boundless-broker-stale-inject-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let first_attach = state
+        .attach_input_broker(allowed_client(), "first-broker".to_string(), true)
+        .await;
+    assert!(first_attach.accepted);
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("claim owner")
+    );
+    state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id.clone(),
+                sequence: 41,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::MouseMove { dx: 3, dy: 0 }],
+            },
+        )
+        .await
+        .expect("route frame");
+    let dispatched = state
+        .exchange_input_broker(
+            allowed_client(),
+            &first_attach.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert_eq!(dispatched.inject_frames.len(), 1);
+    assert_ne!(dispatched.inject_batch_id, 0);
+
+    state.input_broker_relay().expire_attachment_for_test();
+    let replacement = state
+        .attach_input_broker(allowed_client(), "replacement-broker".to_string(), true)
+        .await;
+    assert!(replacement.accepted);
+    let replayed = state
+        .exchange_input_broker(
+            allowed_client(),
+            &replacement.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert!(replayed.accepted);
+    assert_eq!(replayed.inject_frames.len(), 1);
+    assert_eq!(replayed.inject_frames[0].sequence, 41);
+    assert_ne!(replayed.inject_batch_id, dispatched.inject_batch_id);
 
     let _ = std::fs::remove_dir_all(root);
 }

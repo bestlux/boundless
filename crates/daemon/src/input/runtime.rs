@@ -201,10 +201,8 @@ pub(super) async fn drain_pending_inject_frames(
 
         let attempted_event_count = frame.events.len();
         let apply_outcome = apply_frame(backend, &frame);
-        let committed_event_count = apply_outcome.committed_event_count.min(frame.events.len());
-        if committed_event_count > 0 {
-            frame.events.drain(..committed_event_count);
-        }
+        debug_assert!(apply_outcome.committed_event_count <= attempted_event_count);
+        frame.events = apply_outcome.remaining_events;
 
         match apply_outcome.error {
             None => {

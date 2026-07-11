@@ -451,12 +451,14 @@ message BrokerWindowsKeySemantics {
 message InputBrokerAttachRequest {
   string broker_version = 1;
   bool lock_supported = 2;
+  uint32 protocol_revision = 3;
 }
 
 message InputBrokerAttachReply {
   bool accepted = 1;
   string broker_token = 2;
   string message = 3;
+  uint32 protocol_revision = 4;
 }
 
 message InputBrokerExchangeRequest {
@@ -482,6 +484,8 @@ message InputBrokerExchangeRequest {
   int32 handoff_probe_dy = 20;
   uint32 lease_expired_unlock_count = 21;
   uint32 detector_unavailable_unlock_count = 22;
+  bool inject_backpressure = 23;
+  uint64 acked_inject_batch_id = 24;
 }
 
 message InputBrokerInjectFrame {
@@ -497,6 +501,7 @@ message InputBrokerExchangeReply {
   bool lock_should_be_active = 4;
   bool capture_active = 5;
   bool capture_forwarding_authorized = 6;
+  uint64 inject_batch_id = 7;
 }
 
 message ClipboardBrokerPayload {

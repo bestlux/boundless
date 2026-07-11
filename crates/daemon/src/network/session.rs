@@ -320,6 +320,36 @@ impl SessionRuntime {
     where
         W: AsyncWrite + Unpin,
     {
+        if self.remote_protocol != Some(PROTOCOL_CURRENT)
+            && !matches!(
+                &message,
+                WireMessage::Hello { .. } | WireMessage::Error { .. }
+            )
+        {
+            record_transport_frame_rejected(
+                state,
+                &session.peer_id,
+                "reason=protocol_not_negotiated expected=initial_hello".to_string(),
+                0,
+            )
+            .await;
+            send_message(
+                writer,
+                &WireMessage::Error {
+                    message: "protocol not negotiated: initial Hello required".to_string(),
+                },
+                &mut self.write_frame_buffer,
+            )
+            .await?;
+            writer
+                .flush()
+                .await
+                .context("flush pre-Hello protocol rejection")?;
+            return Ok(SessionBranchOutcome::Exit(
+                SessionExitReason::ProtocolRejected,
+            ));
+        }
+
         match message {
             WireMessage::Hello {
                 machine_id,
@@ -508,6 +538,9 @@ impl SessionRuntime {
             }
             WireMessage::Error { message } => {
                 warn!(%message, "remote error frame");
+                return Ok(SessionBranchOutcome::Exit(
+                    SessionExitReason::ProtocolRejected,
+                ));
             }
         }
 

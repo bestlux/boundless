@@ -6,6 +6,8 @@ use std::{
 
 use core_input::{InputEvent, KeySemantics, KeyState, MouseButton};
 
+use super::PendingInjectInputFrame;
+
 /// How long an attached user-session broker may go without an exchange before
 /// the daemon treats it as gone and reports `service_session_unsupported`
 /// again. Fail-closed: silence means no interactive input path.
@@ -52,6 +54,15 @@ struct InputBrokerRelayInner {
     last_accepted_clipboard_sequence: Option<u64>,
     pressed_keys: Vec<(u16, KeySemantics)>,
     pressed_buttons: Vec<MouseButton>,
+    next_inject_batch_id: u64,
+    last_acked_inject_batch_id: u64,
+    inflight_inject_batch: Option<InputBrokerInjectBatch>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InputBrokerInjectBatch {
+    pub batch_id: u64,
+    pub frames: Vec<PendingInjectInputFrame>,
 }
 
 /// Session-neutral relay between the LocalSystem service daemon and the
@@ -105,6 +116,8 @@ impl InputBrokerRelay {
         inner.last_accepted_clipboard_sequence = None;
         inner.pressed_keys.clear();
         inner.pressed_buttons.clear();
+        inner.last_acked_inject_batch_id = 0;
+        inner.inflight_inject_batch = None;
     }
 
     pub(crate) fn detach(&self, broker_token: &str) -> bool {
@@ -358,6 +371,52 @@ impl InputBrokerRelay {
         inner.handoff_probe_dx = 0;
         inner.handoff_probe_dy = 0;
         inner.pressed_buttons.clear();
+    }
+
+    pub(crate) fn acknowledge_inject_batch(&self, batch_id: u64) -> Result<(), &'static str> {
+        if batch_id == 0 {
+            return Ok(());
+        }
+        let mut inner = self.lock();
+        if inner.last_acked_inject_batch_id == batch_id {
+            return Ok(());
+        }
+        let Some(inflight) = inner.inflight_inject_batch.as_ref() else {
+            return Err("unknown inject batch acknowledgement");
+        };
+        if inflight.batch_id != batch_id {
+            return Err("out-of-order inject batch acknowledgement");
+        }
+        inner.inflight_inject_batch = None;
+        inner.last_acked_inject_batch_id = batch_id;
+        Ok(())
+    }
+
+    pub(crate) fn inflight_inject_batch(&self) -> Option<InputBrokerInjectBatch> {
+        self.lock().inflight_inject_batch.clone()
+    }
+
+    pub(crate) fn stage_inject_batch(
+        &self,
+        frames: Vec<PendingInjectInputFrame>,
+    ) -> InputBrokerInjectBatch {
+        let mut inner = self.lock();
+        debug_assert!(inner.inflight_inject_batch.is_none());
+        inner.next_inject_batch_id = inner.next_inject_batch_id.wrapping_add(1).max(1);
+        let batch = InputBrokerInjectBatch {
+            batch_id: inner.next_inject_batch_id,
+            frames,
+        };
+        inner.inflight_inject_batch = Some(batch.clone());
+        batch
+    }
+
+    pub(crate) fn take_inflight_inject_frames(&self) -> Vec<PendingInjectInputFrame> {
+        self.lock()
+            .inflight_inject_batch
+            .take()
+            .map(|batch| batch.frames)
+            .unwrap_or_default()
     }
 }
 

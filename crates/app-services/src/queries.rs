@@ -76,6 +76,7 @@ pub struct InputBrokerAttachSnapshot {
     pub accepted: bool,
     pub broker_token: String,
     pub message: String,
+    pub protocol_revision: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +94,7 @@ pub struct InputBrokerExchangeSnapshot {
     pub lock_should_be_active: bool,
     pub capture_active: bool,
     pub capture_forwarding_authorized: bool,
+    pub inject_batch_id: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -158,6 +158,7 @@ impl InputBackend for WindowsInputBackend {
         let outcome = self.input.send_events(events);
         InputApplyOutcome {
             committed_event_count: outcome.committed_event_count,
+            remaining_events: outcome.remaining_events,
             error: outcome
                 .error
                 .map(|error| error.context("SendInput failed for frame batch")),

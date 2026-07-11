@@ -155,7 +155,7 @@ trait InputBackend: Send {
     fn apply_frame(&mut self, events: &[InputEvent]) -> InputApplyOutcome {
         for (index, event) in events.iter().enumerate() {
             if let Err(error) = self.apply(event) {
-                return InputApplyOutcome::failure(index, error);
+                return InputApplyOutcome::failure(index, events[index..].to_vec(), error);
             }
         }
         InputApplyOutcome::success(events.len())
@@ -165,6 +165,7 @@ trait InputBackend: Send {
 #[derive(Debug)]
 struct InputApplyOutcome {
     committed_event_count: usize,
+    remaining_events: Vec<InputEvent>,
     error: Option<anyhow::Error>,
 }
 
@@ -172,13 +173,19 @@ impl InputApplyOutcome {
     fn success(committed_event_count: usize) -> Self {
         Self {
             committed_event_count,
+            remaining_events: Vec::new(),
             error: None,
         }
     }
 
-    fn failure(committed_event_count: usize, error: anyhow::Error) -> Self {
+    fn failure(
+        committed_event_count: usize,
+        remaining_events: Vec<InputEvent>,
+        error: anyhow::Error,
+    ) -> Self {
         Self {
             committed_event_count,
+            remaining_events,
             error: Some(error),
         }
     }
