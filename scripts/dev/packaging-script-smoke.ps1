@@ -133,6 +133,7 @@ foreach ($requiredInstallContract in @(
         'coordinator_death_cancellation_fixture',
         'failed_drain_quiescence_fixture',
         'kernel_object_acl_fixture',
+        'kernel_object_acl_negative_probe',
         'blocking_service_stop_fixture',
         'start_pending_service_recovery_fixture',
         'failed_msi_service_recovery_fixture',
@@ -173,6 +174,18 @@ if (
     $mutexSecuritySource -match 'GetSecurityDescriptorSddlForm'
 ) {
     throw "Tray owner mutex validation must compare protected semantic access rules, not serialized SDDL aliases."
+}
+$kernelObjectAclSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Invoke-BoundlessKernelObjectAclFixture'
+if (
+    $kernelObjectAclSource -notmatch 'Test-BoundlessProtectedKernelObjectSecurity' -or
+    $kernelObjectAclSource -notmatch 'currentTokenCanUsePrivilegedAcl' -or
+    $kernelObjectAclSource -notmatch 'negativeMutationProbeRequired = -not' -or
+    $kernelObjectAclSource -notmatch 'ChangePermissions' -or
+    $kernelObjectAclSource -notmatch 'Synchronize'
+) {
+    throw "Kernel-object ACL fixtures must always verify semantic rules and retain a real non-admin mutation probe."
 }
 $stopTraySource = Get-PowerShellFunctionSource `
     -Path $installScript `

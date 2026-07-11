@@ -1312,6 +1312,69 @@ function Test-BoundlessTrayOwnerMutexSecurity {
     return $true
 }
 
+function Test-BoundlessProtectedKernelObjectSecurity {
+    param(
+        [Security.AccessControl.NativeObjectSecurity]$Security,
+        [object[]]$ExpectedRules
+    )
+
+    if (-not $Security.AreAccessRulesProtected) {
+        return $false
+    }
+    $rules = @(
+        $Security.GetAccessRules(
+            $true,
+            $false,
+            [Security.Principal.SecurityIdentifier]
+        )
+    )
+    foreach ($rule in $rules) {
+        $rightsProperty = if (
+            $null -ne $rule.PSObject.Properties["EventWaitHandleRights"]
+        ) {
+            "EventWaitHandleRights"
+        }
+        elseif ($null -ne $rule.PSObject.Properties["MutexRights"]) {
+            "MutexRights"
+        }
+        else {
+            return $false
+        }
+        $rights = [uint32]$rule.$rightsProperty
+        $expected = $ExpectedRules | Where-Object {
+            $_.sid -eq $rule.IdentityReference.Value -and
+                [uint32]$_.rights -eq $rights
+        } | Select-Object -First 1
+        if (
+            $null -eq $expected -or
+            $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+            $rule.IsInherited
+        ) {
+            return $false
+        }
+    }
+    foreach ($expected in $ExpectedRules) {
+        $matchingRule = $rules | Where-Object {
+            $rightsProperty = if (
+                $null -ne $_.PSObject.Properties["EventWaitHandleRights"]
+            ) {
+                "EventWaitHandleRights"
+            }
+            else {
+                "MutexRights"
+            }
+            $_.IdentityReference.Value -eq $expected.sid -and
+                [uint32]$_.$rightsProperty -eq [uint32]$expected.rights -and
+                $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+                -not $_.IsInherited
+        } | Select-Object -First 1
+        if ($null -eq $matchingRule) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function New-BoundlessNamedMutex {
     param(
         [string]$Name,
@@ -1391,6 +1454,7 @@ function New-BoundlessInstallerControlEvent {
         event = $event
         name = $name
         created_new = $true
+        security = $security
     }
 }
 
@@ -1515,6 +1579,7 @@ function New-BoundlessInstallerCompletionEvent {
         event = $event
         name = $name
         created_new = $true
+        security = $security
     }
 }
 
@@ -1596,6 +1661,7 @@ function New-BoundlessInstallerPhaseEvent {
         name = $name
         phase = $Phase
         created_new = $true
+        security = $security
     }
 }
 
@@ -1746,6 +1812,7 @@ function New-BoundlessPrivilegedLivenessMutex {
         name = $Name
         created_new = $true
         owned = $true
+        security = $security
     }
 }
 
@@ -7210,11 +7277,59 @@ function Invoke-BoundlessKernelObjectAclFixture {
     $liveness = New-BoundlessPrivilegedLivenessMutex `
         -Name "Local\Boundless.Installer.Monitor.v1.$([guid]::NewGuid().ToString('N'))"
     try {
+        $ownerReadControl = [uint32]0x00020000
+        $genericAll = [uint32]0x10000000
+        $synchronize = [uint32]0x00100000
+        $privilegedRules = @(
+            [pscustomobject]@{ sid = "S-1-3-4"; rights = $ownerReadControl },
+            [pscustomobject]@{ sid = "S-1-5-18"; rights = $genericAll },
+            [pscustomobject]@{ sid = "S-1-5-32-544"; rights = $genericAll }
+        )
+        $observableRules = @($privilegedRules) + @(
+            [pscustomobject]@{ sid = $UserSid; rights = $synchronize }
+        )
+        foreach ($securityFixture in @(
+                [pscustomobject]@{
+                    name = "cancellation event"
+                    security = $control.security
+                    rules = $privilegedRules
+                },
+                [pscustomobject]@{
+                    name = "completion event"
+                    security = $completion.security
+                    rules = $observableRules
+                },
+                [pscustomobject]@{
+                    name = "phase event"
+                    security = $phase.security
+                    rules = $observableRules
+                },
+                [pscustomobject]@{
+                    name = "liveness mutex"
+                    security = $liveness.security
+                    rules = $privilegedRules
+                }
+            )) {
+            if (-not (Test-BoundlessProtectedKernelObjectSecurity `
+                -Security $securityFixture.security `
+                -ExpectedRules $securityFixture.rules)) {
+                throw "Installer $($securityFixture.name) ACL fixture did not preserve its protected semantic rules."
+            }
+        }
         [void]$control.event.Set()
         [void]$completion.event.Set()
+        $currentTokenSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $currentTokenCanUsePrivilegedAcl = (
+            (Test-IsAdministrator) -or
+            $currentTokenSid.IsWellKnown(
+                [Security.Principal.WellKnownSidType]::LocalSystemSid
+            )
+        )
+        $negativeMutationProbeRequired = -not $currentTokenCanUsePrivilegedAcl
         $payload = [Convert]::ToBase64String(
             [Text.Encoding]::UTF8.GetBytes(
-                "$($control.name)`n$($completion.name)`n$($liveness.name)`n$($phase.name)"
+                "$($control.name)`n$($completion.name)`n$($liveness.name)`n" +
+                "$($phase.name)`n$([int]$negativeMutationProbeRequired)"
             )
         )
         $source = @'
@@ -7249,17 +7364,19 @@ $phaseSync = Open-EventWithRights `
     -Name $names[3] `
     -Rights ([Security.AccessControl.EventWaitHandleRights]::Synchronize)
 $phaseSync.Dispose()
-foreach ($probe in @(
-        { Open-EventWithRights -Name $names[0] -Rights ([Security.AccessControl.EventWaitHandleRights]::ChangePermissions) },
-        { Open-EventWithRights -Name $names[1] -Rights ([Security.AccessControl.EventWaitHandleRights]::ChangePermissions) },
-        { Open-MutexWithRights -Name $names[2] -Rights ([Security.AccessControl.MutexRights]::ChangePermissions) },
-        { Open-EventWithRights -Name $names[3] -Rights ([Security.AccessControl.EventWaitHandleRights]::Modify) }
-    )) {
-    $opened = $null
-    try { $opened = & $probe }
-    catch { continue }
-    finally { if ($null -ne $opened) { $opened.Dispose() } }
-    exit 71
+if ([int]$names[4] -eq 1) {
+    foreach ($probe in @(
+            { Open-EventWithRights -Name $names[0] -Rights ([Security.AccessControl.EventWaitHandleRights]::ChangePermissions) },
+            { Open-EventWithRights -Name $names[1] -Rights ([Security.AccessControl.EventWaitHandleRights]::ChangePermissions) },
+            { Open-MutexWithRights -Name $names[2] -Rights ([Security.AccessControl.MutexRights]::ChangePermissions) },
+            { Open-EventWithRights -Name $names[3] -Rights ([Security.AccessControl.EventWaitHandleRights]::Modify) }
+        )) {
+        $opened = $null
+        try { $opened = & $probe }
+        catch { continue }
+        finally { if ($null -ne $opened) { $opened.Dispose() } }
+        exit 71
+    }
 }
 exit 0
 '@.Replace("__PAYLOAD__", $payload)
@@ -7272,8 +7389,12 @@ exit 0
             ) `
             -TimeoutSeconds 10
         if ($result.exit_code -ne 0) {
-            throw "Installer kernel-object ACL fixture allowed a same-SID DACL rewrite; exit=$($result.exit_code) stderr='$($result.stderr)'."
+            throw "Installer kernel-object ACL fixture failed; negative_probe_required=$negativeMutationProbeRequired exit=$($result.exit_code) stderr='$($result.stderr)'."
         }
+        if ($negativeMutationProbeRequired) {
+            return "passed"
+        }
+        return "skipped_privileged_token"
     }
     finally {
         try { $liveness.mutex.ReleaseMutex() } catch { }
@@ -9246,7 +9367,8 @@ public static class BoundlessInstallNativeMethods
     Invoke-BoundlessMsiStartedHardKillRecoveryFixture -UserSid $currentIdentitySid
     Invoke-BoundlessInstallerHeartbeatStallFixture -UserSid $currentIdentitySid
     Invoke-BoundlessOwnedProcessTreeFixture
-    Invoke-BoundlessKernelObjectAclFixture -UserSid $currentIdentitySid
+    $kernelObjectAclNegativeProbe = Invoke-BoundlessKernelObjectAclFixture `
+        -UserSid $currentIdentitySid
     Invoke-BoundlessCoordinatorDeathFixture -UserSid $currentIdentitySid
     Invoke-BoundlessFailedDrainQuiescenceFixture -UserSid $currentIdentitySid
     Invoke-BoundlessUncertainTransactionGuardianFixture -UserSid $currentIdentitySid
@@ -9507,6 +9629,7 @@ public static class BoundlessInstallNativeMethods
         stalled_monitor_takeover_fixture = "passed"
         owned_process_tree_fixture = "passed"
         kernel_object_acl_fixture = "passed"
+        kernel_object_acl_negative_probe = $kernelObjectAclNegativeProbe
         elevated_process_job_fixture = "passed"
         hard_cancel_before_msi_recovery_fixture = "passed"
         admin_only_stage_fixture = "passed"
