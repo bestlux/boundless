@@ -848,10 +848,12 @@ fn key_semantics_for_hook_event(
 ) -> KeySemantics {
     with_active_capture_runtime(|runtime| {
         let Ok(mut state) = runtime.keyboard_state.lock() else {
+            let actual_num_lock_on = runtime.actual_num_lock_state.is_on();
             return windows_key_semantics(
                 scan_code,
                 raw_vk_code,
-                runtime.actual_num_lock_state.is_on(),
+                actual_num_lock_on,
+                actual_num_lock_on,
             );
         };
         let capture_num_lock_on = update_capture_num_lock_state_for_key(
@@ -861,7 +863,12 @@ fn key_semantics_for_hook_event(
             key_state,
             suppressed,
         );
-        let semantics = windows_key_semantics(scan_code, raw_vk_code, capture_num_lock_on);
+        let semantics = windows_key_semantics(
+            scan_code,
+            raw_vk_code,
+            capture_num_lock_on,
+            runtime.actual_num_lock_state.is_on(),
+        );
         if ambiguous_keypad_virtual_key(scan_code, capture_num_lock_on).is_none() {
             return semantics;
         }
@@ -877,16 +884,27 @@ fn key_semantics_for_hook_event(
                 .unwrap_or(semantics),
         }
     })
-    .unwrap_or_else(|| windows_key_semantics(scan_code, raw_vk_code, false))
+    .unwrap_or_else(|| windows_key_semantics(scan_code, raw_vk_code, false, false))
 }
 
-fn windows_key_semantics(_scan_code: u16, raw_vk_code: u16, num_lock_on: bool) -> KeySemantics {
+fn windows_key_semantics(
+    scan_code: u16,
+    raw_vk_code: u16,
+    capture_num_lock_on: bool,
+    actual_num_lock_on: bool,
+) -> KeySemantics {
+    let virtual_key = match ambiguous_keypad_virtual_key(scan_code, actual_num_lock_on) {
+        Some(actual_virtual_key) if raw_vk_code == actual_virtual_key => {
+            ambiguous_keypad_virtual_key(scan_code, capture_num_lock_on).unwrap_or(raw_vk_code)
+        }
+        // A mismatch from the actual-OS projection is a temporary modifier
+        // override reported by KBDLLHOOKSTRUCT (for example Shift turning
+        // Numpad1 into End). Preserve that first-down identity.
+        _ => raw_vk_code,
+    };
     KeySemantics::Windows {
-        // KBDLLHOOKSTRUCT already reflects temporary modifier overrides such
-        // as Shift turning Numpad1 into End. Keep that first-down identity;
-        // Num Lock remains separate metadata for destination reconciliation.
-        virtual_key: raw_vk_code,
-        num_lock_on,
+        virtual_key,
+        num_lock_on: capture_num_lock_on,
     }
 }
 
@@ -2572,7 +2590,7 @@ mod tests {
         );
         assert!(!core.actual_num_lock_state.is_on());
 
-        let keypad = key_semantics_for_hook_event(0x4F, 0x61, KeyState::Down, true);
+        let keypad = key_semantics_for_hook_event(0x4F, 0x23, KeyState::Down, true);
         assert_eq!(
             keypad,
             KeySemantics::Windows {
@@ -2596,7 +2614,7 @@ mod tests {
             }
         );
 
-        let keypad_release = key_semantics_for_hook_event(0x4F, 0x61, KeyState::Up, true);
+        let keypad_release = key_semantics_for_hook_event(0x4F, 0x23, KeyState::Up, true);
         assert_eq!(
             keypad_release,
             KeySemantics::Windows {
@@ -2618,6 +2636,46 @@ mod tests {
     }
 
     #[test]
+    fn suppressed_num_lock_off_remaps_actual_numpad1_to_navigation_identity() {
+        const VK_END: u16 = 0x23;
+        const VK_NUMPAD1: u16 = 0x61;
+
+        let _guard = registry_test_guard().lock().expect("test guard");
+        reset_active_runtime_for_test();
+        let core = test_runtime_core();
+        core.actual_num_lock_state.set(true);
+        activate_capture_runtime(&core).expect("activate runtime");
+        set_hook_lock_active_for(&core, true).expect("lock capture");
+
+        assert_eq!(
+            key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Down, true),
+            KeySemantics::Windows {
+                virtual_key: VK_NUMLOCK_CODE,
+                num_lock_on: false,
+            }
+        );
+        assert!(core.actual_num_lock_state.is_on());
+
+        let first_down = KeySemantics::Windows {
+            virtual_key: VK_END,
+            num_lock_on: false,
+        };
+        assert_eq!(
+            key_semantics_for_hook_event(0x4F, VK_NUMPAD1, KeyState::Down, true),
+            first_down,
+            "capture-logical Num Lock off must remap the actual-OS Numpad1 identity to End"
+        );
+        assert_eq!(
+            key_semantics_for_hook_event(0x4F, VK_NUMPAD1, KeyState::Up, true),
+            first_down,
+            "key-up must retain the remapped first-down identity"
+        );
+
+        set_hook_lock_active_for(&core, false).expect("unlock capture");
+        clear_active_capture_runtime(&core).expect("cleanup runtime");
+    }
+
+    #[test]
     fn shift_overridden_numpad_identity_survives_repeat_modifier_and_num_lock_changes() {
         const VK_END: u16 = 0x23;
         const VK_NUMPAD1: u16 = 0x61;
@@ -2626,23 +2684,9 @@ mod tests {
         let _guard = registry_test_guard().lock().expect("test guard");
         reset_active_runtime_for_test();
         let core = test_runtime_core();
+        core.actual_num_lock_state.set(true);
         activate_capture_runtime(&core).expect("activate runtime");
         set_hook_lock_active_for(&core, true).expect("lock capture");
-
-        assert_eq!(
-            key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Down, true),
-            KeySemantics::Windows {
-                virtual_key: VK_NUMLOCK_CODE,
-                num_lock_on: true,
-            }
-        );
-        assert_eq!(
-            key_semantics_for_hook_event(0x45, VK_NUMLOCK_CODE, KeyState::Up, true),
-            KeySemantics::Windows {
-                virtual_key: VK_NUMLOCK_CODE,
-                num_lock_on: true,
-            }
-        );
         assert_eq!(
             key_semantics_for_hook_event(0x2A, VK_LSHIFT, KeyState::Down, true),
             KeySemantics::Windows {

@@ -476,12 +476,12 @@ fn append_input_records_for_event(
                     if !key_up && ambiguous_keypad && authority.on != *num_lock_on {
                         append_num_lock_toggle(*num_lock_on, authority, prepared);
                     }
-                    if key_up && ambiguous_keypad && *virtual_key != 0 {
-                        // Num Lock may have changed while the key was held.
-                        // Release the first-down logical identity directly;
-                        // replaying only the scan code could be remapped to
-                        // the destination's newer keypad/navigation identity.
-                        prepared.push(keyboard_virtual_key_input(*virtual_key, true), *authority);
+                    if ambiguous_keypad && *virtual_key != 0 {
+                        // Num Lock or a temporary modifier may change while
+                        // the key is held. Replay every phase using the
+                        // captured first-down identity so repeats and release
+                        // cannot be remapped by newer destination state.
+                        prepared.push(keyboard_virtual_key_input(*virtual_key, key_up), *authority);
                     } else {
                         prepared.push(keyboard_input(*scan_code, key_up), *authority);
                     }
@@ -888,8 +888,9 @@ mod tests {
                 );
 
                 let keypad = keyboard_record(records.last().expect("keypad record"));
-                assert_eq!(keypad.wScan, NUMPAD7_SCAN);
-                assert_eq!(keypad.dwFlags & KEYEVENTF_SCANCODE, KEYEVENTF_SCANCODE);
+                assert_eq!(keypad.wVk, virtual_key);
+                assert_eq!(keypad.wScan, 0);
+                assert_eq!(keypad.dwFlags & KEYEVENTF_SCANCODE, 0);
                 if source_num_lock_on == destination_num_lock_on {
                     assert_eq!(records.len(), 1);
                 } else {
@@ -922,14 +923,62 @@ mod tests {
         assert_eq!(keyboard_record(&records[1]).wVk, VK_NUMLOCK_CODE);
         for record in &records[2..4] {
             let key = keyboard_record(record);
-            assert_eq!(key.wScan, 0x4F);
-            assert_ne!(key.dwFlags & KEYEVENTF_SCANCODE, 0);
+            assert_eq!(key.wVk, VK_NUMPAD1);
+            assert_eq!(key.wScan, 0);
+            assert_eq!(key.dwFlags & KEYEVENTF_SCANCODE, 0);
+            assert_eq!(key.dwFlags & KEYEVENTF_KEYUP, 0);
         }
         let release = keyboard_record(&records[4]);
         assert_eq!(release.wVk, VK_NUMPAD1);
         assert_eq!(release.wScan, 0);
         assert_eq!(release.dwFlags & KEYEVENTF_SCANCODE, 0);
         assert_eq!(release.dwFlags & KEYEVENTF_KEYUP, KEYEVENTF_KEYUP);
+    }
+
+    #[test]
+    fn shift_overridden_keypad_identity_survives_modifier_release_before_repeat() {
+        const VK_END: u16 = 0x23;
+        const VK_LSHIFT: u16 = 0xA0;
+
+        let events = [
+            windows_key(0x2A, VK_LSHIFT, true, KeyState::Down),
+            windows_key(0x4F, VK_END, true, KeyState::Down),
+            windows_key(0x2A, VK_LSHIFT, true, KeyState::Up),
+            windows_key(0x4F, VK_END, true, KeyState::Down),
+            windows_key(0x4F, VK_END, true, KeyState::Up),
+        ];
+
+        let records = input_records_for_events_with_num_lock_state(&events, false);
+        assert_eq!(
+            records.len(),
+            7,
+            "one Num Lock reconciliation pair plus the five captured key events"
+        );
+        let shift_down = keyboard_record(&records[0]);
+        assert_eq!(shift_down.wScan, 0x2A);
+        assert_ne!(shift_down.dwFlags & KEYEVENTF_SCANCODE, 0);
+        assert_eq!(keyboard_record(&records[1]).wVk, VK_NUMLOCK_CODE);
+        assert_eq!(keyboard_record(&records[2]).wVk, VK_NUMLOCK_CODE);
+
+        for (index, key_up) in [(3usize, false), (5usize, false), (6usize, true)] {
+            let keypad = keyboard_record(&records[index]);
+            assert_eq!(
+                keypad.wVk, VK_END,
+                "ambiguous keypad event {index} must retain its cached virtual-key identity"
+            );
+            assert_eq!(keypad.wScan, 0);
+            assert_eq!(keypad.dwFlags & KEYEVENTF_SCANCODE, 0);
+            assert_eq!(
+                keypad.dwFlags & KEYEVENTF_KEYUP != 0,
+                key_up,
+                "ambiguous keypad event {index} transition"
+            );
+        }
+
+        let shift_up = keyboard_record(&records[4]);
+        assert_eq!(shift_up.wScan, 0x2A);
+        assert_ne!(shift_up.dwFlags & KEYEVENTF_SCANCODE, 0);
+        assert_ne!(shift_up.dwFlags & KEYEVENTF_KEYUP, 0);
     }
 
     #[test]
@@ -962,7 +1011,10 @@ mod tests {
                         1,
                         "the next frame reuses committed destination state"
                     );
-                    assert_eq!(keyboard_record(&records[0]).wScan, 0x4F);
+                    let keypad = keyboard_record(&records[0]);
+                    assert_eq!(keypad.wVk, VK_NUMPAD1);
+                    assert_eq!(keypad.wScan, 0);
+                    assert_eq!(keypad.dwFlags & KEYEVENTF_SCANCODE, 0);
                     Ok(records.len() as u32)
                 },
             )
@@ -1201,7 +1253,10 @@ mod tests {
         input
             .send_events_with(std::slice::from_ref(&event), |records| {
                 assert_eq!(records.len(), 1, "retry must not toggle Num Lock again");
-                assert_eq!(keyboard_record(&records[0]).wScan, 0x4F);
+                let keypad = keyboard_record(&records[0]);
+                assert_eq!(keypad.wVk, VK_NUMPAD1);
+                assert_eq!(keypad.wScan, 0);
+                assert_eq!(keypad.dwFlags & KEYEVENTF_SCANCODE, 0);
                 Ok(1)
             })
             .into_result()
@@ -1244,7 +1299,11 @@ mod tests {
                         assert_eq!(key.wVk, VK_NUMLOCK_CODE);
                         assert_ne!(key.dwFlags & KEYEVENTF_KEYUP, 0);
                     }
-                    2 => assert_eq!(key.wScan, 0x4F),
+                    2 => {
+                        assert_eq!(key.wVk, VK_NUMPAD1);
+                        assert_eq!(key.wScan, 0);
+                        assert_eq!(key.dwFlags & KEYEVENTF_SCANCODE, 0);
+                    }
                     _ => panic!("unexpected retry send attempt {retry_calls}"),
                 }
                 Ok(1)

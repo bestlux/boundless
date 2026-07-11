@@ -25,6 +25,8 @@ use windows_sys::Win32::{
 const OWNER_RECOVERY_WAIT_MS: u32 = 250;
 const SHUTDOWN_OPEN_RETRY_COUNT: usize = 50;
 const SHUTDOWN_OPEN_RETRY_DELAY: Duration = Duration::from_millis(10);
+const RETIRING_SHUTDOWN_RETRY_COUNT: usize = 50;
+const RETIRING_SHUTDOWN_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 pub enum SingleInstanceAcquire {
     Primary(SingleInstanceGuard),
@@ -184,26 +186,44 @@ impl SingleInstanceGuard {
             KernelObjectSecurityDescriptor::for_user(user_sid, IntegrityLevel::Medium)?;
         let shutdown_attributes = shutdown_security.attributes();
         let shutdown_event_name = wide_null(&format!("{name}.Shutdown"));
-        unsafe {
-            SetLastError(0);
-        }
-        let shutdown_event =
-            unsafe { CreateEventW(&shutdown_attributes, 0, 0, shutdown_event_name.as_ptr()) };
-        if shutdown_event.is_null() {
-            let error = std::io::Error::last_os_error();
+        let mut retiring_shutdown_attempt = 0usize;
+        let shutdown_event = loop {
             unsafe {
-                ReleaseMutex(owner_mutex.0);
+                SetLastError(0);
             }
-            return Err(error).context("failed to create tray shutdown event");
-        }
-        let shutdown_already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-        let shutdown_event = Arc::new(OwnedHandle(shutdown_event));
-        if shutdown_already_exists {
-            unsafe {
-                ReleaseMutex(owner_mutex.0);
+            let shutdown_event =
+                unsafe { CreateEventW(&shutdown_attributes, 0, 0, shutdown_event_name.as_ptr()) };
+            if shutdown_event.is_null() {
+                let error = std::io::Error::last_os_error();
+                unsafe {
+                    ReleaseMutex(owner_mutex.0);
+                }
+                return Err(error).context("failed to create tray shutdown event");
             }
-            bail!("refusing tray ownership because the shutdown event unexpectedly pre-existed");
-        }
+            if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+                break Arc::new(OwnedHandle(shutdown_event));
+            }
+            drop(OwnedHandle(shutdown_event));
+
+            if !owner_already_exists {
+                unsafe {
+                    ReleaseMutex(owner_mutex.0);
+                }
+                bail!(
+                    "refusing tray ownership because the shutdown event unexpectedly pre-existed"
+                );
+            }
+            if retiring_shutdown_attempt == RETIRING_SHUTDOWN_RETRY_COUNT {
+                unsafe {
+                    ReleaseMutex(owner_mutex.0);
+                }
+                bail!(
+                    "refusing recovered tray ownership because the retiring shutdown event did not close"
+                );
+            }
+            retiring_shutdown_attempt += 1;
+            thread::sleep(RETIRING_SHUTDOWN_RETRY_DELAY);
+        };
 
         Ok(SingleInstanceAcquire::Primary(Self {
             owner_mutex: Some(owner_mutex),
@@ -517,6 +537,13 @@ mod tests {
         OwnedHandle(shutdown)
     }
 
+    fn open_shutdown_event(name: &str) -> OwnedHandle {
+        let shutdown_name = wide_null(&format!("{name}.Shutdown"));
+        let shutdown = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, shutdown_name.as_ptr()) };
+        assert!(!shutdown.is_null(), "shutdown event should open");
+        OwnedHandle(shutdown)
+    }
+
     #[test]
     fn second_acquire_signals_primary_listener() {
         let name = unique_name("activation");
@@ -747,6 +774,163 @@ mod tests {
     }
 
     #[test]
+    fn recovered_owner_waits_for_retiring_external_shutdown_handle() {
+        let name = unique_name("retiring-shutdown-handle");
+        let sid = current_sid();
+        let SingleInstanceAcquire::Primary(mut primary) =
+            SingleInstanceGuard::acquire(&name, &sid).expect("first acquire should succeed")
+        else {
+            panic!("first acquire must become primary");
+        };
+        let retiring_shutdown = open_shutdown_event(&name);
+
+        let (activation_tx, activation_rx) = mpsc::channel();
+        primary
+            .start_listener(
+                move || {
+                    activation_tx
+                        .send(())
+                        .expect("activation receiver should stay open");
+                },
+                || {},
+            )
+            .expect("listener should start");
+
+        let (owner_released_tx, owner_released_rx) = mpsc::sync_channel(0);
+        let (resume_drop_tx, resume_drop_rx) = mpsc::channel();
+        primary.drop_probe = Some(SingleInstanceDropProbe {
+            owner_released: owner_released_tx,
+            resume_drop: resume_drop_rx,
+        });
+
+        let secondary_name = name.clone();
+        let secondary_sid = sid.clone();
+        let (secondary_result_tx, secondary_result_rx) = mpsc::channel();
+        let secondary = thread::spawn(move || {
+            let result = match SingleInstanceGuard::acquire(&secondary_name, &secondary_sid) {
+                Ok(SingleInstanceAcquire::Primary(secondary_primary)) => {
+                    drop(secondary_primary);
+                    Ok(())
+                }
+                Ok(SingleInstanceAcquire::ExistingSignaled) => {
+                    Err("secondary timed out waiting for owner mutex".to_string())
+                }
+                Err(error) => Err(format!("secondary acquire failed: {error:#}")),
+            };
+            secondary_result_tx
+                .send(result)
+                .expect("secondary result receiver should stay open");
+        });
+
+        activation_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("secondary should signal before waiting for owner recovery");
+        let coordinator = thread::spawn(move || {
+            owner_released_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("primary drop should publish owner release");
+            let early_result = secondary_result_rx.recv_timeout(Duration::from_millis(50));
+            let remained_pending = matches!(early_result, Err(mpsc::RecvTimeoutError::Timeout));
+            drop(retiring_shutdown);
+            let secondary_result = match early_result {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => secondary_result_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("secondary should recover after retiring handle closes"),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err("secondary result channel disconnected".to_string())
+                }
+            };
+            resume_drop_tx
+                .send(())
+                .expect("primary drop should still be waiting");
+            (remained_pending, secondary_result)
+        });
+
+        drop(primary);
+        let (remained_pending, secondary_result) =
+            coordinator.join().expect("drop coordinator should finish");
+        secondary.join().expect("secondary should finish");
+
+        assert!(
+            remained_pending,
+            "recovered owner must wait while a retiring Shutdown handle keeps the old object alive"
+        );
+        assert!(
+            secondary_result.is_ok(),
+            "recovered owner must publish a fresh Shutdown event after retirement: {secondary_result:?}"
+        );
+    }
+
+    #[test]
+    fn recovered_owner_times_out_when_retiring_shutdown_handle_never_closes() {
+        let name = unique_name("retiring-shutdown-timeout");
+        let sid = current_sid();
+        let SingleInstanceAcquire::Primary(mut primary) =
+            SingleInstanceGuard::acquire(&name, &sid).expect("first acquire should succeed")
+        else {
+            panic!("first acquire must become primary");
+        };
+        let retiring_shutdown = open_shutdown_event(&name);
+
+        let (activation_tx, activation_rx) = mpsc::channel();
+        primary
+            .start_listener(
+                move || {
+                    activation_tx
+                        .send(())
+                        .expect("activation receiver should stay open");
+                },
+                || {},
+            )
+            .expect("listener should start");
+
+        let secondary_name = name.clone();
+        let secondary_sid = sid.clone();
+        let (secondary_result_tx, secondary_result_rx) = mpsc::channel();
+        let secondary = thread::spawn(move || {
+            let started_at = std::time::Instant::now();
+            let result = match SingleInstanceGuard::acquire(&secondary_name, &secondary_sid) {
+                Ok(SingleInstanceAcquire::Primary(secondary_primary)) => {
+                    drop(secondary_primary);
+                    Ok(())
+                }
+                Ok(SingleInstanceAcquire::ExistingSignaled) => {
+                    Err("secondary timed out waiting for owner mutex".to_string())
+                }
+                Err(error) => Err(format!("{error:#}")),
+            };
+            secondary_result_tx
+                .send((started_at.elapsed(), result))
+                .expect("secondary result receiver should stay open");
+        });
+
+        activation_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("secondary should signal before waiting for owner recovery");
+        drop(primary);
+        let (elapsed, secondary_result) = secondary_result_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("recovered owner should fail closed within its bounded drain");
+        secondary.join().expect("secondary should finish");
+        drop(retiring_shutdown);
+
+        let error = secondary_result.expect_err("retiring handle timeout must reject ownership");
+        assert!(
+            error.contains("retiring shutdown event did not close"),
+            "unexpected recovered-owner error: {error}"
+        );
+        assert!(
+            elapsed >= RETIRING_SHUTDOWN_RETRY_DELAY * RETIRING_SHUTDOWN_RETRY_COUNT as u32,
+            "recovered owner failed before the bounded retirement window elapsed: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "recovered owner drain must remain bounded: {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn rejects_non_local_names() {
         let error = match SingleInstanceGuard::acquire("Global\\Boundless.Test", &current_sid()) {
             Ok(_) => panic!("global name must be rejected"),
@@ -873,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_owner_promotion_rejects_a_preexisting_shutdown_event() {
+    fn abandoned_owner_promotion_fails_closed_on_a_persistent_shutdown_event() {
         let name = unique_name("abandoned-precreated-shutdown");
         let sid = current_sid();
         let owner_name = name.clone();
@@ -896,7 +1080,11 @@ mod tests {
             Ok(_) => panic!("stale-owner promotion must reject a pre-existing shutdown event"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("unexpectedly pre-existed"));
+        assert!(
+            error
+                .to_string()
+                .contains("retiring shutdown event did not close")
+        );
         drop(stale_handles);
     }
 
