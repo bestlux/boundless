@@ -22,6 +22,10 @@ param(
     [Parameter(DontShow = $true)]
     [string]$ElevatedBootstrapRecoveryRevocationEvent = "",
     [Parameter(DontShow = $true)]
+    [string]$ElevatedBootstrapRecoveryActionFence = "",
+    [Parameter(DontShow = $true)]
+    [string]$ElevatedBootstrapRecoveryActionCommittedEvent = "",
+    [Parameter(DontShow = $true)]
     [string]$ExpectedInstallerSha256 = "",
     [Parameter(DontShow = $true)]
     [string]$ElevatedInstallCancelEvent = "",
@@ -239,13 +243,12 @@ function ConvertTo-BoundlessCompressedEncodedCommand {
         $buffer.Dispose()
     }
     $launcher = @'
-$bytes = [Convert]::FromBase64String("__COMPRESSED_SOURCE__")
-$input = [IO.MemoryStream]::new($bytes)
-$gzip = [IO.Compression.GZipStream]::new($input, [IO.Compression.CompressionMode]::Decompress)
-$reader = [IO.StreamReader]::new($gzip, [Text.Encoding]::UTF8)
-try { $source = $reader.ReadToEnd() }
-finally { $reader.Dispose(); $gzip.Dispose(); $input.Dispose() }
-& ([scriptblock]::Create($source))
+$b=[Convert]::FromBase64String("__COMPRESSED_SOURCE__")
+$i=[IO.MemoryStream]::new($b)
+$g=[IO.Compression.GZipStream]::new($i,[IO.Compression.CompressionMode]::Decompress)
+$r=[IO.StreamReader]::new($g,[Text.Encoding]::UTF8)
+try{& ([scriptblock]::Create($r.ReadToEnd()))}
+finally{$r.Dispose();$g.Dispose();$i.Dispose()}
 '@.Replace("__COMPRESSED_SOURCE__", $compressed)
     return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($launcher))
 }
@@ -1600,11 +1603,15 @@ function Test-BoundlessNormalQuiescenceReleaseAllowed {
         [bool]$InstallerTreeClosed,
         [ValidateSet("not_started", "definitive", "uncertain")]
         [string]$CompletionState,
-        [bool]$MsiTransactionIdleProven
+        [bool]$MsiTransactionIdleProven,
+        [bool]$RecoveryAuthorityDrained = $true,
+        [bool]$RecoveryActionSettled = $true
     )
 
     return (
         $InstallerTreeClosed -and
+        $RecoveryAuthorityDrained -and
+        $RecoveryActionSettled -and
         ($CompletionState -ne "uncertain" -or $MsiTransactionIdleProven)
     )
 }
@@ -2729,6 +2736,9 @@ function Enter-BoundlessTrayQuiescence {
                 elevated_wrapper_hard_kill_used = $false
                 parent_service_recovery_reconciled = $false
                 parent_service_recovery_status = ""
+                recovery_authority_drained = $true
+                recovery_action_settled = $true
+                recovery_authority_job_name = ""
             }
         }
     }
@@ -2894,11 +2904,87 @@ function Start-BoundlessTrayQuiescenceTakeoverMonitor {
     }
 }
 
+function Wait-BoundlessRecoveryAuthorityDrainProof {
+    param(
+        [string]$JobName,
+        [int]$TimeoutMilliseconds = 15000,
+        [scriptblock]$ActiveProcessProbe = $null
+    )
+
+    if ($JobName -notmatch '^Local\\Boundless\.Installer\.RecoveryAuthority\.v1\.[0-9a-f]{32}$') {
+        return $false
+    }
+    Initialize-BoundlessProcessTreeNativeMethods
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMilliseconds)
+    do {
+        try {
+            $active = if ($null -ne $ActiveProcessProbe) {
+                [int](& $ActiveProcessProbe $JobName)
+            }
+            else {
+                [BoundlessProcessTreeNativeMethods]::GetNamedJobActiveProcessCount(
+                    $JobName
+                )
+            }
+            if ($active -le 0) { return $true }
+        }
+        catch { }
+        Start-Sleep -Milliseconds 50
+    } while ((Get-Date) -lt $deadline)
+    return $false
+}
+
 function Resolve-BoundlessUnconfirmedTreeAndQuiescence {
-    param([object]$Lease)
+    param(
+        [object]$Lease,
+        [scriptblock]$RecoveryAuthorityActiveProcessProbe = $null,
+        [int]$RecoveryAuthorityDrainTimeoutMilliseconds = 15000,
+        [scriptblock]$FailClosedAction = $null
+    )
 
     if ($null -eq $Lease -or $null -eq $Lease.mutex) {
         return
+    }
+    $recoveryActionSettled = (
+        $null -eq $Lease.evidence.PSObject.Properties["recovery_action_settled"] -or
+        [bool]$Lease.evidence.recovery_action_settled
+    )
+    if (-not $recoveryActionSettled) {
+        $reason = "Privileged recovery SCM action settlement remained unproven."
+        if ($null -ne $FailClosedAction) {
+            & $FailClosedAction $Lease $reason
+            return
+        }
+        Hold-BoundlessSynchronousTrayQuiescenceFailClosed `
+            -Lease $Lease `
+            -Reason $reason
+    }
+    $recoveryAuthorityDrained = (
+        $null -eq $Lease.evidence.PSObject.Properties["recovery_authority_drained"] -or
+        [bool]$Lease.evidence.recovery_authority_drained
+    )
+    if (-not $recoveryAuthorityDrained) {
+        $jobName = if (
+            $null -ne $Lease.evidence.PSObject.Properties["recovery_authority_job_name"]
+        ) {
+            [string]$Lease.evidence.recovery_authority_job_name
+        }
+        else { "" }
+        $drained = Wait-BoundlessRecoveryAuthorityDrainProof `
+            -JobName $jobName `
+            -TimeoutMilliseconds $RecoveryAuthorityDrainTimeoutMilliseconds `
+            -ActiveProcessProbe $RecoveryAuthorityActiveProcessProbe
+        if (-not $drained) {
+            $reason = "Privileged recovery authority drain remained unproven."
+            if ($null -ne $FailClosedAction) {
+                & $FailClosedAction $Lease $reason
+                return
+            }
+            Hold-BoundlessSynchronousTrayQuiescenceFailClosed `
+                -Lease $Lease `
+                -Reason $reason
+        }
+        $Lease.evidence.recovery_authority_drained = $true
     }
     $monitorAvailable = -not $Lease.monitor.process.HasExited
     $hasTransferMetadata = (
@@ -3168,47 +3254,125 @@ function Invoke-BoundlessRecoveryLauncherBounded {
     param(
         [string]$LauncherSource,
         [int]$TimeoutMilliseconds,
-        [object]$RecoveryAuthority
+        [object]$RecoveryAuthority,
+        [int]$SettlementTimeoutMilliseconds = 35000
     )
 
     $launcher = $null
-    $completed = $false
+    $launcherFailure = $null
+    $synchronization = $null
+    $synchronizationFailure = $null
+    $closeFailure = $null
     try {
-        $launcher = Start-BoundlessOwnedProcessBoundary `
-            -FilePath (Resolve-CurrentPowerShellExecutable) `
-            -ArgumentList @(
-                "-NoProfile",
-                "-EncodedCommand",
-                [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($LauncherSource))
-            ) `
-            -CreateNoWindow
-        if (-not $launcher.WaitForExit($TimeoutMilliseconds)) {
-            throw "Parent service recovery elevation launch/execution exceeded $TimeoutMilliseconds milliseconds."
+        try {
+            $launcher = Start-BoundlessOwnedProcessBoundary `
+                -FilePath (Resolve-CurrentPowerShellExecutable) `
+                -ArgumentList @(
+                    "-NoProfile",
+                    "-EncodedCommand",
+                    [Convert]::ToBase64String(
+                        [Text.Encoding]::Unicode.GetBytes($LauncherSource)
+                    )
+                ) `
+                -CreateNoWindow
+            if (-not $launcher.WaitForExit($TimeoutMilliseconds)) {
+                throw "Parent service recovery elevation launch/execution exceeded $TimeoutMilliseconds milliseconds."
+            }
+            if (-not $launcher.WaitForTreeExit(5000)) {
+                throw "Parent service recovery launcher left an owned descendant."
+            }
+            if ($launcher.ExitCode -ne 0) {
+                throw "Parent service recovery launcher failed with exit code $($launcher.ExitCode)."
+            }
+            if ($RecoveryAuthority.job.ActiveProcessCount -gt 0) {
+                throw "Parent service recovery launcher exited before its privileged child drained."
+            }
         }
-        if (-not $launcher.WaitForTreeExit(5000)) {
-            throw "Parent service recovery launcher left an owned descendant."
+        catch {
+            $launcherFailure = $_
         }
-        if ($launcher.ExitCode -ne 0) {
-            throw "Parent service recovery launcher failed with exit code $($launcher.ExitCode)."
+
+        if ($null -ne $launcherFailure) {
+            try {
+                $synchronization = Revoke-BoundlessRecoveryAuthorityAndSynchronizeAction `
+                    -Authority $RecoveryAuthority `
+                    -SettlementTimeoutMilliseconds $SettlementTimeoutMilliseconds
+            }
+            catch {
+                $synchronizationFailure = $_
+            }
         }
-        if ($RecoveryAuthority.job.ActiveProcessCount -gt 0) {
-            throw "Parent service recovery launcher exited before its privileged child drained."
+        else {
+            # A successful launcher exit plus an empty authority job proves the
+            # privileged helper finished its bounded SCM settlement and cannot
+            # issue a later service mutation.
+            $RecoveryAuthority.action_settled = $true
         }
-        $completed = $true
-    }
-    finally {
+
         try {
             Close-BoundlessRecoveryAuthority `
                 -Authority $RecoveryAuthority `
-                -Revoke:(-not $completed)
+                -Revoke:($null -ne $launcherFailure) `
+                -ActionFenceOwned:(
+                    $null -ne $synchronization -and
+                    [bool]$synchronization.fence_owned
+                )
         }
-        finally {
-            if ($null -ne $launcher) {
-                if ($launcher.ActiveProcessCount -gt 0) {
-                    Stop-BoundlessProcessBoundary -Process $launcher -TimeoutMilliseconds 5000
-                }
-                $launcher.Dispose()
+        catch {
+            $closeFailure = $_
+        }
+
+        if ($null -ne $synchronizationFailure) {
+            throw (
+                "$($launcherFailure.Exception.Message) Recovery action-fence " +
+                "synchronization also failed: " +
+                $synchronizationFailure.Exception.Message
+            )
+        }
+        if ($null -ne $closeFailure) {
+            $prefix = if ($null -ne $launcherFailure) {
+                "$($launcherFailure.Exception.Message) "
             }
+            else { "" }
+            throw (
+                $prefix +
+                "Recovery authority drain also failed: " +
+                $closeFailure.Exception.Message
+            )
+        }
+        if (
+            $null -ne $launcherFailure -and
+            -not [bool]$synchronization.action_committed
+        ) {
+            throw $launcherFailure
+        }
+        return [pscustomobject]@{
+            launcher_completed = $null -eq $launcherFailure
+            launcher_failure = if ($null -ne $launcherFailure) {
+                $launcherFailure.Exception.Message
+            }
+            else { "" }
+            action_committed = (
+                $null -ne $synchronization -and
+                [bool]$synchronization.action_committed
+            )
+            action_fence_synchronized = (
+                $null -eq $launcherFailure -or
+                (
+                    $null -ne $synchronization -and
+                    [bool]$synchronization.fence_owned
+                )
+            )
+            authority_drained = [bool]$RecoveryAuthority.drained
+            action_settled = [bool]$RecoveryAuthority.action_settled
+        }
+    }
+    finally {
+        if ($null -ne $launcher) {
+            if ($launcher.ActiveProcessCount -gt 0) {
+                Stop-BoundlessProcessBoundary -Process $launcher -TimeoutMilliseconds 5000
+            }
+            $launcher.Dispose()
         }
     }
 }
@@ -3218,6 +3382,7 @@ function Restore-BoundlessServiceAfterHardKilledElevatedInstall {
         [object]$QuiescenceLease,
         [string]$StagedHelperPath,
         [int]$TimeoutMilliseconds = 60000,
+        [int]$ActionSettlementTimeoutMilliseconds = 35000,
         [string]$FixtureLauncherSource = "",
         [scriptblock]$BeforeFixtureLauncherAction = $null,
         [scriptblock]$ServiceStatusProbe = $null
@@ -3261,7 +3426,22 @@ function Restore-BoundlessServiceAfterHardKilledElevatedInstall {
 
     $recoveryAuthority = New-BoundlessRecoveryAuthority `
         -UserSid $QuiescenceLease.expected_owner_sid
+    if ($null -ne $QuiescenceLease.PSObject.Properties["evidence"]) {
+        $QuiescenceLease.evidence | Add-Member `
+            -NotePropertyName recovery_authority_drained `
+            -NotePropertyValue $false `
+            -Force
+        $QuiescenceLease.evidence | Add-Member `
+            -NotePropertyName recovery_action_settled `
+            -NotePropertyValue $false `
+            -Force
+        $QuiescenceLease.evidence | Add-Member `
+            -NotePropertyName recovery_authority_job_name `
+            -NotePropertyValue $recoveryAuthority.job_name `
+            -Force
+    }
     $authorityTransferred = $false
+    $recoveryLaunch = $null
     try {
     $launcherSource = if (-not [string]::IsNullOrWhiteSpace($FixtureLauncherSource)) {
         $FixtureLauncherSource
@@ -3291,7 +3471,11 @@ function Restore-BoundlessServiceAfterHardKilledElevatedInstall {
             "-ElevatedBootstrapRecoveryJob",
             $recoveryAuthority.job_name,
             "-ElevatedBootstrapRecoveryRevocationEvent",
-            $recoveryAuthority.revocation_event_name
+            $recoveryAuthority.revocation_event_name,
+            "-ElevatedBootstrapRecoveryActionFence",
+            $recoveryAuthority.action_fence_name,
+            "-ElevatedBootstrapRecoveryActionCommittedEvent",
+            $recoveryAuthority.action_committed_event_name
         )
         $payload = [ordered]@{
             file_path = Resolve-CurrentPowerShellExecutable
@@ -3343,16 +3527,69 @@ finally {
     ).Replace(
         "__RECOVERY_REVOCATION__",
         $recoveryAuthority.revocation_event_name
+    ).Replace(
+        "__RECOVERY_ACTION_FENCE__",
+        $recoveryAuthority.action_fence_name
+    ).Replace(
+        "__RECOVERY_ACTION_COMMITTED__",
+        $recoveryAuthority.action_committed_event_name
     )
     $authorityTransferred = $true
-    Invoke-BoundlessRecoveryLauncherBounded `
+    $recoveryLaunch = Invoke-BoundlessRecoveryLauncherBounded `
         -LauncherSource $launcherSource `
         -TimeoutMilliseconds $TimeoutMilliseconds `
-        -RecoveryAuthority $recoveryAuthority
+        -RecoveryAuthority $recoveryAuthority `
+        -SettlementTimeoutMilliseconds $ActionSettlementTimeoutMilliseconds
     }
     finally {
-        if (-not $authorityTransferred) {
-            Close-BoundlessRecoveryAuthority -Authority $recoveryAuthority -Revoke
+        try {
+            if (-not $authorityTransferred) {
+                $setupSynchronization = $null
+                $setupSynchronizationFailure = $null
+                $setupCloseFailure = $null
+                try {
+                    $setupSynchronization = Revoke-BoundlessRecoveryAuthorityAndSynchronizeAction `
+                        -Authority $recoveryAuthority `
+                        -SettlementTimeoutMilliseconds $ActionSettlementTimeoutMilliseconds
+                }
+                catch {
+                    $setupSynchronizationFailure = $_
+                }
+                try {
+                    Close-BoundlessRecoveryAuthority `
+                        -Authority $recoveryAuthority `
+                        -Revoke `
+                        -ActionFenceOwned:(
+                            $null -ne $setupSynchronization -and
+                            [bool]$setupSynchronization.fence_owned
+                        )
+                }
+                catch {
+                    $setupCloseFailure = $_
+                }
+                if ($null -ne $setupSynchronizationFailure) {
+                    throw (
+                        "Recovery setup action-fence synchronization failed: " +
+                        $setupSynchronizationFailure.Exception.Message
+                    )
+                }
+                if ($null -ne $setupCloseFailure) {
+                    throw (
+                        "Recovery setup authority drain failed: " +
+                        $setupCloseFailure.Exception.Message
+                    )
+                }
+            }
+        }
+        finally {
+            if ($null -ne $QuiescenceLease.PSObject.Properties["evidence"]) {
+                $QuiescenceLease.evidence.recovery_authority_drained = (
+                    [bool]$recoveryAuthority.drained
+                )
+                $QuiescenceLease.evidence.recovery_action_settled = (
+                    [bool]$recoveryAuthority.action_settled
+                )
+            }
         }
     }
     if (
@@ -3362,7 +3599,23 @@ finally {
     ) {
         throw "Parent service recovery did not publish a definitive or authoritative MSI-idle boundary before restart."
     }
-    $statusAfterRecovery = & $ServiceStatusProbe
+    $statusAfterRecovery = if (
+        $null -ne $recoveryLaunch -and
+        $recoveryLaunch.action_committed
+    ) {
+        Wait-BoundlessServiceTransition `
+            -DesiredStatus "Running" `
+            -Worker $null `
+            -StatusProbe $ServiceStatusProbe `
+            -TimeoutSeconds ([Math]::Max(
+                1,
+                [int][Math]::Ceiling($ActionSettlementTimeoutMilliseconds / 1000.0)
+            )) `
+            -FailurePrefix "Parent service recovery committed-start reconciliation"
+    }
+    else {
+        & $ServiceStatusProbe
+    }
     if ($statusAfterRecovery -notin @("Running", "StartPending")) {
         throw "Parent service recovery process exited successfully but BoundlessService remained $statusAfterRecovery."
     }
@@ -3495,11 +3748,24 @@ function New-BoundlessRecoveryAuthority {
     Initialize-BoundlessRecoveryAuthorityNativeMethods
     $authorityId = [guid]::NewGuid().ToString('N')
     $jobName = "Local\Boundless.Installer.RecoveryAuthority.v1.$authorityId"
+    $actionFenceName = "Local\Boundless.Installer.RecoveryAction.v1.$authorityId"
     $revocation = New-BoundlessSentinelOwnerEvent `
         -Prefix "Boundless.Installer.RecoveryRevoked.v1" `
         -UserSid $UserSid
+    $actionFence = $null
+    $actionCommitted = $null
     $job = $null
     try {
+        $actionFence = New-BoundlessNamedMutex `
+            -Name $actionFenceName `
+            -UserSid $UserSid `
+            -InitiallyOwned $false
+        if (-not $actionFence.created_new) {
+            throw "Recovery action fence unexpectedly already existed."
+        }
+        $actionCommitted = New-BoundlessSentinelOwnerEvent `
+            -Prefix "Boundless.Installer.RecoveryActionCommitted.v1" `
+            -UserSid $UserSid
         $job = [BoundlessRecoveryAuthorityNativeMethodsV1]::Create(
             $jobName,
             "D:P(A;;RC;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;$UserSid)"
@@ -3509,10 +3775,18 @@ function New-BoundlessRecoveryAuthority {
             job_name = $jobName
             revocation_event = $revocation.event
             revocation_event_name = $revocation.name
+            action_fence = $actionFence.mutex
+            action_fence_name = $actionFenceName
+            action_committed_event = $actionCommitted.event
+            action_committed_event_name = $actionCommitted.name
+            drained = $false
+            action_settled = $false
         }
     }
     catch {
         if ($null -ne $job) { $job.Dispose() }
+        if ($null -ne $actionCommitted) { $actionCommitted.event.Dispose() }
+        if ($null -ne $actionFence) { $actionFence.mutex.Dispose() }
         $revocation.event.Dispose()
         throw
     }
@@ -3521,7 +3795,9 @@ function New-BoundlessRecoveryAuthority {
 function Join-BoundlessRecoveryAuthority {
     param(
         [string]$JobName,
-        [string]$RevocationEventName
+        [string]$RevocationEventName,
+        [string]$ActionFenceName,
+        [string]$ActionCommittedEventName
     )
 
     if ($JobName -notmatch '^Local\\Boundless\.Installer\.RecoveryAuthority\.v1\.[0-9a-f]{32}$') {
@@ -3530,16 +3806,76 @@ function Join-BoundlessRecoveryAuthority {
     if ($RevocationEventName -notmatch '^Local\\Boundless\.Installer\.RecoveryRevoked\.v1\.[0-9a-f]{32}$') {
         throw "Recovery revocation event name was invalid."
     }
+    if ($ActionFenceName -notmatch '^Local\\Boundless\.Installer\.RecoveryAction\.v1\.[0-9a-f]{32}$') {
+        throw "Recovery action fence name was invalid."
+    }
+    if ($ActionCommittedEventName -notmatch '^Local\\Boundless\.Installer\.RecoveryActionCommitted\.v1\.[0-9a-f]{32}$') {
+        throw "Recovery action committed event name was invalid."
+    }
     $revocation = [Threading.EventWaitHandle]::OpenExisting($RevocationEventName)
+    $actionFence = $null
+    $actionCommitted = $null
     try {
         if ($revocation.WaitOne(0)) { throw "Recovery authority was revoked before admission." }
+        $actionFence = [Threading.Mutex]::OpenExisting($ActionFenceName)
+        $actionCommitted = [Threading.EventWaitHandle]::OpenExisting(
+            $ActionCommittedEventName
+        )
         Initialize-BoundlessRecoveryAuthorityNativeMethods
         [BoundlessRecoveryAuthorityNativeMethodsV1]::Join($JobName)
         if ($revocation.WaitOne(0)) { throw "Recovery authority was revoked during admission." }
-        return $revocation
+        return [pscustomobject]@{
+            revocation_event = $revocation
+            action_fence = $actionFence
+            action_committed_event = $actionCommitted
+        }
     }
     catch {
+        if ($null -ne $actionCommitted) { $actionCommitted.Dispose() }
+        if ($null -ne $actionFence) { $actionFence.Dispose() }
         $revocation.Dispose()
+        throw
+    }
+}
+
+function Revoke-BoundlessRecoveryAuthorityAndSynchronizeAction {
+    param(
+        [object]$Authority,
+        [int]$SettlementTimeoutMilliseconds = 35000
+    )
+
+    if (-not $Authority.revocation_event.Set()) {
+        throw "Could not revoke parent service recovery authority."
+    }
+    $fenceOwned = $false
+    $fenceAbandoned = $false
+    try {
+        try {
+            $fenceOwned = $Authority.action_fence.WaitOne(
+                $SettlementTimeoutMilliseconds
+            )
+        }
+        catch [Threading.AbandonedMutexException] {
+            $fenceOwned = $true
+            $fenceAbandoned = $true
+        }
+        if (-not $fenceOwned) {
+            throw "Recovery action fence did not settle within $SettlementTimeoutMilliseconds milliseconds."
+        }
+        if ($fenceAbandoned) {
+            throw "Recovery action fence was abandoned before SCM mutation settlement was proved."
+        }
+        $Authority.action_settled = $true
+        return [pscustomobject]@{
+            fence_owned = $true
+            fence_abandoned = $false
+            action_committed = $Authority.action_committed_event.WaitOne(0)
+        }
+    }
+    catch {
+        if ($fenceOwned) {
+            try { $Authority.action_fence.ReleaseMutex() } catch { }
+        }
         throw
     }
 }
@@ -3547,10 +3883,14 @@ function Join-BoundlessRecoveryAuthority {
 function Close-BoundlessRecoveryAuthority {
     param(
         [object]$Authority,
-        [switch]$Revoke
+        [switch]$Revoke,
+        [switch]$ActionFenceOwned,
+        [int]$DrainTimeoutMilliseconds = 5000,
+        [scriptblock]$DrainProof = $null
     )
 
     if ($null -eq $Authority) { return }
+    $Authority.drained = $false
     try {
         if ($Revoke) {
             [void]$Authority.revocation_event.Set()
@@ -3561,14 +3901,35 @@ function Close-BoundlessRecoveryAuthority {
         elseif ($Authority.job.ActiveProcessCount -gt 0) {
             throw "Recovery authority still had an active privileged process at successful completion."
         }
-        if (-not $Authority.job.WaitForEmpty(5000)) {
-            throw "Recovery authority job did not drain within 5000 milliseconds."
+        $drained = if ($null -ne $DrainProof) {
+            [bool](& $DrainProof $Authority $DrainTimeoutMilliseconds)
         }
+        else {
+            $Authority.job.WaitForEmpty($DrainTimeoutMilliseconds)
+        }
+        if (-not $drained) {
+            throw "Recovery authority job did not drain within $DrainTimeoutMilliseconds milliseconds."
+        }
+        $Authority.drained = $true
     }
     finally {
+        if ($ActionFenceOwned) {
+            try { $Authority.action_fence.ReleaseMutex() } catch { }
+        }
         $Authority.job.Dispose()
         $Authority.revocation_event.Dispose()
+        $Authority.action_committed_event.Dispose()
+        $Authority.action_fence.Dispose()
     }
+}
+
+function Close-BoundlessRecoveryAuthorityClient {
+    param([object]$Authority)
+
+    if ($null -eq $Authority) { return }
+    $Authority.action_committed_event.Dispose()
+    $Authority.action_fence.Dispose()
+    $Authority.revocation_event.Dispose()
 }
 
 function Test-BoundlessInstallerStagePath {
@@ -5333,7 +5694,8 @@ function Start-BoundlessServiceAfterFailedInstall {
         [int]$TimeoutSeconds = 15,
         [scriptblock]$StatusProbe = $null,
         [scriptblock]$WorkerFactory = $null,
-        [Threading.EventWaitHandle]$RecoveryAuthority = $null,
+        [object]$RecoveryAuthority = $null,
+        [scriptblock]$BeforeServiceStartAction = $null,
         [switch]$SkipAdministratorCheck
     )
 
@@ -5369,22 +5731,53 @@ function Start-BoundlessServiceAfterFailedInstall {
             -FailurePrefix "BoundlessService recovery existing start"
         return [pscustomobject]@{ start_requested = $false; final_status = $finalStatus }
     }
-    if ($null -ne $RecoveryAuthority -and $RecoveryAuthority.WaitOne(0)) {
-        throw "BoundlessService recovery authority was revoked before the start request."
+    $actionFenceOwned = $false
+    try {
+        if ($null -ne $RecoveryAuthority) {
+            try {
+                $actionFenceOwned = $RecoveryAuthority.action_fence.WaitOne(
+                    ($TimeoutSeconds + 5) * 1000
+                )
+            }
+            catch [Threading.AbandonedMutexException] {
+                $actionFenceOwned = $true
+                throw "BoundlessService recovery action fence was abandoned before admission."
+            }
+            if (-not $actionFenceOwned) {
+                throw "BoundlessService recovery action fence admission timed out."
+            }
+            if ($RecoveryAuthority.revocation_event.WaitOne(0)) {
+                throw "BoundlessService recovery authority was revoked before the start request."
+            }
+            if (-not $RecoveryAuthority.action_committed_event.Set()) {
+                throw "Could not publish the committed BoundlessService recovery action."
+            }
+        }
+        if ($null -ne $BeforeServiceStartAction) {
+            & $BeforeServiceStartAction
+        }
+        $worker = if ($null -ne $WorkerFactory) {
+            & $WorkerFactory
+        }
+        else {
+            Start-BoundlessServiceControlWorker -Action "start"
+        }
+        $finalStatus = Wait-BoundlessServiceTransition `
+            -DesiredStatus "Running" `
+            -Worker $worker `
+            -StatusProbe $StatusProbe `
+            -TimeoutSeconds $TimeoutSeconds `
+            -FailurePrefix "BoundlessService recovery start"
+        return [pscustomobject]@{
+            start_requested = $true
+            final_status = $finalStatus
+        }
     }
-    $worker = if ($null -ne $WorkerFactory) {
-        & $WorkerFactory
+    finally {
+        if ($actionFenceOwned) {
+            $RecoveryAuthority.action_fence.ReleaseMutex()
+        }
     }
-    else {
-        Start-BoundlessServiceControlWorker -Action "start"
-    }
-    $finalStatus = Wait-BoundlessServiceTransition `
-        -DesiredStatus "Running" `
-        -Worker $worker `
-        -StatusProbe $StatusProbe `
-        -TimeoutSeconds $TimeoutSeconds `
-        -FailurePrefix "BoundlessService recovery start"
-    return [pscustomobject]@{ start_requested = $true; final_status = $finalStatus }
 }
 
 function Get-ProcessOwnerSid {
@@ -8062,6 +8455,279 @@ function Invoke-BoundlessFailedMsiServiceRecoveryFixture {
     }
 }
 
+function Invoke-BoundlessRecoveryActionFenceFixture {
+    param([string]$UserSid)
+
+    $revokerSource = @'
+$names = [Text.Encoding]::UTF8.GetString(
+    [Convert]::FromBase64String("__PAYLOAD__")
+) -split "`n"
+$mode = $names[0]
+$revoked = [Threading.EventWaitHandle]::OpenExisting($names[1])
+$fence = [Threading.Mutex]::OpenExisting($names[2])
+$committed = [Threading.EventWaitHandle]::OpenExisting($names[3])
+$trigger = [Threading.EventWaitHandle]::OpenExisting($names[4])
+$release = [Threading.EventWaitHandle]::OpenExisting($names[5])
+$returned = [Threading.EventWaitHandle]::OpenExisting($names[6])
+$owned = $false
+try {
+    if ($mode -eq "parent_wins") {
+        [void]$revoked.Set()
+        try { $owned = $fence.WaitOne(5000) }
+        catch [Threading.AbandonedMutexException] { $owned = $true }
+        if (-not $owned) { exit 81 }
+        [void]$trigger.Set()
+        if (-not $release.WaitOne(5000)) { exit 82 }
+    }
+    else {
+        if (-not $trigger.WaitOne(5000)) { exit 83 }
+        [void]$revoked.Set()
+        try { $owned = $fence.WaitOne(5000) }
+        catch [Threading.AbandonedMutexException] { exit 84 }
+        if (-not $owned -or -not $committed.WaitOne(0)) { exit 85 }
+    }
+}
+finally {
+    if ($owned) { try { $fence.ReleaseMutex() } catch { } }
+    [void]$returned.Set()
+    $returned.Dispose()
+    $release.Dispose()
+    $trigger.Dispose()
+    $committed.Dispose()
+    $fence.Dispose()
+    $revoked.Dispose()
+}
+'@
+
+    foreach ($mode in @("parent_wins", "child_committed")) {
+        $authority = $null
+        $client = $null
+        $revoker = $null
+        $trigger = $null
+        $release = $null
+        $returned = $null
+        $startMarker = $null
+        try {
+            $authority = New-BoundlessRecoveryAuthority -UserSid $UserSid
+            $client = [pscustomobject]@{
+                revocation_event = [Threading.EventWaitHandle]::OpenExisting(
+                    $authority.revocation_event_name
+                )
+                action_fence = [Threading.Mutex]::OpenExisting(
+                    $authority.action_fence_name
+                )
+                action_committed_event = [Threading.EventWaitHandle]::OpenExisting(
+                    $authority.action_committed_event_name
+                )
+            }
+            $trigger = New-BoundlessSentinelOwnerEvent `
+                -Prefix "Boundless.Test.RecoveryFenceTrigger.v1" `
+                -UserSid $UserSid
+            $release = New-BoundlessSentinelOwnerEvent `
+                -Prefix "Boundless.Test.RecoveryFenceRelease.v1" `
+                -UserSid $UserSid
+            $returned = New-BoundlessSentinelOwnerEvent `
+                -Prefix "Boundless.Test.RecoveryFenceReturned.v1" `
+                -UserSid $UserSid
+            $startMarker = New-BoundlessSentinelOwnerEvent `
+                -Prefix "Boundless.Test.RecoveryFenceStart.v1" `
+                -UserSid $UserSid
+            $payload = [Convert]::ToBase64String(
+                [Text.Encoding]::UTF8.GetBytes(
+                    "$mode`n$($authority.revocation_event_name)`n" +
+                    "$($authority.action_fence_name)`n" +
+                    "$($authority.action_committed_event_name)`n" +
+                    "$($trigger.name)`n$($release.name)`n$($returned.name)"
+                )
+            )
+            $source = $revokerSource.Replace("__PAYLOAD__", $payload)
+            $revoker = Start-Process `
+                -FilePath (Resolve-CurrentPowerShellExecutable) `
+                -ArgumentList @(
+                    "-NoProfile",
+                    "-EncodedCommand",
+                    [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($source))
+                ) `
+                -WindowStyle Hidden `
+                -PassThru
+
+            $state = [pscustomobject]@{ service = "Stopped"; starts = 0 }
+            if ($mode -eq "parent_wins") {
+                if (-not $trigger.event.WaitOne(5000)) {
+                    throw "Recovery action-fence parent-wins fixture did not acquire the fence."
+                }
+                [void]$release.event.Set()
+                if (-not $returned.event.WaitOne(5000)) {
+                    throw "Recovery action-fence parent-wins fixture did not return."
+                }
+                if (-not $revoker.WaitForExit(5000) -or $revoker.ExitCode -ne 0) {
+                    throw "Recovery action-fence parent-wins revoker failed."
+                }
+                $startError = $null
+                try {
+                    Start-BoundlessServiceAfterFailedInstall `
+                        -TimeoutSeconds 2 `
+                        -StatusProbe { $state.service } `
+                        -WorkerFactory {
+                            $state.starts += 1
+                            [void]$startMarker.event.Set()
+                            $state.service = "Running"
+                        } `
+                        -RecoveryAuthority $client `
+                        -SkipAdministratorCheck | Out-Null
+                }
+                catch {
+                    $startError = $_
+                }
+                Start-Sleep -Milliseconds 250
+                if (
+                    $null -eq $startError -or
+                    $startError.Exception.Message -notmatch 'revoked before the start request' -or
+                    $state.starts -ne 0 -or
+                    $startMarker.event.WaitOne(0)
+                ) {
+                    throw "Recovery action-fence parent-wins ordering crossed the SCM mutation boundary."
+                }
+            }
+            else {
+                $result = Start-BoundlessServiceAfterFailedInstall `
+                    -TimeoutSeconds 2 `
+                    -StatusProbe { $state.service } `
+                    -BeforeServiceStartAction {
+                        [void]$trigger.event.Set()
+                        if (-not $client.revocation_event.WaitOne(5000)) {
+                            throw "Recovery action-fence committed fixture did not observe parent revocation."
+                        }
+                    } `
+                    -WorkerFactory {
+                        $state.starts += 1
+                        [void]$startMarker.event.Set()
+                        $state.service = "Running"
+                    } `
+                    -RecoveryAuthority $client `
+                    -SkipAdministratorCheck
+                if (-not $returned.event.WaitOne(5000)) {
+                    throw "Recovery action-fence committed parent did not synchronize after settlement."
+                }
+                if (-not $revoker.WaitForExit(5000) -or $revoker.ExitCode -ne 0) {
+                    throw "Recovery action-fence committed revoker failed."
+                }
+                if (
+                    $result.final_status -ne "Running" -or
+                    $state.starts -ne 1 -or
+                    -not $startMarker.event.WaitOne(0) -or
+                    -not $authority.action_committed_event.WaitOne(0)
+                ) {
+                    throw "Recovery action-fence committed ordering did not settle before parent return."
+                }
+            }
+
+            $synchronization = Revoke-BoundlessRecoveryAuthorityAndSynchronizeAction `
+                -Authority $authority `
+                -SettlementTimeoutMilliseconds 2000
+            Close-BoundlessRecoveryAuthority `
+                -Authority $authority `
+                -Revoke `
+                -ActionFenceOwned:([bool]$synchronization.fence_owned)
+            $authority = $null
+        }
+        finally {
+            if ($null -ne $revoker) {
+                if (-not $revoker.HasExited) { $revoker.Kill() }
+                $revoker.Dispose()
+            }
+            if ($null -ne $authority) {
+                try {
+                    $cleanupSynchronization = Revoke-BoundlessRecoveryAuthorityAndSynchronizeAction `
+                        -Authority $authority `
+                        -SettlementTimeoutMilliseconds 2000
+                    Close-BoundlessRecoveryAuthority `
+                        -Authority $authority `
+                        -Revoke `
+                        -ActionFenceOwned:([bool]$cleanupSynchronization.fence_owned)
+                }
+                catch { }
+            }
+            if ($null -ne $client) {
+                Close-BoundlessRecoveryAuthorityClient -Authority $client
+            }
+            foreach ($eventOwner in @($startMarker, $returned, $release, $trigger)) {
+                if ($null -ne $eventOwner) { $eventOwner.event.Dispose() }
+            }
+        }
+    }
+}
+
+function Invoke-BoundlessRecoveryAuthorityDrainFailureFixture {
+    param([string]$UserSid)
+
+    $authority = New-BoundlessRecoveryAuthority -UserSid $UserSid
+    $closeError = $null
+    try {
+        $synchronization = Revoke-BoundlessRecoveryAuthorityAndSynchronizeAction `
+            -Authority $authority `
+            -SettlementTimeoutMilliseconds 2000
+        try {
+            Close-BoundlessRecoveryAuthority `
+                -Authority $authority `
+                -Revoke `
+                -ActionFenceOwned:([bool]$synchronization.fence_owned) `
+                -DrainTimeoutMilliseconds 1 `
+                -DrainProof { $false }
+        }
+        catch {
+            $closeError = $_
+        }
+        if (
+            $null -eq $closeError -or
+            $closeError.Exception.Message -notmatch 'did not drain' -or
+            $authority.drained
+        ) {
+            throw "Recovery authority drain-failure fixture did not retain uncertain evidence."
+        }
+    }
+    finally {
+        # Close-BoundlessRecoveryAuthority disposes all authority handles even
+        # when its injected drain proof fails.
+    }
+
+    $failClosedState = [pscustomobject]@{ invoked = $false; reason = "" }
+    $lease = [pscustomobject]@{
+        mutex = [pscustomobject]@{}
+        evidence = [pscustomobject]@{
+            installer_tree_closed = $true
+            installer_completion_state = "not_started"
+            msi_transaction_idle_proven = $false
+            recovery_authority_drained = $false
+            recovery_action_settled = $true
+            recovery_authority_job_name = $authority.job_name
+        }
+    }
+    if (Test-BoundlessNormalQuiescenceReleaseAllowed `
+        -InstallerTreeClosed $true `
+        -CompletionState "not_started" `
+        -MsiTransactionIdleProven $false `
+        -RecoveryAuthorityDrained $false `
+        -RecoveryActionSettled $true) {
+        throw "Recovery authority drain-failure fixture allowed normal quiescence release."
+    }
+    Resolve-BoundlessUnconfirmedTreeAndQuiescence `
+        -Lease $lease `
+        -RecoveryAuthorityActiveProcessProbe { 1 } `
+        -RecoveryAuthorityDrainTimeoutMilliseconds 100 `
+        -FailClosedAction {
+            param($fixtureLease, $reason)
+            $failClosedState.invoked = $true
+            $failClosedState.reason = $reason
+        }
+    if (
+        -not $failClosedState.invoked -or
+        $failClosedState.reason -notmatch 'authority drain remained unproven'
+    ) {
+        throw "Recovery authority drain-failure fixture did not enter the fail-closed resolver."
+    }
+}
+
 function Invoke-BoundlessReplacementTrayWindowFixture {
     param([string]$UserSid)
 
@@ -8531,6 +9197,8 @@ public static class BoundlessInstallNativeMethods
     Invoke-BoundlessCoordinatorDeathFixture -UserSid $currentIdentitySid
     Invoke-BoundlessFailedDrainQuiescenceFixture -UserSid $currentIdentitySid
     Invoke-BoundlessUncertainTransactionGuardianFixture -UserSid $currentIdentitySid
+    Invoke-BoundlessRecoveryActionFenceFixture -UserSid $currentIdentitySid
+    Invoke-BoundlessRecoveryAuthorityDrainFailureFixture -UserSid $currentIdentitySid
     Invoke-BoundlessBlockingServiceStopFixture
     Invoke-BoundlessFailedMsiServiceRecoveryFixture
     Invoke-BoundlessLogHandoffFixture -SelectedUserSid $validSid
@@ -8792,6 +9460,8 @@ public static class BoundlessInstallNativeMethods
         staging_child_process_probe_hosts = $stagingProbeHosts
         bounded_service_stop_fixture = "passed"
         blocking_service_stop_fixture = "passed"
+        recovery_action_fence_fixture = "passed"
+        recovery_authority_drain_failure_fixture = "passed"
         start_pending_service_recovery_fixture = "passed"
         failed_msi_service_recovery_fixture = "passed"
         elevated_install_result_fixture = "passed"
@@ -8830,7 +9500,9 @@ if (
         if ($ElevatedBootstrapServiceRecovery -or $ElevatedBootstrapMsiIdleServiceRecovery) {
             $recoveryAuthority = Join-BoundlessRecoveryAuthority `
                 -JobName $ElevatedBootstrapRecoveryJob `
-                -RevocationEventName $ElevatedBootstrapRecoveryRevocationEvent
+                -RevocationEventName $ElevatedBootstrapRecoveryRevocationEvent `
+                -ActionFenceName $ElevatedBootstrapRecoveryActionFence `
+                -ActionCommittedEventName $ElevatedBootstrapRecoveryActionCommittedEvent
         }
         $serviceInitialRunning = Open-BoundlessInstallerPhaseEvent `
             -Name $ElevatedInstallServiceInitialRunningEvent `
@@ -8865,9 +9537,6 @@ if (
             ) {
                 throw "Bootstrap service recovery evidence no longer permits a service start."
             }
-            if ($recoveryAuthority.WaitOne(0)) {
-                throw "Bootstrap service recovery authority was revoked before service start."
-            }
             $recovery = Start-BoundlessServiceAfterFailedInstall `
                 -TimeoutSeconds 10 `
                 -RecoveryAuthority $recoveryAuthority
@@ -8889,9 +9558,6 @@ if (
                     throw "Windows Installer transaction idle could not be proved before service recovery."
                 }
                 [void]$msiIdleProven.Set()
-            }
-            if ($recoveryAuthority.WaitOne(0)) {
-                throw "Bootstrap deferred recovery authority was revoked before service start."
             }
             $recovery = Start-BoundlessServiceAfterFailedInstall `
                 -TimeoutSeconds 10 `
@@ -8918,7 +9584,9 @@ if (
         exit 1
     }
     finally {
-        if ($null -ne $recoveryAuthority) { $recoveryAuthority.Dispose() }
+        if ($null -ne $recoveryAuthority) {
+            Close-BoundlessRecoveryAuthorityClient -Authority $recoveryAuthority
+        }
         if ($null -ne $msiIdleProven) { $msiIdleProven.Dispose() }
         if ($null -ne $msiDefinitiveCompletion) { $msiDefinitiveCompletion.Dispose() }
         if ($null -ne $msiMayHaveStarted) { $msiMayHaveStarted.Dispose() }
@@ -9079,7 +9747,9 @@ finally {
     $normalQuiescenceReleaseAllowed = Test-BoundlessNormalQuiescenceReleaseAllowed `
         -InstallerTreeClosed $trayQuiescence.evidence.installer_tree_closed `
         -CompletionState $completionState `
-        -MsiTransactionIdleProven $trayQuiescence.evidence.msi_transaction_idle_proven
+        -MsiTransactionIdleProven $trayQuiescence.evidence.msi_transaction_idle_proven `
+        -RecoveryAuthorityDrained $trayQuiescence.evidence.recovery_authority_drained `
+        -RecoveryActionSettled $trayQuiescence.evidence.recovery_action_settled
     if ($normalQuiescenceReleaseAllowed) {
         Exit-BoundlessTrayQuiescence -Lease $trayQuiescence
     }

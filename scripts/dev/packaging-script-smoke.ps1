@@ -145,10 +145,14 @@ foreach ($requiredInstallContract in @(
         'bounded_recovery_elevation_launch_fixture',
         'msi_started_deferred_recovery_fixture',
         'deferred_recovery_idle_race_fixture',
+        'recovery_action_fence_fixture',
+        'recovery_authority_drain_failure_fixture',
         'native_type_upgrade_compatibility_fixture',
         'Start-BoundlessTrayQuiescenceSentinelOwner',
         'ElevatedInstallCoordinatorProcessId',
         'Get-BoundlessServiceStatusBounded',
+        'ElevatedBootstrapRecoveryActionFence',
+        'recovery_action_settled',
         'Boundless-install-result.txt',
         '(A;;RC;;;OW)'
     )) {
@@ -241,14 +245,31 @@ $parentRecoverySource = Get-PowerShellFunctionSource `
 $recoveryLauncherSource = Get-PowerShellFunctionSource `
     -Path $installScript `
     -Name 'Invoke-BoundlessRecoveryLauncherBounded'
+$recoveryServiceStartSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Start-BoundlessServiceAfterFailedInstall'
+$recoveryRevokeSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Revoke-BoundlessRecoveryAuthorityAndSynchronizeAction'
+$normalReleaseSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Test-BoundlessNormalQuiescenceReleaseAllowed'
 if (
     $parentRecoverySource -notmatch 'ElevatedBootstrapMsiIdleServiceRecovery' -or
     $parentRecoverySource -notmatch 'msi_definitive_completion_event' -or
     $parentRecoverySource -notmatch 'msi_idle_proven_event' -or
+    $parentRecoverySource -notmatch 'ElevatedBootstrapRecoveryActionFence' -or
     $recoveryLauncherSource -notmatch 'WaitForExit\(\$TimeoutMilliseconds\)' -or
-    $recoveryLauncherSource -notmatch 'Stop-BoundlessProcessBoundary'
+    $recoveryLauncherSource -notmatch 'Stop-BoundlessProcessBoundary' -or
+    $recoveryServiceStartSource -notmatch 'action_fence\.WaitOne' -or
+    $recoveryServiceStartSource -notmatch 'action_committed_event\.Set' -or
+    $recoveryServiceStartSource -notmatch 'Wait-BoundlessServiceTransition' -or
+    $recoveryRevokeSource -notmatch 'SettlementTimeoutMilliseconds = 35000' -or
+    $recoveryRevokeSource -notmatch 'did not settle' -or
+    $normalReleaseSource -notmatch 'RecoveryAuthorityDrained' -or
+    $normalReleaseSource -notmatch 'RecoveryActionSettled'
 ) {
-    throw "Parent recovery must bound elevation launch and defer post-MSI service start through definitive or idle proof."
+    throw "Parent recovery must bound elevation, fence SCM mutation through settlement, and retain fail-closed authority evidence."
 }
 $elevatedCommandSource = Get-PowerShellFunctionSource `
     -Path $installScript `
