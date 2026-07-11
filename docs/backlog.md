@@ -40,6 +40,22 @@ These commits shipped in v5.0.13. `Code complete` means the scoped implementatio
 
 ---
 
+## v5.0.14 fix train (engineering candidate; installed proof pending)
+
+This patch train fixes the three regressions found during installed v5.0.13 dogfood and folds in the directly adjacent lifecycle and packaging work. Automated coverage is not installed two-PC evidence; the listed physical/UAC checks remain required before these stories are marked proven.
+
+| story | candidate status | primary commits | remaining gap |
+| --- | --- | --- | --- |
+| BND-NEXT-38 | code complete; needs installed evidence | 57dd527, f180a81, 7207252, cfc7161, ac61ad1, 41b437c | Raw Input is authoritative for the Double-Control detector, hook loss and broker stalls fail open, and input ownership is acknowledged before local lock. Test both Control keys with PowerToys on/off, stalled/unavailable IPC, forced tray loss, and a successful next handoff. |
+| BND-NEXT-40 | code complete; needs physical evidence | c7b346a, ffb4a51, 049eafa, a59c16d, b50f206, e086e5c | Key semantics and source logical Num Lock now survive broker, protocol 4.3, wire, and Windows injection. Run the opposite-Num-Lock matrix both directions, including digits, decimal, Enter, divide, navigation, toggle, hold/repeat, and release. |
+| BND-NEXT-41 | code complete; needs installed/UAC evidence | 5a0be2b, 0d79580, 36cbb60, bc0c69d, 64f4700 | The helper owns a bounded per-user/session quiescence path, protects elevated staging and log handoff, supervises tray and installer liveness, and leaves MSI as the service-stop owner. Prove a normal-user 5.0.13→5.0.14 upgrade with one UAC prompt, no Restart Manager loop, bounded timing, and healthy postconditions on both PCs. |
+| BND-NEXT-31 | code complete for graceful Quit path; needs installed evidence | 5a0be2b, 0d79580, bc0c69d, 64f4700 | The true Quit signal now fails open and exits the broker before process shutdown. Run active-capture Quit/relaunch, upgrade-while-running, process-count, first post-relaunch handoff, and emergency escape on installed hardware. |
+| BND-NEXT-29 item 3 | code complete; needs same-version install evidence | 5a0be2b | WiX now allows same-version upgrades and packaging smoke enforces the contract. Prove a same-version helper rebuild replaces the installed payload instead of silently no-oping. |
+
+Protocol 4.3 is an intentional clean break for the expanded keyboard/input contract. A v5.0.13/v5.0.14 mixed pair must remain disconnected until both PCs are upgraded; this is expected upgrade sequencing, not a compatibility regression.
+
+---
+
 ## BND-NEXT-24 (P0, in progress): Isolate service-mode clipboard failures and carry policy-valid images
 
 Status: the broker-isolation and policy-valid IPC path shipped in v5.0.13, but the explicit degraded-state tray/CLI UX and installed service-mode Paint matrix remain open.
@@ -108,11 +124,11 @@ None. Preserve BND-NEXT-11’s service-ownership rule rather than reverting to a
 
 ---
 
-## BND-NEXT-41 (P0, confirmed installed failure): Make helper upgrades close Boundless once without Restart Manager loops
+## BND-NEXT-41 (P0, v5.0.14 candidate needs installed evidence): Make helper upgrades close Boundless once without Restart Manager loops
 
 **Category:** bug
 
-Status: reproduced during the normal-user 5.0.12→5.0.13 helper/UAC upgrade. The user had to stop the service and retry before both upgrades were complete; the helper-owned upgrade lifecycle is not first-try.
+Status: the failure was reproduced during the normal-user 5.0.12→5.0.13 helper/UAC upgrade. The v5.0.14 candidate adds bounded tray/service quiescence, concurrent installer supervision, protected elevated staging and log handoff, exact user/session ownership, and fail-closed privileged service-start authorization. A real normal-user 5.0.13→5.0.14 upgrade on both PCs remains the proof boundary.
 
 ### Context and evidence
 
@@ -143,9 +159,9 @@ BND-NEXT-23 owns bounded SCM stop, BND-NEXT-31 owns tray/broker lifecycle, and B
 
 ---
 
-## BND-NEXT-38 (P0, reopened installed regression): Make emergency input unlock local and IPC-independent
+## BND-NEXT-38 (P0, v5.0.14 candidate needs installed evidence): Make emergency input unlock local and IPC-independent
 
-Status: reopened after installed v5.0.13 failed to recognize a physical Double-Control gesture. The atomic unlock and lease work remains useful, but the sole physical gesture detector is not reliable enough.
+Status: reopened after installed v5.0.13 failed to recognize a physical Double-Control gesture. The v5.0.14 candidate makes Raw Input keyboard state authoritative, treats the hook as a health-checked fallback, fails open on detector/broker loss, and requires daemon acknowledgment before local lock. Physical both-Control, PowerToys, fault-path, and next-handoff evidence remains pending.
 
 ### Context and evidence
 
@@ -208,11 +224,11 @@ BND-NEXT-34 owns durable bounded stage counters. This story may use temporary ta
 
 ---
 
-## BND-NEXT-40 (P1, confirmed design defect): Preserve numeric-keypad and Num Lock semantics across handoff
+## BND-NEXT-40 (P1, v5.0.14 candidate needs physical evidence): Preserve numeric-keypad and Num Lock semantics across handoff
 
 **Category:** bug
 
-Status: reported on installed v5.0.13 and believed present in earlier versions. The code path confirms identity loss; a small opposite-Num-Lock physical matrix remains useful to pin the exact user-visible variant before implementation.
+Status: reported on installed v5.0.13 and believed present in earlier versions. The v5.0.14 candidate preserves semantic key identity and source logical Num Lock through the broker, protocol 4.3 wire contract, and Windows injection while retaining physical scan/E0 distinctions. The opposite-Num-Lock two-PC matrix remains pending.
 
 ### Context and evidence
 
@@ -342,7 +358,7 @@ Independent small items, one PR each or one sweep; all observed 2026-07-07:
 
 1. **Partial installed pass; lifecycle failure moved to BND-NEXT-41 (5dc1521, 7a39d66).** `Boundless-Install.ps1` previously printed `boundless_install_exit_code=0` on a run where nothing was installed. Both PCs ultimately reached 5.0.13 and a healthy service/API through the matching helper, but the user had to stop the service and retry after repeated Restart Manager prompts. Preserve postcondition verification and make the preflight first-try under BND-NEXT-41.
 2. **Code complete (5dc1521).** `scripts/release/package-windows.ps1` removes `packaging/windows/installer/obj` and `bin` before `dotnet build`, preventing the stale-output MSB3030 failure. Keep the packaging-script smoke in the release gate.
-3. **Open.** Same-version dogfood upgrades silently no-op (`MajorUpgrade` without `AllowSameVersionUpgrades`). Either add `AllowSameVersionUpgrades="yes"` or make the packaging script refuse to build an MSI whose version equals an already-published dogfood artifact. Decide and document in `packaging/windows/README.txt`.
+3. **Code complete; needs installed evidence (5a0be2b).** WiX uses `AllowSameVersionUpgrades="yes"`, the packaging README documents replacement behavior, and packaging-script smoke enforces the contract. Run one same-version helper rebuild on installed hardware to prove the payload is replaced rather than silently no-oping.
 4. **Installed pass.** Both `boundlessctl --version` and `daemon status` report 5.0.13 after the helper-driven upgrade; the stale 5.0.0 runtime-version symptom did not recur.
 5. **Partial installed pass; lifecycle failure moved to BND-NEXT-41 (5dc1521, 7a39d66).** The matching helper resolved the desktop user, requested UAC, passed the SID property, and installed 5.0.13 on both PCs. It did not close running Boundless cleanly and required manual intervention. Direct raw-MSI launch remains unsupported; BND-NEXT-41 must make the primary helper path first-try.
 
@@ -352,9 +368,9 @@ Acceptance: each item has a targeted test or self-test where the surface allows;
 
 ---
 
-## BND-NEXT-31 (P1, partial installed pass): Enforce one tray instance and a safe broker lifecycle per Windows user session
+## BND-NEXT-31 (P1, v5.0.14 candidate needs installed evidence): Enforce one tray instance and a safe broker lifecycle per Windows user session
 
-Status: single-instance ownership and forced-termination recovery passed installed v5.0.13. Graceful active-capture Quit is still open, installer/system shutdown failed under BND-NEXT-41, and emergency escape failed under BND-NEXT-38.
+Status: single-instance ownership and forced-termination recovery passed installed v5.0.13. The v5.0.14 candidate adds a true graceful Quit signal that fails input open, releases broker state, and exits instead of hiding the dashboard; active-capture Quit/relaunch and helper-driven upgrade still need installed proof.
 
 ### Context and evidence
 
