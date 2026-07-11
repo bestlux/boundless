@@ -67,12 +67,19 @@ Incoming (peer frame -> local injection):
    re-attach. The tray keeps completed receipts, partial suffix state, and the
    intended held key/button state across its supervisor sessions, but accepts
    them only when the new attach reports the same epoch. Each injected batch
-   also carries the daemon's input-authorization generation. Owner transitions,
-   `share_input` changes, and resets advance that generation, so a completed
-   Down-only batch cannot be restored after authority changes even if the same
-   peer later reclaims ownership. Session failure first releases committed
-   holds locally so input fails open. A partial or zero-record native release
-   failure retains the exact uncommitted Up suffix; bounded cleanup retries run
+   also carries the daemon's input-authorization generation. The owner, sharing
+   policy, owner-transition cooldown, and generation live under one router
+   lock: owner transitions, `share_input` changes, and resets advance the
+   generation while holding the write lock, while held-state validation and
+   batch staging read one coherent snapshot. Pending input is stamped with the
+   generation that accepted it and is rejected by both injection paths if that
+   generation changes, including after an owner A-to-B-to-A or policy-off/on
+   cycle. A completed Down-only batch therefore cannot be restored after
+   authority changes even if the same peer later reclaims ownership. Session
+   failure first releases committed holds locally so input fails open. A
+   partial or zero-record native release failure retains the exact uncommitted
+   Up suffix and the same Windows input authority, including any synthetic Num
+   Lock key-up still owed after a partial toggle. Bounded cleanup retries run
    before connecting to the daemon again and gate every restore or new payload.
    After same-epoch re-attach, the tray waits for a successful exchange to
    revalidate the retained generation, restores completed or partial holds,
@@ -82,13 +89,17 @@ Incoming (peer frame -> local injection):
    new delivery epoch discards the restore intent. Lost receipt requests and
    request-consumed/response-lost retries remain idempotent without applying a
    payload before its holds.
-5. Cooperative detach carries the tray's latest completed batch ID and delivery
-   epoch. Under the capture-transition lock, the daemon validates the broker
-   token and epoch, acknowledges that exact batch, and only then returns any
-   still-unacknowledged, non-cancelled batch to the front of the pending queue;
-   a mismatched receipt fails closed and a latched cancellation is never
-   resurrected. A transient exchange failure with a partial batch leaves the
-   retained ID in place for suffix-only retry by the same tray supervisor.
+5. Cooperative shutdown detach carries the tray's latest completed batch ID
+   and delivery epoch. Under the capture-transition lock, the daemon validates
+   the broker token and epoch, acknowledges that exact batch, and only then
+   returns any still-unacknowledged, non-cancelled batch to the front of the
+   pending queue; a mismatched receipt fails closed and a latched cancellation
+   is never resurrected. A transient exchange failure skips detach while an
+   active suffix, held-state restore, or local cleanup remains. That preserves
+   the daemon owner/generation and retained ID until the same tray supervisor
+   completes local cleanup, re-attaches, submits its receipt, revalidates held
+   authority, and restores before resuming payload. A completed exchange with
+   no recovery state may still use bounded detach cleanup.
 
 Clipboard (service mode with broker attached):
 

@@ -1007,6 +1007,7 @@ async fn front_requeue_never_evicts_retained_mixed_frames_from_a_full_queue() {
     let pending = |sequence, events| PendingInjectInputFrame {
         peer_id: peer_id.clone(),
         sequence,
+        authorization_generation: 1,
         capture_timestamp_unix_ms: sequence as i64,
         received_timestamp_unix_ms: sequence as i64,
         queued_timestamp_unix_ms: sequence as i64,

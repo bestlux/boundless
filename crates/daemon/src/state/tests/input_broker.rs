@@ -1477,6 +1477,252 @@ async fn completed_hold_authorization_survives_response_loss_but_not_owner_or_po
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authorization_lock_serializes_force_and_auto_owner_switches() {
+    let (state, root) = service_mode_broker_state("boundless-broker-authority-lock-test").await;
+    let peer_a = join_connected_peer(&state).await;
+    let peer_b = join_connected_peer(&state).await;
+    assert_ne!(peer_a, peer_b);
+    assert!(
+        state
+            .claim_input_owner(&peer_a, false)
+            .await
+            .expect("claim owner A")
+    );
+
+    let authority = state.input.control.authorization.read().await;
+    let generation_a = authority.generation();
+    assert!(authority.allows_peer(&peer_a));
+    let force_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let force_state = state.clone();
+    let force_peer = peer_b.clone();
+    let force_task_barrier = force_barrier.clone();
+    let mut force_switch = tokio::spawn(async move {
+        force_task_barrier.wait().await;
+        force_state
+            .claim_input_owner(&force_peer, true)
+            .await
+            .expect("force owner B")
+    });
+    force_barrier.wait().await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut force_switch)
+            .await
+            .is_err(),
+        "force switch must wait for the in-use authorization snapshot"
+    );
+    drop(authority);
+    assert!(force_switch.await.expect("join force switch"));
+    assert!(
+        !state
+            .held_input_authorization_is_current(generation_a)
+            .await,
+        "force switch must invalidate owner A generation"
+    );
+
+    assert!(
+        state
+            .claim_input_owner(&peer_a, true)
+            .await
+            .expect("restore owner A")
+    );
+    let mut authority = state.input.control.authorization.write().await;
+    let (claimed, changed) = authority.claim_owner(&peer_b, true);
+    assert!(
+        claimed && changed,
+        "force B while holding the authority barrier"
+    );
+    let forced_generation_b = authority.generation();
+    let auto_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let auto_state = state.clone();
+    let auto_peer = peer_a.clone();
+    let auto_task_barrier = auto_barrier.clone();
+    let mut auto_switch = tokio::spawn(async move {
+        auto_task_barrier.wait().await;
+        auto_state
+            .route_incoming_input_frame(
+                &auto_peer,
+                InputFrame {
+                    source_peer_id: auto_peer.clone(),
+                    sequence: 1,
+                    timestamp_unix_ms: Utc::now().timestamp_millis(),
+                    events: vec![InputEvent::MouseMove { dx: 1, dy: 0 }],
+                },
+            )
+            .await
+            .expect("auto-switch route")
+    });
+    auto_barrier.wait().await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut auto_switch)
+            .await
+            .is_err(),
+        "auto switch must wait while the force transition owns authority"
+    );
+    drop(authority);
+    assert!(matches!(
+        auto_switch.await.expect("join auto switch"),
+        core_input::RouteDecision::IgnoredWrongOwner { .. }
+    ));
+    assert_eq!(state.input_owner().await.as_deref(), Some(peer_b.as_str()));
+    assert_eq!(
+        state.input_authorization_generation().await,
+        forced_generation_b,
+        "auto claim must observe the force transition's cooldown atomically"
+    );
+
+    {
+        let mut authority = state.input.control.authorization.write().await;
+        authority.set_owner_last_changed_at_for_test(Some(
+            Instant::now()
+                - std::time::Duration::from_millis(
+                    super::super::INPUT_OWNER_AUTO_STEAL_COOLDOWN_MS + 1,
+                ),
+        ));
+    }
+    assert!(matches!(
+        state
+            .route_incoming_input_frame(
+                &peer_a,
+                InputFrame {
+                    source_peer_id: peer_a.clone(),
+                    sequence: 1,
+                    timestamp_unix_ms: Utc::now().timestamp_millis(),
+                    events: vec![InputEvent::MouseMove { dx: 1, dy: 0 }],
+                },
+            )
+            .await
+            .expect("auto switch after cooldown"),
+        core_input::RouteDecision::Applied { .. }
+    ));
+    assert!(
+        !state
+            .held_input_authorization_is_current(forced_generation_b)
+            .await,
+        "an allowed auto switch must advance the generation"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_staging_reads_owner_and_generation_from_one_snapshot() {
+    let (state, root) = service_mode_broker_state("boundless-broker-batch-snapshot-test").await;
+    let peer_a = join_connected_peer(&state).await;
+    let peer_b = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+    assert!(
+        state
+            .claim_input_owner(&peer_a, false)
+            .await
+            .expect("claim owner A")
+    );
+    state
+        .route_incoming_input_frame(
+            &peer_a,
+            InputFrame {
+                source_peer_id: peer_a.clone(),
+                sequence: 1,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::MouseMove { dx: 2, dy: 0 }],
+            },
+        )
+        .await
+        .expect("queue owner A frame");
+
+    let mut authority = state.input.control.authorization.write().await;
+    assert_eq!(authority.claim_owner(&peer_b, true), (true, true));
+    assert_eq!(authority.claim_owner(&peer_a, true), (true, true));
+    let reclaimed_generation_a = authority.generation();
+    let exchange_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let exchange_state = state.clone();
+    let broker_token = attach.broker_token.clone();
+    let exchange_task_barrier = exchange_barrier.clone();
+    let mut exchange = tokio::spawn(async move {
+        exchange_task_barrier.wait().await;
+        exchange_state
+            .exchange_input_broker(
+                allowed_client(),
+                &broker_token,
+                InputBrokerExchangeObservations::default(),
+            )
+            .await
+    });
+    exchange_barrier.wait().await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut exchange)
+            .await
+            .is_err(),
+        "batch staging must wait for the authority snapshot write barrier"
+    );
+    drop(authority);
+    state.notify_input_owner_transition();
+    let outcome = exchange.await.expect("join broker exchange");
+    assert!(outcome.accepted);
+    assert!(
+        outcome.inject_frames.is_empty(),
+        "owner A frame must not be relabeled after an A-to-B-to-A authority cycle"
+    );
+    assert_eq!(outcome.inject_authorization_generation, 0);
+    assert_eq!(
+        state.input_authorization_generation().await,
+        reclaimed_generation_a
+    );
+
+    state
+        .route_incoming_input_frame(
+            &peer_a,
+            InputFrame {
+                source_peer_id: peer_a.clone(),
+                sequence: 2,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::MouseButton {
+                    button: core_input::MouseButton::Left,
+                    state: KeyState::Down,
+                }],
+            },
+        )
+        .await
+        .expect("queue reclaimed owner A frame");
+    let staged_a = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert_ne!(staged_a.inject_batch_id, 0);
+    assert_eq!(
+        staged_a.inject_authorization_generation,
+        reclaimed_generation_a
+    );
+    assert!(
+        state
+            .claim_input_owner(&peer_b, true)
+            .await
+            .expect("force owner B before retained revalidation")
+    );
+    let cancelled = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                inject_backpressure: true,
+                held_input_authorization_generation: reclaimed_generation_a,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(cancelled.inject_batch_cancelled);
+    assert!(!cancelled.held_input_authorized);
+    assert_eq!(cancelled.inject_authorization_generation, 0);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn detach_acknowledges_completed_inject_batch_before_requeue() {
     let (state, root) = service_mode_broker_state("boundless-broker-detach-ack-test").await;

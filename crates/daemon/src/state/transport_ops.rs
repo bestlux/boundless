@@ -145,15 +145,15 @@ impl AppState {
             .await?;
 
         if !disconnected_peer_ids.is_empty() {
-            let mut router = self.input.control.router.write().await;
+            let mut authorization = self.input.control.authorization.write().await;
             let mut released_owner = false;
             for peer_id in &disconnected_peer_ids {
-                released_owner = router.release_owner(peer_id) || released_owner;
-                router.clear_peer_state(peer_id);
+                released_owner = authorization.release_owner(peer_id) || released_owner;
+                authorization.clear_peer_state(peer_id);
             }
-            drop(router);
+            drop(authorization);
             if released_owner {
-                self.note_input_owner_transition().await;
+                self.notify_input_owner_transition();
             }
 
             for peer_id in &disconnected_peer_ids {

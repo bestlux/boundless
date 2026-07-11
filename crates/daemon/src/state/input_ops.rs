@@ -34,7 +34,9 @@ fn try_coalesce_pending_inject_back(
     newer: &PendingInjectInputFrame,
 ) -> Option<(u64, u64, usize)> {
     let last = queue.back_mut()?;
-    if last.peer_id != newer.peer_id {
+    if last.peer_id != newer.peer_id
+        || last.authorization_generation != newer.authorization_generation
+    {
         return None;
     }
 
@@ -293,11 +295,14 @@ impl AppState {
             events: Vec::with_capacity(frame.events.len()),
         };
         let received_timestamp_unix_ms = Utc::now().timestamp_millis();
-        let mut decision = {
-            let mut router = self.input.control.router.write().await;
-            router
+        let (mut decision, mut accepted_authorization_generation) = {
+            let mut authorization = self.input.control.authorization.write().await;
+            let decision = authorization
                 .route_frame(&frame, &mut sink)
-                .map_err(anyhow::Error::from)?
+                .map_err(anyhow::Error::from)?;
+            let generation = matches!(decision, RouteDecision::Applied { .. })
+                .then(|| authorization.generation());
+            (decision, generation)
         };
         let mut auto_claimed_owner = false;
 
@@ -309,31 +314,42 @@ impl AppState {
                 events: Vec::with_capacity(frame.events.len()),
             };
             let mut blocked_reason: Option<&'static str> = None;
-            decision = {
-                let mut router = self.input.control.router.write().await;
-                let mut retried_decision = router
+            let (retried_decision, retried_authorization_generation) = {
+                let mut authorization = self.input.control.authorization.write().await;
+                let mut retried_decision = authorization
                     .route_frame(&frame, &mut retry_sink)
                     .map_err(anyhow::Error::from)?;
                 if matches!(
                     retried_decision,
                     RouteDecision::IgnoredNoOwner | RouteDecision::IgnoredWrongOwner { .. }
                 ) {
-                    let (allow_auto_claim, block_reason) =
-                        self.auto_claim_input_owner_allowed_now(&retried_decision);
-                    if allow_auto_claim && router.claim_owner(peer_id, true) {
-                        auto_claimed_owner = true;
-                        retried_decision = router
+                    let (allow_auto_claim, block_reason) = self.auto_claim_input_owner_allowed_now(
+                        &retried_decision,
+                        authorization.owner_last_changed_at(),
+                    );
+                    let (claimed, owner_changed) = if allow_auto_claim {
+                        authorization.claim_owner(peer_id, true)
+                    } else {
+                        (false, false)
+                    };
+                    if claimed {
+                        auto_claimed_owner = owner_changed;
+                        retried_decision = authorization
                             .route_frame(&frame, &mut retry_sink)
                             .map_err(anyhow::Error::from)?;
                     } else if !allow_auto_claim {
                         blocked_reason = Some(block_reason);
                     }
                 }
-                retried_decision
+                let generation = matches!(retried_decision, RouteDecision::Applied { .. })
+                    .then(|| authorization.generation());
+                (retried_decision, generation)
             };
+            decision = retried_decision;
+            accepted_authorization_generation = retried_authorization_generation;
             sink = retry_sink;
             if auto_claimed_owner {
-                self.note_input_owner_transition().await;
+                self.notify_input_owner_transition();
             } else if let Some(block_reason) = blocked_reason {
                 self.record_input_owner_auto_claim_blocked(peer_id, frame.sequence, block_reason)
                     .await;
@@ -350,6 +366,8 @@ impl AppState {
             let pending = PendingInjectInputFrame {
                 peer_id: peer_id.to_string(),
                 sequence: frame.sequence,
+                authorization_generation: accepted_authorization_generation
+                    .expect("applied route captures its authorization generation"),
                 capture_timestamp_unix_ms: timing.capture_timestamp_unix_ms,
                 received_timestamp_unix_ms: timing.received_timestamp_unix_ms,
                 queued_timestamp_unix_ms: timing.queued_timestamp_unix_ms,
@@ -686,65 +704,73 @@ impl AppState {
         }
 
         let (claimed, owner_changed) = {
-            let mut router = self.input.control.router.write().await;
-            let previous_owner = router.owner().map(str::to_string);
-            let claimed = router.claim_owner(peer_id, force);
-            let owner_changed = claimed && previous_owner.as_deref() != router.owner();
-            (claimed, owner_changed)
+            let mut authorization = self.input.control.authorization.write().await;
+            authorization.claim_owner(peer_id, force)
         };
         if owner_changed {
-            self.note_input_owner_transition().await;
+            self.notify_input_owner_transition();
         }
         Ok(claimed)
     }
 
-    pub async fn input_injection_allowed_for_peer(&self, peer_id: &str) -> bool {
-        let router = self.input.control.router.read().await;
-        router.is_enabled() && router.owner() == Some(peer_id)
+    pub async fn with_input_injection_authorization<T>(
+        &self,
+        peer_id: &str,
+        authorization_generation: u64,
+        apply: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let authorization = self.input.control.authorization.read().await;
+        authorization
+            .authorizes_peer_generation(peer_id, authorization_generation)
+            .then(apply)
+    }
+
+    pub async fn input_injection_authorized(
+        &self,
+        peer_id: &str,
+        authorization_generation: u64,
+    ) -> bool {
+        self.input
+            .control
+            .authorization
+            .read()
+            .await
+            .authorizes_peer_generation(peer_id, authorization_generation)
     }
 
     pub async fn held_input_authorization_is_current(&self, generation: u64) -> bool {
-        if generation == 0 || generation != self.input_authorization_generation() {
-            return false;
-        }
-        let router = self.input.control.router.read().await;
-        router.is_enabled() && router.owner().is_some()
+        self.input
+            .control
+            .authorization
+            .read()
+            .await
+            .authorizes_held_generation(generation)
     }
 
     pub async fn release_input_owner(&self, peer_id: &str) -> bool {
-        let released = self
-            .input
-            .control
-            .router
-            .write()
-            .await
-            .release_owner(peer_id);
+        let released = {
+            let mut authorization = self.input.control.authorization.write().await;
+            authorization.release_owner(peer_id)
+        };
         if released {
-            self.note_input_owner_transition().await;
+            self.notify_input_owner_transition();
         }
         released
     }
 
-    pub async fn note_input_owner_transition(&self) {
-        self.input
-            .control
-            .authorization_generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        *self.input.control.owner_last_changed_at.write().await = Some(std::time::Instant::now());
+    pub fn notify_input_owner_transition(&self) {
         self.notify_input_inject_wake("input_owner_changed");
     }
 
-    pub(crate) fn input_authorization_generation(&self) -> u64 {
-        self.input
-            .control
-            .authorization_generation
-            .load(std::sync::atomic::Ordering::Acquire)
+    #[cfg(test)]
+    pub(crate) async fn input_authorization_generation(&self) -> u64 {
+        self.input.control.authorization.read().await.generation()
     }
 
     pub async fn input_owner(&self) -> Option<String> {
         self.input
             .control
-            .router
+            .authorization
             .read()
             .await
             .owner()
@@ -821,7 +847,11 @@ impl AppState {
         (pending, high_water)
     }
 
-    fn auto_claim_input_owner_allowed_now(&self, decision: &RouteDecision) -> (bool, &'static str) {
+    fn auto_claim_input_owner_allowed_now(
+        &self,
+        decision: &RouteDecision,
+        owner_last_changed_at: Option<Instant>,
+    ) -> (bool, &'static str) {
         match decision {
             RouteDecision::IgnoredNoOwner => (true, "no_owner"),
             RouteDecision::IgnoredWrongOwner { owner_peer_id } => {
@@ -841,19 +871,9 @@ impl AppState {
                 }
 
                 let cooldown = Duration::from_millis(INPUT_OWNER_AUTO_STEAL_COOLDOWN_MS);
-                let cooldown_ready = self
-                    .input
-                    .control
-                    .owner_last_changed_at
-                    .try_read()
-                    .ok()
-                    .map(|last_changed| {
-                        last_changed
-                            .as_ref()
-                            .map(|last| last.elapsed() >= cooldown)
-                            .unwrap_or(true)
-                    })
-                    .unwrap_or(false);
+                let cooldown_ready = owner_last_changed_at
+                    .map(|last| last.elapsed() >= cooldown)
+                    .unwrap_or(true);
 
                 if cooldown_ready {
                     (true, "cooldown_elapsed")

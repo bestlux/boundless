@@ -137,6 +137,7 @@ pub struct InputFrameTiming {
 pub struct PendingInjectInputFrame {
     pub peer_id: String,
     pub sequence: u64,
+    pub authorization_generation: u64,
     pub capture_timestamp_unix_ms: i64,
     pub received_timestamp_unix_ms: i64,
     pub queued_timestamp_unix_ms: i64,

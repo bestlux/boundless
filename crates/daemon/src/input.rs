@@ -425,6 +425,7 @@ mod tests {
         let frame = PendingInjectInputFrame {
             peer_id: "peer-a".to_string(),
             sequence: 1,
+            authorization_generation: 1,
             capture_timestamp_unix_ms: 1,
             received_timestamp_unix_ms: 2,
             queued_timestamp_unix_ms: 3,
@@ -451,6 +452,7 @@ mod tests {
         let frame = PendingInjectInputFrame {
             peer_id: "peer-a".to_string(),
             sequence: 1,
+            authorization_generation: 1,
             capture_timestamp_unix_ms: 1,
             received_timestamp_unix_ms: 2,
             queued_timestamp_unix_ms: 3,
@@ -874,7 +876,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_skips_frame_if_owner_changes_before_inject() {
+    async fn drain_skips_stale_generation_and_keeps_reclaimed_owner_frame_distinct() {
         let (state, peer_id, root) = state_with_peer_for_input_test().await;
         assert!(
             state
@@ -890,21 +892,56 @@ mod tests {
                     source_peer_id: peer_id.clone(),
                     sequence: 1,
                     timestamp_unix_ms: 1,
-                    events: vec![InputEvent::Key {
-                        scan_code: 30,
-                        state: KeyState::Down,
-                        semantics: KeySemantics::Physical,
-                    }],
+                    events: vec![InputEvent::MouseMove { dx: 1, dy: 0 }],
                 },
             )
             .await
             .expect("route");
 
         assert!(state.release_input_owner(&peer_id).await, "release owner");
+        assert!(
+            state
+                .claim_input_owner(&peer_id, false)
+                .await
+                .expect("same peer reclaims owner"),
+            "same peer should reclaim owner under a new authorization generation"
+        );
+        state
+            .route_incoming_input_frame(
+                &peer_id,
+                InputFrame {
+                    source_peer_id: peer_id.clone(),
+                    sequence: 2,
+                    timestamp_unix_ms: 2,
+                    events: vec![InputEvent::MouseMove { dx: 2, dy: 0 }],
+                },
+            )
+            .await
+            .expect("route reclaimed owner frame");
+
+        let mut queued = state
+            .dequeue_pending_inject_input_frames_up_to(usize::MAX)
+            .await;
+        assert_eq!(
+            queued.len(),
+            2,
+            "move frames from different authorization generations must not coalesce"
+        );
+        assert_ne!(
+            queued[0].authorization_generation,
+            queued[1].authorization_generation
+        );
+        queued[0].next_retry_at = Some(Instant::now() + Duration::from_secs(60));
+        state
+            .requeue_pending_inject_input_frames_front(queued)
+            .await;
 
         let mut backend = CountingBackend { applied: 0 };
         drain_pending_inject_frames(&state, &mut backend).await;
-        assert_eq!(backend.applied, 0, "stale owner frame must not be injected");
+        assert_eq!(
+            backend.applied, 1,
+            "only the reclaimed owner's current-generation frame should be injected"
+        );
         assert!(
             state.dequeue_pending_inject_input_frame().await.is_none(),
             "skipped stale frame should be dropped"

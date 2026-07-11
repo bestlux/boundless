@@ -176,17 +176,10 @@ pub(super) async fn drain_pending_inject_frames(
             break;
         }
 
-        if frame
-            .next_retry_at
-            .is_some_and(|next| std::time::Instant::now() < next)
+        if !state
+            .input_injection_authorized(&frame.peer_id, frame.authorization_generation)
+            .await
         {
-            deferred_frames.push(frame);
-            deferred_frames.extend(remaining);
-            preserve_deferred_front = true;
-            break;
-        }
-
-        if !state.input_injection_allowed_for_peer(&frame.peer_id).await {
             state
                 .record_input_inject_skipped(
                     &frame.peer_id,
@@ -199,8 +192,37 @@ pub(super) async fn drain_pending_inject_frames(
             continue;
         }
 
+        if frame
+            .next_retry_at
+            .is_some_and(|next| std::time::Instant::now() < next)
+        {
+            deferred_frames.push(frame);
+            deferred_frames.extend(remaining);
+            preserve_deferred_front = true;
+            break;
+        }
+
+        let Some(apply_outcome) = state
+            .with_input_injection_authorization(
+                &frame.peer_id,
+                frame.authorization_generation,
+                || apply_frame(backend, &frame),
+            )
+            .await
+        else {
+            state
+                .record_input_inject_skipped(
+                    &frame.peer_id,
+                    frame.sequence,
+                    frame.events.len(),
+                    frame.timing(),
+                    "owner_or_feature_changed",
+                )
+                .await;
+            continue;
+        };
+
         let attempted_event_count = frame.events.len();
-        let apply_outcome = apply_frame(backend, &frame);
         debug_assert!(apply_outcome.committed_event_count <= attempted_event_count);
         frame.events = apply_outcome.remaining_events;
 

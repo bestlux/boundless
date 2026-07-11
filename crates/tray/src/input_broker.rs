@@ -91,6 +91,7 @@ struct BrokerInjectBatchState {
     held_authorization_generation: Option<u64>,
     held_input_resume: Option<BrokerHeldInputResume>,
     pending_local_releases: Vec<core_input::InputEvent>,
+    pending_cleanup_windows_input: Option<WindowsInputState>,
 }
 
 #[derive(Debug)]
@@ -312,10 +313,27 @@ impl BrokerInjectBatchState {
         if !releases.is_empty() {
             self.pending_local_releases = releases;
         }
+        if !self.pending_local_releases.is_empty()
+            || injected_state.windows_input.has_pending_native_cleanup()
+        {
+            self.pending_cleanup_windows_input = Some(injected_state.windows_input.clone());
+        }
     }
 
     fn local_cleanup_pending(&self) -> bool {
         !self.pending_local_releases.is_empty()
+            || self
+                .pending_cleanup_windows_input
+                .as_ref()
+                .is_some_and(WindowsInputState::has_pending_native_cleanup)
+    }
+
+    fn pending_local_cleanup_state(&self) -> InjectedInputState {
+        InjectedInputState::with_windows_input(
+            self.pending_cleanup_windows_input
+                .clone()
+                .unwrap_or_else(|| WindowsInputState::new(WindowsNumLockState::new(false))),
+        )
     }
 
     fn process_local_cleanup(&mut self, injected_state: &mut InjectedInputState) -> bool {
@@ -330,15 +348,22 @@ impl BrokerInjectBatchState {
     where
         F: FnMut(&[core_input::InputEvent], &mut InjectedInputState) -> InputSendOutcome,
     {
-        if self.pending_local_releases.is_empty() {
+        if self.pending_local_releases.is_empty()
+            && !injected_state.windows_input.has_pending_native_cleanup()
+        {
             return true;
         }
         let releases = self.pending_local_releases.clone();
         let outcome = apply(&releases, injected_state);
-        let complete = outcome.error.is_none() && outcome.remaining_events.is_empty();
+        let complete = outcome.error.is_none()
+            && outcome.remaining_events.is_empty()
+            && !injected_state.windows_input.has_pending_native_cleanup();
         self.pending_local_releases = outcome.remaining_events;
         if complete {
             self.held_authorization_generation = None;
+            self.pending_cleanup_windows_input = None;
+        } else if self.pending_cleanup_windows_input.is_none() {
+            self.pending_cleanup_windows_input = Some(injected_state.windows_input.clone());
         }
         complete
     }
@@ -435,8 +460,12 @@ impl BrokerInjectBatchState {
 
 impl InjectedInputState {
     fn new(num_lock_state: WindowsNumLockState) -> Self {
+        Self::with_windows_input(WindowsInputState::new(num_lock_state))
+    }
+
+    fn with_windows_input(windows_input: WindowsInputState) -> Self {
         Self {
-            windows_input: WindowsInputState::new(num_lock_state),
+            windows_input,
             pressed_keys: Vec::new(),
             pressed_buttons: Vec::new(),
         }
@@ -769,6 +798,7 @@ impl BrokerCaptureForwardingGate {
     }
 }
 
+#[derive(Clone, Copy)]
 enum BrokerSessionEnd {
     NotNeeded,
     Detached,
@@ -922,7 +952,7 @@ fn input_broker_supervisor_loop(
 }
 
 fn retry_pending_local_cleanup(inject_batches: &mut BrokerInjectBatchState) -> bool {
-    let mut cleanup_state = InjectedInputState::new(WindowsNumLockState::new(false));
+    let mut cleanup_state = inject_batches.pending_local_cleanup_state();
     let complete = inject_batches.process_local_cleanup(&mut cleanup_state);
     if !complete {
         eprintln!("boundless input broker local cleanup remains pending");
@@ -931,7 +961,7 @@ fn retry_pending_local_cleanup(inject_batches: &mut BrokerInjectBatchState) -> b
 }
 
 fn finish_pending_local_cleanup_for_shutdown(inject_batches: &mut BrokerInjectBatchState) {
-    let mut cleanup_state = InjectedInputState::new(WindowsNumLockState::new(false));
+    let mut cleanup_state = inject_batches.pending_local_cleanup_state();
     if !inject_batches.process_local_cleanup_bounded_with(
         &mut cleanup_state,
         LOCAL_INPUT_CLEANUP_SHUTDOWN_ATTEMPTS,
@@ -1072,9 +1102,7 @@ async fn run_input_broker_session(
     // delivery ID and retry only its retained suffix. Cooperative shutdown,
     // and every cleanup after a completed batch, atomically submit the latest
     // exact receipt before the daemon considers any unacknowledged requeue.
-    if matches!(session_end, BrokerSessionEnd::Shutdown)
-        || !inject_batches.backpressure_active()
-    {
+    if should_detach_input_broker_session(session_end, inject_batches) {
         let _ = tokio::time::timeout(
             INPUT_BROKER_CLEANUP_RPC_TIMEOUT,
             client.detach_input_broker(InputBrokerDetachRequest {
@@ -1087,6 +1115,21 @@ async fn run_input_broker_session(
     }
 
     loop_result.map(|_| session_end)
+}
+
+fn should_detach_input_broker_session(
+    session_end: BrokerSessionEnd,
+    inject_batches: &BrokerInjectBatchState,
+) -> bool {
+    match session_end {
+        BrokerSessionEnd::Shutdown => true,
+        BrokerSessionEnd::Detached => {
+            !inject_batches.backpressure_active()
+                && inject_batches.held_input_resume.is_none()
+                && !inject_batches.local_cleanup_pending()
+        }
+        BrokerSessionEnd::NotNeeded => false,
+    }
 }
 
 async fn input_broker_exchange_loop(
@@ -1594,6 +1637,94 @@ mod input_broker_tests {
             )
         });
         assert_eq!(attempts, vec![vec![mouse_down], later_payload]);
+    }
+
+    #[test]
+    fn completed_hold_real_cleanup_path_skips_transient_detach_and_restores() {
+        let ctrl_down = core_input::InputEvent::Key {
+            scan_code: 29,
+            state: core_input::KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let ctrl_up = core_input::InputEvent::Key {
+            scan_code: 29,
+            state: core_input::KeyState::Up,
+            semantics: core_input::KeySemantics::Physical,
+        };
+        let mut batch = BrokerInjectBatchState::default();
+        batch
+            .begin_delivery_epoch("daemon-epoch")
+            .expect("begin session");
+        batch
+            .accept_authorized_batch(30, vec![vec![ctrl_down.clone()]], 7)
+            .expect("stage completed hold");
+        let mut first_session = InjectedInputState::new(WindowsNumLockState::new(false));
+        assert_eq!(
+            batch
+                .process_with(&mut first_session, |events, state| {
+                    observe_injected_input_outcome(
+                        events,
+                        state,
+                        InputSendOutcome {
+                            committed_event_count: events.len(),
+                            remaining_events: Vec::new(),
+                            error: None,
+                        },
+                    )
+                })
+                .completed_frames,
+            1
+        );
+
+        batch.prepare_held_input_resume(&first_session);
+        batch.stage_local_cleanup(&first_session);
+        assert!(batch.process_local_cleanup_with(
+            &mut first_session,
+            |events, state| {
+                assert_eq!(events, std::slice::from_ref(&ctrl_up));
+                observe_injected_input_outcome(
+                    events,
+                    state,
+                    InputSendOutcome {
+                        committed_event_count: events.len(),
+                        remaining_events: Vec::new(),
+                        error: None,
+                    },
+                )
+            }
+        ));
+        assert!(batch.held_input_resume.is_some());
+        assert!(
+            !should_detach_input_broker_session(BrokerSessionEnd::Detached, &batch),
+            "successful transient cleanup must not release daemon owner authority before restore"
+        );
+        assert!(should_detach_input_broker_session(
+            BrokerSessionEnd::Shutdown,
+            &batch
+        ));
+
+        batch
+            .begin_delivery_epoch("daemon-epoch")
+            .expect("reattach to same daemon");
+        let requested = batch.held_authorization_request(&first_session);
+        batch
+            .observe_held_authorization_reply(requested, true)
+            .expect("daemon reauthorizes retained generation");
+        let mut replacement = InjectedInputState::new(WindowsNumLockState::new(false));
+        let mut restored = Vec::new();
+        batch.process_with(&mut replacement, |events, state| {
+            restored.extend_from_slice(events);
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: events.len(),
+                    remaining_events: Vec::new(),
+                    error: None,
+                },
+            )
+        });
+        assert_eq!(restored, vec![ctrl_down]);
     }
 
     #[test]
@@ -2793,6 +2924,93 @@ mod input_broker_tests {
         });
         assert_eq!(completed.completed_frames, 1);
         assert_eq!(payload_attempts.len(), 1);
+    }
+
+    #[test]
+    fn num_lock_native_cleanup_survives_session_loss_before_payload_retry() {
+        let num_lock_down = core_input::InputEvent::Key {
+            scan_code: 0x45,
+            state: core_input::KeyState::Down,
+            semantics: core_input::KeySemantics::Windows {
+                virtual_key: 0x90,
+                num_lock_on: true,
+            },
+        };
+        let windows_input = WindowsInputState::new(WindowsNumLockState::new(false));
+        let mut first_session = InjectedInputState::with_windows_input(windows_input.clone());
+        let mut send_calls = 0usize;
+        let partial_toggle = windows_input.send_events_with_sender(
+            std::slice::from_ref(&num_lock_down),
+            |records| {
+                send_calls += 1;
+                match send_calls {
+                    1 => {
+                        assert_eq!(records.len(), 2);
+                        Ok(1)
+                    }
+                    2 => Err(anyhow::anyhow!("scripted Num Lock toggle suffix failure")),
+                    3 => Err(anyhow::anyhow!("scripted Num Lock key-up cleanup failure")),
+                    _ => panic!("unexpected initial SendInput call {send_calls}"),
+                }
+            },
+        );
+        assert!(partial_toggle.error.is_some());
+        assert!(windows_input.has_pending_native_cleanup());
+        observe_injected_input_outcome(
+            std::slice::from_ref(&num_lock_down),
+            &mut first_session,
+            partial_toggle,
+        );
+
+        let payload = core_input::InputEvent::MouseMove { dx: 4, dy: 0 };
+        let mut batch = BrokerInjectBatchState::default();
+        batch
+            .accept_authorized_batch(50, vec![vec![payload.clone()]], 9)
+            .expect("stage payload behind native cleanup");
+        batch.stage_local_cleanup(&first_session);
+        drop(first_session);
+        assert!(batch.local_cleanup_pending());
+        assert_eq!(
+            batch
+                .process_with(
+                    &mut InjectedInputState::new(WindowsNumLockState::new(false)),
+                    |_events, _state| panic!("payload must wait for native cleanup")
+                )
+                .failed_attempts,
+            1
+        );
+
+        let mut retry_state = batch.pending_local_cleanup_state();
+        let mut cleanup_calls = 0usize;
+        assert!(batch.process_local_cleanup_with(
+            &mut retry_state,
+            |events, state| {
+                assert!(events.is_empty());
+                state.windows_input.send_events_with_sender(events, |records| {
+                    cleanup_calls += 1;
+                    assert_eq!(records.len(), 1);
+                    Ok(1)
+                })
+            }
+        ));
+        assert_eq!(cleanup_calls, 1);
+        assert!(!windows_input.has_pending_native_cleanup());
+
+        let mut payload_attempts = Vec::new();
+        let completed = batch.process_with(&mut retry_state, |events, state| {
+            payload_attempts.extend_from_slice(events);
+            observe_injected_input_outcome(
+                events,
+                state,
+                InputSendOutcome {
+                    committed_event_count: events.len(),
+                    remaining_events: Vec::new(),
+                    error: None,
+                },
+            )
+        });
+        assert_eq!(completed.completed_frames, 1);
+        assert_eq!(payload_attempts, vec![payload]);
     }
 
     #[test]

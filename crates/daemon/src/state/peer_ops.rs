@@ -57,12 +57,12 @@ impl AppState {
             })
             .await?;
         if removed {
-            let mut router = self.input.control.router.write().await;
-            let released_owner = router.release_owner(peer_id);
-            router.clear_peer_state(peer_id);
-            drop(router);
+            let mut authorization = self.input.control.authorization.write().await;
+            let released_owner = authorization.release_owner(peer_id);
+            authorization.clear_peer_state(peer_id);
+            drop(authorization);
             if released_owner {
-                self.note_input_owner_transition().await;
+                self.notify_input_owner_transition();
             }
             self.input
                 .control
@@ -184,12 +184,12 @@ impl AppState {
         }
 
         if !connected {
-            let mut router = self.input.control.router.write().await;
-            let released_owner = router.release_owner(peer_id);
-            router.clear_peer_state(peer_id);
-            drop(router);
+            let mut authorization = self.input.control.authorization.write().await;
+            let released_owner = authorization.release_owner(peer_id);
+            authorization.clear_peer_state(peer_id);
+            drop(authorization);
             if released_owner {
-                self.note_input_owner_transition().await;
+                self.notify_input_owner_transition();
             }
             let mut capture_target = self.input.control.capture_target_peer_id.write().await;
             if capture_target.as_deref() == Some(peer_id) {

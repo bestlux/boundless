@@ -205,6 +205,13 @@ impl WindowsInputState {
         Self { num_lock }
     }
 
+    /// Reports whether a partially sent Boundless Num Lock toggle still owes
+    /// Windows its synthetic key-up. Callers that survive an injection lane
+    /// restart must retain this state until that cleanup succeeds.
+    pub fn has_pending_native_cleanup(&self) -> bool {
+        self.num_lock.lock().boundless_key_down
+    }
+
     pub fn send_events(&self, events: &[InputEvent]) -> InputSendOutcome {
         self.send_events_with(events, send_input_records_once)
     }
@@ -1312,6 +1319,45 @@ mod tests {
             .expect("next batch cleans up before retrying input");
         assert_eq!(retry_calls, 2);
         assert!(!num_lock.lock().boundless_key_down);
+    }
+
+    #[test]
+    fn pending_num_lock_cleanup_survives_input_state_clone_and_empty_retry() {
+        const VK_NUMPAD1: u16 = 0x61;
+        let num_lock = WindowsNumLockState::new(false);
+        let input = WindowsInputState::new(num_lock.clone());
+        let event = windows_key(0x4F, VK_NUMPAD1, true, KeyState::Down);
+        let mut initial_calls = 0usize;
+        input
+            .send_events_with(std::slice::from_ref(&event), |_records| {
+                initial_calls += 1;
+                match initial_calls {
+                    1 => Ok(1),
+                    2 => Err(anyhow::anyhow!("scripted frame failure")),
+                    3 => Err(anyhow::anyhow!("scripted cleanup failure")),
+                    _ => panic!("unexpected initial send {initial_calls}"),
+                }
+            })
+            .into_result()
+            .expect_err("native cleanup remains pending");
+        assert!(input.has_pending_native_cleanup());
+
+        let retained = input.clone();
+        drop(input);
+        let mut retry_calls = 0usize;
+        retained
+            .send_events_with(&[], |records| {
+                retry_calls += 1;
+                assert_eq!(records.len(), 1);
+                let cleanup = keyboard_record(&records[0]);
+                assert_eq!(cleanup.wVk, VK_NUMLOCK_CODE);
+                assert_ne!(cleanup.dwFlags & KEYEVENTF_KEYUP, 0);
+                Ok(1)
+            })
+            .into_result()
+            .expect("retained state completes native cleanup without payload events");
+        assert_eq!(retry_calls, 1);
+        assert!(!retained.has_pending_native_cleanup());
     }
 
     #[test]

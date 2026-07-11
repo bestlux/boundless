@@ -512,10 +512,6 @@ impl AppState {
                 ..Default::default()
             };
         }
-        let held_input_authorized = self
-            .held_input_authorization_is_current(observations.held_input_authorization_generation)
-            .await;
-
         if observations.inject_failure_count > 0 {
             self.record_transport_event(TransportEventRecord {
                 timestamp: Utc::now(),
@@ -629,75 +625,99 @@ impl AppState {
         }
 
         let existing_batch = self.input_broker.inflight_inject_batch();
-        let batch = if let Some(mut batch) = existing_batch {
-            if !batch.cancelled {
-                let mut authorization_changed =
-                    batch.authorization_generation != self.input_authorization_generation();
-                for frame in &batch.frames {
-                    if !self.input_injection_allowed_for_peer(&frame.peer_id).await {
-                        authorization_changed = true;
-                    }
-                }
-                if authorization_changed {
-                    for frame in &batch.frames {
-                        self.record_input_inject_skipped(
-                            &frame.peer_id,
-                            frame.sequence,
-                            frame.events.len(),
-                            frame.timing(),
-                            "retained_batch_authorization_changed",
-                        )
-                        .await;
-                    }
-                    let Some(cancelled_batch) = self
-                        .input_broker
-                        .cancel_inflight_inject_batch(batch.batch_id)
-                    else {
-                        return InputBrokerExchangeOutcome {
-                            accepted: false,
-                            message: "input broker inject batch changed during authorization revalidation"
-                                .to_string(),
-                            ..Default::default()
-                        };
-                    };
-                    batch = cancelled_batch;
-                }
-            }
-            Some(batch)
-        } else if observations.inject_backpressure {
-            None
+        let dequeued = if existing_batch.is_none() && !observations.inject_backpressure {
+            self.dequeue_pending_inject_input_frames_up_to(
+                INPUT_BROKER_INJECT_MAX_FRAMES_PER_EXCHANGE,
+            )
+            .await
         } else {
-            let dequeued = self
-                .dequeue_pending_inject_input_frames_up_to(
-                    INPUT_BROKER_INJECT_MAX_FRAMES_PER_EXCHANGE,
-                )
-                .await;
-            let mut accepted = Vec::with_capacity(dequeued.len());
-            for frame in dequeued {
-                if !self.input_injection_allowed_for_peer(&frame.peer_id).await {
+            Vec::new()
+        };
+
+        // Owner, sharing policy, and generation are one linearizable state.
+        // Hold its read guard through retained-batch validation or new-batch
+        // staging so an owner/policy writer cannot relabel frames between the
+        // authorization decision and the generation committed to the batch.
+        let authorization = self.input.control.authorization.read().await;
+        let held_input_authorized = authorization
+            .authorizes_held_generation(observations.held_input_authorization_generation);
+        let retained_authorization_changed = existing_batch.as_ref().is_some_and(|batch| {
+            !batch.cancelled
+                && (batch.authorization_generation != authorization.generation()
+                    || batch.frames.iter().any(|frame| {
+                        !authorization.authorizes_peer_generation(
+                            &frame.peer_id,
+                            frame.authorization_generation,
+                        )
+                    }))
+        });
+        let mut accepted = Vec::with_capacity(dequeued.len());
+        let mut rejected = Vec::new();
+        for frame in dequeued {
+            if authorization
+                .authorizes_peer_generation(&frame.peer_id, frame.authorization_generation)
+            {
+                accepted.push(frame);
+            } else {
+                rejected.push(frame);
+            }
+        }
+        let staged_batch = (!accepted.is_empty()).then(|| {
+            self.input_broker
+                .stage_inject_batch(accepted, authorization.generation())
+        });
+        drop(authorization);
+
+        let batch = if let Some(mut batch) = existing_batch {
+            if retained_authorization_changed {
+                for frame in &batch.frames {
                     self.record_input_inject_skipped(
                         &frame.peer_id,
                         frame.sequence,
                         frame.events.len(),
                         frame.timing(),
-                        "owner_or_feature_changed",
+                        "retained_batch_authorization_changed",
                     )
                     .await;
-                    continue;
                 }
-                self.record_input_broker_inject_dispatched(
+                let Some(cancelled_batch) = self
+                    .input_broker
+                    .cancel_inflight_inject_batch(batch.batch_id)
+                else {
+                    return InputBrokerExchangeOutcome {
+                        accepted: false,
+                        message:
+                            "input broker inject batch changed during authorization revalidation"
+                                .to_string(),
+                        ..Default::default()
+                    };
+                };
+                batch = cancelled_batch;
+            }
+            Some(batch)
+        } else {
+            for frame in rejected {
+                self.record_input_inject_skipped(
                     &frame.peer_id,
                     frame.sequence,
                     frame.events.len(),
                     frame.timing(),
+                    "owner_or_feature_changed",
                 )
                 .await;
-                accepted.push(frame);
             }
-            (!accepted.is_empty()).then(|| {
-                self.input_broker
-                    .stage_inject_batch(accepted, self.input_authorization_generation())
-            })
+            if let Some(batch) = staged_batch.as_ref() {
+                for frame in &batch.frames {
+                    self.record_input_broker_inject_dispatched(
+                        &frame.peer_id,
+                        frame.sequence,
+                        frame.events.len(),
+                        frame.timing(),
+                    )
+                    .await;
+                }
+            }
+            staged_batch
         };
         let inject_batch_id = batch.as_ref().map_or(0, |batch| batch.batch_id);
         let inject_batch_cancelled = batch.as_ref().is_some_and(|batch| batch.cancelled);
