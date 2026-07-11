@@ -121,7 +121,12 @@ foreach ($requiredInstallContract in @(
         'Request-BoundlessTrayShutdownSignal',
         'UpgradeQuiescence.v1',
         'Start-BoundlessTrayQuiescenceMonitor',
-        'Get-WindowsCommandExecutablePath'
+        'Get-WindowsCommandExecutablePath',
+        'Wait-BoundlessElevatedInstallSupervised',
+        'Boundless-install.log',
+        'Copy-BoundlessInstallerLogHandoff',
+        'ElevatedInstallCancelEvent',
+        'caller_privilege_log_handoff_fixture'
     )) {
     if ($installScriptText -notmatch [regex]::Escape($requiredInstallContract)) {
         throw "Boundless-Install.ps1 is missing the upgrade safety contract: $requiredInstallContract"
@@ -144,6 +149,38 @@ if (
     $postInstallSource -match 'ResolvedInstallerPath'
 ) {
     throw "Post-install verification must use the immutable pre-UAC MSI metadata anchor."
+}
+$elevatedCommandSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'New-BoundlessElevatedInstallCommand'
+if (
+    $elevatedCommandSource -match 'payload\.log_path' -or
+    $elevatedCommandSource -match '(?m)^\s*log_path\s*='
+) {
+    throw "Elevated installer payload must not carry the caller-selected log destination."
+}
+$invokeMsiSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Invoke-BoundlessMsi'
+if (
+    $invokeMsiSource -notmatch 'Wait-BoundlessElevatedInstallSupervised' -or
+    $invokeMsiSource -notmatch 'Copy-BoundlessInstallerLogHandoff'
+) {
+    throw "Installer parent must supervise elevation and copy the completed staged log itself."
+}
+
+$serviceRecovery = Join-Path $RepoRoot 'crates\tray\src\service_recovery.rs'
+$serviceRecoveryText = Get-Content -LiteralPath $serviceRecovery -Raw
+foreach ($requiredServiceStartContract in @(
+        'ServiceStartOriginGuard',
+        'service_start_origin_event_name',
+        'service-start-origin-sid',
+        'tray_upgrade_quiescence_sentinel_name',
+        'held_upgrade_sentinel_refuses_before_scm_start_mutation'
+    )) {
+    if ($serviceRecoveryText -notmatch [regex]::Escape($requiredServiceStartContract)) {
+        throw "Tray service-start recovery is missing privileged origin/quiescence contract: $requiredServiceStartContract"
+    }
 }
 
 $packagingReadme = Join-Path $packagingRoot "README.txt"

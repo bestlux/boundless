@@ -901,6 +901,18 @@ try {
         $installExitCode = Invoke-MsiExec -ArgumentList (@("/i", $InstallerPath, "/qn", "/norestart") + $msiInstallProperties) -LogPath $installLog
     }
 
+    Assert-PathExists -Path $installLog -Message "Installer did not preserve the requested MSI log."
+    $installerStageResidue = @(
+        Get-ChildItem `
+            -LiteralPath ([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)) `
+            -Directory `
+            -Filter "BoundlessInstaller-*" `
+            -ErrorAction SilentlyContinue
+    )
+    if ($installerStageResidue.Count -ne 0) {
+        throw "Installer left a ProgramData staging directory after log handoff: $(@($installerStageResidue.FullName) -join ', ')"
+    }
+
     $daemonPath = Join-Path $installRoot "boundlessd.exe"
     $servicePath = Join-Path $installRoot "boundless-service.exe"
     $cliPath = Join-Path $installRoot "boundlessctl.exe"

@@ -12,7 +12,11 @@ param(
     [Parameter(DontShow = $true)]
     [switch]$ElevatedInstall,
     [Parameter(DontShow = $true)]
-    [string]$ExpectedInstallerSha256 = ""
+    [string]$ExpectedInstallerSha256 = "",
+    [Parameter(DontShow = $true)]
+    [string]$ElevatedInstallCancelEvent = "",
+    [Parameter(DontShow = $true)]
+    [int]$ElevatedInstallTimeoutSeconds = 900
 )
 
 Set-StrictMode -Version Latest
@@ -218,10 +222,48 @@ function New-BoundlessMsiArguments {
     return $arguments
 }
 
+function Open-BoundlessInstallerCancellationEvent {
+    param([string]$Name)
+
+    if ($Name -notmatch '^Local\\Boundless\.Installer\.Cancel\.v1\.[0-9a-f]{32}$') {
+        throw "Installer cancellation event name was invalid."
+    }
+    try {
+        return [Threading.EventWaitHandle]::OpenExisting($Name)
+    }
+    catch {
+        throw "Installer cancellation event was unavailable. $($_.Exception.Message)"
+    }
+}
+
+function Stop-BoundlessProcessBoundary {
+    param(
+        [Diagnostics.Process]$Process,
+        [int]$TimeoutMilliseconds = 5000
+    )
+
+    if ($null -eq $Process -or $Process.HasExited) {
+        return
+    }
+    try {
+        $Process.Kill()
+    }
+    catch {
+        if (-not $Process.HasExited) {
+            throw "Could not terminate installer process boundary PID $($Process.Id). $($_.Exception.Message)"
+        }
+    }
+    if (-not $Process.WaitForExit($TimeoutMilliseconds)) {
+        throw "Installer process boundary PID $($Process.Id) did not stop within $TimeoutMilliseconds ms."
+    }
+}
+
 function Invoke-BoundlessMsiElevated {
     param(
         [string]$ResolvedInstallerPath,
-        [string]$Sid
+        [string]$Sid,
+        [string]$CancellationEventName,
+        [int]$TimeoutSeconds
     )
 
     if (-not (Test-IsAdministrator)) {
@@ -236,12 +278,30 @@ function Invoke-BoundlessMsiElevated {
         PassThru = $true
     }
 
+    $startArgs.Wait = $false
     $process = Start-Process @startArgs
-    if ($process.ExitCode -notin @(0, 3010)) {
-        throw "msiexec.exe failed with exit code $($process.ExitCode)."
+    $cancellationEvent = Open-BoundlessInstallerCancellationEvent -Name $CancellationEventName
+    try {
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        while (-not $process.WaitForExit(100)) {
+            if ($cancellationEvent.WaitOne(0)) {
+                Stop-BoundlessProcessBoundary -Process $process
+                throw "msiexec.exe was canceled because tray quiescence supervision failed."
+            }
+            if ((Get-Date) -ge $deadline) {
+                Stop-BoundlessProcessBoundary -Process $process
+                throw "msiexec.exe exceeded the bounded $TimeoutSeconds second install window."
+            }
+        }
+        if ($process.ExitCode -notin @(0, 3010)) {
+            throw "msiexec.exe failed with exit code $($process.ExitCode)."
+        }
+        return $process.ExitCode
     }
-
-    return $process.ExitCode
+    finally {
+        $cancellationEvent.Dispose()
+        $process.Dispose()
+    }
 }
 
 function Resolve-CurrentPowerShellExecutable {
@@ -303,6 +363,52 @@ function New-BoundlessNamedMutex {
         mutex = $mutex
         created_new = [bool]$arguments[2]
         name = $Name
+    }
+}
+
+function New-BoundlessInstallerControlEvent {
+    param([string]$UserSid)
+
+    Assert-AllowedUserSid -Sid $UserSid
+    $name = "Local\Boundless.Installer.Cancel.v1.$([guid]::NewGuid().ToString('N'))"
+    $security = [Security.AccessControl.EventWaitHandleSecurity]::new()
+    $security.SetSecurityDescriptorSddlForm(
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;$UserSid)"
+    )
+    $arguments = [object[]]@(
+        $false,
+        [Threading.EventResetMode]::ManualReset,
+        $name,
+        $false,
+        $security
+    )
+    $eventAclType = "System.Threading.EventWaitHandleAcl" -as [type]
+    if ($null -ne $eventAclType) {
+        $createMethod = $eventAclType.GetMethods() |
+            Where-Object { $_.Name -eq "Create" -and $_.GetParameters().Count -eq 5 } |
+            Select-Object -First 1
+        if ($null -eq $createMethod) {
+            throw "Could not resolve EventWaitHandleAcl.Create for installer supervision."
+        }
+        $event = $createMethod.Invoke($null, $arguments)
+    }
+    else {
+        $constructor = [Threading.EventWaitHandle].GetConstructors() |
+            Where-Object { $_.GetParameters().Count -eq 5 } |
+            Select-Object -First 1
+        if ($null -eq $constructor) {
+            throw "Could not resolve the secured EventWaitHandle constructor for installer supervision."
+        }
+        $event = $constructor.Invoke($arguments)
+    }
+    if (-not [bool]$arguments[3]) {
+        $event.Dispose()
+        throw "Could not create a unique installer supervision event."
+    }
+    return [pscustomobject]@{
+        event = $event
+        name = $name
+        created_new = $true
     }
 }
 
@@ -383,7 +489,8 @@ function New-BoundlessTrayQuiescenceMonitorCommand {
         [int]$ExpectedSessionId,
         [string]$SentinelName,
         [string]$ReadyEventName,
-        [int]$StableMilliseconds = 500
+        [int]$StableMilliseconds = 500,
+        [int]$FixtureProcessId = 0
     )
 
     $payload = [ordered]@{
@@ -392,6 +499,7 @@ function New-BoundlessTrayQuiescenceMonitorCommand {
         sentinel_name = $SentinelName
         ready_event_name = $ReadyEventName
         stable_milliseconds = $StableMilliseconds
+        fixture_process_id = $FixtureProcessId
     }
     $payloadBase64 = [Convert]::ToBase64String(
         [Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Compress))
@@ -439,8 +547,16 @@ function Test-QuiescenceSentinel {
 }
 function Get-OwnerSid {
     param([int]$ProcessId)
-    $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop |
-        Select-Object -First 1
+    try {
+        $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop |
+            Select-Object -First 1
+    }
+    catch {
+        if ($null -eq (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
+            return ""
+        }
+        throw
+    }
     if ($null -eq $process) {
         return ""
     }
@@ -460,20 +576,43 @@ try {
     $readySignaled = $false
     while (Test-QuiescenceSentinel -Name $payload.sentinel_name) {
         $targets = @(
-            Get-Process -Name "boundlesstray" -ErrorAction SilentlyContinue |
-                Where-Object { $_.SessionId -eq [int]$payload.expected_session_id }
+            if ([int]$payload.fixture_process_id -gt 0) {
+                Get-Process -Id ([int]$payload.fixture_process_id) -ErrorAction SilentlyContinue |
+                    Where-Object { $_.SessionId -eq [int]$payload.expected_session_id }
+            }
+            else {
+                Get-Process -Name "boundlesstray" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.SessionId -eq [int]$payload.expected_session_id }
+            }
         )
         if ($targets.Count -gt 0) {
             $stableSince = $null
             foreach ($target in $targets) {
-                $ownerSid = Get-OwnerSid -ProcessId $target.Id
+                try {
+                    $ownerSid = Get-OwnerSid -ProcessId $target.Id
+                }
+                catch {
+                    if ($null -eq (Get-Process -Id $target.Id -ErrorAction SilentlyContinue)) {
+                        continue
+                    }
+                    throw
+                }
                 if ([string]::IsNullOrWhiteSpace($ownerSid)) {
                     continue
                 }
                 if ($ownerSid -ne [string]$payload.expected_owner_sid) {
                     throw "Replacement tray PID $($target.Id) belonged to unexpected SID $ownerSid."
                 }
-                foreach ($thread in @($target.Threads)) {
+                try {
+                    $threads = @($target.Threads)
+                }
+                catch {
+                    if ($null -eq (Get-Process -Id $target.Id -ErrorAction SilentlyContinue)) {
+                        continue
+                    }
+                    throw
+                }
+                foreach ($thread in $threads) {
                     [void][BoundlessUpgradeMonitorNativeMethods]::PostThreadMessage(
                         [uint32]$thread.Id,
                         [uint32]0x0012,
@@ -514,10 +653,12 @@ function Start-BoundlessTrayQuiescenceMonitor {
     param(
         [string]$ExpectedOwnerSid,
         [int]$ExpectedSessionId,
-        [string]$SentinelName
+        [string]$SentinelName,
+        [int]$FixtureProcessId = 0
     )
 
-    $readyEventName = "Local\Boundless.Tray.UpgradeMonitorReady.v1.$([guid]::NewGuid().ToString('N'))"
+    $monitorId = [guid]::NewGuid().ToString('N')
+    $readyEventName = "Local\Boundless.Tray.UpgradeMonitorReady.v1.$monitorId"
     $readyCreated = $false
     $readyEvent = [Threading.EventWaitHandle]::new(
         $false,
@@ -534,7 +675,8 @@ function Start-BoundlessTrayQuiescenceMonitor {
             -ExpectedOwnerSid $ExpectedOwnerSid `
             -ExpectedSessionId $ExpectedSessionId `
             -SentinelName $SentinelName `
-            -ReadyEventName $readyEventName
+            -ReadyEventName $readyEventName `
+            -FixtureProcessId $FixtureProcessId
         $arguments = @("-NoProfile", "-EncodedCommand", $encodedCommand)
         $process = Start-Process `
             -FilePath (Resolve-CurrentPowerShellExecutable) `
@@ -789,6 +931,55 @@ function Get-BoundlessProgramDataRoot {
     return [IO.Path]::GetFullPath($path).TrimEnd('\')
 }
 
+function Wait-BoundlessElevatedInstallSupervised {
+    param(
+        [Diagnostics.Process]$InstallerProcess,
+        [object]$Monitor,
+        [Threading.EventWaitHandle]$CancellationEvent,
+        [int]$TimeoutSeconds = 900,
+        [int]$CancellationGraceMilliseconds = 10000
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while (-not $InstallerProcess.WaitForExit(50)) {
+        $failure = ""
+        if ($Monitor.process.HasExited) {
+            $failure = "Tray quiescence monitor exited during the elevated install; exit=$($Monitor.process.ExitCode)."
+        }
+        elseif ((Get-Date) -ge $deadline) {
+            $failure = "Elevated Boundless install exceeded the bounded $TimeoutSeconds second window."
+        }
+        if ([string]::IsNullOrWhiteSpace($failure)) {
+            continue
+        }
+
+        if (-not $CancellationEvent.Set()) {
+            throw "$failure Installer cancellation signaling failed."
+        }
+        if (-not $InstallerProcess.WaitForExit($CancellationGraceMilliseconds)) {
+            Stop-BoundlessProcessBoundary `
+                -Process $InstallerProcess `
+                -TimeoutMilliseconds 5000
+        }
+        throw "$failure The staged installer process boundary was canceled."
+    }
+    return $InstallerProcess.ExitCode
+}
+
+function Get-BoundlessLogHandoffSddl {
+    param([string]$UserSid)
+
+    Assert-AllowedUserSid -Sid $UserSid
+    return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;$UserSid)"
+}
+
+function Get-BoundlessLogHandoffFileSddl {
+    param([string]$UserSid)
+
+    Assert-AllowedUserSid -Sid $UserSid
+    return "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;$UserSid)"
+}
+
 function Test-BoundlessInstallerStagePath {
     param(
         [string]$Path,
@@ -811,6 +1002,84 @@ function Test-BoundlessInstallerStagePath {
         return $false
     }
     return [IO.Path]::GetFileName($fullPath) -match '^BoundlessInstaller-[0-9a-f]{32}$'
+}
+
+function Copy-BoundlessInstallerLogHandoff {
+    param(
+        [string]$StageRoot,
+        [string]$StagedLogPath,
+        [string]$DestinationPath,
+        [string]$ProgramDataRoot = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($DestinationPath)) {
+        return [pscustomobject]@{ requested = $false; copied = $false; destination = "" }
+    }
+    if ([string]::IsNullOrWhiteSpace($ProgramDataRoot)) {
+        $ProgramDataRoot = Get-BoundlessProgramDataRoot
+    }
+    if (-not (Test-BoundlessInstallerStagePath -Path $StageRoot -ProgramDataRoot $ProgramDataRoot)) {
+        throw "Refusing installer log handoff from an unsafe stage boundary."
+    }
+    if (-not (Test-Path -LiteralPath $StageRoot -PathType Container)) {
+        return [pscustomobject]@{
+            requested = $true
+            copied = $false
+            destination = $DestinationPath
+            reason = "not_produced"
+        }
+    }
+    $resolvedStage = (Resolve-Path -LiteralPath $StageRoot -ErrorAction Stop).Path
+    $stageItem = Get-Item -LiteralPath $resolvedStage -Force -ErrorAction Stop
+    if (($stageItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing installer log handoff from a reparse-point stage."
+    }
+    $expectedLogPath = Join-Path $resolvedStage "Boundless-install.log"
+    if (-not (Test-WindowsPathEqual -Left $StagedLogPath -Right $expectedLogPath)) {
+        throw "Refusing installer log handoff from an unexpected path."
+    }
+    if (-not (Test-Path -LiteralPath $expectedLogPath -PathType Leaf)) {
+        return [pscustomobject]@{
+            requested = $true
+            copied = $false
+            destination = $DestinationPath
+            reason = "not_produced"
+        }
+    }
+    $entries = @(Get-ChildItem -LiteralPath $resolvedStage -Force -ErrorAction Stop)
+    if ($entries.Count -ne 1 -or $entries[0].Name -ne "Boundless-install.log") {
+        throw "Refusing installer log handoff because the completed stage contained unexpected entries."
+    }
+    if (($entries[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing installer log handoff from a reparse-point file."
+    }
+
+    $resolvedDestination = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+        $DestinationPath
+    )
+    $destinationParent = Split-Path -Parent $resolvedDestination
+    if (-not [string]::IsNullOrWhiteSpace($destinationParent)) {
+        New-Item -ItemType Directory -Path $destinationParent -Force -ErrorAction Stop | Out-Null
+    }
+    Copy-Item `
+        -LiteralPath $expectedLogPath `
+        -Destination $resolvedDestination `
+        -Force `
+        -ErrorAction Stop
+    $sourceHash = (Get-FileHash -LiteralPath $expectedLogPath -Algorithm SHA256).Hash
+    $destinationHash = (Get-FileHash -LiteralPath $resolvedDestination -Algorithm SHA256).Hash
+    if (-not $sourceHash.Equals($destinationHash, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Installer log handoff copy hash did not match the completed staged log."
+    }
+
+    Remove-Item -LiteralPath $expectedLogPath -Force -ErrorAction Stop
+    Remove-Item -LiteralPath $resolvedStage -Force -ErrorAction Stop
+    return [pscustomobject]@{
+        requested = $true
+        copied = $true
+        destination = $resolvedDestination
+        sha256 = $destinationHash
+    }
 }
 
 function Assert-BoundlessAdminOnlyAcl {
@@ -1069,7 +1338,9 @@ function Invoke-ElevatedInstallPhase {
     param(
         [string]$ResolvedInstallerPath,
         [string]$Sid,
-        [string]$ExpectedInstallerSha256
+        [string]$ExpectedInstallerSha256,
+        [string]$CancellationEventName,
+        [int]$TimeoutSeconds
     )
 
     if (-not (Test-IsAdministrator)) {
@@ -1097,6 +1368,8 @@ function Invoke-ElevatedInstallPhase {
     $msiArgs = @{
         ResolvedInstallerPath = $ResolvedInstallerPath
         Sid = $Sid
+        CancellationEventName = $CancellationEventName
+        TimeoutSeconds = $TimeoutSeconds
     }
     $exitCode = Invoke-BoundlessMsiElevated @msiArgs
 
@@ -1117,7 +1390,10 @@ function New-BoundlessElevatedInstallCommand {
     param(
         [string]$ResolvedInstallerPath,
         [string]$Sid,
-        [object]$InstallerAnchor
+        [object]$InstallerAnchor,
+        [string]$CancellationEventName,
+        [int]$TimeoutSeconds = 900,
+        [bool]$LogRequested = (-not [string]::IsNullOrWhiteSpace($LogPath))
     )
 
     $helperAnchor = Assert-BoundlessHelperStartupAnchor
@@ -1125,6 +1401,13 @@ function New-BoundlessElevatedInstallCommand {
         -Anchor $InstallerAnchor `
         -ResolvedInstallerPath $ResolvedInstallerPath
     $resolvedHelperPath = $helperAnchor.path
+    if ($CancellationEventName -notmatch '^Local\\Boundless\.Installer\.Cancel\.v1\.[0-9a-f]{32}$') {
+        throw "Elevated install command received an invalid cancellation event."
+    }
+    $stageLeaf = "BoundlessInstaller-$([guid]::NewGuid().ToString('N'))"
+    $programData = Get-BoundlessProgramDataRoot
+    $stageRoot = Join-Path $programData $stageLeaf
+    $stagedLogPath = Join-Path $stageRoot "Boundless-install.log"
     $payload = [ordered]@{
         installer_path = $ResolvedInstallerPath
         installer_sha256 = $InstallerAnchor.sha256
@@ -1133,8 +1416,13 @@ function New-BoundlessElevatedInstallCommand {
         sid = $Sid
         quiet = [bool]$Quiet
         no_restart = [bool]$NoRestart
-        log_path = $LogPath
+        log_requested = $LogRequested
+        stage_leaf = $stageLeaf
+        cancellation_event_name = $CancellationEventName
+        install_timeout_seconds = $TimeoutSeconds
         stage_sddl = Get-BoundlessAdminOnlyStageSddl
+        log_handoff_sddl = Get-BoundlessLogHandoffSddl -UserSid $Sid
+        log_handoff_file_sddl = Get-BoundlessLogHandoffFileSddl -UserSid $Sid
     }
     $payloadJson = $payload | ConvertTo-Json -Compress
     $payloadBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payloadJson))
@@ -1179,8 +1467,13 @@ if ([string]::IsNullOrWhiteSpace($programDataKnownFolder)) {
     throw "Could not resolve the Windows CommonApplicationData known folder."
 }
 $programData = [IO.Path]::GetFullPath($programDataKnownFolder).TrimEnd('\')
-$stageRoot = Join-Path $programData ("BoundlessInstaller-" + [guid]::NewGuid().ToString("N"))
+$stageLeaf = [string]$payload.stage_leaf
+if ($stageLeaf -notmatch '^BoundlessInstaller-[0-9a-f]{32}$') {
+    throw "Installer stage leaf was invalid."
+}
+$stageRoot = Join-Path $programData $stageLeaf
 $trustedStage = $false
+$logHandoffReady = $false
 $exitCode = 1
 try {
     $security = [Security.AccessControl.DirectorySecurity]::new()
@@ -1209,27 +1502,70 @@ try {
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $stagedHelper,
         "-ElevatedInstall", "-InstallerPath", $stagedMsi,
         "-ExpectedInstallerSha256", $payload.installer_sha256,
-        "-AllowedUserSid", $payload.sid
+        "-AllowedUserSid", $payload.sid,
+        "-ElevatedInstallCancelEvent", $payload.cancellation_event_name,
+        "-ElevatedInstallTimeoutSeconds", ([string]$payload.install_timeout_seconds)
     )
     if ([bool]$payload.quiet) { $arguments += "-Quiet" }
     if ([bool]$payload.no_restart) { $arguments += "-NoRestart" }
-    if (-not [string]::IsNullOrWhiteSpace([string]$payload.log_path)) {
-        $arguments += @("-LogPath", [string]$payload.log_path)
+    $stagedLog = Join-Path $stageRoot "Boundless-install.log"
+    if ([bool]$payload.log_requested) {
+        $arguments += @("-LogPath", $stagedLog)
     }
     $argumentLine = @($arguments | ForEach-Object { Quote-Argument $_ }) -join " "
     $hostPath = (Get-Process -Id $PID -ErrorAction Stop).Path
-    $child = Start-Process -FilePath $hostPath -ArgumentList $argumentLine -WindowStyle Hidden -Wait -PassThru
-    if ($child.ExitCode -notin @(0, 3010)) {
-        throw "Immutable staged helper failed with exit code $($child.ExitCode)."
+    $child = Start-Process -FilePath $hostPath -ArgumentList $argumentLine -WindowStyle Hidden -PassThru
+    $cancelEvent = [Threading.EventWaitHandle]::OpenExisting([string]$payload.cancellation_event_name)
+    $childCanceledReason = ""
+    try {
+        $childDeadline = (Get-Date).AddSeconds([int]$payload.install_timeout_seconds)
+        while (-not $child.WaitForExit(100)) {
+            if ($cancelEvent.WaitOne(0)) {
+                $childCanceledReason = "Staged installer helper was canceled by quiescence supervision."
+            }
+            elseif ((Get-Date) -ge $childDeadline) {
+                $childCanceledReason = "Staged installer helper exceeded its bounded install window."
+            }
+            if (-not [string]::IsNullOrWhiteSpace($childCanceledReason)) {
+                if (-not $child.WaitForExit(5000)) {
+                    $child.Kill()
+                    if (-not $child.WaitForExit(5000)) {
+                        throw "Staged installer helper did not stop after cancellation."
+                    }
+                }
+                break
+            }
+        }
+    }
+    finally {
+        $cancelEvent.Dispose()
     }
     $exitCode = $child.ExitCode
+    $child.Dispose()
+    if ([bool]$payload.log_requested -and (Test-Path -LiteralPath $stagedLog -PathType Leaf)) {
+        Remove-Item -LiteralPath $stagedMsi -Force -ErrorAction Stop
+        Remove-Item -LiteralPath $stagedHelper -Force -ErrorAction Stop
+        $handoffFileSecurity = [Security.AccessControl.FileSecurity]::new()
+        $handoffFileSecurity.SetSecurityDescriptorSddlForm([string]$payload.log_handoff_file_sddl)
+        Set-Acl -LiteralPath $stagedLog -AclObject $handoffFileSecurity -ErrorAction Stop
+        $handoffSecurity = [Security.AccessControl.DirectorySecurity]::new()
+        $handoffSecurity.SetSecurityDescriptorSddlForm([string]$payload.log_handoff_sddl)
+        Set-Acl -LiteralPath $stageRoot -AclObject $handoffSecurity -ErrorAction Stop
+        $logHandoffReady = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($childCanceledReason)) {
+        throw $childCanceledReason
+    }
+    if ($exitCode -notin @(0, 3010)) {
+        throw "Immutable staged helper failed with exit code $exitCode."
+    }
 }
 catch {
     Write-Host "boundless_install_elevated_error=$($_.Exception.Message)"
     $exitCode = 1
 }
 finally {
-    if ($trustedStage -and (Test-Path -LiteralPath $stageRoot)) {
+    if ($trustedStage -and -not $logHandoffReady -and (Test-Path -LiteralPath $stageRoot)) {
         $resolved = (Resolve-Path -LiteralPath $stageRoot).Path
         $parent = [IO.Directory]::GetParent($resolved)
         $leaf = [IO.Path]::GetFileName($resolved)
@@ -1262,6 +1598,9 @@ exit $exitCode
         encoded_command = $encodedCommand
         installer_sha256 = $payload.installer_sha256
         helper_sha256 = $payload.helper_sha256
+        stage_path = $stageRoot
+        staged_log_path = $stagedLogPath
+        log_requested = [bool]$payload.log_requested
     }
 }
 
@@ -1269,36 +1608,95 @@ function Invoke-BoundlessMsi {
     param(
         [string]$ResolvedInstallerPath,
         [string]$Sid,
-        [object]$InstallerAnchor
+        [object]$InstallerAnchor,
+        [object]$QuiescenceMonitor,
+        [int]$TimeoutSeconds = 900
     )
 
-    $elevatedCommandArgs = @{
-        ResolvedInstallerPath = $ResolvedInstallerPath
-        Sid = $Sid
-        InstallerAnchor = $InstallerAnchor
+    if ($null -eq $QuiescenceMonitor) {
+        throw "Elevated install requires an active tray quiescence monitor."
     }
-    $elevatedCommand = New-BoundlessElevatedInstallCommand @elevatedCommandArgs
-    $arguments = @(
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-EncodedCommand",
-        $elevatedCommand.encoded_command
-    )
+    $callerLogPath = if ([string]::IsNullOrWhiteSpace($LogPath)) {
+        ""
+    }
+    else {
+        $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogPath)
+    }
+    $controlEvent = New-BoundlessInstallerControlEvent -UserSid $Sid
+    $process = $null
+    try {
+        $elevatedCommandArgs = @{
+            ResolvedInstallerPath = $ResolvedInstallerPath
+            Sid = $Sid
+            InstallerAnchor = $InstallerAnchor
+            CancellationEventName = $controlEvent.name
+            TimeoutSeconds = $TimeoutSeconds
+        }
+        $elevatedCommand = New-BoundlessElevatedInstallCommand @elevatedCommandArgs
+        $arguments = @(
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            $elevatedCommand.encoded_command
+        )
 
-    $startArgs = @{
-        FilePath = (Resolve-CurrentPowerShellExecutable)
-        ArgumentList = (@($arguments | ForEach-Object { ConvertTo-ProcessArgument -Value $_ }) -join " ")
-        WindowStyle = "Hidden"
-        Wait = $true
-        PassThru = $true
+        $startArgs = @{
+            FilePath = (Resolve-CurrentPowerShellExecutable)
+            ArgumentList = (@($arguments | ForEach-Object { ConvertTo-ProcessArgument -Value $_ }) -join " ")
+            WindowStyle = "Hidden"
+            PassThru = $true
+        }
+        if (-not (Test-IsAdministrator)) {
+            $startArgs.Verb = "RunAs"
+        }
+        $process = Start-Process @startArgs
+        $supervisionError = $null
+        $exitCode = $null
+        try {
+            $exitCode = Wait-BoundlessElevatedInstallSupervised `
+                -InstallerProcess $process `
+                -Monitor $QuiescenceMonitor `
+                -CancellationEvent $controlEvent.event `
+                -TimeoutSeconds $TimeoutSeconds
+        }
+        catch {
+            $supervisionError = $_
+        }
+        $logHandoff = $null
+        if ($elevatedCommand.log_requested) {
+            try {
+                $logHandoff = Copy-BoundlessInstallerLogHandoff `
+                    -StageRoot $elevatedCommand.stage_path `
+                    -StagedLogPath $elevatedCommand.staged_log_path `
+                    -DestinationPath $callerLogPath
+            }
+            catch {
+                if ($null -eq $supervisionError) {
+                    throw
+                }
+                throw "$($supervisionError.Exception.Message) Installer log handoff also failed: $($_.Exception.Message)"
+            }
+            if (-not $logHandoff.copied) {
+                $message = "Elevated installer did not produce the explicitly requested staged MSI log."
+                if ($null -ne $supervisionError) {
+                    throw "$($supervisionError.Exception.Message) $message"
+                }
+                throw $message
+            }
+        }
+        if ($null -ne $supervisionError) {
+            throw $supervisionError
+        }
+        if ($exitCode -notin @(0, 3010)) {
+            throw "Elevated Boundless install phase exited with $exitCode."
+        }
     }
-    if (-not (Test-IsAdministrator)) {
-        $startArgs.Verb = "RunAs"
-    }
-    $process = Start-Process @startArgs
-    if ($process.ExitCode -notin @(0, 3010)) {
-        throw "Elevated Boundless install phase exited with $($process.ExitCode)."
+    finally {
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+        $controlEvent.event.Dispose()
     }
 
     # The elevated phase can launch MSI only after the bounded non-forced
@@ -1306,7 +1704,7 @@ function Invoke-BoundlessMsi {
     # parent records only the cross-elevation contract.
     return Assert-ElevatedInstallResult -Result ([pscustomobject]@{
         status = "passed"
-        msi_exit_code = $process.ExitCode
+        msi_exit_code = $exitCode
         service_shutdown = [pscustomobject]@{
             initial_status = "captured_in_elevated_phase"
             final_status = "StoppedOrNotInstalledBeforeMsi"
@@ -1321,6 +1719,7 @@ function Invoke-BoundlessMsi {
             staged_copy_used = $true
             cleaned = $true
         }
+        log_handoff = $logHandoff
     })
 }
 
@@ -2191,6 +2590,228 @@ function Invoke-PostInstallVerification {
     return Assert-PostInstallEvidence -Evidence $evidence
 }
 
+function Invoke-BoundlessInstallerSupervisionFixture {
+    param([string]$UserSid)
+
+    $control = New-BoundlessInstallerControlEvent -UserSid $UserSid
+    $installer = $null
+    $monitorProcess = $null
+    try {
+        $eventPayload = [Convert]::ToBase64String(
+            [Text.Encoding]::UTF8.GetBytes($control.name)
+        )
+        $installerSource = @'
+$name = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("__EVENT__"))
+$event = [Threading.EventWaitHandle]::OpenExisting($name)
+try {
+    if (-not $event.WaitOne(30000)) { exit 91 }
+    exit 23
+}
+finally { $event.Dispose() }
+'@.Replace("__EVENT__", $eventPayload)
+        $monitorSource = 'Start-Sleep -Milliseconds 500; exit 17'
+        $installer = Start-Process `
+            -FilePath (Resolve-CurrentPowerShellExecutable) `
+            -ArgumentList @(
+                "-NoProfile",
+                "-EncodedCommand",
+                [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($installerSource))
+            ) `
+            -WindowStyle Hidden `
+            -PassThru
+        $monitorProcess = Start-Process `
+            -FilePath (Resolve-CurrentPowerShellExecutable) `
+            -ArgumentList @(
+                "-NoProfile",
+                "-EncodedCommand",
+                [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($monitorSource))
+            ) `
+            -WindowStyle Hidden `
+            -PassThru
+        $monitor = [pscustomobject]@{ process = $monitorProcess }
+        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+        $failure = $null
+        try {
+            Wait-BoundlessElevatedInstallSupervised `
+                -InstallerProcess $installer `
+                -Monitor $monitor `
+                -CancellationEvent $control.event `
+                -TimeoutSeconds 15 `
+                -CancellationGraceMilliseconds 5000 | Out-Null
+        }
+        catch {
+            $failure = $_
+        }
+        $stopwatch.Stop()
+        if (
+            $null -eq $failure -or
+            $failure.Exception.Message -notmatch 'quiescence monitor exited' -or
+            -not $control.event.WaitOne(0) -or
+            -not $installer.HasExited -or
+            $stopwatch.ElapsedMilliseconds -gt 7000
+        ) {
+            throw "Installer supervision fixture did not promptly cancel its long-running process after monitor death."
+        }
+    }
+    finally {
+        if ($null -ne $installer) {
+            if (-not $installer.HasExited) {
+                Stop-BoundlessProcessBoundary -Process $installer
+            }
+            $installer.Dispose()
+        }
+        if ($null -ne $monitorProcess) {
+            if (-not $monitorProcess.HasExited) {
+                Stop-BoundlessProcessBoundary -Process $monitorProcess
+            }
+            $monitorProcess.Dispose()
+        }
+        $control.event.Dispose()
+    }
+}
+
+function Invoke-BoundlessReplacementTrayWindowFixture {
+    param([string]$UserSid)
+
+    $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    $sentinelName = Get-BoundlessTrayQuiescenceSentinelName `
+        -UserSid $UserSid `
+        -SessionId $sessionId
+    $sentinel = New-BoundlessNamedMutex `
+        -Name $sentinelName `
+        -UserSid $UserSid `
+        -InitiallyOwned $true
+    if (-not $sentinel.created_new) {
+        $sentinel.mutex.Dispose()
+        throw "Replacement tray fixture collided with an existing sentinel."
+    }
+    $readyName = "Local\Boundless.Test.ReplacementTrayReady.$([guid]::NewGuid().ToString('N'))"
+    $readyCreated = $false
+    $ready = [Threading.EventWaitHandle]::new(
+        $false,
+        [Threading.EventResetMode]::ManualReset,
+        $readyName,
+        [ref]$readyCreated
+    )
+    $fakeTray = $null
+    $monitor = $null
+    $sentinelReleased = $false
+    $monitorCompleted = $false
+    try {
+        if (-not $readyCreated) {
+            throw "Replacement tray fixture could not create its ready event."
+        }
+        $readyPayload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($readyName))
+        $fakeTraySource = @'
+Add-Type -AssemblyName System.Windows.Forms
+$name = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("__READY__"))
+$ready = [Threading.EventWaitHandle]::OpenExisting($name)
+try {
+    [void]$ready.Set()
+    [Windows.Forms.Application]::Run()
+}
+finally { $ready.Dispose() }
+'@.Replace("__READY__", $readyPayload)
+        $fakeTray = Start-Process `
+            -FilePath (Resolve-CurrentPowerShellExecutable) `
+            -ArgumentList @(
+                "-NoProfile",
+                "-STA",
+                "-EncodedCommand",
+                [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($fakeTraySource))
+            ) `
+            -WindowStyle Hidden `
+            -PassThru
+        if (-not $ready.WaitOne(10000)) {
+            throw "Replacement tray fixture did not publish its message loop."
+        }
+        $monitor = Start-BoundlessTrayQuiescenceMonitor `
+            -ExpectedOwnerSid $UserSid `
+            -ExpectedSessionId $sessionId `
+            -SentinelName $sentinelName `
+            -FixtureProcessId $fakeTray.Id
+        Wait-BoundlessTrayQuiescenceMonitorReady -Monitor $monitor -TimeoutSeconds 10
+        if (-not $fakeTray.WaitForExit(5000) -or $monitor.process.HasExited) {
+            throw "Replacement tray fixture did not close the replacement window and retain supervision."
+        }
+        $monitorExitedEarly = $monitor.process.HasExited
+        try {
+            $sentinel.mutex.ReleaseMutex()
+        }
+        finally {
+            $sentinel.mutex.Dispose()
+            $sentinelReleased = $true
+        }
+        Complete-BoundlessTrayQuiescenceMonitor `
+            -Monitor $monitor `
+            -ExitedBeforeSentinelRelease $monitorExitedEarly | Out-Null
+        $monitorCompleted = $true
+    }
+    finally {
+        $ready.Dispose()
+        if ($null -ne $fakeTray) {
+            if (-not $fakeTray.HasExited) {
+                Stop-BoundlessProcessBoundary -Process $fakeTray
+            }
+            $fakeTray.Dispose()
+        }
+        if (-not $sentinelReleased) {
+            try { $sentinel.mutex.ReleaseMutex() } finally { $sentinel.mutex.Dispose() }
+        }
+        if ($null -ne $monitor -and -not $monitorCompleted) {
+            $monitorExitedEarly = $monitor.process.HasExited
+            Complete-BoundlessTrayQuiescenceMonitor `
+                -Monitor $monitor `
+                -ExitedBeforeSentinelRelease $monitorExitedEarly | Out-Null
+        }
+    }
+}
+
+function Invoke-BoundlessLogHandoffFixture {
+    param([string]$SelectedUserSid)
+
+    $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        "BoundlessLogHandoffFixture-$([guid]::NewGuid().ToString('N'))"
+    )
+    $stageRoot = Join-Path $fixtureRoot "BoundlessInstaller-$([guid]::NewGuid().ToString('N'))"
+    $stagedLog = Join-Path $stageRoot "Boundless-install.log"
+    $destination = Join-Path $fixtureRoot "caller\requested.log"
+    try {
+        New-Item -ItemType Directory -Path $stageRoot -Force -ErrorAction Stop | Out-Null
+        [IO.File]::WriteAllText($stagedLog, "boundless-log-handoff-fixture")
+        $result = Copy-BoundlessInstallerLogHandoff `
+            -StageRoot $stageRoot `
+            -StagedLogPath $stagedLog `
+            -DestinationPath $destination `
+            -ProgramDataRoot $fixtureRoot
+        if (
+            -not $result.copied -or
+            -not (Test-Path -LiteralPath $destination -PathType Leaf) -or
+            (Test-Path -LiteralPath $stageRoot)
+        ) {
+            throw "Installer log handoff fixture did not copy and close the one-file stage."
+        }
+        $directorySddl = Get-BoundlessLogHandoffSddl -UserSid $SelectedUserSid
+        $fileSddl = Get-BoundlessLogHandoffFileSddl -UserSid $SelectedUserSid
+        foreach ($sddl in @($directorySddl, $fileSddl)) {
+            if (
+                $sddl -notmatch [regex]::Escape(";;;$SelectedUserSid)") -or
+                $sddl -notmatch ';;;BA\)' -or
+                $sddl -notmatch ';;;SY\)' -or
+                $sddl -match ';;;WD\)' -or
+                $sddl -match ';;;BU\)'
+            ) {
+                throw "Installer log handoff OTS fixture did not retain the selected-user/admin boundary."
+            }
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $fixtureRoot) {
+            Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Invoke-InstallHelperSelfTest {
     Assert-WindowsServiceExecutablePathFixtures
     $validSid = "S-1-5-21-1-2-3-1001"
@@ -2476,6 +3097,9 @@ function Invoke-InstallHelperSelfTest {
     if ($null -ne $monitorFixtureError) {
         throw $monitorFixtureError
     }
+    Invoke-BoundlessReplacementTrayWindowFixture -UserSid $currentIdentitySid
+    Invoke-BoundlessInstallerSupervisionFixture -UserSid $currentIdentitySid
+    Invoke-BoundlessLogHandoffFixture -SelectedUserSid $validSid
 
     $stageSddl = Get-BoundlessAdminOnlyStageSddl
     if (
@@ -2565,11 +3189,22 @@ function Invoke-InstallHelperSelfTest {
         ResolvedInstallerPath = $PSCommandPath
         Sid = $validSid
         InstallerAnchor = $selfTestInstallerAnchor
+        CancellationEventName = ""
+        LogRequested = $true
     }
-    $elevatedCommand = New-BoundlessElevatedInstallCommand @elevatedCommandArgs
+    $selfTestControlEvent = New-BoundlessInstallerControlEvent -UserSid $currentIdentitySid
+    try {
+        $elevatedCommandArgs.CancellationEventName = $selfTestControlEvent.name
+        $elevatedCommand = New-BoundlessElevatedInstallCommand @elevatedCommandArgs
+    }
+    finally {
+        $selfTestControlEvent.event.Dispose()
+    }
     if (
         $elevatedCommand.helper_sha256 -ne $script:BoundlessHelperStartupAnchor.sha256 -or
-        $elevatedCommand.installer_sha256 -ne $selfTestInstallerAnchor.sha256
+        $elevatedCommand.installer_sha256 -ne $selfTestInstallerAnchor.sha256 -or
+        -not $elevatedCommand.log_requested -or
+        [IO.Path]::GetFileName($elevatedCommand.staged_log_path) -ne "Boundless-install.log"
     ) {
         throw "Elevated command did not retain startup-anchored helper/MSI hashes."
     }
@@ -2622,6 +3257,7 @@ function Invoke-InstallHelperSelfTest {
     if (
         $decodedElevatedCommand -match '\$PSCommandPath' -or
         $decodedElevatedCommand -match '\$env:ProgramData' -or
+        $decodedElevatedCommand -match 'payload\.log_path' -or
         $decodedElevatedCommand -match 'S:\(ML;' -or
         $decodedElevatedCommand -notmatch 'BoundlessInstaller-' -or
         $decodedElevatedCommand -notmatch 'PSObject\.BaseObject' -or
@@ -2684,6 +3320,8 @@ function Invoke-InstallHelperSelfTest {
         direct_shutdown_signal_fixture = "passed"
         tray_quiescence_lease_fixture = "passed"
         tray_quiescence_monitor_fixture = "passed"
+        replacement_tray_window_fixture = "passed"
+        supervised_installer_cancellation_fixture = "passed"
         admin_only_stage_fixture = "passed"
         program_data_known_folder_fixture = "passed"
         staging_child_process_probe_hosts = $stagingProbeHosts
@@ -2692,6 +3330,7 @@ function Invoke-InstallHelperSelfTest {
         elevated_in_memory_command_fixture = "passed"
         helper_startup_anchor_fixture = "passed"
         installer_anchor_fixture = "passed"
+        caller_privilege_log_handoff_fixture = "passed"
         msi_property_fixture = $msiPropertyFixture
     } | ConvertTo-Json -Depth 3
 }
@@ -2710,6 +3349,12 @@ if ($ElevatedInstall) {
         if ($ExpectedInstallerSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
             throw "Internal immutable install phase received an invalid MSI hash."
         }
+        if ($ElevatedInstallTimeoutSeconds -lt 1 -or $ElevatedInstallTimeoutSeconds -gt 3600) {
+            throw "Internal immutable install phase received an invalid bounded timeout."
+        }
+        $cancellationProbe = Open-BoundlessInstallerCancellationEvent `
+            -Name $ElevatedInstallCancelEvent
+        $cancellationProbe.Dispose()
         $resolvedElevatedInstallerPath = Resolve-InstallerPath
         $stageRoot = Split-Path -Parent $resolvedElevatedInstallerPath
         if (
@@ -2724,6 +3369,8 @@ if ($ElevatedInstall) {
             ResolvedInstallerPath = $resolvedElevatedInstallerPath
             Sid = $AllowedUserSid
             ExpectedInstallerSha256 = $ExpectedInstallerSha256
+            CancellationEventName = $ElevatedInstallCancelEvent
+            TimeoutSeconds = $ElevatedInstallTimeoutSeconds
         }
         $elevatedResult = Invoke-ElevatedInstallPhase @elevatedPhaseArgs
         Write-Host "boundless_install_service_stop_initial=$($elevatedResult.service_shutdown.initial_status)"
@@ -2782,7 +3429,8 @@ try {
     $installResult = Invoke-BoundlessMsi `
         -ResolvedInstallerPath $resolvedInstallerPath `
         -Sid $selection.sid `
-        -InstallerAnchor $installerAnchor
+        -InstallerAnchor $installerAnchor `
+        -QuiescenceMonitor $trayQuiescence.monitor
 }
 finally {
     Exit-BoundlessTrayQuiescence -Lease $trayQuiescence

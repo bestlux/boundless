@@ -36,8 +36,10 @@ mod windows_app {
     };
     use platform_windows::{
         input::current_process_session_id,
-        runtime::{current_user_sid_string, process_id_user_sid_string},
-        single_instance::{SingleInstanceAcquire, SingleInstanceGuard},
+        runtime::{
+            current_user_sid_string, process_id_user_sid_string, validate_allowed_user_sid_shape,
+        },
+        single_instance::{ServiceStartOriginGuard, SingleInstanceAcquire, SingleInstanceGuard},
     };
     use serde::Deserialize;
     use std::{
@@ -75,6 +77,12 @@ mod windows_app {
         start_daemon: bool,
         #[arg(long, hide = true, default_value_t = false)]
         start_service_elevated: bool,
+        #[arg(long, hide = true)]
+        service_start_origin_sid: Option<String>,
+        #[arg(long, hide = true)]
+        service_start_origin_session: Option<u32>,
+        #[arg(long, hide = true)]
+        service_start_origin_nonce: Option<String>,
         /// Ask the existing tray in this user session to follow its normal
         /// fail-open Quit path, then exit this control process.
         #[arg(long, default_value_t = false)]
@@ -1820,6 +1828,35 @@ mod windows_app {
 
             assert!(cli.quit);
             assert!(!cli.start_service_elevated);
+            assert!(cli.service_start_origin_sid.is_none());
+            assert!(cli.service_start_origin_session.is_none());
+            assert!(cli.service_start_origin_nonce.is_none());
+        }
+
+        #[test]
+        fn privileged_service_start_identity_arguments_parse_as_one_contract() {
+            let cli = Cli::try_parse_from([
+                "boundlesstray",
+                "--start-service-elevated",
+                "--service-start-origin-sid",
+                "S-1-5-21-1-2-3-1001",
+                "--service-start-origin-session",
+                "7",
+                "--service-start-origin-nonce",
+                "0123456789abcdef0123456789abcdef",
+            ])
+            .expect("privileged service-start identity arguments should parse");
+
+            assert!(cli.start_service_elevated);
+            assert_eq!(
+                cli.service_start_origin_sid.as_deref(),
+                Some("S-1-5-21-1-2-3-1001")
+            );
+            assert_eq!(cli.service_start_origin_session, Some(7));
+            assert_eq!(
+                cli.service_start_origin_nonce.as_deref(),
+                Some("0123456789abcdef0123456789abcdef")
+            );
         }
     }
 }

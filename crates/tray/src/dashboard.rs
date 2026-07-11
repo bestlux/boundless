@@ -55,7 +55,17 @@ use dashboard_window::{
 pub(super) fn run() -> Result<()> {
     let cli = Cli::parse();
     if cli.start_service_elevated {
-        return start_boundless_service_elevated_entrypoint();
+        return start_boundless_service_elevated_entrypoint(
+            cli.service_start_origin_sid.as_deref(),
+            cli.service_start_origin_session,
+            cli.service_start_origin_nonce.as_deref(),
+        );
+    }
+    if cli.service_start_origin_sid.is_some()
+        || cli.service_start_origin_session.is_some()
+        || cli.service_start_origin_nonce.is_some()
+    {
+        anyhow::bail!("service-start origin arguments require the privileged helper mode");
     }
     let session_id = current_process_session_id().context("failed to resolve tray session id")?;
     let user_sid = current_user_sid_string().context("failed to resolve tray user SID")?;

@@ -38,6 +38,65 @@ pub struct SingleInstanceGuard {
     listener: Option<ActivationListener>,
 }
 
+pub struct ServiceStartOriginGuard {
+    event: OwnedHandle,
+}
+
+impl ServiceStartOriginGuard {
+    pub fn create(name: &str, user_sid: &str) -> Result<Self> {
+        validate_local_kernel_object_name(name, "service-start origin event")?;
+        if !validate_allowed_user_sid_shape(user_sid) {
+            bail!("service-start origin user SID must use canonical numeric SID syntax");
+        }
+
+        let security =
+            KernelObjectSecurityDescriptor::for_user_and_admins(user_sid, IntegrityLevel::Medium)?;
+        let attributes = security.attributes();
+        let event_name = wide_null(name);
+        unsafe {
+            SetLastError(0);
+        }
+        let event = unsafe { CreateEventW(&attributes, 1, 0, event_name.as_ptr()) };
+        if event.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to create service-start origin event");
+        }
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            drop(OwnedHandle(event));
+            bail!("service-start origin event unexpectedly already existed");
+        }
+        Ok(Self {
+            event: OwnedHandle(event),
+        })
+    }
+
+    pub fn exists(name: &str) -> Result<bool> {
+        validate_local_kernel_object_name(name, "service-start origin event")?;
+        let event_name = wide_null(name);
+        let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, event_name.as_ptr()) };
+        if event.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+                return Ok(false);
+            }
+            return Err(error).context("failed to open service-start origin event");
+        }
+        drop(OwnedHandle(event));
+        Ok(true)
+    }
+
+    pub fn is_held(&self) -> bool {
+        !self.event.0.is_null()
+    }
+}
+
+fn validate_local_kernel_object_name(name: &str, label: &str) -> Result<()> {
+    if name.is_empty() || !name.starts_with("Local\\") {
+        bail!("{label} name must use the Local namespace");
+    }
+    Ok(())
+}
+
 impl SingleInstanceGuard {
     /// Reports whether a named local mutex already exists without acquiring it.
     ///
@@ -301,6 +360,36 @@ impl KernelObjectSecurityDescriptor {
         if converted == 0 {
             return Err(std::io::Error::last_os_error())
                 .context("failed to build tray single-instance security descriptor");
+        }
+        Ok(Self {
+            security_descriptor,
+        })
+    }
+
+    fn for_user_and_admins(user_sid: &str, integrity: IntegrityLevel) -> Result<Self> {
+        let integrity_sid = match integrity {
+            IntegrityLevel::Low => "LW",
+            IntegrityLevel::Medium => "ME",
+        };
+        Self::from_sddl(&format!(
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{user_sid})S:(ML;;NW;;;{integrity_sid})"
+        ))
+    }
+
+    fn from_sddl(value: &str) -> Result<Self> {
+        let sddl = wide_null(value);
+        let mut security_descriptor = ptr::null_mut();
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut security_descriptor,
+                ptr::null_mut(),
+            )
+        };
+        if converted == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to build kernel object security descriptor");
         }
         Ok(Self {
             security_descriptor,
@@ -579,6 +668,46 @@ mod tests {
             !SingleInstanceGuard::local_mutex_exists(&name)
                 .expect("closed local mutex probe should succeed")
         );
+    }
+
+    #[test]
+    fn service_start_origin_event_is_nonce_scoped_and_open_only() {
+        let name = unique_name("service-start-origin");
+        assert!(
+            !ServiceStartOriginGuard::exists(&name)
+                .expect("missing service-start origin probe should succeed")
+        );
+        let guard = ServiceStartOriginGuard::create(&name, &current_sid())
+            .expect("service-start origin event should be created");
+        assert!(guard.is_held());
+        assert!(
+            ServiceStartOriginGuard::exists(&name)
+                .expect("held service-start origin event should open")
+        );
+        drop(guard);
+        assert!(
+            !ServiceStartOriginGuard::exists(&name)
+                .expect("closed service-start origin event should be missing")
+        );
+    }
+
+    #[test]
+    fn service_start_origin_event_rejects_non_local_names_and_invalid_sids() {
+        let error = match ServiceStartOriginGuard::create("Global\\Boundless.Test", &current_sid())
+        {
+            Ok(_) => panic!("global service-start origin name must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("Local namespace"));
+
+        let error = match ServiceStartOriginGuard::create(
+            &unique_name("service-start-invalid-sid"),
+            "S-1-5-21);(A;;GA;;;WD",
+        ) {
+            Ok(_) => panic!("invalid service-start origin SID must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("canonical numeric SID"));
     }
 
     #[test]
