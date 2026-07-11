@@ -819,6 +819,7 @@ impl ControlPlaneService for ControlPlaneApi {
                 inject_failure_count: request.inject_failure_count,
                 inject_backpressure: request.inject_backpressure,
                 acked_inject_batch_id: request.acked_inject_batch_id,
+                held_input_authorization_generation: request.held_input_authorization_generation,
                 raw_device_wheel_event_count: request.raw_device_wheel_event_count,
                 raw_system_wheel_event_count: request.raw_system_wheel_event_count,
                 hook_wheel_event_count: request.hook_wheel_event_count,
@@ -842,6 +843,8 @@ impl ControlPlaneService for ControlPlaneApi {
             capture_forwarding_authorized: reply.capture_forwarding_authorized,
             inject_batch_id: reply.inject_batch_id,
             inject_batch_cancelled: reply.inject_batch_cancelled,
+            inject_authorization_generation: reply.inject_authorization_generation,
+            held_input_authorized: reply.held_input_authorized,
         }))
     }
 

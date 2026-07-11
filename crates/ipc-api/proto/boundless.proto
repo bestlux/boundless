@@ -487,6 +487,7 @@ message InputBrokerExchangeRequest {
   uint32 detector_unavailable_unlock_count = 22;
   bool inject_backpressure = 23;
   uint64 acked_inject_batch_id = 24;
+  uint64 held_input_authorization_generation = 25;
 }
 
 message InputBrokerInjectFrame {
@@ -504,6 +505,8 @@ message InputBrokerExchangeReply {
   bool capture_forwarding_authorized = 6;
   uint64 inject_batch_id = 7;
   bool inject_batch_cancelled = 8;
+  uint64 inject_authorization_generation = 9;
+  bool held_input_authorized = 10;
 }
 
 message ClipboardBrokerPayload {

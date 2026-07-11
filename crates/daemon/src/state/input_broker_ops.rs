@@ -22,6 +22,8 @@ pub struct InputBrokerExchangeOutcome {
     pub capture_forwarding_authorized: bool,
     pub inject_batch_id: u64,
     pub inject_batch_cancelled: bool,
+    pub inject_authorization_generation: u64,
+    pub held_input_authorized: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +66,7 @@ pub struct InputBrokerExchangeObservations {
     pub inject_failure_count: u32,
     pub inject_backpressure: bool,
     pub acked_inject_batch_id: u64,
+    pub held_input_authorization_generation: u64,
     pub raw_device_wheel_event_count: u32,
     pub raw_system_wheel_event_count: u32,
     pub hook_wheel_event_count: u32,
@@ -509,6 +512,9 @@ impl AppState {
                 ..Default::default()
             };
         }
+        let held_input_authorized = self
+            .held_input_authorization_is_current(observations.held_input_authorization_generation)
+            .await;
 
         if observations.inject_failure_count > 0 {
             self.record_transport_event(TransportEventRecord {
@@ -625,7 +631,8 @@ impl AppState {
         let existing_batch = self.input_broker.inflight_inject_batch();
         let batch = if let Some(mut batch) = existing_batch {
             if !batch.cancelled {
-                let mut authorization_changed = false;
+                let mut authorization_changed =
+                    batch.authorization_generation != self.input_authorization_generation();
                 for frame in &batch.frames {
                     if !self.input_injection_allowed_for_peer(&frame.peer_id).await {
                         authorization_changed = true;
@@ -687,10 +694,17 @@ impl AppState {
                 .await;
                 accepted.push(frame);
             }
-            (!accepted.is_empty()).then(|| self.input_broker.stage_inject_batch(accepted))
+            (!accepted.is_empty()).then(|| {
+                self.input_broker
+                    .stage_inject_batch(accepted, self.input_authorization_generation())
+            })
         };
         let inject_batch_id = batch.as_ref().map_or(0, |batch| batch.batch_id);
         let inject_batch_cancelled = batch.as_ref().is_some_and(|batch| batch.cancelled);
+        let inject_authorization_generation = batch
+            .as_ref()
+            .filter(|batch| !batch.cancelled)
+            .map_or(0, |batch| batch.authorization_generation);
         let inject_frames = if observations.inject_backpressure || inject_batch_cancelled {
             Vec::new()
         } else {
@@ -706,6 +720,8 @@ impl AppState {
             capture_forwarding_authorized,
             inject_batch_id,
             inject_batch_cancelled,
+            inject_authorization_generation,
+            held_input_authorized,
         }
     }
 

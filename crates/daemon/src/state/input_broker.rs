@@ -63,6 +63,7 @@ struct InputBrokerRelayInner {
 #[derive(Debug, Clone)]
 pub(crate) struct InputBrokerInjectBatch {
     pub batch_id: u64,
+    pub authorization_generation: u64,
     pub frames: Vec<PendingInjectInputFrame>,
     pub cancelled: bool,
 }
@@ -444,12 +445,14 @@ impl InputBrokerRelay {
     pub(crate) fn stage_inject_batch(
         &self,
         frames: Vec<PendingInjectInputFrame>,
+        authorization_generation: u64,
     ) -> InputBrokerInjectBatch {
         let mut inner = self.lock();
         debug_assert!(inner.inflight_inject_batch.is_none());
         inner.next_inject_batch_id = inner.next_inject_batch_id.wrapping_add(1).max(1);
         let batch = InputBrokerInjectBatch {
             batch_id: inner.next_inject_batch_id,
+            authorization_generation,
             frames,
             cancelled: false,
         };

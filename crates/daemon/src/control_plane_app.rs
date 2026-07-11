@@ -598,6 +598,8 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
                     inject_failure_count: command.inject_failure_count,
                     inject_backpressure: command.inject_backpressure,
                     acked_inject_batch_id: command.acked_inject_batch_id,
+                    held_input_authorization_generation: command
+                        .held_input_authorization_generation,
                     raw_device_wheel_event_count: command.raw_device_wheel_event_count,
                     raw_system_wheel_event_count: command.raw_system_wheel_event_count,
                     hook_wheel_event_count: command.hook_wheel_event_count,
@@ -621,6 +623,8 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             capture_forwarding_authorized: outcome.capture_forwarding_authorized,
             inject_batch_id: outcome.inject_batch_id,
             inject_batch_cancelled: outcome.inject_batch_cancelled,
+            inject_authorization_generation: outcome.inject_authorization_generation,
+            held_input_authorized: outcome.held_input_authorized,
         })
     }
 

@@ -66,15 +66,22 @@ Incoming (peer frame -> local injection):
    retains an in-flight batch under the same ID across replacement or stale
    re-attach. The tray keeps completed receipts, partial suffix state, and the
    intended held key/button state across its supervisor sessions, but accepts
-   them only when the new attach reports the same epoch. Session failure first
-   releases committed holds locally so input fails open. After same-epoch
-   re-attach, the tray waits for a successful exchange to revalidate the
-   retained batch, restores those holds, and only then resumes the payload
-   suffix. A partial restore retains its exact uncommitted suffix and makes at
-   most one native restore attempt per authorized exchange. Cancellation or a
-   new delivery epoch discards the restore intent. A lost acknowledgment
-   followed by a transient same-process re-attach therefore acknowledges the
-   repeated ID without another payload `SendInput` call.
+   them only when the new attach reports the same epoch. Each injected batch
+   also carries the daemon's input-authorization generation. Owner transitions,
+   `share_input` changes, and resets advance that generation, so a completed
+   Down-only batch cannot be restored after authority changes even if the same
+   peer later reclaims ownership. Session failure first releases committed
+   holds locally so input fails open. A partial or zero-record native release
+   failure retains the exact uncommitted Up suffix; bounded cleanup retries run
+   before connecting to the daemon again and gate every restore or new payload.
+   After same-epoch re-attach, the tray waits for a successful exchange to
+   revalidate the retained generation, restores completed or partial holds,
+   and only then resumes any returned payload suffix. A partial restore retains
+   its exact uncommitted suffix and makes at most one native restore attempt per
+   authorized exchange. Cancellation, authorization-generation rejection, or a
+   new delivery epoch discards the restore intent. Lost receipt requests and
+   request-consumed/response-lost retries remain idempotent without applying a
+   payload before its holds.
 5. Cooperative detach carries the tray's latest completed batch ID and delivery
    epoch. Under the capture-transition lock, the daemon validates the broker
    token and epoch, acknowledges that exact batch, and only then returns any
@@ -122,6 +129,11 @@ Clipboard (service mode with broker attached):
 - Attach also negotiates an exact broker protocol revision. An older tray is
   rejected before it can lock input; a newer tray rejects an unversioned older
   daemon and performs bounded cleanup if that daemon already issued a token.
+- Held-input restore is separately authorized by an epoch-scoped daemon
+  generation. The generation is issued with an inject batch and revalidated on
+  every exchange while a key or button remains down; it is never inferred from
+  a client-supplied peer identity. Owner, input-sharing policy, or reset changes
+  reject the old generation and force local release without restore.
 - The broker adds a per-attachment token, and exchanges with a stale or
   replaced token are rejected.
 - Clipboard broker exchange uses the same attachment token and verified-client
@@ -163,9 +175,9 @@ Clipboard (service mode with broker attached):
   attach (at-least-once), so input that completed immediately before the crash
   can be applied twice. Persisting receipts would be required to close that
   boundary. The tray's locally injected held-state snapshot is process-local as
-  well: if the tray hard-crashes after a key/button Down and authorization is
-  revoked before a matching Up can be replayed, that input can remain held on
-  the receiving PC. Abrupt broker death can also leave keys held on a remote
+  well: a hard tray/process crash can erase both its intended hold snapshot and
+  any pending exact release suffix before the bounded cleanup loop finishes.
+  Abrupt broker death can also leave keys held on a remote
   peer until release synthesis runs on the next capture-target transition.
 - Real two-PC dogfood evidence is still required before the parity matrix rows
   can move; nothing here upgrades BND-NEXT-9C claims.

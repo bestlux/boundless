@@ -1322,6 +1322,162 @@ async fn stale_reattach_reauthorizes_partial_batch_without_replaying_full_frames
 }
 
 #[tokio::test]
+async fn completed_hold_authorization_survives_response_loss_but_not_owner_or_policy_change() {
+    let (state, root) = service_mode_broker_state("boundless-broker-held-auth-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let first_attach = state
+        .attach_input_broker(allowed_client(), "first-broker".to_string(), true)
+        .await;
+    assert!(first_attach.accepted);
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("claim owner")
+    );
+    state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id.clone(),
+                sequence: 43,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::Key {
+                    scan_code: 29,
+                    state: KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
+                }],
+            },
+        )
+        .await
+        .expect("route held modifier");
+    let dispatched = state
+        .exchange_input_broker(
+            allowed_client(),
+            &first_attach.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert_ne!(dispatched.inject_batch_id, 0);
+    assert_ne!(dispatched.inject_authorization_generation, 0);
+
+    state.input_broker_relay().expire_attachment_for_test();
+    let replacement = state
+        .attach_input_broker(allowed_client(), "replacement-broker".to_string(), true)
+        .await;
+    assert!(replacement.accepted);
+    let consumed_receipt = state
+        .exchange_input_broker(
+            allowed_client(),
+            &replacement.broker_token,
+            InputBrokerExchangeObservations {
+                acked_inject_batch_id: dispatched.inject_batch_id,
+                held_input_authorization_generation: dispatched.inject_authorization_generation,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(consumed_receipt.accepted);
+    assert!(consumed_receipt.held_input_authorized);
+    assert_eq!(consumed_receipt.inject_batch_id, 0);
+
+    // The response above may be lost. Authorization is daemon-generation
+    // state, not a one-shot receipt, so the exact retry remains valid.
+    let response_loss_retry = state
+        .exchange_input_broker(
+            allowed_client(),
+            &replacement.broker_token,
+            InputBrokerExchangeObservations {
+                held_input_authorization_generation: dispatched.inject_authorization_generation,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(response_loss_retry.held_input_authorized);
+
+    assert!(state.release_input_owner(&peer_id).await);
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("reclaim same owner")
+    );
+    let owner_changed = state
+        .exchange_input_broker(
+            allowed_client(),
+            &replacement.broker_token,
+            InputBrokerExchangeObservations {
+                held_input_authorization_generation: dispatched.inject_authorization_generation,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(owner_changed.accepted);
+    assert!(
+        !owner_changed.held_input_authorized,
+        "release/reclaim must invalidate the old held-input generation"
+    );
+
+    state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id.clone(),
+                sequence: 44,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::MouseButton {
+                    button: core_input::MouseButton::Left,
+                    state: KeyState::Down,
+                }],
+            },
+        )
+        .await
+        .expect("route new held button");
+    let redispatched = state
+        .exchange_input_broker(
+            allowed_client(),
+            &replacement.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert_ne!(redispatched.inject_authorization_generation, 0);
+    assert_ne!(
+        redispatched.inject_authorization_generation,
+        dispatched.inject_authorization_generation
+    );
+
+    state
+        .set_feature("share_input".to_string(), false)
+        .await
+        .expect("disable input sharing");
+    state
+        .set_feature("share_input".to_string(), true)
+        .await
+        .expect("re-enable input sharing");
+    let policy_changed = state
+        .exchange_input_broker(
+            allowed_client(),
+            &replacement.broker_token,
+            InputBrokerExchangeObservations {
+                inject_backpressure: true,
+                held_input_authorization_generation: redispatched.inject_authorization_generation,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(!policy_changed.held_input_authorized);
+    assert_eq!(policy_changed.inject_batch_id, redispatched.inject_batch_id);
+    assert!(
+        policy_changed.inject_batch_cancelled,
+        "a response-lost batch must be cancelled after its issuing generation is revoked"
+    );
+    assert_eq!(policy_changed.inject_authorization_generation, 0);
+    assert!(policy_changed.inject_frames.is_empty());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn detach_acknowledges_completed_inject_batch_before_requeue() {
     let (state, root) = service_mode_broker_state("boundless-broker-detach-ack-test").await;
     let peer_id = join_connected_peer(&state).await;

@@ -685,14 +685,14 @@ impl AppState {
             anyhow::bail!("unknown peer {peer_id}");
         }
 
-        let claimed = self
-            .input
-            .control
-            .router
-            .write()
-            .await
-            .claim_owner(peer_id, force);
-        if claimed {
+        let (claimed, owner_changed) = {
+            let mut router = self.input.control.router.write().await;
+            let previous_owner = router.owner().map(str::to_string);
+            let claimed = router.claim_owner(peer_id, force);
+            let owner_changed = claimed && previous_owner.as_deref() != router.owner();
+            (claimed, owner_changed)
+        };
+        if owner_changed {
             self.note_input_owner_transition().await;
         }
         Ok(claimed)
@@ -701,6 +701,14 @@ impl AppState {
     pub async fn input_injection_allowed_for_peer(&self, peer_id: &str) -> bool {
         let router = self.input.control.router.read().await;
         router.is_enabled() && router.owner() == Some(peer_id)
+    }
+
+    pub async fn held_input_authorization_is_current(&self, generation: u64) -> bool {
+        if generation == 0 || generation != self.input_authorization_generation() {
+            return false;
+        }
+        let router = self.input.control.router.read().await;
+        router.is_enabled() && router.owner().is_some()
     }
 
     pub async fn release_input_owner(&self, peer_id: &str) -> bool {
@@ -718,8 +726,19 @@ impl AppState {
     }
 
     pub async fn note_input_owner_transition(&self) {
+        self.input
+            .control
+            .authorization_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         *self.input.control.owner_last_changed_at.write().await = Some(std::time::Instant::now());
         self.notify_input_inject_wake("input_owner_changed");
+    }
+
+    pub(crate) fn input_authorization_generation(&self) -> u64 {
+        self.input
+            .control
+            .authorization_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub async fn input_owner(&self) -> Option<String> {

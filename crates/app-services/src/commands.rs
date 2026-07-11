@@ -192,6 +192,7 @@ pub struct InputBrokerExchangeCommand {
     pub inject_failure_count: u32,
     pub inject_backpressure: bool,
     pub acked_inject_batch_id: u64,
+    pub held_input_authorization_generation: u64,
     pub raw_device_wheel_event_count: u32,
     pub raw_system_wheel_event_count: u32,
     pub hook_wheel_event_count: u32,

@@ -97,6 +97,8 @@ pub struct InputBrokerExchangeSnapshot {
     pub capture_forwarding_authorized: bool,
     pub inject_batch_id: u64,
     pub inject_batch_cancelled: bool,
+    pub inject_authorization_generation: u64,
+    pub held_input_authorized: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

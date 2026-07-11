@@ -478,6 +478,10 @@ impl AppState {
 
         if name == "share_input" {
             self.input.control.router.write().await.set_enabled(enabled);
+            self.input
+                .control
+                .authorization_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             self.notify_input_inject_wake("share_input_toggled");
             self.notify_input_capture_wake("share_input_toggled");
         } else if name == "share_clipboard" && !enabled {
