@@ -1224,7 +1224,7 @@ async fn failed_inject_batch_is_cancelled_without_replay_and_mismatch_fails_clos
         .route_incoming_input_frame(
             &peer_id,
             InputFrame {
-                source_peer_id: peer_id,
+                source_peer_id: peer_id.clone(),
                 sequence: 1,
                 timestamp_unix_ms: Utc::now().timestamp_millis(),
                 events: vec![InputEvent::Key {

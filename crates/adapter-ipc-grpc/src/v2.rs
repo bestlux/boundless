@@ -1458,6 +1458,7 @@ mod tests {
         request.extensions_mut().insert(ControlClientIdentity {
             user_sid: Some("S-1-5-21-1-2-3-1001".to_string()),
             session_id: Some(2),
+            process_id: None,
         });
         let verified = verified_control_client(&request).expect("verified identity");
         assert_eq!(verified.user_sid.as_deref(), Some("S-1-5-21-1-2-3-1001"));
