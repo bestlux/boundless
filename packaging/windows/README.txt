@@ -16,6 +16,7 @@ This installer deploys:
 - boundlessd.exe
 - boundless-service.exe
 - boundlessctl.exe
+- boundless-input-injector.exe
 - Boundless-Install.ps1
 - Boundless-Reset.ps1
 - Boundless-ConnectivityDiagnostics.ps1
@@ -44,6 +45,21 @@ Recommended flow
 
 2. Launch Boundless from the Start Menu, desktop shortcut, or boundlesstray.exe.
 
+Elevated application input
+--------------------------
+- Elevated input is explicit and session-scoped. Enabling it launches only
+  boundless-input-injector.exe and presents one cancellable UAC prompt; the
+  tray, clipboard path, network runtime, and settings UI remain unelevated.
+- Cancelling the prompt keeps normal-window input available and does not retry.
+  Tray restart, injector crash, repair, and upgrade also require a new explicit
+  enable action rather than producing an unsolicited UAC prompt.
+- Unsigned dogfood builds display "Unknown publisher" in UAC. That is a known
+  dogfood limitation, not trusted-publisher evidence. Production signing must
+  be configured before this capability is presented as generally ready.
+- The UAC consent or credential screen, Windows secure desktop, lock screen,
+  Winlogon, other user sessions, and alternate-administrator credential flows
+  are not supported. Approve UAC locally with the target computer's hardware.
+
 Fallback/debug flow
 -------------------
 - If the helper cannot infer the intended desktop user safely, it fails closed.
@@ -67,6 +83,9 @@ Install behavior
 - Upgrade input ownership: the helper holds the intended session's existing
   tray-owner mutex from preflight through MSI completion, then releases it
   before post-install tray launch
+- Elevated-input upgrade ownership: the installed injector is closed before
+  payload replacement and is not automatically relaunched after repair or
+  upgrade; the user explicitly enables it again when needed
 - Elevated installer handoff: the helper and MSI are copied into an
   administrator-only ProgramData staging directory and hash-verified before
   the service is stopped or msiexec reopens the package

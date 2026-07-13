@@ -76,6 +76,11 @@
         },
         {
           "type": "toml",
+          "path": "crates/input-injector/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
           "path": "crates/ipc-api/Cargo.toml",
           "jsonpath": "$.package.version"
         },

@@ -199,7 +199,7 @@ jobs:
       - name: Build Windows binaries
         working-directory: source
         shell: pwsh
-        run: cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray
+        run: cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector
 
       - name: Sign Windows binaries
         working-directory: source
@@ -224,7 +224,8 @@ jobs:
               "target/release/boundlessd.exe",
               "target/release/boundless-service.exe",
               "target/release/boundlessctl.exe",
-              "target/release/boundlesstray.exe"
+              "target/release/boundlesstray.exe",
+              "target/release/boundless-input-injector.exe"
             )
 
       - name: Package Windows installer
@@ -240,6 +241,7 @@ jobs:
             -ServicePath "source/target/release/boundless-service.exe" `
             -CliPath "source/target/release/boundlessctl.exe" `
             -TrayPath "source/target/release/boundlesstray.exe" `
+            -InputInjectorPath "source/target/release/boundless-input-injector.exe" `
             -OutputPath $outputPath
           $helperPath = Join-Path (Split-Path -Parent $outputPath) "Boundless-$version-windows-x64-install.ps1"
           "installer_path=$outputPath" >> $env:GITHUB_OUTPUT

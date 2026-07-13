@@ -99,6 +99,71 @@ if ($packageWxsText -notmatch 'AllowSameVersionUpgrades="yes"') {
 if ($packageWxsText -match 'Id="CloseBoundlessService"') {
     throw "Package.wxs must not use CloseApplication/TerminateProcess for BoundlessService; helper stop plus ServiceControl own that lifecycle."
 }
+if (
+    $packageWxsText -notmatch 'Id="CloseBoundlessInputInjector"' -or
+    $packageWxsText -notmatch 'Target="boundless-input-injector\.exe"' -or
+    $packageWxsText -notmatch 'Id="CloseBoundlessInputInjector"(?s:.*?)TerminateProcess="1"'
+) {
+    throw "Package.wxs must own bounded close/termination fallback for the elevated input injector."
+}
+if (
+    $packageWxsText -notmatch 'Id="BoundlessInputInjectorPayloadComponent"' -or
+    $packageWxsText -notmatch 'Id="InputInjectorBinaryFile"' -or
+    $packageWxsText -notmatch 'Source="\$\(var\.PayloadDir\)\\boundless-input-injector\.exe"'
+) {
+    throw "Package.wxs must install the elevated input injector as an MSI-owned Program Files payload."
+}
+
+$packageManifestPath = Join-Path $packagingRoot "package-manifest.json"
+$packageManifest = Get-Content -LiteralPath $packageManifestPath -Raw | ConvertFrom-Json
+if ($packageManifest.executables.input_injector -ne "boundless-input-injector.exe") {
+    throw "package-manifest.json must declare the installed elevated input injector executable."
+}
+
+$packageScriptPath = Join-Path $RepoRoot "scripts\release\package-windows.ps1"
+$packageScriptText = Get-Content -LiteralPath $packageScriptPath -Raw
+if (
+    $packageScriptText -notmatch '\[Parameter\(Mandatory = \$true\)\]\s*\[string\]\$InputInjectorPath' -or
+    $packageScriptText -notmatch 'Resolve-RequiredPath -Path \$InputInjectorPath -Label "Input injector binary"' -or
+    $packageScriptText -notmatch 'Copy-Item -LiteralPath \$inputInjectorBinary -Destination \(Join-Path \$stageRoot "boundless-input-injector\.exe"\)'
+) {
+    throw "package-windows.ps1 must require, validate, and stage the elevated input injector binary."
+}
+
+$releaseWorkflowPath = Join-Path $RepoRoot ".github\workflows\release-please.yml"
+$releaseWorkflowText = Get-Content -LiteralPath $releaseWorkflowPath -Raw
+if (
+    $releaseWorkflowText -notmatch 'cargo build --release[^\r\n]*-p boundless-input-injector' -or
+    $releaseWorkflowText -notmatch '"target/release/boundless-input-injector\.exe"' -or
+    $releaseWorkflowText -notmatch '-InputInjectorPath "source/target/release/boundless-input-injector\.exe"'
+) {
+    throw "The Windows release workflow must build, sign, and package the elevated input injector."
+}
+
+$releasePleaseConfigPath = Join-Path $RepoRoot "release-please-config.json"
+$releasePleaseConfig = Get-Content -LiteralPath $releasePleaseConfigPath -Raw | ConvertFrom-Json
+$releasePleaseExtraFiles = @($releasePleaseConfig.packages."."."extra-files" | ForEach-Object { $_.path })
+if ($releasePleaseExtraFiles -notcontains "crates/input-injector/Cargo.toml") {
+    throw "release-please-config.json must propagate the release version into the input injector crate."
+}
+
+$inputInjectorCrateRoot = Join-Path $RepoRoot "crates\input-injector"
+if (Test-Path -LiteralPath $inputInjectorCrateRoot) {
+    $inputInjectorManifestPath = Join-Path $inputInjectorCrateRoot "assets\input-injector.manifest"
+    if (-not (Test-Path -LiteralPath $inputInjectorManifestPath)) {
+        throw "The input injector crate must keep its execution-level contract in assets/input-injector.manifest."
+    }
+    $inputInjectorManifestText = Get-Content -LiteralPath $inputInjectorManifestPath -Raw
+    if (
+        $inputInjectorManifestText -notmatch 'requestedExecutionLevel\s+level="requireAdministrator"\s+uiAccess="false"' -or
+        @([regex]::Matches($inputInjectorManifestText, 'requestedExecutionLevel')).Count -ne 1
+    ) {
+        throw "The input injector source manifest must declare exactly one requireAdministrator, uiAccess=false execution level."
+    }
+}
+else {
+    Write-Host "input_injector_source_manifest_check=deferred_missing_crate"
+}
 $wixProject = Join-Path $packagingRoot "installer\Boundless.Installer.wixproj"
 $wixProjectText = Get-Content -LiteralPath $wixProject -Raw
 if ($wixProjectText -notmatch '<SuppressIces>[^<]*ICE61') {
