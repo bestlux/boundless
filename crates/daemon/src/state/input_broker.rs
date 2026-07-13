@@ -21,6 +21,51 @@ pub(crate) const CLIPBOARD_DIRECT_BACKEND_MODE: &str = "direct";
 pub(crate) const CLIPBOARD_USER_SESSION_BROKER_MODE: &str = "user_session_broker";
 pub(crate) const CLIPBOARD_BROKER_UNAVAILABLE_MODE: &str = "broker_unavailable";
 
+const ELEVATED_INJECTOR_STATES: &[&str] = &[
+    "off",
+    "prompting",
+    "ready_pending_idle",
+    "active",
+    "stopping",
+    "unavailable",
+    "unknown",
+];
+const ELEVATED_INJECTOR_REASONS: &[&str] = &[
+    "none",
+    "user_cancelled",
+    "not_installed",
+    "wrong_path",
+    "identity_rejected",
+    "signature_invalid",
+    "duplicate",
+    "protocol_mismatch",
+    "ipc_unavailable",
+    "heartbeat_expired",
+    "parent_exited",
+    "inject_failed",
+    "shutdown_incomplete",
+    "unknown",
+];
+const ELEVATED_INJECTOR_SIGNATURE_TRUST: &[&str] =
+    &["valid", "unsigned_dogfood", "invalid", "unknown"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ElevatedInjectorStatus {
+    pub state: String,
+    pub reason: String,
+    pub signature_trust: String,
+}
+
+impl Default for ElevatedInjectorStatus {
+    fn default() -> Self {
+        Self {
+            state: "off".to_string(),
+            reason: "none".to_string(),
+            signature_trust: "unknown".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InputBrokerAttachment {
     pub broker_token: String,
@@ -52,6 +97,7 @@ struct InputBrokerRelayInner {
     capture_forwarding_authorized: bool,
     dropped_event_count: u64,
     last_wheel_source_mode: Option<&'static str>,
+    elevated_injector_status: ElevatedInjectorStatus,
     last_accepted_clipboard_sequence: Option<u64>,
     pressed_keys: Vec<(u16, KeySemantics)>,
     pressed_buttons: Vec<MouseButton>,
@@ -66,6 +112,7 @@ pub(crate) struct InputBrokerInjectBatch {
     pub authorization_generation: u64,
     pub frames: Vec<PendingInjectInputFrame>,
     pub cancelled: bool,
+    delivery_uncertain_reported: bool,
 }
 
 /// Session-neutral relay between the LocalSystem service daemon and the
@@ -127,6 +174,7 @@ impl InputBrokerRelay {
         inner.capture_forwarding_authorized = false;
         inner.dropped_event_count = 0;
         inner.last_wheel_source_mode = None;
+        inner.elevated_injector_status = ElevatedInjectorStatus::default();
         inner.last_accepted_clipboard_sequence = None;
         inner.pressed_keys.clear();
         inner.pressed_buttons.clear();
@@ -166,6 +214,7 @@ impl InputBrokerRelay {
         inner.desired_lock_active = false;
         inner.reported_lock_active = false;
         inner.capture_forwarding_authorized = false;
+        inner.elevated_injector_status = ElevatedInjectorStatus::default();
         Ok(true)
     }
 
@@ -177,6 +226,7 @@ impl InputBrokerRelay {
         inner.desired_lock_active = false;
         inner.reported_lock_active = false;
         inner.capture_forwarding_authorized = false;
+        inner.elevated_injector_status = ElevatedInjectorStatus::default();
         // `detach_any` is the destructive safe-reset path. Rotate the epoch
         // whenever delivery state is discarded so a surviving tray cannot
         // apply or acknowledge a pre-reset batch ID against the new state.
@@ -371,6 +421,33 @@ impl InputBrokerRelay {
         Some(mode)
     }
 
+    /// Retains only a bounded, content-free injector capability vocabulary and
+    /// returns the normalized status when it changes. A pre-upgrade broker that
+    /// sends no status fields maps to the truthful disabled default.
+    pub(crate) fn observe_elevated_injector_status(
+        &self,
+        state: &str,
+        reason: &str,
+        signature_trust: &str,
+    ) -> Option<ElevatedInjectorStatus> {
+        let normalized = normalize_elevated_injector_status(state, reason, signature_trust);
+        let mut inner = self.lock();
+        if inner.elevated_injector_status == normalized {
+            return None;
+        }
+        inner.elevated_injector_status = normalized.clone();
+        Some(normalized)
+    }
+
+    /// A stale or absent broker can never advertise an active privileged path.
+    pub(crate) fn elevated_injector_status(&self) -> ElevatedInjectorStatus {
+        let inner = self.lock();
+        if !inner.service_session_input || !Self::attachment_fresh(&inner, Instant::now()) {
+            return ElevatedInjectorStatus::default();
+        }
+        inner.elevated_injector_status.clone()
+    }
+
     /// Marks a successfully handled local clipboard sequence and returns
     /// whether this is the first accepted observation of that sequence for
     /// the current broker attachment. Same-sequence response-loss retries are
@@ -455,6 +532,7 @@ impl InputBrokerRelay {
             authorization_generation,
             frames,
             cancelled: false,
+            delivery_uncertain_reported: false,
         };
         inner.inflight_inject_batch = Some(batch.clone());
         batch
@@ -473,6 +551,30 @@ impl InputBrokerRelay {
         Some(batch.clone())
     }
 
+    /// Marks a retained batch delivery as uncertain without replaying it.
+    /// Repeated reports for the same retained batch are idempotent; any other
+    /// ID fails closed. The boolean result identifies the first failure report
+    /// independently of cancellation caused by another safety transition.
+    pub(crate) fn fail_inflight_inject_batch(
+        &self,
+        batch_id: u64,
+    ) -> Result<(InputBrokerInjectBatch, bool), &'static str> {
+        if batch_id == 0 {
+            return Err("failed inject batch id must be non-zero");
+        }
+        let mut inner = self.lock();
+        let Some(batch) = inner.inflight_inject_batch.as_mut() else {
+            return Err("failed inject batch is not in flight");
+        };
+        if batch.batch_id != batch_id {
+            return Err("failed inject batch id does not match the in-flight batch");
+        }
+        let first_report = !batch.delivery_uncertain_reported;
+        batch.cancelled = true;
+        batch.delivery_uncertain_reported = true;
+        Ok((batch.clone(), first_report))
+    }
+
     pub(crate) fn take_inflight_inject_frames(&self) -> Vec<PendingInjectInputFrame> {
         self.lock()
             .inflight_inject_batch
@@ -480,6 +582,33 @@ impl InputBrokerRelay {
             .filter(|batch| !batch.cancelled)
             .map(|batch| batch.frames)
             .unwrap_or_default()
+    }
+}
+
+fn normalize_elevated_injector_status(
+    state: &str,
+    reason: &str,
+    signature_trust: &str,
+) -> ElevatedInjectorStatus {
+    if state.trim().is_empty() && reason.trim().is_empty() && signature_trust.trim().is_empty() {
+        return ElevatedInjectorStatus::default();
+    }
+    ElevatedInjectorStatus {
+        state: normalize_vocabulary_value(state, ELEVATED_INJECTOR_STATES),
+        reason: normalize_vocabulary_value(reason, ELEVATED_INJECTOR_REASONS),
+        signature_trust: normalize_vocabulary_value(
+            signature_trust,
+            ELEVATED_INJECTOR_SIGNATURE_TRUST,
+        ),
+    }
+}
+
+fn normalize_vocabulary_value(value: &str, allowed: &[&str]) -> String {
+    let normalized = value.trim();
+    if allowed.contains(&normalized) {
+        normalized.to_string()
+    } else {
+        "unknown".to_string()
     }
 }
 

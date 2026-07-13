@@ -253,6 +253,9 @@ pub(crate) struct ControlPlaneSnapshotBundle {
     pub(crate) clipboard_backend_mode: String,
     pub(crate) pending_inject_frames: usize,
     pub(crate) pending_inject_high_water: usize,
+    pub(crate) elevated_injector_state: String,
+    pub(crate) elevated_injector_reason: String,
+    pub(crate) elevated_injector_signature_trust: String,
     pub(crate) file_transfers: Vec<FileTransferRecord>,
 }
 

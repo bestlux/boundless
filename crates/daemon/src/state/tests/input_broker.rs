@@ -1110,6 +1110,217 @@ async fn inject_batch_backpressure_preserves_fifo_until_exact_ack() {
 }
 
 #[tokio::test]
+async fn elevated_injector_status_is_normalized_and_logged_only_on_transition() {
+    let (state, root) = service_mode_broker_state("boundless-elevated-injector-status-test").await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+
+    let initial = state.input_broker_relay().elevated_injector_status();
+    assert_eq!(initial.state, "off");
+    assert_eq!(initial.reason, "none");
+    assert_eq!(initial.signature_trust, "unknown");
+
+    let active_observation = InputBrokerExchangeObservations {
+        elevated_injector_state: "active".to_string(),
+        elevated_injector_reason: "none".to_string(),
+        elevated_injector_signature_trust: "unsigned_dogfood".to_string(),
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        let outcome = state
+            .exchange_input_broker(
+                allowed_client(),
+                &attach.broker_token,
+                active_observation.clone(),
+            )
+            .await;
+        assert!(outcome.accepted);
+    }
+
+    let active = state.input_broker_relay().elevated_injector_status();
+    assert_eq!(active.state, "active");
+    assert_eq!(active.reason, "none");
+    assert_eq!(active.signature_trust, "unsigned_dogfood");
+    let active_bundle = state.control_plane_snapshot_bundle().await;
+    assert_eq!(active_bundle.elevated_injector_state, "active");
+    assert_eq!(active_bundle.elevated_injector_reason, "none");
+    assert_eq!(
+        active_bundle.elevated_injector_signature_trust,
+        "unsigned_dogfood"
+    );
+    let active_events = state
+        .transport_events()
+        .await
+        .into_iter()
+        .filter(|event| event.kind == "elevated_injector_status_changed")
+        .collect::<Vec<_>>();
+    assert_eq!(active_events.len(), 1);
+    assert_eq!(
+        active_events[0].detail,
+        "state=active reason=none signature_trust=unsigned_dogfood"
+    );
+
+    let unknown = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                elevated_injector_state: "future-state".to_string(),
+                elevated_injector_reason: "future-reason".to_string(),
+                elevated_injector_signature_trust: "future-trust".to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(unknown.accepted);
+    let unknown_status = state.input_broker_relay().elevated_injector_status();
+    assert_eq!(unknown_status.state, "unknown");
+    assert_eq!(unknown_status.reason, "unknown");
+    assert_eq!(unknown_status.signature_trust, "unknown");
+    let status_events = state
+        .transport_events()
+        .await
+        .into_iter()
+        .filter(|event| event.kind == "elevated_injector_status_changed")
+        .collect::<Vec<_>>();
+    assert_eq!(status_events.len(), 2);
+    assert_eq!(
+        status_events[1].detail,
+        "state=unknown reason=unknown signature_trust=unknown"
+    );
+    assert!(!status_events[1].detail.contains("future"));
+
+    state.input_broker_relay().expire_attachment_for_test();
+    let stale = state.input_broker_relay().elevated_injector_status();
+    assert_eq!(stale.state, "off");
+    assert_eq!(stale.reason, "none");
+    assert_eq!(stale.signature_trust, "unknown");
+    let stale_bundle = state.control_plane_snapshot_bundle().await;
+    assert_eq!(stale_bundle.elevated_injector_state, "off");
+    assert_eq!(stale_bundle.elevated_injector_reason, "none");
+    assert_eq!(stale_bundle.elevated_injector_signature_trust, "unknown");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn failed_inject_batch_is_cancelled_without_replay_and_mismatch_fails_closed() {
+    let (state, root) =
+        service_mode_broker_state("boundless-elevated-injector-failed-batch-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("claim owner")
+    );
+    state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id,
+                sequence: 1,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::Key {
+                    scan_code: 30,
+                    state: KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
+                }],
+            },
+        )
+        .await
+        .expect("route frame");
+
+    let dispatched = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert!(dispatched.accepted);
+    assert_ne!(dispatched.inject_batch_id, 0);
+    assert_eq!(dispatched.inject_frames.len(), 1);
+
+    let mismatch = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                failed_inject_batch_id: dispatched.inject_batch_id + 1,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(!mismatch.accepted);
+    assert!(mismatch.message.contains("does not match"));
+
+    let failure_observation = InputBrokerExchangeObservations {
+        failed_inject_batch_id: dispatched.inject_batch_id,
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        let cancelled = state
+            .exchange_input_broker(
+                allowed_client(),
+                &attach.broker_token,
+                failure_observation.clone(),
+            )
+            .await;
+        assert!(cancelled.accepted);
+        assert_eq!(cancelled.inject_batch_id, dispatched.inject_batch_id);
+        assert!(cancelled.inject_batch_cancelled);
+        assert!(cancelled.inject_frames.is_empty());
+    }
+
+    let delivery_events = state
+        .transport_events()
+        .await
+        .into_iter()
+        .filter(|event| event.kind == "elevated_injector_delivery_uncertain")
+        .collect::<Vec<_>>();
+    assert_eq!(delivery_events.len(), 1);
+    assert!(
+        delivery_events[0]
+            .detail
+            .contains("reason=delivery_uncertain")
+    );
+    assert!(
+        delivery_events[0]
+            .detail
+            .contains(&format!("batch_id={}", dispatched.inject_batch_id))
+    );
+
+    let acknowledged = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                acked_inject_batch_id: dispatched.inject_batch_id,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(acknowledged.accepted);
+    assert_eq!(acknowledged.inject_batch_id, 0);
+    assert!(acknowledged.inject_frames.is_empty());
+
+    let no_longer_inflight = state
+        .exchange_input_broker(allowed_client(), &attach.broker_token, failure_observation)
+        .await;
+    assert!(!no_longer_inflight.accepted);
+    assert!(no_longer_inflight.message.contains("not in flight"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn retained_inject_batch_cancellation_replays_until_ack_and_unblocks_later_work() {
     let (state, root) = service_mode_broker_state("boundless-broker-inject-cancel-test").await;
     let peer_id = join_connected_peer(&state).await;

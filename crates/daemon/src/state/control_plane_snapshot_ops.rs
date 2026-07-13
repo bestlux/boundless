@@ -42,6 +42,7 @@ impl AppState {
 
         let (input_locked, input_lock_supported) = input_lock_runtime;
         let (pending_inject_frames, pending_inject_high_water) = pending_inject_stats;
+        let elevated_injector_status = self.input_broker.elevated_injector_status();
         let active_input_capture_target_peer_id =
             if input_capture_backend_mode == "service_session_unsupported" {
                 None
@@ -73,6 +74,9 @@ impl AppState {
             clipboard_backend_mode: clipboard_backend_mode.to_string(),
             pending_inject_frames,
             pending_inject_high_water,
+            elevated_injector_state: elevated_injector_status.state,
+            elevated_injector_reason: elevated_injector_status.reason,
+            elevated_injector_signature_trust: elevated_injector_status.signature_trust,
             file_transfers,
         }
     }

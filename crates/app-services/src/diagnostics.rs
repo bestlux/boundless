@@ -10,7 +10,7 @@ use core_clipboard::sanitize_clipboard_event_output_detail;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::queries::{ConsoleSnapshot, TransportEventSnapshot};
+use crate::queries::{ConsoleSnapshot, InputRuntimeSnapshot, TransportEventSnapshot};
 
 const REDACTED_SECRET: &str = "[redacted-secret]";
 const REDACTED_ID: &str = "[redacted-id]";
@@ -160,16 +160,7 @@ pub fn build_online_bundle(
             "input_locked": snapshot.status.input_locked,
             "input_lock_supported": snapshot.status.input_lock_supported,
             "anti_idle": snapshot.anti_idle_status,
-            "input_runtime": {
-                "owner_peer_id": snapshot.input_runtime.owner_peer_id.map(|id| redaction.pseudonymize_identifier(&id)),
-                "configured_capture_target_peer_id": snapshot.input_runtime.configured_capture_target_peer_id.map(|id| redaction.pseudonymize_identifier(&id)),
-                "active_capture_target_peer_id": snapshot.input_runtime.active_capture_target_peer_id.map(|id| redaction.pseudonymize_identifier(&id)),
-                "lock_active": snapshot.input_runtime.lock_active,
-                "lock_supported": snapshot.input_runtime.lock_supported,
-                "capture_backend_mode": snapshot.input_runtime.capture_backend_mode,
-                "pending_inject_frames": snapshot.input_runtime.pending_inject_frames,
-                "pending_inject_high_water": snapshot.input_runtime.pending_inject_high_water,
-            },
+            "input_runtime": input_runtime_diagnostics(snapshot.input_runtime, &mut redaction),
             "clipboard_runtime": {
                 "backend_mode": snapshot.clipboard_runtime.backend_mode,
             },
@@ -199,6 +190,25 @@ pub fn build_online_bundle(
         "recent_transfer_states": recent_transfer_states,
         "recent_events": recent_events,
         "offline_notes": [],
+    })
+}
+
+fn input_runtime_diagnostics(
+    snapshot: InputRuntimeSnapshot,
+    redaction: &mut RedactionContext,
+) -> Value {
+    json!({
+        "owner_peer_id": snapshot.owner_peer_id.map(|id| redaction.pseudonymize_identifier(&id)),
+        "configured_capture_target_peer_id": snapshot.configured_capture_target_peer_id.map(|id| redaction.pseudonymize_identifier(&id)),
+        "active_capture_target_peer_id": snapshot.active_capture_target_peer_id.map(|id| redaction.pseudonymize_identifier(&id)),
+        "lock_active": snapshot.lock_active,
+        "lock_supported": snapshot.lock_supported,
+        "capture_backend_mode": snapshot.capture_backend_mode,
+        "pending_inject_frames": snapshot.pending_inject_frames,
+        "pending_inject_high_water": snapshot.pending_inject_high_water,
+        "elevated_injector_state": snapshot.elevated_injector_state,
+        "elevated_injector_reason": snapshot.elevated_injector_reason,
+        "elevated_injector_signature_trust": snapshot.elevated_injector_signature_trust,
     })
 }
 
@@ -989,6 +999,31 @@ fn looks_like_clipboard_secret(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_runtime_diagnostics_include_content_free_elevated_injector_status() {
+        let diagnostics = input_runtime_diagnostics(
+            InputRuntimeSnapshot {
+                owner_peer_id: Some("peer-secret".to_string()),
+                configured_capture_target_peer_id: None,
+                active_capture_target_peer_id: None,
+                lock_active: false,
+                lock_supported: true,
+                capture_backend_mode: "user_session_broker".to_string(),
+                pending_inject_frames: 0,
+                pending_inject_high_water: 1,
+                elevated_injector_state: "unavailable".to_string(),
+                elevated_injector_reason: "identity_rejected".to_string(),
+                elevated_injector_signature_trust: "invalid".to_string(),
+            },
+            &mut RedactionContext::default(),
+        );
+
+        assert_eq!(diagnostics["elevated_injector_state"], "unavailable");
+        assert_eq!(diagnostics["elevated_injector_reason"], "identity_rejected");
+        assert_eq!(diagnostics["elevated_injector_signature_trust"], "invalid");
+        assert_eq!(diagnostics["owner_peer_id"], "peer-1");
+    }
 
     #[test]
     fn port_listener_rows_parse_ipv4_ipv6_and_classify_owners() {

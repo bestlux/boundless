@@ -1787,12 +1787,33 @@ pub(super) async fn input_owner(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
-fn none_if_empty(value: String) -> String {
-    if value.is_empty() {
-        "none".to_string()
-    } else {
-        value
-    }
+fn none_if_empty(value: &str) -> &str {
+    if value.is_empty() { "none" } else { value }
+}
+
+fn format_input_status_line(
+    runtime: &InputRuntimeStatusReply,
+    handoff: &InputHandoffConfigReply,
+) -> String {
+    format!(
+        "owner={} configured_capture_target={} active_capture_target={} lock_active={} lock_supported={} capture_backend_mode={} pending_inject_frames={} pending_inject_high_water={} elevated_injector_state={} elevated_injector_reason={} elevated_injector_signature_trust={} block_screen_corners={} corner_block_px={} relative_mouse={} hide_cursor_at_edge={} draw_cursor_marker={}",
+        none_if_empty(&runtime.owner_peer_id),
+        none_if_empty(&runtime.configured_capture_target_peer_id),
+        none_if_empty(&runtime.active_capture_target_peer_id),
+        runtime.lock_active,
+        runtime.lock_supported,
+        none_if_empty(&runtime.capture_backend_mode),
+        runtime.pending_inject_frames,
+        runtime.pending_inject_high_water,
+        none_if_empty(&runtime.elevated_injector_state),
+        none_if_empty(&runtime.elevated_injector_reason),
+        none_if_empty(&runtime.elevated_injector_signature_trust),
+        handoff.block_screen_corners,
+        handoff.corner_block_px,
+        handoff.relative_mouse,
+        handoff.hide_cursor_at_edge,
+        handoff.draw_cursor_marker,
+    )
 }
 
 pub(super) async fn input_status(endpoint: &str) -> Result<()> {
@@ -1800,26 +1821,7 @@ pub(super) async fn input_status(endpoint: &str) -> Result<()> {
     let snapshot = client.get_console_snapshot(Empty {}).await?.into_inner();
     let runtime = snapshot.input_runtime.unwrap_or_default();
     let handoff = snapshot.input_handoff_config.unwrap_or_default();
-    let owner = none_if_empty(runtime.owner_peer_id);
-    let configured_target = none_if_empty(runtime.configured_capture_target_peer_id);
-    let active_target = none_if_empty(runtime.active_capture_target_peer_id);
-
-    println!(
-        "owner={} configured_capture_target={} active_capture_target={} lock_active={} lock_supported={} capture_backend_mode={} pending_inject_frames={} pending_inject_high_water={} block_screen_corners={} corner_block_px={} relative_mouse={} hide_cursor_at_edge={} draw_cursor_marker={}",
-        owner,
-        configured_target,
-        active_target,
-        runtime.lock_active,
-        runtime.lock_supported,
-        none_if_empty(runtime.capture_backend_mode),
-        runtime.pending_inject_frames,
-        runtime.pending_inject_high_water,
-        handoff.block_screen_corners,
-        handoff.corner_block_px,
-        handoff.relative_mouse,
-        handoff.hide_cursor_at_edge,
-        handoff.draw_cursor_marker,
-    );
+    println!("{}", format_input_status_line(&runtime, &handoff));
     Ok(())
 }
 
@@ -2768,6 +2770,21 @@ fn prompt_u16_with_default(label: &str, default: u16) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_status_output_includes_elevated_injector_status() {
+        let runtime = InputRuntimeStatusReply {
+            elevated_injector_state: "active".to_string(),
+            elevated_injector_reason: "none".to_string(),
+            elevated_injector_signature_trust: "unsigned_dogfood".to_string(),
+            ..Default::default()
+        };
+        let line = format_input_status_line(&runtime, &InputHandoffConfigReply::default());
+
+        assert!(line.contains("elevated_injector_state=active"));
+        assert!(line.contains("elevated_injector_reason=none"));
+        assert!(line.contains("elevated_injector_signature_trust=unsigned_dogfood"));
+    }
 
     fn local_tokens() -> LocalLayoutTokens {
         LocalLayoutTokens {

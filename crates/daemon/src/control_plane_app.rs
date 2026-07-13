@@ -598,11 +598,15 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
                     inject_failure_count: command.inject_failure_count,
                     inject_backpressure: command.inject_backpressure,
                     acked_inject_batch_id: command.acked_inject_batch_id,
+                    failed_inject_batch_id: command.failed_inject_batch_id,
                     held_input_authorization_generation: command
                         .held_input_authorization_generation,
                     raw_device_wheel_event_count: command.raw_device_wheel_event_count,
                     raw_system_wheel_event_count: command.raw_system_wheel_event_count,
                     hook_wheel_event_count: command.hook_wheel_event_count,
+                    elevated_injector_state: command.elevated_injector_state,
+                    elevated_injector_reason: command.elevated_injector_reason,
+                    elevated_injector_signature_trust: command.elevated_injector_signature_trust,
                 },
             )
             .await;
@@ -1063,6 +1067,9 @@ fn build_input_runtime_snapshot(
         capture_backend_mode: bundle.input_capture_backend_mode.clone(),
         pending_inject_frames: bundle.pending_inject_frames,
         pending_inject_high_water: bundle.pending_inject_high_water,
+        elevated_injector_state: bundle.elevated_injector_state.clone(),
+        elevated_injector_reason: bundle.elevated_injector_reason.clone(),
+        elevated_injector_signature_trust: bundle.elevated_injector_signature_trust.clone(),
     }
 }
 

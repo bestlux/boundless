@@ -66,10 +66,14 @@ pub struct InputBrokerExchangeObservations {
     pub inject_failure_count: u32,
     pub inject_backpressure: bool,
     pub acked_inject_batch_id: u64,
+    pub failed_inject_batch_id: u64,
     pub held_input_authorization_generation: u64,
     pub raw_device_wheel_event_count: u32,
     pub raw_system_wheel_event_count: u32,
     pub hook_wheel_event_count: u32,
+    pub elevated_injector_state: String,
+    pub elevated_injector_reason: String,
+    pub elevated_injector_signature_trust: String,
 }
 
 /// Identity of the caller as verified by the transport layer (named-pipe
@@ -519,6 +523,23 @@ impl AppState {
                 ..Default::default()
             };
         }
+        if let Some(status) = self.input_broker.observe_elevated_injector_status(
+            &observations.elevated_injector_state,
+            &observations.elevated_injector_reason,
+            &observations.elevated_injector_signature_trust,
+        ) {
+            self.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: "local".to_string(),
+                kind: "elevated_injector_status_changed".to_string(),
+                peer_id: "none".to_string(),
+                detail: format!(
+                    "state={} reason={} signature_trust={}",
+                    status.state, status.reason, status.signature_trust
+                ),
+                size_bytes: 0,
+            });
+        }
         if observations.inject_failure_count > 0 {
             self.record_transport_event(TransportEventRecord {
                 timestamp: Utc::now(),
@@ -597,6 +618,47 @@ impl AppState {
         }
 
         let inflight_before_ack = self.input_broker.inflight_inject_batch();
+        if observations.failed_inject_batch_id != 0 && observations.acked_inject_batch_id != 0 {
+            return InputBrokerExchangeOutcome {
+                accepted: false,
+                message:
+                    "input broker cannot acknowledge and fail an inject batch in the same exchange"
+                        .to_string(),
+                ..Default::default()
+            };
+        }
+
+        if observations.failed_inject_batch_id != 0 {
+            match self
+                .input_broker
+                .fail_inflight_inject_batch(observations.failed_inject_batch_id)
+            {
+                Ok((batch, first_report)) => {
+                    if first_report {
+                        self.record_transport_event(TransportEventRecord {
+                            timestamp: Utc::now(),
+                            direction: "local".to_string(),
+                            kind: "elevated_injector_delivery_uncertain".to_string(),
+                            peer_id: "none".to_string(),
+                            detail: format!(
+                                "reason=delivery_uncertain batch_id={} frame_count={}",
+                                batch.batch_id,
+                                batch.frames.len()
+                            ),
+                            size_bytes: batch.frames.len() as u64,
+                        });
+                    }
+                }
+                Err(reason) => {
+                    return InputBrokerExchangeOutcome {
+                        accepted: false,
+                        message: format!("input broker inject failure report rejected: {reason}"),
+                        ..Default::default()
+                    };
+                }
+            }
+        }
+
         if observations.inject_backpressure && inflight_before_ack.is_none() {
             return InputBrokerExchangeOutcome {
                 accepted: false,
