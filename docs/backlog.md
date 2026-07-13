@@ -296,6 +296,45 @@ BND-NEXT-34 owns durable bounded stage counters. This story may use temporary ta
 
 ---
 
+## BND-NEXT-44 (P0, target v5.0.15; capability blocked on signing): Control ordinary elevated applications without elevating the tray
+
+**Category:** bug
+
+Status: ready for a bounded mechanism/signing proof, followed by implementation. This is the ordinary elevated-window slice of the older BND-NEXT-9C parity gap. Shipping or claiming this capability is blocked until Boundless has a trusted Windows code-signing identity and records an explicit product-policy decision for UIAccess; unrelated v5.0.15 fixes may still release with the limitation clearly reported. The published v5.0.14 MSI is unsigned, its release logs show signing was skipped, and no `WINDOWS_SIGN_*` repository variables are configured.
+
+### Context and evidence
+
+The user cannot interact with a peer while the peer's focused application is running as Administrator, including an elevated terminal or IDE. Mouse and keyboard control appear unavailable until focus returns to a normal-integrity window, so the user must reach for the peer's physical hardware. The current service-mode path intentionally runs capture and `SendInput` injection inside the normal user-session tray broker and documents support for the normal unlocked desktop only. Windows UIPI blocks that medium-integrity process from injecting into a high-integrity foreground process.
+
+Elevating the entire tray is not an acceptable fix. It would give the dashboard, clipboard handling, update/service controls, and other broad UI code an administrator token, complicate sign-in startup, and introduce recurring UAC or scheduled-task behavior. A manifest-only `uiAccess=true` change is also insufficient: Windows requires the UIAccess executable to be trusted-signed and installed in a protected location such as Program Files. Microsoft formally scopes UIAccess to assistive-technology scenarios and documents that a non-administrator user's medium-plus UIAccess token still cannot drive high-integrity applications, so the mechanism must be proven and policy-reviewed for Boundless's split-token administrator dogfood case before it becomes the product contract.
+
+### Implementation slices
+
+1. **44A — sign and prove the elevation mechanism.** Configure a trusted Authenticode identity, build a minimal Program Files-installed proof helper, and measure its actual token/injection behavior on the supported Windows versions. Prefer `uiAccess=true` only if a written product-policy review accepts that use and the split-token administrator dogfood case reaches same-user elevated Terminal/IDE windows without elevating the tray. Record standard-user-to-alternate-admin as unsupported unless separately proven. If UIAccess is rejected, the fallback is still a dedicated `requireAdministrator` input helper launched only by an explicit user action with one cancellable UAC consent—not an elevated tray, automatic sign-in prompt, retry-on-crash prompt, or LocalSystem-spawned interactive process.
+2. **44B — deepen the injector module.** Move only incoming `SendInput` injection and remote held-input cleanup into the small dedicated user-session executable. Keep physical input capture, edge lock/emergency detection, clipboard observation/parsing, network, peer trust, routing, settings, updates, and dashboard ownership in the unelevated tray/service boundaries unless 44A proves a specific Windows constraint that requires a narrowly reviewed exception. Give the privileged channel a minimal input-record/release contract rather than a general-purpose command surface. Bind it server-side to the actual connecting process token, PID/session, canonical MSI-owned image path, trusted Authenticode chain/publisher, and an unguessable per-launch attachment handshake; never authorize from client-reported identity alone.
+3. **44C — package and prove the installed lifecycle.** Install the injector only under `%ProgramFiles%\Boundless`, sign it before MSI creation, and own at most one injector alongside exactly one existing tray broker per allowed interactive user session. Give the tray-broker lease and injector attachment distinct identities and teardown rules. Tray launch, replacement, Quit, service restart, upgrade, session disconnect, and injector crash must preserve BND-NEXT-31 lifecycle and BND-NEXT-38 fail-open behavior. Report active, unsigned/misinstalled, wrong desktop/session, and unhealthy states truthfully. Make manifest, signature, protected path, token capability, and elevated-window smoke hard stable-release gates whenever the feature is enabled.
+
+### Acceptance criteria
+
+- From either dogfood PC's split-token administrator account, remote mouse movement, clicks, wheel/trackpad input, normal typing, shortcuts, and numpad input work in same-user Administrator-launched Terminal, IDE, Task Manager, and simple test windows on the other PC.
+- The tray remains at the user's normal integrity level and never gains an administrator token or a highest-privilege scheduled task. An accepted UIAccess path starts without UAC; a high-integrity fallback presents at most one explicit, cancellable UAC prompt for the injector alone and reports cancellation without retrying.
+- Runtime evidence confirms the dedicated injector's effective integrity/elevation mechanism, expected allowed-user SID/session, trusted signature, and executable path under the MSI-owned Program Files directory. A UIAccess implementation specifically proves `TokenUIAccess=1`; a high-integrity fallback explicitly acknowledges its full administrator token and proves the executable exposes and uses only the minimal injection-and-release surface.
+- An unsigned, tampered, user-writable, wrong-publisher, wrong-user, wrong-session, duplicate, stale, or handshake-mismatched injector/client is rejected or reported unavailable without degrading normal-window input or spawning a retry storm. Tests prove identity is derived from the actual pipe/process/token/image, not request fields.
+- Emergency Double-Control, tray-broker lease expiry, injector attachment loss, input disable/re-enable, Quit/relaunch, service restart, and upgrade all release held input and recover the next normal or elevated-window handoff.
+- The UAC consent/credential screen, Windows lock screen, Winlogon desktop, and other user sessions are never presented as supported. Encountering a desktop boundary fails open to local control and records one bounded, content-free reason.
+- A true standard-user source or target that supplies alternate administrator credentials is reported unsupported unless a separate matrix proves it; passing the split-token administrator dogfood case must not broaden the public claim.
+- A high-integrity fallback never produces unsolicited UAC at sign-in, tray relaunch, injector crash, service restart, or automatic retry. Declining or cancelling elevation latches the capability unavailable until the user explicitly asks again, while normal-window input remains available.
+- Installer and release validation prove manifest intent, Authenticode trust, protected install location, one-tray-broker/at-most-one-injector lifecycle, distinct leases, token capability, elevated-window injection, clean repair/upgrade/uninstall, and accurate degraded-state reporting.
+- The installed two-PC matrix passes in both directions with a normal target window, an Administrator-launched target window, and a return to the normal desktop after a UAC prompt is completed locally.
+
+### Dependencies and scope boundary
+
+Depends on configuring a trusted Windows signing certificate and making the privileged injector signature mandatory before BND-NEXT-44 can ship or be claimed in a stable release, plus a written decision that the selected mechanism is acceptable for Boundless. Reuse BND-NEXT-31 for tray-broker single-owner lifecycle, BND-NEXT-38 for fail-open recovery, and BND-NEXT-34 for bounded capability/failure telemetry; BND-NEXT-44 separately owns injector attachment/lifecycle.
+
+Do not elevate the whole tray or daemon, have LocalSystem silently spawn a high/System interactive helper, add a generic remote-administration channel, bypass UAC, inject into the secure desktop, change UAC policy, control the lock screen, or broaden access beyond the MSI-selected allowed user and current interactive session. Those secure-desktop/Winlogon claims remain a separate evidence and security-design slice under BND-NEXT-9C.
+
+---
+
 ## BND-NEXT-40 (P1, v5.0.14 candidate needs physical evidence): Preserve numeric-keypad and Num Lock semantics across handoff
 
 **Category:** bug
@@ -697,5 +736,5 @@ Do not start before the P0/P1 stories above land; write the full implementation 
 ## Deliberately not in this backlog
 
 - Relay/cloud transport, QUIC/iroh/libp2p migrations: the 2026-07-07 evidence shows direct TCP with role reversal satisfies the LAN dogfood; revisit only per the decision gates in the one-sided-reachability doc.
-- Clipboard image streaming/spooling, lock-screen/elevated-app service parity, mixed-DPI matrix: tracked as explicit gaps in [project-status.md](project-status.md); they need dedicated evidence-driven slices, not backlog stubs.
+- Clipboard image streaming/spooling, secure-desktop/lock-screen control beyond BND-NEXT-44, and the mixed-DPI matrix: tracked as explicit gaps in [project-status.md](project-status.md); they need dedicated evidence-driven slices, not backlog stubs.
 - Broader file-transfer UX beyond BND-NEXT-36’s one-file tracer bullet: folders, multiple files, network paths, resumable transfer, and richer shell integration remain deferred until the P0/P1 clipboard and broker work is proven.

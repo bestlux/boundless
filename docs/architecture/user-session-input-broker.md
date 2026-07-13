@@ -1,8 +1,10 @@
 # User-Session Broker
 
 Status: MVP for normal unlocked-desktop input and clipboard in service mode.
-This is not a BND-NEXT-9C claim: lock screen, secure desktop, UAC prompts,
-elevated apps, and other users' sessions remain unsupported and unvalidated.
+This is not a BND-NEXT-9C claim: lock screen, secure desktop, UAC prompts, and
+other users' sessions remain unsupported and unvalidated. Ordinary elevated
+applications are a narrower planned exception under BND-NEXT-44; they are not
+supported by the current tray broker.
 
 ## Problem
 
@@ -22,8 +24,18 @@ new helper binary:
 - The service named pipe ACL (SYSTEM, Administrators, and exactly one allowed
   user SID) is the trust boundary to preserve; the broker rides it and adds no
   new socket, ACL surface, firewall rule, or transport.
-- A separate helper would need installer, lifecycle, and packaging work without
-  changing the security shape.
+- For the normal desktop, a separate helper would add installer, lifecycle, and
+  packaging work without improving this security shape.
+
+BND-NEXT-44 is the deliberate exception for ordinary elevated windows. It plans
+a separately signed Program Files injector because that process has a different
+Windows token/security shape. The existing tray broker remains concurrently
+responsible for physical capture, edge lock/emergency detection, clipboard, and
+normal service exchange. Only incoming injection records and held-input cleanup
+cross the new narrow channel. The tray-broker lease and injector attachment are
+distinct; the privileged side authenticates the actual connecting PID, token,
+session, canonical signed image/publisher, and per-launch handshake rather than
+client-reported identity.
 
 The LocalSystem service remains the trust, pairing, routing, layout, clipboard
 sync, and network authority. The broker is deliberately dumb: capture hands,

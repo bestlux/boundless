@@ -57,7 +57,8 @@ service lifecycle path:
 `docs/user/service-mode.md` and `docs/release/v5-release-hardening.md` record
 the present limit: service lifecycle is MSI-owned, while tray sign-in startup,
 automatic intended-user SID selection, deeper N-1/repair evidence, and
-lock-screen/elevated-app parity remain follow-up work.
+interactive-desktop parity remain follow-up work. BND-NEXT-44 owns ordinary
+elevated applications; secure-desktop and lock-screen claims remain under 9C.
 
 ## Target Installer Shape
 
@@ -74,8 +75,8 @@ The full-capability MSI should:
 - start the tray at sign-in for the selected desktop user;
 - keep service/tray update application MSI-owned, with no service or tray
   self-updater;
-- avoid lock-screen, secure desktop, or elevated-app claims until BND-NEXT-9C
-  proves them on Windows.
+- avoid secure-desktop or lock-screen claims until BND-NEXT-9C proves them on
+  Windows; ordinary elevated-app support is the narrower BND-NEXT-44 slice.
 
 ## WiX Delta
 
@@ -229,13 +230,15 @@ validated:
 - `scripts/dev/service-smoke.ps1` or an installer-owned variant proves pipe ACL,
   daemon API health, version parity, process cleanup, and service removal.
 
-9C remains separate:
+Interactive-desktop parity remains separate from MSI service ownership:
 
-- cold-boot service availability;
-- elevated-app behavior;
-- lock-screen and secure-desktop behavior;
-- any service-to-session broker or UIAccess helper required by Windows session
-  isolation.
+- BND-NEXT-44 owns ordinary elevated-app behavior through a minimal signed
+  user-session input injector installed under Program Files, after a UIAccess
+  versus explicit-elevation security and product-policy proof; physical capture
+  and clipboard handling remain unelevated;
+- cold-boot service availability remains independent lifecycle evidence;
+- BND-NEXT-9C retains lock-screen, Winlogon, and secure-desktop behavior after
+  the ordinary elevated-window slice is proven.
 
 ## Follow-Up Slices
 
@@ -246,8 +249,14 @@ payload install/uninstall evidence.
 9B-3: add MSI-owned `BoundlessService` registration/autostart, allowed-user SID
 selection, service lifecycle validation, and release-readiness evidence.
 
-9C: prove or falsify lock-screen, secure desktop, and elevated-app control on
-real Windows desktops before changing parity claims.
+BND-NEXT-44: implement and validate ordinary elevated-application control through a
+minimal-surface, signed Program Files input injector without elevating the tray
+or its capture and clipboard responsibilities. UIAccess is the preferred
+lower-privilege mechanism if policy-approved and proven; a `requireAdministrator`
+fallback carries a full administrator token despite its narrow interface.
+
+9C: separately prove or falsify lock-screen, Winlogon, and secure-desktop
+control on real Windows desktops before changing those parity claims.
 
 ## References
 
