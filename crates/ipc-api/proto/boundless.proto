@@ -203,6 +203,9 @@ message InputRuntimeStatusReply {
   string capture_backend_mode = 6;
   uint32 pending_inject_frames = 7;
   uint32 pending_inject_high_water = 8;
+  string elevated_injector_state = 9;
+  string elevated_injector_reason = 10;
+  string elevated_injector_signature_trust = 11;
 }
 
 message ClipboardRuntimeStatusReply {
@@ -488,6 +491,10 @@ message InputBrokerExchangeRequest {
   bool inject_backpressure = 23;
   uint64 acked_inject_batch_id = 24;
   uint64 held_input_authorization_generation = 25;
+  string elevated_injector_state = 26;
+  string elevated_injector_reason = 27;
+  string elevated_injector_signature_trust = 28;
+  uint64 failed_inject_batch_id = 29;
 }
 
 message InputBrokerInjectFrame {
@@ -507,6 +514,93 @@ message InputBrokerExchangeReply {
   bool inject_batch_cancelled = 8;
   uint64 inject_authorization_generation = 9;
   bool held_input_authorized = 10;
+}
+
+enum InputInjectorState {
+  INPUT_INJECTOR_STATE_UNSPECIFIED = 0;
+  INPUT_INJECTOR_STATE_OFF = 1;
+  INPUT_INJECTOR_STATE_PROMPTING = 2;
+  INPUT_INJECTOR_STATE_READY_PENDING_IDLE = 3;
+  INPUT_INJECTOR_STATE_ACTIVE = 4;
+  INPUT_INJECTOR_STATE_STOPPING = 5;
+  INPUT_INJECTOR_STATE_UNAVAILABLE = 6;
+}
+
+enum InputInjectorReason {
+  INPUT_INJECTOR_REASON_UNSPECIFIED = 0;
+  INPUT_INJECTOR_REASON_NONE = 1;
+  INPUT_INJECTOR_REASON_USER_CANCELLED = 2;
+  INPUT_INJECTOR_REASON_NOT_INSTALLED = 3;
+  INPUT_INJECTOR_REASON_WRONG_PATH = 4;
+  INPUT_INJECTOR_REASON_IDENTITY_REJECTED = 5;
+  INPUT_INJECTOR_REASON_SIGNATURE_INVALID = 6;
+  INPUT_INJECTOR_REASON_DUPLICATE = 7;
+  INPUT_INJECTOR_REASON_PROTOCOL_MISMATCH = 8;
+  INPUT_INJECTOR_REASON_IPC_UNAVAILABLE = 9;
+  INPUT_INJECTOR_REASON_HEARTBEAT_EXPIRED = 10;
+  INPUT_INJECTOR_REASON_PARENT_EXITED = 11;
+  INPUT_INJECTOR_REASON_INJECT_FAILED = 12;
+  INPUT_INJECTOR_REASON_SHUTDOWN_INCOMPLETE = 13;
+}
+
+enum InputInjectorSignatureTrust {
+  INPUT_INJECTOR_SIGNATURE_TRUST_UNSPECIFIED = 0;
+  INPUT_INJECTOR_SIGNATURE_TRUST_VALID = 1;
+  INPUT_INJECTOR_SIGNATURE_TRUST_UNSIGNED_DOGFOOD = 2;
+  INPUT_INJECTOR_SIGNATURE_TRUST_INVALID = 3;
+}
+
+// Compact, content-free capability state suitable for broker telemetry and
+// dashboard rendering. It intentionally carries no paths, SIDs, nonce, token,
+// or error text.
+message InputInjectorStatus {
+  InputInjectorState state = 1;
+  InputInjectorReason reason = 2;
+  InputInjectorSignatureTrust signature_trust = 3;
+  string helper_version = 4;
+}
+
+message InputInjectorAttachRequest {
+  uint32 protocol_revision = 1;
+  string launch_nonce = 2;
+}
+
+message InputInjectorAttachReply {
+  bool accepted = 1;
+  InputInjectorReason reason = 2;
+  uint32 protocol_revision = 3;
+  string attachment_token = 4;
+  string helper_version = 5;
+  InputInjectorSignatureTrust signature_trust = 6;
+}
+
+message InputInjectorApplyRequest {
+  string attachment_token = 1;
+  uint64 operation_id = 2;
+  repeated BrokerInputEvent events = 3;
+}
+
+message InputInjectorApplyReply {
+  bool accepted = 1;
+  InputInjectorReason reason = 2;
+  uint64 operation_id = 3;
+  uint32 committed_event_count = 4;
+  repeated BrokerInputEvent remaining_events = 5;
+  bool replayed = 6;
+}
+
+message InputInjectorHeartbeatRequest {
+  string attachment_token = 1;
+}
+
+message InputInjectorReleaseAndShutdownRequest {
+  string attachment_token = 1;
+}
+
+message InputInjectorControlReply {
+  bool accepted = 1;
+  InputInjectorReason reason = 2;
+  uint32 remaining_held_event_count = 3;
 }
 
 message ClipboardBrokerPayload {
@@ -619,6 +713,15 @@ service ControlPlaneService {
   rpc ExchangeInputBroker(InputBrokerExchangeRequest) returns (InputBrokerExchangeReply);
   rpc ExchangeClipboardBroker(ClipboardBrokerExchangeRequest) returns (ClipboardBrokerExchangeReply);
   rpc DetachInputBroker(InputBrokerDetachRequest) returns (OperationReply);
+}
+
+// Dedicated local-only privileged injection surface. The helper hosts this on
+// its own per-launch named pipe; it is never exposed by the daemon.
+service InputInjectorService {
+  rpc Attach(InputInjectorAttachRequest) returns (InputInjectorAttachReply);
+  rpc Apply(InputInjectorApplyRequest) returns (InputInjectorApplyReply);
+  rpc Heartbeat(InputInjectorHeartbeatRequest) returns (InputInjectorControlReply);
+  rpc ReleaseAndShutdown(InputInjectorReleaseAndShutdownRequest) returns (InputInjectorControlReply);
 }
 
 service PairingService {

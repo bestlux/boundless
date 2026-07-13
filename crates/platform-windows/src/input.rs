@@ -199,6 +199,67 @@ pub struct WindowsInputState {
     num_lock: WindowsNumLockState,
 }
 
+/// Native Windows injector plus the exact successfully committed held-input
+/// ledger. This is the common implementation used by the ordinary tray
+/// adapter and the dedicated elevated helper.
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+pub struct TrackedWindowsInput {
+    windows_input: WindowsInputState,
+    held: core_input::HeldInputState,
+}
+
+#[cfg(windows)]
+impl TrackedWindowsInput {
+    pub fn new(num_lock: WindowsNumLockState) -> Self {
+        Self::with_windows_input(WindowsInputState::new(num_lock))
+    }
+
+    pub fn with_windows_input(windows_input: WindowsInputState) -> Self {
+        Self {
+            windows_input,
+            held: core_input::HeldInputState::default(),
+        }
+    }
+
+    pub fn send_events(&mut self, events: &[InputEvent]) -> InputSendOutcome {
+        let outcome = self.windows_input.send_events(events);
+        let committed = outcome.committed_event_count.min(events.len());
+        self.held.observe(&events[..committed]);
+        outcome
+    }
+
+    pub fn held_down_events(&self) -> Vec<InputEvent> {
+        self.held.held_down_events()
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.held.is_empty() && !self.windows_input.has_pending_native_cleanup()
+    }
+
+    /// Attempts one exact fail-open release pass. Partial native completion is
+    /// retained in the held ledger so a watchdog can retry only what remains.
+    pub fn release_all(&mut self) -> InputSendOutcome {
+        let releases = self.held.release_events();
+        self.send_events(&releases)
+    }
+
+    pub fn has_pending_native_cleanup(&self) -> bool {
+        self.windows_input.has_pending_native_cleanup()
+    }
+
+    #[cfg(test)]
+    fn send_events_with_sender<F>(&mut self, events: &[InputEvent], sender: F) -> InputSendOutcome
+    where
+        F: FnMut(&[INPUT]) -> Result<u32>,
+    {
+        let outcome = self.windows_input.send_events_with_sender(events, sender);
+        let committed = outcome.committed_event_count.min(events.len());
+        self.held.observe(&events[..committed]);
+        outcome
+    }
+}
+
 #[cfg(windows)]
 impl WindowsInputState {
     pub fn new(num_lock: WindowsNumLockState) -> Self {
@@ -1049,7 +1110,7 @@ mod tests {
     #[test]
     fn partial_send_reports_exact_committed_key_prefix_before_mouse_failure() {
         let num_lock = WindowsNumLockState::new(false);
-        let input = WindowsInputState::new(num_lock);
+        let mut input = TrackedWindowsInput::new(num_lock);
         let events = [
             InputEvent::Key {
                 scan_code: 30,
@@ -1083,6 +1144,7 @@ mod tests {
 
         assert_eq!(outcome.committed_event_count, 1);
         assert_eq!(outcome.remaining_events, vec![events[1].clone()]);
+        assert_eq!(input.held_down_events(), vec![events[0].clone()]);
         let error = outcome.error.expect("partial send must preserve its error");
         assert!(format!("{error:#}").contains("scripted mouse injection failure"));
         assert_eq!(calls, 2);

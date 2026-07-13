@@ -9,12 +9,14 @@ use {
     std::{
         future::Future,
         io,
+        os::windows::io::AsRawHandle,
         pin::Pin,
         task::{Context as TaskContext, Poll},
         time::Duration,
     },
     tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient},
     tonic::{codegen::Service, transport::Uri},
+    windows_sys::Win32::{Foundation::HANDLE, System::Pipes::GetNamedPipeServerProcessId},
 };
 
 pub fn default_endpoint() -> String {
@@ -41,6 +43,38 @@ pub async fn channel(endpoint: &str) -> Result<Channel> {
         .connect()
         .await
         .with_context(|| format!("failed to connect to {endpoint}"))
+}
+
+/// Opens a local named-pipe channel only when Windows reports the expected
+/// server process id on the connected pipe handle. This prevents a lower-
+/// integrity pipe squatter from impersonating a just-launched injector.
+#[cfg(windows)]
+pub async fn channel_to_named_pipe_server(
+    endpoint: &str,
+    expected_server_process_id: u32,
+) -> Result<Channel> {
+    let pipe_path = parse_npipe_endpoint(endpoint)?
+        .context("expected a named-pipe endpoint for process-bound channel")?;
+    Endpoint::from_static("http://[::]:50051")
+        .connect_with_connector(NamedPipeConnector::with_expected_server(
+            pipe_path,
+            expected_server_process_id,
+        ))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to connect to named pipe endpoint {endpoint} owned by process {expected_server_process_id}"
+            )
+        })
+}
+
+#[cfg(not(windows))]
+pub async fn channel_to_named_pipe_server(
+    endpoint: &str,
+    expected_server_process_id: u32,
+) -> Result<Channel> {
+    let _ = expected_server_process_id;
+    bail!("process-bound named-pipe endpoint is only supported on Windows: {endpoint}")
 }
 
 pub fn parse_npipe_endpoint(endpoint: &str) -> Result<Option<String>> {
@@ -99,12 +133,23 @@ async fn connect_named_pipe(endpoint: &str, pipe_path: String) -> Result<Channel
 #[derive(Clone)]
 struct NamedPipeConnector {
     pipe_path: String,
+    expected_server_process_id: Option<u32>,
 }
 
 #[cfg(windows)]
 impl NamedPipeConnector {
     fn new(pipe_path: String) -> Self {
-        Self { pipe_path }
+        Self {
+            pipe_path,
+            expected_server_process_id: None,
+        }
+    }
+
+    fn with_expected_server(pipe_path: String, process_id: u32) -> Self {
+        Self {
+            pipe_path,
+            expected_server_process_id: Some(process_id),
+        }
     }
 }
 
@@ -120,11 +165,36 @@ impl Service<Uri> for NamedPipeConnector {
 
     fn call(&mut self, _req: Uri) -> Self::Future {
         let pipe_path = self.pipe_path.clone();
+        let expected_server_process_id = self.expected_server_process_id;
         Box::pin(async move {
             let client = open_named_pipe_with_retry(pipe_path).await?;
+            if let Some(expected) = expected_server_process_id {
+                verify_named_pipe_server_process(&client, expected)?;
+            }
             Ok(TokioIo::new(client))
         })
     }
+}
+
+#[cfg(windows)]
+fn verify_named_pipe_server_process(
+    client: &NamedPipeClient,
+    expected_server_process_id: u32,
+) -> io::Result<()> {
+    let mut actual = 0u32;
+    let handle = client.as_raw_handle() as HANDLE;
+    if unsafe { GetNamedPipeServerProcessId(handle, &mut actual) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if actual != expected_server_process_id {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "named-pipe server process mismatch: actual={actual} expected={expected_server_process_id}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
