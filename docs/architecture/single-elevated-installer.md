@@ -60,6 +60,33 @@ automatic intended-user SID selection, deeper N-1/repair evidence, and
 interactive-desktop parity remain follow-up work. BND-NEXT-44 owns ordinary
 elevated applications; secure-desktop and lock-screen claims remain under 9C.
 
+## v5.0.15 One-User Dogfood Exception
+
+BND-NEXT-44 is planned, not implemented. For the first v5.0.15 dogfood build,
+the canonical MSI may install an unsigned `requireAdministrator` input injector
+under `%ProgramFiles%\Boundless` when all of these constraints are enforced:
+
+- elevated-app input is disabled until the configured allowed user explicitly
+  enables or launches it;
+- Windows displays the expected **Unknown Publisher** UAC prompt, and the tray
+  reports `unsigned dogfood` rather than signed, trusted, or production-ready;
+- the allowed user and elevated target applications belong to the same
+  split-token administrator account;
+- the injector exposes only incoming input injection and held-input release;
+- cancellation, sign-in, tray relaunch, injector crash, service restart, repair,
+  upgrade, and automatic retry never launch it or generate another UAC prompt;
+  only another explicit user action may do so; and
+- repair, upgrade, and uninstall preserve or remove the injector through normal
+  MSI component ownership without leaving an elevated process or orphaned file.
+
+This is an explicit one-user dogfood exception, not a signing substitute.
+Unsigned code cannot use the UIAccess path and cannot support a trusted-publisher
+claim. Trusted Authenticode signing plus the UIAccess product-policy decision
+remain prerequisites before setting `uiAccess=true` or presenting elevated-app
+input as polished/trusted. UAC consent or credential desktops, lock screen,
+Winlogon, other sessions, and standard-user-to-alternate-admin control remain
+unsupported.
+
 ## Target Installer Shape
 
 The full-capability MSI should:
@@ -73,6 +100,9 @@ The full-capability MSI should:
 - stop the service during upgrade/uninstall and remove it on uninstall;
 - start the service on install/repair/upgrade;
 - start the tray at sign-in for the selected desktop user;
+- install any BND-NEXT-44 injector as a separately owned Program Files component
+  with explicit launch semantics, at-most-one-per-session lifecycle, and honest
+  signing/capability status;
 - keep service/tray update application MSI-owned, with no service or tray
   self-updater;
 - avoid secure-desktop or lock-screen claims until BND-NEXT-9C proves them on
@@ -232,10 +262,17 @@ validated:
 
 Interactive-desktop parity remains separate from MSI service ownership:
 
-- BND-NEXT-44 owns ordinary elevated-app behavior through a minimal signed
-  user-session input injector installed under Program Files, after a UIAccess
-  versus explicit-elevation security and product-policy proof; physical capture
-  and clipboard handling remain unelevated;
+- BND-NEXT-44 owns ordinary elevated-app behavior through a minimal user-session
+  input injector installed under Program Files; physical capture and clipboard
+  handling remain unelevated;
+- the experimental `requireAdministrator` path must validate canonical MSI
+  ownership, the same split-token administrator SID/session, full administrator
+  token, one explicit **Unknown Publisher** UAC prompt, `unsigned dogfood`
+  status, minimal injection/release surface, at-most-one lifecycle, no automatic
+  prompts, and clean repair/upgrade/uninstall;
+- a UIAccess or polished/trusted-publisher path additionally requires trusted
+  Authenticode validation and, for UIAccess, proof of `TokenUIAccess=1` plus the
+  recorded product-policy decision;
 - cold-boot service availability remains independent lifecycle evidence;
 - BND-NEXT-9C retains lock-screen, Winlogon, and secure-desktop behavior after
   the ordinary elevated-window slice is proven.
@@ -249,11 +286,13 @@ payload install/uninstall evidence.
 9B-3: add MSI-owned `BoundlessService` registration/autostart, allowed-user SID
 selection, service lifecycle validation, and release-readiness evidence.
 
-BND-NEXT-44: implement and validate ordinary elevated-application control through a
-minimal-surface, signed Program Files input injector without elevating the tray
-or its capture and clipboard responsibilities. UIAccess is the preferred
-lower-privilege mechanism if policy-approved and proven; a `requireAdministrator`
-fallback carries a full administrator token despite its narrow interface.
+BND-NEXT-44: implement and validate ordinary elevated-application control through
+a minimal-surface Program Files input injector without elevating the tray or its
+capture and clipboard responsibilities. The one-user dogfood fallback may be an
+explicitly enabled unsigned `requireAdministrator` binary with an **Unknown
+Publisher** UAC prompt and `unsigned dogfood` status; it carries a full
+administrator token despite its narrow interface. UIAccess remains available
+only after trusted signing, policy approval, and proof.
 
 9C: separately prove or falsify lock-screen, Winlogon, and secure-desktop
 control on real Windows desktops before changing those parity claims.

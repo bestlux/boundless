@@ -4,14 +4,14 @@ This is the short, version-neutral repo status packet for agents and release wor
 
 ## Current Stable Version
 
-- Stable version: 5.0.0
+- Stable version: 5.0.14
 - Source of truth: workspace Cargo.toml, .release-please-manifest.json, and packaging/windows/package-manifest.json
 - Primary release artifact: Windows MSI, plus release metadata and checksums from the release workflow
 
 ## Support Posture
 
 - Product target: Windows-first.
-- Public status: pre-release software with a stable 5.0.0 release artifact, but runtime behavior and APIs may still change.
+- Public status: pre-release software with a stable 5.0.14 release artifact, but runtime behavior and APIs may still change.
 - Cross-platform posture: Linux build/test coverage exists, but Windows runtime, tray, input capture, installer, named-pipe, and service behavior are not implied by Linux success.
 - Canonical first-run UX: tray dashboard with local daemon. CLI setup and console flows are automation and diagnostics fallbacks.
 
@@ -76,7 +76,7 @@ These are not hidden release blockers by default; they require explicit release-
 | --- | --- | --- | --- |
 | n_minus_1_msi_upgrade | open | Release-readiness now has an explicit gate, but the evidence still requires a prior GitHub Release MSI asset and Windows installer lab run. Stable packets fail when this evidence is skipped or malformed. | docs/release/v5-release-hardening.md, docs/release/release-readiness.md |
 | service_update_orchestration | deferred | MSI-owned packaged-payload updates are the supported boundary; active admin-registered service binary replacement, tray notification, or installer-launch UX remains future product work, and service/tray self-update remains unsupported. | this document |
-| interactive_desktop_service_mode | planned | BND-NEXT-44 targets ordinary elevated applications with a minimal signed Program Files injector while keeping capture, clipboard, and the tray unelevated. Its first gate must policy-review and prove UIAccess for the split-token administrator case or select an explicitly requested high-integrity fallback. Trusted Windows signing is not configured as of v5.0.14 and is a prerequisite to shipping this capability, not unrelated patch releases. UAC secure desktop, lock screen, Winlogon, and other sessions remain deferred under BND-NEXT-9C. | docs/backlog.md, docs/release/v5-release-hardening.md |
+| interactive_desktop_service_mode | planned | The v5.0.15 BND-NEXT-44 train targets ordinary same-user elevated applications while keeping capture, clipboard, and the tray unelevated. One-user dogfood may explicitly enable an MSI-owned unsigned `requireAdministrator` injector from `%ProgramFiles%\Boundless`; Windows must show **Unknown Publisher**, status must say `unsigned dogfood`, and cancellation or lifecycle recovery must never trigger automatic UAC retries. This exception is limited to the same split-token administrator and does not cover UAC secure desktop, lock screen, Winlogon, other sessions, or alternate-admin credentials. Trusted signing and policy approval remain required for UIAccess or any polished/trusted-publisher claim. No implementation is claimed yet. | docs/backlog.md, docs/architecture/user-session-input-broker.md, docs/architecture/single-elevated-installer.md |
 | transport_fault_injection_harness | partially landed | PR #89 landed a narrow post-auth session fault harness; BND-NEXT-7 used it for behavior-neutral reactor cleanup, while broad multi-peer/runtime fault coverage remains deferred. | this document, docs/architecture/network-v1.md |
 | mixed_dpi_input_matrix | deferred | Mixed-DPI and negative-coordinate monitor validation needs Windows hardware/runtime evidence. | this document |
 | stale_non_file_evidence | deferred | Current strict freshness enforcement is file-summary based; external workflow/run freshness still depends on release review metadata. | docs/release/release-readiness.md |
@@ -89,8 +89,9 @@ These are not hidden release blockers by default; they require explicit release-
 ## Next Backlog Step
 
 - Canonical prioritized backlog: [docs/backlog.md](backlog.md). Dogfood-observed blockers, flows, and nits: [docs/release/launch-ledger.md](release/launch-ledger.md).
-- BND-NEXT-20 (direct TCP with role reversal for one-sided reachability) has real two-PC evidence as of 2026-07-07: pairing, trusted transport, layout propagation, and input handoff all passed on asymmetric-reachability hardware (5.0.10-dogfood-c2e1509). The historic connect blocker was stale service trust, fixed by daemon-API trust rotation (reset-script fix in c2e1509).
-- v5.0.11 (2026-07-08) landed the P0 slice in code: BND-NEXT-23 (service SCM stop), BND-NEXT-24 (broker-routed clipboard), BND-NEXT-25 (readable transport events), BND-NEXT-26 (packaging-script CI). Next step is the 5.0.11 two-PC dogfood to convert 23/24 to evidence-backed; then BND-NEXT-27 (trust-rotation product flow) is the top active story. See the backlog.
+- v5.0.14 is published, but its accumulated installed proof is intentionally rolling into the next dogfood build rather than requiring a separate physical run. BND-NEXT-23, BND-NEXT-24, BND-NEXT-29 item 3, BND-NEXT-31, BND-NEXT-35, and BND-NEXT-37 through BND-NEXT-42 retain their existing evidence status until that run occurs.
+- The bounded v5.0.15 train is BND-NEXT-44 plus only its direct adjacencies: narrow BND-NEXT-34 injector-stage diagnostics, BND-NEXT-24 degraded-state reporting, and BND-NEXT-31/BND-NEXT-38 lifecycle and fail-open integration. Network, firewall, layout, generic transport, and CI workflow changes are not part of this train.
+- After v5.0.15, the ranked code work is: BND-NEXT-27 plus BND-NEXT-28; BND-NEXT-20E; BND-NEXT-21; BND-NEXT-33B/33C with BND-NEXT-33A design in parallel; complete BND-NEXT-34 then BND-NEXT-43. BND-NEXT-32 remains analysis-first, and BND-NEXT-22, BND-NEXT-36, and BND-NEXT-30 stay later.
 - Full `SessionEvent`/`SessionPhase` machinery, broader multi-peer/runtime fault coverage, graceful per-session join lifecycle, clipboard image streaming/spooling, tray update notification UX remain deferred.
 
 ## Pro Oversight Item Accounting
