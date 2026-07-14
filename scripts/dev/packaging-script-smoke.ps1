@@ -153,6 +153,10 @@ foreach ($requiredInstallerIntegrationContract in @(
         'cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector',
         './scripts/release/package-windows.ps1',
         './scripts/dev/installer-smoke.ps1',
+        'Validate installer evidence contract',
+        './scripts/dev/release-readiness.ps1',
+        '-InstallerSmokeSummaryPath',
+        '-SkipUnitGates',
         '-PreviousInstallerPath',
         'Upload installer validation evidence',
         "if: always() && steps.changes.outputs.run_installer == 'true'"
@@ -542,6 +546,8 @@ foreach ($requiredSmokeContract in @(
         '[switch]$SelfTest',
         'Invoke-BoundlessInstallHelper',
         'Assert-BoundlessInstallHelperEvidenceParserFixtures',
+        'ConvertTo-AuthenticodeStatusName',
+        'Assert-AuthenticodeStatusSerializationFixtures',
         'install_helper_upgrade_evidence',
         'boundless_install_tray_quiescence_acquired',
         'Get-WindowsCommandExecutablePath',
@@ -578,6 +584,41 @@ foreach ($scriptFile in $selfTestScripts) {
     Invoke-PackagingScript -ScriptPath $scriptFile.FullName -Arguments @("-SelfTest") | Out-Null
 }
 
+$releaseReadinessFixtures = Join-Path $RepoRoot "scripts\dev\release-readiness-fixtures.ps1"
+if (-not (Test-Path -LiteralPath $releaseReadinessFixtures -PathType Leaf)) {
+    throw "Release readiness fixture script was not found: $releaseReadinessFixtures"
+}
+$releaseReadinessFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) (
+    "BoundlessReleaseReadinessFixtures-$([guid]::NewGuid().ToString('N'))"
+)
+try {
+    Invoke-PackagingScript `
+        -ScriptPath $releaseReadinessFixtures `
+        -Arguments @(
+            "-RepoRoot",
+            $RepoRoot,
+            "-OutputRoot",
+            $releaseReadinessFixtureRoot
+        ) | Out-Null
+}
+finally {
+    $fullTempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+    $fullFixtureRoot = [IO.Path]::GetFullPath($releaseReadinessFixtureRoot).TrimEnd('\')
+    if (
+        -not $fullFixtureRoot.StartsWith(
+            "$fullTempRoot\",
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [IO.Path]::GetFileName($fullFixtureRoot) -notmatch
+        '^BoundlessReleaseReadinessFixtures-[0-9a-f]{32}$'
+    ) {
+        throw "Refusing to clean an unsafe release readiness fixture path: $fullFixtureRoot"
+    }
+    if (Test-Path -LiteralPath $fullFixtureRoot) {
+        Remove-Item -LiteralPath $fullFixtureRoot -Recurse -Force -ErrorAction Stop
+    }
+}
+
 $fixtureHosts = @()
 foreach ($hostName in @("powershell.exe", "pwsh.exe")) {
     $hostCommand = Get-Command $hostName -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -609,4 +650,4 @@ if ($summary.selected_user_sid -ne $smokeSid) {
     throw "Boundless-Install.ps1 -ResolveOnly resolved unexpected SID: $($summary.selected_user_sid)"
 }
 
-Write-Host "packaging_script_smoke=passed self_tests=$($selfTestScripts.Count) install_fixture_hosts=$($fixtureHosts -join ',') installer_smoke_fixture_hosts=$($fixtureHosts -join ',') install_resolve_only=passed wix_upgrade_contract=passed helper_upgrade_contract=passed"
+Write-Host "packaging_script_smoke=passed self_tests=$($selfTestScripts.Count) release_readiness_fixtures=passed install_fixture_hosts=$($fixtureHosts -join ',') installer_smoke_fixture_hosts=$($fixtureHosts -join ',') install_resolve_only=passed wix_upgrade_contract=passed helper_upgrade_contract=passed"
