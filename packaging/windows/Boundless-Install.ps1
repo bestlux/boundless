@@ -4253,6 +4253,22 @@ function Copy-BoundlessInstallerLogHandoff {
     }
 }
 
+function Get-BoundlessElevatedInstallErrorFromLog {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return ""
+    }
+    $matches = [regex]::Matches(
+        [IO.File]::ReadAllText($Path),
+        '(?m)^BE=(?<value>\S+)\r?$'
+    )
+    if ($matches.Count -eq 0) {
+        return ""
+    }
+    return [uri]::UnescapeDataString($matches[$matches.Count - 1].Groups["value"].Value)
+}
+
 function Assert-BoundlessAdminOnlyAcl {
     param(
         [string]$Path,
@@ -4938,6 +4954,14 @@ function New-AdminEvent {
     if (-not [bool]$arguments[3]) { $event.Dispose(); throw "start gate already existed" }
     return $event
 }
+trap {
+    try {
+        $encoded = [uri]::EscapeDataString("$_")
+        [IO.File]::AppendAllText($stagedLog, "`nBE=$encoded`n", [Text.Encoding]::Unicode)
+    }
+    catch { }
+    break
+}
 $payloadJson = [Text.Encoding]::UTF8.GetString(
     [Convert]::FromBase64String("__PAYLOAD_BASE64__")
 )
@@ -4960,6 +4984,7 @@ if ($stageLeaf -notmatch '^BoundlessInstaller-[0-9a-f]{32}$') {
     throw "Installer stage leaf was invalid."
 }
 $stageRoot = Join-Path $programData $stageLeaf
+$stagedLog = Join-Path $stageRoot "Boundless-install.log"
 $trustedStage = $false
 $logHandoffReady = $false
 $exitCode = 1
@@ -5048,7 +5073,6 @@ try {
     )
     if ([bool]$payload.quiet) { $arguments += "-Quiet" }
     if ([bool]$payload.no_restart) { $arguments += "-NoRestart" }
-    $stagedLog = Join-Path $stageRoot "Boundless-install.log"
     if ([bool]$payload.log_requested) {
         $arguments += @("-LogPath", $stagedLog)
     }
@@ -5117,10 +5141,6 @@ try {
         }
         throw "Immutable staged helper failed with exit code $exitCode.$detailSuffix"
     }
-}
-catch {
-    Write-Host "boundless_install_elevated_error=$($_.Exception.Message)"
-    $exitCode = 1
 }
 finally {
     $treeCleanupFailure = $null
@@ -5332,6 +5352,7 @@ function Invoke-BoundlessMsi {
             $supervisionError = $_
         }
         $logHandoff = $null
+        $elevatedErrorDetail = ""
         if ($elevatedCommand.log_requested) {
             try {
                 $logHandoff = Copy-BoundlessInstallerLogHandoff `
@@ -5352,12 +5373,28 @@ function Invoke-BoundlessMsi {
                 }
                 throw $message
             }
+            try {
+                $elevatedErrorDetail = Get-BoundlessElevatedInstallErrorFromLog `
+                    -Path $logHandoff.destination
+            }
+            catch {
+                $elevatedErrorDetail = "Elevated installer error handoff could not be read: $($_.Exception.Message)"
+            }
         }
         if ($null -ne $supervisionError) {
+            if (-not [string]::IsNullOrWhiteSpace($elevatedErrorDetail)) {
+                throw "$($supervisionError.Exception.Message) Elevated installer detail: $elevatedErrorDetail"
+            }
             throw $supervisionError
         }
         if ($exitCode -notin @(0, 3010)) {
-            throw "Elevated Boundless install phase exited with $exitCode."
+            $detailSuffix = if ([string]::IsNullOrWhiteSpace($elevatedErrorDetail)) {
+                ""
+            }
+            else {
+                " $elevatedErrorDetail"
+            }
+            throw "Elevated Boundless install phase exited with $exitCode.$detailSuffix"
         }
     }
     finally {
@@ -9160,6 +9197,52 @@ finally { $ready.Dispose() }
     }
 }
 
+function Invoke-BoundlessElevatedErrorTrapFixture {
+    $fixtureRoot = Join-Path `
+        ([IO.Path]::GetTempPath()) `
+        "BoundlessElevatedError-$([guid]::NewGuid().ToString('N'))"
+    try {
+        New-Item -ItemType Directory -Path $fixtureRoot -ErrorAction Stop | Out-Null
+        foreach ($mode in @("try", "finally")) {
+            $stagedLog = Join-Path $fixtureRoot "$mode.log"
+            $expected = "fixture $mode failure"
+            [IO.File]::WriteAllText($stagedLog, "fixture", [Text.Encoding]::Unicode)
+            try {
+                & {
+                    param($Path, $Mode, $Message)
+                    $stagedLog = $Path
+                    trap {
+                        try {
+                            $encoded = [uri]::EscapeDataString("$_")
+                            [IO.File]::AppendAllText(
+                                $stagedLog,
+                                "`nBE=$encoded`n",
+                                [Text.Encoding]::Unicode
+                            )
+                        }
+                        catch { }
+                        break
+                    }
+                    try {
+                        if ($Mode -eq "try") { throw $Message }
+                    }
+                    finally {
+                        if ($Mode -eq "finally") { throw $Message }
+                    }
+                } $stagedLog $mode $expected
+            }
+            catch { }
+            $actual = Get-BoundlessElevatedInstallErrorFromLog -Path $stagedLog
+            if ($actual -ne $expected) {
+                throw "Elevated installer $mode error trap fixture lost the original failure."
+            }
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-BoundlessLogHandoffFixture {
     param([string]$SelectedUserSid)
 
@@ -9169,9 +9252,15 @@ function Invoke-BoundlessLogHandoffFixture {
     $stageRoot = Join-Path $fixtureRoot "BoundlessInstaller-$([guid]::NewGuid().ToString('N'))"
     $stagedLog = Join-Path $stageRoot "Boundless-install.log"
     $destination = Join-Path $fixtureRoot "caller\requested.log"
+    $expectedElevatedError = "fixture elevated failure`r`nwith reserved characters: % | ?"
+    $encodedElevatedError = [uri]::EscapeDataString($expectedElevatedError)
     try {
         New-Item -ItemType Directory -Path $stageRoot -Force -ErrorAction Stop | Out-Null
-        [IO.File]::WriteAllText($stagedLog, "boundless-log-handoff-fixture")
+        [IO.File]::WriteAllText(
+            $stagedLog,
+            "boundless-log-handoff-fixture`r`nBE=$encodedElevatedError`r`n",
+            [Text.Encoding]::Unicode
+        )
         $result = Copy-BoundlessInstallerLogHandoff `
             -StageRoot $stageRoot `
             -StagedLogPath $stagedLog `
@@ -9183,6 +9272,10 @@ function Invoke-BoundlessLogHandoffFixture {
             (Test-Path -LiteralPath $stageRoot)
         ) {
             throw "Installer log handoff fixture did not copy and close the one-file stage."
+        }
+        $elevatedError = Get-BoundlessElevatedInstallErrorFromLog -Path $destination
+        if ($elevatedError -ne $expectedElevatedError) {
+            throw "Installer log handoff fixture did not preserve the elevated error detail."
         }
         $directorySddl = Get-BoundlessLogHandoffSddl -UserSid $SelectedUserSid
         $fileSddl = Get-BoundlessLogHandoffFileSddl -UserSid $SelectedUserSid
@@ -9593,6 +9686,7 @@ public static class BoundlessInstallNativeMethods
     Invoke-BoundlessBlockingServiceStopFixture
     Invoke-BoundlessFailedMsiServiceRecoveryFixture
     Invoke-BoundlessLogHandoffFixture -SelectedUserSid $validSid
+    Invoke-BoundlessElevatedErrorTrapFixture
 
     $stageSddl = Get-BoundlessAdminOnlyStageSddl
     if (
@@ -9764,7 +9858,8 @@ public static class BoundlessInstallNativeMethods
         $decodedElevatedCommand -match 'S:\(ML;' -or
         $decodedElevatedCommand -notmatch 'BoundlessInstaller-' -or
         $decodedElevatedCommand -notmatch 'PSObject\.BaseObject' -or
-        $decodedElevatedCommand -notmatch 'Staged helper hash mismatch'
+        $decodedElevatedCommand -notmatch 'Staged helper hash mismatch' -or
+        $decodedElevatedCommand -notmatch 'BE='
     ) {
         throw "Elevated command fixture did not enforce immutable helper/MSI staging."
     }
@@ -9863,6 +9958,8 @@ public static class BoundlessInstallNativeMethods
         failed_msi_service_recovery_fixture = "passed"
         elevated_install_result_fixture = "passed"
         elevated_in_memory_command_fixture = "passed"
+        elevated_command_length = $elevatedCommand.encoded_command.Length
+        elevated_error_trap_fixture = "passed"
         helper_startup_anchor_fixture = "passed"
         installer_anchor_fixture = "passed"
         caller_privilege_log_handoff_fixture = "passed"
