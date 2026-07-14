@@ -83,13 +83,101 @@ The first installed v5.0.15 pass should absorb the existing evidence debt rather
 
 ### Ranked work after v5.0.15
 
-1. BND-NEXT-27 plus BND-NEXT-28: make trust reset a first-class product flow and remove parser-dependent automation.
-2. BND-NEXT-20E: self-heal and explain one-way discovery on the routed dogfood topology.
-3. BND-NEXT-21: add the separately approved installer-owned Private/LocalSubnet firewall policy.
-4. BND-NEXT-33B then BND-NEXT-33C: define and converge automatic one-to-three-PC layouts; run BND-NEXT-33A design exploration in parallel and start BND-NEXT-33D only after a direction is approved.
-5. Complete the generic BND-NEXT-34 telemetry contract, then take BND-NEXT-43 as its own continuously-readable transport refactor.
-6. Complete the BND-NEXT-32 CI/CD analysis before changing workflows; do not mix workflow migration into the signing and injector release gate.
-7. Keep BND-NEXT-22, BND-NEXT-36, and BND-NEXT-30 behind the reliability and product-flow work above.
+1. BND-NEXT-45 install-path replacement train (owner decision 2026-07-14): 45A–45C land as 5.0.16 product-side enablers; 45D–45F land as the 5.1.0 install-contract change; 45G stays decision-gated on the firewall policy. This retires the BND-NEXT-41 helper-orchestration proof and absorbs BND-NEXT-28 and BND-NEXT-29 items 3/5.
+2. BND-NEXT-27: make trust reset a first-class product flow (its CLI surface builds on 45B `--json`).
+3. BND-NEXT-20E: self-heal and explain one-way discovery on the routed dogfood topology.
+4. BND-NEXT-21: firewall policy decision; implementation lands as BND-NEXT-45G on the rebuilt MSI.
+5. BND-NEXT-33B then BND-NEXT-33C: define and converge automatic one-to-three-PC layouts; run BND-NEXT-33A design exploration in parallel and start BND-NEXT-33D only after a direction is approved.
+6. Complete the generic BND-NEXT-34 telemetry contract, then take BND-NEXT-43 as its own continuously-readable transport refactor.
+7. Complete the BND-NEXT-32 CI/CD analysis before changing workflows; note that BND-NEXT-45F deletes a large share of what that analysis would otherwise inventory (helper fixtures, dual-host smoke matrix), so run the analysis after 45F or scope it around the post-45 surface.
+8. Keep BND-NEXT-22, BND-NEXT-36, and BND-NEXT-30 behind the reliability and product-flow work above.
+
+---
+
+## BND-NEXT-45 (P0 epic, target 5.0.16 + 5.1.0): Replace the install path with a boring, product-owned contract
+
+Owner decision 2026-07-14: aggressively replace the current install path; scrapping existing installer assets is explicitly authorized. Sequenced after the 5.0.14→5.0.15 dogfood run banks its product evidence.
+
+### Context and evidence
+
+The documented install is a two-file download (MSI + `Boundless-Install.ps1`) run from a non-elevated shell with `-ExecutionPolicy Bypass`. The helper has grown to 10,464 lines and 154 functions of PowerShell with three embedded C# native-method classes (process-tree job objects, recovery authority, upgrade monitor). It owns pre-UAC SID capture, elevated `msiexec` choreography, tray/injector quiescence through kernel events/mutexes/sentinels, Windows Installer transaction-idle proofs, privileged recovery fencing, and post-install verification. It absorbed roughly twenty `fix(installer)` commits across the 5.0.14/5.0.15 trains and requires a dual-host (PowerShell 5.1 + 7.x) smoke matrix. `Package.wxs` spends ~90 lines of launch conditions character-validating one SID, and a raw MSI double-click fails with error 1603 by design.
+
+Every layer of that complexity compensates for one of three product gaps:
+
+1. **The service cannot determine the desktop user at runtime.** The control-pipe DACL (`crates/platform-windows/src/runtime.rs`, `control_pipe_sddl_for_allowed_user`) needs one user SID, so the MSI demands `BOUNDLESS_ALLOWED_USER_SID`, so a helper must capture the SID before UAC.
+2. **The tray does not cooperate with Restart Manager.** Window close means hide-to-tray and only the tray-menu Quit path performs a real graceful exit, so `msiexec` upgrades hit Restart Manager 10006 loops (281-second 5.0.12→5.0.13 upgrade), so the helper grew installer-side quiescence orchestration (BND-NEXT-41).
+3. **Post-install verification lives only in the helper**, so smoke scripts, CI, and support tooling cannot reuse it, and the helper cannot shrink without losing it.
+
+This epic deletes the gaps in the product, then deletes the helper. It also restores the recorded architecture decision in [architecture/single-elevated-installer.md](architecture/single-elevated-installer.md) — "one elevated machine-wide MSI as the primary Windows installer route" — by removing the SID condition that forced a helper in front of it.
+
+Slating: 45A–45C are product-side, evidence-neutral enablers → **5.0.16**. 45D–45F change the install contract (MSI property removed, helper deleted, release assets change) → **5.1.0**, expressed through conventional commits (`feat!`). 45G rides the rebuilt MSI and stays decision-gated.
+
+### BND-NEXT-45A (5.0.16): Tray and injector cooperate with Restart Manager and system shutdown
+
+- Route `WM_QUERYENDSESSION`/`WM_ENDSESSION` (including the `ENDSESSION_CLOSEAPP` Restart Manager flavor) and RM-driven close requests into the existing graceful Quit path (the `SingleInstanceGuard` shutdown event → broker fail-open, held-input release, detach, bounded exit). Ordinary user window close keeps hide-to-tray semantics.
+- Apply the same cooperative-close contract to `boundless-input-injector.exe`.
+- Bound the full graceful exit at five seconds.
+- Acceptance: a plain `msiexec` upgrade over a running tray + service + injector completes with no FilesInUse dialog, no Restart Manager 10006, no forced termination, and no reboot request — with no helper preflight involved. Deterministic tests cover close-reason discrimination (user close vs. RM vs. sign-out).
+- Likely files: `crates/tray/src/main.rs`, `crates/tray/src/dashboard.rs`, `crates/platform-windows/src/single_instance.rs`, `crates/input-injector/`.
+- Supersedes the helper-quiescence half of BND-NEXT-41; its budgets (one UAC, bounded duration, no RM loop) transfer here and to 45E.
+
+### BND-NEXT-45B (5.0.16): `boundlessctl --json`
+
+Promotes BND-NEXT-28 into this train unchanged: `daemon status`, `peer list`, `transport events`, `feature list` emit stable JSON with a `schema_version` field; the human format stays default and unchanged. Foundation for 45C and every smoke script; retires the regex-scraping of single-line `key=value` prose that caused the c2e1509 bug class.
+
+### BND-NEXT-45C (5.0.16): `boundlessctl doctor --install` — product-owned postcondition verification
+
+- Port the helper's verification contract (not its implementation) into the product: Windows Installer product registration and DisplayVersion vs. `package-manifest.json`, payload presence, service identity (LocalSystem, Program Files binary path), service Running, daemon API health and runtime-version match, per-executable `--version` agreement, and exactly one responsive tray in the caller's session.
+- Nonzero exit with a machine-readable failure list; supports `--json` from 45B.
+- Consumed by `installer-smoke.ps1`, release validation, and support triage; ends the era where the only trustworthy install verification lives inside a script.
+- Likely files: `crates/cli/src/commands.rs`, `crates/app-services/`, `crates/platform-windows/` (registry/SCM queries). The battle-tested contract and negative fixtures live in `Boundless-Install.ps1` (`Invoke-PostInstallVerification`, `Assert-PostInstallEvidence`) — mirror the fixture matrix as Rust tests.
+
+### BND-NEXT-45D (5.1.0): Resolve the allowed desktop user at runtime; delete the install-time SID
+
+- Security property to preserve, verbatim: only SYSTEM, built-in Administrators, and the interactive console-session user may use the daemon control pipe and brokers.
+- Replace install-time `--allowed-user-sid` with runtime resolution of the active console-session user. Two acceptable mechanisms — implementation picks one and proves it with tests: (a) session-change-driven re-ACL: accept `SERVICE_CONTROL_SESSIONCHANGE`, resolve the console session token SID (`WTSGetActiveConsoleSessionId`/`WTSQueryUserToken`), rebuild pipe security on change; or (b) static SYSTEM/Administrators/INTERACTIVE DACL plus a mandatory per-connection authorization check that the client token user matches the current console-session user.
+- No interactive console session (headless/service-only state): serve SYSTEM/Administrators only; fail closed.
+- Fast user switching: control follows the console; the previous user's brokers detach through the existing fail-open primitives (BND-NEXT-31/BND-NEXT-38).
+- Delete: `parse_allowed_user_sid` and the argument plumbing in `crates/daemon/src/service_main.rs`, the `BOUNDLESS_ALLOWED_USER_SID` property and its ~90-line launch-condition forest in `Package.wxs`, and the SID-shape validation duplicated across helper and product.
+- Document the multi-user policy: the interactive console desktop owns input sharing; RDP and secondary sessions remain unsupported exactly as today.
+- Acceptance: a plain double-click MSI install (no property) yields a working tray/daemon for the installing desktop user; after user switching, the console user has control and the previous user's pipe access is refused; deterministic authorization tests cover console user, non-console user, SYSTEM, Administrators, and no-session states; BND-NEXT-44's same-user injector constraint keeps working unchanged.
+
+### BND-NEXT-45E (5.1.0): Plain, double-clickable MSI as the canonical artifact
+
+- Rebuild `Package.wxs` minimal: payload components, `ServiceInstall` with no arguments, the injector component (BND-NEXT-44 semantics unchanged), shortcuts, ARP metadata, `MajorUpgrade` with `AllowSameVersionUpgrades="yes"` (closes BND-NEXT-29 item 3), and an optional PATH entry for `boundlessctl` (closes the full-path paper cut in the quickstart).
+- Verify `InstallExecuteSequence` ordering against the 45A cooperative apps: Restart Manager handles running processes; remove any `CloseApplication` force-termination fallback that races SCM ownership (BND-NEXT-41 finding).
+- Release assets become: MSI + `SHA256SUMS.txt` (+ Linux tarball). No helper is published.
+- Acceptance: double-click install, silent `/qn` install, upgrade over a fully running product, repair, and uninstall all pass installer smoke; the raw-MSI 1603 ledger nit closes; same-version dogfood rebuild installs as a replacement.
+
+### BND-NEXT-45F (5.1.0): Delete the helper; shrink every install script to a thin wrapper
+
+- Delete `Boundless-Install.ps1` and its fixture/self-test surface (`scripts/dev/installer-helper-fixtures.ps1`).
+- Rewrite `scripts/dev/installer-smoke.ps1` around plain `msiexec` scenarios plus `boundlessctl doctor --install` plus the 45A/45E duration and Restart Manager budget assertions; target an order-of-magnitude size reduction from 1,481 lines.
+- `scripts/dev/packaging-script-smoke.ps1` keeps only what still exists; the dual-host PowerShell 5.1/7.x matrix shrinks accordingly.
+- `Boundless-Reset.ps1` stays a thin wrapper until BND-NEXT-27 productizes trust rotation; do not grow it here.
+- Rewrite install documentation: quickstart install/uninstall sections, README packaging section, `docs/user/service-mode.md`, `packaging/windows/README.txt`. Fresh-machine install documents as: download one MSI, double-click, launch Boundless.
+- Acceptance: no document references the helper; the release workflow publishes no helper; total install-path script footprint drops from ~14k lines to under ~2k.
+
+### BND-NEXT-45G (5.1.0, decision-gated): Firewall opt-in rides the rebuilt MSI
+
+Contract unchanged from BND-NEXT-21 and [architecture/one-sided-reachability.md](architecture/one-sided-reachability.md); this story only fixes its landing zone: an explicit opt-in MSI property on the rebuilt `Package.wxs`, fail-closed on every unverifiable prerequisite, Private profile + LocalSubnet scope, service-binary-scoped, TCP 15100/15200 only, repair/upgrade/uninstall ownership. Do not merge without the recorded product decision.
+
+### Epic acceptance criteria
+
+- A new Windows user installs Boundless by downloading one MSI and double-clicking it; the first tray launch reaches a healthy, pairing-ready state with no shell commands anywhere in the flow.
+- An upgrade over a fully running system needs one UAC prompt, hits no FilesInUse/Restart Manager dialogs, completes within a documented bound, and recovers trust/layout/connection — proven on both dogfood PCs.
+- `packaging/windows/` contains no orchestration logic beyond thin wrappers, and all prior helper verification value survives inside `boundlessctl doctor --install`.
+- The install-time SID concept no longer exists anywhere in product, packaging, scripts, or docs.
+
+### Sequencing and evidence boundary
+
+Bank the planned 5.0.14→5.0.15 dogfood run first — its product evidence (injector, clipboard, escape, scrolling, numpad) is independent of this epic. BND-NEXT-41's helper-orchestration proof is explicitly retired: do not spend dogfood cycles proving helper quiescence once this epic is scheduled.
+
+### Deliberately out of scope
+
+- A compiled setup.exe bootstrapper or GUI installer: revisit only if the plain MSI proves insufficient (signing/SmartScreen strategy or richer first-run UX). This epic makes any future bootstrapper trivial instead of building one now.
+- Code signing acquisition — separate track; the `WINDOWS_SIGN_REQUIRED` release plumbing already exists.
+- Auto-update mechanisms; the MSI remains the update vehicle.
 
 ---
 
@@ -161,11 +249,13 @@ None. Preserve BND-NEXT-11’s service-ownership rule rather than reverting to a
 
 ---
 
-## BND-NEXT-41 (P0, v5.0.14 candidate needs installed evidence): Make helper upgrades close Boundless once without Restart Manager loops
+## BND-NEXT-41 (P0, superseded in part by BND-NEXT-45): Make helper upgrades close Boundless once without Restart Manager loops
 
 **Category:** bug
 
-Status: the failure was reproduced during the normal-user 5.0.12→5.0.13 helper/UAC upgrade. The v5.0.14 candidate bounds per-user/session quiescence and the elevated installer process tree, retains quiescence through uncertain cancellation, and fences fail-closed service recovery until privileged authority drains and the service-start action settles. A real normal-user 5.0.13→5.0.14 upgrade on both PCs remains the proof boundary.
+Status 2026-07-14: the helper-orchestration approach is retired by the BND-NEXT-45 decision — BND-NEXT-45A moves quiescence into the product (Restart Manager cooperation) and BND-NEXT-45F deletes the helper. The upgrade budgets here (one UAC, bounded duration, no Restart Manager 10006) transfer to 45A/45E acceptance. Do not spend a dedicated dogfood cycle proving helper quiescence; the 5.0.14→5.0.15 upgrade may still record whatever it observes. Original context below retained as evidence.
+
+Prior status: the failure was reproduced during the normal-user 5.0.12→5.0.13 helper/UAC upgrade. The v5.0.14 candidate bounds per-user/session quiescence and the elevated installer process tree, retains quiescence through uncertain cancellation, and fences fail-closed service recovery until privileged authority drains and the service-start action settles. A real normal-user 5.0.13→5.0.14 upgrade on both PCs remains the proof boundary.
 
 ### Context and evidence
 
@@ -437,7 +527,7 @@ Stale LocalSystem service trust caused the entire historic two-PC connect blocke
 
 ## BND-NEXT-21 (P1): Installer-owned Private/local-subnet firewall policy (implementation)
 
-The design and fail-closed requirements are fully specified in [architecture/one-sided-reachability.md](architecture/one-sided-reachability.md) (BND-NEXT-21 sections) — read those before starting; they are the contract. This entry adds the dogfood evidence and scopes the implementation slice.
+The design and fail-closed requirements are fully specified in [architecture/one-sided-reachability.md](architecture/one-sided-reachability.md) (BND-NEXT-21 sections) — read those before starting; they are the contract. This entry adds the dogfood evidence and scopes the implementation slice. Landing zone update 2026-07-14: the implementation slice ships as BND-NEXT-45G on the rebuilt 5.1.0 MSI; the product decision gate is unchanged.
 
 ### Context and evidence
 
@@ -494,11 +584,13 @@ Build on the existing BND-NEXT-20 candidate and role-reversal model; no relay/cl
 
 ---
 
-## BND-NEXT-28 (P2): `boundlessctl --json`
+## BND-NEXT-28 (P2, promoted into BND-NEXT-45B for 5.0.16): `boundlessctl --json`
 
 Machine-readable output (`--json`) for `daemon status`, `peer list`, `transport events`, `feature list`. Motivation: the c2e1509 bug class — scripts regex-scraping single-line prose — plus the CI contract tests (BND-NEXT-26, landed with a text fixture that JSON would make sturdier) and support tooling. Keep the human format the default and unchanged. Acceptance: the four commands emit stable JSON with a `schema_version` field; `Boundless-Reset.ps1` machine-id lookup prefers JSON with regex fallback; CLI tests snapshot the JSON shape. Files: `crates/cli/src/commands.rs`, `crates/cli/src/console.rs`, `packaging/windows/Boundless-Reset.ps1`.
 
-## BND-NEXT-29 (P2): Install/packaging paper cuts (bundle)
+## BND-NEXT-29 (P2, partially absorbed by BND-NEXT-45): Install/packaging paper cuts (bundle)
+
+Absorption note 2026-07-14: item 3 (`AllowSameVersionUpgrades`) lands in BND-NEXT-45E; item 5's helper-primary-entry-point model is retired by BND-NEXT-45D/45F (the property and the helper both go away). Items below remain historical context.
 
 Independent small items, one PR each or one sweep; all observed 2026-07-07:
 
