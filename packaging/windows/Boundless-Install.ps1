@@ -4508,6 +4508,18 @@ function Assert-ElevatedInstallResult {
     if ($Result.msi_exit_code -notin @(0, 3010)) {
         throw "Elevated Boundless install returned unexpected MSI exit code $($Result.msi_exit_code)."
     }
+    $inputInjectorShutdownProperty = $Result.PSObject.Properties.Match("input_injector_shutdown")
+    if ($inputInjectorShutdownProperty.Count -ne 1) {
+        throw "Elevated Boundless install result omitted the input_injector_shutdown field."
+    }
+    $inputInjectorShutdown = $inputInjectorShutdownProperty[0].Value
+    if ($null -ne $inputInjectorShutdown) {
+        foreach ($member in @("initial_count", "elapsed_milliseconds", "force_kill_used")) {
+            if ($inputInjectorShutdown.PSObject.Properties.Match($member).Count -ne 1) {
+                throw "Elevated Boundless install result input_injector_shutdown omitted '$member'."
+            }
+        }
+    }
     if ($Result.service_shutdown.force_kill_used) {
         throw "Elevated Boundless install reported a forbidden service force-kill."
     }
@@ -5445,6 +5457,10 @@ function Invoke-BoundlessMsi {
             force_kill_used = $false
             msi_service_control = "idempotent_verification_after_helper_stop"
         }
+        # Detailed shutdown evidence remains owned by the staged elevated
+        # helper. Preserve the parent result schema without inventing values
+        # that were not serialized across the process boundary.
+        input_injector_shutdown = $null
         installer_stage = [pscustomobject]@{
             admin_only = $true
             hash_verified = $true
@@ -9778,15 +9794,68 @@ public static class BoundlessInstallNativeMethods
         service_shutdown = [pscustomobject]@{
             force_kill_used = $false
         }
+        input_injector_shutdown = $null
         installer_stage = [pscustomobject]@{
             admin_only = $true
             hash_verified = $true
         }
     }
-    Assert-ElevatedInstallResult -Result $validElevatedResult | Out-Null
+    $validatedElevatedResult = Assert-ElevatedInstallResult -Result $validElevatedResult
+    if ($null -ne $validatedElevatedResult.input_injector_shutdown) {
+        throw "Elevated install fixture did not preserve the null parent input injector evidence boundary."
+    }
     $rebootElevatedResult = $validElevatedResult.PSObject.Copy()
     $rebootElevatedResult.msi_exit_code = 3010
     Assert-ElevatedInstallResult -Result $rebootElevatedResult | Out-Null
+    $missingInputInjectorEvidenceRejected = $false
+    try {
+        $missingInputInjectorEvidence = $validElevatedResult.PSObject.Copy()
+        $missingInputInjectorEvidence.PSObject.Properties.Remove("input_injector_shutdown")
+        Assert-ElevatedInstallResult -Result $missingInputInjectorEvidence | Out-Null
+    }
+    catch {
+        if ($_.Exception.Message -eq "Elevated Boundless install result omitted the input_injector_shutdown field.") {
+            $missingInputInjectorEvidenceRejected = $true
+        }
+        else {
+            throw
+        }
+    }
+    if (-not $missingInputInjectorEvidenceRejected) {
+        throw "Elevated install fixture accepted a result with an incomplete input injector shutdown schema."
+    }
+    $detailedInputInjectorResult = $validElevatedResult.PSObject.Copy()
+    $detailedInputInjectorResult.input_injector_shutdown = [pscustomobject]@{
+        initial_count = 1
+        elapsed_milliseconds = 10
+        force_kill_used = $false
+    }
+    Assert-ElevatedInstallResult -Result $detailedInputInjectorResult | Out-Null
+    foreach ($missingMember in @("initial_count", "elapsed_milliseconds", "force_kill_used")) {
+        $members = [ordered]@{
+            initial_count = 1
+            elapsed_milliseconds = 10
+            force_kill_used = $false
+        }
+        $members.Remove($missingMember)
+        $malformedInputInjectorResult = $validElevatedResult.PSObject.Copy()
+        $malformedInputInjectorResult.input_injector_shutdown = [pscustomobject]$members
+        $malformedInputInjectorRejected = $false
+        try {
+            Assert-ElevatedInstallResult -Result $malformedInputInjectorResult | Out-Null
+        }
+        catch {
+            if ($_.Exception.Message -eq "Elevated Boundless install result input_injector_shutdown omitted '$missingMember'.") {
+                $malformedInputInjectorRejected = $true
+            }
+            else {
+                throw
+            }
+        }
+        if (-not $malformedInputInjectorRejected) {
+            throw "Elevated install fixture accepted input injector evidence without '$missingMember'."
+        }
+    }
     $serviceForceKillRejected = $false
     try {
         $invalidElevatedResult = $validElevatedResult.PSObject.Copy()
