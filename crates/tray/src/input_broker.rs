@@ -1321,6 +1321,37 @@ fn finish_pending_local_cleanup_for_shutdown(inject_batches: &mut BrokerInjectBa
     }
 }
 
+fn reconcile_elevated_controller_without_input_state<F>(
+    controller: &ElevatedInputController,
+    mut stop: F,
+) -> bool
+where
+    F: FnMut() -> bool,
+{
+    // A hard exit can be observed between broker sessions, when no
+    // InjectedInputState remains to own a release snapshot. The supervisor has
+    // already drained any persisted local cleanup before entering this path,
+    // so a marker-absent recovery latch can be completed without inventing
+    // held input. Two bounded stop passes cover the transition where the first
+    // failed stop discovers the hard exit and the second confirms lane absence.
+    for _ in 0..2 {
+        if controller.direct_fallback_safe() {
+            return true;
+        }
+        let stopped = stop();
+        if stopped && controller.direct_recovery_cleanup_required() {
+            controller.complete_direct_recovery_cleanup();
+        }
+        if controller.direct_fallback_safe() {
+            return true;
+        }
+        if !controller.direct_recovery_cleanup_required() {
+            return false;
+        }
+    }
+    false
+}
+
 async fn wait_for_broker_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
     if *shutdown_rx.borrow() {
         return;
@@ -1357,6 +1388,14 @@ async fn run_input_broker_session(
     .input_runtime
     .map(|runtime| runtime.capture_backend_mode)
     .unwrap_or_default();
+    if inject_batches.local_cleanup_pending() {
+        bail!("pending local input cleanup reached broker-session preflight");
+    }
+    if !reconcile_elevated_controller_without_input_state(elevated_input_controller, || {
+        elevated_input_controller.disable_and_wait()
+    }) {
+        bail!("elevated input cleanup was not confirmed before a replacement broker session");
+    }
     if backend_mode != INPUT_BROKER_SERVICE_UNSUPPORTED_MODE {
         // A user-session daemon owns capture/injection directly; a broker
         // would double-capture. It cannot consume the elevated controller,
@@ -1365,6 +1404,12 @@ async fn run_input_broker_session(
             != platform_windows::elevated_input::InputInjectorState::Off
         {
             let _ = elevated_input_controller.disable_and_wait();
+            if !reconcile_elevated_controller_without_input_state(
+                elevated_input_controller,
+                || elevated_input_controller.disable_and_wait(),
+            ) {
+                bail!("elevated input cleanup remained pending without a service-session broker");
+            }
         }
         return Ok(BrokerSessionEnd::NotNeeded);
     }
@@ -1406,14 +1451,6 @@ async fn run_input_broker_session(
     if !attach.accepted {
         eprintln!("boundless input broker attach rejected: {}", attach.message);
         return Ok(BrokerSessionEnd::NotNeeded);
-    }
-    if !elevated_input_controller.direct_fallback_safe() {
-        let _ = elevated_input_controller.disable_and_wait();
-        if !elevated_input_controller.direct_fallback_safe() {
-            bail!(
-                "elevated input cleanup was not confirmed before a replacement broker session"
-            );
-        }
     }
     inject_batches.begin_delivery_epoch(&attach.delivery_epoch)?;
     let broker_token = attach.broker_token;
@@ -1895,6 +1932,36 @@ mod input_broker_tests {
         assert!(recovered.direct_fallback_safe);
         assert!(!recovered.direct_recovery_cleanup_required);
         assert!(!batch.local_cleanup_pending());
+    }
+
+    #[test]
+    fn hard_helper_exit_between_sessions_completes_controller_only_recovery() {
+        let controller = ElevatedInputController::start().expect("start test controller");
+        update_elevated_input_status(&controller.inner.status, |status| {
+            status.state = platform_windows::elevated_input::InputInjectorState::Active;
+            status.direct_fallback_safe = false;
+            status.direct_recovery_cleanup_required = false;
+        });
+        let mut stop_attempts = 0usize;
+        assert!(reconcile_elevated_controller_without_input_state(
+            &controller,
+            || {
+                stop_attempts += 1;
+                if stop_attempts == 1 {
+                    mark_direct_recovery_required_after_helper_exit(
+                        &controller.inner.status,
+                        true,
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+        ));
+        assert_eq!(stop_attempts, 2);
+        let recovered = controller.status();
+        assert!(recovered.direct_fallback_safe);
+        assert!(!recovered.direct_recovery_cleanup_required);
     }
 
     #[test]
