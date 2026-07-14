@@ -1,6 +1,6 @@
 [package]
 name = "daemon-host"
-version = "5.0.14"
+version = "5.0.15"
 edition.workspace = true
 license.workspace = true
 
