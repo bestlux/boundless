@@ -209,6 +209,8 @@ foreach ($requiredInstallContract in @(
         'staging_child_process_probe_hosts',
         'BoundlessHelperStartupAnchor',
         'New-BoundlessInstallerAnchor',
+        'Get-BoundlessInstallerSourcePackageName',
+        'installer_source_package_name_fixture',
         'Request-BoundlessTrayShutdownSignal',
         'UpgradeQuiescence.v1',
         'Start-BoundlessTrayQuiescenceMonitor',
@@ -330,11 +332,24 @@ if (
 $elevatedCommandSource = Get-PowerShellFunctionSource `
     -Path $installScript `
     -Name 'New-BoundlessElevatedInstallCommand'
+$sourcePackageNameSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Get-BoundlessInstallerSourcePackageName'
 if (
     $elevatedCommandSource -match 'payload\.log_path' -or
     $elevatedCommandSource -match '(?m)^\s*log_path\s*='
 ) {
     throw "Elevated installer payload must not carry the caller-selected log destination."
+}
+if (
+    $sourcePackageNameSource -notmatch 'GetFileName' -or
+    $sourcePackageNameSource -notmatch 'GetInvalidFileNameChars' -or
+    $sourcePackageNameSource -notmatch 'OrdinalIgnoreCase' -or
+    $elevatedCommandSource -notmatch 'installer_source_package_name' -or
+    $elevatedCommandSource -notmatch 'Join-Path \$stageRoot \$sourcePackageName' -or
+    $elevatedCommandSource -match 'Join-Path \$stageRoot "Boundless\.msi"'
+) {
+    throw "Elevated installer staging must preserve a validated MSI source package name under the immutable stage."
 }
 $invokeMsiSource = Get-PowerShellFunctionSource `
     -Path $installScript `

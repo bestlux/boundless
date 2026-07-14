@@ -4175,6 +4175,29 @@ function Test-BoundlessInstallerStagePath {
     return [IO.Path]::GetFileName($fullPath) -match '^BoundlessInstaller-[0-9a-f]{32}$'
 }
 
+function Get-BoundlessInstallerSourcePackageName {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw "Installer source package path was empty."
+    }
+
+    $leafName = [IO.Path]::GetFileName($Path)
+    if (
+        [string]::IsNullOrWhiteSpace($leafName) -or
+        $leafName.Length -le 4 -or
+        -not [IO.Path]::GetExtension($leafName).Equals(
+            ".msi",
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        $leafName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0
+    ) {
+        throw "Installer source package name was not a safe MSI leaf name."
+    }
+
+    return $leafName
+}
+
 function Copy-BoundlessInstallerLogHandoff {
     param(
         [string]$StageRoot,
@@ -4586,10 +4609,8 @@ function Invoke-ElevatedInstallPhase {
     }
 
     $stageRoot = Split-Path -Parent $ResolvedInstallerPath
-    if (
-        -not (Test-BoundlessInstallerStagePath -Path $stageRoot) -or
-        [IO.Path]::GetFileName($ResolvedInstallerPath) -ne "Boundless.msi"
-    ) {
+    Get-BoundlessInstallerSourcePackageName -Path $ResolvedInstallerPath | Out-Null
+    if (-not (Test-BoundlessInstallerStagePath -Path $stageRoot)) {
         throw "Internal elevated install phase did not receive the expected immutable MSI stage."
     }
     Assert-BoundlessAdminOnlyAcl -Path $stageRoot -RequireProtected $true | Out-Null
@@ -4716,6 +4737,10 @@ function New-BoundlessElevatedInstallCommand {
     $programData = Get-BoundlessProgramDataRoot
     $stageRoot = Join-Path $programData $stageLeaf
     $stagedLogPath = Join-Path $stageRoot "Boundless-install.log"
+    # Validate before serializing the immutable in-memory payload. The elevated
+    # bootstrap derives this same leaf from installer_path before staging it.
+    $installerSourcePackageName = Get-BoundlessInstallerSourcePackageName `
+        -Path $ResolvedInstallerPath
     $payload = [ordered]@{
         installer_path = $ResolvedInstallerPath
         installer_sha256 = $InstallerAnchor.sha256
@@ -5045,7 +5070,8 @@ try {
     Assert-AdminAcl -Path $stageRoot -RequireProtected $true
     $trustedStage = $true
 
-    $stagedMsi = Join-Path $stageRoot "Boundless.msi"
+    $sourcePackageName = [IO.Path]::GetFileName([string]$payload.installer_path)
+    $stagedMsi = Join-Path $stageRoot $sourcePackageName
     $stagedHelper = Join-Path $stageRoot "Boundless-Install.ps1"
     Copy-Item -LiteralPath $payload.installer_path -Destination $stagedMsi -ErrorAction Stop
     Copy-Item -LiteralPath $payload.helper_path -Destination $stagedHelper -ErrorAction Stop
@@ -5276,6 +5302,7 @@ exit $exitCode
         source = $source
         encoded_command = $encodedCommand
         installer_sha256 = $payload.installer_sha256
+        installer_source_package_name = $installerSourcePackageName
         helper_sha256 = $payload.helper_sha256
         stage_path = $stageRoot
         staged_log_path = $stagedLogPath
@@ -9870,10 +9897,44 @@ public static class BoundlessInstallNativeMethods
     if (-not $serviceForceKillRejected) {
         throw "Elevated install fixture accepted a service force-kill."
     }
-    $selfTestInstallerItem = Get-Item -LiteralPath $PSCommandPath -Force
+    $expectedSourcePackageName = "Boundless-5.0.15-windows-x64.msi"
+    $safeSourcePackagePath = Join-Path ([IO.Path]::GetTempPath()) $expectedSourcePackageName
+    if (
+        (Get-BoundlessInstallerSourcePackageName -Path $safeSourcePackagePath) -cne
+        $expectedSourcePackageName
+    ) {
+        throw "Installer source package fixture did not preserve the canonical release filename."
+    }
+    foreach ($invalidSourcePackagePath in @(
+            "",
+            "C:\Temp\Boundless.exe",
+            "C:\Temp\Boundless?.msi",
+            "C:\Temp\Boundless.msi:stream"
+        )) {
+        $invalidSourcePackageRejected = $false
+        try {
+            Get-BoundlessInstallerSourcePackageName `
+                -Path $invalidSourcePackagePath | Out-Null
+        }
+        catch {
+            $invalidSourcePackageRejected = $true
+        }
+        if (-not $invalidSourcePackageRejected) {
+            throw "Installer source package fixture accepted an unsafe path '$invalidSourcePackagePath'."
+        }
+    }
+
+    $sourcePackageFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        "BoundlessSourcePackageFixture-$([guid]::NewGuid().ToString('N'))"
+    )
+    $selfTestInstallerPath = Join-Path $sourcePackageFixtureRoot $expectedSourcePackageName
+    New-Item -ItemType Directory -Path $sourcePackageFixtureRoot -Force -ErrorAction Stop | Out-Null
+    Copy-Item -LiteralPath $PSCommandPath -Destination $selfTestInstallerPath -ErrorAction Stop
+    try {
+    $selfTestInstallerItem = Get-Item -LiteralPath $selfTestInstallerPath -Force
     $selfTestInstallerAnchor = [pscustomobject]@{
-        path = $PSCommandPath
-        sha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+        path = $selfTestInstallerPath
+        sha256 = (Get-FileHash -LiteralPath $selfTestInstallerPath -Algorithm SHA256).Hash
         length = [int64]$selfTestInstallerItem.Length
         last_write_utc_ticks = [int64]$selfTestInstallerItem.LastWriteTimeUtc.Ticks
         product_version = "5.0.13"
@@ -9881,7 +9942,7 @@ public static class BoundlessInstallNativeMethods
     }
     $selfTestPhaseId = [guid]::NewGuid().ToString('N')
     $elevatedCommandArgs = @{
-        ResolvedInstallerPath = $PSCommandPath
+        ResolvedInstallerPath = $selfTestInstallerPath
         Sid = $validSid
         InstallerAnchor = $selfTestInstallerAnchor
         CancellationEventName = ""
@@ -9909,6 +9970,7 @@ public static class BoundlessInstallNativeMethods
     if (
         $elevatedCommand.helper_sha256 -ne $script:BoundlessHelperStartupAnchor.sha256 -or
         $elevatedCommand.installer_sha256 -ne $selfTestInstallerAnchor.sha256 -or
+        $elevatedCommand.installer_source_package_name -cne $expectedSourcePackageName -or
         -not $elevatedCommand.log_requested -or
         [IO.Path]::GetFileName($elevatedCommand.staged_log_path) -ne "Boundless-install.log"
     ) {
@@ -9966,6 +10028,8 @@ public static class BoundlessInstallNativeMethods
         $decodedElevatedCommand -notmatch 'BoundlessInstaller-' -or
         $decodedElevatedCommand -notmatch 'PSObject\.BaseObject' -or
         $decodedElevatedCommand -notmatch 'Staged helper hash mismatch' -or
+        $decodedElevatedCommand -notmatch 'Join-Path \$stageRoot \$sourcePackageName' -or
+        $decodedElevatedCommand -match 'Join-Path \$stageRoot "Boundless\.msi"' -or
         $decodedElevatedCommand -notmatch 'BE='
     ) {
         throw "Elevated command fixture did not enforce immutable helper/MSI staging."
@@ -9976,6 +10040,16 @@ public static class BoundlessInstallNativeMethods
     Invoke-BoundlessHardCancelBeforeMsiRecoveryFixture `
         -Source $decodedElevatedCommand `
         -UserSid $currentIdentitySid
+    }
+    finally {
+        if (Test-Path -LiteralPath $sourcePackageFixtureRoot) {
+            Remove-Item `
+                -LiteralPath $sourcePackageFixtureRoot `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
+    }
 
     $msiPropertyFixture = "skipped"
     if (-not [string]::IsNullOrWhiteSpace($InstallerPath)) {
@@ -10069,6 +10143,7 @@ public static class BoundlessInstallNativeMethods
         elevated_error_trap_fixture = "passed"
         helper_startup_anchor_fixture = "passed"
         installer_anchor_fixture = "passed"
+        installer_source_package_name_fixture = "passed"
         caller_privilege_log_handoff_fixture = "passed"
         msi_property_fixture = $msiPropertyFixture
     } | ConvertTo-Json -Depth 3

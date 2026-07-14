@@ -567,6 +567,8 @@ The v5.0.15 packaging pass reproduced two concrete examples. First, the owned-pr
 
 The subsequent v5.0.15 release attempts exposed three more harness defects only after merge: the elevated helper lost the native root-process exit code, its serialized parent result omitted a strict-mode field, and `installer-smoke.ps1` rejected valid CRLF-delimited helper evidence even though the helper had installed 5.0.15 and restored service/API health. The approved first migration slice therefore keeps the release gate intact while moving two checks earlier: deterministic helper-evidence parser fixtures under Windows PowerShell and PowerShell 7 in the existing fast packaging job, plus a PR-only hosted MSI lane for installer-relevant changes that builds the candidate and runs the real N-1 upgrade, repair, health, and uninstall contract. This slice is intentionally additive and reversible; it does not claim the 30-run inventory or authorize deletion of existing workflows.
 
+The first PR execution of that hosted lane caught a fourth defect before merge: the elevated helper renamed the protected staged MSI to `Boundless.msi`, so Windows Installer registered that source package name while the repair check supplied the versioned release artifact and failed with `SECUREREPAIR`/1603. Preserving the validated release filename inside the immutable stage fixes the product source contract while retaining the existing ACL, hash, cleanup, and elevation boundaries.
+
 ### Scope
 
 This is an analysis and migration-design story before workflow changes:
