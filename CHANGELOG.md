@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.0.15](https://github.com/bestlux/boundless/compare/v5.0.14...v5.0.15) (2026-07-14)
+
+
+### Features
+
+* **input:** add explicit elevated application control ([#143](https://github.com/bestlux/boundless/issues/143)) ([0c849a6](https://github.com/bestlux/boundless/commit/0c849a672f8ba8b80e0b6ecfcb35af6159e3768f))
+
 ## [5.0.14](https://github.com/bestlux/boundless/compare/v5.0.13...v5.0.14) (2026-07-11)
 
 
