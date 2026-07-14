@@ -325,9 +325,10 @@ if (
     $invokeMsiSource -notmatch 'TreeJobName' -or
     $invokeMsiSource -notmatch 'TreeClosureState' -or
     $invokeMsiSource -notmatch 'HardKillRecoveryAction' -or
-    $invokeMsiSource -notmatch 'Restore-BoundlessServiceAfterHardKilledElevatedInstall'
+    $invokeMsiSource -notmatch 'Restore-BoundlessServiceAfterHardKilledElevatedInstall' -or
+    $invokeMsiSource -notmatch '(?m)^\s*input_injector_shutdown\s*=\s*\$null\s*$'
 ) {
-    throw "Installer parent must supervise elevation/tree completion, hard-kill recovery, and completed staged-log handoff."
+    throw "Installer parent must supervise elevation/tree completion, hard-kill recovery, completed staged-log handoff, and the cross-elevation input injector result schema."
 }
 $supervisedInstallSource = Get-PowerShellFunctionSource `
     -Path $installScript `
