@@ -71,6 +71,37 @@ function Get-MsiColumnValues {
     }
 }
 
+function Get-MsiRows {
+    param(
+        [__ComObject]$Database,
+        [string]$Sql,
+        [int]$ColumnCount,
+        [string]$VariableName
+    )
+
+    $view = $Database.OpenView($Sql)
+    try {
+        $view.Execute()
+        $rows = @()
+        while ($true) {
+            $record = $view.Fetch()
+            if ($null -eq $record) {
+                break
+            }
+
+            $values = @()
+            for ($index = 1; $index -le $ColumnCount; $index++) {
+                $values += $record.StringData($index)
+            }
+            $rows += [pscustomobject]@{ values = $values }
+        }
+        Set-Variable -Name $VariableName -Value $rows -Scope Script
+    }
+    finally {
+        $view.Close()
+    }
+}
+
 function Assert-Equals {
     param(
         [string]$Actual,
@@ -176,6 +207,30 @@ if ($file[0] -notmatch '(^|[|])boundless-service\.exe$') {
 }
 Assert-Equals -Actual $file[1] -Expected "BoundlessServicePayloadComponent" -Label "File.Component_"
 
+Set-MsiSingleRow -Database $database -Sql "SELECT Directory_, KeyPath FROM Component WHERE Component = 'BoundlessInputInjectorPayloadComponent'" -ColumnCount 2 -Label "input injector Component" -VariableName "inputInjectorComponent"
+Assert-Equals -Actual $inputInjectorComponent[0] -Expected "INSTALLDIR" -Label "InputInjector.Component.Directory_"
+Assert-Equals -Actual $inputInjectorComponent[1] -Expected "InputInjectorBinaryFile" -Label "InputInjector.Component.KeyPath"
+
+Set-MsiSingleRow -Database $database -Sql "SELECT FileName, Component_ FROM File WHERE File = 'InputInjectorBinaryFile'" -ColumnCount 2 -Label "input injector File" -VariableName "inputInjectorFile"
+if ($inputInjectorFile[0] -notmatch '(^|[|])boundless-input-injector\.exe$') {
+    throw "InputInjectorBinaryFile does not install boundless-input-injector.exe: $($inputInjectorFile[0])"
+}
+Assert-Equals -Actual $inputInjectorFile[1] -Expected "BoundlessInputInjectorPayloadComponent" -Label "InputInjectorFile.Component_"
+
+Get-MsiRows -Database $database -Sql 'SELECT * FROM `Wix4CloseApplication`' -ColumnCount 9 -VariableName "closeApplicationRows"
+$closeApplicationRows = @($closeApplicationRows)
+$inputInjectorCloseRows = @($closeApplicationRows | Where-Object { $_.values[0] -eq "CloseBoundlessInputInjector" })
+if ($inputInjectorCloseRows.Count -ne 1) {
+    throw "Expected exactly one CloseBoundlessInputInjector row, found $($inputInjectorCloseRows.Count)."
+}
+$inputInjectorClose = $inputInjectorCloseRows[0].values
+Assert-Equals -Actual $inputInjectorClose[1] -Expected "boundless-input-injector.exe" -Label "InputInjectorClose.Target"
+Assert-Equals -Actual $inputInjectorClose[2] -Expected "Boundless elevated input injector" -Label "InputInjectorClose.Description"
+if ((([int]$inputInjectorClose[4]) -band 32) -eq 0) {
+    throw "CloseBoundlessInputInjector must suppress a restart prompt. Attributes=$($inputInjectorClose[4])"
+}
+Assert-Equals -Actual $inputInjectorClose[7] -Expected "1" -Label "InputInjectorClose.TerminateExitCode"
+
 Set-MsiSingleRow -Database $database -Sql "SELECT FileName, Component_ FROM File WHERE File = 'InstallHelperScriptFile'" -ColumnCount 2 -Label "install helper File" -VariableName "installHelperFile"
 if ($installHelperFile[0] -notmatch '(^|[|])Boundless-Install\.ps1$') {
     throw "InstallHelperScriptFile does not install Boundless-Install.ps1: $($installHelperFile[0])"
@@ -213,6 +268,10 @@ $summary = [ordered]@{
     service_component = $serviceInstall[7]
     service_control_event = [int]$serviceControl[1]
     service_binary_file = $file[0]
+    input_injector_component = "BoundlessInputInjectorPayloadComponent"
+    input_injector_binary_file = $inputInjectorFile[0]
+    input_injector_close_target = $inputInjectorClose[1]
+    input_injector_close_terminate_exit_code = [int]$inputInjectorClose[7]
     install_helper_file = $installHelperFile[0]
     daemon_status_fixture_file = $statusFixtureFile[0]
     install_directory_parent = $installDir[0]

@@ -239,6 +239,7 @@ fn named_pipe_client_identity(server: &NamedPipeServer) -> ControlClientIdentity
 
     let mut process_id = 0_u32;
     if unsafe { GetNamedPipeClientProcessId(handle, &mut process_id) } != 0 {
+        identity.process_id = Some(process_id);
         match process_id_user_sid_string(process_id) {
             Ok(user_sid) => identity.user_sid = Some(user_sid),
             Err(error) => {

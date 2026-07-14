@@ -11,7 +11,8 @@
     "tray": "boundlesstray.exe",
     "daemon": "boundlessd.exe",
     "service": "boundless-service.exe",
-    "cli": "boundlessctl.exe"
+    "cli": "boundlessctl.exe",
+    "input_injector": "boundless-input-injector.exe"
   },
   "scripts": {
     "install": "Boundless-Install.ps1",

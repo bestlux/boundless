@@ -40,6 +40,7 @@ pub(super) fn test_app() -> DashboardApp {
         activation_requested: Arc::new(AtomicBool::new(false)),
         _single_instance_guard: None,
         _input_broker_supervisor: None,
+        elevated_input_controller: None,
         layout_grid: HashMap::new(),
         layout_unassigned: Vec::new(),
         layout_initialized: false,
@@ -155,6 +156,9 @@ pub(super) fn sample_first_run_snapshot() -> UiSnapshot {
             capture_backend_mode: "windows_hooks".to_string(),
             pending_inject_frames: 0,
             pending_inject_high_water: 0,
+        },
+        clipboard_runtime: UiClipboardRuntime {
+            backend_mode: "direct".to_string(),
         },
     }
 }

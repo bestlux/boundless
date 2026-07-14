@@ -58,6 +58,41 @@ Protocol 4.4 is an intentional clean break for the expanded keyboard/input contr
 
 ---
 
+## v5.0.15 elevated-input train (code complete; release and installed evidence pending)
+
+The next dogfood build is one coherent privileged-input and recovery train. The source, tests, MSI lifecycle, and release gates are implemented; the published 5.0.15 artifact plus installed UAC/two-PC evidence remain pending. It does not reopen unrelated network, firewall, layout, or transport work:
+
+| story | candidate status and primary commits | remaining boundary |
+| --- | --- | --- |
+| BND-NEXT-44 | Code complete: 597f385, be566e9, 4b3ac03, 3b1802e, 466921a. The explicit helper, minimal authenticated injection surface, atomic uncertain-delivery reset, crash cleanup, UI control, MSI lifecycle, and N-1 release gate are implemented. | Publish 5.0.15, then prove ordinary same-user elevated Terminal/IDE/Task Manager control in both directions. No secure desktop, lock screen, Winlogon, alternate-admin credentials, elevated tray/daemon, or general privileged command channel. |
+| BND-NEXT-34 | The bounded injector capability/reason slice is code complete in 6c33b04 and be566e9. | The full generic per-stage telemetry vocabulary and sustained-input trace remain open. |
+| BND-NEXT-24 | The tray, CLI, snapshot, and diagnostics now distinguish input, clipboard, and elevated-injector health in be566e9. | Installed degraded-state and Paint size/fault evidence remain open; no clipboard spooling, Explorer-file semantics, or peer-transport expansion. |
+| BND-NEXT-31 / BND-NEXT-38 | Injector integration now preserves single-owner routing, bounded shutdown, held-input release, uncertain-delivery quarantine, helper-crash recovery, and direct-lane fail-open behavior in be566e9, 4b3ac03, and 3b1802e. | Installed Quit/relaunch, helper-crash, emergency-unlock, and next-handoff evidence remain required. |
+
+For this one-user dogfood train, an explicitly user-enabled `requireAdministrator` injector may ship unsigned as an experimental fallback when all of the following are true:
+
+- the canonical MSI installs and owns it under `%ProgramFiles%\Boundless`;
+- the user launches or enables it through an explicit action and Windows shows the expected **Unknown Publisher** UAC prompt;
+- both the allowed user and target elevation use the same split-token administrator account;
+- tray, CLI, and diagnostics label the capability `unsigned dogfood` rather than trusted or production-ready; and
+- cancellation, sign-in, tray relaunch, injector crash, service restart, and automatic retry never generate another elevation prompt until the user explicitly asks again.
+
+This exception does not permit UIAccess. Trusted Authenticode signing remains mandatory before setting `uiAccess=true`, authenticating a publisher as part of the security boundary, or making a polished/trusted-publisher elevated-input claim. It also does not expand support to UAC consent or credential desktops, lock screen, Winlogon, other user sessions, or standard-user-to-alternate-admin control.
+
+The first installed v5.0.15 pass should absorb the existing evidence debt rather than require a separate v5.0.14 dogfood cycle. In addition to BND-NEXT-44, run the still-open physical or installed checks for BND-NEXT-23, BND-NEXT-24, BND-NEXT-29 item 3, BND-NEXT-31, BND-NEXT-35, and BND-NEXT-37 through BND-NEXT-42. Those stories remain code-complete, partial, or open exactly as recorded below until evidence exists.
+
+### Ranked work after v5.0.15
+
+1. BND-NEXT-27 plus BND-NEXT-28: make trust reset a first-class product flow and remove parser-dependent automation.
+2. BND-NEXT-20E: self-heal and explain one-way discovery on the routed dogfood topology.
+3. BND-NEXT-21: add the separately approved installer-owned Private/LocalSubnet firewall policy.
+4. BND-NEXT-33B then BND-NEXT-33C: define and converge automatic one-to-three-PC layouts; run BND-NEXT-33A design exploration in parallel and start BND-NEXT-33D only after a direction is approved.
+5. Complete the generic BND-NEXT-34 telemetry contract, then take BND-NEXT-43 as its own continuously-readable transport refactor.
+6. Complete the BND-NEXT-32 CI/CD analysis before changing workflows; do not mix workflow migration into the signing and injector release gate.
+7. Keep BND-NEXT-22, BND-NEXT-36, and BND-NEXT-30 behind the reliability and product-flow work above.
+
+---
+
 ## BND-NEXT-24 (P0, in progress): Isolate service-mode clipboard failures and carry policy-valid images
 
 Status: the broker-isolation and policy-valid IPC path shipped in v5.0.13, but the explicit degraded-state tray/CLI UX and installed service-mode Paint matrix remain open.
@@ -296,6 +331,45 @@ BND-NEXT-34 owns durable bounded stage counters. This story may use temporary ta
 
 ---
 
+## BND-NEXT-44 (P0, target v5.0.15; experimental unsigned dogfood exception): Control ordinary elevated applications without elevating the tray
+
+**Category:** bug
+
+Status: code complete for the bounded v5.0.15 candidate in 597f385, be566e9, 4b3ac03, 3b1802e, and 466921a; release workflow and installed evidence are pending. This is the ordinary elevated-window slice of the older BND-NEXT-9C parity gap. The one-user dogfood policy permits an explicitly enabled, MSI-owned, unsigned `requireAdministrator` injector with an **Unknown Publisher** UAC prompt and truthful `unsigned dogfood` status. Trusted Windows code signing and a written policy decision remain mandatory for UIAccess or a polished/trusted-publisher claim. The published v5.0.14 MSI is unsigned, its release logs show signing was skipped, and no `WINDOWS_SIGN_*` repository variables are configured.
+
+### Context and evidence
+
+The user cannot interact with a peer while the peer's focused application is running as Administrator, including an elevated terminal or IDE. Mouse and keyboard control appear unavailable until focus returns to a normal-integrity window, so the user must reach for the peer's physical hardware. The current service-mode path intentionally runs capture and `SendInput` injection inside the normal user-session tray broker and documents support for the normal unlocked desktop only. Windows UIPI blocks that medium-integrity process from injecting into a high-integrity foreground process.
+
+Elevating the entire tray is not an acceptable fix. It would give the dashboard, clipboard handling, update/service controls, and other broad UI code an administrator token, complicate sign-in startup, and introduce recurring UAC or scheduled-task behavior. A manifest-only `uiAccess=true` change is also insufficient: Windows requires the UIAccess executable to be trusted-signed and installed in a protected location such as Program Files. Microsoft formally scopes UIAccess to assistive-technology scenarios and documents that a non-administrator user's medium-plus UIAccess token still cannot drive high-integrity applications, so the mechanism must be proven and policy-reviewed for Boundless's split-token administrator dogfood case before it becomes the product contract.
+
+### Implementation slices
+
+1. **44A — prove the elevation mechanism and signing boundary.** Build a minimal Program Files-installed proof helper and measure its actual token/injection behavior on the supported Windows versions. The immediate dogfood fallback is a dedicated unsigned `requireAdministrator` input helper launched only by an explicit user action with one cancellable **Unknown Publisher** UAC consent. Prefer `uiAccess=true` only after a trusted Authenticode identity is configured, a written product-policy review accepts that use, and the split-token administrator dogfood case reaches same-user elevated Terminal/IDE windows without elevating the tray. Record standard-user-to-alternate-admin as unsupported unless separately proven. Neither path may use an elevated tray, automatic sign-in prompt, retry-on-crash prompt, or LocalSystem-spawned interactive process.
+2. **44B — deepen the injector module.** Move only incoming `SendInput` injection and remote held-input cleanup into the small dedicated user-session executable. Keep physical input capture, edge lock/emergency detection, clipboard observation/parsing, network, peer trust, routing, settings, updates, and dashboard ownership in the unelevated tray/service boundaries unless 44A proves a specific Windows constraint that requires a narrowly reviewed exception. Give the privileged channel a minimal input-record/release contract rather than a general-purpose command surface. Always bind it server-side to the actual connecting process token, PID/session, canonical MSI-owned image path, and an unguessable per-launch attachment handshake; when signing is configured, additionally require the trusted Authenticode chain/publisher. Never authorize from client-reported identity alone.
+3. **44C — package and prove the installed lifecycle.** Install the injector only under `%ProgramFiles%\Boundless` and own at most one injector alongside exactly one existing tray broker per allowed interactive user session. Give the tray-broker lease and injector attachment distinct identities and teardown rules. Tray launch, replacement, Quit, service restart, upgrade, session disconnect, and injector crash must preserve BND-NEXT-31 lifecycle and BND-NEXT-38 fail-open behavior. Report active, `unsigned dogfood`, unsigned/misinstalled outside the approved exception, wrong desktop/session, and unhealthy states truthfully. Make manifest intent, protected path, token capability, and elevated-window smoke hard gates for the experimental path; add trusted signature and publisher gates before enabling UIAccess or making a polished/trusted-publisher claim.
+
+### Acceptance criteria
+
+- From either dogfood PC's split-token administrator account, remote mouse movement, clicks, wheel/trackpad input, normal typing, shortcuts, and numpad input work in same-user Administrator-launched Terminal, IDE, Task Manager, and simple test windows on the other PC.
+- The tray remains at the user's normal integrity level and never gains an administrator token or a highest-privilege scheduled task. An accepted, trusted-signed UIAccess path starts without UAC; the high-integrity dogfood fallback presents at most one explicit, cancellable **Unknown Publisher** UAC prompt for the injector alone and reports cancellation without retrying.
+- Runtime evidence confirms the dedicated injector's effective integrity/elevation mechanism, expected allowed-user SID/session, executable path under the MSI-owned Program Files directory, and signing classification. A UIAccess implementation specifically proves `TokenUIAccess=1` and a trusted signature. The experimental high-integrity fallback explicitly reports `unsigned dogfood`, acknowledges its full administrator token, and proves the executable exposes and uses only the minimal injection-and-release surface.
+- The sole unsigned exception is the explicitly enabled `requireAdministrator` dogfood injector at the canonical MSI-owned Program Files path for the same split-token administrator. An unsigned image elsewhere, a tampered or user-writable image, wrong publisher when signing is required, wrong user, wrong session, duplicate, stale, or handshake-mismatched injector/client is rejected or reported unavailable without degrading normal-window input or spawning a retry storm. Tests prove identity is derived from the actual pipe/process/token/image, not request fields.
+- Emergency Double-Control, tray-broker lease expiry, injector attachment loss, input disable/re-enable, Quit/relaunch, service restart, and upgrade all release held input and recover the next normal or elevated-window handoff.
+- The UAC consent/credential screen, Windows lock screen, Winlogon desktop, and other user sessions are never presented as supported. Encountering a desktop boundary fails open to local control and records one bounded, content-free reason.
+- A true standard-user source or target that supplies alternate administrator credentials is reported unsupported unless a separate matrix proves it; passing the split-token administrator dogfood case must not broaden the public claim.
+- A high-integrity fallback never produces unsolicited UAC at sign-in, tray relaunch, injector crash, service restart, or automatic retry. Declining or cancelling elevation latches the capability unavailable until the user explicitly asks again, while normal-window input remains available.
+- Installer and release validation prove manifest intent, protected install location, one-tray-broker/at-most-one-injector lifecycle, distinct leases, token capability, elevated-window injection, clean repair/upgrade/uninstall, and accurate degraded-state reporting. Experimental artifacts must prove and display the unsigned classification; UIAccess and polished/trusted-publisher artifacts must additionally prove Authenticode trust.
+- The installed two-PC matrix passes in both directions with a normal target window, an Administrator-launched target window, and a return to the normal desktop after a UAC prompt is completed locally.
+
+### Dependencies and scope boundary
+
+The one-user dogfood exception allows the explicit unsigned `requireAdministrator` fallback to ship without a trusted certificate, but only with **Unknown Publisher** consent and `unsigned dogfood` status. Configuring a trusted Windows signing certificate and making signature/publisher verification mandatory remain prerequisites for UIAccess and any polished/trusted-publisher elevated-input claim. Reuse BND-NEXT-31 for tray-broker single-owner lifecycle, BND-NEXT-38 for fail-open recovery, and the narrow v5.0.15 slice of BND-NEXT-34 for bounded capability/failure telemetry; BND-NEXT-44 separately owns injector attachment/lifecycle.
+
+Do not elevate the whole tray or daemon, have LocalSystem silently spawn a high/System interactive helper, add a generic remote-administration channel, bypass UAC, inject into the secure desktop, change UAC policy, control the lock screen, or broaden access beyond the MSI-selected allowed user and current interactive session. Those secure-desktop/Winlogon claims remain a separate evidence and security-design slice under BND-NEXT-9C.
+
+---
+
 ## BND-NEXT-40 (P1, v5.0.14 candidate needs physical evidence): Preserve numeric-keypad and Num Lock semantics across handoff
 
 **Category:** bug
@@ -332,7 +406,7 @@ The confirmed loss is source logical Num Lock meaning for ambiguous non-E0 keypa
 
 ---
 
-## BND-NEXT-27 (P1, top active priority): Trust rotation and reset as a first-class product flow
+## BND-NEXT-27 (P1, next ranked after v5.0.15): Trust rotation and reset as a first-class product flow
 
 ### Context and evidence
 
@@ -486,6 +560,8 @@ Targeted tray/platform tests; `scripts/dev/installer-smoke.ps1` process-count co
 ### Context and evidence
 
 Boundless currently has one active user and is iterating through private two-PC dogfood rather than supporting a broad public release population. CI and release work have accumulated multiple workflows, release paths, PowerShell harnesses, platform-specific gates, and recovery fixes. Recent releases succeeded, but repeated workflow and installer-validation hiccups made routine iteration expensive and obscured which checks protect a real product risk versus historical process complexity. The desired outcome is not maximum automation; it is a small, legible system that gives fast feedback during development and preserves the few Windows/release proofs that matter.
+
+The v5.0.15 packaging pass reproduced two concrete examples. First, the owned-process-tree self-test reported a descendant as running immediately after the Windows job signaled an empty tree, while the PID was already absent on inspection; 466921a adds bounded process-object convergence. Second, hosted CI could not cold-start a synthetic recovery PowerShell process inside the fixture's artificial 300 ms allowance; abc0af2 keeps the production timeout unchanged, widens only the fixture boundary, and emits condition-level diagnostics. These local flake fixes do not replace the broader current-state analysis or authorize workflow consolidation without evidence.
 
 ### Scope
 
@@ -697,5 +773,5 @@ Do not start before the P0/P1 stories above land; write the full implementation 
 ## Deliberately not in this backlog
 
 - Relay/cloud transport, QUIC/iroh/libp2p migrations: the 2026-07-07 evidence shows direct TCP with role reversal satisfies the LAN dogfood; revisit only per the decision gates in the one-sided-reachability doc.
-- Clipboard image streaming/spooling, lock-screen/elevated-app service parity, mixed-DPI matrix: tracked as explicit gaps in [project-status.md](project-status.md); they need dedicated evidence-driven slices, not backlog stubs.
+- Clipboard image streaming/spooling, secure-desktop/lock-screen control beyond BND-NEXT-44, and the mixed-DPI matrix: tracked as explicit gaps in [project-status.md](project-status.md); they need dedicated evidence-driven slices, not backlog stubs.
 - Broader file-transfer UX beyond BND-NEXT-36’s one-file tracer bullet: folders, multiple files, network paths, resumable transfer, and richer shell integration remain deferred until the P0/P1 clipboard and broker work is proven.

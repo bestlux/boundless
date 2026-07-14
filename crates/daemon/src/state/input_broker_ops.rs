@@ -66,10 +66,14 @@ pub struct InputBrokerExchangeObservations {
     pub inject_failure_count: u32,
     pub inject_backpressure: bool,
     pub acked_inject_batch_id: u64,
+    pub failed_inject_batch_id: u64,
     pub held_input_authorization_generation: u64,
     pub raw_device_wheel_event_count: u32,
     pub raw_system_wheel_event_count: u32,
     pub hook_wheel_event_count: u32,
+    pub elevated_injector_state: String,
+    pub elevated_injector_reason: String,
+    pub elevated_injector_signature_trust: String,
 }
 
 /// Identity of the caller as verified by the transport layer (named-pipe
@@ -295,6 +299,24 @@ impl AppState {
         delivery_epoch: &str,
         acked_inject_batch_id: u64,
     ) -> bool {
+        self.detach_input_broker_with_reset(
+            verified_client,
+            broker_token,
+            delivery_epoch,
+            acked_inject_batch_id,
+            false,
+        )
+        .await
+    }
+
+    pub async fn detach_input_broker_with_reset(
+        &self,
+        verified_client: Option<InputBrokerClientIdentity>,
+        broker_token: &str,
+        delivery_epoch: &str,
+        acked_inject_batch_id: u64,
+        reset_input_session: bool,
+    ) -> bool {
         if let Some(reason) = self.input_broker_client_rejection(&verified_client) {
             self.record_input_broker_rejection("detach", reason).await;
             return false;
@@ -316,14 +338,40 @@ impl AppState {
             }
         };
         if detached {
+            let uncertain_batch = reset_input_session
+                .then(|| self.input_broker.inflight_inject_batch())
+                .flatten();
+            let mut affected_peers = uncertain_batch
+                .as_ref()
+                .map(|batch| {
+                    batch
+                        .frames
+                        .iter()
+                        .map(|frame| frame.peer_id.clone())
+                        .collect::<HashSet<_>>()
+                })
+                .unwrap_or_default();
+            if reset_input_session && affected_peers.is_empty() {
+                affected_peers.extend(
+                    self.config
+                        .read()
+                        .await
+                        .peers
+                        .iter()
+                        .filter(|peer| peer.connected)
+                        .map(|peer| peer.peer_id.clone()),
+                );
+            }
             let unacked_inject_frames = self.input_broker.take_inflight_inject_frames();
             // The daemon owns delivery until the tray acknowledges a batch.
             // A cooperative detach/replacement therefore returns every
             // unacknowledged frame to the queue before a new broker can drain.
             // A hard daemon-process crash remains the explicit durability
             // boundary; these in-memory input frames are not persisted.
-            self.requeue_pending_inject_input_frames_front(unacked_inject_frames)
-                .await;
+            if !reset_input_session {
+                self.requeue_pending_inject_input_frames_front(unacked_inject_frames)
+                    .await;
+            }
             let release_events = self.input_broker.drain_release_events();
             let release_event_count = release_events.len();
             if let Some(peer_id) = capture_target.as_deref()
@@ -332,20 +380,71 @@ impl AppState {
                 let _ = self.queue_input_events(peer_id, release_events).await;
             }
             self.clear_input_capture_target().await;
-            let released_owner = if let Some(peer_id) = self.input_owner().await {
-                self.release_input_owner(&peer_id).await
-            } else {
-                false
+            let released_owner = {
+                let mut authorization = self.input.control.authorization.write().await;
+                let incoming_owner = authorization.owner().map(str::to_string);
+                if reset_input_session {
+                    if affected_peers.is_empty()
+                        && let Some(peer_id) = incoming_owner.as_ref()
+                    {
+                        affected_peers.insert(peer_id.clone());
+                    }
+                    authorization.quarantine_auto_claim_peers(affected_peers.iter().cloned());
+                }
+                let release_current_owner = !reset_input_session
+                    || incoming_owner
+                        .as_ref()
+                        .is_some_and(|peer_id| affected_peers.contains(peer_id));
+                release_current_owner
+                    && incoming_owner
+                        .as_deref()
+                        .is_some_and(|peer_id| authorization.release_owner(peer_id))
             };
+            if released_owner {
+                self.notify_input_owner_transition();
+            }
             self.set_input_lock_runtime(false, false).await;
             self.requeue_broker_clipboard_inflight().await;
+            if reset_input_session {
+                let affected_peer = match affected_peers.len() {
+                    0 => "none".to_string(),
+                    1 => affected_peers
+                        .iter()
+                        .next()
+                        .cloned()
+                        .unwrap_or_else(|| "none".to_string()),
+                    _ => "multiple".to_string(),
+                };
+                self.record_transport_event(TransportEventRecord {
+                    timestamp: Utc::now(),
+                    direction: "local".to_string(),
+                    kind: "elevated_injector_delivery_uncertain".to_string(),
+                    peer_id: affected_peer,
+                    detail: format!(
+                        "reason=session_reset batch_id={} frame_count={} affected_peer_count={}",
+                        uncertain_batch.as_ref().map_or(0, |batch| batch.batch_id),
+                        uncertain_batch
+                            .as_ref()
+                            .map_or(0, |batch| batch.frames.len()),
+                        affected_peers.len()
+                    ),
+                    size_bytes: uncertain_batch
+                        .as_ref()
+                        .map_or(0, |batch| batch.frames.len() as u64),
+                });
+            }
             self.record_transport_event(TransportEventRecord {
                 timestamp: Utc::now(),
                 direction: "local".to_string(),
                 kind: "input_broker_detached".to_string(),
                 peer_id: "none".to_string(),
                 detail: format!(
-                    "reason=broker_requested capture_target_cleared={} owner_released={released_owner} release_events={}",
+                    "reason={} capture_target_cleared={} owner_released={released_owner} release_events={}",
+                    if reset_input_session {
+                        "delivery_uncertain"
+                    } else {
+                        "broker_requested"
+                    },
                     capture_target.is_some(),
                     release_event_count
                 ),
@@ -519,6 +618,23 @@ impl AppState {
                 ..Default::default()
             };
         }
+        if let Some(status) = self.input_broker.observe_elevated_injector_status(
+            &observations.elevated_injector_state,
+            &observations.elevated_injector_reason,
+            &observations.elevated_injector_signature_trust,
+        ) {
+            self.record_transport_event(TransportEventRecord {
+                timestamp: Utc::now(),
+                direction: "local".to_string(),
+                kind: "elevated_injector_status_changed".to_string(),
+                peer_id: "none".to_string(),
+                detail: format!(
+                    "state={} reason={} signature_trust={}",
+                    status.state, status.reason, status.signature_trust
+                ),
+                size_bytes: 0,
+            });
+        }
         if observations.inject_failure_count > 0 {
             self.record_transport_event(TransportEventRecord {
                 timestamp: Utc::now(),
@@ -597,6 +713,47 @@ impl AppState {
         }
 
         let inflight_before_ack = self.input_broker.inflight_inject_batch();
+        if observations.failed_inject_batch_id != 0 && observations.acked_inject_batch_id != 0 {
+            return InputBrokerExchangeOutcome {
+                accepted: false,
+                message:
+                    "input broker cannot acknowledge and fail an inject batch in the same exchange"
+                        .to_string(),
+                ..Default::default()
+            };
+        }
+
+        if observations.failed_inject_batch_id != 0 {
+            match self
+                .input_broker
+                .fail_inflight_inject_batch(observations.failed_inject_batch_id)
+            {
+                Ok((batch, first_report)) => {
+                    if first_report {
+                        self.record_transport_event(TransportEventRecord {
+                            timestamp: Utc::now(),
+                            direction: "local".to_string(),
+                            kind: "elevated_injector_delivery_uncertain".to_string(),
+                            peer_id: "none".to_string(),
+                            detail: format!(
+                                "reason=delivery_uncertain batch_id={} frame_count={}",
+                                batch.batch_id,
+                                batch.frames.len()
+                            ),
+                            size_bytes: batch.frames.len() as u64,
+                        });
+                    }
+                }
+                Err(reason) => {
+                    return InputBrokerExchangeOutcome {
+                        accepted: false,
+                        message: format!("input broker inject failure report rejected: {reason}"),
+                        ..Default::default()
+                    };
+                }
+            }
+        }
+
         if observations.inject_backpressure && inflight_before_ack.is_none() {
             return InputBrokerExchangeOutcome {
                 accepted: false,

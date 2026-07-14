@@ -30,6 +30,8 @@ Skipped gates are never hidden. A release reviewer must either provide the missi
 - Installer-smoke summary freshness is checked from the evidence file timestamp by default. Evidence older than `-MaxEvidenceAgeHours` fails stable policy.
 - Service update evidence is MSI-owned by default with `-ServiceUpdateMode msi-owned`. `service-self-update` and `tray-self-update` are accepted only as explicit unsupported/deferred modes and fail readiness when selected.
 - Full-service installer coverage requires installer-smoke evidence for MSI-owned service registration, repair recovery, and uninstall cleanup. Missing repair or stale-service cleanup evidence blocks readiness.
+- When the package manifest declares `executables.input_injector`, readiness requires the installed helper at `%ProgramFiles%\Boundless\<declared-file>`, matching PE product version, `requireAdministrator`, `uiAccess=false`, and zero helper processes after tray startup, repair, and uninstall.
+- Input-injector signatures default to `-InputInjectorSignaturePolicy signed`, which accepts only `Valid`. A deliberately unsigned one-user build must opt in with `-InputInjectorSignaturePolicy unsigned-dogfood`; that exception accepts only `NotSigned` and is recorded in the packet.
 - N-1 MSI upgrade coverage requires a prior MSI path passed to installer smoke. The summary must prove both app payload and service payload replacement, Program Files ownership of the current payloads, and the active service path after upgrade. Missing prior-MSI coverage is recorded as skipped evidence, which fails `-Policy stable`.
 
 Physical two-machine performance labs are release evidence, not default PR gates. Keep them out of ordinary PR validation until the scenarios are stable, fast, non-disruptive, and supported by repeated real runs. Fixture packets may validate artifact shape, but real product scorecard thresholds stay provisional until at least two real two-PC runs exist for the scenario.
@@ -76,6 +78,17 @@ Release-blocking packet:
   -Policy stable
 ```
 
+Explicit unsigned dogfood packet:
+
+```powershell
+./scripts/dev/release-readiness.ps1 `
+  -InstallerSmokeSummaryPath artifacts/installer-validation/installer-smoke.json `
+  -InputInjectorSignaturePolicy unsigned-dogfood `
+  -Policy stable
+```
+
+The unsigned-dogfood option is an auditable exception for the current private dogfood lane. It does not accept invalid, hash-mismatched, revoked, or unknown signature states, and it is not evidence for a signed distribution claim.
+
 N-1 MSI upgrade evidence:
 
 ```powershell
@@ -94,6 +107,17 @@ N-1 MSI upgrade evidence:
 The service-version gate parses `boundless-service.exe --version` strictly as `boundless-service <version>`. For a stable release such as `v5.0.0`, the parsed service version must exactly equal `5.0.0`; substring matches, prerelease suffixes, empty output, and malformed output fail. If no installer-smoke summary is supplied, `service_version_parity` is recorded as skipped and `-RequireReady` blocks the packet.
 
 The `service_lifecycle_evidence` gate passes only when installer smoke summary evidence shows MSI-owned service registration, AutoStart LocalSystem config, a repair run that restores a deleted `BoundlessService` registration and daemon health, and uninstall cleanup that removes the service registration, Program Files install root, and Program Files service binary.
+
+The `input_injector_evidence` gate is present whenever `packaging/windows/package-manifest.json` declares `executables.input_injector`. It requires all of these installer-smoke summary fields:
+
+- `input_injector_path`: exact canonical Program Files path using the manifest file name.
+- `input_injector_signature`: `Valid`, or exactly `NotSigned` when the packet explicitly selects `unsigned-dogfood`.
+- `input_injector_product_version`: exact release version from the PE version resource.
+- `input_injector_execution_level`: exactly `requireAdministrator`.
+- `input_injector_ui_access`: exactly `false` (boolean or case-insensitive text).
+- `input_injector_count_after_tray_launch`, `input_injector_count_after_repair`, and `input_injector_count_after_uninstall`: integer zero.
+
+Missing or malformed fields fail closed. The process-count fields prove that install/startup/repair/uninstall do not launch or strand the elevated helper; they do not replace a focused, user-initiated elevated-input runtime smoke.
 
 The `n_minus_1_msi_upgrade` gate passes only when installer smoke summary evidence includes `upgraded_from`, `previous_install_exit_code = 0`, and `upgrade_payload_replacement` booleans proving app payload replacement, service payload replacement, Program Files ownership, and active service use of the current Program Files service binary. The supported prior artifact source is a GitHub Release MSI asset named `Boundless-<version>-windows-x64.msi`; the release workflow also stages the current Windows MSI under the `boundless-windows-x64` artifact before publish.
 

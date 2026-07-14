@@ -17,6 +17,9 @@ param(
     [string]$TrayPath,
 
     [Parameter(Mandatory = $true)]
+    [string]$InputInjectorPath,
+
+    [Parameter(Mandatory = $true)]
     [string]$OutputPath,
 
     [string]$WorkingDirectory = "",
@@ -72,6 +75,7 @@ else {
 $serviceBinary = Resolve-RequiredPath -Path $servicePathCandidate -Label "Service binary"
 $cliBinary = Resolve-RequiredPath -Path $CliPath -Label "CLI binary"
 $trayBinary = Resolve-RequiredPath -Path $TrayPath -Label "Tray binary"
+$inputInjectorBinary = Resolve-RequiredPath -Path $InputInjectorPath -Label "Input injector binary"
 $packageAssetRoot = Resolve-RequiredPath -Path (Join-Path $repoRoot "packaging\windows") -Label "Packaging asset root"
 $installerProject = Resolve-RequiredPath -Path (Join-Path $repoRoot "packaging\windows\installer\Boundless.Installer.wixproj") -Label "Installer project"
 $trayIconPath = Resolve-RequiredPath -Path (Join-Path $repoRoot "crates\tray\assets\app-icon.ico") -Label "Tray app icon"
@@ -107,6 +111,7 @@ Copy-Item -LiteralPath $daemonBinary -Destination (Join-Path $stageRoot "boundle
 Copy-Item -LiteralPath $serviceBinary -Destination (Join-Path $stageRoot "boundless-service.exe")
 Copy-Item -LiteralPath $cliBinary -Destination (Join-Path $stageRoot "boundlessctl.exe")
 Copy-Item -LiteralPath $trayBinary -Destination (Join-Path $stageRoot "boundlesstray.exe")
+Copy-Item -LiteralPath $inputInjectorBinary -Destination (Join-Path $stageRoot "boundless-input-injector.exe")
 Copy-Item -LiteralPath $trayIconPath -Destination (Join-Path $stageRoot "Boundless.ico")
 Copy-Item -LiteralPath $licensePath -Destination (Join-Path $stageRoot "LICENSE.txt")
 Copy-Item -LiteralPath $changeLogPath -Destination (Join-Path $stageRoot "CHANGELOG.md")

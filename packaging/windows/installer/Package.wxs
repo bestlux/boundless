@@ -34,6 +34,12 @@
       Description="Boundless daemon"
       RebootPrompt="no"
       TerminateProcess="1" />
+    <util:CloseApplication
+      Id="CloseBoundlessInputInjector"
+      Target="boundless-input-injector.exe"
+      Description="Boundless elevated input injector"
+      RebootPrompt="no"
+      TerminateProcess="1" />
     <Property Id="BOUNDLESSLEGACYSCRIPTINSTALL">
       <DirectorySearch Id="LegacyScriptInstallDirSearch" Path="[LocalAppDataFolder]Programs\Boundless">
         <FileSearch Id="LegacyScriptInstallFileSearch" Name="Boundless-Install.ps1" />
@@ -161,6 +167,12 @@
           Type="integer"
           Value="1"
           KeyPath="no" />
+      </Component>
+      <Component Id="BoundlessInputInjectorPayloadComponent" Guid="10929535-7B38-4BF9-86E3-8170BD2AEEFF">
+        <File
+          Id="InputInjectorBinaryFile"
+          Source="$(var.PayloadDir)\boundless-input-injector.exe"
+          KeyPath="yes" />
       </Component>
     </ComponentGroup>
   </Fragment>

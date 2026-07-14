@@ -1,0 +1,20 @@
+[package]
+name = "boundless-input-injector"
+version = "5.0.14"
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "boundless-input-injector"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+platform-windows = { path = "../platform-windows" }
+
+[build-dependencies]
+winres = "0.1.12"

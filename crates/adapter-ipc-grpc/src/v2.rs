@@ -819,10 +819,14 @@ impl ControlPlaneService for ControlPlaneApi {
                 inject_failure_count: request.inject_failure_count,
                 inject_backpressure: request.inject_backpressure,
                 acked_inject_batch_id: request.acked_inject_batch_id,
+                failed_inject_batch_id: request.failed_inject_batch_id,
                 held_input_authorization_generation: request.held_input_authorization_generation,
                 raw_device_wheel_event_count: request.raw_device_wheel_event_count,
                 raw_system_wheel_event_count: request.raw_system_wheel_event_count,
                 hook_wheel_event_count: request.hook_wheel_event_count,
+                elevated_injector_state: request.elevated_injector_state,
+                elevated_injector_reason: request.elevated_injector_reason,
+                elevated_injector_signature_trust: request.elevated_injector_signature_trust,
             })
             .await
             .map_err(|error| Status::internal(format!("exchange input broker: {error:#}")))?;
@@ -910,6 +914,7 @@ impl ControlPlaneService for ControlPlaneApi {
                 broker_token: request.broker_token,
                 delivery_epoch: request.delivery_epoch,
                 acked_inject_batch_id: request.acked_inject_batch_id,
+                reset_input_session: request.reset_input_session,
             })
             .await
             .map_err(|error| Status::internal(format!("detach input broker: {error:#}")))?;
@@ -1305,6 +1310,9 @@ fn map_input_runtime(snapshot: InputRuntimeSnapshot) -> InputRuntimeStatusReply 
         capture_backend_mode: snapshot.capture_backend_mode,
         pending_inject_frames: snapshot.pending_inject_frames as u32,
         pending_inject_high_water: snapshot.pending_inject_high_water as u32,
+        elevated_injector_state: snapshot.elevated_injector_state,
+        elevated_injector_reason: snapshot.elevated_injector_reason,
+        elevated_injector_signature_trust: snapshot.elevated_injector_signature_trust,
     }
 }
 
@@ -1392,6 +1400,27 @@ mod tests {
     use ipc_api::client_identity::ControlClientIdentity;
 
     #[test]
+    fn input_runtime_mapping_preserves_elevated_injector_status() {
+        let mapped = map_input_runtime(InputRuntimeSnapshot {
+            owner_peer_id: None,
+            configured_capture_target_peer_id: None,
+            active_capture_target_peer_id: None,
+            lock_active: false,
+            lock_supported: true,
+            capture_backend_mode: "user_session_broker".to_string(),
+            pending_inject_frames: 0,
+            pending_inject_high_water: 2,
+            elevated_injector_state: "active".to_string(),
+            elevated_injector_reason: "none".to_string(),
+            elevated_injector_signature_trust: "unsigned_dogfood".to_string(),
+        });
+
+        assert_eq!(mapped.elevated_injector_state, "active");
+        assert_eq!(mapped.elevated_injector_reason, "none");
+        assert_eq!(mapped.elevated_injector_signature_trust, "unsigned_dogfood");
+    }
+
+    #[test]
     fn transport_event_mapping_removes_clipboard_content() {
         const SECRET: &str = "BOUNDLESS_SECRET_SENTINEL_289193a4";
         let mapped = map_transport_event(TransportEventSnapshot {
@@ -1430,6 +1459,7 @@ mod tests {
         request.extensions_mut().insert(ControlClientIdentity {
             user_sid: Some("S-1-5-21-1-2-3-1001".to_string()),
             session_id: Some(2),
+            process_id: None,
         });
         let verified = verified_control_client(&request).expect("verified identity");
         assert_eq!(verified.user_sid.as_deref(), Some("S-1-5-21-1-2-3-1001"));

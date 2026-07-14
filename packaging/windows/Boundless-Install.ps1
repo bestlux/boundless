@@ -1111,6 +1111,116 @@ function Stop-BoundlessProcessBoundary {
     }
 }
 
+function Assert-BoundlessInputInjectorTargets {
+    param(
+        [object[]]$Processes,
+        [string]$ExpectedOwnerSid,
+        [int]$ExpectedSessionId,
+        [string]$ExpectedPath
+    )
+
+    foreach ($process in @($Processes)) {
+        if ($process.owner_sid -ne $ExpectedOwnerSid) {
+            throw "Input injector PID $($process.id) belonged to unexpected SID $($process.owner_sid)."
+        }
+        if ([int]$process.session_id -ne $ExpectedSessionId) {
+            throw "Input injector PID $($process.id) ran in unexpected session $($process.session_id); expected $ExpectedSessionId."
+        }
+        if (-not (Test-WindowsPathEqual -Left $process.path -Right $ExpectedPath)) {
+            throw "Input injector PID $($process.id) did not run from the MSI-owned Program Files path."
+        }
+    }
+    return @($Processes)
+}
+
+function Get-BoundlessInputInjectorTargets {
+    param(
+        [string]$ExpectedOwnerSid,
+        [int]$ExpectedSessionId,
+        [string]$ExpectedPath
+    )
+
+    $snapshot = @(
+        Get-Process -Name "boundless-input-injector" -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $processPath = try { $_.Path } catch { "" }
+                [pscustomobject]@{
+                    id = $_.Id
+                    session_id = $_.SessionId
+                    owner_sid = Get-ProcessOwnerSid -ProcessId $_.Id
+                    path = $processPath
+                    process = $_
+                }
+            }
+    )
+    return @(
+        Assert-BoundlessInputInjectorTargets `
+            -Processes $snapshot `
+            -ExpectedOwnerSid $ExpectedOwnerSid `
+            -ExpectedSessionId $ExpectedSessionId `
+            -ExpectedPath $ExpectedPath
+    )
+}
+
+function Stop-BoundlessInputInjectorBeforeMsi {
+    param(
+        [string]$ExpectedOwnerSid,
+        [int]$ExpectedSessionId,
+        [int]$GracefulTimeoutMilliseconds = 3500
+    )
+
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $expectedPath = Join-Path $env:ProgramFiles "Boundless\boundless-input-injector.exe"
+    $targets = @(Get-BoundlessInputInjectorTargets `
+        -ExpectedOwnerSid $ExpectedOwnerSid `
+        -ExpectedSessionId $ExpectedSessionId `
+        -ExpectedPath $expectedPath)
+    if ($targets.Count -eq 0) {
+        $finalTargets = @(Get-BoundlessInputInjectorTargets `
+            -ExpectedOwnerSid $ExpectedOwnerSid `
+            -ExpectedSessionId $ExpectedSessionId `
+            -ExpectedPath $expectedPath)
+        if ($finalTargets.Count -ne 0) {
+            throw "Input injector appeared during the bounded shutdown preflight."
+        }
+        return [pscustomobject]@{
+            initial_count = 0
+            elapsed_milliseconds = 0
+            force_kill_used = $false
+        }
+    }
+
+    $deadline = (Get-Date).AddMilliseconds($GracefulTimeoutMilliseconds)
+    do {
+        $remaining = @(
+            $targets |
+                Where-Object { $null -ne (Get-Process -Id $_.id -ErrorAction SilentlyContinue) }
+        )
+        if ($remaining.Count -eq 0) {
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    } while ((Get-Date) -lt $deadline)
+
+    $forceKillUsed = $remaining.Count -gt 0
+    foreach ($target in $remaining) {
+        Stop-BoundlessProcessBoundary -Process $target.process -TimeoutMilliseconds 2000
+    }
+    $finalTargets = @(Get-BoundlessInputInjectorTargets `
+        -ExpectedOwnerSid $ExpectedOwnerSid `
+        -ExpectedSessionId $ExpectedSessionId `
+        -ExpectedPath $expectedPath)
+    if ($finalTargets.Count -ne 0) {
+        throw "Input injector shutdown left $($finalTargets.Count) process(es) after the bounded stop."
+    }
+    $stopwatch.Stop()
+    return [pscustomobject]@{
+        initial_count = $targets.Count
+        elapsed_milliseconds = $stopwatch.ElapsedMilliseconds
+        force_kill_used = $forceKillUsed
+    }
+}
+
 function Throw-BoundlessMsiFailure {
     param(
         [string]$Message,
@@ -4477,6 +4587,9 @@ function Invoke-ElevatedInstallPhase {
         # The request and status polling are bounded independently. A blocked
         # ServiceController call remains inside an owned child process tree that is
         # drained before this function can return or allow MSI to start.
+        $inputInjectorShutdown = Stop-BoundlessInputInjectorBeforeMsi `
+            -ExpectedOwnerSid $Sid `
+            -ExpectedSessionId ([Diagnostics.Process]::GetCurrentProcess().SessionId)
         $serviceShutdown = Stop-BoundlessServiceBeforeMsi `
             -InitialRunningEvent $serviceInitialRunning
         $msiArgs = @{
@@ -4499,6 +4612,7 @@ function Invoke-ElevatedInstallPhase {
             status = "passed"
             msi_exit_code = $exitCode
             service_shutdown = $serviceShutdown
+            input_injector_shutdown = $inputInjectorShutdown
             installer_stage = [pscustomobject]@{
                 admin_only = $true
                 hash_verified = $true
@@ -6464,6 +6578,13 @@ function Assert-PostInstallEvidence {
     if (-not $Evidence.executable_versions_match) {
         throw "One or more installed Boundless executables did not report the installed package version."
     }
+    if ($Evidence.input_injector_signature_status -notin @("Valid", "NotSigned")) {
+        throw "Installed elevated input injector signature status '$($Evidence.input_injector_signature_status)' was neither Valid nor the explicit NotSigned dogfood exception."
+    }
+    $expectedUnsignedDogfood = $Evidence.input_injector_signature_status -eq "NotSigned"
+    if ([bool]$Evidence.input_injector_unsigned_dogfood -ne $expectedUnsignedDogfood) {
+        throw "Installed elevated input injector signature classification was inconsistent with '$($Evidence.input_injector_signature_status)'."
+    }
     if ($Evidence.tray_verification -eq "passed" -and $Evidence.tray_count -ne 1) {
         throw "Expected exactly one Boundless tray after install, found $($Evidence.tray_count)."
     }
@@ -6536,11 +6657,21 @@ function Invoke-PostInstallVerification {
     $trayPath = Join-Path $installRoot "boundlesstray.exe"
     $daemonPath = Join-Path $installRoot "boundlessd.exe"
     $servicePath = Join-Path $installRoot "boundless-service.exe"
-    foreach ($requiredPath in @($cliPath, $trayPath, $daemonPath, $servicePath)) {
+    $inputInjectorPath = Join-Path $installRoot "boundless-input-injector.exe"
+    foreach ($requiredPath in @($cliPath, $trayPath, $daemonPath, $servicePath, $inputInjectorPath)) {
         if (-not (Test-Path -LiteralPath $requiredPath)) {
             throw "Installed Boundless payload was missing: $requiredPath"
         }
     }
+
+    $installedManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if (
+        $installedManifest.executables.PSObject.Properties.Match("input_injector").Count -ne 1 -or
+        $installedManifest.executables.input_injector -ne "boundless-input-injector.exe"
+    ) {
+        throw "Installed package manifest did not identify the elevated input injector payload."
+    }
+    $inputInjectorSignature = Get-AuthenticodeSignature -LiteralPath $inputInjectorPath
 
     $reportedExecutableVersions = [ordered]@{
         boundlessctl = Get-BoundlessExecutableVersion -Path $cliPath -ExecutableName "boundlessctl"
@@ -6586,6 +6717,9 @@ function Invoke-PostInstallVerification {
         expected_runtime_version = $manifestVersion
         executable_versions_match = $executableVersionsMatch
         executable_versions = $reportedExecutableVersions
+        input_injector_path = $inputInjectorPath
+        input_injector_signature_status = $inputInjectorSignature.Status.ToString()
+        input_injector_unsigned_dogfood = $inputInjectorSignature.Status.ToString() -eq "NotSigned"
         tray_count = $trayCount
         tray_path_matches = $trayPathMatches
         tray_responding = $trayResponding
@@ -6805,10 +6939,13 @@ finally { $attempt.Dispose() }
                 -TreeJobName "Local\Boundless.Installer.Tree.v1.$([guid]::NewGuid().ToString('N'))" `
                 -TreeClosureState $failedTreeState `
                 -HardKillRecoveryAction {
+                    # The fixture must allow a cold hosted PowerShell process
+                    # to enter its script before proving the bounded hang path.
+                    # Production recovery retains its separate 60-second default.
                     Restore-BoundlessServiceAfterHardKilledElevatedInstall `
                         -QuiescenceLease $fixtureLease `
                         -StagedHelperPath "fixture" `
-                        -TimeoutMilliseconds 300 `
+                        -TimeoutMilliseconds 3000 `
                         -FixtureLauncherSource $failedLauncherSource `
                         -BeforeFixtureLauncherAction {
                             param($authority)
@@ -6875,22 +7012,30 @@ finally { $serviceStart.Dispose(); $ready.Dispose(); $revoked.Dispose() }
             $null -ne $failedBrokerState.process -and
             $failedBrokerState.process.WaitForExit(5000)
         )
+        $failedBrokerServiceStartObserved = $failedBrokerServiceStart.event.WaitOne(0)
+        $failedInstallerExited = $failedInstaller.HasExited
         if (
             $null -eq $failedError -or
             $failedError.Exception.Message -notmatch 'quiescence monitor exited' -or
-            $failedError.Exception.Message -notmatch 'elevation launch/execution exceeded 300' -or
+            $failedError.Exception.Message -notmatch 'elevation launch/execution exceeded 3000' -or
             -not $firstLaunchObserved -or
             $secondLaunchObserved -or
             -not $failedBrokerExited -or
-            $failedBrokerServiceStart.event.WaitOne(0) -or
-            -not $failedInstaller.HasExited -or
+            $failedBrokerServiceStartObserved -or
+            -not $failedInstallerExited -or
             -not $failedTreeState.confirmed -or
             -not $failedTreeState.hard_kill_used -or
             $failedTreeState.parent_service_recovery_reconciled -or
             $failedTreeState.parent_service_recovery_status -ne "failed" -or
-            $failedStopwatch.ElapsedMilliseconds -gt 7000
+            $failedStopwatch.ElapsedMilliseconds -gt 12000
         ) {
-            throw "Recovery launch-hang fixture did not preserve both errors and exit after one bounded launch attempt."
+            throw (
+                "Recovery launch-hang fixture did not preserve both errors and exit after one bounded launch attempt. " +
+                "error=$($failedError.Exception.Message);first_launch=$firstLaunchObserved;second_launch=$secondLaunchObserved;" +
+                "broker_exited=$failedBrokerExited;service_start=$failedBrokerServiceStartObserved;" +
+                "installer_exited=$failedInstallerExited;tree=$($failedTreeState | ConvertTo-Json -Compress);" +
+                "elapsed=$($failedStopwatch.ElapsedMilliseconds)"
+            )
         }
     }
     finally {
@@ -7246,9 +7391,21 @@ Start-Sleep -Seconds 30
             throw "Owned process-tree fixture descendant exited before cancellation."
         }
         Stop-BoundlessProcessBoundary -Process $boundary -TimeoutMilliseconds 5000
+        # Windows can keep a just-terminated process visible to Get-Process for
+        # a short interval after the job has reported JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO.
+        # Bound the convergence wait so the fixture still fails for a genuinely
+        # live descendant without turning normal handle teardown into a CI flake.
+        $convergenceDeadline = (Get-Date).AddSeconds(2)
+        do {
+            $descendant = Get-Process -Id $childPid -ErrorAction SilentlyContinue
+            if ($boundary.ActiveProcessCount -eq 0 -and $null -eq $descendant) {
+                break
+            }
+            Start-Sleep -Milliseconds 50
+        } while ((Get-Date) -lt $convergenceDeadline)
         if (
             $boundary.ActiveProcessCount -ne 0 -or
-            $null -ne (Get-Process -Id $childPid -ErrorAction SilentlyContinue)
+            $null -ne $descendant
         ) {
             throw "Owned process-tree cancellation left descendant PID $childPid running."
         }
@@ -9064,6 +9221,8 @@ function Invoke-InstallHelperSelfTest {
         daemon_runtime_version = "5.0.13-dogfood.1"
         expected_runtime_version = "5.0.13-dogfood.1"
         executable_versions_match = $true
+        input_injector_signature_status = "NotSigned"
+        input_injector_unsigned_dogfood = $true
         tray_count = 1
         tray_path_matches = $true
         tray_responding = $true
@@ -9098,6 +9257,53 @@ function Invoke-InstallHelperSelfTest {
     }
 
     $expectedTrayPath = "C:\Program Files\Boundless\boundlesstray.exe"
+    $expectedInjectorPath = "C:\Program Files\Boundless\boundless-input-injector.exe"
+    $validInjectorTargets = @(
+        [pscustomobject]@{
+            id = 901
+            session_id = 7
+            owner_sid = $validSid
+            path = $expectedInjectorPath
+        },
+        [pscustomobject]@{
+            id = 902
+            session_id = 7
+            owner_sid = $validSid
+            path = $expectedInjectorPath
+        }
+    )
+    $acceptedInjectorTargets = @(
+        Assert-BoundlessInputInjectorTargets `
+            -Processes $validInjectorTargets `
+            -ExpectedOwnerSid $validSid `
+            -ExpectedSessionId 7 `
+            -ExpectedPath $expectedInjectorPath
+    )
+    if ($acceptedInjectorTargets.Count -ne 2) {
+        throw "Input injector target fixture did not preserve every validated process."
+    }
+    foreach ($mutation in @(
+        @{ property = "owner_sid"; value = "S-1-5-21-9-9-9-1002" },
+        @{ property = "session_id"; value = 8 },
+        @{ property = "path"; value = "C:\Portable\boundless-input-injector.exe" }
+    )) {
+        $invalidTarget = $validInjectorTargets[0].PSObject.Copy()
+        $invalidTarget.($mutation.property) = $mutation.value
+        $rejected = $false
+        try {
+            Assert-BoundlessInputInjectorTargets `
+                -Processes @($invalidTarget) `
+                -ExpectedOwnerSid $validSid `
+                -ExpectedSessionId 7 `
+                -ExpectedPath $expectedInjectorPath | Out-Null
+        }
+        catch {
+            $rejected = $true
+        }
+        if (-not $rejected) {
+            throw "Input injector target fixture accepted an invalid $($mutation.property)."
+        }
+    }
     $correctTray = [pscustomobject]@{
         id = 123
         path = $expectedTrayPath
@@ -9590,6 +9796,9 @@ public static class BoundlessInstallNativeMethods
         @{ name = "api"; property = "daemon_api_healthy"; value = $false },
         @{ name = "daemon_runtime_version"; property = "daemon_runtime_version"; value = "5.0.12" },
         @{ name = "executable_versions"; property = "executable_versions_match"; value = $false },
+        @{ name = "input_injector_invalid_signature"; property = "input_injector_signature_status"; value = "HashMismatch" },
+        @{ name = "input_injector_signed_mislabeled"; property = "input_injector_signature_status"; value = "Valid" },
+        @{ name = "input_injector_unsigned_unlabeled"; property = "input_injector_unsigned_dogfood"; value = $false },
         @{ name = "tray_count"; property = "tray_count"; value = 2 },
         @{ name = "tray_path"; property = "tray_path_matches"; value = $false },
         @{ name = "tray_responsive"; property = "tray_responding"; value = $false },
@@ -9612,13 +9821,14 @@ public static class BoundlessInstallNativeMethods
     [pscustomobject]@{
         status = "passed"
         helper = "Boundless-Install.ps1"
-        post_install_fixtures = 13
+        post_install_fixtures = 16
         bounded_process_fixture = "passed"
         daemon_version_fixture = "passed"
         executable_version_fixture = "passed"
         service_executable_path_fixture = "passed"
         tray_path_fixture = "passed"
         tray_shutdown_identity_fixture = "passed"
+        input_injector_target_fixture = "passed"
         native_type_upgrade_compatibility_fixture = "passed"
         legacy_quit_bridge_fixture = "passed"
         direct_shutdown_signal_fixture = "passed"
@@ -9950,6 +10160,11 @@ Write-Host "boundless_install_service_stop_initial=$($installResult.service_shut
 Write-Host "boundless_install_service_stop_final=$($installResult.service_shutdown.final_status)"
 if ($null -ne $installResult.service_shutdown.elapsed_milliseconds) {
     Write-Host "boundless_install_service_stop_elapsed_ms=$($installResult.service_shutdown.elapsed_milliseconds)"
+}
+if ($null -ne $installResult.input_injector_shutdown) {
+    Write-Host "boundless_install_input_injector_shutdown_count=$($installResult.input_injector_shutdown.initial_count)"
+    Write-Host "boundless_install_input_injector_shutdown_elapsed_ms=$($installResult.input_injector_shutdown.elapsed_milliseconds)"
+    Write-Host "boundless_install_input_injector_force_kill=$($installResult.input_injector_shutdown.force_kill_used)"
 }
 $verification = Invoke-PostInstallVerification `
     -InstallerAnchor $installerAnchor `

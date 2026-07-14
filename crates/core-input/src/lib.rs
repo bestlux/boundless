@@ -78,6 +78,123 @@ pub enum InputEvent {
     },
 }
 
+/// Exact process-local ledger of input that Boundless has successfully placed
+/// in the down state on a destination Windows session.
+///
+/// Callers must observe only the committed prefix reported by the native
+/// injector. Keeping this policy in `core-input` lets the ordinary tray
+/// injector and the elevated injector synthesize the same deterministic
+/// cleanup without duplicating held-state rules across integrity levels.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeldInputState {
+    pressed_keys: Vec<(u16, KeySemantics)>,
+    pressed_buttons: Vec<MouseButton>,
+}
+
+impl HeldInputState {
+    pub fn observe(&mut self, events: &[InputEvent]) {
+        for event in events {
+            match event {
+                InputEvent::Key {
+                    scan_code,
+                    state,
+                    semantics,
+                } => match state {
+                    KeyState::Down => {
+                        if !self
+                            .pressed_keys
+                            .iter()
+                            .any(|(pressed_scan_code, _)| pressed_scan_code == scan_code)
+                        {
+                            self.pressed_keys.push((*scan_code, *semantics));
+                        }
+                    }
+                    KeyState::Up => self
+                        .pressed_keys
+                        .retain(|(pressed_scan_code, _)| pressed_scan_code != scan_code),
+                },
+                InputEvent::MouseButton { button, state } => match state {
+                    KeyState::Down => {
+                        if !self.pressed_buttons.contains(button) {
+                            self.pressed_buttons.push(*button);
+                        }
+                    }
+                    KeyState::Up => self.pressed_buttons.retain(|pressed| pressed != button),
+                },
+                InputEvent::MouseMove { .. }
+                | InputEvent::MouseMoveAbsolute { .. }
+                | InputEvent::MouseWheel { .. } => {}
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pressed_keys.is_empty() && self.pressed_buttons.is_empty()
+    }
+
+    /// Replays the intended held state with keys before buttons so modifiers
+    /// are restored before a drag or chord continues.
+    pub fn held_down_events(&self) -> Vec<InputEvent> {
+        let mut held = self
+            .pressed_keys
+            .iter()
+            .map(|(scan_code, semantics)| InputEvent::Key {
+                scan_code: *scan_code,
+                state: KeyState::Down,
+                semantics: *semantics,
+            })
+            .collect::<Vec<_>>();
+        held.extend(
+            self.pressed_buttons
+                .iter()
+                .map(|button| InputEvent::MouseButton {
+                    button: *button,
+                    state: KeyState::Down,
+                }),
+        );
+        held
+    }
+
+    /// Synthesizes a deterministic fail-open cleanup: buttons first, then
+    /// keys. Releasing buttons before modifier keys preserves the current tray
+    /// broker's shutdown semantics.
+    pub fn release_events(&self) -> Vec<InputEvent> {
+        let mut pressed_buttons = self.pressed_buttons.clone();
+        pressed_buttons.sort_by_key(|button| match button {
+            MouseButton::Left => 0,
+            MouseButton::Right => 1,
+            MouseButton::Middle => 2,
+            MouseButton::X1 => 3,
+            MouseButton::X2 => 4,
+        });
+        let mut pressed_keys = self.pressed_keys.clone();
+        pressed_keys.sort_unstable_by_key(|(scan_code, _)| *scan_code);
+
+        let mut releases = pressed_buttons
+            .into_iter()
+            .map(|button| InputEvent::MouseButton {
+                button,
+                state: KeyState::Up,
+            })
+            .collect::<Vec<_>>();
+        releases.extend(
+            pressed_keys
+                .into_iter()
+                .map(|(scan_code, semantics)| InputEvent::Key {
+                    scan_code,
+                    state: KeyState::Up,
+                    semantics,
+                }),
+        );
+        releases
+    }
+
+    pub fn clear(&mut self) {
+        self.pressed_keys.clear();
+        self.pressed_buttons.clear();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputFrame {
     pub source_peer_id: String,
@@ -506,5 +623,121 @@ mod tests {
             .route_frame(&sample_frame("peer-a", 1), &mut sink)
             .expect("sequence restart should pass after clear");
         assert_eq!(decision, RouteDecision::Applied { event_count: 2 });
+    }
+
+    #[test]
+    fn held_input_tracks_only_transitions_and_releases_deterministically() {
+        let windows_semantics = KeySemantics::Windows {
+            virtual_key: 0x61,
+            num_lock_on: true,
+        };
+        let mut held = HeldInputState::default();
+        held.observe(&[
+            InputEvent::Key {
+                scan_code: 0x4f,
+                state: KeyState::Down,
+                semantics: windows_semantics,
+            },
+            InputEvent::MouseButton {
+                button: MouseButton::Right,
+                state: KeyState::Down,
+            },
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                state: KeyState::Down,
+            },
+            InputEvent::Key {
+                scan_code: 0x2a,
+                state: KeyState::Down,
+                semantics: KeySemantics::Physical,
+            },
+            InputEvent::Key {
+                scan_code: 0x4f,
+                state: KeyState::Down,
+                semantics: KeySemantics::Physical,
+            },
+            InputEvent::MouseMove { dx: 3, dy: -2 },
+        ]);
+
+        assert_eq!(
+            held.held_down_events(),
+            vec![
+                InputEvent::Key {
+                    scan_code: 0x4f,
+                    state: KeyState::Down,
+                    semantics: windows_semantics,
+                },
+                InputEvent::Key {
+                    scan_code: 0x2a,
+                    state: KeyState::Down,
+                    semantics: KeySemantics::Physical,
+                },
+                InputEvent::MouseButton {
+                    button: MouseButton::Right,
+                    state: KeyState::Down,
+                },
+                InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    state: KeyState::Down,
+                },
+            ]
+        );
+        assert_eq!(
+            held.release_events(),
+            vec![
+                InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    state: KeyState::Up,
+                },
+                InputEvent::MouseButton {
+                    button: MouseButton::Right,
+                    state: KeyState::Up,
+                },
+                InputEvent::Key {
+                    scan_code: 0x2a,
+                    state: KeyState::Up,
+                    semantics: KeySemantics::Physical,
+                },
+                InputEvent::Key {
+                    scan_code: 0x4f,
+                    state: KeyState::Up,
+                    semantics: windows_semantics,
+                },
+            ]
+        );
+
+        held.observe(&[
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                state: KeyState::Up,
+            },
+            InputEvent::Key {
+                scan_code: 0x4f,
+                state: KeyState::Up,
+                semantics: KeySemantics::Physical,
+            },
+        ]);
+        assert_eq!(held.held_down_events().len(), 2);
+    }
+
+    #[test]
+    fn held_input_can_observe_an_exact_committed_prefix() {
+        let events = [
+            InputEvent::Key {
+                scan_code: 0x1d,
+                state: KeyState::Down,
+                semantics: KeySemantics::Physical,
+            },
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                state: KeyState::Down,
+            },
+        ];
+        let mut held = HeldInputState::default();
+        held.observe(&events[..1]);
+
+        assert_eq!(held.held_down_events(), vec![events[0].clone()]);
+        held.clear();
+        assert!(held.is_empty());
     }
 }

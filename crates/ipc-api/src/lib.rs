@@ -10,7 +10,14 @@ pub mod client_identity;
 /// Exact protocol revision for the out-of-process input broker contract.
 /// Protobuf's default zero represents an unversioned/older peer and is always
 /// rejected; tray and daemon must negotiate this value before local locking.
-pub const INPUT_BROKER_PROTOCOL_REVISION: u32 = 4;
+pub const INPUT_BROKER_PROTOCOL_REVISION: u32 = 6;
+
+/// Exact protocol revision for the dedicated elevated input injector.
+pub const INPUT_INJECTOR_PROTOCOL_REVISION: u32 = 1;
+
+/// One helper request can contain at most one peer input frame. The daemon's
+/// existing core-input policy already caps a frame at 256 events.
+pub const INPUT_INJECTOR_MAX_EVENTS: usize = core_input::MAX_EVENTS_PER_FRAME;
 
 /// The clipboard policy permits 8 MiB bitmap payloads. Reserve another MiB
 /// for the broker token, protobuf framing, and future envelope fields so a

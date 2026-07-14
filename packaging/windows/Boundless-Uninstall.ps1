@@ -95,7 +95,8 @@ if ([string]::IsNullOrWhiteSpace($SecurityRoot)) {
     $SecurityRoot = Get-DefaultSecurityRoot
 }
 
-Get-Process -Name "boundlesstray", "boundlessd" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process -Name "boundlesstray", "boundlessd", "boundless-input-injector" -ErrorAction SilentlyContinue |
+    Stop-Process -Force -ErrorAction SilentlyContinue
 
 $shortcutPaths = @(
     (Join-Path $StartupFolderPath "Boundless.lnk"),

@@ -35,6 +35,16 @@ function New-InstallerSmokeSummary {
         [string]$RepairStartName = "LocalSystem",
         [string]$InstallAllowedUserSid = "S-1-5-21-1-2-3-1001",
         [string]$RepairAllowedUserSid = "S-1-5-21-1-2-3-1001",
+        [string]$InputInjectorPath = "C:\Program Files\Boundless\boundless-input-injector.exe",
+        [string]$InputInjectorSignature = "Valid",
+        [string]$InputInjectorProductVersion = "5.0.0",
+        [string]$InputInjectorExecutionLevel = "requireAdministrator",
+        [object]$InputInjectorUiAccess = "false",
+        [object]$InputInjectorCountAfterTrayLaunch = 0,
+        [object]$InputInjectorCountAfterRepair = 0,
+        [object]$InputInjectorCountAfterUninstall = 0,
+        [ValidateSet("", "input_injector_path", "input_injector_signature", "input_injector_product_version", "input_injector_execution_level", "input_injector_ui_access", "input_injector_count_after_tray_launch", "input_injector_count_after_repair", "input_injector_count_after_uninstall")]
+        [string]$OmitInputInjectorField = "",
         [switch]$OmitInstallAllowedUserSidEvidence,
         [switch]$OmitRepairAllowedUserSidEvidence,
         [switch]$OmitServiceLifecycleEvidence,
@@ -50,9 +60,21 @@ function New-InstallerSmokeSummary {
         cli_signature = "unchecked"
         service_version_output = $ServiceVersionOutput
         service_version_exit_code = 0
+        input_injector_path = $InputInjectorPath
+        input_injector_signature = $InputInjectorSignature
+        input_injector_product_version = $InputInjectorProductVersion
+        input_injector_execution_level = $InputInjectorExecutionLevel
+        input_injector_ui_access = $InputInjectorUiAccess
+        input_injector_count_after_tray_launch = $InputInjectorCountAfterTrayLaunch
+        input_injector_count_after_repair = $InputInjectorCountAfterRepair
+        input_injector_count_after_uninstall = $InputInjectorCountAfterUninstall
         upgraded_from = $UpgradedFrom
         previous_install_exit_code = $PreviousInstallExitCode
         status = "passed"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($OmitInputInjectorField)) {
+        $summary.Remove($OmitInputInjectorField)
     }
 
     if (-not $OmitServiceLifecycleEvidence) {
@@ -152,6 +174,16 @@ function Invoke-Fixture {
         [string]$RepairStartName = "LocalSystem",
         [string]$InstallAllowedUserSid = "S-1-5-21-1-2-3-1001",
         [string]$RepairAllowedUserSid = "S-1-5-21-1-2-3-1001",
+        [string]$InputInjectorPath = "C:\Program Files\Boundless\boundless-input-injector.exe",
+        [string]$InputInjectorSignature = "Valid",
+        [string]$InputInjectorProductVersion = "5.0.0",
+        [string]$InputInjectorExecutionLevel = "requireAdministrator",
+        [object]$InputInjectorUiAccess = "false",
+        [object]$InputInjectorCountAfterTrayLaunch = 0,
+        [object]$InputInjectorCountAfterRepair = 0,
+        [object]$InputInjectorCountAfterUninstall = 0,
+        [ValidateSet("", "input_injector_path", "input_injector_signature", "input_injector_product_version", "input_injector_execution_level", "input_injector_ui_access", "input_injector_count_after_tray_launch", "input_injector_count_after_repair", "input_injector_count_after_uninstall")]
+        [string]$OmitInputInjectorField = "",
         [switch]$OmitInstallAllowedUserSidEvidence,
         [switch]$OmitRepairAllowedUserSidEvidence,
         [switch]$OmitServiceLifecycleEvidence,
@@ -161,12 +193,15 @@ function Invoke-Fixture {
         [string]$Policy = "prerelease",
         [ValidateSet("msi-owned", "service-self-update", "tray-self-update")]
         [string]$ServiceUpdateMode = "msi-owned",
+        [ValidateSet("signed", "unsigned-dogfood")]
+        [string]$InputInjectorSignaturePolicy = "signed",
         [int]$ExpectedExitCode,
         [string]$ExpectedRisk,
         [string]$ExpectedInstallerStatus,
         [string]$ExpectedServiceVersionStatus,
         [string]$ExpectedServiceUpdateOwnershipStatus,
         [string]$ExpectedServiceLifecycleStatus,
+        [string]$ExpectedInputInjectorStatus = "passed",
         [string]$ExpectedNMinusOneStatus
     )
 
@@ -187,6 +222,15 @@ function Invoke-Fixture {
             RepairStartName = $RepairStartName
             InstallAllowedUserSid = $InstallAllowedUserSid
             RepairAllowedUserSid = $RepairAllowedUserSid
+            InputInjectorPath = $InputInjectorPath
+            InputInjectorSignature = $InputInjectorSignature
+            InputInjectorProductVersion = $InputInjectorProductVersion
+            InputInjectorExecutionLevel = $InputInjectorExecutionLevel
+            InputInjectorUiAccess = $InputInjectorUiAccess
+            InputInjectorCountAfterTrayLaunch = $InputInjectorCountAfterTrayLaunch
+            InputInjectorCountAfterRepair = $InputInjectorCountAfterRepair
+            InputInjectorCountAfterUninstall = $InputInjectorCountAfterUninstall
+            OmitInputInjectorField = $OmitInputInjectorField
             OmitInstallAllowedUserSidEvidence = $OmitInstallAllowedUserSidEvidence.IsPresent
             OmitRepairAllowedUserSidEvidence = $OmitRepairAllowedUserSidEvidence.IsPresent
             OmitServiceLifecycleEvidence = $OmitServiceLifecycleEvidence.IsPresent
@@ -209,6 +253,8 @@ function Invoke-Fixture {
         $Policy,
         "-ServiceUpdateMode",
         $ServiceUpdateMode,
+        "-InputInjectorSignaturePolicy",
+        $InputInjectorSignaturePolicy,
         "-OutputRoot",
         $readinessRoot
     )
@@ -239,11 +285,15 @@ function Invoke-Fixture {
     Assert-GateStatus -Packet $packet -Id "service_version_parity" -ExpectedStatus $ExpectedServiceVersionStatus
     Assert-GateStatus -Packet $packet -Id "service_update_ownership" -ExpectedStatus $ExpectedServiceUpdateOwnershipStatus
     Assert-GateStatus -Packet $packet -Id "service_lifecycle_evidence" -ExpectedStatus $ExpectedServiceLifecycleStatus
+    Assert-GateStatus -Packet $packet -Id "input_injector_evidence" -ExpectedStatus $ExpectedInputInjectorStatus
     Assert-GateStatus -Packet $packet -Id "n_minus_1_msi_upgrade" -ExpectedStatus $ExpectedNMinusOneStatus
     if ($packet.service_update_mode -ne $ServiceUpdateMode) {
         throw "Fixture '$Name' expected service_update_mode '$ServiceUpdateMode', found '$($packet.service_update_mode)'."
     }
-    Write-Host "fixture=$Name exit_code=$exitCode risk=$($packet.risk_classification) service_version_parity=$ExpectedServiceVersionStatus service_lifecycle_evidence=$ExpectedServiceLifecycleStatus n_minus_1_msi_upgrade=$ExpectedNMinusOneStatus"
+    if ($packet.input_injector_signature_policy -ne $InputInjectorSignaturePolicy) {
+        throw "Fixture '$Name' expected input_injector_signature_policy '$InputInjectorSignaturePolicy', found '$($packet.input_injector_signature_policy)'."
+    }
+    Write-Host "fixture=$Name exit_code=$exitCode risk=$($packet.risk_classification) service_version_parity=$ExpectedServiceVersionStatus service_lifecycle_evidence=$ExpectedServiceLifecycleStatus input_injector_evidence=$ExpectedInputInjectorStatus n_minus_1_msi_upgrade=$ExpectedNMinusOneStatus"
 }
 
 Invoke-Fixture -Name "exact_stable_version_passes_without_n_minus_one" -ServiceVersionOutput "boundless-service 5.0.0" -ExpectedExitCode 0 -ExpectedRisk "at-risk" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedNMinusOneStatus "skipped"
@@ -268,10 +318,20 @@ Invoke-Fixture -Name "repair_user_account_fails" -ServiceVersionOutput "boundles
 Invoke-Fixture -Name "repair_missing_allowed_user_sid_fails" -ServiceVersionOutput "boundless-service 5.0.0" -RepairPathName '"C:\Program Files\Boundless\boundless-service.exe"' -OmitRepairAllowedUserSidEvidence -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "failed" -ExpectedNMinusOneStatus "skipped"
 Invoke-Fixture -Name "repair_changed_allowed_user_sid_fails" -ServiceVersionOutput "boundless-service 5.0.0" -RepairPathName '"C:\Program Files\Boundless\boundless-service.exe" --allowed-user-sid=S-1-5-21-1-2-3-1002' -RepairAllowedUserSid "S-1-5-21-1-2-3-1002" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "failed" -ExpectedNMinusOneStatus "skipped"
 Invoke-Fixture -Name "missing_upgrade_replacement_evidence_fails" -ServiceVersionOutput "boundless-service 5.0.0" -UpgradedFrom "Boundless-4.0.2-windows-x64.msi" -PreviousInstallExitCode 0 -OmitUpgradeReplacementEvidence -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedNMinusOneStatus "failed"
+Invoke-Fixture -Name "unsigned_input_injector_requires_explicit_dogfood_policy" -ServiceVersionOutput "boundless-service 5.0.0" -InputInjectorSignature "NotSigned" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedInputInjectorStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "explicit_unsigned_input_injector_dogfood_policy_passes" -ServiceVersionOutput "boundless-service 5.0.0" -InputInjectorSignature "NotSigned" -InputInjectorSignaturePolicy "unsigned-dogfood" -ExpectedExitCode 0 -ExpectedRisk "at-risk" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedInputInjectorStatus "passed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "missing_input_injector_path_evidence_fails" -ServiceVersionOutput "boundless-service 5.0.0" -OmitInputInjectorField "input_injector_path" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedInputInjectorStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "noncanonical_input_injector_path_fails" -ServiceVersionOutput "boundless-service 5.0.0" -InputInjectorPath "C:\Users\example\AppData\Local\Boundless\boundless-input-injector.exe" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedInputInjectorStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "input_injector_product_version_mismatch_fails" -ServiceVersionOutput "boundless-service 5.0.0" -InputInjectorProductVersion "5.0.1" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedInputInjectorStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "input_injector_as_invoker_manifest_fails" -ServiceVersionOutput "boundless-service 5.0.0" -InputInjectorExecutionLevel "asInvoker" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedInputInjectorStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "input_injector_ui_access_true_fails" -ServiceVersionOutput "boundless-service 5.0.0" -InputInjectorUiAccess "true" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedInputInjectorStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "input_injector_running_after_tray_launch_fails" -ServiceVersionOutput "boundless-service 5.0.0" -InputInjectorCountAfterTrayLaunch 1 -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedInputInjectorStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "input_injector_running_after_repair_fails" -ServiceVersionOutput "boundless-service 5.0.0" -InputInjectorCountAfterRepair 1 -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedInputInjectorStatus "failed" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "input_injector_running_after_uninstall_fails" -ServiceVersionOutput "boundless-service 5.0.0" -InputInjectorCountAfterUninstall 1 -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "passed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedInputInjectorStatus "failed" -ExpectedNMinusOneStatus "skipped"
 Invoke-Fixture -Name "substring_version_fails" -ServiceVersionOutput "boundless-service 15.0.0" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "failed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedNMinusOneStatus "skipped"
 Invoke-Fixture -Name "prerelease_service_version_fails_for_stable_release" -ServiceVersionOutput "boundless-service 5.0.0-rc" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "failed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedNMinusOneStatus "skipped"
 Invoke-Fixture -Name "empty_service_version_output_fails" -ServiceVersionOutput "" -ExpectedExitCode 1 -ExpectedRisk "blocked" -ExpectedInstallerStatus "passed" -ExpectedServiceVersionStatus "failed" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "passed" -ExpectedNMinusOneStatus "skipped"
-Invoke-Fixture -Name "missing_installer_summary_skips_and_require_ready_fails" -NoInstallerSummary -RequireReady -ExpectedExitCode 1 -ExpectedRisk "at-risk" -ExpectedInstallerStatus "skipped" -ExpectedServiceVersionStatus "skipped" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "skipped" -ExpectedNMinusOneStatus "skipped"
-Invoke-Fixture -Name "missing_installer_summary_stable_policy_fails" -NoInstallerSummary -Policy stable -ExpectedExitCode 1 -ExpectedRisk "at-risk" -ExpectedInstallerStatus "skipped" -ExpectedServiceVersionStatus "skipped" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "skipped" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "missing_installer_summary_skips_and_require_ready_fails" -NoInstallerSummary -RequireReady -ExpectedExitCode 1 -ExpectedRisk "at-risk" -ExpectedInstallerStatus "skipped" -ExpectedServiceVersionStatus "skipped" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "skipped" -ExpectedInputInjectorStatus "skipped" -ExpectedNMinusOneStatus "skipped"
+Invoke-Fixture -Name "missing_installer_summary_stable_policy_fails" -NoInstallerSummary -Policy stable -ExpectedExitCode 1 -ExpectedRisk "at-risk" -ExpectedInstallerStatus "skipped" -ExpectedServiceVersionStatus "skipped" -ExpectedServiceUpdateOwnershipStatus "passed" -ExpectedServiceLifecycleStatus "skipped" -ExpectedInputInjectorStatus "skipped" -ExpectedNMinusOneStatus "skipped"
 
 Write-Host "release_readiness_fixtures=passed artifacts=$OutputRoot"

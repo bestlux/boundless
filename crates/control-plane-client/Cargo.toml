@@ -12,4 +12,5 @@ tonic.workspace = true
 [target.'cfg(windows)'.dependencies]
 hyper-util.workspace = true
 tokio.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Pipes"] }
 

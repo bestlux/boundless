@@ -113,6 +113,7 @@ mod windows_app {
         file_transfers: Vec<UiFileTransfer>,
         input_handoff_config: UiInputHandoffConfig,
         input_runtime: UiInputRuntime,
+        clipboard_runtime: UiClipboardRuntime,
     }
 
     #[derive(Debug, Clone, Deserialize, Default)]
@@ -176,6 +177,11 @@ mod windows_app {
         capture_backend_mode: String,
         pending_inject_frames: u32,
         pending_inject_high_water: u32,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Default)]
+    struct UiClipboardRuntime {
+        backend_mode: String,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -289,6 +295,8 @@ mod windows_app {
         alias: Option<String>,
         endpoint_candidates: Vec<String>,
     }
+
+    include!("elevated_input_controller.rs");
 
     include!("dashboard.rs");
 
@@ -469,6 +477,12 @@ mod windows_app {
                             capture_backend_mode: runtime.capture_backend_mode,
                             pending_inject_frames: runtime.pending_inject_frames,
                             pending_inject_high_water: runtime.pending_inject_high_water,
+                        })
+                        .unwrap_or_default(),
+                    clipboard_runtime: snapshot
+                        .clipboard_runtime
+                        .map(|runtime| UiClipboardRuntime {
+                            backend_mode: runtime.backend_mode,
                         })
                         .unwrap_or_default(),
                 })?;

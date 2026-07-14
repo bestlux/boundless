@@ -241,6 +241,65 @@ function Assert-Authenticode {
     return $signature.Status
 }
 
+function Get-WindowsManifestToolPath {
+    $command = Get-Command "mt.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $command) {
+        return $command.Source
+    }
+
+    $kitsRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
+    if (Test-Path -LiteralPath $kitsRoot) {
+        $candidate = Get-ChildItem -LiteralPath $kitsRoot -Filter "mt.exe" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\mt\.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+        if ($null -ne $candidate) {
+            return $candidate.FullName
+        }
+    }
+
+    throw "mt.exe was not found. Install the Windows SDK before validating the input injector execution manifest."
+}
+
+function Assert-InputInjectorExecutionManifest {
+    param([string]$Path)
+
+    $manifestTool = Get-WindowsManifestToolPath
+    $manifestPath = Join-Path ([IO.Path]::GetTempPath()) ("boundless-input-injector-manifest-" + [guid]::NewGuid().ToString("N") + ".xml")
+    try {
+        $global:LASTEXITCODE = 0
+        & $manifestTool `
+            "-nologo" `
+            "-inputresource:$Path;#1" `
+            "-out:$manifestPath"
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $manifestPath)) {
+            throw "mt.exe could not extract the input injector execution manifest. Exit code: $LASTEXITCODE."
+        }
+
+        [xml]$manifest = Get-Content -LiteralPath $manifestPath -Raw
+        $namespaceManager = New-Object System.Xml.XmlNamespaceManager($manifest.NameTable)
+        $namespaceManager.AddNamespace("asmv3", "urn:schemas-microsoft-com:asm.v3")
+        $executionLevels = @($manifest.SelectNodes("//asmv3:requestedExecutionLevel", $namespaceManager))
+        if ($executionLevels.Count -ne 1) {
+            throw "Input injector manifest must contain exactly one requestedExecutionLevel element; found $($executionLevels.Count)."
+        }
+
+        $executionLevel = $executionLevels[0].GetAttribute("level")
+        $uiAccess = $executionLevels[0].GetAttribute("uiAccess")
+        if ($executionLevel -cne "requireAdministrator" -or $uiAccess -cne "false") {
+            throw "Input injector manifest must declare requireAdministrator with uiAccess=false; level=$executionLevel uiAccess=$uiAccess."
+        }
+
+        return [ordered]@{
+            execution_level = $executionLevel
+            ui_access = $uiAccess
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-ExpectedDisplayVersion {
     param([string]$Path)
 
@@ -411,13 +470,13 @@ function Test-InteractiveDesktopSession {
 }
 
 function Stop-BoundlessProcesses {
-    Get-Process -Name "boundlesstray", "boundlessd", "boundless-service" -ErrorAction SilentlyContinue |
+    Get-Process -Name "boundlesstray", "boundlessd", "boundless-service", "boundless-input-injector" -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 800
 }
 
 function Assert-NoBoundlessProcesses {
-    $remaining = Get-Process -Name "boundlesstray", "boundlessd", "boundless-service" -ErrorAction SilentlyContinue
+    $remaining = Get-Process -Name "boundlesstray", "boundlessd", "boundless-service", "boundless-input-injector" -ErrorAction SilentlyContinue
     if ($null -ne $remaining) {
         $names = @($remaining | ForEach-Object { "$($_.ProcessName):$($_.Id)" }) -join ", "
         throw "Boundless processes still running after uninstall: $names"
@@ -429,7 +488,7 @@ function Wait-ForNoBoundlessProcesses {
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
-        $remaining = Get-Process -Name "boundlesstray", "boundlessd", "boundless-service" -ErrorAction SilentlyContinue
+        $remaining = Get-Process -Name "boundlesstray", "boundlessd", "boundless-service", "boundless-input-injector" -ErrorAction SilentlyContinue
         if ($null -eq $remaining) {
             return
         }
@@ -755,7 +814,7 @@ if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
 
     Push-Location $repoRoot
     try {
-        & cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray
+        & cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector
         if ($LASTEXITCODE -ne 0) {
             throw "cargo build --release failed with exit code $LASTEXITCODE"
         }
@@ -766,6 +825,7 @@ if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
             -DaemonPath (Join-Path $repoRoot "target\release\boundlessd.exe") `
             -CliPath (Join-Path $repoRoot "target\release\boundlessctl.exe") `
             -TrayPath (Join-Path $repoRoot "target\release\boundlesstray.exe") `
+            -InputInjectorPath (Join-Path $repoRoot "target\release\boundless-input-injector.exe") `
             -OutputPath $InstallerPath
         if ($LASTEXITCODE -ne 0) {
             throw "package-windows.ps1 failed with exit code $LASTEXITCODE"
@@ -819,6 +879,8 @@ try {
     $upgradeDaemonStatus = $null
     $postUpgradeTrayCount = $null
     $postUpgradeDaemonCount = $null
+    $inputInjectorCountAfterTrayLaunch = $null
+    $inputInjectorCountAfterRepair = $null
     $traySingleInstanceTested = $false
     $traySecondLaunchExitCode = $null
     $trayCurrentSessionCount = $null
@@ -917,11 +979,13 @@ try {
     $servicePath = Join-Path $installRoot "boundless-service.exe"
     $cliPath = Join-Path $installRoot "boundlessctl.exe"
     $trayPath = Join-Path $installRoot "boundlesstray.exe"
+    $inputInjectorPath = Join-Path $installRoot "boundless-input-injector.exe"
 
     Assert-PathExists -Path $daemonPath -Message "Installed daemon binary is missing."
     Assert-PathExists -Path $servicePath -Message "Installed service binary is missing."
     Assert-PathExists -Path $cliPath -Message "Installed CLI binary is missing."
     Assert-PathExists -Path $trayPath -Message "Installed tray binary is missing."
+    Assert-PathExists -Path $inputInjectorPath -Message "Installed elevated input injector binary is missing."
     Assert-PathExists -Path $resetScriptPath -Message "Installed reset helper is missing."
     Assert-PathExists -Path $iconPath -Message "Installed icon asset is missing."
     Assert-PathExists -Path $startMenuShortcutPath -Message "Start menu shortcut is missing."
@@ -995,6 +1059,7 @@ try {
     $daemonSignature = Assert-Authenticode -Path $daemonPath -Required:$RequireSignature.IsPresent
     $serviceSignature = Assert-Authenticode -Path $servicePath -Required:$RequireSignature.IsPresent
     $cliSignature = Assert-Authenticode -Path $cliPath -Required:$RequireSignature.IsPresent
+    $inputInjectorSignature = Assert-Authenticode -Path $inputInjectorPath -Required:$RequireSignature.IsPresent
 
     $trayVersionOutput = (& $trayPath --version 2>&1 | Out-String).Trim()
     $trayVersionExitCode = $LASTEXITCODE
@@ -1021,6 +1086,19 @@ try {
     ) {
         throw "Installed service executable reported an unexpected version string: $serviceVersionOutput"
     }
+
+    $inputInjectorVersionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($inputInjectorPath)
+    $inputInjectorProductVersion = $inputInjectorVersionInfo.ProductVersion
+    if ([string]::IsNullOrWhiteSpace($inputInjectorProductVersion)) {
+        throw "Installed input injector executable did not carry ProductVersion metadata."
+    }
+    if (
+        -not [string]::IsNullOrWhiteSpace($expectedDisplayVersion) -and
+        $inputInjectorProductVersion -ne $expectedDisplayVersion
+    ) {
+        throw "Installed input injector ProductVersion '$inputInjectorProductVersion' did not match MSI version '$expectedDisplayVersion'."
+    }
+    $inputInjectorExecutionManifest = Assert-InputInjectorExecutionManifest -Path $inputInjectorPath
 
     $trayLaunchMode = if ($interactiveDesktopSession) { "interactive_desktop" } else { "headless_session" }
     $trayExitedEarly = $false
@@ -1063,6 +1141,11 @@ try {
         else {
             $daemonReadyOutput = Wait-ForDaemonReady -CliPath $cliPath
         }
+    }
+
+    $inputInjectorCountAfterTrayLaunch = Get-BoundlessProcessCount -Name "boundless-input-injector"
+    if ($inputInjectorCountAfterTrayLaunch -ne 0) {
+        throw "Tray startup launched $inputInjectorCountAfterTrayLaunch elevated input injector process(es) without an explicit user action."
     }
 
     if ($interactiveDesktopSession) {
@@ -1140,12 +1223,17 @@ try {
     Wait-BoundlessServiceStatus -ExpectedStatus "Running" | Out-Null
     $repairDaemonStatusOutput = Wait-ForDaemonReady -CliPath $cliPath
     $serviceRunningAfterRepair = ((Get-BoundlessService).Status.ToString() -eq "Running")
+    $inputInjectorCountAfterRepair = Get-BoundlessProcessCount -Name "boundless-input-injector"
+    if ($inputInjectorCountAfterRepair -ne 0) {
+        throw "MSI repair left or launched $inputInjectorCountAfterRepair elevated input injector process(es)."
+    }
 
     $serviceRunningBeforeUninstall = (Get-BoundlessService).Status.ToString() -eq "Running"
 
     $uninstallExitCode = Invoke-MsiExec -ArgumentList @("/x", $InstallerPath, "/qn", "/norestart") -LogPath $uninstallLog
 
     Wait-ForNoBoundlessProcesses
+    $inputInjectorCountAfterUninstall = Get-BoundlessProcessCount -Name "boundless-input-injector"
     Wait-ForPathRemoval -Path $installRoot
     if (Test-Path -LiteralPath $startMenuShortcutPath) {
         throw "Uninstall did not remove start menu shortcut."
@@ -1161,6 +1249,9 @@ try {
     }
     if (Test-Path -LiteralPath $servicePath) {
         throw "Uninstall left the Program Files service binary: $servicePath"
+    }
+    if (Test-Path -LiteralPath $inputInjectorPath) {
+        throw "Uninstall left the Program Files elevated input injector binary: $inputInjectorPath"
     }
     if (Test-InstallerEvidencePresent) {
         throw "Uninstall left machine-wide installer evidence under HKLM\Software\Boundless\Installer."
@@ -1188,10 +1279,15 @@ try {
         daemon_signature = $daemonSignature
         service_signature = $serviceSignature
         cli_signature = $cliSignature
+        input_injector_path = $inputInjectorPath
+        input_injector_signature = $inputInjectorSignature
         tray_version_output = $trayVersionOutput
         tray_version_exit_code = $trayVersionExitCode
         service_version_output = $serviceVersionOutput
         service_version_exit_code = $serviceVersionExitCode
+        input_injector_product_version = $inputInjectorProductVersion
+        input_injector_execution_level = $inputInjectorExecutionManifest.execution_level
+        input_injector_ui_access = $inputInjectorExecutionManifest.ui_access
         tray_launch_mode = $trayLaunchMode
         tray_exited_early = $trayExitedEarly
         tray_exit_code = $trayExitCode
@@ -1221,6 +1317,9 @@ try {
         upgrade_daemon_status = $upgradeDaemonStatus
         post_upgrade_tray_count = $postUpgradeTrayCount
         post_upgrade_daemon_count = $postUpgradeDaemonCount
+        input_injector_count_after_tray_launch = $inputInjectorCountAfterTrayLaunch
+        input_injector_count_after_repair = $inputInjectorCountAfterRepair
+        input_injector_count_after_uninstall = $inputInjectorCountAfterUninstall
         post_uninstall_processes_cleared = $true
         post_uninstall_service_removed = $true
         post_uninstall_program_files_root_removed = $true

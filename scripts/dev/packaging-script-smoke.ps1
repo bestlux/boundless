@@ -99,6 +99,75 @@ if ($packageWxsText -notmatch 'AllowSameVersionUpgrades="yes"') {
 if ($packageWxsText -match 'Id="CloseBoundlessService"') {
     throw "Package.wxs must not use CloseApplication/TerminateProcess for BoundlessService; helper stop plus ServiceControl own that lifecycle."
 }
+if (
+    $packageWxsText -notmatch 'Id="CloseBoundlessInputInjector"' -or
+    $packageWxsText -notmatch 'Target="boundless-input-injector\.exe"' -or
+    $packageWxsText -notmatch 'Id="CloseBoundlessInputInjector"(?s:.*?)TerminateProcess="1"'
+) {
+    throw "Package.wxs must own bounded close/termination fallback for the elevated input injector."
+}
+if (
+    $packageWxsText -notmatch 'Id="BoundlessInputInjectorPayloadComponent"' -or
+    $packageWxsText -notmatch 'Id="InputInjectorBinaryFile"' -or
+    $packageWxsText -notmatch 'Source="\$\(var\.PayloadDir\)\\boundless-input-injector\.exe"'
+) {
+    throw "Package.wxs must install the elevated input injector as an MSI-owned Program Files payload."
+}
+
+$packageManifestPath = Join-Path $packagingRoot "package-manifest.json"
+$packageManifest = Get-Content -LiteralPath $packageManifestPath -Raw | ConvertFrom-Json
+if ($packageManifest.executables.input_injector -ne "boundless-input-injector.exe") {
+    throw "package-manifest.json must declare the installed elevated input injector executable."
+}
+
+$packageScriptPath = Join-Path $RepoRoot "scripts\release\package-windows.ps1"
+$packageScriptText = Get-Content -LiteralPath $packageScriptPath -Raw
+if (
+    $packageScriptText -notmatch '\[Parameter\(Mandatory = \$true\)\]\s*\[string\]\$InputInjectorPath' -or
+    $packageScriptText -notmatch 'Resolve-RequiredPath -Path \$InputInjectorPath -Label "Input injector binary"' -or
+    $packageScriptText -notmatch 'Copy-Item -LiteralPath \$inputInjectorBinary -Destination \(Join-Path \$stageRoot "boundless-input-injector\.exe"\)'
+) {
+    throw "package-windows.ps1 must require, validate, and stage the elevated input injector binary."
+}
+
+$releaseWorkflowPath = Join-Path $RepoRoot ".github\workflows\release-please.yml"
+$releaseWorkflowText = Get-Content -LiteralPath $releaseWorkflowPath -Raw
+if (
+    $releaseWorkflowText -notmatch 'cargo build --release[^\r\n]*-p boundless-input-injector' -or
+    $releaseWorkflowText -notmatch '"target/release/boundless-input-injector\.exe"' -or
+    $releaseWorkflowText -notmatch '-InputInjectorPath "source/target/release/boundless-input-injector\.exe"' -or
+    $releaseWorkflowText -notmatch '-InputInjectorSignaturePolicy \$inputInjectorSignaturePolicy' -or
+    $releaseWorkflowText -notmatch 'gh release download \$previous\.tag' -or
+    $releaseWorkflowText -notmatch '-PreviousInstallerPath "\$\{\{ steps\.previous-installer\.outputs\.installer_path \}\}"' -or
+    $releaseWorkflowText -notmatch '-Policy prerelease'
+) {
+    throw "The Windows release workflow must build, sign, package, run N-1 upgrade smoke, and explicitly select dogfood readiness policy."
+}
+
+$releasePleaseConfigPath = Join-Path $RepoRoot "release-please-config.json"
+$releasePleaseConfig = Get-Content -LiteralPath $releasePleaseConfigPath -Raw | ConvertFrom-Json
+$releasePleaseExtraFiles = @($releasePleaseConfig.packages."."."extra-files" | ForEach-Object { $_.path })
+if ($releasePleaseExtraFiles -notcontains "crates/input-injector/Cargo.toml") {
+    throw "release-please-config.json must propagate the release version into the input injector crate."
+}
+
+$inputInjectorCrateRoot = Join-Path $RepoRoot "crates\input-injector"
+if (Test-Path -LiteralPath $inputInjectorCrateRoot) {
+    $inputInjectorManifestPath = Join-Path $inputInjectorCrateRoot "assets\input-injector.manifest"
+    if (-not (Test-Path -LiteralPath $inputInjectorManifestPath)) {
+        throw "The input injector crate must keep its execution-level contract in assets/input-injector.manifest."
+    }
+    $inputInjectorManifestText = Get-Content -LiteralPath $inputInjectorManifestPath -Raw
+    if (
+        $inputInjectorManifestText -notmatch 'requestedExecutionLevel\s+level="requireAdministrator"\s+uiAccess="false"' -or
+        @([regex]::Matches($inputInjectorManifestText, 'requestedExecutionLevel')).Count -ne 1
+    ) {
+        throw "The input injector source manifest must declare exactly one requireAdministrator, uiAccess=false execution level."
+    }
+}
+else {
+    Write-Host "input_injector_source_manifest_check=deferred_missing_crate"
+}
 $wixProject = Join-Path $packagingRoot "installer\Boundless.Installer.wixproj"
 $wixProjectText = Get-Content -LiteralPath $wixProject -Raw
 if ($wixProjectText -notmatch '<SuppressIces>[^<]*ICE61') {
@@ -366,6 +435,29 @@ $elevatedPhaseSource = Get-PowerShellFunctionSource `
     -Name 'Invoke-ElevatedInstallPhase'
 if ($elevatedPhaseSource -notmatch 'Stop-BoundlessServiceBeforeMsi') {
     throw "The elevated install phase must use the bounded pre-MSI service recovery boundary."
+}
+$injectorShutdownSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Stop-BoundlessInputInjectorBeforeMsi'
+$injectorSnapshotSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Get-BoundlessInputInjectorTargets'
+$injectorValidationSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Assert-BoundlessInputInjectorTargets'
+if (
+    $elevatedPhaseSource -notmatch 'Stop-BoundlessInputInjectorBeforeMsi' -or
+    $injectorShutdownSource -notmatch 'Get-BoundlessInputInjectorTargets' -or
+    $injectorShutdownSource -notmatch 'finalTargets' -or
+    $injectorShutdownSource -notmatch 'GracefulTimeoutMilliseconds' -or
+    $injectorSnapshotSource -notmatch 'Get-Process -Name "boundless-input-injector"' -or
+    $injectorSnapshotSource -notmatch 'Get-ProcessOwnerSid' -or
+    $injectorSnapshotSource -notmatch 'Assert-BoundlessInputInjectorTargets' -or
+    $injectorValidationSource -notmatch 'ExpectedOwnerSid' -or
+    $injectorValidationSource -notmatch 'ExpectedSessionId' -or
+    $injectorValidationSource -notmatch 'Test-WindowsPathEqual'
+) {
+    throw "The elevated install phase must validate every named injector and prove a bounded, fully re-enumerated shutdown before MSI."
 }
 $serviceRecoverySource = Get-PowerShellFunctionSource `
     -Path $installScript `

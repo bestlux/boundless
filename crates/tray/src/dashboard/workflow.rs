@@ -636,6 +636,15 @@ impl DashboardApp {
                 ))
                 .weak(),
             );
+            let input_health = input_sharing_health(&runtime.capture_backend_mode);
+            let clipboard_health =
+                clipboard_sharing_health(&self.snapshot.clipboard_runtime.backend_mode);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Sharing health:").strong());
+                render_sharing_health(ui, "Input", input_health);
+                ui.label("|");
+                render_sharing_health(ui, "Clipboard", clipboard_health);
+            });
             if !runtime.owner_peer_id.is_empty()
                 || !runtime.configured_capture_target_peer_id.is_empty()
                 || !runtime.active_capture_target_peer_id.is_empty()
@@ -661,16 +670,146 @@ impl DashboardApp {
                     .italics(),
                 );
             } else if runtime.capture_backend_mode == "user_session_broker" {
+                let elevated_status = self
+                    .elevated_input_controller
+                    .as_ref()
+                    .map(ElevatedInputController::status)
+                    .unwrap_or_default();
+                let elevated_active = matches!(
+                    elevated_status.state,
+                    platform_windows::elevated_input::InputInjectorState::ReadyPendingIdle
+                        | platform_windows::elevated_input::InputInjectorState::Active
+                );
                 ui.label(
                     egui::RichText::new(
-                        "Input runs through the tray user-session broker: normal unlocked \
-                         desktop only. Lock screen, UAC prompts, and elevated apps are not \
-                         controlled.",
+                        if elevated_active {
+                            "Input runs through the tray broker with administrator-app control enabled. Lock screen and the UAC consent screen remain unavailable."
+                        } else {
+                            "Input runs through the tray user-session broker. Administrator-launched app windows require the explicit control below; lock screen and the UAC consent screen remain unavailable."
+                        },
                     )
                     .weak()
                     .italics(),
                 );
             }
+            let elevated_status = self
+                .elevated_input_controller
+                .as_ref()
+                .map(ElevatedInputController::status)
+                .unwrap_or_default();
+            let (elevated_state, elevated_reason, elevated_trust) =
+                elevated_status.telemetry_fields();
+            let elevated_backend_supported = matches!(
+                runtime.capture_backend_mode.as_str(),
+                "service_session_unsupported" | "user_session_broker"
+            );
+            ui.add_space(8.0);
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Administrator app control").strong());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "State: {}  |  Reason: {}  |  Trust: {}{}",
+                        elevated_state.replace('_', " "),
+                        elevated_reason.replace('_', " "),
+                        elevated_trust.replace('_', " "),
+                        if elevated_status.helper_version.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  |  Helper: {}", elevated_status.helper_version)
+                        }
+                    ))
+                    .weak(),
+                );
+                if !elevated_backend_supported {
+                    ui.label(
+                        egui::RichText::new(
+                            "Available only with the installed service and tray input broker; the direct daemon path does not use this helper.",
+                        )
+                        .color(egui::Color32::LIGHT_YELLOW),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Enable only when you need to control an administrator-launched app. Windows asks each time you enable it for a tray session; the current dogfood build is unsigned, so the prompt identifies an unknown publisher.",
+                    )
+                    .weak()
+                    .size(12.0),
+                );
+                if elevated_status.signature_trust
+                    == platform_windows::elevated_input::InputInjectorSignatureTrust::UnsignedDogfood
+                {
+                    ui.label(
+                        egui::RichText::new("Unsigned dogfood helper active")
+                            .color(egui::Color32::LIGHT_YELLOW),
+                    );
+                }
+
+                let can_enable = elevated_backend_supported
+                    && elevated_status.direct_fallback_safe
+                    && matches!(
+                        elevated_status.state,
+                        platform_windows::elevated_input::InputInjectorState::Off
+                            | platform_windows::elevated_input::InputInjectorState::Unavailable
+                    );
+                let can_disable = matches!(
+                    elevated_status.state,
+                    platform_windows::elevated_input::InputInjectorState::Prompting
+                        | platform_windows::elevated_input::InputInjectorState::ReadyPendingIdle
+                        | platform_windows::elevated_input::InputInjectorState::Active
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            can_enable,
+                            egui::Button::new("Enable administrator-app control"),
+                        )
+                        .clicked()
+                    {
+                        let started = self
+                            .elevated_input_controller
+                            .as_ref()
+                            .is_some_and(ElevatedInputController::request_enable);
+                        if started {
+                            self.push_toast(
+                                "Approve the Windows permission prompt on this PC".to_string(),
+                                false,
+                            );
+                        } else {
+                            self.push_toast(
+                                "Administrator-app control could not start; check its status and restart the tray if shutdown is incomplete".to_string(),
+                                true,
+                            );
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            can_disable,
+                            egui::Button::new("Disable administrator-app control"),
+                        )
+                        .clicked()
+                    {
+                        let requested = self
+                            .elevated_input_controller
+                            .as_ref()
+                            .is_some_and(ElevatedInputController::request_disable);
+                        if requested {
+                            self.push_toast(
+                                "Administrator-app control is stopping and releasing held input"
+                                    .to_string(),
+                                false,
+                            );
+                        }
+                    }
+                });
+                if !elevated_status.direct_fallback_safe {
+                    ui.label(
+                        egui::RichText::new(
+                            "Direct input fallback is blocked until elevated cleanup is confirmed. Quit and relaunch Boundless if this state persists.",
+                        )
+                        .color(egui::Color32::LIGHT_RED),
+                    );
+                }
+            });
             if !runtime.lock_supported {
                 ui.label(
                     egui::RichText::new("Input locking is unavailable on this platform")
@@ -1021,5 +1160,59 @@ impl DashboardApp {
                     .size(11.0),
             );
         });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharingHealth {
+    Healthy,
+    Degraded,
+    Unknown,
+}
+
+fn input_sharing_health(backend_mode: &str) -> SharingHealth {
+    match backend_mode {
+        "windows_hooks" | "user_session_broker" | "direct" => SharingHealth::Healthy,
+        "service_session_unsupported" => SharingHealth::Degraded,
+        _ => SharingHealth::Unknown,
+    }
+}
+
+fn clipboard_sharing_health(backend_mode: &str) -> SharingHealth {
+    match backend_mode {
+        "user_session_broker" | "direct" => SharingHealth::Healthy,
+        "broker_unavailable" => SharingHealth::Degraded,
+        _ => SharingHealth::Unknown,
+    }
+}
+
+fn render_sharing_health(ui: &mut egui::Ui, label: &str, health: SharingHealth) {
+    let (status, color) = match health {
+        SharingHealth::Healthy => ("healthy", egui::Color32::LIGHT_GREEN),
+        SharingHealth::Degraded => ("degraded", egui::Color32::LIGHT_RED),
+        SharingHealth::Unknown => ("unknown", egui::Color32::GRAY),
+    };
+    ui.label(egui::RichText::new(format!("{label} {status}")).color(color));
+}
+
+#[cfg(test)]
+mod sharing_health_tests {
+    use super::*;
+
+    #[test]
+    fn sharing_health_distinguishes_healthy_degraded_and_unknown_backends() {
+        assert_eq!(
+            input_sharing_health("user_session_broker"),
+            SharingHealth::Healthy
+        );
+        assert_eq!(
+            input_sharing_health("service_session_unsupported"),
+            SharingHealth::Degraded
+        );
+        assert_eq!(
+            clipboard_sharing_health("broker_unavailable"),
+            SharingHealth::Degraded
+        );
+        assert_eq!(clipboard_sharing_health(""), SharingHealth::Unknown);
     }
 }

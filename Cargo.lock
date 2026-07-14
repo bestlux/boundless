@@ -499,6 +499,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "boundless-input-injector"
+version = "5.0.14"
+dependencies = [
+ "platform-windows",
+ "tokio",
+ "winres",
+]
+
+[[package]]
 name = "boundless-tray"
 version = "5.0.14"
 dependencies = [
@@ -821,6 +830,7 @@ dependencies = [
  "ipc-api",
  "tokio",
  "tonic",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3129,13 +3139,16 @@ name = "platform-windows"
 version = "5.0.14"
 dependencies = [
  "anyhow",
+ "clap",
  "clipboard-win",
+ "control-plane-client",
  "core-clipboard",
  "core-input",
  "ipc-api",
  "tokio",
  "tonic",
  "tracing",
+ "uuid",
  "windows-sys 0.61.2",
 ]
 

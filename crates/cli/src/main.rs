@@ -15,12 +15,13 @@ use tokio::time::Instant;
 use ipc_api::boundless::v1::{
     AntiIdleSetRequest, DiagnosticsDumpRequest, Empty, FeatureSetRequest, FileTransferSetRequest,
     HotkeySetRequest, HotkeyTriggerRequest, ImportTrustBundleRequest, InputCaptureTargetRequest,
-    InputHandoffSetRequest, InputOwnerRequest, LayoutSetRequest, NearbyJoinStartRequest,
-    NearbyJoinStatusRequest, NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest,
-    NearbySubmitCodeRequest, PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest,
-    RotateTrustRequest, SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest,
-    SendFileRequest, SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest,
-    TransportEvent, UiSnapshotReply,
+    InputHandoffConfigReply, InputHandoffSetRequest, InputOwnerRequest, InputRuntimeStatusReply,
+    LayoutSetRequest, NearbyJoinStartRequest, NearbyJoinStatusRequest,
+    NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
+    PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest, RotateTrustRequest,
+    SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest,
+    SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest, TransportEvent,
+    UiSnapshotReply,
 };
 
 mod cli_helpers;

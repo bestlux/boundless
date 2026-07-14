@@ -9,6 +9,8 @@
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ControlClientIdentity {
+    /// Process id resolved from the connected pipe handle, when available.
+    pub process_id: Option<u32>,
     /// String SID of the account owning the client process, when resolvable.
     pub user_sid: Option<String>,
     /// Windows session id of the pipe client, when resolvable.

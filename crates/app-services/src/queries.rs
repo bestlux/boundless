@@ -64,6 +64,24 @@ pub struct InputRuntimeSnapshot {
     pub capture_backend_mode: String,
     pub pending_inject_frames: usize,
     pub pending_inject_high_water: usize,
+    #[serde(default = "default_elevated_injector_state")]
+    pub elevated_injector_state: String,
+    #[serde(default = "default_elevated_injector_reason")]
+    pub elevated_injector_reason: String,
+    #[serde(default = "default_elevated_injector_signature_trust")]
+    pub elevated_injector_signature_trust: String,
+}
+
+fn default_elevated_injector_state() -> String {
+    "off".to_string()
+}
+
+fn default_elevated_injector_reason() -> String {
+    "none".to_string()
+}
+
+fn default_elevated_injector_signature_trust() -> String {
+    "unknown".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

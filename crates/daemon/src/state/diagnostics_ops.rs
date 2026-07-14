@@ -94,10 +94,11 @@ impl AppState {
         let input_capture_backend_mode = self.input_capture_backend_mode().await;
         let (pending_inject_frames, pending_inject_high_water) =
             self.pending_inject_frame_stats().await;
+        let elevated_injector_status = self.input_broker.elevated_injector_status();
         let pairing_diagnostics = self.pairing_diagnostics_report().await;
 
         let report = format!(
-            "Boundless Diagnostics\nMachine: [redacted-machine-id]\nFingerprint: [redacted-fingerprint]\nPeers: {}\nTrusted CAs: {}\nTransport Events: {}\nInput Owner: {}\nInput Capture Target: {}\nInput Capture Backend Mode: {}\nInput Pending Inject Frames: {}\nInput Pending Inject High Water: {}\nInput Handoff: block_screen_corners={} corner_block_px={} relative_mouse={} hide_cursor_at_edge={} draw_cursor_marker={}\nAPI: [redacted-endpoint]\nTransport Port: {}\nProtocol: {}\n{}\nRedaction Manifest: sidecar redaction manifest written next to this dump\n",
+            "Boundless Diagnostics\nMachine: [redacted-machine-id]\nFingerprint: [redacted-fingerprint]\nPeers: {}\nTrusted CAs: {}\nTransport Events: {}\nInput Owner: {}\nInput Capture Target: {}\nInput Capture Backend Mode: {}\nInput Pending Inject Frames: {}\nInput Pending Inject High Water: {}\nElevated Injector State: {}\nElevated Injector Reason: {}\nElevated Injector Signature Trust: {}\nInput Handoff: block_screen_corners={} corner_block_px={} relative_mouse={} hide_cursor_at_edge={} draw_cursor_marker={}\nAPI: [redacted-endpoint]\nTransport Port: {}\nProtocol: {}\n{}\nRedaction Manifest: sidecar redaction manifest written next to this dump\n",
             snapshot.peers.len(),
             trust_count,
             event_count,
@@ -106,6 +107,9 @@ impl AppState {
             input_capture_backend_mode,
             pending_inject_frames,
             pending_inject_high_water,
+            elevated_injector_status.state,
+            elevated_injector_status.reason,
+            elevated_injector_status.signature_trust,
             input_handoff.block_screen_corners,
             input_handoff.corner_block_px,
             input_handoff.relative_mouse,

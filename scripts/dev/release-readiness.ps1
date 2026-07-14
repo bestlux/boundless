@@ -19,6 +19,8 @@ param(
     [string]$Policy = "prerelease",
     [ValidateSet("msi-owned", "service-self-update", "tray-self-update")]
     [string]$ServiceUpdateMode = "msi-owned",
+    [ValidateSet("signed", "unsigned-dogfood")]
+    [string]$InputInjectorSignaturePolicy = "signed",
     [int]$MaxEvidenceAgeHours = 168
 )
 
@@ -44,12 +46,25 @@ $results = New-Object System.Collections.Generic.List[object]
 $evidenceRoot = Join-Path $OutputRoot "evidence"
 New-Item -ItemType Directory -Force -Path $evidenceRoot | Out-Null
 $installerSmokeSummary = $null
+$installerSmokeEvidencePath = ""
 $nMinusOneMsiCommand = "scripts/dev/installer-smoke.ps1 -InstallerPath <current-msi> -PreviousInstallerPath <prior-msi> -KeepArtifacts"
 
 $packageManifestPath = Join-Path $repoRoot "packaging/windows/package-manifest.json"
+$packageManifest = $null
 $packageManifestVersion = ""
+$inputInjectorDeclared = $false
+$inputInjectorExecutable = ""
 if (Test-Path -LiteralPath $packageManifestPath) {
-    $packageManifestVersion = (Get-Content -LiteralPath $packageManifestPath -Raw | ConvertFrom-Json).version
+    $packageManifest = Get-Content -LiteralPath $packageManifestPath -Raw | ConvertFrom-Json
+    $packageManifestVersion = $packageManifest.version
+    $executablesProperty = $packageManifest.PSObject.Properties["executables"]
+    if ($null -ne $executablesProperty -and $null -ne $executablesProperty.Value) {
+        $inputInjectorProperty = $executablesProperty.Value.PSObject.Properties["input_injector"]
+        if ($null -ne $inputInjectorProperty) {
+            $inputInjectorDeclared = $true
+            $inputInjectorExecutable = [string]$inputInjectorProperty.Value
+        }
+    }
 }
 $effectiveReleaseVersion = if ([string]::IsNullOrWhiteSpace($ReleaseVersion)) { $packageManifestVersion } else { $ReleaseVersion }
 
@@ -231,6 +246,32 @@ function Test-StrictTrue {
         return $Value
     }
     return [string]::Equals([string]$Value, "true", [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-StrictFalse {
+    param([object]$Value)
+
+    if ($Value -is [bool]) {
+        return -not $Value
+    }
+    return [string]::Equals([string]$Value, "false", [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-ExpectedInputInjectorBinaryPath {
+    param([string]$Executable)
+
+    if ([string]::IsNullOrWhiteSpace($Executable) -or [System.IO.Path]::GetFileName($Executable) -ne $Executable) {
+        return ""
+    }
+
+    $programFilesRoot = if ([string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        "C:\Program Files"
+    }
+    else {
+        $env:ProgramFiles
+    }
+
+    return (Join-Path $programFilesRoot "Boundless\$Executable")
 }
 
 function Get-ExpectedServiceBinaryPath {
@@ -539,6 +580,104 @@ function Add-ServiceVersionGate {
     Add-GateResult -Id "service_version_parity" -Category "release" -Command "installed boundless-service.exe --version" -Status $status -LogPath $LogPath -Reason $reason -Impact $impact
 }
 
+function Add-InputInjectorEvidenceGate {
+    param(
+        [object]$Summary,
+        [string]$ExpectedVersion,
+        [string]$LogPath,
+        [string]$Command
+    )
+
+    if (-not $inputInjectorDeclared) {
+        return
+    }
+
+    if ($null -eq $Summary) {
+        Add-SkippedGate -Id "input_injector_evidence" -Category "release" -Command $Command -Reason "installer smoke summary was not provided" -Impact "elevated input injector install, privilege, signature, version, and lifecycle evidence must be supplied before release signoff"
+        return
+    }
+
+    $requiredFields = @(
+        "input_injector_path",
+        "input_injector_signature",
+        "input_injector_product_version",
+        "input_injector_execution_level",
+        "input_injector_ui_access",
+        "input_injector_count_after_tray_launch",
+        "input_injector_count_after_repair",
+        "input_injector_count_after_uninstall"
+    )
+    foreach ($field in $requiredFields) {
+        if (-not ($Summary.PSObject.Properties.Name -contains $field)) {
+            Add-GateResult -Id "input_injector_evidence" -Category "release" -Command $Command -Status "failed" -LogPath $LogPath -Reason "installer summary missing '$field'" -Impact "elevated input injector evidence is incomplete"
+            return
+        }
+    }
+
+    $expectedPath = Get-ExpectedInputInjectorBinaryPath -Executable $inputInjectorExecutable
+    if ([string]::IsNullOrWhiteSpace($expectedPath)) {
+        Add-GateResult -Id "input_injector_evidence" -Category "release" -Command $Command -Status "failed" -LogPath $LogPath -Reason "package manifest input_injector executable '$inputInjectorExecutable' was not a canonical file name" -Impact "the release manifest must declare one Program Files payload name"
+        return
+    }
+
+    $actualPath = Normalize-ServicePath -Path ([string](Get-SummaryPropertyValue -Summary $Summary -Name "input_injector_path"))
+    $normalizedExpectedPath = Normalize-ServicePath -Path $expectedPath
+    if (-not [string]::Equals($actualPath, $normalizedExpectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Add-GateResult -Id "input_injector_evidence" -Category "release" -Command $Command -Status "failed" -LogPath $LogPath -Reason "input injector path was '$actualPath', expected '$normalizedExpectedPath'" -Impact "the MSI-owned elevated helper must be installed only at its canonical Program Files path"
+        return
+    }
+
+    $signature = [string](Get-SummaryPropertyValue -Summary $Summary -Name "input_injector_signature")
+    $signatureAccepted = [string]::Equals($signature, "Valid", [System.StringComparison]::OrdinalIgnoreCase)
+    $unsignedDogfoodAccepted = $InputInjectorSignaturePolicy -eq "unsigned-dogfood" -and [string]::Equals($signature, "NotSigned", [System.StringComparison]::OrdinalIgnoreCase)
+    if (-not $signatureAccepted -and -not $unsignedDogfoodAccepted) {
+        $expectedSignature = if ($InputInjectorSignaturePolicy -eq "unsigned-dogfood") { "Valid or NotSigned under the explicit unsigned-dogfood policy" } else { "Valid" }
+        Add-GateResult -Id "input_injector_evidence" -Category "release" -Command $Command -Status "failed" -LogPath $LogPath -Reason "input injector signature was '$signature', expected $expectedSignature" -Impact "unexpected or implicitly unsigned elevated executables cannot satisfy release readiness"
+        return
+    }
+
+    $normalizedExpectedVersion = Normalize-ReleaseVersion -Version $ExpectedVersion
+    $productVersion = [string](Get-SummaryPropertyValue -Summary $Summary -Name "input_injector_product_version")
+    if ([string]::IsNullOrWhiteSpace($normalizedExpectedVersion) -or -not [string]::Equals($productVersion, $normalizedExpectedVersion, [System.StringComparison]::Ordinal)) {
+        Add-GateResult -Id "input_injector_evidence" -Category "release" -Command $Command -Status "failed" -LogPath $LogPath -Reason "input injector PE product version was '$productVersion', expected '$normalizedExpectedVersion'" -Impact "the installed elevated helper must match the release payload version exactly"
+        return
+    }
+
+    $executionLevel = [string](Get-SummaryPropertyValue -Summary $Summary -Name "input_injector_execution_level")
+    if (-not [string]::Equals($executionLevel, "requireAdministrator", [System.StringComparison]::Ordinal)) {
+        Add-GateResult -Id "input_injector_evidence" -Category "release" -Command $Command -Status "failed" -LogPath $LogPath -Reason "input injector execution level was '$executionLevel', expected 'requireAdministrator'" -Impact "the packaged input boundary did not preserve the reviewed elevation contract"
+        return
+    }
+
+    $uiAccess = Get-SummaryPropertyValue -Summary $Summary -Name "input_injector_ui_access"
+    if (-not (Test-StrictFalse -Value $uiAccess)) {
+        Add-GateResult -Id "input_injector_evidence" -Category "release" -Command $Command -Status "failed" -LogPath $LogPath -Reason "input injector ui_access was '$uiAccess', expected false" -Impact "the helper must not silently expand to the Windows UIAccess trust model"
+        return
+    }
+
+    foreach ($field in @(
+        "input_injector_count_after_tray_launch",
+        "input_injector_count_after_repair",
+        "input_injector_count_after_uninstall"
+    )) {
+        $countValue = Get-SummaryPropertyValue -Summary $Summary -Name $field
+        $countText = [string]$countValue
+        $parsedCount = 0
+        if ($null -eq $countValue -or [string]::IsNullOrWhiteSpace($countText) -or -not [int]::TryParse($countText, [ref]$parsedCount) -or $parsedCount -ne 0) {
+            Add-GateResult -Id "input_injector_evidence" -Category "release" -Command $Command -Status "failed" -LogPath $LogPath -Reason "$field was '$countText', expected integer zero" -Impact "installer startup, repair, and uninstall must not leave an unsolicited elevated helper running"
+            return
+        }
+    }
+
+    $reason = if ($unsignedDogfoodAccepted) {
+        "NotSigned input injector accepted under the explicit unsigned-dogfood policy; canonical path, PE version, privilege manifest, and zero-process lifecycle evidence passed"
+    }
+    else {
+        "signed input injector canonical path, PE version, privilege manifest, and zero-process lifecycle evidence passed"
+    }
+    Add-GateResult -Id "input_injector_evidence" -Category "release" -Command $Command -Status "passed" -LogPath $LogPath -Reason $reason
+}
+
 function Add-ServiceUpdateOwnershipGate {
     param([string]$Mode)
 
@@ -775,6 +914,7 @@ else {
 
 if (-not [string]::IsNullOrWhiteSpace($InstallerSmokeSummaryPath)) {
     $installerSmokeSummary = Copy-AndValidateInstallerSmokeSummary -Path $InstallerSmokeSummaryPath -ExpectedVersion $effectiveReleaseVersion
+    $installerSmokeEvidencePath = Join-Path $evidenceRoot "installer-smoke.json"
 }
 elseif ($IncludeInstallerSmoke) {
     if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
@@ -795,6 +935,7 @@ elseif ($IncludeInstallerSmoke) {
         }
         $generatedInstallerSmokeSummaryPath = Join-Path $OutputRoot "installer-smoke/installer-smoke.json"
         if (Test-Path -LiteralPath $generatedInstallerSmokeSummaryPath) {
+            $installerSmokeEvidencePath = $generatedInstallerSmokeSummaryPath
             $installerSmokeSummary = Get-Content -LiteralPath $generatedInstallerSmokeSummaryPath -Raw | ConvertFrom-Json
             Add-ServiceVersionGate -Summary $installerSmokeSummary -ExpectedVersion $effectiveReleaseVersion -LogPath $generatedInstallerSmokeSummaryPath
         }
@@ -807,6 +948,7 @@ else {
 
 Add-ServiceUpdateOwnershipGate -Mode $ServiceUpdateMode
 Add-ServiceLifecycleEvidenceGate -Summary $installerSmokeSummary -Command "scripts/dev/installer-smoke.ps1"
+Add-InputInjectorEvidenceGate -Summary $installerSmokeSummary -ExpectedVersion $effectiveReleaseVersion -LogPath $installerSmokeEvidencePath -Command "scripts/dev/installer-smoke.ps1 (input injector evidence)"
 Add-NMinusOneMsiUpgradeGate -Summary $installerSmokeSummary -Mode $ServiceUpdateMode -Command $nMinusOneMsiCommand
 
 if ($IncludeServiceSmoke) {
@@ -855,6 +997,7 @@ $packet = [pscustomobject]@{
     release_version = $effectiveReleaseVersion
     release_policy = $Policy
     service_update_mode = $ServiceUpdateMode
+    input_injector_signature_policy = $InputInjectorSignaturePolicy
     risk_classification = $risk
     release_manager_signoff = $ReleaseManagerSignoff
     environment = $environment
@@ -877,6 +1020,7 @@ $markdown.Add("- Git commit: $($packet.git_commit)")
 $markdown.Add("- Release version: $($packet.release_version)")
 $markdown.Add("- Release policy: $($packet.release_policy)")
 $markdown.Add("- Service update mode: $($packet.service_update_mode)")
+$markdown.Add("- Input injector signature policy: $($packet.input_injector_signature_policy)")
 $markdown.Add("- Risk classification: $risk")
 $markdown.Add("- Release manager signoff: $($packet.release_manager_signoff)")
 $markdown.Add("- Parity matrix: ``docs/parity/mouse-without-borders.md``")
