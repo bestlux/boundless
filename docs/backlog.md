@@ -58,16 +58,16 @@ Protocol 4.4 is an intentional clean break for the expanded keyboard/input contr
 
 ---
 
-## v5.0.15 elevated-input train (planned; no implementation claim)
+## v5.0.15 elevated-input train (code complete; release and installed evidence pending)
 
-The next dogfood build is one coherent privileged-input and recovery train. It does not reopen unrelated network, firewall, layout, or transport work:
+The next dogfood build is one coherent privileged-input and recovery train. The source, tests, MSI lifecycle, and release gates are implemented; the published 5.0.15 artifact plus installed UAC/two-PC evidence remain pending. It does not reopen unrelated network, firewall, layout, or transport work:
 
-| story | planned v5.0.15 slice | boundary |
+| story | candidate status and primary commits | remaining boundary |
 | --- | --- | --- |
-| BND-NEXT-44 | Implement 44A/44B/44C: prove the elevation mechanism, add the minimal incoming-input/release injector, and package its explicit lifecycle. | Ordinary same-user elevated applications only; no secure desktop, lock screen, Winlogon, alternate-admin credentials, elevated tray/daemon, or general privileged command channel. |
-| BND-NEXT-34 | Add only bounded capability and stage reasons needed to distinguish normal broker delivery from privileged-injector unavailable, rejected, wrong-session, and injection-failed states. | The full generic per-stage telemetry and sustained-input story remains open. |
-| BND-NEXT-24 | Finish the missing truthful health model and tray/CLI presentation for healthy, input-degraded, clipboard-degraded, and elevated-injection-unavailable states. | No clipboard spooling, Explorer-file semantics, or peer-transport expansion. |
-| BND-NEXT-31 / BND-NEXT-38 | Integrate the injector into existing single-owner, Quit/relaunch, lease-expiry, held-input cleanup, and emergency fail-open behavior. | These are regression and lifecycle constraints, not permission to redesign the tray or escape contract. |
+| BND-NEXT-44 | Code complete: 597f385, be566e9, 4b3ac03, 3b1802e, 466921a. The explicit helper, minimal authenticated injection surface, atomic uncertain-delivery reset, crash cleanup, UI control, MSI lifecycle, and N-1 release gate are implemented. | Publish 5.0.15, then prove ordinary same-user elevated Terminal/IDE/Task Manager control in both directions. No secure desktop, lock screen, Winlogon, alternate-admin credentials, elevated tray/daemon, or general privileged command channel. |
+| BND-NEXT-34 | The bounded injector capability/reason slice is code complete in 6c33b04 and be566e9. | The full generic per-stage telemetry vocabulary and sustained-input trace remain open. |
+| BND-NEXT-24 | The tray, CLI, snapshot, and diagnostics now distinguish input, clipboard, and elevated-injector health in be566e9. | Installed degraded-state and Paint size/fault evidence remain open; no clipboard spooling, Explorer-file semantics, or peer-transport expansion. |
+| BND-NEXT-31 / BND-NEXT-38 | Injector integration now preserves single-owner routing, bounded shutdown, held-input release, uncertain-delivery quarantine, helper-crash recovery, and direct-lane fail-open behavior in be566e9, 4b3ac03, and 3b1802e. | Installed Quit/relaunch, helper-crash, emergency-unlock, and next-handoff evidence remain required. |
 
 For this one-user dogfood train, an explicitly user-enabled `requireAdministrator` injector may ship unsigned as an experimental fallback when all of the following are true:
 
@@ -335,7 +335,7 @@ BND-NEXT-34 owns durable bounded stage counters. This story may use temporary ta
 
 **Category:** bug
 
-Status: planned for the bounded v5.0.15 train; no implementation is claimed. This is the ordinary elevated-window slice of the older BND-NEXT-9C parity gap. The one-user dogfood policy permits an explicitly enabled, MSI-owned, unsigned `requireAdministrator` injector with an **Unknown Publisher** UAC prompt and truthful `unsigned dogfood` status. Trusted Windows code signing and a written policy decision remain mandatory for UIAccess or a polished/trusted-publisher claim. The published v5.0.14 MSI is unsigned, its release logs show signing was skipped, and no `WINDOWS_SIGN_*` repository variables are configured.
+Status: code complete for the bounded v5.0.15 candidate in 597f385, be566e9, 4b3ac03, 3b1802e, and 466921a; release workflow and installed evidence are pending. This is the ordinary elevated-window slice of the older BND-NEXT-9C parity gap. The one-user dogfood policy permits an explicitly enabled, MSI-owned, unsigned `requireAdministrator` injector with an **Unknown Publisher** UAC prompt and truthful `unsigned dogfood` status. Trusted Windows code signing and a written policy decision remain mandatory for UIAccess or a polished/trusted-publisher claim. The published v5.0.14 MSI is unsigned, its release logs show signing was skipped, and no `WINDOWS_SIGN_*` repository variables are configured.
 
 ### Context and evidence
 
@@ -560,6 +560,8 @@ Targeted tray/platform tests; `scripts/dev/installer-smoke.ps1` process-count co
 ### Context and evidence
 
 Boundless currently has one active user and is iterating through private two-PC dogfood rather than supporting a broad public release population. CI and release work have accumulated multiple workflows, release paths, PowerShell harnesses, platform-specific gates, and recovery fixes. Recent releases succeeded, but repeated workflow and installer-validation hiccups made routine iteration expensive and obscured which checks protect a real product risk versus historical process complexity. The desired outcome is not maximum automation; it is a small, legible system that gives fast feedback during development and preserves the few Windows/release proofs that matter.
+
+The v5.0.15 packaging pass reproduced one concrete example twice: the owned-process-tree self-test reported a descendant as running immediately after the Windows job signaled an empty tree, while the PID was already absent on inspection. Commit 466921a adds a bounded process-object convergence check and repeated Windows PowerShell/pwsh validation. That local flake fix does not replace the broader current-state analysis or authorize workflow consolidation without evidence.
 
 ### Scope
 
