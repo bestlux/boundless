@@ -6939,10 +6939,13 @@ finally { $attempt.Dispose() }
                 -TreeJobName "Local\Boundless.Installer.Tree.v1.$([guid]::NewGuid().ToString('N'))" `
                 -TreeClosureState $failedTreeState `
                 -HardKillRecoveryAction {
+                    # The fixture must allow a cold hosted PowerShell process
+                    # to enter its script before proving the bounded hang path.
+                    # Production recovery retains its separate 60-second default.
                     Restore-BoundlessServiceAfterHardKilledElevatedInstall `
                         -QuiescenceLease $fixtureLease `
                         -StagedHelperPath "fixture" `
-                        -TimeoutMilliseconds 300 `
+                        -TimeoutMilliseconds 3000 `
                         -FixtureLauncherSource $failedLauncherSource `
                         -BeforeFixtureLauncherAction {
                             param($authority)
@@ -7009,22 +7012,30 @@ finally { $serviceStart.Dispose(); $ready.Dispose(); $revoked.Dispose() }
             $null -ne $failedBrokerState.process -and
             $failedBrokerState.process.WaitForExit(5000)
         )
+        $failedBrokerServiceStartObserved = $failedBrokerServiceStart.event.WaitOne(0)
+        $failedInstallerExited = $failedInstaller.HasExited
         if (
             $null -eq $failedError -or
             $failedError.Exception.Message -notmatch 'quiescence monitor exited' -or
-            $failedError.Exception.Message -notmatch 'elevation launch/execution exceeded 300' -or
+            $failedError.Exception.Message -notmatch 'elevation launch/execution exceeded 3000' -or
             -not $firstLaunchObserved -or
             $secondLaunchObserved -or
             -not $failedBrokerExited -or
-            $failedBrokerServiceStart.event.WaitOne(0) -or
-            -not $failedInstaller.HasExited -or
+            $failedBrokerServiceStartObserved -or
+            -not $failedInstallerExited -or
             -not $failedTreeState.confirmed -or
             -not $failedTreeState.hard_kill_used -or
             $failedTreeState.parent_service_recovery_reconciled -or
             $failedTreeState.parent_service_recovery_status -ne "failed" -or
-            $failedStopwatch.ElapsedMilliseconds -gt 7000
+            $failedStopwatch.ElapsedMilliseconds -gt 12000
         ) {
-            throw "Recovery launch-hang fixture did not preserve both errors and exit after one bounded launch attempt."
+            throw (
+                "Recovery launch-hang fixture did not preserve both errors and exit after one bounded launch attempt. " +
+                "error=$($failedError.Exception.Message);first_launch=$firstLaunchObserved;second_launch=$secondLaunchObserved;" +
+                "broker_exited=$failedBrokerExited;service_start=$failedBrokerServiceStartObserved;" +
+                "installer_exited=$failedInstallerExited;tree=$($failedTreeState | ConvertTo-Json -Compress);" +
+                "elapsed=$($failedStopwatch.ElapsedMilliseconds)"
+            )
         }
     }
     finally {
