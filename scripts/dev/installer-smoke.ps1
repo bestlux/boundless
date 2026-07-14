@@ -6,7 +6,8 @@ param(
     [string]$OutputRoot = "",
     [string]$AllowedUserSid = "",
     [switch]$RequireSignature,
-    [switch]$KeepArtifacts
+    [switch]$KeepArtifacts,
+    [switch]$SelfTest
 )
 
 Set-StrictMode -Version Latest
@@ -111,14 +112,102 @@ function Get-BoundlessInstallHelperEvidenceValue {
         [string]$Name
     )
 
-    $match = [regex]::Match(
-        $Output,
-        "(?m)^$([regex]::Escape($Name))=(?<value>[^\r\n]+)$"
-    )
-    if (-not $match.Success) {
+    $prefix = "$Name="
+    $values = @()
+    $reader = [System.IO.StringReader]::new($Output)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ($line.StartsWith($prefix, [StringComparison]::Ordinal)) {
+                $values += $line.Substring($prefix.Length)
+            }
+        }
+    }
+    finally {
+        $reader.Dispose()
+    }
+
+    if ($values.Count -eq 0) {
         throw "Packaged install helper did not emit required evidence '$Name'."
     }
-    return $match.Groups["value"].Value.Trim()
+    if ($values.Count -ne 1) {
+        throw "Packaged install helper emitted required evidence '$Name' more than once."
+    }
+
+    $value = $values[0].Trim()
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        throw "Packaged install helper emitted empty required evidence '$Name'."
+    }
+    return $value
+}
+
+function Assert-BoundlessInstallHelperEvidenceParserFixtures {
+    $evidenceName = "boundless_install_tray_shutdown_count"
+    $expectedValue = "7"
+    $validFixtures = @(
+        [pscustomobject]@{
+            Name = "lf"
+            Output = "before=ignored`n$evidenceName=$expectedValue`nafter=ignored"
+        },
+        [pscustomobject]@{
+            Name = "crlf"
+            Output = "before=ignored`r`n$evidenceName=$expectedValue`r`nafter=ignored"
+        },
+        [pscustomobject]@{
+            Name = "cr"
+            Output = "before=ignored`r$evidenceName=$expectedValue`rafter=ignored"
+        },
+        [pscustomobject]@{
+            Name = "final-line"
+            Output = "before=ignored`r`n$evidenceName=$expectedValue"
+        }
+    )
+
+    foreach ($fixture in $validFixtures) {
+        $actualValue = Get-BoundlessInstallHelperEvidenceValue `
+            -Output $fixture.Output `
+            -Name $evidenceName
+        if ($actualValue -ne $expectedValue) {
+            throw "Install helper evidence parser fixture '$($fixture.Name)' returned '$actualValue'."
+        }
+    }
+
+    foreach ($invalidFixture in @(
+            [pscustomobject]@{
+                Name = "missing"
+                Output = "before=ignored`r`nafter=ignored"
+                ExpectedMessage = "did not emit required evidence"
+            },
+            [pscustomobject]@{
+                Name = "empty"
+                Output = "$evidenceName=   "
+                ExpectedMessage = "emitted empty required evidence"
+            },
+            [pscustomobject]@{
+                Name = "duplicate"
+                Output = "$evidenceName=1`r`n$evidenceName=2"
+                ExpectedMessage = "more than once"
+            },
+            [pscustomobject]@{
+                Name = "embedded"
+                Output = "noise_$evidenceName=$expectedValue"
+                ExpectedMessage = "did not emit required evidence"
+            }
+        )) {
+        $caughtMessage = $null
+        try {
+            Get-BoundlessInstallHelperEvidenceValue `
+                -Output $invalidFixture.Output `
+                -Name $evidenceName | Out-Null
+        }
+        catch {
+            $caughtMessage = $_.Exception.Message
+        }
+        if ($null -eq $caughtMessage -or $caughtMessage -notmatch [regex]::Escape($invalidFixture.ExpectedMessage)) {
+            throw "Install helper evidence parser fixture '$($invalidFixture.Name)' did not fail as expected."
+        }
+    }
+
+    Write-Host "installer_smoke_helper_evidence_parser_fixtures=passed"
 }
 
 function Invoke-BoundlessInstallHelper {
@@ -779,6 +868,13 @@ function Wait-ForRuntimePresence {
     }
 
     throw "Timed out waiting for Boundless runtime to become present."
+}
+
+if ($SelfTest) {
+    Assert-BoundlessInstallHelperEvidenceParserFixtures
+    Assert-WindowsServiceExecutablePathFixtures
+    Write-Host "installer_smoke_self_test=passed"
+    return
 }
 
 if ((Get-Variable -Name IsWindows -ErrorAction SilentlyContinue) -and (-not $IsWindows)) {

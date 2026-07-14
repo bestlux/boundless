@@ -557,11 +557,15 @@ Targeted tray/platform tests; `scripts/dev/installer-smoke.ps1` process-count co
 
 ## BND-NEXT-32 (P1): Simplify CI/CD for one-user dogfood iteration
 
+Status: first reversible shift-left slice approved 2026-07-14; the broader workflow inventory and consolidation analysis remain open.
+
 ### Context and evidence
 
 Boundless currently has one active user and is iterating through private two-PC dogfood rather than supporting a broad public release population. CI and release work have accumulated multiple workflows, release paths, PowerShell harnesses, platform-specific gates, and recovery fixes. Recent releases succeeded, but repeated workflow and installer-validation hiccups made routine iteration expensive and obscured which checks protect a real product risk versus historical process complexity. The desired outcome is not maximum automation; it is a small, legible system that gives fast feedback during development and preserves the few Windows/release proofs that matter.
 
 The v5.0.15 packaging pass reproduced two concrete examples. First, the owned-process-tree self-test reported a descendant as running immediately after the Windows job signaled an empty tree, while the PID was already absent on inspection; 466921a adds bounded process-object convergence. Second, hosted CI could not cold-start a synthetic recovery PowerShell process inside the fixture's artificial 300 ms allowance; abc0af2 keeps the production timeout unchanged, widens only the fixture boundary, and emits condition-level diagnostics. These local flake fixes do not replace the broader current-state analysis or authorize workflow consolidation without evidence.
+
+The subsequent v5.0.15 release attempts exposed three more harness defects only after merge: the elevated helper lost the native root-process exit code, its serialized parent result omitted a strict-mode field, and `installer-smoke.ps1` rejected valid CRLF-delimited helper evidence even though the helper had installed 5.0.15 and restored service/API health. The approved first migration slice therefore keeps the release gate intact while moving two checks earlier: deterministic helper-evidence parser fixtures under Windows PowerShell and PowerShell 7 in the existing fast packaging job, plus a PR-only hosted MSI lane for installer-relevant changes that builds the candidate and runs the real N-1 upgrade, repair, health, and uninstall contract. This slice is intentionally additive and reversible; it does not claim the 30-run inventory or authorize deletion of existing workflows.
 
 ### Scope
 

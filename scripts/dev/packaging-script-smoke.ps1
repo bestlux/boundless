@@ -144,6 +144,27 @@ if (
     throw "The Windows release workflow must build, sign, package, run N-1 upgrade smoke, and explicitly select dogfood readiness policy."
 }
 
+$ciWorkflowPath = Join-Path $RepoRoot ".github\workflows\ci.yml"
+$ciWorkflowText = Get-Content -LiteralPath $ciWorkflowPath -Raw
+foreach ($requiredInstallerIntegrationContract in @(
+        'windows-installer-integration:',
+        "if: github.event_name == 'pull_request'",
+        'needs: packaging-scripts',
+        'cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector',
+        './scripts/release/package-windows.ps1',
+        './scripts/dev/installer-smoke.ps1',
+        '-PreviousInstallerPath',
+        'Upload installer validation evidence',
+        "if: always() && steps.changes.outputs.run_installer == 'true'"
+    )) {
+    if ($ciWorkflowText -notmatch [regex]::Escape($requiredInstallerIntegrationContract)) {
+        throw "The PR CI workflow is missing Windows installer integration contract: $requiredInstallerIntegrationContract"
+    }
+}
+if ($ciWorkflowText -match '(?m)^\s*pull_request_target\s*:') {
+    throw "The Windows installer integration lane must not execute PR code through pull_request_target."
+}
+
 $releasePleaseConfigPath = Join-Path $RepoRoot "release-please-config.json"
 $releasePleaseConfig = Get-Content -LiteralPath $releasePleaseConfigPath -Raw | ConvertFrom-Json
 $releasePleaseExtraFiles = @($releasePleaseConfig.packages."."."extra-files" | ForEach-Object { $_.path })
@@ -503,7 +524,9 @@ if (-not (Test-Path -LiteralPath $installerSmoke)) {
 }
 $installerSmokeText = Get-Content -LiteralPath $installerSmoke -Raw
 foreach ($requiredSmokeContract in @(
+        '[switch]$SelfTest',
         'Invoke-BoundlessInstallHelper',
+        'Assert-BoundlessInstallHelperEvidenceParserFixtures',
         'install_helper_upgrade_evidence',
         'boundless_install_tray_quiescence_acquired',
         'Get-WindowsCommandExecutablePath',
@@ -551,6 +574,10 @@ foreach ($hostName in @("powershell.exe", "pwsh.exe")) {
             -Arguments @("-SelfTest") `
             -PowerShellExe $hostCommand.Source | Out-Null
     }
+    Invoke-PackagingScript `
+        -ScriptPath $installerSmoke `
+        -Arguments @("-SelfTest") `
+        -PowerShellExe $hostCommand.Source | Out-Null
 }
 
 $smokeSid = "S-1-5-21-1000-1000-1000-1001"
@@ -567,4 +594,4 @@ if ($summary.selected_user_sid -ne $smokeSid) {
     throw "Boundless-Install.ps1 -ResolveOnly resolved unexpected SID: $($summary.selected_user_sid)"
 }
 
-Write-Host "packaging_script_smoke=passed self_tests=$($selfTestScripts.Count) install_fixture_hosts=$($fixtureHosts -join ',') install_resolve_only=passed wix_upgrade_contract=passed helper_upgrade_contract=passed"
+Write-Host "packaging_script_smoke=passed self_tests=$($selfTestScripts.Count) install_fixture_hosts=$($fixtureHosts -join ',') installer_smoke_fixture_hosts=$($fixtureHosts -join ',') install_resolve_only=passed wix_upgrade_contract=passed helper_upgrade_contract=passed"
