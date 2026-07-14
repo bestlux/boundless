@@ -18,7 +18,7 @@ use ipc_api::boundless::v1::{
     InputHandoffConfigReply, InputHandoffSetRequest, InputOwnerRequest, InputRuntimeStatusReply,
     LayoutSetRequest, NearbyJoinStartRequest, NearbyJoinStatusRequest,
     NearbyPairingDecisionRequest, NearbyRequestCodeStartRequest, NearbySubmitCodeRequest,
-    PairCreateCodeRequest, PairJoinRequest, RemovePeerRequest, RotateTrustRequest,
+    PairCreateCodeRequest, PairJoinRequest, PeerInfo, RemovePeerRequest, RotateTrustRequest,
     SafeResetRequest, SendClipboardImageRequest, SendClipboardTextRequest, SendFileRequest,
     SendInputKeyRequest, SendInputMoveRequest, StatusReply, StatusRequest, TransportEvent,
     UiSnapshotReply,
@@ -41,6 +41,9 @@ use console::{ConsoleDiscoveredPeer, ConsoleSnapshot};
 #[derive(Debug, Parser)]
 #[command(name = "boundlessctl", version, about = "Boundless CLI")]
 struct Cli {
+    #[arg(long, global = true, default_value_t = false)]
+    json: bool,
+
     #[arg(
         long,
         global = true,
@@ -403,12 +406,18 @@ struct StoredTrustBundle {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.json && !command_supports_json(&cli.command) {
+        anyhow::bail!(
+            "--json is supported by daemon status, peer list, feature list, and transport events"
+        );
+    }
+    let output = OutputFormat::from_json_flag(cli.json);
 
     match cli.command {
         Command::Setup { start_daemon } => setup_wizard(&cli.endpoint, start_daemon).await,
         Command::Console { start_daemon } => console_run(&cli.endpoint, start_daemon).await,
         Command::Daemon { command } => match command {
-            DaemonCommand::Status => daemon_status(&cli.endpoint).await,
+            DaemonCommand::Status => daemon_status(&cli.endpoint, output).await,
         },
         Command::Service { command } => match command {
             ServiceCommand::Status => service_status().await,
@@ -484,7 +493,7 @@ async fn main() -> Result<()> {
             PairCommand::RotateTrust { confirm } => pair_rotate_trust(&cli.endpoint, confirm).await,
         },
         Command::Peer { command } => match command {
-            PeerCommand::List => peer_list(&cli.endpoint).await,
+            PeerCommand::List => peer_list(&cli.endpoint, output).await,
             PeerCommand::Remove { peer_id } => peer_remove(&cli.endpoint, peer_id).await,
         },
         Command::Layout { command } => match command {
@@ -500,7 +509,7 @@ async fn main() -> Result<()> {
             LayoutCommand::Wizard => layout_wizard(&cli.endpoint).await,
         },
         Command::Feature { command } => match command {
-            FeatureCommand::List => feature_list(&cli.endpoint).await,
+            FeatureCommand::List => feature_list(&cli.endpoint, output).await,
             FeatureCommand::Set { name, value } => feature_set(&cli.endpoint, name, value).await,
         },
         Command::AntiIdle { command } => match command {
@@ -561,6 +570,7 @@ async fn main() -> Result<()> {
                     limit,
                     kind.as_deref(),
                     exclude_kind.as_deref(),
+                    output,
                 )
                 .await
             }
@@ -636,9 +646,43 @@ async fn main() -> Result<()> {
     }
 }
 
+fn command_supports_json(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Daemon {
+            command: DaemonCommand::Status
+        } | Command::Peer {
+            command: PeerCommand::List
+        } | Command::Feature {
+            command: FeatureCommand::List
+        } | Command::Transport {
+            command: TransportCommand::Events { .. }
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_flag_is_global_and_defaults_to_human_output() {
+        let before = Cli::try_parse_from(["boundlessctl", "--json", "daemon", "status"])
+            .expect("parse global flag before command");
+        assert!(before.json);
+
+        let after = Cli::try_parse_from(["boundlessctl", "daemon", "status", "--json"])
+            .expect("parse global flag after nested command");
+        assert!(after.json);
+
+        let default = Cli::try_parse_from(["boundlessctl", "daemon", "status"])
+            .expect("parse without global flag");
+        assert!(!default.json);
+
+        let unsupported = Cli::try_parse_from(["boundlessctl", "--json", "service", "status"])
+            .expect("global syntax remains parseable");
+        assert!(!command_supports_json(&unsupported.command));
+    }
 
     #[test]
     fn validate_bmp_payload_rejects_non_bmp() {

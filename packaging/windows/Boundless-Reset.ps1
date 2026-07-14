@@ -105,6 +105,22 @@ function Get-MachineIdFromStatusOutput {
     return $null
 }
 
+function Get-MachineIdFromStatusJson {
+    param([object[]]$StatusOutput)
+
+    try {
+        $status = ($StatusOutput -join [Environment]::NewLine) | ConvertFrom-Json -ErrorAction Stop
+        if ($status.schema_version -eq 1 -and -not [string]::IsNullOrWhiteSpace([string]$status.machine_id)) {
+            return ([string]$status.machine_id).Trim()
+        }
+    }
+    catch {
+        return $null
+    }
+
+    return $null
+}
+
 function Get-CanonicalDaemonStatusFixture {
     $fixturePath = Join-Path (Join-Path $script:PackagingScriptRoot "fixtures") "daemon-status-single-line.txt"
     if (-not (Test-Path -LiteralPath $fixturePath)) {
@@ -114,19 +130,52 @@ function Get-CanonicalDaemonStatusFixture {
     return (Get-Content -LiteralPath $fixturePath -Raw).Trim()
 }
 
+function Invoke-NativeCommandCapture {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5.1 promotes redirected native stderr to a
+        # terminating NativeCommandError when the script preference is Stop.
+        # This probe must observe old boundlessctl exit 2 and continue to the
+        # human-output compatibility fallback.
+        $ErrorActionPreference = "Continue"
+        $output = & $FilePath @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+        return [pscustomobject]@{
+            output = @($output)
+            exit_code = $exitCode
+        }
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
 function Get-DaemonMachineId {
     param(
         [string]$BoundlessCtl,
         [string]$TargetEndpoint
     )
 
-    $statusArguments = @("--endpoint", $TargetEndpoint, "daemon", "status")
-    $statusOutput = & $BoundlessCtl @statusArguments 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "boundlessctl daemon status exited with $($LASTEXITCODE): $statusOutput"
+    $jsonArguments = @("--json", "--endpoint", $TargetEndpoint, "daemon", "status")
+    $jsonResult = Invoke-NativeCommandCapture -FilePath $BoundlessCtl -Arguments $jsonArguments
+    if ($jsonResult.exit_code -eq 0) {
+        $machineId = Get-MachineIdFromStatusJson -StatusOutput $jsonResult.output
+        if ($null -ne $machineId) {
+            return $machineId
+        }
     }
 
-    $machineId = Get-MachineIdFromStatusOutput -StatusOutput $statusOutput
+    $statusArguments = @("--endpoint", $TargetEndpoint, "daemon", "status")
+    $statusResult = Invoke-NativeCommandCapture -FilePath $BoundlessCtl -Arguments $statusArguments
+    if ($statusResult.exit_code -ne 0) {
+        throw "boundlessctl daemon status exited with $($statusResult.exit_code): $($statusResult.output)"
+    }
+    $machineId = Get-MachineIdFromStatusOutput -StatusOutput $statusResult.output
     if ($null -ne $machineId) {
         return $machineId
     }
@@ -135,6 +184,24 @@ function Get-DaemonMachineId {
 }
 
 function Invoke-ResetSelfTest {
+    $nativeFailure = Invoke-NativeCommandCapture `
+        -FilePath $env:ComSpec `
+        -Arguments @("/d", "/c", "echo legacy-error 1>&2 & exit /b 2")
+    if ($nativeFailure.exit_code -ne 2 -or ($nativeFailure.output -join " ") -notmatch "legacy-error") {
+        throw "native command failure capture must remain non-terminating for legacy fallback"
+    }
+
+    $json = '{"schema_version":1,"machine_id":"json-machine-id"}'
+    if ((Get-MachineIdFromStatusJson -StatusOutput @($json)) -ne "json-machine-id") {
+        throw "machine_id must parse from daemon status JSON"
+    }
+    if ($null -ne (Get-MachineIdFromStatusJson -StatusOutput @('{"schema_version":2,"machine_id":"wrong-schema"}'))) {
+        throw "unknown daemon status JSON schemas must be rejected"
+    }
+    if ($null -ne (Get-MachineIdFromStatusJson -StatusOutput @('not-json'))) {
+        throw "invalid daemon status JSON must return null"
+    }
+
     $singleLine = Get-CanonicalDaemonStatusFixture
     if ((Get-MachineIdFromStatusOutput -StatusOutput @($singleLine)) -ne "4f0c6bce-6c10-4df9-b8b5-3a9a3fbb5da1") {
         throw "machine_id must parse from canonical single-line daemon status output"

@@ -21,6 +21,40 @@ const BOUNDLESS_SERVICE_DISPLAY_NAME: &str = "Boundless Service";
 #[cfg(windows)]
 const USER_WRITABLE_SERVICE_SOURCE_DIRS: [&str; 3] = ["LOCALAPPDATA", "APPDATA", "TEMP"];
 
+const OUTPUT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OutputFormat {
+    Human,
+    Json,
+}
+
+impl OutputFormat {
+    pub(super) fn from_json_flag(json: bool) -> Self {
+        if json { Self::Json } else { Self::Human }
+    }
+}
+
+#[derive(Serialize)]
+struct DaemonStatusJson<'a> {
+    schema_version: u32,
+    daemon_version: &'a str,
+    running: bool,
+    machine_id: &'a str,
+    peer_count: u32,
+    protocol_version: &'a str,
+    api_bind: &'a str,
+    api_transport: &'a str,
+    api_pipe_name: &'a str,
+    input_locked: bool,
+    input_lock_supported: bool,
+    capture_target_peer_id: &'a str,
+    anti_idle_supported: bool,
+    anti_idle_enabled: bool,
+    anti_idle_active: bool,
+    anti_idle_display_required: bool,
+}
+
 pub(super) async fn ensure_daemon_available(endpoint: &str, start_daemon: bool) -> Result<()> {
     let initial_error = match channel(endpoint).await {
         Ok(_) => return Ok(()),
@@ -92,11 +126,36 @@ fn resolve_boundless_service_binary() -> Result<PathBuf> {
     Ok(parent.join("boundless-service.exe"))
 }
 
-pub(super) async fn daemon_status(endpoint: &str) -> Result<()> {
+pub(super) async fn daemon_status(endpoint: &str, output: OutputFormat) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let status = client.get_status(StatusRequest {}).await?.into_inner();
-    println!("{}", format_daemon_status_line(&status));
+    match output {
+        OutputFormat::Human => println!("{}", format_daemon_status_line(&status)),
+        OutputFormat::Json => println!("{}", daemon_status_json(&status)?),
+    }
     Ok(())
+}
+
+fn daemon_status_json(status: &StatusReply) -> Result<String> {
+    serde_json::to_string_pretty(&DaemonStatusJson {
+        schema_version: OUTPUT_SCHEMA_VERSION,
+        daemon_version: &status.daemon_version,
+        running: status.running,
+        machine_id: &status.machine_id,
+        peer_count: status.peer_count,
+        protocol_version: &status.protocol_version,
+        api_bind: &status.api_bind,
+        api_transport: &status.api_transport,
+        api_pipe_name: &status.api_pipe_name,
+        input_locked: status.input_locked,
+        input_lock_supported: status.input_lock_supported,
+        capture_target_peer_id: &status.capture_target_peer_id,
+        anti_idle_supported: status.anti_idle_supported,
+        anti_idle_enabled: status.anti_idle_enabled,
+        anti_idle_active: status.anti_idle_active,
+        anti_idle_display_required: status.anti_idle_display_required,
+    })
+    .context("serialize daemon status")
 }
 
 fn format_daemon_status_line(status: &StatusReply) -> String {
@@ -925,9 +984,34 @@ pub(super) async fn pair_rotate_trust(endpoint: &str, confirm: String) -> Result
     Ok(())
 }
 
-pub(super) async fn peer_list(endpoint: &str) -> Result<()> {
+#[derive(Serialize)]
+struct PeerListJson<'a> {
+    schema_version: u32,
+    peers: Vec<PeerJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct PeerJson<'a> {
+    peer_id: &'a str,
+    display_name: &'a str,
+    address: &'a str,
+    connected: bool,
+    health_state: &'a str,
+    health_reason: &'a str,
+    trust_state: &'a str,
+    trusted_since: &'a str,
+    trust_fingerprint: &'a str,
+    device_identity: &'a str,
+}
+
+pub(super) async fn peer_list(endpoint: &str, output: OutputFormat) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let response = client.list_peers(Empty {}).await?.into_inner();
+
+    if output == OutputFormat::Json {
+        println!("{}", peer_list_json(&response.peers)?);
+        return Ok(());
+    }
 
     if response.peers.is_empty() {
         println!("no peers configured");
@@ -1504,12 +1588,48 @@ pub(super) async fn layout_wizard(endpoint: &str) -> Result<()> {
     layout_orient(endpoint, left, right, up, down).await
 }
 
-pub(super) async fn feature_list(endpoint: &str) -> Result<()> {
+#[derive(Serialize)]
+struct FeatureListJson {
+    schema_version: u32,
+    features: std::collections::BTreeMap<String, bool>,
+}
+
+fn peer_list_json(peers: &[PeerInfo]) -> Result<String> {
+    let peers = peers
+        .iter()
+        .map(|peer| PeerJson {
+            peer_id: &peer.peer_id,
+            display_name: &peer.display_name,
+            address: &peer.address,
+            connected: peer.connected,
+            health_state: &peer.health_state,
+            health_reason: &peer.health_reason,
+            trust_state: &peer.trust_state,
+            trusted_since: &peer.trusted_since,
+            trust_fingerprint: &peer.trust_fingerprint,
+            device_identity: &peer.device_identity,
+        })
+        .collect();
+    serde_json::to_string_pretty(&PeerListJson {
+        schema_version: OUTPUT_SCHEMA_VERSION,
+        peers,
+    })
+    .context("serialize peer list")
+}
+
+pub(super) async fn feature_list(endpoint: &str, output: OutputFormat) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let response = client.list_features(Empty {}).await?.into_inner();
 
-    let mut features = response.features.into_iter().collect::<Vec<_>>();
-    features.sort_by(|a, b| a.0.cmp(&b.0));
+    let features = response
+        .features
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    if output == OutputFormat::Json {
+        println!("{}", feature_list_json(features)?);
+        return Ok(());
+    }
 
     for (name, enabled) in features {
         println!("{name}={enabled}");
@@ -1704,6 +1824,7 @@ pub(super) async fn transport_events(
     limit: usize,
     kind: Option<&str>,
     exclude_kind: Option<&str>,
+    output: OutputFormat,
 ) -> Result<()> {
     let mut client = connect_control_plane(endpoint).await?;
     let mut events = client
@@ -1712,6 +1833,11 @@ pub(super) async fn transport_events(
         .into_inner()
         .events;
     events = select_transport_events(events, limit, kind, exclude_kind);
+
+    if output == OutputFormat::Json {
+        println!("{}", transport_events_json(&events)?);
+        return Ok(());
+    }
 
     if events.is_empty() {
         println!("no transport events");
@@ -1732,6 +1858,49 @@ pub(super) async fn transport_events(
     }
 
     Ok(())
+}
+
+fn feature_list_json(features: std::collections::BTreeMap<String, bool>) -> Result<String> {
+    serde_json::to_string_pretty(&FeatureListJson {
+        schema_version: OUTPUT_SCHEMA_VERSION,
+        features,
+    })
+    .context("serialize feature list")
+}
+
+#[derive(Serialize)]
+struct TransportEventsJson<'a> {
+    schema_version: u32,
+    events: Vec<TransportEventJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct TransportEventJson<'a> {
+    timestamp: &'a str,
+    direction: &'a str,
+    kind: &'a str,
+    peer_id: &'a str,
+    detail: String,
+    size_bytes: u64,
+}
+
+fn transport_events_json(events: &[TransportEvent]) -> Result<String> {
+    let events = events
+        .iter()
+        .map(|event| TransportEventJson {
+            timestamp: &event.timestamp,
+            direction: &event.direction,
+            kind: &event.kind,
+            peer_id: &event.peer_id,
+            detail: protected_transport_event_detail(event),
+            size_bytes: event.size_bytes,
+        })
+        .collect();
+    serde_json::to_string_pretty(&TransportEventsJson {
+        schema_version: OUTPUT_SCHEMA_VERSION,
+        events,
+    })
+    .context("serialize transport events")
 }
 
 fn protected_transport_event_detail(event: &TransportEvent) -> String {
@@ -2829,6 +2998,114 @@ mod tests {
                 .trim();
 
         assert_eq!(format_daemon_status_line(&status), fixture);
+    }
+
+    #[test]
+    fn daemon_status_json_uses_stable_schema_fields() {
+        let status = StatusReply {
+            daemon_version: "5.0.16".to_string(),
+            running: true,
+            machine_id: "machine-a".to_string(),
+            peer_count: 2,
+            protocol_version: "4.4.0".to_string(),
+            api_bind: "127.0.0.1:15100".to_string(),
+            api_transport: "npipe".to_string(),
+            api_pipe_name: "boundlessd-api".to_string(),
+            input_locked: true,
+            input_lock_supported: true,
+            capture_target_peer_id: String::new(),
+            anti_idle_supported: true,
+            anti_idle_enabled: true,
+            anti_idle_active: false,
+            anti_idle_display_required: false,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&daemon_status_json(&status).expect("serialize status"))
+                .expect("parse status JSON");
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["machine_id"], "machine-a");
+        assert_eq!(value["peer_count"], 2);
+        assert_eq!(value["capture_target_peer_id"], "");
+        assert_eq!(value.as_object().expect("object").len(), 16);
+    }
+
+    #[test]
+    fn peer_and_feature_json_preserve_full_stable_shapes() {
+        let peer = PeerInfo {
+            peer_id: "peer-a".to_string(),
+            display_name: "Desk".to_string(),
+            address: "10.0.0.2:15100".to_string(),
+            connected: true,
+            health_state: "healthy".to_string(),
+            health_reason: "connected".to_string(),
+            trust_state: "trusted".to_string(),
+            trusted_since: "2026-07-14T00:00:00Z".to_string(),
+            trust_fingerprint: "sha256:abc".to_string(),
+            device_identity: "device-a".to_string(),
+        };
+        let peers: serde_json::Value =
+            serde_json::from_str(&peer_list_json(&[peer]).expect("serialize peers"))
+                .expect("parse peers JSON");
+        assert_eq!(peers["schema_version"], 1);
+        assert_eq!(peers["peers"][0]["health_reason"], "connected");
+        assert_eq!(peers["peers"][0]["device_identity"], "device-a");
+        assert_eq!(
+            peers["peers"][0].as_object().expect("peer object").len(),
+            10
+        );
+
+        let features = std::collections::BTreeMap::from([
+            ("file_transfer".to_string(), false),
+            ("clipboard".to_string(), true),
+        ]);
+        let rendered = feature_list_json(features).expect("serialize features");
+        let clipboard = rendered.find("clipboard").expect("clipboard field");
+        let file_transfer = rendered.find("file_transfer").expect("file field");
+        assert!(
+            clipboard < file_transfer,
+            "feature keys must be stable and sorted"
+        );
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("parse features");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["features"]["clipboard"], true);
+    }
+
+    #[test]
+    fn empty_json_collections_are_arrays_and_objects() {
+        let peers: serde_json::Value =
+            serde_json::from_str(&peer_list_json(&[]).expect("empty peers"))
+                .expect("parse empty peers");
+        assert_eq!(peers["peers"], serde_json::json!([]));
+
+        let features: serde_json::Value = serde_json::from_str(
+            &feature_list_json(std::collections::BTreeMap::new()).expect("empty features"),
+        )
+        .expect("parse empty features");
+        assert_eq!(features["features"], serde_json::json!({}));
+
+        let events: serde_json::Value =
+            serde_json::from_str(&transport_events_json(&[]).expect("empty events"))
+                .expect("parse empty events");
+        assert_eq!(events["events"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn transport_event_json_keeps_clipboard_detail_protected() {
+        let event = test_transport_event(
+            "clipboard_text_sent",
+            "secret clipboard text that must not be emitted",
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&transport_events_json(&[event]).expect("serialize events"))
+                .expect("parse events JSON");
+        let detail = value["events"][0]["detail"].as_str().expect("detail");
+        assert!(!detail.contains("secret"));
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(
+            value["events"][0].as_object().expect("event object").len(),
+            6
+        );
     }
 
     fn test_transport_event(kind: &str, detail: &str) -> TransportEvent {
