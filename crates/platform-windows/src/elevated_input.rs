@@ -39,11 +39,12 @@ use tonic::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_CANCELLED, GetLastError, HANDLE, WAIT_OBJECT_0,
-        WAIT_TIMEOUT,
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND, GetLastError,
+        HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     System::Threading::{
-        CreateMutexW, GetProcessId, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        CreateMutexW, GetProcessId, MUTEX_MODIFY_STATE, OpenMutexW, OpenProcess,
+        PROCESS_SYNCHRONIZE, WaitForSingleObject,
     },
     UI::{
         Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
@@ -87,6 +88,7 @@ pub fn reason_name(reason: InputInjectorReason) -> &'static str {
         InputInjectorReason::ParentExited => "parent_exited",
         InputInjectorReason::InjectFailed => "inject_failed",
         InputInjectorReason::ShutdownIncomplete => "shutdown_incomplete",
+        InputInjectorReason::DeliveryUncertain => "delivery_uncertain",
     }
 }
 
@@ -124,6 +126,7 @@ pub struct InjectorApplyOutcome {
     pub remaining_events: Vec<core_input::InputEvent>,
     pub replayed: bool,
     pub reason: InputInjectorReason,
+    pub destination_num_lock_on: bool,
 }
 
 #[derive(Debug)]
@@ -212,6 +215,18 @@ pub fn launch_explicit() -> Result<ExplicitInjectorLaunch> {
     })
 }
 
+/// Returns true only when no elevated injector currently owns this user's
+/// interactive-session lane. Direct SendInput callers must check this at the
+/// final injection boundary so a fast tray restart cannot overlap a stale
+/// helper that is still releasing held input.
+pub fn direct_input_lane_available() -> Result<bool> {
+    let identity = current_process_identity().context("resolve direct input lane identity")?;
+    Ok(direct_input_lane_available_for_identity(
+        &identity.user_sid,
+        identity.session_id,
+    ))
+}
+
 pub struct InjectorClient {
     launch: ExplicitInjectorLaunch,
     client: InputInjectorServiceClient<Channel>,
@@ -289,10 +304,13 @@ impl InjectorClient {
     pub async fn apply(
         &mut self,
         events: &[core_input::InputEvent],
+        destination_num_lock_on: bool,
     ) -> Result<InjectorApplyOutcome> {
         let encoded = broker_events_from_input_events(events);
         let request = if let Some(pending) = self.pending_apply.as_ref() {
-            if pending.events != encoded {
+            if pending.events != encoded
+                || pending.destination_num_lock_on != destination_num_lock_on
+            {
                 bail!("an uncertain injector operation must be retried before newer input");
             }
             pending.clone()
@@ -301,6 +319,7 @@ impl InjectorClient {
                 attachment_token: self.attachment_token.clone(),
                 operation_id: self.next_operation_id,
                 events: encoded,
+                destination_num_lock_on,
             };
             self.pending_apply = Some(request.clone());
             request
@@ -340,6 +359,7 @@ impl InjectorClient {
             remaining_events,
             replayed: reply.replayed,
             reason,
+            destination_num_lock_on: reply.destination_num_lock_on,
         })
     }
 
@@ -531,6 +551,7 @@ struct InjectorRuntimeState {
 #[derive(Clone)]
 struct CachedApply {
     request_events: Vec<BrokerInputEvent>,
+    request_destination_num_lock_on: bool,
     reply: InputInjectorApplyReply,
 }
 
@@ -541,6 +562,7 @@ fn validate_operation_sequence(
     last_apply: Option<&CachedApply>,
     operation_id: u64,
     request_events: &[BrokerInputEvent],
+    request_destination_num_lock_on: bool,
 ) -> Result<bool, Status> {
     let Some(cached) = last_apply else {
         if operation_id != 1 {
@@ -551,7 +573,9 @@ fn validate_operation_sequence(
         return Ok(false);
     };
     if operation_id == cached.reply.operation_id {
-        if request_events != cached.request_events {
+        if request_events != cached.request_events
+            || request_destination_num_lock_on != cached.request_destination_num_lock_on
+        {
             return Err(Status::failed_precondition(
                 "injector operation replay changed payload",
             ));
@@ -656,6 +680,7 @@ impl InputInjectorService for InjectorServiceImpl {
             state.last_apply.as_ref(),
             request.operation_id,
             &request.events,
+            request.destination_num_lock_on,
         )? {
             let mut reply = state
                 .last_apply
@@ -667,6 +692,9 @@ impl InputInjectorService for InjectorServiceImpl {
             return Ok(Response::new(reply));
         }
 
+        let _ = state
+            .injector
+            .synchronize_num_lock_if_native_idle(request.destination_num_lock_on);
         let outcome = state.injector.send_events(&events);
         let reply = InputInjectorApplyReply {
             accepted: true,
@@ -679,9 +707,11 @@ impl InputInjectorService for InjectorServiceImpl {
             committed_event_count: outcome.committed_event_count as u32,
             remaining_events: broker_events_from_input_events(&outcome.remaining_events),
             replayed: false,
+            destination_num_lock_on: state.injector.num_lock_is_on(),
         };
         state.last_apply = Some(CachedApply {
             request_events: request.events,
+            request_destination_num_lock_on: request.destination_num_lock_on,
             reply: reply.clone(),
         });
         Ok(Response::new(reply))
@@ -878,9 +908,7 @@ fn open_parent_watch(process_id: u32) -> Result<ParentWatchHandle> {
 struct InjectorMutex(HANDLE);
 impl InjectorMutex {
     fn acquire(user_sid: &str, session_id: u32) -> Result<Self> {
-        let name = wide_null(&format!(
-            "Local\\Boundless.ElevatedInputInjector.v1.{user_sid}.{session_id}"
-        ));
+        let name = wide_null(&injector_mutex_name(user_sid, session_id));
         let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
         if handle.is_null() {
             return Err(std::io::Error::last_os_error()).context("create injector owner mutex");
@@ -893,6 +921,22 @@ impl InjectorMutex {
         }
         Ok(Self(handle))
     }
+}
+
+fn injector_mutex_name(user_sid: &str, session_id: u32) -> String {
+    format!("Local\\Boundless.ElevatedInputInjector.v1.{user_sid}.{session_id}")
+}
+
+fn direct_input_lane_available_for_identity(user_sid: &str, session_id: u32) -> bool {
+    let name = wide_null(&injector_mutex_name(user_sid, session_id));
+    let handle = unsafe { OpenMutexW(MUTEX_MODIFY_STATE, 0, name.as_ptr()) };
+    if handle.is_null() {
+        return unsafe { GetLastError() } == ERROR_FILE_NOT_FOUND;
+    }
+    unsafe {
+        CloseHandle(handle);
+    }
+    false
 }
 impl Drop for InjectorMutex {
     fn drop(&mut self) {
@@ -954,14 +998,27 @@ mod tests {
     }
 
     #[test]
+    fn direct_lane_waits_for_stale_helper_mutex_release() {
+        let sid = format!("S-1-5-21-test-{}", uuid::Uuid::new_v4().simple());
+        let session_id = 4242;
+        for _ in 0..32 {
+            assert!(direct_input_lane_available_for_identity(&sid, session_id));
+        }
+        let helper = InjectorMutex::acquire(&sid, session_id).expect("acquire helper lane");
+        assert!(!direct_input_lane_available_for_identity(&sid, session_id));
+        drop(helper);
+        assert!(direct_input_lane_available_for_identity(&sid, session_id));
+    }
+
+    #[test]
     fn operation_sequence_accepts_only_exact_replay_or_contiguous_next() {
         let first =
             broker_events_from_input_events(&[core_input::InputEvent::MouseMove { dx: 4, dy: -3 }]);
         let changed =
             broker_events_from_input_events(&[core_input::InputEvent::MouseMove { dx: 5, dy: -3 }]);
-        assert!(!validate_operation_sequence(None, 1, &first).expect("first operation"));
+        assert!(!validate_operation_sequence(None, 1, &first, false).expect("first operation"));
         assert_eq!(
-            validate_operation_sequence(None, 2, &first)
+            validate_operation_sequence(None, 2, &first, false)
                 .expect_err("first operation cannot skip")
                 .code(),
             tonic::Code::FailedPrecondition
@@ -969,21 +1026,32 @@ mod tests {
 
         let cached = CachedApply {
             request_events: first.clone(),
+            request_destination_num_lock_on: false,
             reply: InputInjectorApplyReply {
                 operation_id: 7,
                 ..Default::default()
             },
         };
-        assert!(validate_operation_sequence(Some(&cached), 7, &first).expect("exact replay"));
-        assert!(!validate_operation_sequence(Some(&cached), 8, &changed).expect("next operation"));
+        assert!(
+            validate_operation_sequence(Some(&cached), 7, &first, false).expect("exact replay")
+        );
+        assert!(
+            !validate_operation_sequence(Some(&cached), 8, &changed, true).expect("next operation")
+        );
         assert_eq!(
-            validate_operation_sequence(Some(&cached), 7, &changed)
+            validate_operation_sequence(Some(&cached), 7, &changed, false)
                 .expect_err("replay payload must match")
                 .code(),
             tonic::Code::FailedPrecondition
         );
         assert_eq!(
-            validate_operation_sequence(Some(&cached), 9, &first)
+            validate_operation_sequence(Some(&cached), 7, &first, true)
+                .expect_err("replay destination Num Lock must match")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            validate_operation_sequence(Some(&cached), 9, &first, false)
                 .expect_err("operation cannot skip")
                 .code(),
             tonic::Code::FailedPrecondition

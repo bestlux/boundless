@@ -225,6 +225,8 @@ pub struct InputBrokerDetachCommand {
     pub broker_token: String,
     pub delivery_epoch: String,
     pub acked_inject_batch_id: u64,
+    #[serde(default)]
+    pub reset_input_session: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

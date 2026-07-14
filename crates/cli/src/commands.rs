@@ -1788,7 +1788,11 @@ pub(super) async fn input_owner(endpoint: &str) -> Result<()> {
 }
 
 fn none_if_empty(value: &str) -> &str {
-    if value.is_empty() { "none" } else { value }
+    value_or_default(value, "none")
+}
+
+fn value_or_default<'a>(value: &'a str, default: &'a str) -> &'a str {
+    if value.is_empty() { default } else { value }
 }
 
 fn format_input_status_line(
@@ -1805,9 +1809,9 @@ fn format_input_status_line(
         none_if_empty(&runtime.capture_backend_mode),
         runtime.pending_inject_frames,
         runtime.pending_inject_high_water,
-        none_if_empty(&runtime.elevated_injector_state),
-        none_if_empty(&runtime.elevated_injector_reason),
-        none_if_empty(&runtime.elevated_injector_signature_trust),
+        value_or_default(&runtime.elevated_injector_state, "off"),
+        value_or_default(&runtime.elevated_injector_reason, "none"),
+        value_or_default(&runtime.elevated_injector_signature_trust, "unknown"),
         handoff.block_screen_corners,
         handoff.corner_block_px,
         handoff.relative_mouse,
@@ -2784,6 +2788,14 @@ mod tests {
         assert!(line.contains("elevated_injector_state=active"));
         assert!(line.contains("elevated_injector_reason=none"));
         assert!(line.contains("elevated_injector_signature_trust=unsigned_dogfood"));
+
+        let default_line = format_input_status_line(
+            &InputRuntimeStatusReply::default(),
+            &InputHandoffConfigReply::default(),
+        );
+        assert!(default_line.contains("elevated_injector_state=off"));
+        assert!(default_line.contains("elevated_injector_reason=none"));
+        assert!(default_line.contains("elevated_injector_signature_trust=unknown"));
     }
 
     fn local_tokens() -> LocalLayoutTokens {

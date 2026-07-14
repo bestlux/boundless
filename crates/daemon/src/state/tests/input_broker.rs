@@ -1976,6 +1976,265 @@ async fn batch_staging_reads_owner_and_generation_from_one_snapshot() {
 }
 
 #[tokio::test]
+async fn uncertain_delivery_reset_discards_inflight_batch_and_releases_input_session() {
+    let (state, root) = service_mode_broker_state("boundless-broker-reset-input-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("claim owner")
+    );
+    state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id.clone(),
+                sequence: 50,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::Key {
+                    scan_code: 29,
+                    state: KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
+                }],
+            },
+        )
+        .await
+        .expect("route uncertain input frame");
+    let dispatched = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert_ne!(dispatched.inject_batch_id, 0);
+
+    assert!(
+        state
+            .detach_input_broker_with_reset(
+                allowed_client(),
+                &attach.broker_token,
+                &attach.delivery_epoch,
+                0,
+                true,
+            )
+            .await,
+        "uncertain delivery must atomically discard the batch and detach"
+    );
+    assert!(state.input_owner().await.is_none());
+    assert!(state.input_capture_target().await.is_none());
+
+    let replacement = state
+        .attach_input_broker(allowed_client(), "replacement-broker".to_string(), true)
+        .await;
+    assert!(replacement.accepted);
+    let blocked = state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id.clone(),
+                sequence: 51,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![
+                    InputEvent::Key {
+                        scan_code: 46,
+                        state: KeyState::Down,
+                        semantics: core_input::KeySemantics::Physical,
+                    },
+                    InputEvent::Key {
+                        scan_code: 46,
+                        state: KeyState::Up,
+                        semantics: core_input::KeySemantics::Physical,
+                    },
+                ],
+            },
+        )
+        .await
+        .expect("route post-reset frame");
+    assert!(matches!(blocked, RouteDecision::IgnoredNoOwner));
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("fresh handoff restores owner")
+    );
+    let recovered = state
+        .route_incoming_input_frame(
+            &peer_id,
+            InputFrame {
+                source_peer_id: peer_id.clone(),
+                sequence: 52,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::MouseMove { dx: 1, dy: 0 }],
+            },
+        )
+        .await
+        .expect("route frame after fresh handoff");
+    assert!(matches!(recovered, RouteDecision::Applied { .. }));
+    let after_reset = state
+        .exchange_input_broker(
+            allowed_client(),
+            &replacement.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert_eq!(after_reset.inject_frames.len(), 1);
+    assert_eq!(after_reset.inject_frames[0].sequence, 52);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn uncertain_delivery_reset_quarantines_batch_peer_without_releasing_new_owner() {
+    let (state, root) = service_mode_broker_state("boundless-broker-reset-owner-race-test").await;
+    let peer_a = join_connected_peer(&state).await;
+    let peer_b = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "test-broker".to_string(), true)
+        .await;
+    assert!(attach.accepted);
+    assert!(
+        state
+            .claim_input_owner(&peer_a, false)
+            .await
+            .expect("claim owner A")
+    );
+    state
+        .route_incoming_input_frame(
+            &peer_a,
+            InputFrame {
+                source_peer_id: peer_a.clone(),
+                sequence: 1,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::Key {
+                    scan_code: 29,
+                    state: KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
+                }],
+            },
+        )
+        .await
+        .expect("route uncertain A frame");
+    let dispatched = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations::default(),
+        )
+        .await;
+    assert_ne!(dispatched.inject_batch_id, 0);
+    assert!(
+        state
+            .claim_input_owner(&peer_b, true)
+            .await
+            .expect("move owner to B before reset")
+    );
+
+    assert!(
+        state
+            .detach_input_broker_with_reset(
+                allowed_client(),
+                &attach.broker_token,
+                &attach.delivery_epoch,
+                0,
+                true,
+            )
+            .await
+    );
+    assert_eq!(state.input_owner().await.as_deref(), Some(peer_b.as_str()));
+    let replacement = state
+        .attach_input_broker(allowed_client(), "replacement-broker".to_string(), true)
+        .await;
+    assert!(replacement.accepted);
+
+    let blocked_a = state
+        .route_incoming_input_frame(
+            &peer_a,
+            InputFrame {
+                source_peer_id: peer_a.clone(),
+                sequence: 2,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::Key {
+                    scan_code: 46,
+                    state: KeyState::Down,
+                    semantics: core_input::KeySemantics::Physical,
+                }],
+            },
+        )
+        .await
+        .expect("route quarantined A frame");
+    assert!(matches!(
+        blocked_a,
+        RouteDecision::IgnoredWrongOwner { owner_peer_id } if owner_peer_id == peer_b
+    ));
+    assert!(
+        state
+            .claim_input_owner(&peer_a, true)
+            .await
+            .expect("fresh explicit A handoff")
+    );
+    let recovered_a = state
+        .route_incoming_input_frame(
+            &peer_a,
+            InputFrame {
+                source_peer_id: peer_a.clone(),
+                sequence: 3,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events: vec![InputEvent::MouseMove { dx: 1, dy: 0 }],
+            },
+        )
+        .await
+        .expect("route A after fresh handoff");
+    assert!(matches!(recovered_a, RouteDecision::Applied { .. }));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn explicit_claim_after_reset_atomically_clears_auto_claim_quarantine() {
+    let (state, root) = service_mode_broker_state("boundless-broker-reset-claim-race-test").await;
+    let peer_id = join_connected_peer(&state).await;
+    assert!(
+        state
+            .claim_input_owner(&peer_id, false)
+            .await
+            .expect("claim initial owner")
+    );
+
+    let mut authorization = state.input.control.authorization.write().await;
+    let claim_state = state.clone();
+    let claim_peer = peer_id.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let claim = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        claim_state.claim_input_owner(&claim_peer, true).await
+    });
+    started_rx.await.expect("claim task started");
+    tokio::task::yield_now().await;
+
+    authorization.quarantine_auto_claim_peers([peer_id.clone()]);
+    assert!(authorization.release_owner(&peer_id));
+    drop(authorization);
+
+    assert!(
+        claim
+            .await
+            .expect("claim task joined")
+            .expect("claim result")
+    );
+    let authorization = state.input.control.authorization.read().await;
+    assert_eq!(authorization.owner(), Some(peer_id.as_str()));
+    assert!(!authorization.auto_claim_quarantined(&peer_id));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn detach_acknowledges_completed_inject_batch_before_requeue() {
     let (state, root) = service_mode_broker_state("boundless-broker-detach-ack-test").await;
     let peer_id = join_connected_peer(&state).await;

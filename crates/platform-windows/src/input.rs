@@ -248,6 +248,17 @@ impl TrackedWindowsInput {
         self.windows_input.has_pending_native_cleanup()
     }
 
+    pub fn num_lock_is_on(&self) -> bool {
+        self.windows_input.num_lock_is_on()
+    }
+
+    /// Reconciles the helper's process-local authority with the ordinary
+    /// tray hook lane. A partially committed synthetic toggle remains the
+    /// stronger authority until its key-up cleanup completes.
+    pub fn synchronize_num_lock_if_native_idle(&self, on: bool) -> bool {
+        self.windows_input.synchronize_num_lock_if_native_idle(on)
+    }
+
     #[cfg(test)]
     fn send_events_with_sender<F>(&mut self, events: &[InputEvent], sender: F) -> InputSendOutcome
     where
@@ -271,6 +282,19 @@ impl WindowsInputState {
     /// restart must retain this state until that cleanup succeeds.
     pub fn has_pending_native_cleanup(&self) -> bool {
         self.num_lock.lock().boundless_key_down
+    }
+
+    pub fn num_lock_is_on(&self) -> bool {
+        self.num_lock.is_on()
+    }
+
+    pub fn synchronize_num_lock_if_native_idle(&self, on: bool) -> bool {
+        let mut authority = self.num_lock.lock();
+        if authority.boundless_key_down {
+            return false;
+        }
+        authority.on = on;
+        true
     }
 
     pub fn send_events(&self, events: &[InputEvent]) -> InputSendOutcome {
@@ -1356,6 +1380,11 @@ mod tests {
         assert_eq!(calls, 3);
         assert!(error.to_string().contains("key-up cleanup failed"));
         assert!(num_lock.lock().boundless_key_down);
+        assert!(
+            !input.synchronize_num_lock_if_native_idle(false),
+            "a partially committed toggle remains authoritative"
+        );
+        assert!(num_lock.is_on());
 
         let mut retry_calls = 0usize;
         input
@@ -1381,6 +1410,8 @@ mod tests {
             .expect("next batch cleans up before retrying input");
         assert_eq!(retry_calls, 2);
         assert!(!num_lock.lock().boundless_key_down);
+        assert!(input.synchronize_num_lock_if_native_idle(false));
+        assert!(!num_lock.is_on());
     }
 
     #[test]

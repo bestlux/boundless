@@ -323,7 +323,9 @@ impl AppState {
                     retried_decision,
                     RouteDecision::IgnoredNoOwner | RouteDecision::IgnoredWrongOwner { .. }
                 ) {
+                    let auto_claim_quarantined = authorization.auto_claim_quarantined(peer_id);
                     let (allow_auto_claim, block_reason) = self.auto_claim_input_owner_allowed_now(
+                        auto_claim_quarantined,
                         &retried_decision,
                         authorization.owner_last_changed_at(),
                     );
@@ -705,7 +707,7 @@ impl AppState {
 
         let (claimed, owner_changed) = {
             let mut authorization = self.input.control.authorization.write().await;
-            authorization.claim_owner(peer_id, force)
+            authorization.claim_owner_explicit(peer_id, force)
         };
         if owner_changed {
             self.notify_input_owner_transition();
@@ -849,9 +851,13 @@ impl AppState {
 
     fn auto_claim_input_owner_allowed_now(
         &self,
+        auto_claim_quarantined: bool,
         decision: &RouteDecision,
         owner_last_changed_at: Option<Instant>,
     ) -> (bool, &'static str) {
+        if auto_claim_quarantined {
+            return (false, "delivery_uncertain_reset");
+        }
         match decision {
             RouteDecision::IgnoredNoOwner => (true, "no_owner"),
             RouteDecision::IgnoredWrongOwner { owner_peer_id } => {

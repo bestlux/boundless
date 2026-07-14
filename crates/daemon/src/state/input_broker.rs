@@ -44,6 +44,7 @@ const ELEVATED_INJECTOR_REASONS: &[&str] = &[
     "parent_exited",
     "inject_failed",
     "shutdown_incomplete",
+    "delivery_uncertain",
     "unknown",
 ];
 const ELEVATED_INJECTOR_SIGNATURE_TRUST: &[&str] =

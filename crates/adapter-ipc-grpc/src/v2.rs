@@ -914,6 +914,7 @@ impl ControlPlaneService for ControlPlaneApi {
                 broker_token: request.broker_token,
                 delivery_epoch: request.delivery_epoch,
                 acked_inject_batch_id: request.acked_inject_batch_id,
+                reset_input_session: request.reset_input_session,
             })
             .await
             .map_err(|error| Status::internal(format!("detach input broker: {error:#}")))?;

@@ -690,11 +690,12 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
     ) -> Result<OperationReply> {
         let detached = self
             .state
-            .detach_input_broker(
+            .detach_input_broker_with_reset(
                 broker_client_identity(command.verified_client),
                 &command.broker_token,
                 &command.delivery_epoch,
                 command.acked_inject_batch_id,
+                command.reset_input_session,
             )
             .await;
         Ok(OperationReply {

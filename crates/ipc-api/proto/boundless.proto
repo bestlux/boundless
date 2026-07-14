@@ -541,6 +541,7 @@ enum InputInjectorReason {
   INPUT_INJECTOR_REASON_PARENT_EXITED = 11;
   INPUT_INJECTOR_REASON_INJECT_FAILED = 12;
   INPUT_INJECTOR_REASON_SHUTDOWN_INCOMPLETE = 13;
+  INPUT_INJECTOR_REASON_DELIVERY_UNCERTAIN = 14;
 }
 
 enum InputInjectorSignatureTrust {
@@ -578,6 +579,7 @@ message InputInjectorApplyRequest {
   string attachment_token = 1;
   uint64 operation_id = 2;
   repeated BrokerInputEvent events = 3;
+  bool destination_num_lock_on = 4;
 }
 
 message InputInjectorApplyReply {
@@ -587,6 +589,7 @@ message InputInjectorApplyReply {
   uint32 committed_event_count = 4;
   repeated BrokerInputEvent remaining_events = 5;
   bool replayed = 6;
+  bool destination_num_lock_on = 7;
 }
 
 message InputInjectorHeartbeatRequest {
@@ -646,6 +649,7 @@ message InputBrokerDetachRequest {
   string broker_token = 1;
   string delivery_epoch = 2;
   uint64 acked_inject_batch_id = 3;
+  bool reset_input_session = 4;
 }
 
 message NearbyPairingCompletionReply {

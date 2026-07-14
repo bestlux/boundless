@@ -21,6 +21,7 @@ pub(super) struct InputAuthorizationState {
     router: InputRouter,
     generation: u64,
     owner_last_changed_at: Option<Instant>,
+    auto_claim_quarantined_peers: HashSet<String>,
 }
 
 impl InputAuthorizationState {
@@ -29,6 +30,7 @@ impl InputAuthorizationState {
             router: InputRouter::new(input_enabled),
             generation: generation.max(1),
             owner_last_changed_at: None,
+            auto_claim_quarantined_peers: HashSet::new(),
         }
     }
 
@@ -80,6 +82,25 @@ impl InputAuthorizationState {
             self.record_owner_transition();
         }
         (claimed, owner_changed)
+    }
+
+    pub(super) fn claim_owner_explicit(&mut self, peer_id: &str, force: bool) -> (bool, bool) {
+        let outcome = self.claim_owner(peer_id, force);
+        if outcome.0 {
+            self.auto_claim_quarantined_peers.remove(peer_id);
+        }
+        outcome
+    }
+
+    pub(super) fn auto_claim_quarantined(&self, peer_id: &str) -> bool {
+        self.auto_claim_quarantined_peers.contains(peer_id)
+    }
+
+    pub(super) fn quarantine_auto_claim_peers(
+        &mut self,
+        peer_ids: impl IntoIterator<Item = String>,
+    ) {
+        self.auto_claim_quarantined_peers.extend(peer_ids);
     }
 
     pub(super) fn release_owner(&mut self, peer_id: &str) -> bool {

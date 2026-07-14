@@ -10,7 +10,7 @@ pub mod client_identity;
 /// Exact protocol revision for the out-of-process input broker contract.
 /// Protobuf's default zero represents an unversioned/older peer and is always
 /// rejected; tray and daemon must negotiate this value before local locking.
-pub const INPUT_BROKER_PROTOCOL_REVISION: u32 = 5;
+pub const INPUT_BROKER_PROTOCOL_REVISION: u32 = 6;
 
 /// Exact protocol revision for the dedicated elevated input injector.
 pub const INPUT_INJECTOR_PROTOCOL_REVISION: u32 = 1;
