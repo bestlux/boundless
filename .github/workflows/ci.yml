@@ -36,6 +36,175 @@ jobs:
         shell: pwsh
         run: cargo test -p boundless-cli commands::tests::daemon_status_output_matches_packaging_fixture
 
+  windows-installer-integration:
+    if: github.event_name == 'pull_request'
+    needs: packaging-scripts
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect installer-relevant changes
+        id: changes
+        shell: pwsh
+        run: |
+          $baseSha = "${{ github.event.pull_request.base.sha }}"
+          $changedPaths = @(
+            git diff --name-only --no-renames --diff-filter=ACDMRT $baseSha HEAD |
+              ForEach-Object { $_.Trim().Replace('\', '/') } |
+              Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+          )
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not determine changed paths against PR base $baseSha."
+          }
+          $relevantPatterns = @(
+            '^(Cargo\.toml|Cargo\.lock|\.release-please-manifest\.json|release-please-config\.json|CHANGELOG\.md|LICENSE)$',
+            '^rust-toolchain(\.toml)?$',
+            '^crates/',
+            '^packaging/windows/',
+            '^scripts/dev/installer-smoke\.ps1$',
+            '^scripts/release/(assert-release-consistency|package-windows)\.ps1$',
+            '^\.github/actions/setup-rust/',
+            '^\.github/workflows/(ci|release-please)\.yml$'
+          )
+          $relevantPaths = @(
+            $changedPaths | Where-Object {
+              $path = $_
+              $null -ne ($relevantPatterns | Where-Object { $path -match $_ } | Select-Object -First 1)
+            }
+          )
+          $runInstaller = $relevantPaths.Count -gt 0
+          "run_installer=$($runInstaller.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          Write-Host "installer_integration_changed_paths=$($changedPaths.Count)"
+          Write-Host "installer_integration_relevant_paths=$($relevantPaths -join ',')"
+          if (-not $runInstaller) {
+            Write-Host "installer_integration=skipped_no_relevant_changes"
+          }
+
+      - name: Setup Rust
+        if: steps.changes.outputs.run_installer == 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Read and validate candidate version
+        if: steps.changes.outputs.run_installer == 'true'
+        id: candidate
+        shell: pwsh
+        run: |
+          $version = (Get-Content -LiteralPath packaging/windows/package-manifest.json -Raw | ConvertFrom-Json).version
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "packaging/windows/package-manifest.json did not declare a version."
+          }
+          ./scripts/release/assert-release-consistency.ps1 -Tag "v$version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build Windows candidate binaries
+        if: steps.changes.outputs.run_installer == 'true'
+        shell: pwsh
+        run: cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector
+
+      - name: Package Windows candidate installer
+        if: steps.changes.outputs.run_installer == 'true'
+        id: package
+        shell: pwsh
+        run: |
+          $candidateRoot = Join-Path (Resolve-Path .).Path "artifacts/candidate"
+          New-Item -ItemType Directory -Force -Path $candidateRoot | Out-Null
+          $installerPath = Join-Path $candidateRoot "Boundless-${{ steps.candidate.outputs.version }}-windows-x64.msi"
+          ./scripts/release/package-windows.ps1 `
+            -Version "${{ steps.candidate.outputs.version }}" `
+            -DaemonPath "target/release/boundlessd.exe" `
+            -ServicePath "target/release/boundless-service.exe" `
+            -CliPath "target/release/boundlessctl.exe" `
+            -TrayPath "target/release/boundlesstray.exe" `
+            -InputInjectorPath "target/release/boundless-input-injector.exe" `
+            -OutputPath $installerPath
+          $helperPath = Join-Path $candidateRoot "Boundless-${{ steps.candidate.outputs.version }}-windows-x64-install.ps1"
+          ./scripts/release/assert-release-consistency.ps1 `
+            -Tag "v${{ steps.candidate.outputs.version }}" `
+            -AssetPaths @($installerPath, $helperPath) `
+            -CheckWindowsInstallerVersion
+          "installer_path=$installerPath" >> $env:GITHUB_OUTPUT
+          "helper_path=$helperPath" >> $env:GITHUB_OUTPUT
+
+      - name: Download previous stable installer
+        if: steps.changes.outputs.run_installer == 'true'
+        id: previous
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $currentVersion = [version]("${{ steps.candidate.outputs.version }}".Split('-')[0])
+          $releases = gh release list `
+            --repo "${{ github.repository }}" `
+            --limit 100 `
+            --json tagName,isDraft |
+            ConvertFrom-Json
+          $candidates = @(
+            foreach ($release in $releases) {
+              if (-not $release.isDraft -and $release.tagName -match '^v?(\d+\.\d+\.\d+)$') {
+                $version = [version]$Matches[1]
+                if ($version -lt $currentVersion) {
+                  [pscustomobject]@{ tag = $release.tagName; version = $version }
+                }
+              }
+            }
+          )
+          $previous = $candidates | Sort-Object version -Descending | Select-Object -First 1
+          if ($null -eq $previous) {
+            throw "No prior published Windows MSI was available for the PR installer integration smoke."
+          }
+          $previousRoot = Join-Path (Resolve-Path .).Path "artifacts/previous"
+          New-Item -ItemType Directory -Force -Path $previousRoot | Out-Null
+          $expectedAsset = "Boundless-$($previous.version)-windows-x64.msi"
+          gh release download $previous.tag `
+            --repo "${{ github.repository }}" `
+            --pattern $expectedAsset `
+            --dir $previousRoot
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not download prior installer $expectedAsset from $($previous.tag)."
+          }
+          $installerPath = Join-Path $previousRoot $expectedAsset
+          if (-not (Test-Path -LiteralPath $installerPath)) {
+            throw "Prior installer was not downloaded to the expected path: $installerPath"
+          }
+          "installer_path=$installerPath" >> $env:GITHUB_OUTPUT
+          Write-Host "installer_integration_upgrade=$($previous.version)->${{ steps.candidate.outputs.version }}"
+
+      - name: Validate N-1 upgrade, repair, and uninstall
+        if: steps.changes.outputs.run_installer == 'true'
+        shell: pwsh
+        run: |
+          ./scripts/dev/installer-smoke.ps1 `
+            -InstallerPath "${{ steps.package.outputs.installer_path }}" `
+            -PreviousInstallerPath "${{ steps.previous.outputs.installer_path }}" `
+            -OutputRoot (Join-Path (Resolve-Path .).Path "artifacts/installer-validation") `
+            -KeepArtifacts
+
+      - name: Upload installer validation evidence
+        if: always() && steps.changes.outputs.run_installer == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr-installer-validation
+          path: artifacts/installer-validation
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload failed candidate installer
+        if: failure() && steps.changes.outputs.run_installer == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr-installer-candidate
+          path: artifacts/candidate
+          if-no-files-found: warn
+          retention-days: 7
+
   verify:
     strategy:
       fail-fast: false
