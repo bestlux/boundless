@@ -312,6 +312,44 @@ jobs:
           name: boundless-windows-x64
           path: artifacts
 
+      - name: Download previous Windows installer
+        id: previous-installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $currentVersion = [version]("${{ needs.release-context.outputs.tag_name }}".TrimStart('v').Split('-')[0])
+          $releases = gh release list `
+            --repo "${{ github.repository }}" `
+            --limit 100 `
+            --json tagName,isDraft |
+            ConvertFrom-Json
+          $candidates = @(
+            foreach ($release in $releases) {
+              if (-not $release.isDraft -and $release.tagName -match '^v?(\d+\.\d+\.\d+)$') {
+                $version = [version]$Matches[1]
+                if ($version -lt $currentVersion) {
+                  [pscustomobject]@{ tag = $release.tagName; version = $version }
+                }
+              }
+            }
+          )
+          $previous = $candidates | Sort-Object version -Descending | Select-Object -First 1
+          if ($null -eq $previous) {
+            throw "No prior published Windows MSI was available for the N-1 upgrade smoke."
+          }
+          $previousRoot = Join-Path (Resolve-Path .).Path "artifacts/previous"
+          New-Item -ItemType Directory -Force -Path $previousRoot | Out-Null
+          gh release download $previous.tag `
+            --repo "${{ github.repository }}" `
+            --pattern "Boundless-*-windows-x64.msi" `
+            --dir $previousRoot
+          $previousInstallers = @(Get-ChildItem -LiteralPath $previousRoot -Filter *.msi -File)
+          if ($previousInstallers.Count -ne 1) {
+            throw "Expected exactly one prior Windows MSI for $($previous.tag), found $($previousInstallers.Count)."
+          }
+          "installer_path=$($previousInstallers[0].FullName)" >> $env:GITHUB_OUTPUT
+
       - name: Validate Windows installer
         shell: pwsh
         run: |
@@ -324,6 +362,7 @@ jobs:
           $requireSignature = $stableRelease -and $signingRequiredByPolicy
           ./.release-tooling/scripts/dev/installer-smoke.ps1 `
             -InstallerPath $installer `
+            -PreviousInstallerPath "${{ steps.previous-installer.outputs.installer_path }}" `
             -OutputRoot (Join-Path (Resolve-Path .).Path "artifacts/installer-validation") `
             -RequireSignature:$requireSignature `
             -KeepArtifacts
@@ -331,11 +370,16 @@ jobs:
       - name: Write release readiness packet
         shell: pwsh
         run: |
+          $stableRelease = [System.Convert]::ToBoolean('${{ !contains(needs.release-context.outputs.tag_name, '-') }}')
+          $signingRequiredByPolicy = [System.Convert]::ToBoolean('${{ vars.WINDOWS_SIGN_REQUIRED == 'true' }}')
+          $inputInjectorSignaturePolicy = if ($stableRelease -and $signingRequiredByPolicy) { "signed" } else { "unsigned-dogfood" }
           ./.release-tooling/scripts/dev/release-readiness.ps1 `
             -RepoRoot (Resolve-Path source).Path `
             -OutputRoot (Join-Path (Resolve-Path .).Path "artifacts/release-readiness") `
             -InstallerSmokeSummaryPath (Join-Path (Resolve-Path .).Path "artifacts/installer-validation/installer-smoke.json") `
-            -ReleaseVersion "${{ needs.release-context.outputs.tag_name }}"
+            -ReleaseVersion "${{ needs.release-context.outputs.tag_name }}" `
+            -Policy prerelease `
+            -InputInjectorSignaturePolicy $inputInjectorSignaturePolicy
 
       - name: Upload installer validation logs
         if: always()

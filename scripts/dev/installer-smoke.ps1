@@ -1233,6 +1233,7 @@ try {
     $uninstallExitCode = Invoke-MsiExec -ArgumentList @("/x", $InstallerPath, "/qn", "/norestart") -LogPath $uninstallLog
 
     Wait-ForNoBoundlessProcesses
+    $inputInjectorCountAfterUninstall = Get-BoundlessProcessCount -Name "boundless-input-injector"
     Wait-ForPathRemoval -Path $installRoot
     if (Test-Path -LiteralPath $startMenuShortcutPath) {
         throw "Uninstall did not remove start menu shortcut."
@@ -1278,6 +1279,7 @@ try {
         daemon_signature = $daemonSignature
         service_signature = $serviceSignature
         cli_signature = $cliSignature
+        input_injector_path = $inputInjectorPath
         input_injector_signature = $inputInjectorSignature
         tray_version_output = $trayVersionOutput
         tray_version_exit_code = $trayVersionExitCode
@@ -1317,6 +1319,7 @@ try {
         post_upgrade_daemon_count = $postUpgradeDaemonCount
         input_injector_count_after_tray_launch = $inputInjectorCountAfterTrayLaunch
         input_injector_count_after_repair = $inputInjectorCountAfterRepair
+        input_injector_count_after_uninstall = $inputInjectorCountAfterUninstall
         post_uninstall_processes_cleared = $true
         post_uninstall_service_removed = $true
         post_uninstall_program_files_root_removed = $true

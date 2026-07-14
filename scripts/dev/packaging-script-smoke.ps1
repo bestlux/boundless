@@ -135,9 +135,13 @@ $releaseWorkflowText = Get-Content -LiteralPath $releaseWorkflowPath -Raw
 if (
     $releaseWorkflowText -notmatch 'cargo build --release[^\r\n]*-p boundless-input-injector' -or
     $releaseWorkflowText -notmatch '"target/release/boundless-input-injector\.exe"' -or
-    $releaseWorkflowText -notmatch '-InputInjectorPath "source/target/release/boundless-input-injector\.exe"'
+    $releaseWorkflowText -notmatch '-InputInjectorPath "source/target/release/boundless-input-injector\.exe"' -or
+    $releaseWorkflowText -notmatch '-InputInjectorSignaturePolicy \$inputInjectorSignaturePolicy' -or
+    $releaseWorkflowText -notmatch 'gh release download \$previous\.tag' -or
+    $releaseWorkflowText -notmatch '-PreviousInstallerPath "\$\{\{ steps\.previous-installer\.outputs\.installer_path \}\}"' -or
+    $releaseWorkflowText -notmatch '-Policy prerelease'
 ) {
-    throw "The Windows release workflow must build, sign, and package the elevated input injector."
+    throw "The Windows release workflow must build, sign, package, run N-1 upgrade smoke, and explicitly select dogfood readiness policy."
 }
 
 $releasePleaseConfigPath = Join-Path $RepoRoot "release-please-config.json"
@@ -431,6 +435,29 @@ $elevatedPhaseSource = Get-PowerShellFunctionSource `
     -Name 'Invoke-ElevatedInstallPhase'
 if ($elevatedPhaseSource -notmatch 'Stop-BoundlessServiceBeforeMsi') {
     throw "The elevated install phase must use the bounded pre-MSI service recovery boundary."
+}
+$injectorShutdownSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Stop-BoundlessInputInjectorBeforeMsi'
+$injectorSnapshotSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Get-BoundlessInputInjectorTargets'
+$injectorValidationSource = Get-PowerShellFunctionSource `
+    -Path $installScript `
+    -Name 'Assert-BoundlessInputInjectorTargets'
+if (
+    $elevatedPhaseSource -notmatch 'Stop-BoundlessInputInjectorBeforeMsi' -or
+    $injectorShutdownSource -notmatch 'Get-BoundlessInputInjectorTargets' -or
+    $injectorShutdownSource -notmatch 'finalTargets' -or
+    $injectorShutdownSource -notmatch 'GracefulTimeoutMilliseconds' -or
+    $injectorSnapshotSource -notmatch 'Get-Process -Name "boundless-input-injector"' -or
+    $injectorSnapshotSource -notmatch 'Get-ProcessOwnerSid' -or
+    $injectorSnapshotSource -notmatch 'Assert-BoundlessInputInjectorTargets' -or
+    $injectorValidationSource -notmatch 'ExpectedOwnerSid' -or
+    $injectorValidationSource -notmatch 'ExpectedSessionId' -or
+    $injectorValidationSource -notmatch 'Test-WindowsPathEqual'
+) {
+    throw "The elevated install phase must validate every named injector and prove a bounded, fully re-enumerated shutdown before MSI."
 }
 $serviceRecoverySource = Get-PowerShellFunctionSource `
     -Path $installScript `
