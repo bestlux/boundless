@@ -729,6 +729,13 @@ impl InjectedInputState {
 
     fn elevated_cleanup_controller(&mut self) -> Option<ElevatedInputController> {
         let controller = self.elevated_controller.clone()?;
+        // A helper can exit while it is connected but still waiting for the
+        // ordinary lane to drain. No elevated payload has started in that
+        // state, yet the recovery latch still needs a cleanup-owned marker
+        // probe and explicit completion before the next broker session.
+        if controller.direct_recovery_cleanup_required() {
+            return Some(controller);
+        }
         if self.delivery_lane == InputDeliveryLane::Direct {
             return None;
         }
@@ -1857,6 +1864,37 @@ mod input_broker_tests {
         batch.complete_input_session_reset();
         assert!(batch.frames.is_empty());
         assert!(!batch.input_session_reset_required);
+    }
+
+    #[test]
+    fn hard_helper_exit_while_direct_and_idle_clears_recovery_latch_during_cleanup() {
+        let controller = ElevatedInputController::start().expect("start test controller");
+        update_elevated_input_status(&controller.inner.status, |status| {
+            status.state = platform_windows::elevated_input::InputInjectorState::Unavailable;
+            status.reason = platform_windows::elevated_input::InputInjectorReason::ParentExited;
+            status.direct_fallback_safe = false;
+            status.direct_recovery_cleanup_required = true;
+        });
+        let mut injected = InjectedInputState::with_elevated_controller(
+            WindowsNumLockState::new(false),
+            controller,
+        );
+        injected.delivery_lane = InputDeliveryLane::Direct;
+        assert!(injected.held_down_events().is_empty());
+
+        let mut batch = BrokerInjectBatchState::default();
+        batch.require_session_reset_for_elevated_recovery();
+        batch.stage_local_cleanup(&mut injected);
+        assert!(batch.pending_elevated_cleanup.is_some());
+        assert!(batch.process_local_cleanup_with(
+            &mut injected,
+            |events, _state| panic!("idle recovery emitted unexpected releases: {events:?}")
+        ));
+
+        let recovered = injected.elevated_status();
+        assert!(recovered.direct_fallback_safe);
+        assert!(!recovered.direct_recovery_cleanup_required);
+        assert!(!batch.local_cleanup_pending());
     }
 
     #[test]
