@@ -4785,8 +4785,9 @@ public sealed class BoundlessElevatedJob : IDisposable {
  [DllImport("kernel32.dll",SetLastError=true)] static extern uint ResumeThread(IntPtr t);
  [DllImport("kernel32.dll",SetLastError=true)] static extern bool TerminateProcess(IntPtr p,uint e);
  [DllImport("kernel32.dll",SetLastError=true)] static extern uint WaitForSingleObject(IntPtr h,uint m);
+ [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr p,out uint e);
  [DllImport("kernel32.dll",SetLastError=true)] static extern bool CloseHandle(IntPtr h);
- IntPtr job;
+ IntPtr job,root;
  BoundlessElevatedJob(IntPtr h){job=h;}
  public static BoundlessElevatedJob Create(string name,string sddl){
   IntPtr sd=IntPtr.Zero,j=IntPtr.Zero;
@@ -4802,12 +4803,13 @@ public sealed class BoundlessElevatedJob : IDisposable {
  }
  public void Assign(int pid){IntPtr p=OpenProcess(0x101,false,pid);if(p==IntPtr.Zero)throw new Win32Exception(Marshal.GetLastWin32Error());try{if(!AssignProcessToJobObject(job,p))throw new Win32Exception(Marshal.GetLastWin32Error());}finally{CloseHandle(p);}}
  public Process StartOwned(string applicationName,string commandLine){
+  if(root!=IntPtr.Zero)throw new InvalidOperationException();
   SI s=new SI();s.cb=Marshal.SizeOf(typeof(SI));PI p=new PI();bool resumed=false;
   if(!CreateProcessW(applicationName,new StringBuilder(commandLine),IntPtr.Zero,IntPtr.Zero,false,0x08000004,IntPtr.Zero,null,ref s,out p))throw new Win32Exception(Marshal.GetLastWin32Error());
   try{
    if(!AssignProcessToJobObject(job,p.process))throw new Win32Exception(Marshal.GetLastWin32Error(),"AssignProcessToJobObject failed");
    if(ResumeThread(p.thread)==0xFFFFFFFF)throw new Win32Exception(Marshal.GetLastWin32Error(),"ResumeThread failed");
-   resumed=true;return Process.GetProcessById(p.pid);
+   resumed=true;Process r=Process.GetProcessById(p.pid);root=p.process;p.process=IntPtr.Zero;return r;
   }catch(Exception original){
    if(!resumed){
     Exception cleanup=null;uint wait=WaitForSingleObject(p.process,0);
@@ -4820,8 +4822,9 @@ public sealed class BoundlessElevatedJob : IDisposable {
   finally{if(p.thread!=IntPtr.Zero)CloseHandle(p.thread);if(p.process!=IntPtr.Zero)CloseHandle(p.process);}
  }
  public int Active { get { AC a;if(!QueryInformationJobObject(job,1,out a,(uint)Marshal.SizeOf(typeof(AC)),IntPtr.Zero))throw new Win32Exception(Marshal.GetLastWin32Error());return (int)a.active; } }
+ public int RootExitCode { get {uint e;if(root==IntPtr.Zero)throw new InvalidOperationException();if(!GetExitCodeProcess(root,out e))throw new Win32Exception(Marshal.GetLastWin32Error());return (int)e;} }
  public void Terminate(){if(Active>0&&!TerminateJobObject(job,1))throw new Win32Exception(Marshal.GetLastWin32Error());}
- public void Dispose(){if(job!=IntPtr.Zero){CloseHandle(job);job=IntPtr.Zero;}GC.SuppressFinalize(this);}
+ public void Dispose(){if(job!=IntPtr.Zero){CloseHandle(job);job=IntPtr.Zero;}if(root!=IntPtr.Zero){CloseHandle(root);root=IntPtr.Zero;}GC.SuppressFinalize(this);}
  ~BoundlessElevatedJob(){Dispose();}
 }
 "@
@@ -4915,7 +4918,7 @@ function Restore-BootstrapServiceBeforeMsiFailure {
             return "mode=$WorkerMode;status=tree_not_drained"
         }
         $p.WaitForExit()
-        if ($p.ExitCode -eq 0) {
+        if ($j.RootExitCode -eq 0) {
             return "mode=$WorkerMode;status=completed"
         }
         return "mode=$WorkerMode;status=failed"
@@ -5109,7 +5112,7 @@ try {
             throw "Staged installer descendant did not stop after process-tree cancellation."
         }
     }
-    $exitCode = $child.ExitCode
+    $exitCode = $job.RootExitCode
     $child.Dispose()
     $child = $null
     $childFailureDetail = ""
@@ -5251,8 +5254,11 @@ exit $exitCode
     $source = $source.Replace("__SECURED_DIRECTORY_FUNCTION__", $securedDirectoryFunction)
     $source = $source.Replace("__PAYLOAD_BASE64__", $payloadBase64)
     $encodedCommand = ConvertTo-BoundlessCompressedEncodedCommand -Source $source
-    if ($encodedCommand.Length -gt 30000) {
-        throw "The bounded elevated install command exceeded the safe Windows command-line budget ($($encodedCommand.Length) > 30000)."
+    # CreateProcess limits the complete command line to 32,767 UTF-16 code
+    # units. Keep more than 2 KiB for the PowerShell host path and switches.
+    $encodedCommandBudget = 30500
+    if ($encodedCommand.Length -gt $encodedCommandBudget) {
+        throw "The bounded elevated install command exceeded the safe Windows command-line budget ($($encodedCommand.Length) > $encodedCommandBudget)."
     }
     return [pscustomobject]@{
         source = $source
@@ -7626,6 +7632,38 @@ function Invoke-BoundlessElevatedJobSourceFixture {
         Add-Type -TypeDefinition $match.Groups["code"].Value
     }
 
+    $ownedTreeSddl = Get-BoundlessOwnedTreeSddl -UserSid $UserSid
+    $exitCodeJob = $null
+    $exitCodeProcess = $null
+    try {
+        $exitCodeJob = [BoundlessElevatedJob]::Create(
+            "Local\Boundless.Installer.Tree.v1.$([guid]::NewGuid().ToString('N'))",
+            $ownedTreeSddl
+        )
+        $hostPath = Resolve-CurrentPowerShellExecutable
+        $encodedExit = [Convert]::ToBase64String(
+            [Text.Encoding]::Unicode.GetBytes("exit 37")
+        )
+        $exitCommandLine = @(
+            ConvertTo-ProcessArgument -Value $hostPath
+            "-NoProfile"
+            "-EncodedCommand"
+            $encodedExit
+        ) -join " "
+        $exitCodeProcess = $exitCodeJob.StartOwned($hostPath, $exitCommandLine)
+        if (
+            -not $exitCodeProcess.WaitForExit(5000) -or
+            $exitCodeJob.Active -ne 0 -or
+            $exitCodeJob.RootExitCode -ne 37
+        ) {
+            throw "Elevated process-job fixture lost the native root exit code."
+        }
+    }
+    finally {
+        if ($null -ne $exitCodeProcess) { $exitCodeProcess.Dispose() }
+        if ($null -ne $exitCodeJob) { $exitCodeJob.Dispose() }
+    }
+
     $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) (
         "BoundlessElevatedJobFixture-$([guid]::NewGuid().ToString('N'))"
     )
@@ -7665,7 +7703,7 @@ finally { $gate.Dispose() }
         $jobName = "Local\Boundless.Installer.Tree.v1.$([guid]::NewGuid().ToString('N'))"
         $job = [BoundlessElevatedJob]::Create(
             $jobName,
-            (Get-BoundlessOwnedTreeSddl -UserSid $UserSid)
+            $ownedTreeSddl
         )
         $hostPath = Resolve-CurrentPowerShellExecutable
         $rootArguments = @(
