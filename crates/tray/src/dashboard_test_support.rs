@@ -38,6 +38,7 @@ pub(super) fn test_app() -> DashboardApp {
         exit_requested_signal: Arc::new(AtomicBool::new(false)),
         native_window_handle: None,
         activation_requested: Arc::new(AtomicBool::new(false)),
+        _shutdown_subclass: None,
         _single_instance_guard: None,
         _input_broker_supervisor: None,
         elevated_input_controller: None,

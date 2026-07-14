@@ -510,3 +510,11 @@ fn close_request_hides_to_tray_only_when_tray_exists_and_exit_was_not_requested(
         "without a tray icon, close should not hide the only window"
     );
 }
+
+#[test]
+fn cooperative_shutdown_waits_leave_margin_inside_five_second_budget() {
+    let blocking_cleanup_budget =
+        INPUT_BROKER_SHUTDOWN_JOIN_TIMEOUT + ELEVATED_INPUT_SHUTDOWN_JOIN_TIMEOUT;
+    assert!(blocking_cleanup_budget < Duration::from_secs(5));
+    assert_eq!(blocking_cleanup_budget, Duration::from_secs(4));
+}

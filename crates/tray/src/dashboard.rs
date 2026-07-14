@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
 #[cfg(windows)]
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
@@ -125,6 +124,8 @@ pub(super) fn run() -> Result<()> {
         daemon_candidates: resolve_boundlessd_candidates(std::env::current_exe().ok()),
     });
 
+    let cooperative_exit_requested = Arc::new(AtomicBool::new(false));
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_visible(false)
@@ -144,6 +145,7 @@ pub(super) fn run() -> Result<()> {
                 cc,
                 ctx,
                 single_instance_guard,
+                cooperative_exit_requested,
             )?))
         }),
     )
@@ -223,7 +225,13 @@ fn should_hide_on_close(exit_requested: bool, tray_available: bool) -> bool {
 
 impl eframe::App for DashboardApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.exit_requested |= self.exit_requested_signal.load(Ordering::SeqCst);
+        let exit_was_requested = self.exit_requested_signal.load(Ordering::SeqCst);
+        if exit_was_requested && !self.exit_requested {
+            if let Some(supervisor) = &self._input_broker_supervisor {
+                supervisor.shutdown_signal().request();
+            }
+            self.exit_requested = true;
+        }
 
         if self.activation_requested.swap(false, Ordering::SeqCst) {
             show_dashboard_window(self.native_window_handle, ctx);

@@ -107,6 +107,11 @@ pub(super) struct DashboardApp {
     pub(super) confirm_apply_pending: bool,
     pub(super) confirm_network_reset_pending: bool,
     pub(super) confirm_safe_reset_pending: bool,
+
+    // Must remain last: its Drop disarms the process-level shutdown deadline,
+    // after every field that can perform blocking cleanup has been dropped.
+    pub(super) _shutdown_subclass:
+        Option<platform_windows::cooperative_shutdown::TrayShutdownSubclass>,
 }
 
 impl DashboardApp {
@@ -114,6 +119,7 @@ impl DashboardApp {
         cc: &eframe::CreationContext<'_>,
         app_ctx: Arc<AppContext>,
         mut single_instance_guard: SingleInstanceGuard,
+        exit_requested_signal: Arc<AtomicBool>,
     ) -> Result<Self> {
         // eframe has created winit's event loop before invoking the app
         // creator. Registering Raw Input here ensures the input broker is the
@@ -125,8 +131,15 @@ impl DashboardApp {
         )?;
         let input_broker_shutdown = input_broker_supervisor.shutdown_signal();
         let (tx, rx) = mpsc::channel();
-        let exit_requested_signal = Arc::new(AtomicBool::new(false));
         let native_window_handle = native_window_handle_from_creation_context(cc);
+        let shutdown_subclass = native_window_handle
+            .map(|hwnd| {
+                platform_windows::cooperative_shutdown::TrayShutdownSubclass::attach(
+                    hwnd,
+                    exit_requested_signal.clone(),
+                )
+            })
+            .transpose()?;
         let activation_requested = Arc::new(AtomicBool::new(false));
         let activation_requested_signal = activation_requested.clone();
         let activation_ctx = cc.egui_ctx.clone();
@@ -221,6 +234,7 @@ impl DashboardApp {
             exit_requested_signal,
             native_window_handle,
             activation_requested,
+            _shutdown_subclass: shutdown_subclass,
             _single_instance_guard: Some(single_instance_guard),
             _input_broker_supervisor: Some(input_broker_supervisor),
             elevated_input_controller: Some(elevated_input_controller),

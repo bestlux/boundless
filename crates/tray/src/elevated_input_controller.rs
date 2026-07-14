@@ -1,7 +1,7 @@
 const ELEVATED_INPUT_APPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
 const ELEVATED_INPUT_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const ELEVATED_INPUT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-const ELEVATED_INPUT_SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const ELEVATED_INPUT_SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ElevatedInputControllerStatus {
@@ -303,11 +303,12 @@ impl ElevatedInputController {
 
 impl Drop for ElevatedInputControllerInner {
     fn drop(&mut self) {
+        let deadline = std::time::Instant::now() + ELEVATED_INPUT_SHUTDOWN_JOIN_TIMEOUT;
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let _ = self
             .commands
             .send(ElevatedInputControllerCommand::Shutdown(reply_tx));
-        let _ = reply_rx.recv_timeout(ELEVATED_INPUT_SHUTDOWN_JOIN_TIMEOUT);
+        let _ = reply_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
         let done = self
             .worker_done
             .lock()
@@ -315,7 +316,7 @@ impl Drop for ElevatedInputControllerInner {
             .take()
             .is_none_or(|receiver| {
                 receiver
-                    .recv_timeout(ELEVATED_INPUT_SHUTDOWN_JOIN_TIMEOUT)
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
                     .is_ok()
             });
         if let Some(worker) = self

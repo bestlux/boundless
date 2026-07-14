@@ -436,6 +436,9 @@ pub async fn run_helper() -> Result<()> {
     let parent = open_parent_watch(args.origin_pid)?;
     let signature_trust = combined_signature_trust(&tray, &helper);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let _shutdown_window =
+        crate::cooperative_shutdown::CooperativeShutdownWindow::start(shutdown_tx.clone())
+            .context("start elevated injector cooperative shutdown window")?;
     let runtime = Arc::new(InjectorRuntime {
         origin: tray,
         helper,
