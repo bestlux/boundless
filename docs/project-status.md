@@ -4,14 +4,14 @@ This is the short, version-neutral repo status packet for agents and release wor
 
 ## Current Stable Version
 
-- Stable version: 5.0.14
+- Stable version: 5.0.15 (released 2026-07-14; assets: Windows MSI, install helper, Linux tarball, SHA256SUMS)
 - Source of truth: workspace Cargo.toml, .release-please-manifest.json, and packaging/windows/package-manifest.json
 - Primary release artifact: Windows MSI, plus release metadata and checksums from the release workflow
 
 ## Support Posture
 
 - Product target: Windows-first.
-- Public status: pre-release software with a stable 5.0.14 release artifact, but runtime behavior and APIs may still change.
+- Public status: pre-release software with a stable 5.0.15 release artifact, but runtime behavior and APIs may still change.
 - Cross-platform posture: Linux build/test coverage exists, but Windows runtime, tray, input capture, installer, named-pipe, and service behavior are not implied by Linux success.
 - Canonical first-run UX: tray dashboard with local daemon. CLI setup and console flows are automation and diagnostics fallbacks.
 
@@ -83,14 +83,14 @@ These are not hidden release blockers by default; they require explicit release-
 | clipboard_image_spooling | deferred | BND-NEXT-8A bounded the measured outbound/local image allocation path; inbound/apply still materializes full BMP buffers and should become streaming or spooling work only with separate architecture evidence. | docs/performance/clipboard-image-memory.md |
 | product_scorecard_real_lab_runs | open | Scorecard thresholds are provisional until at least two real two-PC runs exist for each category; fixture rows validate artifact shape but do not make product-performance thresholds binding. | docs/performance/product-scorecard.md |
 | local_subnet_firewall_policy | proposed | BND-NEXT-21 defines a human-gated installer-owned Private/local-subnet firewall policy, but no firewall mutation is implemented or approved. Release evidence must prove explicit opt-in, Program Files service-binary scope, TCP 15100/15200 only, fail-closed behavior, repair/uninstall ownership, and real two-PC Private-network success before claiming frictionless MWB-like install connectivity. | docs/architecture/one-sided-reachability.md, docs/release/release-readiness.md |
-| clipboard_service_mode_broker | needs-evidence | Fix landed in v5.0.11 (9bd45dd, BND-NEXT-24): clipboard is broker-routed through the tray user session in service mode. Awaiting first real two-PC copy/paste proof — service-mode clipboard has never worked live. | docs/backlog.md, docs/release/launch-ledger.md |
-| service_scm_stop | needs-evidence | Fix landed in v5.0.11 (0828513, BND-NEXT-23): control handler reports StopPending and aborts runtime work. Awaiting proof on the first real-binary upgrade (5.0.10→5.0.11 over a running service). | docs/backlog.md (BND-NEXT-23), docs/release/launch-ledger.md |
+| clipboard_service_mode_broker | in-progress | Broker routing landed in v5.0.11 (9bd45dd, BND-NEXT-24); installed 5.0.12 proved service-mode text clipboard in both directions. The image path below the 8 MB policy broke the shared broker; v5.0.13 fault isolation and the symmetric control-plane limit are landed, and the installed Paint size/fault matrix remains the open evidence gap. | docs/backlog.md, docs/release/launch-ledger.md |
+| service_scm_stop | partial installed pass | Fix landed in v5.0.11 (0828513, BND-NEXT-23). During the installed 5.0.12→5.0.13 upgrade the old service reported StopPending and stopped cleanly in ~2.02 s with no multi-minute wedge; the retained final criterion is a surviving verbose helper MSI log on a later upgrade. | docs/backlog.md (BND-NEXT-23), docs/release/launch-ledger.md |
 
 ## Next Backlog Step
 
 - Canonical prioritized backlog: [docs/backlog.md](backlog.md). Dogfood-observed blockers, flows, and nits: [docs/release/launch-ledger.md](release/launch-ledger.md).
 - v5.0.14 is published, but its accumulated installed proof is intentionally rolling into the next dogfood build rather than requiring a separate physical run. BND-NEXT-23, BND-NEXT-24, BND-NEXT-29 item 3, BND-NEXT-31, BND-NEXT-35, and BND-NEXT-37 through BND-NEXT-42 retain their existing evidence status until that run occurs.
-- The bounded v5.0.15 train is code complete and awaiting release validation. It contains BND-NEXT-44 plus only its direct adjacencies: narrow BND-NEXT-34 injector-stage diagnostics, BND-NEXT-24 degraded-state reporting, and BND-NEXT-31/BND-NEXT-38 lifecycle and fail-open integration. Network, firewall, layout, generic transport, and broad CI migration are not part of this train.
+- The bounded v5.0.15 train was released 2026-07-14 (v5.0.15 on GitHub with MSI + helper assets); installed proof is pending on the 5.0.14→5.0.15 dogfood run (5.0.14 is the reported installed baseline). It contains BND-NEXT-44 plus only its direct adjacencies: narrow BND-NEXT-34 injector-stage diagnostics, BND-NEXT-24 degraded-state reporting, and BND-NEXT-31/BND-NEXT-38 lifecycle and fail-open integration. Network, firewall, layout, generic transport, and broad CI migration are not part of this train.
 - After v5.0.15, the ranked code work is: BND-NEXT-27 plus BND-NEXT-28; BND-NEXT-20E; BND-NEXT-21; BND-NEXT-33B/33C with BND-NEXT-33A design in parallel; complete BND-NEXT-34 then BND-NEXT-43. BND-NEXT-32 remains analysis-first, and BND-NEXT-22, BND-NEXT-36, and BND-NEXT-30 stay later.
 - Full `SessionEvent`/`SessionPhase` machinery, broader multi-peer/runtime fault coverage, graceful per-session join lifecycle, clipboard image streaming/spooling, tray update notification UX remain deferred.
 
