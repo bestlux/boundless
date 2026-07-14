@@ -316,6 +316,52 @@ function Test-ExpectedShortcutIconLocation {
     return $resolvedLocation -imatch '[\\/](?:Microsoft|Windows)[\\/]Installer[\\/]\{[^\\/]+\}[\\/]BoundlessIcon\.ico$'
 }
 
+function ConvertTo-AuthenticodeStatusName {
+    param([object]$Status)
+
+    if ($null -eq $Status) {
+        throw "Authenticode signature status was missing."
+    }
+
+    $name = $Status.ToString()
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        throw "Authenticode signature status did not have a stable name."
+    }
+    return $name
+}
+
+function Assert-AuthenticodeStatusSerializationFixtures {
+    foreach ($status in [Enum]::GetValues([System.Management.Automation.SignatureStatus])) {
+        $expectedName = $status.ToString()
+        $summaryJson = [ordered]@{
+            signature = ConvertTo-AuthenticodeStatusName -Status $status
+        } | ConvertTo-Json -Compress
+        $roundTrip = $summaryJson | ConvertFrom-Json
+        if (
+            $roundTrip.signature -isnot [string] -or
+            $roundTrip.signature -cne $expectedName
+        ) {
+            throw "Authenticode status '$expectedName' did not serialize as its stable string name."
+        }
+    }
+
+    $rawStatusName = (Get-AuthenticodeSignature -LiteralPath $PSCommandPath).Status.ToString()
+    $assertedStatusName = Assert-Authenticode -Path $PSCommandPath -Required $false
+    $assertedRoundTrip = ([ordered]@{
+        input_injector_signature = $assertedStatusName
+    } | ConvertTo-Json -Compress) | ConvertFrom-Json
+    if (
+        $assertedStatusName -isnot [string] -or
+        $assertedStatusName -cne $rawStatusName -or
+        $assertedRoundTrip.input_injector_signature -isnot [string] -or
+        $assertedRoundTrip.input_injector_signature -cne $rawStatusName
+    ) {
+        throw "Assert-Authenticode did not preserve the live signature status as a JSON string."
+    }
+
+    Write-Host "installer_smoke_authenticode_status_serialization_fixtures=passed"
+}
+
 function Assert-Authenticode {
     param(
         [string]$Path,
@@ -327,7 +373,7 @@ function Assert-Authenticode {
         throw "Authenticode signature was expected to be valid for $Path but was $($signature.Status)."
     }
 
-    return $signature.Status
+    return ConvertTo-AuthenticodeStatusName -Status $signature.Status
 }
 
 function Get-WindowsManifestToolPath {
@@ -872,6 +918,7 @@ function Wait-ForRuntimePresence {
 
 if ($SelfTest) {
     Assert-BoundlessInstallHelperEvidenceParserFixtures
+    Assert-AuthenticodeStatusSerializationFixtures
     Assert-WindowsServiceExecutablePathFixtures
     Write-Host "installer_smoke_self_test=passed"
     return

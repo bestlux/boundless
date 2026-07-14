@@ -70,6 +70,7 @@ jobs:
             '^crates/',
             '^packaging/windows/',
             '^scripts/dev/installer-smoke\.ps1$',
+            '^scripts/dev/release-readiness\.ps1$',
             '^scripts/release/(assert-release-consistency|package-windows)\.ps1$',
             '^\.github/actions/setup-rust/',
             '^\.github/workflows/(ci|release-please)\.yml$'
@@ -186,6 +187,20 @@ jobs:
             -PreviousInstallerPath "${{ steps.previous.outputs.installer_path }}" `
             -OutputRoot (Join-Path (Resolve-Path .).Path "artifacts/installer-validation") `
             -KeepArtifacts
+
+      - name: Validate installer evidence contract
+        if: steps.changes.outputs.run_installer == 'true'
+        shell: pwsh
+        run: |
+          $validationRoot = Join-Path (Resolve-Path .).Path "artifacts/installer-validation"
+          ./scripts/dev/release-readiness.ps1 `
+            -RepoRoot (Resolve-Path .).Path `
+            -OutputRoot (Join-Path $validationRoot "release-readiness") `
+            -InstallerSmokeSummaryPath (Join-Path $validationRoot "installer-smoke.json") `
+            -ReleaseVersion "v${{ steps.candidate.outputs.version }}" `
+            -Policy prerelease `
+            -InputInjectorSignaturePolicy unsigned-dogfood `
+            -SkipUnitGates
 
       - name: Upload installer validation evidence
         if: always() && steps.changes.outputs.run_installer == 'true'

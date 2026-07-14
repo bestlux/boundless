@@ -569,6 +569,8 @@ The subsequent v5.0.15 release attempts exposed three more harness defects only 
 
 The first PR execution of that hosted lane caught a fourth defect before merge: the elevated helper renamed the protected staged MSI to `Boundless.msi`, so Windows Installer registered that source package name while the repair check supplied the versioned release artifact and failed with `SECUREREPAIR`/1603. Preserving the validated release filename inside the immutable stage fixes the product source contract while retaining the existing ACL, hash, cleanup, and elevation boundaries.
 
+The first post-merge release then exposed a fifth late schema mismatch after the installed smoke had passed: PowerShell serialized `SignatureStatus.NotSigned` as enum value `2`, while release readiness required the stable name `NotSigned`. The follow-up slice makes the installer-smoke summary use explicit signature names, covers that JSON contract in both PowerShell hosts, and makes the PR installer lane consume its real summary through release readiness with redundant unit gates skipped.
+
 ### Scope
 
 This is an analysis and migration-design story before workflow changes:
