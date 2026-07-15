@@ -10,9 +10,10 @@ use app_services::diagnostics::{
     write_diagnostic_bundle,
 };
 use app_services::install_doctor::{
-    InstallDoctorReport, InstallEvidence, REQUIRED_PAYLOADS, VERSIONED_EXECUTABLES,
-    evaluate_install_evidence,
+    InstallDoctorReport, InstallEvidence, evaluate_install_evidence,
 };
+#[cfg(windows)]
+use app_services::install_doctor::{REQUIRED_PAYLOADS, VERSIONED_EXECUTABLES};
 use core_clipboard::sanitize_clipboard_event_output_detail;
 #[cfg(any(windows, test))]
 use std::path::PathBuf as StdPathBuf;
@@ -196,6 +197,7 @@ fn print_install_doctor_report(report: &InstallDoctorReport, output: OutputForma
     Ok(())
 }
 
+#[cfg(windows)]
 #[derive(Deserialize, Default)]
 struct InstalledPackageManifest {
     version: String,
