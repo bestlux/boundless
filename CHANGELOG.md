@@ -1,5 +1,24 @@
 # Changelog
 
+## [5.0.16](https://github.com/bestlux/boundless/compare/v5.0.15...v5.0.16) (2026-07-15)
+
+
+### Features
+
+* **cli:** add installed product doctor ([9e06d7d](https://github.com/bestlux/boundless/commit/9e06d7d7dee77d6c4cc7d1a9cf140907fec2dedc))
+* **cli:** add stable json output ([50dbb0d](https://github.com/bestlux/boundless/commit/50dbb0dba45f21d9513a90c949dff7839f855f79))
+* **windows:** cooperate with restart manager shutdown ([9479a87](https://github.com/bestlux/boundless/commit/9479a8734e4a532db98bec251e136caadce3885f))
+
+
+### Bug Fixes
+
+* **cli:** gate install doctor probes to windows ([88ad43e](https://github.com/bestlux/boundless/commit/88ad43efa1dcb45bf4ff1a23cc8608bbc20e81f9))
+
+
+### Miscellaneous Chores
+
+* **release:** target 5.0.16 ([a79932a](https://github.com/bestlux/boundless/commit/a79932a7871289a5623d2f8e954a0cce7027b670))
+
 ## [5.0.15](https://github.com/bestlux/boundless/compare/v5.0.14...v5.0.15) (2026-07-14)
 
 
