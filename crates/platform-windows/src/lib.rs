@@ -6,6 +6,8 @@ pub mod cooperative_shutdown;
 pub mod elevated_input;
 pub mod input;
 #[cfg(windows)]
+pub mod install_verification;
+#[cfg(windows)]
 pub mod process_identity;
 pub mod runtime;
 #[cfg(windows)]

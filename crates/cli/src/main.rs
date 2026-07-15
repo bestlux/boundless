@@ -114,6 +114,10 @@ enum Command {
         #[command(subcommand)]
         command: DiagnosticsCommand,
     },
+    Doctor {
+        #[arg(long, default_value_t = false)]
+        install: bool,
+    },
     Ui {
         #[command(subcommand)]
         command: UiCommand,
@@ -408,7 +412,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.json && !command_supports_json(&cli.command) {
         anyhow::bail!(
-            "--json is supported by daemon status, peer list, feature list, and transport events"
+            "--json is supported by daemon status, peer list, feature list, transport events, and doctor --install"
         );
     }
     let output = OutputFormat::from_json_flag(cli.json);
@@ -635,6 +639,12 @@ async fn main() -> Result<()> {
                 diagnostics_run_action(&cli.endpoint, action).await
             }
         },
+        Command::Doctor { install } => {
+            if !install {
+                anyhow::bail!("doctor requires --install");
+            }
+            doctor_install(&cli.endpoint, output).await
+        }
         Command::Ui { command } => match command {
             UiCommand::Snapshot { start_daemon } => ui_snapshot(&cli.endpoint, start_daemon).await,
         },
@@ -657,7 +667,7 @@ fn command_supports_json(command: &Command) -> bool {
             command: FeatureCommand::List
         } | Command::Transport {
             command: TransportCommand::Events { .. }
-        }
+        } | Command::Doctor { install: true }
     )
 }
 
@@ -682,6 +692,10 @@ mod tests {
         let unsupported = Cli::try_parse_from(["boundlessctl", "--json", "service", "status"])
             .expect("global syntax remains parseable");
         assert!(!command_supports_json(&unsupported.command));
+
+        let doctor = Cli::try_parse_from(["boundlessctl", "--json", "doctor", "--install"])
+            .expect("parse install doctor JSON");
+        assert!(command_supports_json(&doctor.command));
     }
 
     #[test]

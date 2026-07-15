@@ -9,6 +9,10 @@ use app_services::diagnostics::{
     DiagnosticExportOptions, ServiceDiagnosticSnapshot, build_offline_bundle,
     write_diagnostic_bundle,
 };
+use app_services::install_doctor::{
+    InstallDoctorReport, InstallEvidence, REQUIRED_PAYLOADS, VERSIONED_EXECUTABLES,
+    evaluate_install_evidence,
+};
 use core_clipboard::sanitize_clipboard_event_output_detail;
 #[cfg(any(windows, test))]
 use std::path::PathBuf as StdPathBuf;
@@ -156,6 +160,227 @@ fn daemon_status_json(status: &StatusReply) -> Result<String> {
         anti_idle_display_required: status.anti_idle_display_required,
     })
     .context("serialize daemon status")
+}
+
+pub(super) async fn doctor_install(endpoint: &str, output: OutputFormat) -> Result<()> {
+    let evidence = collect_install_evidence(endpoint).await;
+    let report = evaluate_install_evidence(evidence);
+    print_install_doctor_report(&report, output)?;
+    if report.ok {
+        Ok(())
+    } else {
+        bail!("installed Boundless failed one or more verification checks")
+    }
+}
+
+fn print_install_doctor_report(report: &InstallDoctorReport, output: OutputFormat) -> Result<()> {
+    match output {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(report).context("serialize install doctor report")?
+        ),
+        OutputFormat::Human => {
+            for check in &report.checks {
+                println!(
+                    "{} {} expected={} actual={} message={}",
+                    if check.ok { "PASS" } else { "FAIL" },
+                    check.id,
+                    check.expected,
+                    check.actual,
+                    check.message
+                );
+            }
+            println!("doctor_install={}", if report.ok { "pass" } else { "fail" });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize, Default)]
+struct InstalledPackageManifest {
+    version: String,
+    executables: std::collections::BTreeMap<String, String>,
+}
+
+#[cfg(windows)]
+async fn collect_install_evidence(endpoint: &str) -> InstallEvidence {
+    use windows_service::{
+        service::{ServiceAccess, ServiceState},
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let mut evidence = InstallEvidence {
+        platform_supported: true,
+        ..Default::default()
+    };
+    match platform_windows::install_verification::collect_windows_install_snapshot() {
+        Ok(snapshot) => {
+            evidence.product_codes = snapshot.product_codes;
+            evidence.display_version = snapshot.display_version;
+            evidence.install_root = snapshot.install_root.display().to_string();
+            evidence.tray_count = snapshot.tray_count;
+            evidence.tray_path_matches = snapshot.tray_path_matches;
+            evidence.tray_responding = snapshot.tray_responding;
+        }
+        Err(error) => evidence
+            .collection_errors
+            .push(format!("windows install snapshot: {error:#}")),
+    }
+
+    let install_root = if evidence.install_root.is_empty() {
+        std::env::var_os("ProgramFiles")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
+            .join("Boundless")
+    } else {
+        PathBuf::from(&evidence.install_root)
+    };
+    evidence.install_root = install_root.display().to_string();
+    let manifest_path = install_root.join("package-manifest.json");
+    evidence.manifest_present = manifest_path.is_file();
+    match std::fs::read_to_string(&manifest_path)
+        .context("read installed package manifest")
+        .and_then(|contents| {
+            serde_json::from_str::<InstalledPackageManifest>(
+                contents.trim_start_matches('\u{feff}'),
+            )
+            .context("parse installed package manifest")
+        }) {
+        Ok(manifest) => {
+            evidence.manifest_version = manifest.version;
+            evidence.manifest_executables = manifest.executables;
+        }
+        Err(error) => evidence
+            .collection_errors
+            .push(format!("manifest: {error:#}")),
+    }
+    for payload in REQUIRED_PAYLOADS {
+        evidence
+            .payloads_present
+            .insert(payload.to_string(), install_root.join(payload).is_file());
+    }
+
+    match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).and_then(
+        |manager| {
+            manager.open_service(
+                BOUNDLESS_SERVICE_NAME,
+                ServiceAccess::QUERY_CONFIG | ServiceAccess::QUERY_STATUS,
+            )
+        },
+    ) {
+        Ok(service) => {
+            match service.query_config() {
+                Ok(config) => {
+                    evidence.service_account = config
+                        .account_name
+                        .map(|value| value.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let binary =
+                        extract_service_executable_path(&config.executable_path.to_string_lossy());
+                    evidence.service_binary_path = binary.display().to_string();
+                    evidence.service_binary_path_matches = paths_equal_case_insensitive(
+                        &binary,
+                        &install_root.join("boundless-service.exe"),
+                    );
+                }
+                Err(error) => evidence
+                    .collection_errors
+                    .push(format!("service config: {error}")),
+            }
+            match service.query_status() {
+                Ok(status) => {
+                    evidence.service_running = status.current_state == ServiceState::Running
+                }
+                Err(error) => evidence
+                    .collection_errors
+                    .push(format!("service status: {error}")),
+            }
+        }
+        Err(error) => evidence
+            .collection_errors
+            .push(format!("open BoundlessService: {error}")),
+    }
+
+    for executable in VERSIONED_EXECUTABLES {
+        let file_name = format!("{executable}.exe");
+        let version = probe_executable_version(&install_root.join(file_name), executable)
+            .unwrap_or_else(|error| {
+                evidence
+                    .collection_errors
+                    .push(format!("{executable} version: {error:#}"));
+                String::new()
+            });
+        evidence
+            .executable_versions
+            .insert(executable.to_string(), version);
+    }
+
+    match connect_control_plane(endpoint).await {
+        Ok(mut client) => match client.get_status(StatusRequest {}).await {
+            Ok(status) => {
+                let status = status.into_inner();
+                evidence.daemon_api_healthy = true;
+                evidence.daemon_running = status.running;
+                evidence.daemon_runtime_version = status.daemon_version;
+            }
+            Err(error) => evidence
+                .collection_errors
+                .push(format!("daemon status: {error}")),
+        },
+        Err(error) => evidence
+            .collection_errors
+            .push(format!("daemon API: {error}")),
+    }
+    evidence
+}
+
+#[cfg(not(windows))]
+async fn collect_install_evidence(_endpoint: &str) -> InstallEvidence {
+    InstallEvidence {
+        collection_errors: vec!["install verification is supported on Windows only".to_string()],
+        ..Default::default()
+    }
+}
+
+#[cfg(windows)]
+fn probe_executable_version(path: &Path, expected_name: &str) -> Result<String> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("start {} --version", path.display()))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if child.try_wait()?.is_some() {
+            let output = child.wait_with_output()?;
+            if !output.status.success() {
+                bail!("{} --version exited {}", path.display(), output.status);
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut fields = stdout.split_whitespace();
+            let name = fields.next().unwrap_or_default();
+            let version = fields.next().unwrap_or_default();
+            if name != expected_name || version.is_empty() || fields.next().is_some() {
+                bail!("{} returned malformed version output", path.display());
+            }
+            return Ok(version.to_string());
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("{} --version timed out", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(windows)]
+fn paths_equal_case_insensitive(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
 fn format_daemon_status_line(status: &StatusReply) -> String {
