@@ -9701,7 +9701,10 @@ public static class BoundlessInstallNativeMethods
             -SentinelName $monitorFixtureSentinelName `
             -TreeJobName $monitorFixtureTreeJob `
             -CompletionEventName $monitorFixtureCompletion.name
-        Wait-BoundlessTrayQuiescenceMonitorReady -Monitor $monitorFixture -TimeoutSeconds 10
+        # Hosted Windows runners can spend well over 10 seconds cold-starting
+        # the hidden PowerShell monitor. This is fixture readiness time, not a
+        # product shutdown or installer-quiescence budget.
+        Wait-BoundlessTrayQuiescenceMonitorReady -Monitor $monitorFixture -TimeoutSeconds 30
         if ($monitorFixture.process.HasExited) {
             throw "Tray quiescence monitor fixture did not remain active after its stable-zero handshake."
         }
