@@ -511,19 +511,19 @@ jobs:
 
       - name: Attest Windows installer
         if: ${{ !github.event.repository.private }}
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
         with:
           subject-path: ${{ steps.assets.outputs.windows_installer }}
 
       - name: Attest Linux tarball
         if: ${{ !github.event.repository.private }}
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
         with:
           subject-path: ${{ steps.assets.outputs.linux_archive }}
 
       - name: Attest checksum manifest
         if: ${{ !github.event.repository.private }}
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
         with:
           subject-path: dist/SHA256SUMS.txt
 
