@@ -9,13 +9,13 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 bincode = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 hyper-util = { version = "0.1.11", features = ["tokio"] }
-mdns-sd = "0.20.0"
+mdns-sd = "0.21.0"
 prost = "0.14"
 protoc-bin-vendored = "3"
 rand = "0.10"
