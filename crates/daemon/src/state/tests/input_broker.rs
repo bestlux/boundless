@@ -78,6 +78,21 @@ async fn paused_broker_keeps_clipboard_live_and_allows_only_release_recovery() {
         vec![InputEvent::MouseMove { dx: 9, dy: 9 }],
     )
     .await;
+    assert!(state.release_input_owner(&peer).await);
+    let cancelled = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                inject_backpressure: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(cancelled.accepted && cancelled.inject_batch_cancelled);
+    assert_eq!(cancelled.inject_batch_id, uncertain.inject_batch_id);
+    // The tray has a committed Down whose cleanup failed. It must keep this
+    // cancellation unacknowledged, allowing pause to preserve a recovery Up.
     let paused = state
         .exchange_input_broker(
             allowed_client(),

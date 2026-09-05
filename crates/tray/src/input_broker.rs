@@ -97,6 +97,7 @@ struct BrokerInjectBatchState {
     active_authorization_generation: Option<u64>,
     frames: std::collections::VecDeque<Vec<core_input::InputEvent>>,
     last_completed_batch_id: u64,
+    pending_cancelled_batch_id: Option<u64>,
     held_authorization_generation: Option<u64>,
     held_input_resume: Option<BrokerHeldInputResume>,
     pending_local_releases: Vec<core_input::InputEvent>,
@@ -149,6 +150,7 @@ impl BrokerInjectBatchState {
         self.active_authorization_generation = None;
         self.frames.clear();
         self.last_completed_batch_id = 0;
+        self.pending_cancelled_batch_id = None;
         self.held_authorization_generation = None;
         self.held_input_resume = None;
         self.failed_inject_batch_id = None;
@@ -157,7 +159,7 @@ impl BrokerInjectBatchState {
     }
 
     fn backpressure_active(&self) -> bool {
-        self.active_batch_id.is_some()
+        self.active_batch_id.is_some() || self.pending_cancelled_batch_id.is_some()
     }
 
     fn acked_batch_id(&self) -> u64 {
@@ -210,7 +212,10 @@ impl BrokerInjectBatchState {
         self.frames.clear();
         self.active_batch_id = None;
         self.active_authorization_generation = None;
-        self.last_completed_batch_id = batch_id;
+        // Dropping a suffix does not prove that its committed Downs were
+        // released. Keep the cancellation receipt pending through cleanup,
+        // including paused heartbeats and reconnects.
+        self.pending_cancelled_batch_id = Some(batch_id);
         self.held_input_resume = None;
         self.failed_inject_batch_id = None;
         Ok(true)
@@ -251,6 +256,9 @@ impl BrokerInjectBatchState {
             // A lost acknowledgement response can replay a completed ID. The
             // server retains IDs, so acknowledge again without reinjection.
             return Ok(());
+        }
+        if self.pending_cancelled_batch_id.is_some() {
+            bail!("input broker advanced before cancelled-batch cleanup completed");
         }
         if let Some(active_batch_id) = self.active_batch_id {
             if active_batch_id != batch_id {
@@ -407,6 +415,7 @@ impl BrokerInjectBatchState {
             && !injected_state.windows_input.has_pending_native_cleanup()
         {
             self.complete_elevated_cleanup();
+            self.complete_cancelled_batch_cleanup();
             return true;
         }
         let releases = self.pending_local_releases.clone();
@@ -419,10 +428,17 @@ impl BrokerInjectBatchState {
             self.held_authorization_generation = None;
             self.pending_cleanup_windows_input = None;
             self.complete_elevated_cleanup();
+            self.complete_cancelled_batch_cleanup();
         } else if self.pending_cleanup_windows_input.is_none() {
             self.pending_cleanup_windows_input = Some(injected_state.windows_input.clone());
         }
         complete
+    }
+
+    fn complete_cancelled_batch_cleanup(&mut self) {
+        if let Some(batch_id) = self.pending_cancelled_batch_id.take() {
+            self.last_completed_batch_id = batch_id;
+        }
     }
 
     fn complete_elevated_cleanup(&mut self) {
@@ -584,6 +600,10 @@ impl BrokerInjectBatchState {
         self.active_batch_id = None;
         self.active_authorization_generation = None;
         self.frames.clear();
+        // The daemon retired the old batch while preserving its conservative
+        // releases. Its cancellation must never become a late receipt for a
+        // now-replaced batch; the recovery batch earns its own receipt.
+        self.pending_cancelled_batch_id = None;
         self.held_authorization_generation = None;
         self.held_input_resume = None;
         self.failed_inject_batch_id = None;
@@ -2058,6 +2078,56 @@ mod input_broker_tests {
     }
 
     #[tokio::test]
+    async fn paused_heartbeat_retains_cancelled_receipt_until_failed_release_recovers() {
+        let down = core_input::InputEvent::Key { scan_code: 30, state: core_input::KeyState::Down,
+            semantics: core_input::KeySemantics::Physical };
+        let up = core_input::InputEvent::Key { scan_code: 30, state: core_input::KeyState::Up,
+            semantics: core_input::KeySemantics::Physical };
+        let suffix = core_input::InputEvent::MouseMove { dx: 1, dy: 0 };
+        let mut batches = BrokerInjectBatchState::default();
+        batches.accept_batch(7, vec![vec![down, suffix.clone()]]).expect("batch");
+        let mut injected = InjectedInputState::new(WindowsNumLockState::new(false));
+        batches.process_with(&mut injected, |events, state| observe_injected_input_outcome(events, state,
+            InputSendOutcome { committed_event_count: 1, remaining_events: vec![suffix.clone()],
+                error: Some(anyhow::anyhow!("partial send")) }));
+        assert!(batches.accept_reply(7, true, Vec::new(), 0).expect("cancel"));
+        batches.stage_local_cleanup(&mut injected);
+        assert!(!batches.process_local_cleanup_with(&mut injected, |events, _| InputSendOutcome {
+            committed_event_count: 0, remaining_events: events.to_vec(), error: Some(anyhow::anyhow!("release blocked"))
+        }));
+        assert_eq!(batches.acked_batch_id(), 0, "cancellation is not complete while its committed Down remains held");
+        let exchanges = std::cell::Cell::new(0);
+        let releases = std::cell::Cell::new(0);
+        let result = paused_input_exchange_loop(|request| {
+            let count = exchanges.get(); exchanges.set(count + 1);
+            if count < 2 {
+                assert_eq!(request.acked_inject_batch_id, 0, "paused heartbeat must preserve daemon recovery evidence");
+                let frames = if count == 0 { vec![ipc_api::boundless::v1::InputBrokerInjectFrame {
+                    source_peer_id: String::new(), sequence: 0,
+                    events: broker_events_from_input_events(std::slice::from_ref(&up)),
+                }] } else { Vec::new() };
+                std::future::ready(Ok(InputBrokerExchangeReply { accepted: true, inject_batch_id: 8,
+                    inject_authorization_generation: 1, inject_frames: frames, ..Default::default() }))
+            } else {
+                assert_eq!(request.acked_inject_batch_id, 8, "only the completed replacement recovery is acknowledged");
+                std::future::ready(Err(anyhow::anyhow!("fixture complete")))
+            }
+        }, "token", &mut batches, |events, state| {
+            assert_eq!(events, std::slice::from_ref(&up));
+            let count = releases.get(); releases.set(count + 1);
+            if count == 0 {
+                InputSendOutcome { committed_event_count: 0, remaining_events: events.to_vec(), error: Some(anyhow::anyhow!("still blocked")) }
+            } else {
+                observe_injected_input_outcome(events, state, InputSendOutcome { committed_event_count: events.len(), remaining_events: Vec::new(), error: None })
+            }
+        }).await;
+        assert!(result.expect_err("bounded fixture").to_string().contains("fixture complete"));
+        assert_eq!(exchanges.get(), 3);
+        assert_eq!(releases.get(), 3);
+        assert!(!batches.local_cleanup_pending());
+    }
+
+    #[tokio::test]
     async fn local_pause_interrupts_stalled_exchange_without_waiting_for_ipc() {
         let (pause_tx, mut pause_rx) = tokio::sync::watch::channel(false);
         let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -3275,6 +3345,10 @@ mod input_broker_tests {
                 .expect("daemon cancellation")
         );
         let mut second_session = InjectedInputState::new(WindowsNumLockState::new(false));
+        batch.stage_local_cleanup(&mut second_session);
+        assert!(batch.process_local_cleanup_with(&mut second_session, |_, _| {
+            panic!("the previous session already released its held input")
+        }));
         let progress = batch.process_with(&mut second_session, |_events, _state| {
             panic!("cancelled batch must not restore held input or retry its suffix")
         });
@@ -3514,8 +3588,9 @@ mod input_broker_tests {
             .accept_reply(7, true, Vec::new(), 0)
             .expect("owner revocation cancels retained suffix");
         assert!(cancelled_now);
+        batch.stage_local_cleanup(&mut injected);
         assert_eq!(
-            injected.drain_release_events(),
+            batch.pending_local_releases,
             vec![core_input::InputEvent::Key {
                 scan_code: 30,
                 state: core_input::KeyState::Up,
@@ -3523,6 +3598,12 @@ mod input_broker_tests {
             }],
             "cancelling a partially committed batch must release held local input"
         );
+        assert_eq!(batch.acked_batch_id(), 0);
+        assert!(batch.process_local_cleanup_with(&mut injected, |events, state| {
+            observe_injected_input_outcome(events, state, InputSendOutcome {
+                committed_event_count: events.len(), remaining_events: Vec::new(), error: None,
+            })
+        }));
         let after_cancel = batch.process_with(&mut injected, |_events, _state| {
             panic!("cancelled input suffix must not be retried")
         });
