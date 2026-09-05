@@ -169,7 +169,7 @@ impl DashboardHarness {
                 .get(&mesh.texture_id)
                 .expect("every painted mesh must have a texture");
             let clip = primitive.clip_rect * self.output.pixels_per_point;
-            for triangle in mesh.indices.chunks_exact(3) {
+            for triangle in mesh.indices.as_chunks::<3>().0 {
                 let vertices = [triangle[0], triangle[1], triangle[2]]
                     .map(|index| mesh.vertices[index as usize]);
                 paint_triangle(
