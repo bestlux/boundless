@@ -1,6 +1,7 @@
 //! Real TCP/TLS fixtures. These deliberately report loopback, never physical-PC evidence.
 use app_services::paired_testing::{EvidenceCategory, MAX_PROBE_BYTES, PairedTestOptions};
 use core_security::{SecurityPaths, TrustRecord, upsert_trust_record};
+use tokio::task::JoinHandle;
 
 use super::*;
 
@@ -37,7 +38,7 @@ impl Fixture {
             ..Default::default()
         };
         config.file_transfer.receive_dir = root.join("inbox").to_string_lossy().into_owned();
-        config.features.insert("clipboard".into(), false);
+        config.features.insert("share_clipboard".into(), false);
         config.features.insert("share_input".into(), false);
         config.peers.push(crate::config::PeerConfig {
             peer_id: peer_id.into(),
@@ -142,6 +143,12 @@ async fn paired_testing_real_tls_denies_then_measures_then_revokes_without_user_
     let b_id = "20000000-0000-0000-0000-000000000002";
     let a = Fixture::new(a_id, b_id);
     let b = Fixture::new(b_id, a_id);
+    // A probe must neither create the sender's receive folder nor touch an
+    // existing receiver file, even when the connection permits file sharing.
+    let receiver_inbox = b.root.join("inbox");
+    std::fs::create_dir(&receiver_inbox).unwrap();
+    let existing_file = receiver_inbox.join("existing-user-file.txt");
+    std::fs::write(&existing_file, b"keep this user content").unwrap();
     a.trust(&b, b_id);
     b.trust(&a, a_id);
     let (client, server) = start_pair(&a, &b, b_id).await;
@@ -188,7 +195,12 @@ async fn paired_testing_real_tls_denies_then_measures_then_revokes_without_user_
         before.remaining_bytes - after.remaining_bytes,
         8 * (64 + MAX_PROBE_BYTES as u64)
     );
-    assert_eq!(std::fs::read_dir(b.root.join("inbox")).unwrap().count(), 0);
+    assert!(!a.root.join("inbox").exists());
+    assert_eq!(std::fs::read_dir(&receiver_inbox).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read(&existing_file).unwrap(),
+        b"keep this user content"
+    );
     assert_eq!(b.state.pending_inject_input_frame_count().await, 0);
 
     // Emits actual local measurements for an optional captured benchmark artifact.

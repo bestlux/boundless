@@ -908,6 +908,7 @@ fn insert_runtime_task_health(bundle: &mut Value, snapshots: Vec<RuntimeTaskSnap
     };
 
     component_health.insert("runtime_tasks".to_string(), task_health_json(&snapshots));
+    component_health.insert("logging".to_string(), crate::logging::logging_health());
 }
 
 async fn build_status_snapshot(state: &AppState) -> Result<StatusSnapshot> {
@@ -1757,6 +1758,14 @@ mod tests {
             .expect("dump diagnostics");
         let content = std::fs::read_to_string(&reply.bundle_path).expect("read bundle");
         let manifest = std::fs::read_to_string(&reply.manifest_path).expect("read manifest");
+        let exported: Value = serde_json::from_str(&content).expect("exported JSON");
+        let logging = &exported["component_health"]["logging"];
+        assert_eq!(logging["runtime"]["total_payload_bytes"], 100 * 1024 * 1024);
+        assert_eq!(
+            logging["service_startup"]["total_payload_bytes"],
+            4 * 1024 * 1024
+        );
+        assert!(logging["runtime"]["dropped_records"].is_u64());
 
         assert!(content.contains(r#""mode": "online""#));
         assert!(content.contains(r#""layout_matrix": "self,peer-2""#));
