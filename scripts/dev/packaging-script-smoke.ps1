@@ -619,6 +619,13 @@ finally {
 }
 
 $fixtureHosts = @()
+$legacyFixtureArguments = @('-HelperPath', $installScript)
+$fixturePrincipal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+if ($fixturePrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    # Hosted Windows CI is elevated. The fixture first checks the production
+    # rejection, then models desktop-user authority only in its temporary roots.
+    $legacyFixtureArguments += '-SimulateUnelevatedAuthority'
+}
 foreach ($hostName in @("powershell.exe", "pwsh.exe")) {
     $hostCommand = Get-Command $hostName -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $hostCommand) { continue }
@@ -636,6 +643,10 @@ foreach ($hostName in @("powershell.exe", "pwsh.exe")) {
     Invoke-PackagingScript `
         -ScriptPath (Join-Path $RepoRoot 'scripts/dev/windows-bundle-fixtures.ps1') `
         -Arguments @('-RepoRoot', $RepoRoot) `
+        -PowerShellExe $hostCommand.Source | Out-Null
+    Invoke-PackagingScript `
+        -ScriptPath (Join-Path $RepoRoot 'scripts/dev/legacy-install-migration-fixtures.ps1') `
+        -Arguments $legacyFixtureArguments `
         -PowerShellExe $hostCommand.Source | Out-Null
 }
 
