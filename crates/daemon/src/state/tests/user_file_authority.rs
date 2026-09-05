@@ -151,6 +151,45 @@ async fn retained_source_handles_are_bounded_and_cancellation_restores_capacity(
 }
 
 #[tokio::test]
+async fn cancelled_source_open_keeps_capacity_until_blocking_worker_finishes() {
+    let (state, root) = fixture();
+    let source = root.join("source.txt");
+    std::fs::write(&source, b"user content").expect("fixture file");
+    let lease = state.user_io_lease().await.expect("user authority");
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = slots.clone().try_acquire_owned().expect("initial capacity");
+    let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+    let caller = tokio::spawn(async move {
+        super::super::clipboard_ops::open_outbound_source_with_capacity(&lease, permit, move || {
+            let file = std::fs::File::open(source)?;
+            let _ = opened_tx.send(());
+            finish_rx.recv_timeout(std::time::Duration::from_secs(5))?;
+            let metadata = file.metadata()?;
+            Ok((file, metadata))
+        })
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), opened_rx)
+        .await
+        .expect("worker opened fixture")
+        .expect("worker signal");
+    caller.abort();
+    assert!(caller.await.expect_err("cancelled RPC").is_cancelled());
+    assert_eq!(slots.available_permits(), 0);
+    assert!(slots.clone().try_acquire_owned().is_err());
+    finish_tx.send(()).expect("finish uncancellable worker");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while slots.available_permits() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("worker completion restores capacity");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn missing_service_user_authority_blocks_user_paths_but_keeps_state_queryable() {
     let (state, root) = fixture();
     let peer = peer(&state).await;

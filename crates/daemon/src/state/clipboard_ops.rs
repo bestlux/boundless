@@ -3,6 +3,28 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::*;
 
+// A started blocking operation cannot be cancelled with its awaiting RPC.
+// Keep its slot on that worker until the opened handle can take ownership.
+pub(super) async fn open_outbound_source_with_capacity<F>(
+    user_io: &platform_windows::user_io::UserIoLease,
+    handle_permit: tokio::sync::OwnedSemaphorePermit,
+    open: F,
+) -> Result<(
+    std::fs::File,
+    std::fs::Metadata,
+    tokio::sync::OwnedSemaphorePermit,
+)>
+where
+    F: FnOnce() -> Result<(std::fs::File, std::fs::Metadata)> + Send + 'static,
+{
+    user_io
+        .run_sync(move || {
+            let (file, metadata) = open()?;
+            Ok((file, metadata, handle_permit))
+        })
+        .await
+}
+
 pub(crate) struct ReservedIncomingFile {
     pub(crate) sanitized_name: String,
     pub(crate) final_path: PathBuf,
@@ -828,8 +850,8 @@ impl AppState {
         };
         let user_io = self.user_io_lease().await?;
         let open_path = source_path.clone();
-        let (source_file, metadata) = match user_io
-            .run_sync(move || {
+        let (source_file, metadata, handle_permit) =
+            match open_outbound_source_with_capacity(&user_io, handle_permit, move || {
                 let file = std::fs::File::open(&open_path).map_err(|error| {
                     // Windows File::open rejects directories before metadata is
                     // available. Classify this error under the same user token.
@@ -843,17 +865,17 @@ impl AppState {
                 Ok((file, metadata))
             })
             .await
-        {
-            Ok(opened) => opened,
-            Err(error) => {
-                self.record_outgoing_file_transfer_failed(
-                    outgoing_projection(0),
-                    format!("source_unavailable: {error}"),
-                )
-                .await;
-                return Err(error);
-            }
-        };
+            {
+                Ok(opened) => opened,
+                Err(error) => {
+                    self.record_outgoing_file_transfer_failed(
+                        outgoing_projection(0),
+                        format!("source_unavailable: {error}"),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
         if !metadata.is_file() {
             self.record_outgoing_file_transfer_failed(
                 outgoing_projection(metadata.len()),
