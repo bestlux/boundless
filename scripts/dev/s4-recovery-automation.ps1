@@ -27,7 +27,7 @@ $cliExe = Join-Path $repoRoot "target/debug/boundlessctl.exe"
 $captureScript = Join-Path $repoRoot "scripts/dev/multi-display-capture.ps1"
 
 if (-not (Test-Path $cliExe)) {
-    throw "boundlessctl binary not found at $cliExe; run cargo build -p boundlessctl first"
+    throw "boundlessctl binary not found at $cliExe; run cargo build --locked -p boundlessctl first"
 }
 if (-not (Test-Path $captureScript)) {
     throw "capture script not found at $captureScript"

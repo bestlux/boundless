@@ -32,9 +32,15 @@ jobs:
         shell: pwsh
         run: ./scripts/dev/packaging-script-smoke.ps1
 
+      - name: Test functional measurement rejection contracts
+        shell: pwsh
+        run: |
+          ./scripts/dev/functional-validation-fixtures.ps1
+          ./scripts/dev/perf-two-machine-fixtures.ps1
+
       - name: Test CLI daemon status output contract
         shell: pwsh
-        run: cargo test -p boundless-cli commands::tests::daemon_status_output_matches_packaging_fixture
+        run: cargo test --locked -p boundless-cli commands::tests::daemon_status_output_matches_packaging_fixture
 
   windows-installer-integration:
     if: github.event_name == 'pull_request'
@@ -108,7 +114,7 @@ jobs:
       - name: Build Windows candidate binaries
         if: steps.changes.outputs.run_installer == 'true'
         shell: pwsh
-        run: cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector
+        run: cargo build --locked --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector
 
       - name: Package Windows candidate installer
         if: steps.changes.outputs.run_installer == 'true'
@@ -243,7 +249,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace

@@ -12,7 +12,8 @@ param(
     [int]$ReceiveToApplyP95BudgetMs = 8,
     [int]$CaptureToApplyJitterP95BudgetMs = 10,
     [int]$ClockSkewThresholdMs = 500,
-    [bool]$AdjustForClockSkew = $true,
+    [ValidateRange(2, 1000000)]
+    [int]$MinimumSamples = 20,
     [switch]$EnforceBudgets
 )
 
@@ -24,7 +25,7 @@ Set-Location $repoRoot
 $cliExe = Join-Path $repoRoot "target/debug/boundlessctl.exe"
 
 if (-not (Test-Path $cliExe)) {
-    throw "boundlessctl binary not found at $cliExe; run cargo build -p boundless-cli first"
+    throw "boundlessctl binary not found at $cliExe; run cargo build --locked -p boundless-cli first"
 }
 if ($DurationSeconds -le 0) {
     throw "DurationSeconds must be > 0"
@@ -64,10 +65,10 @@ function Invoke-CliUnchecked {
     )
 
     $allArgs = @("--endpoint", $Endpoint) + $CommandArgs
-    $output = & $cliExe @allArgs 2>&1
+    $output = @(& $cliExe @allArgs 2>&1)
     return @{
         ExitCode = $LASTEXITCODE
-        Output = [string]$output
+        Output = ($output | ForEach-Object { $_.ToString() }) -join "`n"
     }
 }
 
@@ -80,101 +81,7 @@ function Parse-CaptureTarget {
     return "unknown"
 }
 
-function Get-MetricValue {
-    param(
-        [string]$Line,
-        [string]$MetricName
-    )
-    $match = [regex]::Match($Line, "$MetricName=([0-9]+)")
-    if (-not $match.Success) {
-        return $null
-    }
-    return [int]$match.Groups[1].Value
-}
-
-function Get-Percentile {
-    param(
-        [int[]]$Values,
-        [double]$Percentile
-    )
-    if ($null -eq $Values -or $Values.Count -eq 0) {
-        return $null
-    }
-    $sorted = $Values | Sort-Object
-    $rank = [Math]::Ceiling(($Percentile / 100.0) * $sorted.Count)
-    $index = [Math]::Max(0, [Math]::Min($sorted.Count - 1, $rank - 1))
-    return [int]$sorted[$index]
-}
-
-function Get-JitterP95 {
-    param([int[]]$Series)
-    if ($null -eq $Series -or $Series.Count -lt 2) {
-        return $null
-    }
-
-    $deltas = New-Object System.Collections.Generic.List[int]
-    for ($i = 1; $i -lt $Series.Count; $i++) {
-        $deltas.Add([Math]::Abs($Series[$i] - $Series[$i - 1]))
-    }
-    return Get-Percentile -Values $deltas.ToArray() -Percentile 95
-}
-
-function Summarize-Metrics {
-    param(
-        [string]$Label,
-        [System.Collections.Generic.List[int]]$CaptureToApply,
-        [System.Collections.Generic.List[int]]$CaptureToReceive,
-        [System.Collections.Generic.List[int]]$ReceiveToApply,
-        [int]$ClockSkewThresholdMs
-    )
-
-    $applyValues = $CaptureToApply.ToArray()
-    $receiveValues = $CaptureToReceive.ToArray()
-    $receiveToApplyValues = $ReceiveToApply.ToArray()
-    $applyP50 = Get-Percentile -Values $applyValues -Percentile 50
-    $applyP95 = Get-Percentile -Values $applyValues -Percentile 95
-    $applyP99 = Get-Percentile -Values $applyValues -Percentile 99
-    $receiveP50 = Get-Percentile -Values $receiveValues -Percentile 50
-    $receiveP95 = Get-Percentile -Values $receiveValues -Percentile 95
-    $receiveP99 = Get-Percentile -Values $receiveValues -Percentile 99
-    $receiveToApplyP50 = Get-Percentile -Values $receiveToApplyValues -Percentile 50
-    $receiveToApplyP95 = Get-Percentile -Values $receiveToApplyValues -Percentile 95
-    $receiveToApplyP99 = Get-Percentile -Values $receiveToApplyValues -Percentile 99
-    $receiveToApplyJitterP95 = Get-JitterP95 -Series $receiveToApplyValues
-    $applyJitterP95 = Get-JitterP95 -Series $applyValues
-    $applyMax = if ($applyValues.Count -gt 0) { ($applyValues | Measure-Object -Maximum).Maximum } else { $null }
-    $receiveMax = if ($receiveValues.Count -gt 0) { ($receiveValues | Measure-Object -Maximum).Maximum } else { $null }
-    $receiveToApplyMax = if ($receiveToApplyValues.Count -gt 0) { ($receiveToApplyValues | Measure-Object -Maximum).Maximum } else { $null }
-    $estimatedClockSkewMs = $null
-    if ($null -ne $applyP50 -and $null -ne $receiveToApplyP50) {
-        $delta = $applyP50 - $receiveToApplyP50
-        if ($delta -ge $ClockSkewThresholdMs) {
-            $estimatedClockSkewMs = $delta
-        }
-    }
-
-    return @{
-        Label = $Label
-        CaptureToApplyCount = $applyValues.Count
-        CaptureToReceiveCount = $receiveValues.Count
-        ReceiveToApplyCount = $receiveToApplyValues.Count
-        CaptureToApplyP50 = $applyP50
-        CaptureToApplyP95 = $applyP95
-        CaptureToApplyP99 = $applyP99
-        CaptureToApplyMax = $applyMax
-        CaptureToApplyJitterP95 = $applyJitterP95
-        CaptureToReceiveP50 = $receiveP50
-        CaptureToReceiveP95 = $receiveP95
-        CaptureToReceiveP99 = $receiveP99
-        CaptureToReceiveMax = $receiveMax
-        ReceiveToApplyP50 = $receiveToApplyP50
-        ReceiveToApplyP95 = $receiveToApplyP95
-        ReceiveToApplyP99 = $receiveToApplyP99
-        ReceiveToApplyMax = $receiveToApplyMax
-        ReceiveToApplyJitterP95 = $receiveToApplyJitterP95
-        EstimatedClockSkewMs = $estimatedClockSkewMs
-    }
-}
+. (Join-Path $PSScriptRoot "input-trace-contract.ps1")
 
 $targets = @(
     @{ Endpoint = $EndpointA; Label = $LabelA }
@@ -217,6 +124,14 @@ foreach ($target in $targets) {
         Write-TraceLine "snapshot label=$($target.Label) input_status=$(($inputStatus.Output -replace '\r?\n',' | ').Trim())"
     }
 
+    # Existing history is diagnostic context, not a sample from this measurement window.
+    $baseline = Invoke-CliUnchecked -Endpoint $target.Endpoint -CommandArgs @("transport", "events", "--limit", "$EventsLimit")
+    if ($baseline.ExitCode -ne 0 -and $EnforceBudgets) {
+        throw "Cannot establish fresh event baseline for $($target.Label)"
+    }
+    foreach ($line in ($baseline.Output -split "`r?`n")) {
+        $seenEvents["$($target.Label)|$line"] = $true
+    }
     $layout = Invoke-CliUnchecked -Endpoint $target.Endpoint -CommandArgs @("layout", "show")
     if ($layout.ExitCode -eq 0) {
         Write-TraceLine "snapshot label=$($target.Label) layout_show=$(($layout.Output -replace '\r?\n',' | ').Trim())"
@@ -351,41 +266,11 @@ foreach ($target in $targets) {
     )
 
     if ($EnforceBudgets) {
-        $applyMetricName = "capture_to_apply_p95"
-        $effectiveApplyP95 = $summary.CaptureToApplyP95
-        $receiveMetricName = "capture_to_receive_p95"
-        $effectiveReceiveP95 = $summary.CaptureToReceiveP95
-        $jitterMetricName = "capture_to_apply_jitter_p95"
-        $effectiveJitterP95 = $summary.CaptureToApplyJitterP95
-        if ($AdjustForClockSkew -and $null -ne $summary.EstimatedClockSkewMs) {
-            Write-TraceLine "clock_skew_detected label=$label estimated_ms=$($summary.EstimatedClockSkewMs) apply_p95_raw=$($summary.CaptureToApplyP95) receive_to_apply_p95=$($summary.ReceiveToApplyP95) capture_to_receive_p95_raw=$($summary.CaptureToReceiveP95) jitter_raw=$($summary.CaptureToApplyJitterP95) receive_to_apply_jitter_p95=$($summary.ReceiveToApplyJitterP95)"
-            if ($null -ne $summary.ReceiveToApplyP95) {
-                $applyMetricName = "receive_to_apply_p95 (clock-skew-adjusted)"
-                $effectiveApplyP95 = $summary.ReceiveToApplyP95
-            }
-            $receiveMetricName = "capture_to_receive_p95 (skipped: clock-skew-suspected)"
-            $effectiveReceiveP95 = $null
-            if ($null -ne $summary.ReceiveToApplyJitterP95) {
-                $jitterMetricName = "receive_to_apply_jitter_p95 (clock-skew-adjusted)"
-                $effectiveJitterP95 = $summary.ReceiveToApplyJitterP95
-            }
-        }
-
-        if ($null -ne $effectiveApplyP95 -and $effectiveApplyP95 -gt $CaptureToApplyP95BudgetMs) {
-            throw "$applyMetricName budget exceeded for ${label}: actual=${effectiveApplyP95}ms budget=${CaptureToApplyP95BudgetMs}ms"
-        }
-        if ($null -ne $effectiveReceiveP95 -and $effectiveReceiveP95 -gt $CaptureToReceiveP95BudgetMs) {
-            throw "$receiveMetricName budget exceeded for ${label}: actual=${effectiveReceiveP95}ms budget=${CaptureToReceiveP95BudgetMs}ms"
-        }
-        if ($null -eq $summary.ReceiveToApplyP95) {
-            throw "receive_to_apply_p95 missing for ${label}"
-        }
-        if ($summary.ReceiveToApplyP95 -gt $ReceiveToApplyP95BudgetMs) {
-            throw "receive_to_apply_p95 budget exceeded for ${label}: actual=$($summary.ReceiveToApplyP95)ms budget=${ReceiveToApplyP95BudgetMs}ms"
-        }
-        if ($null -ne $effectiveJitterP95 -and $effectiveJitterP95 -gt $CaptureToApplyJitterP95BudgetMs) {
-            throw "$jitterMetricName budget exceeded for ${label}: actual=${effectiveJitterP95}ms budget=${CaptureToApplyJitterP95BudgetMs}ms"
-        }
+        Assert-InputTraceBudgets -Summary $summary -MinimumSamples $MinimumSamples `
+            -CaptureToApplyP95BudgetMs $CaptureToApplyP95BudgetMs `
+            -CaptureToReceiveP95BudgetMs $CaptureToReceiveP95BudgetMs `
+            -ReceiveToApplyP95BudgetMs $ReceiveToApplyP95BudgetMs `
+            -CaptureToApplyJitterP95BudgetMs $CaptureToApplyJitterP95BudgetMs
     }
 }
 

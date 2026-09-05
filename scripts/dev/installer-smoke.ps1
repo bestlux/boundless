@@ -957,9 +957,9 @@ if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
 
     Push-Location $repoRoot
     try {
-        & cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector
+        & cargo build --locked --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector
         if ($LASTEXITCODE -ne 0) {
-            throw "cargo build --release failed with exit code $LASTEXITCODE"
+            throw "cargo build --locked --release failed with exit code $LASTEXITCODE"
         }
 
         $InstallerPath = Join-Path $OutputRoot ("Boundless-$Version-windows-x64.msi")

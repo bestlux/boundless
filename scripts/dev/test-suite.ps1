@@ -7,6 +7,8 @@ param(
     [int]$TraceCaptureToApplyP95BudgetMs = 45,
     [int]$TraceCaptureToReceiveP95BudgetMs = 20,
     [int]$TraceCaptureToApplyJitterP95BudgetMs = 18,
+    [ValidateRange(2, 1000000)]
+    [int]$TraceMinimumSamples = 20,
     [switch]$TraceEnforceBudgets,
     [string]$TraceOutputPath = "",
     [string]$TraceMatrixCsvPath = "",
@@ -55,14 +57,17 @@ function Invoke-CheckedCommand {
 }
 
 function Run-WorkspaceQualityChecks {
+    Invoke-CheckedCommand -Label 'functional measurement contracts' -Action {
+        & (Join-Path $repoRoot 'scripts/dev/functional-validation-fixtures.ps1')
+    }
     Invoke-CheckedCommand -Label "cargo fmt --all -- --check" -CheckLastExitCode -Action {
         cargo fmt --all -- --check | Out-Host
     }
-    Invoke-CheckedCommand -Label "cargo test --workspace" -CheckLastExitCode -Action {
-        cargo test --workspace | Out-Host
+    Invoke-CheckedCommand -Label "cargo test --locked --workspace" -CheckLastExitCode -Action {
+        cargo test --locked --workspace | Out-Host
     }
-    Invoke-CheckedCommand -Label "cargo clippy --workspace --all-targets -- -D warnings" -CheckLastExitCode -Action {
-        cargo clippy --workspace --all-targets -- -D warnings | Out-Host
+    Invoke-CheckedCommand -Label "cargo clippy --locked --workspace --all-targets -- -D warnings" -CheckLastExitCode -Action {
+        cargo clippy --locked --workspace --all-targets -- -D warnings | Out-Host
     }
 }
 
@@ -109,6 +114,7 @@ function Run-TraceCapture {
         CaptureToApplyP95BudgetMs = $TraceCaptureToApplyP95BudgetMs
         CaptureToReceiveP95BudgetMs = $TraceCaptureToReceiveP95BudgetMs
         CaptureToApplyJitterP95BudgetMs = $TraceCaptureToApplyJitterP95BudgetMs
+        MinimumSamples = $TraceMinimumSamples
     }
     if ($TraceEnforceBudgets) {
         $commandParams.EnforceBudgets = $true

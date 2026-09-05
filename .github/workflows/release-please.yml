@@ -1,4 +1,9 @@
-name: Release
+name: Release Preview
+
+# This lane validates builds and installers, not physical desktop acceptance.
+# A numeric tag does not promote these artifacts to stable/public-ready status.
+env:
+  RELEASE_CHANNEL: preview
 
 on:
   push:
@@ -75,6 +80,12 @@ jobs:
             echo "source_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Describe release evidence scope
+        run: |
+          echo '### Preview release' >> "$GITHUB_STEP_SUMMARY"
+          echo 'This workflow publishes prereleases only. Build, unit, and MSI evidence does not certify physical two-PC input, clipboard, recovery, or endurance.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Stable promotion requires a separate claim-scoped review of the exact installed artifacts and physical desktop evidence. Signing remains governed by WINDOWS_SIGN_REQUIRED.' >> "$GITHUB_STEP_SUMMARY"
+
   build-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -106,7 +117,7 @@ jobs:
 
       - name: Build Linux binaries
         working-directory: source
-        run: cargo build --release -p boundless-daemon -p boundless-cli
+        run: cargo build --locked --release -p boundless-daemon -p boundless-cli
 
       - name: Package Linux release
         id: package
@@ -162,7 +173,7 @@ jobs:
       - name: Test CLI daemon status output contract
         working-directory: source
         shell: pwsh
-        run: cargo test -p boundless-cli commands::tests::daemon_status_output_matches_packaging_fixture
+        run: cargo test --locked -p boundless-cli commands::tests::daemon_status_output_matches_packaging_fixture
 
   build-windows:
     runs-on: windows-latest
@@ -199,7 +210,7 @@ jobs:
       - name: Build Windows binaries
         working-directory: source
         shell: pwsh
-        run: cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector
+        run: cargo build --locked --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector
 
       - name: Sign Windows binaries
         working-directory: source
@@ -496,17 +507,11 @@ jobs:
               echo "Release $tag already exists and is published; refusing to overwrite it." >&2
               exit 1
             fi
-            edit_args=(release edit "$tag" --draft --title "$tag" --notes-file release-notes.md --target "$source_ref")
-            if [[ "$tag" == *-* ]]; then
-              edit_args+=(--prerelease)
-            fi
+            edit_args=(release edit "$tag" --draft --prerelease --latest=false --title "$tag" --notes-file release-notes.md --target "$source_ref")
             gh "${edit_args[@]}"
             exit 0
           fi
-          create_args=(release create "$tag" --draft --title "$tag" --target "$source_ref" --notes-file release-notes.md)
-          if [[ "$tag" == *-* ]]; then
-            create_args+=(--prerelease)
-          fi
+          create_args=(release create "$tag" --draft --prerelease --latest=false --title "$tag" --target "$source_ref" --notes-file release-notes.md)
           gh "${create_args[@]}"
 
       - name: Attest Windows installer
@@ -532,18 +537,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
         run: gh release upload "${{ needs.release-context.outputs.tag_name }}" dist/* --clobber
 
-      - name: Publish draft release
+      - name: Publish preview prerelease
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           tag="${{ needs.release-context.outputs.tag_name }}"
-          if [[ "$tag" == *-* ]]; then
-            gh release edit "$tag" --draft=false --prerelease
-          else
-            gh release edit "$tag" --draft=false --latest
-          fi
+          gh release edit "$tag" --draft=false --prerelease --latest=false
 
       - name: Close superseded autorelease pull requests
         env:

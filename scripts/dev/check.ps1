@@ -141,15 +141,12 @@ function Invoke-DocsStatusCheck {
     $missing = New-Object System.Collections.Generic.List[string]
 
     $projectRequired = @(
-        "Current Stable Version",
+        "Release Baseline",
         "Support Posture",
         "Service Mode Boundary",
         "Canonical Release Flow",
         "Known Validation Gaps",
-        "Pro Oversight Item Accounting",
-        "landed",
-        "deferred",
-        "open"
+        "Current Work"
     )
     foreach ($item in Test-DocContains -Path $projectStatusPath -RequiredPatterns $projectRequired) {
         $missing.Add($item)
