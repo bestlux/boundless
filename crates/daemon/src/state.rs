@@ -82,6 +82,7 @@ mod peer_ops;
 mod routing_helpers;
 mod transfer_center_ops;
 mod transport_ops;
+pub(crate) use transport_ops::TransportSessionRegistrationGuard;
 mod transport_state;
 mod validation;
 
@@ -313,7 +314,8 @@ pub struct AppState {
     pairing: Arc<PairingState>,
     transport: Arc<TransportState>,
     paired_testing: Arc<paired_testing::PairedTestingState>,
-    transport_session_transition: Arc<Mutex<()>>,
+    transport_session_transitions:
+        Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>,
     discovery: Arc<DiscoveryState>,
     input: Arc<InputState>,
     input_broker: Arc<InputBrokerRelay>,

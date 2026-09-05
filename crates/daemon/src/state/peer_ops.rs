@@ -157,31 +157,21 @@ impl AppState {
     }
 
     pub async fn set_peer_connected(&self, peer_id: &str, connected: bool) -> Result<()> {
-        let (peer_found, transitioned_to_connected) = self
-            .mutate_config_and_save(|config| {
-                let mut peer_found = false;
-                let mut transitioned_to_connected = false;
-                let mut should_save = false;
-
-                if let Some(peer_index) = config.peers.iter().position(|p| p.peer_id == peer_id) {
-                    let previous_connected = config.peers[peer_index].connected;
-                    transitioned_to_connected = !previous_connected && connected;
-                    peer_found = true;
-
-                    if previous_connected || connected {
-                        config.peers[peer_index].connected = connected;
-                        config.peers[peer_index].last_seen = Utc::now();
-                        should_save = true;
-                    }
-                }
-
-                Ok(((peer_found, transitioned_to_connected), should_save))
-            })
-            .await?;
-
-        if !peer_found {
-            return Ok(());
-        }
+        let transitioned = {
+            let mut config = self.config.write().await;
+            let Some(peer) = config.peers.iter_mut().find(|peer| peer.peer_id == peer_id) else {
+                return Ok(());
+            };
+            let transitioned = peer.connected != connected;
+            if !transitioned && connected {
+                return Ok(());
+            }
+            if transitioned {
+                peer.connected = connected;
+                peer.last_seen = Utc::now();
+            }
+            transitioned
+        };
 
         if !connected {
             let mut authorization = self.input.control.authorization.write().await;
@@ -192,9 +182,11 @@ impl AppState {
                 self.notify_input_owner_transition();
             }
             let mut capture_target = self.input.control.capture_target_peer_id.write().await;
-            if capture_target.as_deref() == Some(peer_id) {
+            let capture_released = capture_target.as_deref() == Some(peer_id);
+            if capture_released {
                 *capture_target = None;
             }
+            drop(capture_target);
             self.clear_pending_inject_input_frames_for_peer(peer_id)
                 .await;
             self.clear_pending_clipboard_replay_for_peer(peer_id).await;
@@ -203,8 +195,10 @@ impl AppState {
             self.fail_outbound_file_transfers_for_peer(peer_id, "peer_disconnected")
                 .await;
             self.clear_remote_anti_idle_peer(peer_id).await;
-            self.notify_input_capture_wake("peer_disconnected");
-        } else if transitioned_to_connected
+            if transitioned || capture_released {
+                self.notify_input_capture_wake("peer_disconnected");
+            }
+        } else if transitioned
             && !self
                 .has_current_clipboard_replay_delivery_pending_for_peer(peer_id)
                 .await
@@ -215,11 +209,13 @@ impl AppState {
             self.notify_outgoing_flush_signal();
         }
 
-        self.notify_peer_reconcile_wake(if connected {
-            "peer_connected"
-        } else {
-            "peer_disconnected"
-        });
+        if transitioned {
+            self.notify_peer_reconcile_wake(if connected {
+                "peer_connected"
+            } else {
+                "peer_disconnected"
+            });
+        }
 
         Ok(())
     }

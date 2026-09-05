@@ -13,24 +13,16 @@ fn config_save_lock() -> &'static Mutex<()> {
     CONFIG_SAVE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn preserve_in_memory_peer_touches(
+fn preserve_in_memory_peer_state(
     base: &RuntimeConfig,
     current: &RuntimeConfig,
     candidate: &mut RuntimeConfig,
 ) {
     for current_peer in &current.peers {
-        let Some(base_peer) = base
+        if !base
             .peers
             .iter()
-            .find(|peer| peer.peer_id == current_peer.peer_id)
-        else {
-            continue;
-        };
-
-        if current_peer.display_name != base_peer.display_name
-            || current_peer.address != base_peer.address
-            || current_peer.connected != base_peer.connected
-            || current_peer.last_seen <= base_peer.last_seen
+            .any(|peer| peer.peer_id == current_peer.peer_id)
         {
             continue;
         }
@@ -39,8 +31,8 @@ fn preserve_in_memory_peer_touches(
             .peers
             .iter_mut()
             .find(|peer| peer.peer_id == current_peer.peer_id)
-            && current_peer.last_seen > candidate_peer.last_seen
         {
+            candidate_peer.connected = current_peer.connected;
             candidate_peer.last_seen = current_peer.last_seen;
         }
     }
@@ -61,7 +53,7 @@ impl AppState {
         if should_save {
             self.save_config_snapshot(candidate.clone()).await?;
             let mut config = self.config.write().await;
-            preserve_in_memory_peer_touches(&base, &config, &mut candidate);
+            preserve_in_memory_peer_state(&base, &config, &mut candidate);
             *config = candidate;
         }
 

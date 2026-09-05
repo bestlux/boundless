@@ -53,7 +53,7 @@ impl AppState {
             pairing: Arc::new(PairingState::default()),
             transport: Arc::new(TransportState::default()),
             paired_testing: Arc::new(paired_testing::PairedTestingState::default()),
-            transport_session_transition: Arc::new(Mutex::new(())),
+            transport_session_transitions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             discovery: Arc::new(DiscoveryState::default()),
             input: Arc::new(InputState::new(input_enabled)),
             input_broker: Arc::new(InputBrokerRelay::default()),
@@ -154,30 +154,41 @@ impl AppState {
             },
         )?;
 
-        self.mutate_config_and_save(|config| {
-            self.ensure_trust_rotation_not_pending()?;
-            if let Some(peer) = config
-                .peers
-                .iter_mut()
-                .find(|p| p.peer_id == machine_id.as_str())
-            {
-                peer.address = normalized_address;
-                peer.display_name = alias.unwrap_or(display_name);
-                peer.connected = false;
-                peer.last_seen = Utc::now();
-            } else {
-                config.peers.push(PeerConfig {
-                    peer_id: machine_id,
-                    display_name: alias.unwrap_or(display_name),
-                    address: normalized_address,
-                    connected: false,
-                    last_seen: Utc::now(),
-                });
-            }
+        let reconnect_peer_id = machine_id.clone();
+        let replaced = self
+            .mutate_config_and_save(|config| {
+                self.ensure_trust_rotation_not_pending()?;
+                let replaced = if let Some(peer) = config
+                    .peers
+                    .iter_mut()
+                    .find(|p| p.peer_id == machine_id.as_str())
+                {
+                    peer.address = normalized_address;
+                    peer.display_name = alias.unwrap_or(display_name);
+                    true
+                } else {
+                    config.peers.push(PeerConfig {
+                        peer_id: machine_id,
+                        display_name: alias.unwrap_or(display_name),
+                        address: normalized_address,
+                        connected: false,
+                        last_seen: Utc::now(),
+                    });
+                    false
+                };
 
-            Ok(((), true))
-        })
-        .await
+                Ok((replaced, true))
+            })
+            .await?;
+        // Trust changes belong to durable state, but an existing authenticated
+        // route must end through runtime ownership and input-release paths.
+        if replaced {
+            self.request_peer_reconnect_and_reset(&reconnect_peer_id)
+                .await?;
+        } else {
+            self.notify_peer_reconcile_wake("peer_trust_imported");
+        }
+        Ok(())
     }
 
     pub async fn snapshot(&self) -> RuntimeConfig {

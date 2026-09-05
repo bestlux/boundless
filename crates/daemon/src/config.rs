@@ -14,7 +14,7 @@ use core_security::atomic_write_file;
 use core_transfer::MAX_TRANSFER_BYTES;
 
 const DEFAULT_LAYOUT_MATRIX: &str = "self";
-const RUNTIME_CONFIG_VERSION: &str = "5";
+const RUNTIME_CONFIG_VERSION: &str = "6";
 const MIGRATABLE_PROTOCOL_VERSIONS: &[&str] = &["4.1.0", "4.2.0", "4.3.0", "4.4.0"];
 const DEFAULT_ANTI_IDLE_RECENT_ACTIVITY_WINDOW_SECS: u32 = 300;
 const DEFAULT_ANTI_IDLE_PULSE_INTERVAL_SECS: u32 = 30;
@@ -25,7 +25,10 @@ pub struct PeerConfig {
     pub peer_id: String,
     pub display_name: String,
     pub address: String,
+    // Runtime observations are neither persisted nor restored from old files.
+    #[serde(skip)]
     pub connected: bool,
+    #[serde(skip)]
     pub last_seen: DateTime<Utc>,
 }
 
@@ -315,7 +318,7 @@ pub fn load_or_create_config_at(path: &Path) -> Result<RuntimeConfig> {
 
     if config.config_version != RUNTIME_CONFIG_VERSION {
         bail!(
-            "unsupported config version `{}`; expected `{}`. remove `{}` to regenerate config for this build",
+            "unsupported config version `{}`; expected `{}`. use a compatible build or restore a pre-upgrade configuration backup for `{}`",
             config.config_version,
             RUNTIME_CONFIG_VERSION,
             path.display()
@@ -324,7 +327,7 @@ pub fn load_or_create_config_at(path: &Path) -> Result<RuntimeConfig> {
 
     if config.protocol_version != PROTOCOL_CURRENT.to_string() {
         bail!(
-            "unsupported protocol version `{}` in config; expected `{}`. remove `{}` to regenerate config for this build",
+            "unsupported protocol version `{}` in config; expected `{}`. use a compatible build or restore a pre-upgrade configuration backup for `{}`",
             config.protocol_version,
             PROTOCOL_CURRENT,
             path.display()
@@ -414,8 +417,26 @@ fn migrate_config_value(path: &Path, value: &mut serde_json::Value) -> Result<()
     };
 
     match config_version {
-        RUNTIME_CONFIG_VERSION => {
-            let mut changed = false;
+        RUNTIME_CONFIG_VERSION | "5" => {
+            let mut changed = config_version != RUNTIME_CONFIG_VERSION;
+            if changed {
+                object.insert(
+                    "config_version".to_string(),
+                    serde_json::Value::String(RUNTIME_CONFIG_VERSION.to_string()),
+                );
+            }
+            if let Some(peers) = object
+                .get_mut("peers")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for peer in peers
+                    .iter_mut()
+                    .filter_map(serde_json::Value::as_object_mut)
+                {
+                    changed |= peer.remove("connected").is_some();
+                    changed |= peer.remove("last_seen").is_some();
+                }
+            }
             if !object.contains_key("anti_idle") {
                 object.insert(
                     "anti_idle".to_string(),
@@ -529,7 +550,7 @@ fn migrate_config_value(path: &Path, value: &mut serde_json::Value) -> Result<()
             Ok(())
         }
         other => bail!(
-            "unsupported config version `{}`; expected `{}`. remove `{}` to regenerate config for this build",
+            "unsupported config version `{}`; expected `{}`. use a compatible build or restore a pre-upgrade configuration backup for `{}`",
             other,
             RUNTIME_CONFIG_VERSION,
             path.display()
@@ -636,7 +657,9 @@ mod tests {
             "unexpected error: {error:#}"
         );
         assert!(
-            error.to_string().contains("regenerate config"),
+            error
+                .to_string()
+                .contains("pre-upgrade configuration backup"),
             "unexpected error: {error:#}"
         );
 
@@ -855,7 +878,7 @@ mod tests {
         .expect("seed config");
 
         let config = load_or_create_config_at(&path).expect("migrate config");
-        assert_eq!(config.config_version, "5");
+        assert_eq!(config.config_version, "6");
         assert_eq!(config.anti_idle, AntiIdleConfig::default());
         assert_eq!(config.input_handoff, InputHandoffConfig::default());
 
@@ -904,7 +927,7 @@ mod tests {
         .expect("write seeded config");
 
         let config = load_or_create_config_at(&path).expect("migrate v4 config");
-        assert_eq!(config.config_version, "5");
+        assert_eq!(config.config_version, "6");
         assert!(!config.anti_idle.enabled);
         assert_eq!(config.anti_idle.recent_activity_window_secs, 900);
         assert!(config.anti_idle.allow_on_battery);

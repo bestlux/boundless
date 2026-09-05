@@ -82,6 +82,8 @@ async fn set_peer_connected_does_not_persist_already_disconnected_peer() {
         .expect("join");
 
     let before = std::fs::read_to_string(&config_path).expect("read before");
+    let reconcile = state.peer_reconcile_wake_signal();
+    let _ = reconcile.take_pending();
     state
         .set_peer_connected(&peer_id, false)
         .await
@@ -91,6 +93,10 @@ async fn set_peer_connected_does_not_persist_already_disconnected_peer() {
     assert_eq!(
         before, after,
         "already-disconnected retry should not rewrite config"
+    );
+    assert!(
+        !reconcile.take_pending(),
+        "unchanged connection must not wake its retry supervisor"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -233,7 +239,7 @@ async fn input_capture_target_requires_known_peer() {
 }
 
 #[tokio::test]
-async fn set_peer_connected_rolls_back_in_memory_state_when_config_save_fails() {
+async fn peer_runtime_transitions_and_input_release_survive_unwritable_config() {
     let root = std::env::temp_dir().join(format!(
         "boundless-peer-connect-save-fail-test-{}",
         uuid::Uuid::new_v4()
@@ -257,23 +263,26 @@ async fn set_peer_connected_rolls_back_in_memory_state_when_config_save_fails() 
     std::fs::create_dir_all(&blocked_path).expect("create blocked path directory");
     *std::sync::Arc::make_mut(&mut state.config_path) = blocked_path;
 
-    let error = state
+    state
         .set_peer_connected(&peer_id, true)
         .await
-        .expect_err("save failure should bubble up");
-    assert!(
-        error.to_string().contains("write"),
-        "unexpected error: {error:#}"
-    );
-
-    let peer = state
-        .get_peer(&peer_id)
+        .expect("runtime connection does not write configuration");
+    assert!(state.get_peer(&peer_id).await.unwrap().connected);
+    state
+        .claim_input_owner(&peer_id, false)
         .await
-        .expect("peer must still exist");
-    assert!(
-        !peer.connected,
-        "failed persistence must not leave the in-memory peer marked connected"
-    );
+        .expect("claim owner");
+    state
+        .set_input_capture_target(Some(&peer_id))
+        .await
+        .expect("capture target");
+    state
+        .set_peer_connected(&peer_id, false)
+        .await
+        .expect("disconnect must fail open even when disk is unwritable");
+    assert!(!state.get_peer(&peer_id).await.unwrap().connected);
+    assert!(state.input_owner().await.is_none());
+    assert!(state.input_capture_target().await.is_none());
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -862,4 +871,139 @@ async fn request_all_peers_reconnect_and_reset_clears_shared_input_state() {
     assert!(join_error_two.is_cancelled());
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn legacy_connected_config_is_not_restored_or_repersisted() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-volatile-peer-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let path = root.join("config.json");
+    let state =
+        AppState::load_or_create_with_paths(path.clone(), root.join("security")).expect("state");
+    let remote = AppState::load_or_create_with_paths(
+        root.join("remote/config.json"),
+        root.join("remote/security"),
+    )
+    .expect("remote state");
+    let mut bundle = remote.export_trust_bundle().await.expect("remote trust");
+    bundle.network_address = "127.0.0.1:15100".into();
+    let peer = bundle.machine_id.clone();
+    state
+        .import_trust_bundle(bundle, Some("retained peer".into()))
+        .await
+        .expect("import peer trust");
+    let original_trust = state.trusted_records().await.expect("trust");
+    state
+        .set_feature("share_clipboard".into(), false)
+        .await
+        .expect("custom feature");
+    state
+        .set_layout_and_queue_sync(format!("self,{peer}"))
+        .await
+        .expect("custom layout");
+    let original = std::fs::read(&path).expect("config");
+    state
+        .set_peer_connected(&peer, true)
+        .await
+        .expect("connected");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        original,
+        "runtime transitions must not write settings"
+    );
+    let mut legacy: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    legacy["config_version"] = serde_json::json!("5");
+    legacy["peers"][0]["connected"] = serde_json::json!(true);
+    legacy["peers"][0]["last_seen"] = serde_json::json!("2099-01-01T00:00:00Z");
+    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let reloaded =
+        AppState::load_or_create_with_paths(path.clone(), root.join("security")).unwrap();
+    let old_snapshot = state.snapshot().await;
+    let new_snapshot = reloaded.snapshot().await;
+    assert_eq!(new_snapshot.config_version, "6");
+    assert_eq!(old_snapshot.machine_id, new_snapshot.machine_id);
+    assert_eq!(old_snapshot.peers[0].address, new_snapshot.peers[0].address);
+    assert_eq!(old_snapshot.peers[0].peer_id, new_snapshot.peers[0].peer_id);
+    assert_eq!(old_snapshot.layout_matrix, new_snapshot.layout_matrix);
+    assert_eq!(old_snapshot.features, new_snapshot.features);
+    assert_eq!(
+        state.identity().device_cert_pem,
+        reloaded.identity().device_cert_pem
+    );
+    let reloaded_trust = reloaded.trusted_records().await.expect("reloaded trust");
+    assert_eq!(original_trust.len(), reloaded_trust.len());
+    for original in original_trust {
+        assert!(reloaded_trust.iter().any(|record| {
+            record.machine_id == original.machine_id
+                && record.ca_cert_pem == original.ca_cert_pem
+                && (record.machine_id != peer || record.added_at == original.added_at)
+        }));
+    }
+    assert!(!reloaded.get_peer(&peer).await.unwrap().connected);
+    assert!(reloaded.get_peer(&peer).await.unwrap().last_seen < chrono::Utc::now());
+    reloaded
+        .update_bind("127.0.0.1:50052".into())
+        .await
+        .expect("save settings");
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(saved["peers"][0].get("connected").is_none());
+    assert!(saved["peers"][0].get("last_seen").is_none());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn reimported_trust_resets_runtime_ownership_after_durable_save() {
+    let root = std::env::temp_dir().join(format!(
+        "boundless-reimport-runtime-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let state =
+        AppState::load_or_create_with_paths(root.join("config.json"), root.join("security"))
+            .expect("state");
+    let remote = AppState::load_or_create_with_paths(
+        root.join("remote/config.json"),
+        root.join("remote/security"),
+    )
+    .expect("remote");
+    let mut bundle = remote.export_trust_bundle().await.expect("trust bundle");
+    bundle.network_address = "127.0.0.1:15100".into();
+    let peer = bundle.machine_id.clone();
+    state
+        .import_trust_bundle(bundle.clone(), None)
+        .await
+        .unwrap();
+    let child = tokio::spawn(std::future::pending::<()>());
+    let session_id = state.register_transport_session_for_peer(&peer, child.abort_handle());
+    state
+        .claim_transport_session(
+            &peer,
+            session_id,
+            true,
+            Arc::new(RuntimeWakeSignal::default()),
+        )
+        .await;
+    state.set_peer_connected(&peer, true).await.unwrap();
+    state.claim_input_owner(&peer, false).await.unwrap();
+    state.set_input_capture_target(Some(&peer)).await.unwrap();
+    state.update_bind("127.0.0.1:50052".into()).await.unwrap();
+    assert!(state.get_peer(&peer).await.unwrap().connected);
+    assert!(state.has_active_transport_session(&peer));
+
+    state
+        .import_trust_bundle(bundle, Some("updated".into()))
+        .await
+        .unwrap();
+    assert!(
+        child
+            .await
+            .expect_err("old trusted route aborted")
+            .is_cancelled()
+    );
+    assert!(!state.get_peer(&peer).await.unwrap().connected);
+    assert!(!state.has_active_transport_session(&peer));
+    assert!(state.input_owner().await.is_none());
+    assert!(state.input_capture_target().await.is_none());
+    let _ = std::fs::remove_dir_all(root);
 }

@@ -865,6 +865,10 @@ impl TransportRuntimeState {
     }
 
     pub async fn clear_transport_session_registration(&self, session_id: u64) {
+        self.clear_transport_session_registration_now(session_id);
+    }
+
+    pub fn clear_transport_session_registration_now(&self, session_id: u64) {
         let Ok(mut registry) = self.transport_session_registry.lock() else {
             return;
         };
@@ -884,6 +888,20 @@ impl TransportRuntimeState {
         registry
             .active_session_by_peer
             .retain(|_, active| active.session_id != session_id);
+    }
+
+    pub fn transport_session_registration_count(&self) -> usize {
+        self.transport_session_registry
+            .lock()
+            .map(|registry| {
+                registry.pending_abort_handles.len()
+                    + registry
+                        .abort_handles_by_peer
+                        .values()
+                        .map(HashMap::len)
+                        .sum::<usize>()
+            })
+            .unwrap_or_default()
     }
 
     pub async fn abort_transport_sessions_for_peer(&self, peer_id: &str) -> usize {
