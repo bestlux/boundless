@@ -105,9 +105,10 @@ Incoming (peer frame -> local injection):
    drops its local remainder, releases any locally held keys/buttons, and
    acknowledges that ID. A batch is otherwise acknowledged only after every
    frame completes.
-4. The daemon assigns one random delivery epoch for its in-memory relay and
-   retains an in-flight batch under the same ID across replacement or stale
-   re-attach. The tray keeps completed receipts, partial suffix state, and the
+4. The daemon assigns a random delivery epoch for its in-memory relay and
+   retains an in-flight batch under the same ID across stale re-attach only
+   when the transport verifies the same process incarnation (PID, creation
+   time, account SID, and Windows session). The tray keeps completed receipts, partial suffix state, and the
    intended held key/button state across its supervisor sessions, but accepts
    them only when the new attach reports the same epoch. Each injected batch
    also carries the daemon's input-authorization generation. The owner, sharing
@@ -137,6 +138,18 @@ Incoming (peer frame -> local injection):
    discards the uncertain batch, and the daemon quarantines the affected peer
    against automatic owner claim until a fresh explicit handoff. A helper crash
    permits direct cleanup only after its per-user/session lane mutex disappears.
+   A replacement process cannot prove any previous receipt. Before touching
+   configuration or queueing peer releases, the daemon clears local lock and
+   capture state. It then revokes incoming ownership, requires a fresh explicit
+   handoff, discards pending and uncertain interactive payload, and rotates the
+   delivery epoch. The daemon remembers acknowledged held keys/buttons and
+   conservatively adds every possibly committed Down from the unacknowledged
+   batch; an unacknowledged Up cannot prove a release. The replacement receives
+   only synthesized Ups until that cleanup is acknowledged. Cleanup bypasses
+   remote-owner validation only inside the relay's private release constructor;
+   it cannot contain peer-supplied Downs, motion, or wheel actions. Each cleanup
+   batch is capped at 256 events and retains normal exact-receipt/backpressure
+   handling. No old payload is restored across the process boundary.
 5. Cooperative shutdown detach carries the tray's latest completed batch ID
    and delivery epoch. Under the capture-transition lock, the daemon validates
    the broker token and epoch, acknowledges that exact batch, and only then
@@ -151,6 +164,12 @@ Incoming (peer frame -> local injection):
    completes local cleanup, re-attaches, submits its receipt, revalidates held
    authority, and restores before resuming payload. A completed exchange with
    no recovery state may still use bounded detach cleanup.
+6. The dashboard's local pause control latches pause and synchronously releases
+   the active hook lock before any control-plane request. The supervisor cancels
+   a stalled exchange, releases held input before detach IPC, discards retained
+   payload through a session reset, and stays paused until explicit resume.
+   Resume is allowed by the UI only after enabling daemon policy succeeds.
+   A failed detach never authorizes resuming the paused payload suffix.
 
 The BND-NEXT-44 candidate changes step 3 only when the user explicitly enables
 administrator-app control. It remains an experimental dogfood capability until
@@ -179,7 +198,8 @@ Clipboard (service mode with broker attached):
 
 - Broker authorization is verified server-side from the actual pipe client:
   at accept time the named-pipe server resolves the client's account SID
-  (`GetNamedPipeClientProcessId` + process token) and Windows session
+  (`GetNamedPipeClientProcessId` + process token), process creation time
+  (`GetProcessTimes` on that process handle), and Windows session
   (`GetNamedPipeClientSessionId`) and attaches them as tonic connect info.
   Attach, exchange, and detach are gated on that verified identity only — no
   client-supplied claim exists on the wire.
@@ -201,8 +221,10 @@ Clipboard (service mode with broker attached):
   every exchange while a key or button remains down; it is never inferred from
   a client-supplied peer identity. Owner, input-sharing policy, or reset changes
   reject the old generation and force local release without restore.
-- The broker adds a per-attachment token, and exchanges with a stale or
-  replaced token are rejected.
+- The broker adds a per-attachment token bound to its verified process
+  incarnation. Missing creation-time evidence, a stale/replaced token, or a
+  different process presenting that token fails closed. A copied token cannot
+  refresh the original process's input lease.
 - Clipboard broker exchange uses the same attachment token and verified-client
   gate as input exchange; clipboard payload contents never authorize broker
   access.
@@ -245,24 +267,40 @@ Clipboard (service mode with broker attached):
 
 ## Known Limits / Follow-Ups
 
+The pure delivery-state benchmark runs without sockets, disk writes, or native
+input. It exercises 64-frame / 192-event batches through exact acknowledgment
+and through uncertain-delivery release recovery:
+
+```powershell
+cargo test -p boundless-daemon broker_delivery_state_benchmark --lib -- --ignored --nocapture
+```
+
+It emits JSON with profile, iterations, and p50/p95/p99 nanoseconds. A local debug
+run on 2026-09-04 (10,000 iterations each) measured p95 of 25.5 microseconds for
+stage/ack and 20.0 microseconds for replacement/release recovery. These are
+in-memory implementation measurements, not end-to-end input-latency budgets;
+compare the same build profile and host, and retain physical latency evidence
+separately.
+
 - Poll-based exchange (8 ms active / 40 ms idle) adds up to one poll interval
   of latency per direction; a streaming exchange is a candidate follow-up if
   two-PC latency evidence warrants it.
-- Pending and in-flight injection queues are intentionally in-memory. Normal
-  detach/replacement/stale-recovery preserves or requeues unacknowledged work,
-  but a hard daemon-process crash is the durability boundary and can lose those
-  frames. A safe reset rotates the delivery epoch before accepting new broker
-  receipts.
-- Delivery dedupe is exact only while the tray supervisor process retains its
-  epoch-scoped receipt. A hard tray crash erases that evidence; the daemon
-  deliberately keeps and replays its unacknowledged in-flight batch on the next
-  attach (at-least-once), so input that completed immediately before the crash
-  can be applied twice. Persisting receipts would be required to close that
-  boundary. The tray's locally injected held-state snapshot is process-local as
-  well: a hard tray/process crash can erase both its intended hold snapshot and
-  any pending exact release suffix before the bounded cleanup loop finishes.
-  Abrupt broker death can also leave keys held on a remote
-  peer until release synthesis runs on the next capture-target transition.
+- Input queues and delivery evidence remain in memory. Same-process transient
+  recovery preserves exact receipts/suffixes; a replacement process deliberately
+  loses uncertain payload and requires fresh handoff. Hard daemon death also
+  loses the conservative held-state evidence. Persisting receipts alone cannot
+  atomically commit Windows input side effects and their acknowledgements.
+- The supervisor runs independently of dashboard rendering on its own thread,
+  but still shares the tray process lifetime. Full separation into a user-session
+  engine remains future work. Hard death can lose platform-native cleanup details
+  (including synthetic modifier/toggle bookkeeping); the new relay release set
+  is conservative logical-input recovery, not a claim of exactly-once native
+  recovery. Keys can remain held until a replacement broker reaches cleanup;
+  outgoing holds depend on daemon release synthesis reaching the previous peer.
+- Local fault tests cover PID reuse, lost receipts, partial sends, stale
+  generations, helper uncertainty, a stalled control call during pause, and
+  config-lock contention during replacement. They do not invoke host input APIs
+  or substitute for physical key-up, elevated-app, and two-PC fault evidence.
 - Real two-PC dogfood evidence is still required before the parity matrix rows
   can move. The implemented one-user unsigned exception does not itself prove
   BND-NEXT-44 and does not upgrade any BND-NEXT-9C secure-desktop, lock-screen,

@@ -22,6 +22,7 @@ pub(super) struct InputAuthorizationState {
     generation: u64,
     owner_last_changed_at: Option<Instant>,
     auto_claim_quarantined_peers: HashSet<String>,
+    explicit_handoff_required: bool,
 }
 
 impl InputAuthorizationState {
@@ -31,6 +32,7 @@ impl InputAuthorizationState {
             generation: generation.max(1),
             owner_last_changed_at: None,
             auto_claim_quarantined_peers: HashSet::new(),
+            explicit_handoff_required: false,
         }
     }
 
@@ -87,13 +89,24 @@ impl InputAuthorizationState {
     pub(super) fn claim_owner_explicit(&mut self, peer_id: &str, force: bool) -> (bool, bool) {
         let outcome = self.claim_owner(peer_id, force);
         if outcome.0 {
+            self.explicit_handoff_required = false;
             self.auto_claim_quarantined_peers.remove(peer_id);
         }
         outcome
     }
 
     pub(super) fn auto_claim_quarantined(&self, peer_id: &str) -> bool {
-        self.auto_claim_quarantined_peers.contains(peer_id)
+        self.explicit_handoff_required || self.auto_claim_quarantined_peers.contains(peer_id)
+    }
+
+    /// A broker process died without a trustworthy side-effect receipt. Stop
+    /// every automatic owner claim until a new explicit remote handoff.
+    pub(super) fn require_explicit_handoff(&mut self) {
+        if let Some(owner) = self.router.owner().map(str::to_string) {
+            self.router.release_owner(&owner);
+        }
+        self.explicit_handoff_required = true;
+        self.record_owner_transition();
     }
 
     pub(super) fn quarantine_auto_claim_peers(

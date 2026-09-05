@@ -854,6 +854,8 @@ fn broker_client_identity(
     verified_client: Option<app_services::commands::VerifiedControlClient>,
 ) -> Option<crate::state::InputBrokerClientIdentity> {
     verified_client.map(|client| crate::state::InputBrokerClientIdentity {
+        process_id: client.process_id,
+        process_creation_time: client.process_creation_time,
         user_sid: client.user_sid,
         session_id: client.session_id,
     })

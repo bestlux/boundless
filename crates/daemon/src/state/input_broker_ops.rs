@@ -1,4 +1,4 @@
-use super::input_broker::{InputBrokerAttachment, InputBrokerRelay};
+use super::input_broker::{InputBrokerAttachment, InputBrokerProcessIdentity, InputBrokerRelay};
 use super::*;
 
 pub(crate) const INPUT_BROKER_INJECT_MAX_FRAMES_PER_EXCHANGE: usize = 64;
@@ -81,8 +81,23 @@ pub struct InputBrokerExchangeObservations {
 /// transport could not verify the caller; broker authorization fails closed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InputBrokerClientIdentity {
+    pub process_id: Option<u32>,
+    pub process_creation_time: Option<u64>,
     pub user_sid: Option<String>,
     pub session_id: Option<u32>,
+}
+
+impl InputBrokerClientIdentity {
+    fn process_identity(&self) -> Option<InputBrokerProcessIdentity> {
+        let process_id = self.process_id.filter(|pid| *pid != 0)?;
+        let creation_time = self.process_creation_time.filter(|time| *time != 0)?;
+        Some(InputBrokerProcessIdentity {
+            process_id,
+            creation_time,
+            user_sid: self.user_sid.clone()?,
+            session_id: self.session_id?,
+        })
+    }
 }
 
 impl AppState {
@@ -146,6 +161,9 @@ impl AppState {
         if user_sid != allowed_user_sid {
             return Some("wrong_user");
         }
+        if client.process_identity().is_none() {
+            return Some("unverified_process_incarnation");
+        }
         None
     }
 
@@ -204,9 +222,37 @@ impl AppState {
         // Serialize replacement with broker exchanges and the capture pass so
         // every pre-replacement Down is ordered before one authoritative Up.
         let _capture_transition = self.input_capture_transition.lock().await;
+        let process = verified_client
+            .as_ref()
+            .and_then(InputBrokerClientIdentity::process_identity)
+            .expect("broker authorization verified process incarnation");
+        let process_replaced = self.input_broker.process_replaced(&process);
         let broker_token = uuid::Uuid::new_v4().to_string();
         let replaced = self.input_broker.attachment().is_some();
         let capture_target = self.input_capture_target().await;
+        // Fail-open state is settled before config access or peer queueing.
+        // Network/persistence availability must never retain local capture.
+        if replaced || process_replaced {
+            let _ = self.input_broker.set_desired_lock_active(false);
+            self.set_input_lock_runtime(false, false).await;
+            self.clear_input_capture_target().await;
+        }
+        let recovery_release_count = if process_replaced {
+            let mut authorization = self.input.control.authorization.write().await;
+            authorization.require_explicit_handoff();
+            self.input
+                .inject
+                .pending_inject_frames
+                .write()
+                .await
+                .clear();
+            let release_count = self.input_broker.reset_replaced_process_delivery();
+            drop(authorization);
+            self.notify_input_owner_transition();
+            release_count
+        } else {
+            0
+        };
         let mut release_event_count = 0usize;
         if replaced {
             let release_events = self.input_broker.release_events_snapshot();
@@ -234,21 +280,13 @@ impl AppState {
             }
             self.input_broker.clear_pressed_state();
             self.requeue_broker_clipboard_inflight().await;
-            // A replacement broker cannot prove whether the previous tray
-            // process exited before reporting a local emergency unlock. End
-            // the outgoing capture at this process boundary so stale daemon
-            // state can never relock the replacement broker. Inject delivery
-            // receipts and incoming owner state remain daemon-owned below.
-            self.clear_input_capture_target().await;
-            let _ = self.input_broker.set_desired_lock_active(false);
         }
-        // Delivery state belongs to the daemon instance, not one broker token.
-        // Preserve the exact in-flight batch ID across replacement/stale
-        // reattach so a surviving tray receipt can acknowledge without
-        // re-injecting an already completed batch.
+        // Only a surviving process may retain a delivery receipt/suffix. A
+        // replacement has a new epoch and release-only recovery work.
         self.input_broker.attach(InputBrokerAttachment {
             broker_token: broker_token.clone(),
             lock_supported,
+            process,
         });
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
@@ -256,7 +294,7 @@ impl AppState {
             kind: "input_broker_attached".to_string(),
             peer_id: "none".to_string(),
             detail: format!(
-                "client_session_id={} lock_supported={lock_supported} replaced_previous={replaced} release_events={release_event_count} broker_version={broker_version}",
+                "client_session_id={} lock_supported={lock_supported} replaced_previous={replaced} process_replaced={process_replaced} recovery_releases={recovery_release_count} release_events={release_event_count} broker_version={broker_version}",
                 verified_client
                     .as_ref()
                     .and_then(|client| client.session_id)
@@ -325,6 +363,15 @@ impl AppState {
         // Order an in-flight captured batch before the final release frame,
         // or detach first so the capture pass observes an empty relay.
         let _capture_transition = self.input_capture_transition.lock().await;
+        if !verified_client
+            .as_ref()
+            .and_then(InputBrokerClientIdentity::process_identity)
+            .is_some_and(|process| self.input_broker.attached_process_matches(&process))
+        {
+            self.record_input_broker_rejection("detach", "wrong_process_incarnation")
+                .await;
+            return false;
+        }
         let capture_target = self.input_capture_target().await;
         let detached = match self.input_broker.acknowledge_and_detach(
             broker_token,
@@ -477,6 +524,10 @@ impl AppState {
         if !self
             .input_broker
             .validate_without_touch(broker_token, Instant::now())
+            || !verified_client
+                .as_ref()
+                .and_then(InputBrokerClientIdentity::process_identity)
+                .is_some_and(|process| self.input_broker.attached_process_matches(&process))
         {
             return ClipboardBrokerExchangeOutcome {
                 accepted: false,
@@ -607,9 +658,13 @@ impl AppState {
             };
         }
         let _capture_transition = self.input_capture_transition.lock().await;
-        if !self
-            .input_broker
-            .validate_and_touch(broker_token, Instant::now())
+        if !verified_client
+            .as_ref()
+            .and_then(InputBrokerClientIdentity::process_identity)
+            .is_some_and(|process| self.input_broker.attached_process_matches(&process))
+            || !self
+                .input_broker
+                .validate_and_touch(broker_token, Instant::now())
         {
             return InputBrokerExchangeOutcome {
                 accepted: false,
@@ -788,7 +843,11 @@ impl AppState {
             };
         }
 
-        let existing_batch = self.input_broker.inflight_inject_batch();
+        let existing_batch = self.input_broker.inflight_inject_batch().or_else(|| {
+            // Generation is validated below for normal work; synthesized Ups
+            // deliberately do not require the failed process's remote owner.
+            self.input_broker.stage_recovery_cleanup(1)
+        });
         let dequeued = if existing_batch.is_none() && !observations.inject_backpressure {
             self.dequeue_pending_inject_input_frames_up_to(
                 INPUT_BROKER_INJECT_MAX_FRAMES_PER_EXCHANGE,
@@ -807,6 +866,7 @@ impl AppState {
             .authorizes_held_generation(observations.held_input_authorization_generation);
         let retained_authorization_changed = existing_batch.as_ref().is_some_and(|batch| {
             !batch.cancelled
+                && !batch.recovery_cleanup
                 && (batch.authorization_generation != authorization.generation()
                     || batch.frames.iter().any(|frame| {
                         !authorization.authorizes_peer_generation(
