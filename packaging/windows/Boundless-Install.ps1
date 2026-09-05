@@ -9379,6 +9379,279 @@ function Invoke-BoundlessLogHandoffFixture {
     }
 }
 
+function Assert-BoundlessLegacyPlainPath {
+    param([string]$Path)
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $cursor = $fullPath
+    while (-not [string]::IsNullOrWhiteSpace($cursor)) {
+        if (Test-Path -LiteralPath $cursor) {
+            $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Legacy migration refuses a reparse point: $cursor"
+            }
+        }
+        $parent = [IO.Path]::GetDirectoryName($cursor)
+        if ($parent -eq $cursor) { break }
+        $cursor = $parent
+    }
+    return $fullPath
+}
+
+function Get-BoundlessLegacyRegistrySnapshot {
+    param([string]$SubKey)
+
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($SubKey)
+    if ($null -eq $key) { return $null }
+    try {
+        if ($key.SubKeyCount -ne 0) {
+            throw "Legacy uninstall registration has unexpected child keys; it was left unchanged."
+        }
+        $values = @(
+            foreach ($name in $key.GetValueNames()) {
+                [pscustomobject]@{
+                    name = $name
+                    kind = $key.GetValueKind($name).ToString()
+                    value = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                }
+            }
+        )
+        return [pscustomobject]@{ sub_key = $SubKey; values = $values }
+    }
+    finally { $key.Dispose() }
+}
+
+function New-BoundlessLegacyInstallPlan {
+    param(
+        [string]$LocalAppDataPath,
+        [string[]]$ShortcutDirectories,
+        [string]$UninstallSubKey,
+        [string]$ExpectedUserSid
+    )
+
+    # Only the normal desktop-user caller may move a legacy user install. This
+    # function never follows a registry InstallLocation or executes old code.
+    $localRoot = Assert-BoundlessLegacyPlainPath -Path $LocalAppDataPath
+    $installRoot = Join-Path $localRoot "Programs\Boundless"
+    $marker = Join-Path $installRoot "Boundless-Install.ps1"
+    $registration = Get-BoundlessLegacyRegistrySnapshot -SubKey $UninstallSubKey
+    if (-not (Test-Path -LiteralPath $marker)) {
+        if ($null -ne $registration) {
+            throw "A custom or incomplete legacy Boundless registration exists. Its files and settings were left unchanged; remove that installation explicitly before continuing."
+        }
+        return $null
+    }
+    if ((Test-IsAdministrator) -or [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne $ExpectedUserSid) {
+        throw "Legacy migration requires the intended desktop user's normal, non-elevated shell."
+    }
+    [void](Assert-BoundlessLegacyPlainPath -Path $installRoot)
+    $owner = (Get-Acl -LiteralPath $installRoot).GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($owner -ne $ExpectedUserSid) {
+        throw "Legacy install ownership does not match the intended desktop user."
+    }
+    foreach ($name in @("Boundless-Install.ps1", "Boundless-Uninstall.ps1", "package-manifest.json", "boundlessd.exe", "boundlessctl.exe", "boundlesstray.exe")) {
+        $path = Assert-BoundlessLegacyPlainPath -Path (Join-Path $installRoot $name)
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ($item.PSIsContainer) { throw "Legacy marker was not a regular file: $path" }
+    }
+    $manifestPath = Join-Path $installRoot "package-manifest.json"
+    if ((Get-Item -LiteralPath $manifestPath).Length -gt 65536) {
+        throw "Legacy package manifest exceeds its supported size."
+    }
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ($manifest.app_id -ne "boundless" -or $manifest.publisher -ne "Boundless" -or $manifest.version -notmatch '^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$') {
+        throw "Legacy package markers do not identify a supported Boundless package."
+    }
+    if ($null -ne $registration) {
+        $properties = @{}
+        foreach ($entry in $registration.values) { $properties[$entry.name] = $entry.value }
+        $expectedUninstall = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $installRoot "Boundless-Uninstall.ps1")
+        if ($properties["DisplayName"] -ne "Boundless" -or $properties["Publisher"] -ne "Boundless" -or
+            -not (Test-WindowsPathEqual -Left ([string]$properties["InstallLocation"]) -Right $installRoot) -or
+            $properties["UninstallString"] -ne $expectedUninstall) {
+            throw "Legacy uninstall registration does not match the recognized install; it was left unchanged."
+        }
+    }
+    $shortcuts = @()
+    $shortcutHashes = @{}
+    $shell = New-Object -ComObject WScript.Shell
+    try {
+        foreach ($directory in $ShortcutDirectories | Select-Object -Unique) {
+            if ([string]::IsNullOrWhiteSpace($directory)) { continue }
+            $shortcutPath = Join-Path $directory "Boundless.lnk"
+            if (-not (Test-Path -LiteralPath $shortcutPath)) { continue }
+            [void](Assert-BoundlessLegacyPlainPath -Path $shortcutPath)
+            $shortcut = $shell.CreateShortcut($shortcutPath)
+            if (Test-WindowsPathEqual -Left $shortcut.TargetPath -Right (Join-Path $installRoot "boundlesstray.exe")) {
+                $shortcuts += $shortcutPath
+                $shortcutHashes[$shortcutPath] = (Get-FileHash -LiteralPath $shortcutPath -Algorithm SHA256).Hash
+            }
+        }
+    }
+    finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
+    return [pscustomobject]@{
+        install_root = $installRoot
+        expected_user_sid = $ExpectedUserSid
+        registration = $registration
+        shortcuts = $shortcuts
+        shortcut_hashes = $shortcutHashes
+        manifest_sha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+        version = [string]$manifest.version
+        state_root = Join-Path $localRoot "Boundless"
+    }
+}
+
+function Get-BoundlessLegacyInstallPlan {
+    param([string]$ExpectedUserSid)
+
+    return New-BoundlessLegacyInstallPlan `
+        -LocalAppDataPath ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) `
+        -ShortcutDirectories @(
+            [Environment]::GetFolderPath([Environment+SpecialFolder]::Startup),
+            [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs),
+            [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+        ) `
+        -UninstallSubKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\Boundless" `
+        -ExpectedUserSid $ExpectedUserSid
+}
+
+function Wait-BoundlessLegacyProcessesExited {
+    param([object]$Plan, [int]$TimeoutMilliseconds = 5000)
+
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    do {
+        $remaining = @()
+        foreach ($process in @(Get-Process -Name "boundlessd", "boundlesstray", "boundless-input-injector" -ErrorAction SilentlyContinue)) {
+            try {
+                $path = $process.Path
+                if ([string]::IsNullOrWhiteSpace($path)) {
+                    if ($process.SessionId -eq [Diagnostics.Process]::GetCurrentProcess().SessionId) {
+                        throw "Could not prove executable identity for Boundless PID $($process.Id)."
+                    }
+                    continue
+                }
+                if (Test-WindowsPathEqual -Left ([IO.Path]::GetDirectoryName($path)) -Right $Plan.install_root) {
+                    # Never stop a surviving input/daemon process by name. The
+                    # existing tray quiescence path owns graceful shutdown.
+                    $remaining += $process.Id
+                }
+            }
+            catch {
+                if (-not $process.HasExited) { throw }
+            }
+            finally { $process.Dispose() }
+        }
+        if ($remaining.Count -eq 0) { return }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Legacy Boundless processes remain active (PIDs: $($remaining -join ', ')). Quit that installation before upgrading; no legacy files were moved."
+}
+
+function Restore-BoundlessLegacyInstall {
+    param([object]$Migration)
+
+    if ($null -eq $Migration) { return }
+    $plan = $Migration.plan
+    if ($Migration.install_moved) {
+        if (Test-Path -LiteralPath $plan.install_root) {
+            throw "Legacy rollback will not overwrite a newly-created install root. Backup: $($Migration.backup_root)"
+        }
+        [void](Assert-BoundlessLegacyPlainPath -Path $Migration.backup_root)
+        [void](Assert-BoundlessLegacyPlainPath -Path $plan.install_root)
+        [IO.Directory]::Move((Join-Path $Migration.backup_root "install"), $plan.install_root)
+        $Migration.install_moved = $false
+    }
+    foreach ($move in @($Migration.shortcut_moves)) {
+        if (-not (Test-Path -LiteralPath $move.backup)) { continue }
+        [void](Assert-BoundlessLegacyPlainPath -Path $move.original)
+        if (Test-Path -LiteralPath $move.original) {
+            throw "Legacy rollback will not overwrite a new shortcut: $($move.original)"
+        }
+        [IO.File]::Move($move.backup, $move.original)
+    }
+    if ($Migration.registration_removed) {
+        if ($null -ne (Get-BoundlessLegacyRegistrySnapshot -SubKey $plan.registration.sub_key)) {
+            throw "Legacy rollback will not overwrite a newly-created uninstall registration. Backup: $($Migration.backup_root)"
+        }
+        $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($plan.registration.sub_key)
+        try {
+            foreach ($entry in $plan.registration.values) {
+                $kind = [Microsoft.Win32.RegistryValueKind]([Enum]::Parse([Microsoft.Win32.RegistryValueKind], $entry.kind))
+                $key.SetValue($entry.name, $entry.value, $kind)
+            }
+        }
+        finally { $key.Dispose() }
+        $Migration.registration_removed = $false
+    }
+    $Migration.status = "restored"
+}
+
+function Start-BoundlessLegacyInstallMigration {
+    param([object]$Plan)
+
+    if ($null -eq $Plan) { return $null }
+    if ((Test-IsAdministrator) -or [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne $Plan.expected_user_sid) {
+        throw "Legacy migration may run only as the selected unelevated desktop user."
+    }
+    Wait-BoundlessLegacyProcessesExited -Plan $Plan
+    [void](Assert-BoundlessLegacyPlainPath -Path $Plan.install_root)
+    $manifestPath = Assert-BoundlessLegacyPlainPath -Path (Join-Path $Plan.install_root "package-manifest.json")
+    if ((Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash -ne $Plan.manifest_sha256) {
+        throw "Legacy package manifest changed during migration; no files were moved."
+    }
+    $backupRoot = Join-Path ([IO.Path]::GetDirectoryName($Plan.install_root)) ("Boundless-legacy-backup-" + [guid]::NewGuid().ToString("N"))
+    [void](Assert-BoundlessLegacyPlainPath -Path $backupRoot)
+    if (Test-Path -LiteralPath $backupRoot) { throw "Legacy backup destination already exists." }
+    $security = [Security.AccessControl.DirectorySecurity]::new()
+    $security.SetSecurityDescriptorSddlForm("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;$($Plan.expected_user_sid))")
+    [void](New-BoundlessSecuredDirectoryAtomic -Path $backupRoot -Security $security)
+    $migration = [pscustomobject]@{
+        plan = $Plan
+        backup_root = $backupRoot
+        install_moved = $false
+        registration_removed = $false
+        shortcut_moves = @()
+        status = "preparing"
+    }
+    try {
+        # The journal contains paths/registration only, never config, identity,
+        # clipboard, or log contents. It survives cancellation and uncertain MSI.
+        $Plan | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $backupRoot "migration.json") -Encoding UTF8
+        foreach ($shortcut in $Plan.shortcuts) {
+            [void](Assert-BoundlessLegacyPlainPath -Path $shortcut)
+            if ((Get-FileHash -LiteralPath $shortcut -Algorithm SHA256).Hash -ne $Plan.shortcut_hashes[$shortcut]) {
+                throw "Legacy shortcut changed during migration; the new shortcut was left unchanged."
+            }
+            $destination = Join-Path $backupRoot ("shortcut-" + $migration.shortcut_moves.Count + ".lnk")
+            [IO.File]::Move($shortcut, $destination)
+            $migration.shortcut_moves += [pscustomobject]@{ original = $shortcut; backup = $destination }
+        }
+        # A same-volume rename does not copy large files and leaves unknown
+        # payload files intact in the backup. Active user/service state stays put.
+        [IO.Directory]::Move($Plan.install_root, (Join-Path $backupRoot "install"))
+        $migration.install_moved = $true
+        if ($null -ne $Plan.registration) {
+            $current = Get-BoundlessLegacyRegistrySnapshot -SubKey $Plan.registration.sub_key
+            if (($current | ConvertTo-Json -Depth 8 -Compress) -ne ($Plan.registration | ConvertTo-Json -Depth 8 -Compress)) {
+                throw "Legacy uninstall registration changed during migration."
+            }
+            [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($Plan.registration.sub_key, $false)
+            $migration.registration_removed = $true
+        }
+        $migration.status = "archived"
+        Write-Host "boundless_legacy_backup=$backupRoot"
+        Write-Host "boundless_legacy_user_state_preserved=$($Plan.state_root)"
+        Write-Host "The previous per-user install was archived. Existing MSI service settings are preserved; a first move from a per-user install to the service requires pairing again."
+        return $migration
+    }
+    catch {
+        $originalError = $_
+        try { Restore-BoundlessLegacyInstall -Migration $migration }
+        catch { Write-Warning "Legacy preparation rollback needs attention. Backup: $backupRoot. $($_.Exception.Message)" }
+        throw $originalError
+    }
+}
+
 function Invoke-InstallHelperSelfTest {
     Assert-WindowsServiceExecutablePathFixtures
     $validSid = "S-1-5-21-1-2-3-1001"
@@ -10400,6 +10673,8 @@ if (-not [string]::IsNullOrWhiteSpace($selection.account)) {
 }
 Write-Host "boundless_install_selected_user_source=$($selection.source)"
 
+$legacyPlan = Get-BoundlessLegacyInstallPlan -ExpectedUserSid $selection.sid
+$legacyMigration = $null
 $currentSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
 $quiescenceArgs = @{
     # The selected SID is the intended desktop identity captured before UAC.
@@ -10415,11 +10690,34 @@ Write-Host "boundless_install_tray_shutdown_count=$($trayShutdown.initial_count)
 Write-Host "boundless_install_tray_shutdown_elapsed_ms=$($trayShutdown.elapsed_milliseconds)"
 Write-Host "boundless_install_tray_quiescence_acquired=$($trayQuiescence.evidence.acquired)"
 try {
+    # No elevated child exists yet; a legacy preflight failure can release the
+    # normal quiescence lease after its local rollback.
+    $trayQuiescence.evidence.installer_tree_closed = $true
+    $legacyMigration = Start-BoundlessLegacyInstallMigration -Plan $legacyPlan
+    $trayQuiescence.evidence.installer_tree_closed = $false
     $installResult = Invoke-BoundlessMsi `
         -ResolvedInstallerPath $resolvedInstallerPath `
         -Sid $selection.sid `
         -InstallerAnchor $installerAnchor `
         -QuiescenceLease $trayQuiescence
+}
+catch {
+    $originalError = $_
+    [void](Update-BoundlessInstallerPhaseEvidence -Lease $trayQuiescence)
+    # Restore only after proof that no MSI transaction can still own the
+    # payload. An uncertain/successful MSI keeps the recoverable archive.
+    if ($null -ne $legacyMigration -and
+        -not $trayQuiescence.evidence.msi_may_have_started -and
+        $trayQuiescence.evidence.installer_tree_closed -and
+        $trayQuiescence.evidence.recovery_authority_drained -and
+        $trayQuiescence.evidence.recovery_action_settled) {
+        try { Restore-BoundlessLegacyInstall -Migration $legacyMigration }
+        catch { Write-Warning "Legacy rollback needs attention. Backup: $($legacyMigration.backup_root). $($_.Exception.Message)" }
+    }
+    elseif ($null -ne $legacyMigration) {
+        Write-Warning "Legacy files remain safely archived because MSI completion is not a proven failure. Backup: $($legacyMigration.backup_root)"
+    }
+    throw $originalError
 }
 finally {
     $completionState = Update-BoundlessInstallerPhaseEvidence -Lease $trayQuiescence
@@ -10452,6 +10750,8 @@ $verification = Invoke-PostInstallVerification `
     -InstallerAnchor $installerAnchor `
     -ExpectedAllowedUserSid $selection.sid `
     -LaunchTray:(-not $Quiet -and -not (Test-IsAdministrator))
+$summary.legacy_install_migration = if ($null -eq $legacyMigration) { "not_needed" } else { $legacyMigration.status }
+$summary.legacy_install_backup = if ($null -eq $legacyMigration) { $null } else { $legacyMigration.backup_root }
 $summary.pre_install_tray_shutdown = $trayShutdown
 $summary.pre_install_tray_quiescence = $trayQuiescence.evidence
 $summary.elevated_install = $installResult
