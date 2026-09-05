@@ -45,9 +45,10 @@ This is consistency checking, not attestation. An edited JSON file or dishonest 
 ./scripts/dev/functional-benchmarks.ps1 -Benchmark transport
 ./scripts/dev/functional-benchmarks.ps1 -Benchmark logging
 ./scripts/dev/functional-benchmarks.ps1 -Benchmark ui
+./scripts/dev/functional-benchmarks.ps1 -BuildProfile debug
 ```
 
-The wrapper builds daemon library and tray test executables with `--locked`, two build jobs, and a separate target directory. It executes exactly one ignored test per selected benchmark, rejects missing metric output, and validates named safety bounds. It preserves each binary hash, checkout commit/dirty state, toolchain, platform, raw measurements, and execution logs under `artifacts/performance/functional-benchmarks/`. A dirty checkout is recorded as such; the executable hash identifies what actually ran.
+The wrapper defaults to optimized release-profile daemon library and tray test executables with `--locked --release`, two build jobs, and a separate target directory. Select `-BuildProfile debug` for investigations; the packet records the selected profile. It executes exactly one ignored test per selected benchmark, rejects missing metric output, and validates named safety bounds. It preserves each binary hash, checkout commit/dirty state, toolchain, platform, raw measurements, and execution logs under `artifacts/performance/functional-benchmarks/`. A dirty checkout is recorded as such; the executable hash identifies what actually ran.
 
 | Benchmark | Actual exercised code | Measurements and limits |
 | --- | --- | --- |
@@ -67,7 +68,7 @@ The output schema is `boundless.performance.functional_benchmarks.v1`. These int
 
 Trace collection without `-TraceEnforceBudgets` remains diagnostic. The readiness latency gate always enables it. The enforced gate needs enough fresh capture-to-receive, receive-to-apply, and capture-to-apply samples for every target, plus jitter. Historical events present at the start are excluded. Missing samples and excessive budgets fail. Suspected clock skew fails an end-to-end claim instead of replacing it with a different receiver-only metric. The former `-AdjustForClockSkew` option was removed for that reason; use same-clock paired RTT when clocks cannot support cross-machine stage timing.
 
-Stage telemetry does not by itself prove that a physical target application responded correctly. Keep physical keyboard, touchpad, emergency-unlock, clipboard and recovery checks in the candidate acceptance record.
+The daemon coalesces high-frequency telemetry. The trace samples fresh observed records at polling intervals, so its p95 and jitter describe that observed series, not every input frame. Stage telemetry does not by itself prove that a physical target application responded correctly. Keep physical keyboard, touchpad, emergency-unlock, clipboard and recovery checks in the candidate acceptance record.
 
 ## Metadata fixtures
 

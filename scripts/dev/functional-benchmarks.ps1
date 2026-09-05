@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidateSet('transport', 'logging', 'ui')][string[]]$Benchmark = @('transport', 'logging', 'ui'),
+    [ValidateSet('debug', 'release')][string]$BuildProfile = 'release',
     [string]$OutputPath = '',
     [string]$TargetDirectory = ''
 )
@@ -25,12 +26,13 @@ try {
     if (@($Benchmark | Where-Object { $_ -in @('transport', 'logging') }).Count -gt 0) { $groups += @{ package = 'boundless-daemon'; target = 'boundless_daemon'; selector = @('--lib') } }
     if ($Benchmark -contains 'ui') { $groups += @{ package = 'boundless-tray'; target = 'boundlesstray'; selector = @('--bin', 'boundlesstray') } }
     foreach ($group in $groups) {
-        Write-Host "[functional-benchmarks] compiling locked $($group.package) benchmark executable (2 build jobs)"
+        Write-Host "[functional-benchmarks] compiling locked $BuildProfile $($group.package) benchmark executable (2 build jobs)"
         $buildLog = [IO.Path]::ChangeExtension($OutputPath, ".$($group.package).build.log")
         $priorPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
             $cargoArgs = @('test', '--locked', '-p', $group.package) + $group.selector + @('--no-run', '--message-format=json')
+            if ($BuildProfile -eq 'release') { $cargoArgs += '--release' }
             $buildOutput = @(& cargo @cargoArgs 2> $buildLog)
             $buildExit = $LASTEXITCODE
         }
@@ -121,6 +123,7 @@ try {
         role = 'local_benchmark_host'
         process_bitness = if ([Environment]::Is64BitProcess) { 64 } else { 32 }
         build_jobs = 2
+        build_profile = $BuildProfile
         locked_build = $true
         measurements = @($measurements.ToArray())
         physical_two_pc_acceptance = 'not_tested'

@@ -8,7 +8,7 @@ Use this scorecard to decide whether an exact candidate is ready for a stated au
 | --- | --- | --- |
 | Deterministic tests | Actual policy/state/session code with controlled failure injection | The tested behavioral contract holds in that controlled environment |
 | Metadata fixture | Invented observations passed through report generation | Artifact shape, redaction and calculation checks work |
-| Local benchmark | Actual worker/queue/logging code with injected connections, in-memory streams, or local filesystem | Measured local runtime/resource behavior; no physical LAN or desktop claim |
+| Local benchmark | Actual worker/queue/logging code with injected connections, in-memory streams, or local filesystem; offscreen egui layout/tessellation | Measured local runtime/resource/CPU-render behavior; no physical LAN or native desktop claim |
 | Paired transport | Executing authenticated daemons report raw RTT, echo integrity, exact executable hashes and session identities | Transport behavior for those endpoints and that run; `real_paired` means non-loopback, not hardware attestation |
 | Physical acceptance | Operator-controlled run on identified PCs using exact installed candidate artifacts | Supported keyboard, mouse, clipboard, installation and recovery claims exercised in that run |
 
