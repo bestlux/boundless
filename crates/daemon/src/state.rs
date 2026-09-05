@@ -157,8 +157,14 @@ struct OutboundFileTransfer {
     total_bytes: u64,
     source_modified: Option<SystemTime>,
     offset_bytes: u64,
-    source_file: tokio::fs::File,
+    source: Arc<OutboundFileSource>,
     user_io: platform_windows::user_io::UserIoLease,
+}
+
+// Blocking file work retains this entire object, including its capacity slot,
+// even after its awaiting session and transfer record have been cancelled.
+struct OutboundFileSource {
+    file: std::sync::Mutex<std::fs::File>,
     _handle_permit: tokio::sync::OwnedSemaphorePermit,
 }
 

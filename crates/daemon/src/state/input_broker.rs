@@ -798,6 +798,20 @@ impl InputBrokerRelay {
         let Some(batch) = inner.inflight_inject_batch.take() else {
             return Vec::new();
         };
+        if batch.recovery_cleanup {
+            // Recovery has no remote owner and must never enter the ordinary
+            // authorization queue. A lost response or partial cleanup keeps
+            // these idempotent Ups pending until an exact completed receipt.
+            for event in batch
+                .frames
+                .into_iter()
+                .rev()
+                .flat_map(|frame| frame.events.into_iter().rev())
+            {
+                inner.recovery_releases.push_front(event);
+            }
+            return Vec::new();
+        }
         for event in batch.frames.iter().flat_map(|frame| &frame.events) {
             inner.delivered_held_input.observe(event, false);
         }

@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use std::io::{Read, Seek};
 
 use super::*;
 
@@ -910,9 +910,11 @@ impl AppState {
                 total_bytes,
                 source_modified,
                 offset_bytes: 0,
-                source_file: tokio::fs::File::from_std(source_file),
+                source: Arc::new(OutboundFileSource {
+                    file: std::sync::Mutex::new(source_file),
+                    _handle_permit: handle_permit,
+                }),
                 user_io,
-                _handle_permit: handle_permit,
             },
         );
         {
@@ -949,64 +951,80 @@ impl AppState {
         peer_id: &str,
         transfer_id: &str,
     ) -> Result<OutboundFileChunk> {
+        self.materialize_outbound_file_chunk_with_reader(
+            peer_id,
+            transfer_id,
+            |file, offset, length| {
+                file.seek(std::io::SeekFrom::Start(offset))?;
+                let mut data = vec![0u8; length];
+                file.read_exact(&mut data)?;
+                Ok(data)
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn materialize_outbound_file_chunk_with_reader<F>(
+        &self,
+        peer_id: &str,
+        transfer_id: &str,
+        read: F,
+    ) -> Result<OutboundFileChunk>
+    where
+        F: FnOnce(&mut std::fs::File, u64, usize) -> Result<Vec<u8>> + Send + 'static,
+    {
         self.ensure_file_transfer_enabled().await?;
-        let mut transfers = self.outbound_file_transfers.write().await;
-        let Some(transfer) = transfers.get_mut(transfer_id) else {
+        let transfers = self.outbound_file_transfers.read().await;
+        let Some(transfer) = transfers.get(transfer_id) else {
             anyhow::bail!("unknown outbound file transfer {transfer_id}");
         };
         if transfer.peer_id != peer_id {
             anyhow::bail!("outbound file transfer {transfer_id} does not belong to peer {peer_id}");
         }
 
-        transfer.user_io.validate().await?;
-        let metadata = transfer.source_file.metadata().await.with_context(|| {
-            format!(
-                "inspect outbound file source {}",
-                transfer.source_path.display()
-            )
-        })?;
-        if !metadata.is_file() {
-            anyhow::bail!("outbound file source is no longer a regular file");
-        }
-        if metadata.len() != transfer.total_bytes
-            || (transfer.source_modified.is_some()
-                && metadata.modified().ok() != transfer.source_modified)
-        {
-            anyhow::bail!("outbound file source changed after transfer was queued");
-        }
-
+        let source = transfer.source.clone();
+        let source_path = transfer.source_path.clone();
+        let source_modified = transfer.source_modified;
+        let total_bytes = transfer.total_bytes;
+        let user_io = transfer.user_io.clone();
         let remaining = transfer.total_bytes.saturating_sub(transfer.offset_bytes);
         let length_bytes = (remaining as usize).min(FILE_TRANSFER_CHUNK_BYTES);
         let offset_bytes = transfer.offset_bytes;
-        let mut data = vec![0u8; length_bytes];
-        if length_bytes > 0 {
-            let source_file = &mut transfer.source_file;
-            source_file
-                .seek(std::io::SeekFrom::Start(offset_bytes))
-                .await
-                .with_context(|| {
-                    format!(
-                        "seek outbound file source {} to offset {}",
-                        transfer.source_path.display(),
-                        offset_bytes
-                    )
+        drop(transfers);
+        let data = user_io
+            .run_sync(move || {
+                let mut file = source
+                    .file
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("outbound source lock poisoned"))?;
+                let metadata = file.metadata().with_context(|| {
+                    format!("inspect outbound file source {}", source_path.display())
                 })?;
-            source_file.read_exact(&mut data).await.with_context(|| {
-                format!(
-                    "read outbound file source {} offset {} length {}",
-                    transfer.source_path.display(),
-                    offset_bytes,
-                    length_bytes
-                )
-            })?;
-        }
+                if !metadata.is_file() {
+                    anyhow::bail!("outbound file source is no longer a regular file");
+                }
+                if metadata.len() != total_bytes
+                    || (source_modified.is_some() && metadata.modified().ok() != source_modified)
+                {
+                    anyhow::bail!("outbound file source changed after transfer was queued");
+                }
+                read(&mut file, offset_bytes, length_bytes).with_context(|| {
+                    format!(
+                        "read outbound file source {} offset {} length {}",
+                        source_path.display(),
+                        offset_bytes,
+                        length_bytes
+                    )
+                })
+            })
+            .await?;
 
         let next_offset = offset_bytes.saturating_add(length_bytes as u64);
         Ok(OutboundFileChunk {
             transfer_id: transfer_id.to_string(),
             offset_bytes,
             data,
-            finished: next_offset >= transfer.total_bytes,
+            finished: next_offset >= total_bytes,
         })
     }
 

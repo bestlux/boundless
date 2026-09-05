@@ -36,7 +36,7 @@ Opened file handles may cross async boundaries. Windows checked their granted ac
 
 `InboundTransfer` belongs to `daemon::network`, where its user lease and filesystem handle can be owned together. `peer-transport` retains protocol and flow-control state without platform authority. The older internal `OutboundPayload::FileChunk` carries only a source path; service mode rejects it. Normal `SendFile` uses the supported cursor and retained-handle path. This changes no remote wire format.
 
-At most 64 queued/active outbound sources retain handles. A semaphore reserves capacity before a source is opened, including concurrent requests; error, completion and cancellation release it. Reaching the limit returns a capacity error instead of accumulating more handles.
+At most 64 queued/active or still-running outbound sources retain handles. A semaphore reserves capacity before a source is opened, including concurrent requests. The opened file and permit share one owner retained by every blocking metadata/read worker. Cancelling a session removes its transfer record immediately, but a started worker retains capacity until it finishes. Reaching the limit returns a capacity error instead of accumulating more handles. Filesystem work runs outside the transfer registry lock, so stalled storage does not block reconnect cleanup or unrelated transfers.
 
 The service does not create the receive directory during daemon startup. An exact persisted service-profile default is resolved to the installed user's Downloads/Boundless folder when authority is available. Explicit destinations remain explicit. Existing files, private keys and installation identity are not moved.
 

@@ -339,6 +339,103 @@ async fn broker_process_replacement_releases_possible_holds_and_requires_fresh_h
 }
 
 #[tokio::test]
+async fn lost_recovery_reply_survives_cooperative_detach_and_reattach() {
+    let (state, root) = service_mode_broker_state("boundless-broker-lost-recovery").await;
+    let peer = join_connected_peer(&state).await;
+    let original = state
+        .attach_input_broker(allowed_client(), "original".into(), true)
+        .await;
+    assert!(state.claim_input_owner(&peer, false).await.expect("owner"));
+    route_broker_test_events(
+        &state,
+        &peer,
+        1,
+        vec![InputEvent::Key {
+            scan_code: 29,
+            state: KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        }],
+    )
+    .await;
+    let down = state
+        .exchange_input_broker(allowed_client(), &original.broker_token, Default::default())
+        .await;
+    assert!(!down.inject_frames.is_empty());
+    let mut replacement = state
+        .attach_input_broker(restarted_client(), "replacement".into(), true)
+        .await;
+    let mut cleanup = state
+        .exchange_input_broker(
+            restarted_client(),
+            &replacement.broker_token,
+            Default::default(),
+        )
+        .await;
+    let expected = vec![InputEvent::Key {
+        scan_code: 29,
+        state: KeyState::Up,
+        semantics: core_input::KeySemantics::Physical,
+    }];
+    for reset in [false, true] {
+        assert_eq!(
+            cleanup
+                .inject_frames
+                .iter()
+                .flat_map(|frame| frame.events.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        // The first cleanup response never reached the tray, so it has no
+        // active batch or local held state and detaches without a receipt.
+        assert!(
+            state
+                .detach_input_broker_with_reset(
+                    restarted_client(),
+                    &replacement.broker_token,
+                    &replacement.delivery_epoch,
+                    0,
+                    reset
+                )
+                .await
+        );
+        replacement = state
+            .attach_input_broker(restarted_client(), "same-process".into(), true)
+            .await;
+        cleanup = state
+            .exchange_input_broker(
+                restarted_client(),
+                &replacement.broker_token,
+                Default::default(),
+            )
+            .await;
+        assert!(cleanup.accepted);
+        assert_eq!(
+            cleanup
+                .inject_frames
+                .iter()
+                .flat_map(|frame| frame.events.clone())
+                .collect::<Vec<_>>(),
+            expected,
+            "unacknowledged recovery must remain in the release-only lane"
+        );
+        assert!(!cleanup.held_input_authorized);
+        assert_eq!(state.input_owner().await, None);
+    }
+    let completed = state
+        .exchange_input_broker(
+            restarted_client(),
+            &replacement.broker_token,
+            InputBrokerExchangeObservations {
+                acked_inject_batch_id: cleanup.inject_batch_id,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(completed.accepted && completed.inject_frames.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn broker_process_replacement_unlocks_before_blocked_config_or_peer_queue() {
     let (state, root) = service_mode_broker_state("boundless-broker-unlock-before-io").await;
     let peer = join_connected_peer(&state).await;

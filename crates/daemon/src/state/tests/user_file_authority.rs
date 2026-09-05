@@ -190,6 +190,93 @@ async fn cancelled_source_open_keeps_capacity_until_blocking_worker_finishes() {
 }
 
 #[tokio::test]
+async fn reconnect_cancellation_keeps_source_capacity_until_blocked_read_finishes() {
+    let (state, root) = fixture();
+    let peer = peer(&state).await;
+    state
+        .set_peer_connected(&peer, true)
+        .await
+        .expect("connected");
+    let source = root.join("source.txt");
+    std::fs::write(&source, b"fixture").expect("source");
+    let transfer = state
+        .queue_file_from_path(&peer, &source)
+        .await
+        .expect("queue");
+    let remaining_slots = state
+        .outbound_file_handle_slots
+        .clone()
+        .try_acquire_many_owned((MAX_OUTBOUND_FILE_HANDLES - 1) as u32)
+        .expect("reserve other capacity");
+    let (reading_tx, reading_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+    let reader_state = state.clone();
+    let reader_peer = peer.clone();
+    let session = tokio::spawn(async move {
+        reader_state
+            .materialize_outbound_file_chunk_with_reader(
+                &reader_peer,
+                &transfer,
+                move |file, offset, length| {
+                    use std::io::{Read, Seek};
+                    file.seek(std::io::SeekFrom::Start(offset))?;
+                    let _ = reading_tx.send(());
+                    finish_rx.recv_timeout(std::time::Duration::from_secs(5))?;
+                    let mut data = vec![0u8; length];
+                    file.read_exact(&mut data)?;
+                    assert_eq!(data, b"fixture");
+                    Ok(data)
+                },
+            )
+            .await
+    });
+    state.register_transport_session_for_peer(&peer, session.abort_handle());
+    tokio::time::timeout(std::time::Duration::from_secs(2), reading_rx)
+        .await
+        .expect("worker started")
+        .expect("read signal");
+    let (_, aborted) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.request_peer_reconnect_and_reset(&peer),
+    )
+    .await
+    .expect("reconnect does not wait for storage")
+    .expect("reconnect");
+    assert_eq!(aborted, 1);
+    assert!(matches!(session.await, Err(error) if error.is_cancelled()));
+    assert_eq!(state.outbound_file_transfer_count().await, 0);
+    assert_eq!(
+        state.outbound_file_handle_slots.available_permits(),
+        0,
+        "the cancelled worker still owns the source handle and capacity"
+    );
+    let error = state
+        .queue_file_from_path(&peer, &source)
+        .await
+        .expect_err("stalled worker retains capacity");
+    assert!(error.to_string().contains("capacity reached"));
+    finish_tx.send(()).expect("finish read");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while state.outbound_file_handle_slots.available_permits() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("completed worker restores capacity");
+    assert!(state.queue_file_from_path(&peer, &source).await.is_ok());
+    state
+        .set_feature("transfer_file".into(), false)
+        .await
+        .expect("close fixture handles");
+    drop(remaining_slots);
+    assert_eq!(
+        state.outbound_file_handle_slots.available_permits(),
+        MAX_OUTBOUND_FILE_HANDLES
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn missing_service_user_authority_blocks_user_paths_but_keeps_state_queryable() {
     let (state, root) = fixture();
     let peer = peer(&state).await;
