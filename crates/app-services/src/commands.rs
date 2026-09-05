@@ -163,6 +163,8 @@ pub struct SendInputKeyCommand {
 /// could not verify the caller; identity-gated commands fail closed on it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedControlClient {
+    pub process_id: Option<u32>,
+    pub process_creation_time: Option<u64>,
     pub user_sid: Option<String>,
     pub session_id: Option<u32>,
 }

@@ -1099,6 +1099,8 @@ fn verified_control_client<T>(request: &Request<T>) -> Option<app_commands::Veri
         .extensions()
         .get::<ipc_api::client_identity::ControlClientIdentity>()
         .map(|identity| app_commands::VerifiedControlClient {
+            process_id: identity.process_id,
+            process_creation_time: identity.process_creation_time,
             user_sid: identity.user_sid.clone(),
             session_id: identity.session_id,
         })
@@ -1459,10 +1461,13 @@ mod tests {
         request.extensions_mut().insert(ControlClientIdentity {
             user_sid: Some("S-1-5-21-1-2-3-1001".to_string()),
             session_id: Some(2),
-            process_id: None,
+            process_id: Some(123),
+            process_creation_time: Some(456),
         });
         let verified = verified_control_client(&request).expect("verified identity");
         assert_eq!(verified.user_sid.as_deref(), Some("S-1-5-21-1-2-3-1001"));
         assert_eq!(verified.session_id, Some(2));
+        assert_eq!(verified.process_id, Some(123));
+        assert_eq!(verified.process_creation_time, Some(456));
     }
 }
