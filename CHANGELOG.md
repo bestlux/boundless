@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.1.0](https://github.com/bestlux/boundless/compare/v5.0.16...v5.1.0) (2026-09-05)
+
+
+### Features
+
+* **windows:** harden runtime and bundle two-PC qualification preview ([#157](https://github.com/bestlux/boundless/issues/157)) ([5d3362b](https://github.com/bestlux/boundless/commit/5d3362bf926f2086db33d4431a09492a4bc630b5))
+
 ## [5.0.16](https://github.com/bestlux/boundless/compare/v5.0.15...v5.0.16) (2026-07-15)
 
 
