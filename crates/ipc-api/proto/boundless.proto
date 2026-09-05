@@ -667,6 +667,9 @@ service DaemonService {
 }
 
 service ControlPlaneService {
+  rpc PairedTestConsent(PairedTestConsentRequest) returns (PairedTestJsonReply);
+  rpc GetPairedTestConsent(Empty) returns (PairedTestJsonReply);
+  rpc RunPairedTest(PairedTestRunRequest) returns (PairedTestJsonReply);
   rpc GetUiSnapshot(Empty) returns (UiSnapshotReply);
   rpc GetConsoleSnapshot(Empty) returns (ConsoleSnapshotReply);
   rpc GetStatus(StatusRequest) returns (StatusReply);
@@ -718,6 +721,19 @@ service ControlPlaneService {
   rpc ExchangeClipboardBroker(ClipboardBrokerExchangeRequest) returns (ClipboardBrokerExchangeReply);
   rpc DetachInputBroker(InputBrokerDetachRequest) returns (OperationReply);
 }
+
+// Stable schema-versioned JSON DTOs live in app-services::paired_testing.
+message PairedTestConsentRequest {
+  string peer_id = 1;
+  uint32 duration_seconds = 2;
+}
+message PairedTestRunRequest {
+  string peer_id = 1;
+  uint32 samples = 2;
+  uint32 payload_bytes = 3;
+  uint32 timeout_ms = 4;
+}
+message PairedTestJsonReply { string json = 1; }
 
 // Dedicated local-only privileged injection surface. The helper hosts this on
 // its own per-launch named pipe; it is never exposed by the daemon.

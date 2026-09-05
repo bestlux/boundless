@@ -27,6 +27,7 @@ use ipc_api::boundless::v1::{
 mod cli_helpers;
 mod commands;
 mod console;
+mod paired_testing;
 
 #[cfg(test)]
 use app_services::desktop::nearby_pairing_port;
@@ -58,6 +59,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Explicitly permitted, bounded diagnostics across an existing paired connection.
+    PairedTest {
+        #[command(subcommand)]
+        command: paired_testing::PairedTestCommand,
+    },
     Setup {
         #[arg(long, default_value_t = true)]
         start_daemon: bool,
@@ -618,6 +624,9 @@ async fn main() -> Result<()> {
                 .await
             }
         },
+        Command::PairedTest { command } => {
+            paired_testing::execute(&cli.endpoint, command, output).await
+        }
         Command::Hotkey { action, combo } => hotkey_set(&cli.endpoint, action, combo).await,
         Command::Diagnostics { command } => match command {
             DiagnosticsCommand::Dump {
@@ -668,12 +677,54 @@ fn command_supports_json(command: &Command) -> bool {
         } | Command::Transport {
             command: TransportCommand::Events { .. }
         } | Command::Doctor { install: true }
+            | Command::PairedTest { .. }
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paired_test_commands_accept_json_and_reject_unbounded_work() {
+        let cli = Cli::try_parse_from(["boundlessctl", "paired-test", "run", "peer-id", "--json"])
+            .unwrap();
+        assert!(command_supports_json(&cli.command));
+        assert!(
+            Cli::try_parse_from([
+                "boundlessctl",
+                "paired-test",
+                "run",
+                "peer-id",
+                "--samples",
+                "101"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "boundlessctl",
+                "paired-test",
+                "run",
+                "peer-id",
+                "--payload-bytes",
+                "65537"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "boundlessctl",
+                "paired-test",
+                "allow",
+                "peer-id",
+                "--seconds",
+                "601"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["boundlessctl", "paired-test", "revoke", "--json"]).is_ok());
+    }
 
     #[test]
     fn json_flag_is_global_and_defaults_to_human_output() {

@@ -28,6 +28,22 @@ use crate::{
 
 #[async_trait]
 pub trait ControlPlaneApp: Send + Sync {
+    async fn paired_test_consent(
+        &self,
+        _peer_id: String,
+        _duration_seconds: u32,
+    ) -> Result<crate::paired_testing::PairedTestConsent> {
+        anyhow::bail!("paired transport tests unavailable")
+    }
+    async fn get_paired_test_consent(&self) -> Result<crate::paired_testing::PairedTestConsent> {
+        anyhow::bail!("paired transport tests unavailable")
+    }
+    async fn run_paired_test(
+        &self,
+        _options: crate::paired_testing::PairedTestOptions,
+    ) -> Result<crate::paired_testing::PairedTestReport> {
+        anyhow::bail!("paired transport tests unavailable")
+    }
     async fn status_snapshot(&self) -> Result<StatusSnapshot>;
     async fn ui_snapshot(&self) -> Result<UiSnapshot>;
     async fn console_snapshot(&self) -> Result<ConsoleSnapshot>;
