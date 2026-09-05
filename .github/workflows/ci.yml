@@ -77,7 +77,7 @@ jobs:
             '^packaging/windows/',
             '^scripts/dev/installer-smoke\.ps1$',
             '^scripts/dev/release-readiness\.ps1$',
-            '^scripts/release/(assert-release-consistency|package-windows)\.ps1$',
+            '^scripts/release/(assert-release-consistency|assert-windows-bundle|package-windows|package-windows-bundle)\.ps1$',
             '^\.github/actions/setup-rust/',
             '^\.github/workflows/(ci|release-please)\.yml$'
           )
@@ -133,12 +133,18 @@ jobs:
             -InputInjectorPath "target/release/boundless-input-injector.exe" `
             -OutputPath $installerPath
           $helperPath = Join-Path $candidateRoot "Boundless-${{ steps.candidate.outputs.version }}-windows-x64-install.ps1"
+          $bundlePath = Join-Path $candidateRoot "Boundless-${{ steps.candidate.outputs.version }}-windows-x64.zip"
+          ./scripts/release/package-windows-bundle.ps1 `
+            -Version "${{ steps.candidate.outputs.version }}" `
+            -InstallerPath $installerPath -HelperPath $helperPath -OutputPath $bundlePath
           ./scripts/release/assert-release-consistency.ps1 `
             -Tag "v${{ steps.candidate.outputs.version }}" `
-            -AssetPaths @($installerPath, $helperPath) `
+            -AssetPaths @($installerPath, $helperPath, $bundlePath) `
             -CheckWindowsInstallerVersion
-          "installer_path=$installerPath" >> $env:GITHUB_OUTPUT
-          "helper_path=$helperPath" >> $env:GITHUB_OUTPUT
+          $extracted = Join-Path $candidateRoot 'extracted bundle'
+          Expand-Archive -LiteralPath $bundlePath -DestinationPath $extracted
+          "installer_path=$(Join-Path $extracted ([IO.Path]::GetFileName($installerPath)))" >> $env:GITHUB_OUTPUT
+          "helper_path=$(Join-Path $extracted ([IO.Path]::GetFileName($helperPath)))" >> $env:GITHUB_OUTPUT
 
       - name: Download previous stable installer
         if: steps.changes.outputs.run_installer == 'true'

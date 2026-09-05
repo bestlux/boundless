@@ -633,6 +633,10 @@ foreach ($hostName in @("powershell.exe", "pwsh.exe")) {
         -ScriptPath $installerSmoke `
         -Arguments @("-SelfTest") `
         -PowerShellExe $hostCommand.Source | Out-Null
+    Invoke-PackagingScript `
+        -ScriptPath (Join-Path $RepoRoot 'scripts/dev/windows-bundle-fixtures.ps1') `
+        -Arguments @('-RepoRoot', $RepoRoot) `
+        -PowerShellExe $hostCommand.Source | Out-Null
 }
 
 $smokeSid = "S-1-5-21-1000-1000-1000-1001"

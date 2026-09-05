@@ -122,7 +122,7 @@ The recommended Boundless policy is an explicit, user-visible installer/helper o
 
 - Ownership: MSI/helper-owned Windows Defender Firewall rule for the installed Program Files service binary only: `%ProgramFiles%\Boundless\boundless-service.exe`.
 - Scope: Private profile plus local-subnet remote scope, or a narrower user-approved remote scope if the implementation can verify it. No Public profile and no router-forwarding guidance.
-- Ports: TCP `15100` for trusted transport and TCP `15200` for nearby pairing. Do not open TCP `15101`; that port is only a side-by-side diagnostic probe today. Alternate `network_port` support must be a separate explicit flow that opens only the selected transport port and derived pairing port.
+- Ports: TCP `16100` for trusted transport and TCP `16200` for nearby pairing. Legacy/MWB `15100`/`15101`/`15200` are diagnostic probes. Alternate `network_port` support must be a separate explicit flow that opens only the selected transport port and derived pairing port.
 - UX: installer/helper copy must say the rule allows inbound Boundless pairing and transport from the local private network. It must be opt-in or an explicit reviewed installer choice; do not make it an invisible side effect of pairing, diagnostics, reset, or role reversal.
 - Repair/update: MSI repair must recreate the exact approved rule when the option is enabled. MSI upgrade must keep ownership tied to the current Program Files service path. Uninstall must remove the MSI-owned Boundless rule and must not delete unrelated user-created firewall rules.
 - Observability: diagnostics should report whether the expected rule exists, its profile, remote scope, program path, and ports using local process/path redaction policy where needed.

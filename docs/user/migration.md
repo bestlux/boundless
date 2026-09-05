@@ -4,11 +4,13 @@ This guide covers peer compatibility, older Boundless installations, and moving 
 
 ## Peer protocol upgrade
 
-The Windows hardening work adds protocol **4.5.0** for temporary, consented paired-test probes. It is incompatible with protocol 4.4.0 peers under Boundless' exact-version transport policy. Update both PCs to the same build before testing. Configuration schema **6** preserves durable pairing and preferences while dropping saved connection observations. Live connection state is rediscovered after startup; a remembered pairing is not evidence that its peer is currently connected.
+The Windows hardening work adds protocol **4.5.0** for temporary, consented paired-test probes. It is incompatible with protocol 4.4.0 peers under Boundless' exact-version transport policy. Update both PCs to the same build before testing. Configuration schema **7** preserves durable pairing and preferences while dropping saved connection observations. Live connection state is rediscovered after startup; a remembered pairing is not evidence that its peer is currently connected.
+
+Schema 2–6 configs using the old default transport port **15100** migrate to **16100**, with nearby pairing on **16200**. Saved manual peer endpoints using the old default also migrate. Other ports stay unchanged; an explicit 15100 in schema 7 stays unchanged. Older schemas cannot distinguish a deliberately chosen 15100 from the old default, so both migrate once. Before rewriting a supported old config, Boundless creates `config.json.pre-v7.bak` beside it from its exact original bytes; an existing backup is not overwritten. Invalid configs or a failed backup stop migration before the active file is rewritten.
 
 Older binaries do not understand the new protocol/configuration contract. Before an installed upgrade, preserve a private backup of the existing configuration and identity/trust state for rollback. Do not post that backup in an issue. Rolling back requires the compatible pre-upgrade state on both PCs or a build that understands the newer schema; do not edit the version fields to force an old binary to accept it.
 
-This is a source-change compatibility notice, not a claim that the hardening build has been published. Check [Project Status](../project-status.md) for the candidate's implementation and validation state.
+Check the release's preview status and [Project Status](../project-status.md) for the implementation and validation boundary.
 
 ## From Boundless V4 To V5
 
@@ -27,9 +29,9 @@ This is a source-change compatibility notice, not a claim that the hardening bui
    Get-Service BoundlessService -ErrorAction SilentlyContinue
    ```
 
-3. If `Boundless-Install.ps1` exists under `%LocalAppData%\Programs\Boundless`, remove the old script-based install before running the MSI. The first MSI releases intentionally block over legacy script-installed layouts.
+3. The bundled helper recognizes supported per-user script installs under `%LocalAppData%\Programs\Boundless`, verifies their marker/manifest/owner, then moves the old payload into a private recovery archive before the MSI. It retires only matching old shortcuts and the user's matching uninstall entry. It does not run the old uninstall script or delete configuration, identity, or trust. Unrecognized layouts, reparse points, or an old process that cannot stop safely block migration with an explanation. Keep the printed recovery location until qualification finishes.
 4. If `BoundlessService` was installed manually from a copied service binary, uninstall that manual service from an elevated shell before using the MSI-owned service path. The v5 MSI is the owner of future service registration, repair, upgrade, and uninstall.
-5. Install v5 from the intended desktop user's normal, non-elevated PowerShell session:
+5. Extract the Windows release ZIP and double-click **Install.cmd** as the intended desktop user. The equivalent command is:
 
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass -File .\Boundless-<version>-windows-x64-install.ps1
@@ -39,11 +41,13 @@ This is a source-change compatibility notice, not a claim that the hardening bui
    already-elevated shell, pass the intended SID explicitly:
 
    ```powershell
-   msiexec /i .\Boundless-<version>-windows-x64.msi BOUNDLESS_ALLOWED_USER_SID=S-...
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\Boundless-<version>-windows-x64-install.ps1 -AllowedUserSid S-...
    ```
 
 6. Open the tray dashboard.
 7. Confirm paired peers, layout, feature toggles, hotkeys, and file-transfer settings.
+
+   The machine service owns its state under `%WINDIR%\System32\config\systemprofile\AppData\Local\Boundless`; a former per-user daemon used `%LocalAppData%\Boundless`. The installer preserves that older user state but does not copy its identity into the service. Pair again and reapply preferences after that transition. An ordinary MSI-to-MSI upgrade retains the existing service state.
 8. Run the reset helper only when you intentionally want to clear local state:
 
    ```powershell

@@ -6,6 +6,8 @@ Share a mouse and keyboard between Windows PCs. Boundless is a Rust desktop app 
 
 ## Use Boundless
 
+For Windows installation, download the release's `Boundless-<version>-windows-x64.zip`, extract it, and double-click **Install.cmd**. Use the same preview build on both PCs.
+
 - [Install, pair, and arrange two PCs](docs/user/quickstart.md)
 - [Clipboard and files](docs/user/clipboard-file-workflows.md)
 - [Windows service and elevated input](docs/user/service-mode.md)

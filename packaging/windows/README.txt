@@ -1,9 +1,9 @@
 Boundless for Windows
 =====================
 
-IMPORTANT: Do not double-click the raw MSI. The MSI intentionally fails closed
-without an explicit desktop-user SID. Run the matching
-Boundless-<version>-windows-x64-install.ps1 helper as described below; it captures
+Extract the release's Boundless-<version>-windows-x64.zip and double-click
+Install.cmd as the intended desktop user. The complete MSI is included.
+The launcher runs the matching Boundless-<version>-windows-x64-install.ps1; it captures
 the intended user's SID before UAC and verifies the installed service, API, and
 tray before reporting success.
 
@@ -26,7 +26,7 @@ This installer deploys:
 
 Recommended flow
 ----------------
-1. From the intended desktop user's normal, non-elevated PowerShell session, run the install helper that ships beside the MSI:
+1. Double-click Install.cmd from the extracted bundle. From the intended desktop user's normal, non-elevated PowerShell session, the equivalent command is:
 
    powershell -NoProfile -ExecutionPolicy Bypass -File .\Boundless-<version>-windows-x64-install.ps1
 
@@ -113,20 +113,20 @@ Recovery
 
 Connectivity diagnostics
 ------------------------
-- Boundless-ConnectivityDiagnostics.ps1 is read-only. It checks local listener/process ownership for TCP 15100, 15101, and 15200 and, when a remote host is supplied, remote TCP reachability for the same ports.
-- TCP 15100 is the default Boundless transport port. TCP 15200 is the default nearby pairing port. TCP 15101 is included to diagnose Mouse Without Borders / PowerToys side-by-side listener ownership during dogfood.
-- In JSON output, firewall_hint reports read-only evidence for the expected policy shape: enabled inbound allow rules for %ProgramFiles%\Boundless\boundless-service.exe, Private profile, TCP 15100 and 15200, and LocalSubnet-or-narrower remote scope. It also flags broad/Public/Any-style matching rules. TCP 15101 remains diagnostics-only, not a default firewall requirement.
+- Boundless-ConnectivityDiagnostics.ps1 is read-only. It checks listener/process ownership and optional remote TCP reachability for 16100/16200 plus legacy/MWB observations on 15100/15101/15200.
+- TCP 16100 is the default transport port. TCP 16200 is the default nearby pairing port.
+- In JSON output, firewall_hint reports read-only evidence for enabled inbound allow rules for %ProgramFiles%\Boundless\boundless-service.exe, Private profile, TCP 16100 and 16200, and LocalSubnet-or-narrower remote scope. It also flags broad/Public/Any-style matching rules. Legacy/MWB ports remain diagnostics-only.
 - Example:
 
   powershell -NoProfile -ExecutionPolicy Bypass -File "%ProgramFiles%\Boundless\Boundless-ConnectivityDiagnostics.ps1" -RemoteHost 10.10.0.187
 
-- If Mouse Without Borders or another process owns required Boundless TCP 15100 or 15200 during side-by-side dogfood, configure the same alternate Boundless network_port on every participating machine before pairing. Nearby pairing uses network_port + 100, so network_port 16100 pairs on TCP 16200. Mouse Without Borders on diagnostics-only TCP 15101 is evidence to record, not a Boundless pairing or transport collision by itself.
+- Old schema 2-6 configs using default 15100 migrate to 16100 with an exact config.json.pre-v7.bak recovery copy. Custom ports remain unchanged. Nearby pairing uses network_port + 100. Disable competing MWB input sharing during Boundless qualification.
 - Boundless does not silently create firewall rules. If you add rules manually, use an elevated shell only after explicit approval, restrict them to the Private profile, and scope them to %ProgramFiles%\Boundless\boundless-service.exe.
 - Do not expose Boundless ports on Public networks or through router port forwarding.
 
 Notes
 -----
-- The MSI blocks over an existing legacy script-installed Boundless layout. Remove the old script-based install first, then rerun the installer.
+- The bundled helper retires recognized legacy per-user payloads and matching shortcuts/uninstall registration into a private recovery archive before MSI installation. It preserves user config/trust and stops on unknown layouts or unsafe running processes. A per-user-to-service transition requires pairing again because the service has its own identity/state.
 - The MSI fails closed without BOUNDLESS_ALLOWED_USER_SID, and the helper refuses to infer a user from an already-elevated shell by default, so elevation does not silently authorize the wrong Windows account.
 - The tray and CLI default to the local named-pipe API endpoint.
 - If your daemon is configured for TCP, launch the tray or CLI with an explicit endpoint.

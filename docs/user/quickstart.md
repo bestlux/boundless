@@ -4,21 +4,21 @@ Install the same Boundless build on both PCs, open the tray dashboard, pair them
 
 ## Install
 
-1. Download the Windows MSI and matching `Boundless-<version>-windows-x64-install.ps1` helper from the same release into one folder.
-2. In the intended desktop user's normal PowerShell session, run:
+1. Download `Boundless-<version>-windows-x64.zip` from the release, copy it to each PC, and choose **Extract All**. The ZIP includes the complete MSI and matching helper, so installation does not download another package.
+2. Sign in as the intended desktop user and double-click **Install.cmd** in the extracted folder. Approve the Windows elevation prompt and leave the window open until the checks finish.
 
-   ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File .\Boundless-<version>-windows-x64-install.ps1
-   ```
-
-   The helper identifies the desktop user before the Windows elevation prompt. The current installer still requires this helper; simply double-clicking the MSI without its required user property is not the supported path. See [Service Mode](service-mode.md) for the administrative fallback.
+   The launcher runs the matching helper, which identifies the desktop user before elevation and verifies the installed service, API, and tray. Unsigned preview builds may display **Unknown publisher**. See [Service Mode](service-mode.md) for the administrative fallback.
 
 3. Launch Boundless from the Start Menu or desktop shortcut. Choose **Dashboard** from its tray icon if the window is hidden.
 4. Check **Home**. If the background runtime is unavailable, open **Support** before attempting pairing.
 
 The installer puts binaries in `%ProgramFiles%\Boundless` and installs `BoundlessService`. Keep one service-owned runtime; starting a second per-user daemon is not a repair step. The MSI does not add the CLI to `PATH`.
 
+Existing MSI installs are upgraded. Recognized old per-user installs are retired with a recovery copy, and supported old configs migrate with a backup. Moving from a per-user daemon to the machine service requires pairing again. See [Migration](migration.md) for the exact preservation and rollback behavior.
+
 ## Pair
+
+The default transport and nearby pairing ports are TCP **16100** and **16200**. If Windows Firewall blocks pairing, follow the scoped Private-network instructions in [Troubleshooting](troubleshooting.md#firewall-or-network-reachability); this preview does not add firewall rules automatically. Disable Mouse Without Borders input sharing while qualifying Boundless, even though their default ports now differ.
 
 On both PCs, open Boundless. From **Home → Add a PC**, choose the other PC from discovery or enter its host address. Follow the code-entry flow shown by Boundless and verify the intended PC before completing it. Pairing establishes trust; it does not imply the peer is online or ready to accept input.
 

@@ -278,9 +278,22 @@ jobs:
             -RequireSigning:$requireSigning `
             -Files @("${{ steps.package.outputs.installer_path }}")
 
+      - name: Package Windows transfer bundle
+        id: bundle
+        shell: pwsh
+        run: |
+          $version = "${{ needs.release-context.outputs.tag_name }}".TrimStart('v')
+          $bundlePath = Join-Path (Resolve-Path .).Path "Boundless-$version-windows-x64.zip"
+          ./.release-tooling/scripts/release/package-windows-bundle.ps1 `
+            -Version $version `
+            -InstallerPath "${{ steps.package.outputs.installer_path }}" `
+            -HelperPath "${{ steps.package.outputs.installer_helper_path }}" `
+            -OutputPath $bundlePath
+          "bundle_path=$bundlePath" >> $env:GITHUB_OUTPUT
+
       - name: Validate Windows asset name
         shell: pwsh
-        run: ./.release-tooling/scripts/release/assert-release-consistency.ps1 -RepoRoot (Resolve-Path source).Path -Tag "${{ needs.release-context.outputs.tag_name }}" -AssetPaths @("${{ steps.package.outputs.installer_path }}", "${{ steps.package.outputs.installer_helper_path }}") -CheckWindowsInstallerVersion
+        run: ./.release-tooling/scripts/release/assert-release-consistency.ps1 -RepoRoot (Resolve-Path source).Path -Tag "${{ needs.release-context.outputs.tag_name }}" -AssetPaths @("${{ steps.package.outputs.installer_path }}", "${{ steps.package.outputs.installer_helper_path }}", "${{ steps.bundle.outputs.bundle_path }}") -CheckWindowsInstallerVersion
 
       - name: Upload Windows release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -289,6 +302,7 @@ jobs:
           path: |
             ${{ steps.package.outputs.installer_path }}
             ${{ steps.package.outputs.installer_helper_path }}
+            ${{ steps.bundle.outputs.bundle_path }}
 
   validate-windows-installer:
     runs-on: windows-latest
@@ -361,13 +375,24 @@ jobs:
           }
           "installer_path=$($previousInstallers[0].FullName)" >> $env:GITHUB_OUTPUT
 
+      - name: Verify and extract the Windows transfer bundle
+        id: bundle
+        shell: pwsh
+        run: |
+          $version = "${{ needs.release-context.outputs.tag_name }}".TrimStart('v')
+          $bundlePath = Join-Path (Resolve-Path artifacts).Path "Boundless-$version-windows-x64.zip"
+          ./.release-tooling/scripts/release/assert-windows-bundle.ps1 `
+            -Version $version -BundlePath $bundlePath `
+            -InstallerPath "artifacts/Boundless-$version-windows-x64.msi" `
+            -HelperPath "artifacts/Boundless-$version-windows-x64-install.ps1"
+          $extracted = Join-Path (Resolve-Path artifacts).Path 'extracted bundle'
+          Expand-Archive -LiteralPath $bundlePath -DestinationPath $extracted
+          "installer_path=$(Join-Path $extracted "Boundless-$version-windows-x64.msi")" >> $env:GITHUB_OUTPUT
+
       - name: Validate Windows installer
         shell: pwsh
         run: |
-          $installer = (Get-ChildItem -LiteralPath artifacts -Filter *.msi -File | Select-Object -First 1).FullName
-          if (-not $installer) {
-            throw "Downloaded installer artifact was not found."
-          }
+          $installer = "${{ steps.bundle.outputs.installer_path }}"
           $stableRelease = [System.Convert]::ToBoolean('${{ !contains(needs.release-context.outputs.tag_name, '-') }}')
           $signingRequiredByPolicy = [System.Convert]::ToBoolean('${{ vars.WINDOWS_SIGN_REQUIRED == 'true' }}')
           $requireSignature = $stableRelease -and $signingRequiredByPolicy
@@ -458,12 +483,14 @@ jobs:
           find dist -mindepth 2 -type f -exec mv -t dist {} +
           find dist -mindepth 1 -type d -empty -delete
           windows_installer="$(find dist -maxdepth 1 -type f -name 'Boundless-*.msi' | head -n 1)"
+          windows_bundle="$(find dist -maxdepth 1 -type f -name 'Boundless-*-windows-x64.zip' | head -n 1)"
           linux_archive="$(find dist -maxdepth 1 -type f -name 'boundless-*-linux-x64.tar.gz' | head -n 1)"
-          if [[ -z "$windows_installer" || -z "$linux_archive" ]]; then
+          if [[ -z "$windows_installer" || -z "$windows_bundle" || -z "$linux_archive" ]]; then
             echo "Expected release artifacts were not found in dist/" >&2
             exit 1
           fi
           echo "windows_installer=$windows_installer" >> "$GITHUB_OUTPUT"
+          echo "windows_bundle=$windows_bundle" >> "$GITHUB_OUTPUT"
           echo "linux_archive=$linux_archive" >> "$GITHUB_OUTPUT"
 
       - name: Validate release metadata
@@ -492,6 +519,16 @@ jobs:
             exit 1
           fi
           gh pr view "${pr_number}" --json body --jq .body > release-notes.md
+          cat >> release-notes.md <<'NOTES'
+
+          ## Windows qualification preview
+
+          Download **Boundless-<version>-windows-x64.zip**, copy it to each Windows PC, extract all files, then double-click **Install.cmd** as the intended desktop user. The ZIP includes the complete MSI and its matching installer helper. Recognized legacy per-user installs are retired with a recovery copy; supported config migrations retain a byte-for-byte backup. A transition from a per-user daemon to the machine service requires pairing again.
+
+          New transport/pairing defaults are **TCP 16100/16200**, avoiding Mouse Without Borders' common 15100/15101 listeners. Existing custom ports are preserved. Install the same version on both PCs and disable competing input sharing while testing.
+
+          This is a prerelease for physical two-PC qualification. Automated build and installer checks do not establish input, clipboard, recovery, or endurance on the actual PCs. Windows signing remains optional for this preview.
+          NOTES
           echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
 
       - name: Recreate draft release with tag
@@ -525,6 +562,12 @@ jobs:
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
         with:
           subject-path: ${{ steps.assets.outputs.linux_archive }}
+
+      - name: Attest Windows transfer bundle
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-path: ${{ steps.assets.outputs.windows_bundle }}
 
       - name: Attest checksum manifest
         if: ${{ !github.event.repository.private }}
