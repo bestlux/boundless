@@ -25,7 +25,6 @@ socket2.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
-tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 tokio-rustls.workspace = true
