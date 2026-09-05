@@ -128,6 +128,117 @@ async fn connect_fixture(
     Ok(stream)
 }
 
+#[tokio::test]
+async fn migrated_manual_peer_keeps_trust_and_connects_to_its_new_advertised_endpoint() {
+    let a_id = "10000000-0000-0000-0000-000000000003";
+    let b_id = "20000000-0000-0000-0000-000000000004";
+    let mut a = Fixture::new(a_id, b_id);
+    let b = Fixture::new(b_id, a_id);
+    a.trust(&b, b_id);
+    b.trust(&a, a_id);
+    let identity_before = a.state.identity().device_cert_pem.clone();
+    let trust_before = serde_json::to_value(
+        a.state
+            .trusted_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.machine_id == b_id)
+            .unwrap(),
+    )
+    .unwrap();
+    let config_path = a.root.join("config.json");
+    let mut config = a.state.snapshot().await;
+    config.config_version = "6".into();
+    config.network_port = 15100;
+    config.peers[0].address = "manual-peer.local:15100".into();
+    crate::config::save_config_at(&config_path, &config).unwrap();
+    a.state = AppState::load_or_create_with_paths(config_path, a.root.join("security")).unwrap();
+
+    let peer = a.state.get_peer(b_id).await.unwrap();
+    assert_eq!(peer.address, "manual-peer.local:16100");
+    assert_eq!(a.state.identity().device_cert_pem, identity_before);
+    let trusted_peer = a
+        .state
+        .trusted_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.machine_id == b_id)
+        .unwrap();
+    assert_eq!(serde_json::to_value(trusted_peer).unwrap(), trust_before);
+    assert_eq!(
+        runtime::outbound_target_candidates(&peer.address, &[]),
+        ["manual-peer.local:16100"],
+        "manual-only networks must retain a usable migrated fallback"
+    );
+
+    // Discovery may advertise a custom port. Connect to the learned address with
+    // the unchanged pinned trust, while retaining the durable manual fallback.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let advertised = listener.local_addr().unwrap();
+    a.state
+        .set_discovered_endpoint(b_id, "Custom-port peer", advertised)
+        .await;
+    let learned = a.state.discovered_endpoint_candidates(b_id).await;
+    let candidates = runtime::outbound_target_candidates(&peer.address, &learned);
+    assert_eq!(
+        candidates,
+        [advertised.to_string(), "manual-peer.local:16100".into()]
+    );
+    let server_state = b.state.clone();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await?;
+        session::handle_incoming_connection(server_state, socket, None).await
+    });
+    let stream = time::timeout(
+        Duration::from_secs(5),
+        connect_fixture(&a.state, b_id, &candidates[0]),
+    )
+    .await
+    .expect("bounded TLS handshake")
+    .expect("unchanged trust accepts discovered endpoint");
+    let client_state = a.state.clone();
+    let client = tokio::spawn(async move {
+        session::run_authenticated_outbound_session(client_state, b_id.into(), stream, None).await
+    });
+    time::timeout(Duration::from_secs(5), async {
+        while !a
+            .state
+            .get_peer(b_id)
+            .await
+            .is_some_and(|peer| peer.connected)
+            || !b
+                .state
+                .get_peer(a_id)
+                .await
+                .is_some_and(|peer| peer.connected)
+        {
+            time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("both migrated peers complete authenticated Hello negotiation");
+    client.abort();
+    server.abort();
+    let _ = client.await;
+    let _ = server.await;
+    a.state.clear_discovered_endpoint(b_id).await;
+    assert_eq!(
+        a.state.get_peer(b_id).await.unwrap().address,
+        "manual-peer.local:16100"
+    );
+    let trusted_peer = a
+        .state
+        .trusted_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.machine_id == b_id)
+        .unwrap();
+    assert_eq!(serde_json::to_value(trusted_peer).unwrap(), trust_before);
+}
+
 fn options(peer_id: &str) -> PairedTestOptions {
     PairedTestOptions {
         peer_id: peer_id.into(),

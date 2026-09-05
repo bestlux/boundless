@@ -21,7 +21,7 @@ param(
     [string]$LabelA = "machine-a",
     [string]$LabelB = "machine-b",
     [string]$RecoveryResponderHost = "",
-    [int]$RecoveryResponderPairingPort = 15200,
+    [int]$RecoveryResponderPairingPort = 16200,
     [string]$RecoveryScenarioPrefix = "s4_recovery",
     [int]$RecoveryPendingWaitSeconds = 20,
     [int]$RecoveryPostExpiryGraceSeconds = 2,

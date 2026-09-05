@@ -179,3 +179,15 @@ fn filter_connectable_discovered_peers_hides_self_and_existing_pairings() {
     assert_eq!(filtered[0].machine_id, "peer-machine-5678");
     assert_eq!(filtered[0].display_name, "Office Desktop");
 }
+
+#[test]
+fn discovered_pairing_uses_each_advertised_port_including_new_default_and_custom_ports() {
+    for (transport, pairing) in [(16100, 16200), (25100, 25200), (15100, 15200)] {
+        let mut peer = sample_discovered_peer();
+        peer.endpoint = format!("10.0.0.25:{transport}");
+        peer.endpoint_candidates = vec![peer.endpoint.clone()];
+        let flow = guided_flow_from_discovered_peer(&peer).unwrap();
+        assert_eq!(flow.pairing_port, pairing);
+        assert_eq!(flow.endpoint_candidates, peer.endpoint_candidates);
+    }
+}

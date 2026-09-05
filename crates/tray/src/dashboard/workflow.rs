@@ -277,7 +277,7 @@ impl DashboardApp {
                 );
                 ui.collapsing("Port", |ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.manual_port).desired_width(90.0));
-                    ui.label("Use 15200 unless you changed the pairing port on the other PC.");
+                    ui.label(format!("Use {} unless you changed the pairing port on the other PC.", app_services::desktop::DEFAULT_PAIRING_PORT));
                 });
                 let port_valid = self
                     .manual_port

@@ -35,7 +35,7 @@ pub(super) fn test_app() -> DashboardApp {
         pairing_role_reversal_message: None,
         selected_tab: Tab::Status,
         manual_host: String::new(),
-        manual_port: "15200".to_string(),
+        manual_port: app_services::desktop::DEFAULT_PAIRING_PORT.to_string(),
         pairing_flow: None,
         pairing_challenge: None,
         pairing_code: String::new(),

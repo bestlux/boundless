@@ -14,7 +14,9 @@ use core_security::atomic_write_file;
 use core_transfer::MAX_TRANSFER_BYTES;
 
 const DEFAULT_LAYOUT_MATRIX: &str = "self";
-const RUNTIME_CONFIG_VERSION: &str = "6";
+const RUNTIME_CONFIG_VERSION: &str = "7";
+const LEGACY_DEFAULT_NETWORK_PORT: u16 = 15100;
+mod migration_backup;
 const MIGRATABLE_PROTOCOL_VERSIONS: &[&str] = &["4.1.0", "4.2.0", "4.3.0", "4.4.0"];
 const DEFAULT_ANTI_IDLE_RECENT_ACTIVITY_WINDOW_SECS: u32 = 300;
 const DEFAULT_ANTI_IDLE_PULSE_INTERVAL_SECS: u32 = 30;
@@ -200,7 +202,7 @@ impl Default for RuntimeConfig {
             protocol_version: PROTOCOL_CURRENT.to_string(),
             layout_matrix: DEFAULT_LAYOUT_MATRIX.to_string(),
             auto_start: true,
-            network_port: 15100,
+            network_port: app_services::desktop::DEFAULT_NETWORK_PORT,
             features,
             anti_idle: AntiIdleConfig::default(),
             hotkeys,
@@ -297,6 +299,7 @@ pub fn config_path() -> PathBuf {
 }
 
 pub fn load_or_create_config_at(path: &Path) -> Result<RuntimeConfig> {
+    migration_backup::validate_path(path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -307,11 +310,11 @@ pub fn load_or_create_config_at(path: &Path) -> Result<RuntimeConfig> {
         return Ok(config);
     }
 
-    let data = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let data = migration_backup::read_bounded_config(path)?;
     let mut value: serde_json::Value =
-        serde_json::from_str(&data).with_context(|| format!("parse {}", path.display()))?;
+        serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display()))?;
 
-    migrate_config_value(path, &mut value)?;
+    let changed = migrate_config_value(path, &mut value)?;
 
     let config: RuntimeConfig =
         serde_json::from_value(value).with_context(|| format!("parse {}", path.display()))?;
@@ -376,10 +379,16 @@ pub fn load_or_create_config_at(path: &Path) -> Result<RuntimeConfig> {
         );
     }
 
+    if changed {
+        // Validate the entire migrated configuration before touching the original.
+        migration_backup::create_once(path, &data)?;
+        save_config_at(path, &config)?;
+    }
     Ok(config)
 }
 
 pub fn save_config_at(path: &Path, config: &RuntimeConfig) -> Result<()> {
+    migration_backup::validate_path(path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -388,6 +397,9 @@ pub fn save_config_at(path: &Path, config: &RuntimeConfig) -> Result<()> {
     cloned.updated_at = Utc::now();
 
     let payload = serde_json::to_string_pretty(&cloned).context("serialize config")?;
+    if payload.len() as u64 > migration_backup::MAX_CONFIG_BYTES {
+        bail!("configuration exceeds the 4 MiB size limit");
+    }
     atomic_write_file(path, payload).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
@@ -398,164 +410,109 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "boundless-host".to_string())
 }
 
-fn migrate_config_value(path: &Path, value: &mut serde_json::Value) -> Result<()> {
+fn migrate_config_value(path: &Path, value: &mut serde_json::Value) -> Result<bool> {
+    let original = value.clone();
     let Some(object) = value.as_object_mut() else {
         bail!(
             "invalid config: root must be an object in `{}`",
             path.display()
         );
     };
-
-    let Some(config_version) = object
+    let config_version = object
         .get("config_version")
-        .and_then(|entry| entry.as_str())
-    else {
+        .and_then(serde_json::Value::as_str)
+        .context("invalid config: config_version is required")?
+        .to_string();
+    if !matches!(
+        config_version.as_str(),
+        "2" | "3" | "4" | "5" | "6" | RUNTIME_CONFIG_VERSION
+    ) {
         bail!(
-            "invalid config: config_version is required in `{}`",
+            "unsupported config version `{config_version}`; expected `{RUNTIME_CONFIG_VERSION}`. use a compatible build or restore a pre-upgrade configuration backup for `{}`",
             path.display()
         );
-    };
-
-    match config_version {
-        RUNTIME_CONFIG_VERSION | "5" => {
-            let mut changed = config_version != RUNTIME_CONFIG_VERSION;
-            if changed {
-                object.insert(
-                    "config_version".to_string(),
-                    serde_json::Value::String(RUNTIME_CONFIG_VERSION.to_string()),
-                );
-            }
-            if let Some(peers) = object
-                .get_mut("peers")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                for peer in peers
-                    .iter_mut()
-                    .filter_map(serde_json::Value::as_object_mut)
-                {
-                    changed |= peer.remove("connected").is_some();
-                    changed |= peer.remove("last_seen").is_some();
-                }
-            }
-            if !object.contains_key("anti_idle") {
-                object.insert(
-                    "anti_idle".to_string(),
-                    serde_json::to_value(AntiIdleConfig::default())
-                        .context("serialize anti_idle default")?,
-                );
-                changed = true;
-            }
-            if !object.contains_key("file_transfer") {
-                object.insert(
-                    "file_transfer".to_string(),
-                    serde_json::to_value(FileTransferConfig::default())
-                        .context("serialize file_transfer default")?,
-                );
-                changed = true;
-            }
-            if !object.contains_key("input_handoff") {
-                object.insert(
-                    "input_handoff".to_string(),
-                    serde_json::to_value(InputHandoffConfig::default())
-                        .context("serialize input_handoff default")?,
-                );
-                changed = true;
-            }
-            if let Some(protocol_version) = object
-                .get("protocol_version")
-                .and_then(|entry| entry.as_str())
-                && protocol_version != PROTOCOL_CURRENT.to_string()
-                && MIGRATABLE_PROTOCOL_VERSIONS.contains(&protocol_version)
-            {
-                object.insert(
-                    "protocol_version".to_string(),
-                    serde_json::Value::String(PROTOCOL_CURRENT.to_string()),
-                );
-                changed = true;
-            }
-            if changed {
-                let migrated: RuntimeConfig =
-                    serde_json::from_value(serde_json::Value::Object(object.clone()))
-                        .with_context(|| format!("parse migrated {}", path.display()))?;
-                save_config_at(path, &migrated)?;
-            }
-            Ok(())
-        }
-        "4" => {
-            object.insert(
-                "config_version".to_string(),
-                serde_json::Value::String(RUNTIME_CONFIG_VERSION.to_string()),
-            );
-            object.insert(
-                "protocol_version".to_string(),
-                serde_json::Value::String(PROTOCOL_CURRENT.to_string()),
-            );
-            if !object.contains_key("anti_idle") {
-                object.insert(
-                    "anti_idle".to_string(),
-                    serde_json::to_value(AntiIdleConfig::default())
-                        .context("serialize anti_idle default")?,
-                );
-            }
-            if !object.contains_key("file_transfer") {
-                object.insert(
-                    "file_transfer".to_string(),
-                    serde_json::to_value(FileTransferConfig::default())
-                        .context("serialize file_transfer default")?,
-                );
-            }
-            if !object.contains_key("input_handoff") {
-                object.insert(
-                    "input_handoff".to_string(),
-                    serde_json::to_value(InputHandoffConfig::default())
-                        .context("serialize input_handoff default")?,
-                );
-            }
-
-            let migrated: RuntimeConfig =
-                serde_json::from_value(serde_json::Value::Object(object.clone()))
-                    .with_context(|| format!("parse migrated {}", path.display()))?;
-            save_config_at(path, &migrated)?;
-            Ok(())
-        }
-        "2" | "3" => {
-            object.insert(
-                "config_version".to_string(),
-                serde_json::Value::String(RUNTIME_CONFIG_VERSION.to_string()),
-            );
-            object.insert(
-                "protocol_version".to_string(),
-                serde_json::Value::String(PROTOCOL_CURRENT.to_string()),
-            );
-            object.insert(
-                "anti_idle".to_string(),
-                serde_json::to_value(AntiIdleConfig::default())
-                    .context("serialize anti_idle default")?,
-            );
-            object.insert(
-                "file_transfer".to_string(),
-                serde_json::to_value(FileTransferConfig::default())
-                    .context("serialize file_transfer default")?,
-            );
-            object.insert(
-                "input_handoff".to_string(),
-                serde_json::to_value(InputHandoffConfig::default())
-                    .context("serialize input_handoff default")?,
-            );
-
-            let migrated: RuntimeConfig =
-                serde_json::from_value(serde_json::Value::Object(object.clone()))
-                    .with_context(|| format!("parse migrated {}", path.display()))?;
-            save_config_at(path, &migrated)?;
-            Ok(())
-        }
-        other => bail!(
-            "unsupported config version `{}`; expected `{}`. use a compatible build or restore a pre-upgrade configuration backup for `{}`",
-            other,
-            RUNTIME_CONFIG_VERSION,
-            path.display()
-        ),
     }
+
+    // Older schemas did not record default-vs-explicit intent. Treat exactly the
+    // former product default as migratable once; explicit schema-7 ports survive.
+    let migrate_default_ports = config_version != RUNTIME_CONFIG_VERSION;
+    if migrate_default_ports {
+        object.insert("config_version".into(), RUNTIME_CONFIG_VERSION.into());
+        if object
+            .get("network_port")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(LEGACY_DEFAULT_NETWORK_PORT))
+        {
+            object.insert(
+                "network_port".into(),
+                app_services::desktop::DEFAULT_NETWORK_PORT.into(),
+            );
+        }
+    }
+    if let Some(peers) = object
+        .get_mut("peers")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for peer in peers
+            .iter_mut()
+            .filter_map(serde_json::Value::as_object_mut)
+        {
+            peer.remove("connected");
+            peer.remove("last_seen");
+            if migrate_default_ports
+                && let Some(address) = peer.get_mut("address")
+                && let Some(migrated) = address.as_str().and_then(migrate_legacy_peer_address)
+            {
+                *address = migrated.into();
+            }
+        }
+    }
+    for (key, default) in [
+        (
+            "anti_idle",
+            serde_json::to_value(AntiIdleConfig::default())?,
+        ),
+        (
+            "file_transfer",
+            serde_json::to_value(FileTransferConfig::default())?,
+        ),
+        (
+            "input_handoff",
+            serde_json::to_value(InputHandoffConfig::default())?,
+        ),
+    ] {
+        object.entry(key).or_insert(default);
+    }
+    let protocol_version = object
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_str);
+    // Schemas 2-4 already used unconditional protocol migration. Later schemas
+    // only accept the explicitly known previous protocol versions.
+    if matches!(config_version.as_str(), "2" | "3" | "4")
+        || protocol_version.is_some_and(|version| MIGRATABLE_PROTOCOL_VERSIONS.contains(&version))
+    {
+        object.insert(
+            "protocol_version".into(),
+            PROTOCOL_CURRENT.to_string().into(),
+        );
+    }
+    Ok(*value != original)
+}
+
+fn migrate_legacy_peer_address(address: &str) -> Option<String> {
+    let (host, port) = address.trim().rsplit_once(':')?;
+    if port.parse::<u16>().ok()? != LEGACY_DEFAULT_NETWORK_PORT || host.is_empty() {
+        return None;
+    }
+    // Keep hostnames, IPv4, bracketed IPv6 and interface scope IDs byte-for-byte.
+    // An unbracketed IPv6 suffix is not an unambiguous host:port endpoint.
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        return None;
+    }
+    Some(format!(
+        "{host}:{}",
+        app_services::desktop::DEFAULT_NETWORK_PORT
+    ))
 }
 
 #[cfg(test)]
@@ -878,7 +835,7 @@ mod tests {
         .expect("seed config");
 
         let config = load_or_create_config_at(&path).expect("migrate config");
-        assert_eq!(config.config_version, "6");
+        assert_eq!(config.config_version, "7");
         assert_eq!(config.anti_idle, AntiIdleConfig::default());
         assert_eq!(config.input_handoff, InputHandoffConfig::default());
 
@@ -927,7 +884,7 @@ mod tests {
         .expect("write seeded config");
 
         let config = load_or_create_config_at(&path).expect("migrate v4 config");
-        assert_eq!(config.config_version, "6");
+        assert_eq!(config.config_version, "7");
         assert!(!config.anti_idle.enabled);
         assert_eq!(config.anti_idle.recent_activity_window_secs, 900);
         assert!(config.anti_idle.allow_on_battery);
@@ -1001,5 +958,220 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn supported_old_configs_migrate_default_ports_once_with_exact_backup_and_preserved_settings() {
+        for version in ["2", "3", "4", "5", "6"] {
+            let root = std::env::temp_dir().join(format!(
+                "boundless-config-port-migration-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("config.json");
+            let mut seed = RuntimeConfig {
+                config_version: version.into(),
+                network_port: 15100,
+                device_name: "Office PC".into(),
+                layout_matrix: "self,peer-1".into(),
+                ..RuntimeConfig::default()
+            };
+            seed.anti_idle.enabled = false;
+            seed.file_transfer.receive_dir = root.join("keep-my-files").display().to_string();
+            seed.input_handoff.corner_block_px = 72;
+            seed.features.insert("share_clipboard".into(), false);
+            seed.hotkeys
+                .insert("reconnect".into(), "Ctrl+Alt+F8".into());
+            let mut value = serde_json::to_value(&seed).unwrap();
+            value["peers"] = serde_json::json!([
+                {"peer_id":"peer-1", "display_name":"Office laptop", "address":"office.local:15100", "connected":true, "last_seen":"2026-01-01T00:00:00Z"},
+                {"peer_id":"peer-2", "display_name":"Custom", "address":"10.0.0.7:25100"},
+                {"peer_id":"peer-3", "display_name":"IPv6", "address":"[fe80::7%4]:15100"}
+            ]);
+            let original = format!(
+                "  {}\r\n",
+                serde_json::to_string_pretty(&value)
+                    .unwrap()
+                    .replace('\n', "\r\n")
+            )
+            .into_bytes();
+            std::fs::write(&path, &original).unwrap();
+            let migrated = load_or_create_config_at(&path).unwrap();
+            assert_eq!(migrated.network_port, 16100);
+            assert_eq!(migrated.config_version, "7");
+            assert_eq!(migrated.machine_id, seed.machine_id);
+            assert_eq!(migrated.device_name, seed.device_name);
+            assert_eq!(migrated.layout_matrix, seed.layout_matrix);
+            assert_eq!(migrated.anti_idle, seed.anti_idle);
+            assert_eq!(migrated.file_transfer, seed.file_transfer);
+            assert_eq!(migrated.input_handoff, seed.input_handoff);
+            assert_eq!(migrated.features, seed.features);
+            assert_eq!(migrated.hotkeys, seed.hotkeys);
+            assert_eq!(migrated.peers[0].address, "office.local:16100");
+            assert_eq!(migrated.peers[0].peer_id, "peer-1");
+            assert_eq!(migrated.peers[0].display_name, "Office laptop");
+            assert!(!migrated.peers[0].connected);
+            assert_eq!(migrated.peers[1].address, "10.0.0.7:25100");
+            assert_eq!(migrated.peers[2].address, "[fe80::7%4]:16100");
+            let backup = super::migration_backup::backup_path(&path).unwrap();
+            assert_eq!(std::fs::read(&backup).unwrap(), original);
+            let once = std::fs::read(&path).unwrap();
+            load_or_create_config_at(&path).unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                once,
+                "second launch must not rewrite config"
+            );
+            assert_eq!(std::fs::read(&backup).unwrap(), original);
+            assert_eq!(
+                std::fs::read_dir(&root).unwrap().count(),
+                2,
+                "no growing set of backups/staging files"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_preserves_custom_listener_ports_and_current_explicit_legacy_ports() {
+        for (version, port, peer_port) in [("6", 25100, 27100), ("7", 15100, 15100)] {
+            let root = std::env::temp_dir().join(format!(
+                "boundless-config-custom-ports-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let path = root.join("config.json");
+            let seed = RuntimeConfig {
+                config_version: version.into(),
+                network_port: port,
+                peers: vec![super::PeerConfig {
+                    peer_id: "trusted".into(),
+                    display_name: "Custom port PC".into(),
+                    address: format!("manual.local:{peer_port}"),
+                    connected: false,
+                    last_seen: chrono::Utc::now(),
+                }],
+                ..RuntimeConfig::default()
+            };
+            save_config_at(&path, &seed).unwrap();
+            let migrated = load_or_create_config_at(&path).unwrap();
+            assert_eq!(migrated.network_port, port);
+            assert_eq!(migrated.peers[0].address, seed.peers[0].address);
+            assert_eq!(migrated.machine_id, seed.machine_id);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_validation_or_backup_failure_does_not_rewrite_original() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-config-invalid-migration-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("config.json");
+        let seed = RuntimeConfig {
+            config_version: "6".into(),
+            network_port: 15100,
+            layout_matrix: "".into(),
+            ..RuntimeConfig::default()
+        };
+        save_config_at(&path, &seed).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(load_or_create_config_at(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let backup = super::migration_backup::backup_path(&path).unwrap();
+        assert!(!backup.exists());
+        let valid = RuntimeConfig {
+            layout_matrix: "self".into(),
+            ..seed
+        };
+        save_config_at(&path, &valid).unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(load_or_create_config_at(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(backup.is_dir());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_config_is_rejected_without_backup_or_rewrite() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-config-oversized-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.json");
+        let length = super::migration_backup::MAX_CONFIG_BYTES + 1;
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(length)
+            .unwrap();
+        let error = load_or_create_config_at(&path).unwrap_err();
+        assert!(error.to_string().contains("4 MiB"));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
+        assert!(
+            !super::migration_backup::backup_path(&path)
+                .unwrap()
+                .exists()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_complete_migration_backup_is_not_overwritten() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-config-backup-once-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("config.json");
+        let seed = RuntimeConfig {
+            config_version: "6".into(),
+            network_port: 15100,
+            ..RuntimeConfig::default()
+        };
+        save_config_at(&path, &seed).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        load_or_create_config_at(&path).unwrap();
+        let changed = RuntimeConfig {
+            device_name: "renamed before retry".into(),
+            ..seed
+        };
+        save_config_at(&path, &changed).unwrap();
+        let loaded = load_or_create_config_at(&path).unwrap();
+        assert_eq!(loaded.device_name, changed.device_name);
+        assert_eq!(
+            std::fs::read(super::migration_backup::backup_path(&path).unwrap()).unwrap(),
+            original
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn interrupted_backup_is_preserved_and_retries_do_not_accumulate_copies() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-config-backup-interrupted-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("config.json");
+        let seed = RuntimeConfig {
+            config_version: "6".into(),
+            network_port: 15100,
+            ..RuntimeConfig::default()
+        };
+        save_config_at(&path, &seed).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let pending = root.join("config.json.pre-v7.bak.pending");
+        std::fs::write(&pending, b"interrupted backup").unwrap();
+        for _ in 0..3 {
+            assert!(load_or_create_config_at(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(std::fs::read(&pending).unwrap(), b"interrupted backup");
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        }
+        std::fs::remove_file(&pending).unwrap();
+        assert_eq!(load_or_create_config_at(&path).unwrap().network_port, 16100);
+        assert_eq!(
+            std::fs::read(super::migration_backup::backup_path(&path).unwrap()).unwrap(),
+            original
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

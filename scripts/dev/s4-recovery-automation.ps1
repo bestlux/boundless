@@ -4,7 +4,7 @@ param(
     [string]$LabelA = "machine-a",
     [string]$LabelB = "machine-b",
     [string]$ResponderHost = "192.0.2.10",
-    [int]$ResponderPairingPort = 15200,
+    [int]$ResponderPairingPort = 16200,
     [int]$EventsLimit = 300,
     [string]$ScenarioPrefix = "s4_recovery",
     [int]$PendingWaitSeconds = 20,

@@ -1313,7 +1313,8 @@ mod windows_app {
                 .map(|port| format!(" TCP {port}"))
                 .unwrap_or_else(|| " the nearby pairing TCP port".to_string());
             return format!(
-                "{message}\n\nThe remote pairing service was discovered, but{remote_port} was not reachable or did not respond.\nVerify both machines are on a trusted Private network. If a firewall rule is needed, make it a manual, admin-approved Private-profile rule scoped to %ProgramFiles%\\Boundless\\boundless-service.exe. Transport also needs TCP 15100 after trust is established."
+                "{message}\n\nThe remote pairing service was discovered, but{remote_port} was not reachable or did not respond.\nVerify both machines are on a trusted Private network. If a firewall rule is needed, make it a manual, admin-approved Private-profile rule scoped to %ProgramFiles%\\Boundless\\boundless-service.exe. Transport also needs the other PC's configured TCP port (default {transport_port}) after trust is established.",
+                transport_port = app_services::desktop::DEFAULT_NETWORK_PORT
             );
         }
 
@@ -1498,7 +1499,7 @@ mod windows_app {
             assert!(formatted.contains("Private network"));
             assert!(formatted.contains("admin-approved"));
             assert!(formatted.contains("%ProgramFiles%\\Boundless\\boundless-service.exe"));
-            assert!(formatted.contains("TCP 15100"));
+            assert!(formatted.contains("default 16100"));
         }
 
         #[test]

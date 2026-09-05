@@ -16,7 +16,13 @@ const REDACTED_SECRET: &str = "[redacted-secret]";
 const REDACTED_ID: &str = "[redacted-id]";
 const REDACTED_FILE_NAME: &str = "[redacted-file-name]";
 const REDACTED_PATH: &str = "[redacted-path]";
-const BOUNDLESS_RELATED_TCP_PORTS: &[u16] = &[15100, 15101, 15200];
+const BOUNDLESS_RELATED_TCP_PORTS: &[u16] = &[
+    15100,
+    15101,
+    15200,
+    crate::desktop::DEFAULT_NETWORK_PORT,
+    crate::desktop::DEFAULT_PAIRING_PORT,
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticExportOptions {
@@ -456,7 +462,7 @@ fn suggested_listener_mitigation(owner_kind: &str, port: u16) -> String {
             "TCP {port} is owned by Boundless; this is expected when the daemon is running."
         ),
         "mouse-without-borders" => format!(
-            "Mouse Without Borders or PowerToys is listening on TCP {port}; stop MWB during Boundless dogfood or move Boundless to an alternate network_port before pairing."
+            "Mouse Without Borders or PowerToys is listening on TCP {port}; current Boundless defaults are TCP 16100/16200. Pause MWB input sharing during Boundless qualification so both apps do not control the same input."
         ),
         "other" => format!(
             "Another local process is listening on TCP {port}; identify the owner, stop it if appropriate, or move Boundless to an alternate network_port for side-by-side testing."
@@ -470,7 +476,7 @@ fn suggested_listener_mitigation(owner_kind: &str, port: u16) -> String {
 fn port_listener_summary(listeners: &[PortListenerDiagnostic]) -> Vec<String> {
     if listeners.is_empty() {
         return vec![
-            "No local listeners were found on Boundless-related TCP ports 15100, 15101, or 15200."
+            "No local listeners were found on current Boundless TCP ports 16100/16200 or legacy comparison ports 15100/15101/15200."
                 .to_string(),
         ];
     }
@@ -1130,7 +1136,7 @@ mod tests {
 
         assert_eq!(snapshot.platform, "windows");
         assert!(snapshot.read_only);
-        assert_eq!(snapshot.ports, vec![15100, 15101, 15200]);
+        assert_eq!(snapshot.ports, vec![15100, 15101, 15200, 16100, 16200]);
         assert_eq!(snapshot.listeners.len(), 3);
         assert_eq!(snapshot.listeners[0].address_family, "ipv4");
         assert_eq!(snapshot.listeners[0].bind_scope, "any");

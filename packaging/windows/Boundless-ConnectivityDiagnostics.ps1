@@ -2,7 +2,7 @@ param(
     [string]$RemoteHost,
 
     [ValidateRange(1, 65535)]
-    [int[]]$Ports = @(15100, 15101, 15200),
+    [int[]]$Ports = @(16100, 16200, 15100, 15101, 15200),
 
     [ValidateRange(1, 30)]
     [int]$TimeoutSeconds = 4,
@@ -112,13 +112,13 @@ function Get-ListenerOwnerKind {
 function Test-RequiredBoundlessPort {
     param([int]$Port)
 
-    return $Port -in @(15100, 15200)
+    return $Port -in @(16100, 16200)
 }
 
 function Test-DiagnosticsOnlyPort {
     param([int]$Port)
 
-    return $Port -eq 15101
+    return $Port -in @(15100, 15101, 15200)
 }
 
 function Get-ListenerMitigation {
@@ -168,16 +168,16 @@ function Get-SideBySideGuidance {
     $diagnosticsOnlyOther = @($entries | Where-Object { (Test-DiagnosticsOnlyPort -Port $_.local_port) -and ($_.owner_kind -eq "other" -or $_.owner_kind -eq "unknown") })
     $guidance = @()
     if (@($requiredCollisions | Where-Object { $_.owner_kind -eq "mouse-without-borders" }).Count -gt 0) {
-        $guidance += "Mouse Without Borders/PowerToys listener ownership was detected on required Boundless TCP 15100 or 15200; stop MWB during Boundless dogfood or configure an alternate Boundless network_port on all participating machines."
+        $guidance += "Mouse Without Borders/PowerToys listener ownership was detected on required Boundless TCP 16100 or 16200; stop MWB during Boundless dogfood or configure an alternate Boundless network_port on all participating machines."
     }
     if (@($requiredCollisions | Where-Object { $_.owner_kind -eq "other" -or $_.owner_kind -eq "unknown" }).Count -gt 0) {
-        $guidance += "A non-Boundless or unresolved listener owns required Boundless TCP 15100 or 15200; resolve local port ownership before resetting trust or changing firewall policy."
+        $guidance += "A non-Boundless or unresolved listener owns required Boundless TCP 16100 or 16200; resolve local port ownership before resetting trust or changing firewall policy."
     }
     if ($diagnosticsOnlyMwb.Count -gt 0 -and $requiredCollisions.Count -eq 0) {
-        $guidance += "Mouse Without Borders/PowerToys is listening only on diagnostics-only TCP 15101; record it as side-by-side evidence, but it is not a Boundless pairing or transport port collision by itself."
+        $guidance += "Mouse Without Borders/PowerToys is listening on legacy comparison ports (15100/15101/15200); record it as side-by-side evidence, but it is not a Boundless pairing or transport port collision by itself."
     }
     if ($diagnosticsOnlyOther.Count -gt 0 -and $requiredCollisions.Count -eq 0) {
-        $guidance += "A non-Boundless or unresolved listener owns diagnostics-only TCP 15101; record it as side-by-side evidence, but it is not a Boundless pairing or transport port collision by itself."
+        $guidance += "A non-Boundless or unresolved listener owns legacy comparison ports (15100/15101/15200); record it as side-by-side evidence, but it is not a Boundless pairing or transport port collision by itself."
     }
     if ($guidance.Count -gt 0) {
         $guidance += "This script is read-only and did not create firewall rules, elevate, or change network state."
@@ -459,7 +459,7 @@ function Get-FirewallPolicyReport {
         [string]$ErrorMessage
     )
 
-    $requiredFirewallPorts = @(15100, 15200)
+    $requiredFirewallPorts = @(16100, 16200)
     $portReports = @(
         foreach ($port in $requiredFirewallPorts) {
             $matches = @($RuleEvidence | Where-Object {
@@ -505,7 +505,7 @@ function Get-FirewallPolicyReport {
 function Get-FirewallRuleHint {
     $serviceExe = Join-Path $env:ProgramFiles "Boundless\boundless-service.exe"
     try {
-        $evidence = @(Get-FirewallRuleEvidence -ExpectedProgram $serviceExe -RequiredPorts @(15100, 15200))
+        $evidence = @(Get-FirewallRuleEvidence -ExpectedProgram $serviceExe -RequiredPorts @(16100, 16200))
         return Get-FirewallPolicyReport -ServiceExe $serviceExe -RuleEvidence $evidence -ErrorMessage $null
     } catch {
         return Get-FirewallPolicyReport -ServiceExe $serviceExe -RuleEvidence @() -ErrorMessage $_.Exception.Message
@@ -514,18 +514,18 @@ function Get-FirewallRuleHint {
 
 function Invoke-FirewallPolicySelfTest {
     $serviceExe = Join-Path $env:ProgramFiles "Boundless\boundless-service.exe"
-    $requiredPorts = @(15100, 15200)
+    $requiredPorts = @(16100, 16200)
     $evidence = @(
-        New-FirewallRuleEvidence -Name "good" -DisplayName "Boundless private" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile @("Private") -Program $serviceExe -Protocol "TCP" -LocalPort @("15100", "15200") -RemoteAddress "LocalSubnet" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
-        New-FirewallRuleEvidence -Name "narrow-cidr" -DisplayName "Boundless narrow" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile "Private" -Program $serviceExe -Protocol "TCP" -LocalPort "15100" -RemoteAddress "10.10.0.12/32" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
+        New-FirewallRuleEvidence -Name "good" -DisplayName "Boundless private" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile @("Private") -Program $serviceExe -Protocol "TCP" -LocalPort @("16100", "16200") -RemoteAddress "LocalSubnet" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
+        New-FirewallRuleEvidence -Name "narrow-cidr" -DisplayName "Boundless narrow" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile "Private" -Program $serviceExe -Protocol "TCP" -LocalPort "16100" -RemoteAddress "10.10.0.12/32" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
         New-FirewallRuleEvidence -Name "broad" -DisplayName "Boundless broad" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile @("Any") -Program $serviceExe -Protocol "Any" -LocalPort "Any" -RemoteAddress "Any" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
-        New-FirewallRuleEvidence -Name "comma-profile" -DisplayName "Boundless comma profile" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile "Private, Public" -Program $serviceExe -Protocol "TCP" -LocalPort "15100, 15200" -RemoteAddress "LocalSubnet" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
+        New-FirewallRuleEvidence -Name "comma-profile" -DisplayName "Boundless comma profile" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile "Private, Public" -Program $serviceExe -Protocol "TCP" -LocalPort "16100, 16200" -RemoteAddress "LocalSubnet" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
         New-FirewallRuleEvidence -Name "diagnostics-only" -DisplayName "Boundless 15101" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile @("Private") -Program $serviceExe -Protocol "TCP" -LocalPort "15101" -RemoteAddress "LocalSubnet" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts
     )
     $report = Get-FirewallPolicyReport -ServiceExe $serviceExe -RuleEvidence $evidence -ErrorMessage $null
 
     if (-not $report.required_ports_covered) {
-        throw "expected TCP 15100 and 15200 coverage"
+        throw "expected TCP 16100 and 16200 coverage"
     }
     if (@($report.required_ports | Where-Object { $_.port -eq 15101 }).Count -ne 0) {
         throw "TCP 15101 must remain diagnostics-only, not a required firewall port"
@@ -542,7 +542,7 @@ function Invoke-FirewallPolicySelfTest {
     if (@($report.broad_or_public_patterns | Where-Object { $_.name -eq "comma-profile" }).Count -ne 1) {
         throw "comma-separated Private, Public profile must be classified as broad/Public"
     }
-    if (@($report.relevant_rules | Where-Object { $_.name -eq "comma-profile" -and @($_.profile).Contains("Private") -and @($_.profile).Contains("Public") -and @($_.local_port).Contains("15100") -and @($_.local_port).Contains("15200") }).Count -ne 1) {
+    if (@($report.relevant_rules | Where-Object { $_.name -eq "comma-profile" -and @($_.profile).Contains("Private") -and @($_.profile).Contains("Public") -and @($_.local_port).Contains("16100") -and @($_.local_port).Contains("16200") }).Count -ne 1) {
         throw "comma-separated scalar fields must be normalized into individual values"
     }
 
@@ -554,36 +554,51 @@ function Invoke-FirewallPolicySelfTest {
         throw "MWB on TCP 15101 must be labeled as diagnostics-only evidence"
     }
 
-    $mwb15100Mitigation = Get-ListenerMitigation -Port 15100 -OwnerKind "mouse-without-borders"
-    if ($mwb15100Mitigation -notmatch "required Boundless TCP 15100" -or $mwb15100Mitigation -notmatch "stop MWB") {
-        throw "MWB on required TCP 15100 must keep collision mitigation"
+    $mwb16100Mitigation = Get-ListenerMitigation -Port 16100 -OwnerKind "mouse-without-borders"
+    if ($mwb16100Mitigation -notmatch "required Boundless TCP 16100" -or $mwb16100Mitigation -notmatch "stop MWB") {
+        throw "MWB on required TCP 16100 must keep collision mitigation"
     }
-    $other15200Mitigation = Get-ListenerMitigation -Port 15200 -OwnerKind "other"
-    if ($other15200Mitigation -notmatch "required Boundless TCP 15200" -or $other15200Mitigation -notmatch "alternate network_port") {
-        throw "other process on required TCP 15200 must keep collision mitigation"
+    $other16200Mitigation = Get-ListenerMitigation -Port 16200 -OwnerKind "other"
+    if ($other16200Mitigation -notmatch "required Boundless TCP 16200" -or $other16200Mitigation -notmatch "alternate network_port") {
+        throw "other process on required TCP 16200 must keep collision mitigation"
     }
-    $boundless15100Mitigation = Get-ListenerMitigation -Port 15100 -OwnerKind "boundless"
-    if ($boundless15100Mitigation -notmatch "owned by Boundless" -or $boundless15100Mitigation -notmatch "expected") {
-        throw "Boundless-owned TCP 15100 must remain expected"
+    $boundless16100Mitigation = Get-ListenerMitigation -Port 16100 -OwnerKind "boundless"
+    if ($boundless16100Mitigation -notmatch "owned by Boundless" -or $boundless16100Mitigation -notmatch "expected") {
+        throw "Boundless-owned TCP 16100 must remain expected"
     }
 
     $mwb15101OnlyGuidance = @(Get-SideBySideGuidance -LocalListeners @(
-        [pscustomobject]@{ port = 15100; listeners = @([pscustomobject]@{ local_port = 15100; owner_kind = "boundless" }) },
+        [pscustomobject]@{ port = 16100; listeners = @([pscustomobject]@{ local_port = 16100; owner_kind = "boundless" }) },
         [pscustomobject]@{ port = 15101; listeners = @([pscustomobject]@{ local_port = 15101; owner_kind = "mouse-without-borders" }) },
-        [pscustomobject]@{ port = 15200; listeners = @([pscustomobject]@{ local_port = 15200; owner_kind = "boundless" }) }
+        [pscustomobject]@{ port = 16200; listeners = @([pscustomobject]@{ local_port = 16200; owner_kind = "boundless" }) }
     ))
     if (@($mwb15101OnlyGuidance | Where-Object { $_ -match "stop MWB|alternate Boundless network_port" }).Count -ne 0) {
         throw "MWB only on diagnostics-only TCP 15101 must not produce collision guidance"
     }
-    if (@($mwb15101OnlyGuidance | Where-Object { $_ -match "diagnostics-only TCP 15101" }).Count -ne 1) {
+    if (@($mwb15101OnlyGuidance | Where-Object { $_ -match "legacy comparison ports" }).Count -ne 1) {
         throw "MWB only on diagnostics-only TCP 15101 must produce informational guidance"
     }
 
+    foreach ($legacyPort in @(15100, 15101, 15200)) {
+        if (Test-RequiredBoundlessPort -Port $legacyPort) {
+            throw "Legacy TCP $legacyPort must not be required by current Boundless defaults"
+        }
+        $legacyMitigation = Get-ListenerMitigation -Port $legacyPort -OwnerKind "mouse-without-borders"
+        if ($legacyMitigation -match "stop MWB|alternate network_port" -or $legacyMitigation -notmatch "diagnostics-only") {
+            throw "Legacy TCP $legacyPort alone must not be labeled a default Boundless port collision"
+        }
+    }
+    $legacyFirewallEvidence = @(New-FirewallRuleEvidence -Name "old-ports" -DisplayName "Old Boundless ports" -Enabled "True" -Direction "Inbound" -Action "Allow" -Profile "Private" -Program $serviceExe -Protocol "TCP" -LocalPort @("15100", "15200") -RemoteAddress "LocalSubnet" -ExpectedProgram $serviceExe -RequiredPorts $requiredPorts)
+    $legacyFirewallReport = Get-FirewallPolicyReport -ServiceExe $serviceExe -RuleEvidence $legacyFirewallEvidence -ErrorMessage $null
+    if ($legacyFirewallReport.required_ports_covered) {
+        throw "An old 15100/15200 firewall rule must not satisfy the current 16100/16200 port plan"
+    }
+
     $requiredCollisionGuidance = @(Get-SideBySideGuidance -LocalListeners @(
-        [pscustomobject]@{ port = 15100; listeners = @([pscustomobject]@{ local_port = 15100; owner_kind = "mouse-without-borders" }) },
-        [pscustomobject]@{ port = 15200; listeners = @([pscustomobject]@{ local_port = 15200; owner_kind = "other" }) }
+        [pscustomobject]@{ port = 16100; listeners = @([pscustomobject]@{ local_port = 16100; owner_kind = "mouse-without-borders" }) },
+        [pscustomobject]@{ port = 16200; listeners = @([pscustomobject]@{ local_port = 16200; owner_kind = "other" }) }
     ))
-    if (@($requiredCollisionGuidance | Where-Object { $_ -match "required Boundless TCP 15100 or 15200" }).Count -lt 2) {
+    if (@($requiredCollisionGuidance | Where-Object { $_ -match "required Boundless TCP 16100 or 16200" }).Count -lt 2) {
         throw "MWB/other listeners on required ports must produce collision guidance"
     }
 
@@ -616,8 +631,8 @@ $report = [pscustomobject]@{
     remote_reachability = $remoteReports
     firewall_hint = Get-FirewallRuleHint
     guidance = [pscustomobject]@{
-        pairing_port = 15200
-        transport_port = 15100
+        pairing_port = 16200
+        transport_port = 16100
         side_by_side_probe_ports = $uniquePorts
         private_profile_only = $true
         service_program = "%ProgramFiles%\Boundless\boundless-service.exe"
@@ -679,8 +694,8 @@ if ($RemoteHost) {
 Write-Host ""
 Write-Host "Firewall guidance:"
 Write-Host "- This script did not create or edit firewall rules."
-Write-Host "- Boundless pairing uses TCP 15200; trusted transport uses TCP 15100. TCP 15101 is checked only for side-by-side dogfood collisions."
-Write-Host "- firewall_hint reports whether TCP 15100 and 15200 appear covered by enabled inbound allow rules for %ProgramFiles%\Boundless\boundless-service.exe on Private profile with LocalSubnet-or-narrower remote scope."
+Write-Host "- Boundless pairing uses TCP 16200; trusted transport uses TCP 16100. TCP 15100/15101/15200 are checked only for legacy configuration and MWB comparison."
+Write-Host "- firewall_hint reports whether TCP 16100 and 16200 appear covered by enabled inbound allow rules for %ProgramFiles%\Boundless\boundless-service.exe on Private profile with LocalSubnet-or-narrower remote scope."
 Write-Host "- firewall_hint also reports broad/Public/Any-style matching rules as evidence; it does not change them."
 Write-Host "- If a rule is needed, create it only after explicit approval, only for Private profile, and only for %ProgramFiles%\Boundless\boundless-service.exe."
 Write-Host "- Do not expose Boundless ports on Public networks or through router port forwarding."

@@ -192,7 +192,7 @@ enum PairCommand {
         code: String,
         #[arg(long)]
         host: String,
-        #[arg(long, default_value_t = 15200)]
+        #[arg(long, default_value_t = app_services::desktop::DEFAULT_PAIRING_PORT)]
         port: u16,
         #[arg(long, default_value_t = 120)]
         timeout_seconds: u64,
@@ -684,6 +684,38 @@ fn command_supports_json(command: &Command) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearby_join_cli_uses_new_default_but_keeps_explicit_custom_port() {
+        let default = Cli::try_parse_from([
+            "boundlessctl",
+            "pair",
+            "nearby-join",
+            "123456",
+            "--host",
+            "office.local",
+        ])
+        .unwrap();
+        let custom = Cli::try_parse_from([
+            "boundlessctl",
+            "pair",
+            "nearby-join",
+            "123456",
+            "--host",
+            "office.local",
+            "--port",
+            "15200",
+        ])
+        .unwrap();
+        for (cli, expected) in [(default, 16200), (custom, 15200)] {
+            match cli.command {
+                Command::Pair {
+                    command: PairCommand::NearbyJoin { port, .. },
+                } => assert_eq!(port, expected),
+                _ => panic!("expected nearby join"),
+            }
+        }
+    }
 
     #[test]
     fn paired_test_commands_accept_json_and_reject_unbounded_work() {

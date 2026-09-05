@@ -922,9 +922,10 @@ async fn legacy_connected_config_is_not_restored_or_repersisted() {
         AppState::load_or_create_with_paths(path.clone(), root.join("security")).unwrap();
     let old_snapshot = state.snapshot().await;
     let new_snapshot = reloaded.snapshot().await;
-    assert_eq!(new_snapshot.config_version, "6");
+    assert_eq!(new_snapshot.config_version, "7");
     assert_eq!(old_snapshot.machine_id, new_snapshot.machine_id);
-    assert_eq!(old_snapshot.peers[0].address, new_snapshot.peers[0].address);
+    assert_eq!(old_snapshot.peers[0].address, "127.0.0.1:15100");
+    assert_eq!(new_snapshot.peers[0].address, "127.0.0.1:16100");
     assert_eq!(old_snapshot.peers[0].peer_id, new_snapshot.peers[0].peer_id);
     assert_eq!(old_snapshot.layout_matrix, new_snapshot.layout_matrix);
     assert_eq!(old_snapshot.features, new_snapshot.features);
