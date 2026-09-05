@@ -140,7 +140,9 @@ Incoming (peer frame -> local injection):
    permits direct cleanup only after its per-user/session lane mutex disappears.
    A replacement process cannot prove any previous receipt. Before touching
    configuration or queueing peer releases, the daemon clears local lock and
-   capture state. It then revokes incoming ownership, requires a fresh explicit
+   capture state. The previous capture target and exact release set survive
+   queue failure and capture-stream reset, so retry cannot silently lose them.
+   It then revokes incoming ownership, requires a fresh explicit
    handoff, discards pending and uncertain interactive payload, and rotates the
    delivery epoch. The daemon remembers acknowledged held keys/buttons and
    conservatively adds every possibly committed Down from the unacknowledged

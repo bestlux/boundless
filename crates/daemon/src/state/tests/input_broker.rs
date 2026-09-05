@@ -1005,6 +1005,40 @@ async fn replacement_attach_queue_failure_preserves_prior_broker_and_pressed_sta
         "failed replacement must preserve authoritative pressed state for retry"
     );
 
+    assert_eq!(
+        state.input_capture_target().await,
+        None,
+        "capture authority must already be clear"
+    );
+    state.input_broker_relay().reset_capture_stream();
+    let retry = state
+        .attach_input_broker(allowed_client(), "retry".into(), true)
+        .await;
+    assert!(
+        !retry.accepted,
+        "retry must remember the old release target even after capture reset"
+    );
+    // Restore only the unavailable queue dependency, then retry the actual
+    // attach: the exact release must still be present and clear on success.
+    let mut restored_peer = state.config.read().await.peers[0].clone();
+    restored_peer.peer_id = "missing-peer".into();
+    state.config.write().await.peers.push(restored_peer);
+    assert!(
+        state
+            .attach_input_broker(allowed_client(), "recovered".into(), true)
+            .await
+            .accepted
+    );
+    assert!(
+        state
+            .input_broker_relay()
+            .prepare_capture_release(None)
+            .is_none()
+    );
+    let released = state.drain_outgoing("missing-peer").await;
+    assert!(released.iter().any(|payload| matches!(payload, OutboundPayload::InputFrame { events, .. }
+        if events == &vec![InputEvent::Key { scan_code: 30, state: KeyState::Up, semantics: core_input::KeySemantics::Physical }])));
+
     let _ = std::fs::remove_dir_all(root);
 }
 

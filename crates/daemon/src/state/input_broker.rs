@@ -179,6 +179,7 @@ struct InputBrokerRelayInner {
     last_accepted_clipboard_sequence: Option<u64>,
     pressed_keys: Vec<(u16, KeySemantics)>,
     pressed_buttons: Vec<MouseButton>,
+    pending_capture_release: Option<(String, Vec<InputEvent>)>,
     next_inject_batch_id: u64,
     last_acked_inject_batch_id: u64,
     inflight_inject_batch: Option<InputBrokerInjectBatch>,
@@ -386,6 +387,7 @@ impl InputBrokerRelay {
         inner.inflight_inject_batch = None;
         inner.delivered_held_input = DeliveredHeldInput::default();
         inner.recovery_releases.clear();
+        inner.pending_capture_release = None;
         was_attached
     }
 
@@ -622,8 +624,31 @@ impl InputBrokerRelay {
         events
     }
 
+    #[cfg(test)]
     pub(crate) fn release_events_snapshot(&self) -> Vec<InputEvent> {
         release_events_for_pressed_state(&self.lock())
+    }
+
+    /// Capture authority can be cleared immediately while its old target and
+    /// exact releases survive a failed queue attempt or capture-stream reset.
+    pub(crate) fn prepare_capture_release(
+        &self,
+        target: Option<&str>,
+    ) -> Option<(String, Vec<InputEvent>)> {
+        let mut inner = self.lock();
+        if inner.pending_capture_release.is_none() {
+            let events = release_events_for_pressed_state(&inner);
+            if let Some(target) = target
+                && !events.is_empty()
+            {
+                inner.pending_capture_release = Some((target.to_string(), events));
+            }
+        }
+        inner.pending_capture_release.clone()
+    }
+
+    pub(crate) fn complete_capture_release(&self) {
+        self.lock().pending_capture_release = None;
     }
 
     pub(crate) fn clear_pressed_state(&self) {

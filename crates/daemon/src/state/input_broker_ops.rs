@@ -254,22 +254,23 @@ impl AppState {
             0
         };
         let mut release_event_count = 0usize;
-        if replaced {
-            let release_events = self.input_broker.release_events_snapshot();
-            release_event_count = release_events.len();
-            if let Some(peer_id) = capture_target.as_deref()
-                && !release_events.is_empty()
-                && let Err(error) = self.queue_input_events(peer_id, release_events).await
-            {
-                self.record_transport_event(TransportEventRecord {
-                    timestamp: Utc::now(),
-                    direction: "local".to_string(),
-                    kind: "input_broker_release_queue_failed".to_string(),
-                    peer_id: peer_id.to_string(),
-                    detail: format!("reason=replacement_attach error={error:#}"),
-                    size_bytes: release_event_count as u64,
-                });
-                return InputBrokerAttachOutcome {
+        let release = self
+            .input_broker
+            .prepare_capture_release(capture_target.as_deref());
+        if replaced || release.is_some() {
+            if let Some((peer_id, release_events)) = release {
+                release_event_count = release_events.len();
+                for events in release_events.chunks(MAX_EVENTS_PER_FRAME) {
+                    if let Err(error) = self.queue_input_events(&peer_id, events.to_vec()).await {
+                        self.record_transport_event(TransportEventRecord {
+                            timestamp: Utc::now(),
+                            direction: "local".to_string(),
+                            kind: "input_broker_release_queue_failed".to_string(),
+                            peer_id: peer_id.clone(),
+                            detail: format!("reason=replacement_attach error={error:#}"),
+                            size_bytes: release_event_count as u64,
+                        });
+                        return InputBrokerAttachOutcome {
                     accepted: false,
                     broker_token: String::new(),
                     message: "input broker replacement deferred: authoritative releases could not be queued; retry attach"
@@ -277,7 +278,10 @@ impl AppState {
                     protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
                     delivery_epoch: String::new(),
                 };
+                    }
+                }
             }
+            self.input_broker.complete_capture_release();
             self.input_broker.clear_pressed_state();
             self.requeue_broker_clipboard_inflight().await;
         }
