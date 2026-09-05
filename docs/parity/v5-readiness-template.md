@@ -1,18 +1,5 @@
-# V5 Readiness Packet Template
+# Readiness Template Superseded
 
-The generated packet from `scripts/dev/release-readiness.ps1` is the canonical release readiness packet for v5. Release reviewers should treat this template as the required shape when reading or extending the generated JSON and Markdown.
+Use [release readiness](../release/release-readiness.md) for current commands, generated packet shape, gate policy, and engineering prerelease/public-promotion distinctions. Use the [product matrix](mouse-without-borders.md) for the exact capability claims being evaluated.
 
-## Required Sections
-
-- Release metadata: version, branch, commit, generation time, environment, and release-manager signoff.
-- Gate table: each unit, runtime, installer, and service gate marked `passed`, `failed`, or `skipped`.
-- Evidence: log path or copied artifact path for every passed or failed gate.
-- Skip rationale: reason and release impact for every skipped gate.
-- Parity release blockers: snapshot of each `yes` row from `docs/parity/mouse-without-borders.md`.
-- Installer evidence: copied `installer-smoke.json` with binary signature status for MSI, tray, daemon, service host, and CLI, plus matching service-host version output.
-
-## Release Rule
-
-`ready` means no failed and no skipped gates. `at-risk` means no failures but at least one skip. `blocked` means at least one failed gate.
-
-Release automation must not publish from an `at-risk` or `blocked` packet unless a separate human release process explicitly changes the release policy and records that deferral outside the packet.
+The [original V5 readiness template](../history/2026-09-04/parity/v5-readiness-template.md) is preserved as historical source. It is not a second release policy.
