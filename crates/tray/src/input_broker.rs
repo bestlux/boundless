@@ -1424,6 +1424,25 @@ async fn wait_for_broker_pause(pause_rx: &mut tokio::sync::watch::Receiver<bool>
     }
 }
 
+async fn supervise_input_exchange(
+    exchange: impl std::future::Future<Output = Result<()>>,
+    pause_rx: &mut tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> (Result<()>, BrokerSessionEnd) {
+    let (result, mut end) = tokio::select! {
+        biased;
+        _ = wait_for_broker_shutdown(shutdown_rx) => (Ok(()), BrokerSessionEnd::Shutdown),
+        _ = wait_for_broker_pause(pause_rx) => (Ok(()), BrokerSessionEnd::Paused),
+        result = exchange => (result, BrokerSessionEnd::Detached),
+    };
+    // Pause can arrive while the exchange's final synchronous injection guard
+    // is returning. Preserve reset semantics even if that future wins the race.
+    if *pause_rx.borrow() && !matches!(end, BrokerSessionEnd::Shutdown) {
+        end = BrokerSessionEnd::Paused;
+    }
+    (result, end)
+}
+
 async fn run_input_broker_session(
     endpoint: &str,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -1534,10 +1553,8 @@ async fn run_input_broker_session(
         elevated_input_controller.clone(),
     );
     let exchange_pause = pause_rx.clone();
-    let (loop_result, mut session_end) = tokio::select! {
-        biased;
-        _ = wait_for_broker_pause(&mut pause_rx) => (Ok(()), BrokerSessionEnd::Paused),
-        result = input_broker_exchange_loop(
+    let (loop_result, session_end) = supervise_input_exchange(
+        input_broker_exchange_loop(
             &mut input_client,
             &broker_token,
             &mut pump,
@@ -1545,12 +1562,10 @@ async fn run_input_broker_session(
             inject_batches,
             safety_unlock,
             &exchange_pause,
-        ) => (result, BrokerSessionEnd::Detached),
-        _ = wait_for_broker_shutdown(&mut shutdown_rx) => (Ok(()), BrokerSessionEnd::Shutdown),
-    };
-    if *pause_rx.borrow() && !matches!(session_end, BrokerSessionEnd::Shutdown) {
-        session_end = BrokerSessionEnd::Paused;
-    }
+        ),
+        &mut pause_rx,
+        &mut shutdown_rx,
+    ).await;
     if matches!(session_end, BrokerSessionEnd::Paused) {
         inject_batches.input_session_reset_required = true;
     }
@@ -1820,12 +1835,10 @@ mod input_broker_tests {
     #[tokio::test]
     async fn local_pause_interrupts_stalled_exchange_without_waiting_for_ipc() {
         let (pause_tx, mut pause_rx) = tokio::sync::watch::channel(false);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let control = InputBrokerPauseControl { pause_tx };
         let blocked_exchange = tokio::spawn(async move {
-            tokio::select! {
-                _ = std::future::pending::<()>() => panic!("simulated IPC cannot complete"),
-                _ = wait_for_broker_pause(&mut pause_rx) => BrokerSessionEnd::Paused,
-            }
+            supervise_input_exchange(std::future::pending(), &mut pause_rx, &mut shutdown_rx).await.1
         });
         let mut released_locally = false;
         control.pause_with(|| {
