@@ -23,6 +23,7 @@ pub(super) struct InputAuthorizationState {
     owner_last_changed_at: Option<Instant>,
     auto_claim_quarantined_peers: HashSet<String>,
     explicit_handoff_required: bool,
+    broker_paused: bool,
 }
 
 impl InputAuthorizationState {
@@ -33,6 +34,7 @@ impl InputAuthorizationState {
             owner_last_changed_at: None,
             auto_claim_quarantined_peers: HashSet::new(),
             explicit_handoff_required: false,
+            broker_paused: false,
         }
     }
 
@@ -50,7 +52,7 @@ impl InputAuthorizationState {
     }
 
     pub(super) fn allows_peer(&self, peer_id: &str) -> bool {
-        self.router.is_enabled() && self.router.owner() == Some(peer_id)
+        !self.broker_paused && self.router.is_enabled() && self.router.owner() == Some(peer_id)
     }
 
     pub(super) fn authorizes_peer_generation(&self, peer_id: &str, generation: u64) -> bool {
@@ -61,6 +63,7 @@ impl InputAuthorizationState {
         generation != 0
             && generation == self.generation
             && self.router.is_enabled()
+            && !self.broker_paused
             && self.router.owner().is_some()
     }
 
@@ -73,10 +76,16 @@ impl InputAuthorizationState {
         frame: &InputFrame,
         sink: &mut S,
     ) -> Result<RouteDecision, core_input::InputRouteError> {
+        if self.broker_paused {
+            return Ok(RouteDecision::IgnoredFeatureDisabled);
+        }
         self.router.route_frame(frame, sink)
     }
 
     pub(super) fn claim_owner(&mut self, peer_id: &str, force: bool) -> (bool, bool) {
+        if self.broker_paused {
+            return (false, false);
+        }
         let previous_owner = self.router.owner().map(str::to_string);
         let claimed = self.router.claim_owner(peer_id, force);
         let owner_changed = claimed && previous_owner.as_deref() != self.router.owner();
@@ -131,6 +140,16 @@ impl InputAuthorizationState {
     pub(super) fn set_enabled(&mut self, enabled: bool) {
         self.router.set_enabled(enabled);
         self.advance_generation();
+    }
+
+    pub(super) fn set_broker_paused(&mut self, paused: bool) -> bool {
+        if self.broker_paused == paused {
+            return false;
+        }
+        self.broker_paused = paused;
+        // Resume restores capability, never the previous remote owner's claim.
+        self.require_explicit_handoff();
+        true
     }
 
     pub(super) fn owner_last_changed_at(&self) -> Option<Instant> {

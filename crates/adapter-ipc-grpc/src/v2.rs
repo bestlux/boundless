@@ -866,6 +866,7 @@ impl ControlPlaneService for ControlPlaneApi {
                 inject_backpressure: request.inject_backpressure,
                 acked_inject_batch_id: request.acked_inject_batch_id,
                 failed_inject_batch_id: request.failed_inject_batch_id,
+                input_paused: request.input_paused,
                 held_input_authorization_generation: request.held_input_authorization_generation,
                 raw_device_wheel_event_count: request.raw_device_wheel_event_count,
                 raw_system_wheel_event_count: request.raw_system_wheel_event_count,

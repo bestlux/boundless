@@ -495,6 +495,8 @@ message InputBrokerExchangeRequest {
   string elevated_injector_reason = 27;
   string elevated_injector_signature_trust = 28;
   uint64 failed_inject_batch_id = 29;
+  // Keeps the user-session clipboard attachment live without input authority.
+  bool input_paused = 30;
 }
 
 message InputBrokerInjectFrame {

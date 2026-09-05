@@ -12,7 +12,7 @@
 use ipc_api::boundless::v1::{
     ClipboardBrokerApplyReport, ClipboardBrokerExchangeRequest, ClipboardBrokerPayload,
     ClipboardBrokerLocalPayloadDisposition, InputBrokerAttachReply, InputBrokerAttachRequest,
-    InputBrokerDetachRequest, InputBrokerExchangeRequest,
+    InputBrokerDetachRequest, InputBrokerExchangeRequest, InputBrokerExchangeReply,
     clipboard_broker_payload, control_plane_service_client::ControlPlaneServiceClient,
 };
 use ipc_api::broker_events::{broker_events_from_input_events, input_events_from_broker_events};
@@ -1143,6 +1143,7 @@ enum BrokerSessionEnd {
     NotNeeded,
     Detached,
     Paused,
+    Resumed,
     Shutdown,
 }
 
@@ -1278,7 +1279,7 @@ fn input_broker_supervisor_loop(
     endpoint: String,
     elevated_input_controller: ElevatedInputController,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    mut pause_rx: tokio::sync::watch::Receiver<bool>,
+    pause_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1303,6 +1304,7 @@ fn input_broker_supervisor_loop(
         let mut safety_unlock = SafetyUnlockReconciler::default();
         loop {
             if inject_batches.local_cleanup_pending()
+                && !*pause_rx.borrow()
                 && !retry_pending_local_cleanup(&mut inject_batches)
             {
                 tokio::select! {
@@ -1314,15 +1316,6 @@ fn input_broker_supervisor_loop(
                 }
             }
 
-            while *pause_rx.borrow() {
-                tokio::select! {
-                    _ = pause_rx.changed() => {}
-                    _ = wait_for_broker_shutdown(&mut shutdown_rx) => {
-                        finish_pending_local_cleanup_for_shutdown(&mut inject_batches);
-                        return;
-                    }
-                }
-            }
             match run_input_broker_session(
                 &endpoint,
                 shutdown_rx.clone(),
@@ -1337,7 +1330,7 @@ fn input_broker_supervisor_loop(
                     finish_pending_local_cleanup_for_shutdown(&mut inject_batches);
                     break;
                 }
-                Ok(BrokerSessionEnd::Paused) => continue,
+                Ok(BrokerSessionEnd::Paused | BrokerSessionEnd::Resumed) => continue,
                 Ok(BrokerSessionEnd::NotNeeded) | Ok(BrokerSessionEnd::Detached) => {}
                 Err(error) => eprintln!("boundless input broker session ended: {error:#}"),
             }
@@ -1451,9 +1444,7 @@ async fn run_input_broker_session(
     elevated_input_controller: &ElevatedInputController,
     mut pause_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<BrokerSessionEnd> {
-    if *pause_rx.borrow() {
-        return Ok(BrokerSessionEnd::Paused);
-    }
+    let initially_paused = *pause_rx.borrow();
     // Fail closed: never broker interactive input from a non-interactive
     // (session 0) process, even if a daemon would accept it.
     if !current_process_can_use_interactive_input().unwrap_or(false) {
@@ -1463,21 +1454,21 @@ async fn run_input_broker_session(
     let mut client = tokio::select! {
         result = connect_control_plane(endpoint) => result?,
         _ = wait_for_broker_shutdown(&mut shutdown_rx) => return Ok(BrokerSessionEnd::Shutdown),
-        _ = wait_for_broker_pause(&mut pause_rx) => return Ok(BrokerSessionEnd::Paused),
+        _ = wait_for_broker_pause(&mut pause_rx), if !initially_paused => return Ok(BrokerSessionEnd::Paused),
     };
     let backend_mode = tokio::select! {
         result = client.get_ui_snapshot(Empty {}) => result?,
         _ = wait_for_broker_shutdown(&mut shutdown_rx) => return Ok(BrokerSessionEnd::Shutdown),
-        _ = wait_for_broker_pause(&mut pause_rx) => return Ok(BrokerSessionEnd::Paused),
+        _ = wait_for_broker_pause(&mut pause_rx), if !initially_paused => return Ok(BrokerSessionEnd::Paused),
     }
     .into_inner()
     .input_runtime
     .map(|runtime| runtime.capture_backend_mode)
     .unwrap_or_default();
-    if inject_batches.local_cleanup_pending() {
+    if !initially_paused && inject_batches.local_cleanup_pending() {
         bail!("pending local input cleanup reached broker-session preflight");
     }
-    if !reconcile_elevated_controller_without_input_state(elevated_input_controller, || {
+    if !initially_paused && !reconcile_elevated_controller_without_input_state(elevated_input_controller, || {
         elevated_input_controller.disable_and_wait()
     }) {
         bail!("elevated input cleanup was not confirmed before a replacement broker session");
@@ -1498,6 +1489,10 @@ async fn run_input_broker_session(
             }
         }
         return Ok(BrokerSessionEnd::NotNeeded);
+    }
+
+    if initially_paused {
+        return run_paused_broker_session(client, inject_batches, &mut pause_rx, &mut shutdown_rx).await;
     }
 
     let mut pump =
@@ -1638,7 +1633,7 @@ fn should_detach_input_broker_session(
 ) -> bool {
     match session_end {
         BrokerSessionEnd::Shutdown | BrokerSessionEnd::Paused => true,
-        BrokerSessionEnd::Detached => {
+        BrokerSessionEnd::Detached | BrokerSessionEnd::Resumed => {
             inject_batches.input_session_reset_required
                 || (!inject_batches.backpressure_active()
                 && inject_batches.held_input_resume.is_none()
@@ -1646,6 +1641,135 @@ fn should_detach_input_broker_session(
         }
         BrokerSessionEnd::NotNeeded => false,
     }
+}
+
+async fn wait_for_broker_resume(pause_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    while *pause_rx.borrow() {
+        if pause_rx.changed().await.is_err() { return; }
+    }
+}
+
+// Both channels belong to this connection. A local pause cancels the active
+// input engine, then this no-hook session keeps clipboard authority alive.
+async fn supervise_paused_broker_channels(
+    heartbeat: impl std::future::Future<Output = Result<()>>,
+    clipboard: impl std::future::Future<Output = ()>,
+    pause_rx: &mut tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> (Result<()>, BrokerSessionEnd) {
+    tokio::select! {
+        biased;
+        _ = wait_for_broker_shutdown(shutdown_rx) => (Ok(()), BrokerSessionEnd::Shutdown),
+        _ = wait_for_broker_resume(pause_rx) => (Ok(()), BrokerSessionEnd::Resumed),
+        result = heartbeat => (result, BrokerSessionEnd::Detached),
+        _ = clipboard => (Err(anyhow::anyhow!("clipboard broker supervisor stopped")), BrokerSessionEnd::Detached),
+    }
+}
+
+async fn run_paused_broker_session(
+    mut client: ControlPlaneServiceClient<Channel>,
+    inject_batches: &mut BrokerInjectBatchState,
+    pause_rx: &mut tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<BrokerSessionEnd> {
+    let attach = tokio::select! {
+        result = client.attach_input_broker(InputBrokerAttachRequest {
+            broker_version: env!("CARGO_PKG_VERSION").into(),
+            lock_supported: false,
+            protocol_revision: ipc_api::INPUT_BROKER_PROTOCOL_REVISION,
+        }) => result?.into_inner(),
+        _ = wait_for_broker_shutdown(shutdown_rx) => return Ok(BrokerSessionEnd::Shutdown),
+        _ = wait_for_broker_resume(pause_rx) => return Ok(BrokerSessionEnd::Resumed),
+    };
+    validate_input_broker_attach_revision(&attach)?;
+    if !attach.accepted { bail!("paused broker attach rejected: {}", attach.message); }
+    inject_batches.begin_delivery_epoch(&attach.delivery_epoch)?;
+    let input_client = client.clone();
+    let token = attach.broker_token.clone();
+    let (result, end) = supervise_paused_broker_channels(
+        paused_input_exchange_loop(
+            move |request| {
+                let mut client = input_client.clone();
+                async move { Ok(client.exchange_input_broker(request).await?.into_inner()) }
+            },
+            &attach.broker_token,
+            inject_batches,
+            apply_injected_input_events,
+        ),
+        clipboard_broker_supervisor_loop(client.clone(), token),
+        pause_rx,
+        shutdown_rx,
+    ).await;
+    if should_detach_input_broker_session(end, inject_batches) {
+        let _ = tokio::time::timeout(INPUT_BROKER_CLEANUP_RPC_TIMEOUT,
+            client.detach_input_broker(InputBrokerDetachRequest {
+                broker_token: attach.broker_token,
+                delivery_epoch: attach.delivery_epoch,
+                acked_inject_batch_id: inject_batches.acked_batch_id(),
+                reset_input_session: inject_batches.input_session_reset_required,
+            }),
+        ).await;
+    }
+    result.map(|_| end)
+}
+
+async fn paused_input_exchange_loop<Exchange, ExchangeFuture, Apply>(
+    mut exchange: Exchange,
+    broker_token: &str,
+    inject_batches: &mut BrokerInjectBatchState,
+    mut apply_release: Apply,
+) -> Result<()>
+where
+    Exchange: FnMut(InputBrokerExchangeRequest) -> ExchangeFuture,
+    ExchangeFuture: std::future::Future<Output = Result<InputBrokerExchangeReply>>,
+    Apply: FnMut(&[core_input::InputEvent], &mut InjectedInputState) -> InputSendOutcome,
+{
+    let mut first_exchange = true;
+    let mut release_state = InjectedInputState::with_windows_input(
+        WindowsInputState::new(WindowsNumLockState::new(false)));
+    loop {
+        let reply = exchange(InputBrokerExchangeRequest {
+            broker_token: broker_token.to_string(),
+            input_paused: true,
+            acked_inject_batch_id: inject_batches.acked_batch_id(),
+            inject_backpressure: !first_exchange && inject_batches.backpressure_active(),
+            ..Default::default()
+        }).await?;
+        if !reply.accepted { bail!("paused broker exchange rejected: {}", reply.message); }
+        if reply.lock_should_be_active || reply.capture_active || reply.capture_forwarding_authorized
+            || reply.held_input_authorized {
+            inject_batches.input_session_reset_required = true;
+            bail!("paused broker received ordinary input authority");
+        }
+        let mut frames = Vec::with_capacity(reply.inject_frames.len());
+        for frame in &reply.inject_frames {
+            let (events, undecodable) = input_events_from_broker_events(&frame.events);
+            if undecodable != 0 || events.iter().any(|event| !is_input_release(event)) {
+                inject_batches.input_session_reset_required = true;
+                bail!("paused broker received non-release input");
+            }
+            frames.push(events);
+        }
+        if first_exchange {
+            // The daemon has confirmed its volatile pause gate and replaced
+            // uncertain work. Keep local cleanup, drop ordinary old suffixes.
+            inject_batches.complete_input_session_reset();
+            first_exchange = false;
+        }
+        inject_batches.accept_reply(reply.inject_batch_id, reply.inject_batch_cancelled,
+            frames, reply.inject_authorization_generation)?;
+        let mut cleanup_state = inject_batches.pending_local_cleanup_state();
+        if inject_batches.process_local_cleanup_with(&mut cleanup_state, &mut apply_release) {
+            inject_batches.process_with(&mut release_state, &mut apply_release);
+        }
+        tokio::time::sleep(CLIPBOARD_BROKER_POLL).await;
+    }
+}
+
+fn is_input_release(event: &core_input::InputEvent) -> bool {
+    matches!(event,
+        core_input::InputEvent::Key { state: core_input::KeyState::Up, .. }
+        | core_input::InputEvent::MouseButton { state: core_input::KeyState::Up, .. })
 }
 
 async fn input_broker_exchange_loop(
@@ -1724,6 +1848,7 @@ async fn input_broker_exchange_loop(
                 elevated_injector_reason: elevated_reason.to_string(),
                 elevated_injector_signature_trust: elevated_signature_trust.to_string(),
                 failed_inject_batch_id: inject_batches.failed_batch_id(),
+                input_paused: false,
             })
             .await?
             .into_inner();
@@ -1831,6 +1956,106 @@ async fn input_broker_exchange_loop(
 #[cfg(test)]
 mod input_broker_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn paused_connection_driver_keeps_clipboard_running_across_reconnects() {
+        let (_pause_tx, mut pause_rx) = tokio::sync::watch::channel(true);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut batches = BrokerInjectBatchState::default();
+        for token in ["before-reconnect", "after-reconnect"] {
+            let exchanges = std::cell::Cell::new(0usize);
+            let clipboard_roundtrips = std::cell::Cell::new(0usize);
+            let heartbeat = paused_input_exchange_loop(
+                |request| {
+                    assert_eq!(request.broker_token, token);
+                    assert!(request.input_paused);
+                    assert!(request.captured_events.is_empty());
+                    assert!(!request.cursor_valid && !request.bounds_valid && !request.lock_active);
+                    assert_eq!((request.handoff_probe_dx, request.handoff_probe_dy), (0, 0));
+                    let count = exchanges.get() + 1;
+                    exchanges.set(count);
+                    async move {
+                        if count == 4 { bail!("fixture connection loss"); }
+                        Ok(InputBrokerExchangeReply { accepted: true, ..Default::default() })
+                    }
+                }, token, &mut batches,
+                |_, _| panic!("idle paused mode must not inject or acquire input"),
+            );
+            // A scheduled clipboard worker runs through the actual connection
+            // supervisor; daemon tests separately verify both payload directions.
+            let clipboard = async {
+                loop {
+                    clipboard_roundtrips.set(clipboard_roundtrips.get() + 1);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            let (result, end) = tokio::time::timeout(Duration::from_secs(2),
+                supervise_paused_broker_channels(heartbeat, clipboard, &mut pause_rx, &mut shutdown_rx))
+                .await.expect("bounded paused connection");
+            assert!(result.expect_err("connection fails").to_string().contains("fixture connection loss"));
+            assert!(matches!(end, BrokerSessionEnd::Detached));
+            assert!(clipboard_roundtrips.get() >= 3);
+            assert!(*pause_rx.borrow(), "reconnect must not clear the local pause latch");
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_driver_rejects_ordinary_input_before_native_application() {
+        for event in [
+            core_input::InputEvent::Key { scan_code: 30, state: core_input::KeyState::Down,
+                semantics: core_input::KeySemantics::Physical },
+            core_input::InputEvent::MouseMove { dx: 1, dy: 1 },
+            core_input::InputEvent::MouseWheel { delta_x: 0, delta_y: 120 },
+        ] {
+            let mut batches = BrokerInjectBatchState::default();
+            let reply = InputBrokerExchangeReply {
+                accepted: true, inject_batch_id: 1, inject_authorization_generation: 1,
+                inject_frames: vec![ipc_api::boundless::v1::InputBrokerInjectFrame {
+                    source_peer_id: "peer".into(), sequence: 1,
+                    events: broker_events_from_input_events(&[event]),
+                }], ..Default::default()
+            };
+            let error = paused_input_exchange_loop(|_| std::future::ready(Ok(reply.clone())),
+                "token", &mut batches, |_, _| panic!("ordinary input reached paused native backend"))
+                .await.expect_err("ordinary event rejected");
+            assert!(error.to_string().contains("non-release"));
+            assert_eq!(batches.acked_batch_id(), 0);
+            assert!(batches.input_session_reset_required);
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_release_recovery_acknowledges_only_completed_cleanup() {
+        let mut batches = BrokerInjectBatchState::default();
+        let exchanges = std::cell::Cell::new(0usize);
+        let applications = std::cell::Cell::new(0usize);
+        let up = core_input::InputEvent::Key { scan_code: 30, state: core_input::KeyState::Up,
+            semantics: core_input::KeySemantics::Physical };
+        let reply = InputBrokerExchangeReply {
+            accepted: true, inject_batch_id: 1, inject_authorization_generation: 1,
+            inject_frames: vec![ipc_api::boundless::v1::InputBrokerInjectFrame {
+                source_peer_id: String::new(), sequence: 0,
+                events: broker_events_from_input_events(std::slice::from_ref(&up)),
+            }], ..Default::default()
+        };
+        let result = paused_input_exchange_loop(|request| {
+            let count = exchanges.get(); exchanges.set(count + 1);
+            if count == 0 {
+                assert_eq!(request.acked_inject_batch_id, 0);
+                std::future::ready(Ok(reply.clone()))
+            } else {
+                assert_eq!(request.acked_inject_batch_id, 1);
+                std::future::ready(Err(anyhow::anyhow!("fixture complete")))
+            }
+        }, "token", &mut batches, |events, _| {
+            assert_eq!(events, std::slice::from_ref(&up));
+            applications.set(applications.get() + 1);
+            InputSendOutcome { committed_event_count: events.len(), remaining_events: Vec::new(), error: None }
+        }).await;
+        assert!(result.is_err());
+        assert_eq!(applications.get(), 1);
+        assert_eq!(batches.acked_batch_id(), 1);
+    }
 
     #[tokio::test]
     async fn local_pause_interrupts_stalled_exchange_without_waiting_for_ipc() {

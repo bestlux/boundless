@@ -172,6 +172,16 @@ Incoming (peer frame -> local injection):
    payload through a session reset, and stays paused until explicit resume.
    Resume is allowed by the UI only after enabling daemon policy succeeds.
    A failed detach never authorizes resuming the paused payload suffix.
+   After that bounded cleanup, a no-hook broker session keeps clipboard service
+   alive while paused, including after reconnection. Local broker protocol
+   revision 7 adds a volatile `input_paused` heartbeat: it revokes input ownership
+   and ordinary delivery under the existing authorization lock without writing
+   configuration. This works even when saving the sharing preference fails.
+   Paused replies can contain only conservative key/button releases; the tray
+   validates that restriction before native application and acknowledges only
+   completed cleanup. Resume permits a fresh handoff and cannot revive the old
+   owner, captured payload, or key-down suffix. Clipboard freshness still depends
+   on broker heartbeats; clipboard activity alone never sustains input authority.
 
 The BND-NEXT-44 candidate changes step 3 only when the user explicitly enables
 administrator-app control. It remains an experimental dogfood capability until

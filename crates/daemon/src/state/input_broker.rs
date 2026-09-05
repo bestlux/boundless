@@ -158,6 +158,7 @@ pub(crate) struct SafetyUnlockCounts {
 struct InputBrokerRelayInner {
     delivery_epoch: String,
     service_session_input: bool,
+    input_paused: bool,
     allowed_user_sid: Option<String>,
     attachment: Option<InputBrokerAttachment>,
     delivery_process: Option<InputBrokerProcessIdentity>,
@@ -299,6 +300,36 @@ impl InputBrokerRelay {
         inner.next_inject_batch_id = 0;
         inner.last_acked_inject_batch_id = 0;
         inner.recovery_releases.len()
+    }
+
+    pub(crate) fn reset_delivery_for_pause(&self) {
+        let mut inner = self.lock();
+        if let Some(batch) = inner.inflight_inject_batch.take() {
+            for event in batch.frames.iter().flat_map(|frame| &frame.events) {
+                inner.delivered_held_input.observe(event, false);
+            }
+        }
+        inner.recovery_releases = inner.delivered_held_input.releases().into();
+        // The same process may have a completed receipt. Keep its epoch and
+        // monotonically increasing batch IDs while replacing uncertain work
+        // with conservative releases only.
+    }
+
+    pub(crate) fn input_paused(&self) -> bool {
+        self.lock().input_paused
+    }
+
+    pub(crate) fn set_input_paused(&self, paused: bool) {
+        let mut inner = self.lock();
+        inner.input_paused = paused;
+        if paused {
+            inner.desired_lock_active = false;
+            inner.reported_lock_active = false;
+            inner.capture_forwarding_authorized = false;
+            inner.captured_events.clear();
+            inner.handoff_probe_dx = 0;
+            inner.handoff_probe_dy = 0;
+        }
     }
 
     /// Cleanup has a bounded ordinary batch shape but no remote owner. The only
@@ -513,6 +544,7 @@ impl InputBrokerRelay {
     /// state the broker reported as actually applied in its session.
     pub(crate) fn set_desired_lock_active(&self, active: bool) -> bool {
         let mut inner = self.lock();
+        let active = active && !inner.input_paused;
         if inner.desired_lock_active != active || !active {
             inner.capture_forwarding_authorized = false;
         }

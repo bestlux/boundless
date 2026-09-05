@@ -67,6 +67,7 @@ pub struct InputBrokerExchangeObservations {
     pub inject_backpressure: bool,
     pub acked_inject_batch_id: u64,
     pub failed_inject_batch_id: u64,
+    pub input_paused: bool,
     pub held_input_authorization_generation: u64,
     pub raw_device_wheel_event_count: u32,
     pub raw_system_wheel_event_count: u32,
@@ -262,6 +263,20 @@ impl AppState {
                 release_event_count = release_events.len();
                 for events in release_events.chunks(MAX_EVENTS_PER_FRAME) {
                     if let Err(error) = self.queue_input_events(&peer_id, events.to_vec()).await {
+                        if self.get_peer(&peer_id).await.is_none() {
+                            // Forgetting a peer revokes its delivery destination.
+                            // It must not wedge the broker for all remaining PCs
+                            // or require resurrecting removed trust to recover.
+                            self.record_transport_event(TransportEventRecord {
+                                timestamp: Utc::now(),
+                                direction: "local".to_string(),
+                                kind: "input_broker_release_discarded".to_string(),
+                                peer_id: peer_id.clone(),
+                                detail: "reason=peer_removed".to_string(),
+                                size_bytes: release_event_count as u64,
+                            });
+                            break;
+                        }
                         self.record_transport_event(TransportEventRecord {
                             timestamp: Utc::now(),
                             direction: "local".to_string(),
@@ -728,8 +743,10 @@ impl AppState {
             });
         }
 
-        let capture_active = self.active_input_capture_target().await.is_some();
-        let lock_should_be_active = self.input_broker.desired_lock_active();
+        let capture_active =
+            !observations.input_paused && self.active_input_capture_target().await.is_some();
+        let lock_should_be_active =
+            !observations.input_paused && self.input_broker.desired_lock_active();
         let lock_report_authorizes_next_exchange = capture_active
             && lock_should_be_active
             && self.input_broker.lock_supported()
@@ -745,7 +762,7 @@ impl AppState {
         } else {
             Vec::new()
         };
-        let accepted_handoff_probe = if capture_active {
+        let accepted_handoff_probe = if capture_active || observations.input_paused {
             None
         } else {
             observations.handoff_probe
@@ -845,6 +862,41 @@ impl AppState {
                 message: format!("input broker inject acknowledgement rejected: {reason}"),
                 ..Default::default()
             };
+        }
+
+        let pause_changed = self
+            .input
+            .control
+            .authorization
+            .write()
+            .await
+            .set_broker_paused(observations.input_paused);
+        self.input_broker
+            .set_input_paused(observations.input_paused);
+        if pause_changed {
+            if let Some((peer_id, releases)) = self
+                .input_broker
+                .prepare_capture_release(self.input_capture_target().await.as_deref())
+            {
+                for events in releases.chunks(MAX_EVENTS_PER_FRAME) {
+                    let _ = self.queue_input_events(&peer_id, events.to_vec()).await;
+                }
+                self.input_broker.complete_capture_release();
+            }
+            self.input_broker.reset_capture_stream();
+            self.clear_input_capture_target().await;
+            self.set_input_lock_runtime(false, false).await;
+            self.input
+                .inject
+                .pending_inject_frames
+                .write()
+                .await
+                .clear();
+            if observations.input_paused {
+                self.input_broker.reset_delivery_for_pause();
+            }
+            self.notify_input_owner_transition();
+            self.notify_input_capture_wake("broker_pause_changed");
         }
 
         let existing_batch = self.input_broker.inflight_inject_batch().or_else(|| {

@@ -637,6 +637,7 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
                     inject_backpressure: command.inject_backpressure,
                     acked_inject_batch_id: command.acked_inject_batch_id,
                     failed_inject_batch_id: command.failed_inject_batch_id,
+                    input_paused: command.input_paused,
                     held_input_authorization_generation: command
                         .held_input_authorization_generation,
                     raw_device_wheel_event_count: command.raw_device_wheel_event_count,
