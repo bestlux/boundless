@@ -62,7 +62,8 @@ function Get-MsiProductVersion {
 function Assert-ReleasePleaseExtraFiles {
     param(
         [string]$RepoRoot,
-        [string[]]$CrateCargoTomlPaths
+        [string[]]$CrateCargoTomlPaths,
+        [string[]]$CrateNames
     )
 
     $configPath = Join-Path $RepoRoot "release-please-config.json"
@@ -75,6 +76,7 @@ function Assert-ReleasePleaseExtraFiles {
     $configuredPaths = @($package."extra-files" | ForEach-Object { $_.path })
     $expectedPaths = @(
         "Cargo.toml",
+        "Cargo.lock",
         "packaging/windows/package-manifest.json"
     )
     $resolvedRepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path.TrimEnd('\', '/')
@@ -92,6 +94,50 @@ function Assert-ReleasePleaseExtraFiles {
         $found = $configuredPaths | Where-Object { $_ -eq $expectedPath -or $_ -eq $windowsPath } | Select-Object -First 1
         if ($null -eq $found) {
             throw "release-please config is missing extra-files entry for '$expectedPath'."
+        }
+    }
+
+    # GenericToml in the pinned release-please action wraps scalars in tagged
+    # objects, so filters use name.value while the update target remains version.
+    # Require the canonical selector to catch newly added crates and prevent
+    # dependency versions (including same-name registry packages) from changing.
+    $nameFilters = @($CrateNames | Sort-Object -Unique | ForEach-Object { "@.name.value == '$_'" })
+    $expectedLockJsonPath = '$.package[?(!@.source && (' + ($nameFilters -join ' || ') + '))].version'
+    $lockEntries = @($package."extra-files" | Where-Object { $_.path -eq "Cargo.lock" })
+    if ($lockEntries.Count -ne 1 -or $lockEntries[0].type -ne "toml" -or $lockEntries[0].jsonpath -cne $expectedLockJsonPath) {
+        throw "release-please Cargo.lock entry must use type 'toml' and select exactly the workspace package versions. Expected jsonpath: $expectedLockJsonPath"
+    }
+}
+
+function Assert-WorkspaceLockVersions {
+    param(
+        [string]$CargoLockPath,
+        [string[]]$CrateNames,
+        [string]$WorkspaceVersion
+    )
+
+    $cargoLock = Get-Content -LiteralPath $CargoLockPath -Raw
+    $lockVersions = @{}
+    foreach ($package in [regex]::Matches($cargoLock, '(?ms)^\[\[package\]\]\s*(?<body>.*?)(?=^\[|\z)')) {
+        $body = $package.Groups["body"].Value
+        $nameMatch = [regex]::Match($body, '(?m)^name\s*=\s*"(?<name>[^"]+)"\s*$')
+        $name = $nameMatch.Groups["name"].Value
+        if ($CrateNames -cnotcontains $name -or $body -match '(?m)^source\s*=') {
+            continue
+        }
+        if ($lockVersions.ContainsKey($name)) {
+            throw "Cargo.lock contains multiple local package entries for '$name'."
+        }
+        $versionMatch = [regex]::Match($body, '(?m)^version\s*=\s*"(?<version>[^"]+)"\s*$')
+        $lockVersions[$name] = $versionMatch.Groups["version"].Value
+    }
+
+    foreach ($name in $CrateNames) {
+        if (-not $lockVersions.ContainsKey($name)) {
+            throw "Cargo.lock is missing workspace package '$name'."
+        }
+        if ($lockVersions[$name] -ne $WorkspaceVersion) {
+            throw "Cargo.lock package '$name' version '$($lockVersions[$name])' does not match workspace version '$WorkspaceVersion'."
         }
     }
 }
@@ -118,9 +164,16 @@ if ($workspaceVersion -ne $releasePleaseVersion) {
 }
 
 $crateCargoTomls = Get-ChildItem -LiteralPath (Join-Path $repoRoot "crates") -Recurse -Filter Cargo.toml -File
+$crateNames = @()
 foreach ($crateCargoToml in $crateCargoTomls) {
     $crateManifest = Get-Content -LiteralPath $crateCargoToml.FullName -Raw
-    $crateVersionMatch = [regex]::Match($crateManifest, '(?m)^\s*version\s*=\s*"(?<version>[^"]+)"\s*$')
+    $packageSection = [regex]::Match($crateManifest, '(?ms)^\[package\]\s*(?<body>.*?)(?=^\[|\z)').Groups["body"].Value
+    $crateNameMatch = [regex]::Match($packageSection, '(?m)^name\s*=\s*"(?<name>[A-Za-z0-9_-]+)"\s*$')
+    if (-not $crateNameMatch.Success) {
+        throw "Crate manifest must declare a literal package name: $($crateCargoToml.FullName)"
+    }
+    $crateNames += $crateNameMatch.Groups["name"].Value
+    $crateVersionMatch = [regex]::Match($packageSection, '(?m)^version\s*=\s*"(?<version>[^"]+)"\s*$')
     if (-not $crateVersionMatch.Success) {
         throw "Crate manifest must declare a literal package version: $($crateCargoToml.FullName)"
     }
@@ -130,7 +183,8 @@ foreach ($crateCargoToml in $crateCargoTomls) {
         throw "Crate manifest version '$crateVersion' does not match workspace version '$workspaceVersion': $($crateCargoToml.FullName)"
     }
 }
-Assert-ReleasePleaseExtraFiles -RepoRoot $repoRoot -CrateCargoTomlPaths @($crateCargoTomls.FullName)
+Assert-WorkspaceLockVersions -CargoLockPath (Join-Path $repoRoot "Cargo.lock") -CrateNames $crateNames -WorkspaceVersion $workspaceVersion
+Assert-ReleasePleaseExtraFiles -RepoRoot $repoRoot -CrateCargoTomlPaths @($crateCargoTomls.FullName) -CrateNames $crateNames
 
 if (-not [string]::IsNullOrWhiteSpace($Tag)) {
     $expectedTag = "v$workspaceVersion"
@@ -151,6 +205,7 @@ foreach ($assetPath in $AssetPaths) {
 
     $expectedNames = @(
         "Boundless-$workspaceVersion-windows-x64.msi",
+        "Boundless-$workspaceVersion-windows-x64.zip",
         "Boundless-$workspaceVersion-windows-x64-install.ps1",
         "boundless-$workspaceVersion-linux-x64.tar.gz"
     )
