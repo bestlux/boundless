@@ -104,7 +104,11 @@ Incoming (peer frame -> local injection):
    under the same ID; the daemon repeats it across response loss until the tray
    drops its local remainder, releases any locally held keys/buttons, and
    acknowledges that ID. A batch is otherwise acknowledged only after every
-   frame completes.
+   frame completes. A cancellation receipt stays pending while logical/native
+   cleanup fails, including paused heartbeats. If the daemon replaces that
+   batch with conservative recovery releases, only the completed recovery
+   batch earns a new receipt. Unacknowledged recovery releases retain their
+   dedicated lane through cooperative or reset detach.
 4. The daemon assigns a random delivery epoch for its in-memory relay and
    retains an in-flight batch under the same ID across stale re-attach only
    when the transport verifies the same process incarnation (PID, creation

@@ -17,7 +17,7 @@ The first public beta target is two Windows PCs. Four computers total is a later
 | 7. Support claims match real use | Repeated installed evidence, multi-monitor/mixed-DPI coverage, elevated-app scope, and four-PC topology | Each public claim has exact-build Windows evidence. Four-PC handoff/reconnect and peer failure are exercised before advertising four-PC support. Support bundles are bounded and redacted. |
 | 8. Fast, light daily use is measured | Idle resources, connection/handoff/recovery latency, bulk contention, UI frame CPU, and logging cost | Establish actual Windows release-build baselines and explicit regression budgets on supported hardware. Repeat the same scenarios after changes; comparative speed claims require equivalent competitor measurements. |
 
-Outcomes 1–4 are the active hardening train. Their implementation and local tests do not close the installed or physical acceptance in this table. The current installation-time selected-user SID remains in place until outcome 5 replaces that contract deliberately.
+Outcomes 1–4 now have an implemented candidate and [local verification record](validation/windows-hardening-2026-09-04.md). Those tests do not close the installed or physical acceptance in this table. The current installation-time selected-user SID remains in place until outcome 5 replaces that contract deliberately.
 
 ## Architecture Direction
 

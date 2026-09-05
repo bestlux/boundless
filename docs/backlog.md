@@ -4,7 +4,7 @@ This is the ordered work needed to turn the current Windows implementation into 
 
 Status is deliberately separated from release readiness: **active** means implementation or integration is underway; **open** means required work remains; **deferred** means excluded from the current train. A source change or passing local test does not close a physical acceptance criterion.
 
-## Active Hardening Train
+## Implemented Hardening Candidate
 
 | Work | Required behavior | Completion evidence |
 | --- | --- | --- |
@@ -16,7 +16,7 @@ Status is deliberately separated from release readiness: **active** means implem
 | Peer-approved transport testing | Add a short, bounded, memory-only test run over existing authenticated peer transport, with explicit peer approval and stop/expiry behavior. | Protocol/admission/expiry/revocation/resource tests and reports identifying actual measured transport samples. Wire 4.5 compatibility and both-peer upgrade requirements are explicit. This does not measure physical input or clipboard integration. |
 | Honest gates and release channels | Classify layout tests as unit evidence, validate actual sample-based reports, separate previews from public promotion, and preserve required Windows/installer evidence. | Negative evidence fixtures, gate tests, source validation, and prerelease/not-latest release configuration. No claim that a release has been published. |
 
-All rows remain part of candidate integration until the coordinating change records the final commits and validation. The app manifests still identify 5.0.16. Current installed versions are not inferred from those manifests.
+All rows have implementation and local evidence in the [dated verification record](validation/windows-hardening-2026-09-04.md). Their installed and physical acceptance remains open. The app manifests still identify 5.0.16; candidate `5fa97d8` and its artifact hashes distinguish this work from the published release. Current installed versions are not inferred from manifests.
 
 ## Required Installed And Physical Evidence
 

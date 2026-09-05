@@ -27,9 +27,9 @@ Ordinary elevated-application input has an explicit helper/capability boundary. 
 
 ## Current Work
 
-The active hardening train addresses bounded logs, per-peer retry/session ownership and duplex progress, user-authorized file I/O, verified input process lifetime, a smaller truthful tray flow with local pause, peer-approved transport testing, and evidence/release-policy accuracy. These are targeted refactors of the existing Rust architecture.
+The locally validated hardening candidate implements bounded logs, per-peer retry/session ownership and duplex progress, user-authorized file I/O, verified input process lifetime, a smaller truthful tray flow with local pause, peer-approved transport testing, and evidence/release-policy accuracy. These are targeted refactors of the existing Rust architecture.
 
-Some fixes may be landed in integration before others; the final change's verification record must identify the exact commits and tests. Do not mark the train or a product capability qualified solely because its source exists. The remaining outcome and acceptance list lives in [the backlog](backlog.md), rather than a duplicated completion table here.
+The [dated verification record](validation/windows-hardening-2026-09-04.md) identifies implementation `5fa97d8`, 773 passing workspace tests, the three review rounds, optimized local benchmarks and the built unsigned MSI. The candidate has not been installed or physically qualified. The remaining outcome and acceptance list lives in [the backlog](backlog.md), rather than a duplicated completion table here.
 
 ## Canonical Release Flow
 

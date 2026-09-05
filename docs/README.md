@@ -24,6 +24,7 @@ Boundless is a pre-release Windows multi-PC control app. Start with the guide fo
 ## Implement And Verify Changes
 
 - [Development and local validation](development.md): commands and meaningful evidence boundaries.
+- [Windows hardening assessment and verification](validation/windows-hardening-2026-09-04.md): architecture decision, implemented changes, reviewed candidate, local measurements and remaining qualification.
 - [Component map](architecture/component-map.md): ownership across the Rust workspace.
 - [Network architecture](architecture/network-v1.md): discovery, connection/session ownership, transport, and backpressure.
 - [User-session input broker](architecture/user-session-input-broker.md): interactive input and service boundaries.
