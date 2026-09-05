@@ -23,7 +23,7 @@ Filenames are redacted by default. Passing `--include-filenames` is an explicit 
 
 Symptoms:
 
-- peer does not appear in Status & Pairing,
+- peer does not appear under Home → Add a PC,
 - manual host works but discovery does not,
 - discovered host is stale.
 
@@ -64,8 +64,8 @@ If manual host pairing works only after local firewall changes, verify inbound T
 
 ```powershell
 $ServiceExe = "$env:ProgramFiles\Boundless\boundless-service.exe"
-New-NetFirewallRule -DisplayName "Boundless TCP 15100 Private" -Direction Inbound -Action Allow -Profile Private -Protocol TCP -LocalPort 15100 -Program $ServiceExe
-New-NetFirewallRule -DisplayName "Boundless TCP 15200 Private" -Direction Inbound -Action Allow -Profile Private -Protocol TCP -LocalPort 15200 -Program $ServiceExe
+New-NetFirewallRule -DisplayName "Boundless TCP 15100 Private" -Direction Inbound -Action Allow -Profile Private -Protocol TCP -LocalPort 15100 -Program $ServiceExe -RemoteAddress LocalSubnet
+New-NetFirewallRule -DisplayName "Boundless TCP 15200 Private" -Direction Inbound -Action Allow -Profile Private -Protocol TCP -LocalPort 15200 -Program $ServiceExe -RemoteAddress LocalSubnet
 ```
 
 If you add firewall rules manually, restrict them to trusted private LAN profiles and known peer IPs. Do not port-forward or expose Boundless control, pairing, or transport ports to the internet or public networks.
@@ -149,7 +149,7 @@ Checks:
 & $BoundlessCtl input capture-stop
 ```
 
-Confirm Easy Mouse, wrap, corner blocking, and the active layout in Settings or:
+Press Ctrl twice on the local keyboard to return control. Home also offers Pause input. Confirm Easy Mouse, wrap, and corner blocking in Sharing, then the active arrangement in Arrange PCs or:
 
 ```powershell
 & $BoundlessCtl layout preview
@@ -170,4 +170,21 @@ Checks:
 & $BoundlessCtl file-transfer config
 ```
 
-File transfer is default-deny unless the user accepts the transfer or enables trusted-peer auto-accept and the transfer passes path, size, hash, and temp-file validation. Per-peer auto-accept remains follow-up work.
+File receipt is default-deny. Enable file transfer and trusted-peer auto-accept explicitly, and use a receive folder accessible to the selected user. There is currently no individual-transfer approval inbox. Per-peer auto-accept remains follow-up work. A changed or unavailable Windows user session can reject file operations even while the service and network remain healthy.
+
+## Log storage and disk growth
+
+The hardening implementation bounds both disk log streams independently:
+
+| Stream | Active file | Segment size | Files retained | Maximum retained bytes |
+| --- | --- | --- | --- | --- |
+| Runtime | `boundlessd.log` | 10 MiB | 10 including active | 100 MiB |
+| Service startup | `boundless-service-startup.log` | 1 MiB | 4 including active | 4 MiB |
+
+Each stream also limits a record to 16 KiB and queues at most 256 records. Older daily runtime files matching the logger's exact legacy naming pattern participate in cleanup. Rotation and initialization run away from input/control execution; a storage failure suspends disk writes for a cooldown instead of growing an unbounded fallback file. Redacted diagnostic exports include `component_health.logging`: configured budgets, readiness, written/dropped/oversized record counts, and storage failures. Counters reset per process and do not require disk access to read. See [Project Status](../project-status.md) for validation of the hardening build.
+
+Runtime logs live under `Boundless\logs` in the account's local application-data directory. A per-user daemon typically uses `%LOCALAPPDATA%\Boundless\logs`; the LocalSystem service has a separate system-profile data directory. Service startup logs are under `%ProgramData%\Boundless\logs`. App size in Windows Installed Apps may exclude these locations.
+
+These budgets apply per stream and security context. An older installed binary can still have the original unbounded logger, and another account's log directory is separate. Check installed/runtime versions before assuming a source fix is active. Do not grant broad access to protected service-profile folders to inspect them.
+
+For a report, preserve the path, size, timestamps, installed version, and a small excerpt. If disk space is critically low, stop the affected Boundless runtime first so it cannot keep growing the file, then remove only positively identified log files you intend to discard. Configuration, identity, and trust files are not logs. A working retry backoff and a bounded log sink are both required; changing the log level alone is insufficient.

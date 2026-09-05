@@ -1,6 +1,6 @@
 # Four-Machine Layouts
 
-Boundless v5 is designed to exceed the old one-row/two-by-two Mouse Without Borders layout model by validating one-row, grid, and cardinal arrangements. The configuration/unit-test limit is four remote peers plus the local machine; release-grade runtime parity is still measured against the four-computer Mouse Without Borders target until the readiness packet includes broader physical or deterministic runtime evidence.
+Boundless can validate one-row, grid, and cardinal arrangements. The configuration limit is four remote peers plus the local machine. That is a parser/policy limit, not a validated five-PC product claim. The immediate product qualification target is two Windows PCs; broader layouts remain in the [roadmap](../v5-roadmap.md).
 
 ## Rules
 
@@ -33,6 +33,6 @@ Preview before changing active behavior:
 
 ## Validation Expectations
 
-The release readiness packet must include deterministic topology validation and, for release candidates, runtime evidence from multi-node smoke or equivalent deterministic harnesses.
+The release readiness packet must distinguish layout validation, actual multi-daemon transport tests, and physical multi-PC input tests. A layout validator test cannot establish runtime topology or input handoff behavior.
 
 Mixed-DPI and multi-monitor behavior must be validated with input trace evidence before claiming complete real-world parity.

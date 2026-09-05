@@ -1,5 +1,7 @@
 # V5 Release Hardening
 
+> Historical release-hardening record retained for earlier candidate evidence. Its version, sequencing, and capability statements are not current status. Use [Project Status](../project-status.md), the [Windows roadmap](../v5-roadmap.md), and [Release Readiness](release-readiness.md) for the current contract.
+
 This document records the release-hardening contract for the Boundless v5 Windows artifact.
 
 ## Implemented Controls

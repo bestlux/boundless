@@ -1,5 +1,7 @@
 # Single Elevated Installer Spike
 
+> Historical design/implementation record. It includes intermediate v5.0.15 plans that have since changed. The current installed contract is in [Service Mode](../user/service-mode.md); current sequencing is in the [Windows roadmap](../v5-roadmap.md). The plain-MSI replacement and narrower privileged runtime are still distinct follow-up work.
+
 Status: BND-NEXT-9B-3 MSI-owned service lifecycle.
 
 This records the first implementation slice for the Windows one-install,

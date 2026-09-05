@@ -1,6 +1,14 @@
 # Migration Guide
 
-This guide covers migration from Boundless v4 and from Mouse Without Borders.
+This guide covers peer compatibility, older Boundless installations, and moving from Mouse Without Borders.
+
+## Peer protocol upgrade
+
+The Windows hardening work adds protocol **4.5.0** for temporary, consented paired-test probes. It is incompatible with protocol 4.4.0 peers under Boundless' exact-version transport policy. Update both PCs to the same build before testing. Configuration schema **6** preserves durable pairing and preferences while dropping saved connection observations. Live connection state is rediscovered after startup; a remembered pairing is not evidence that its peer is currently connected.
+
+Older binaries do not understand the new protocol/configuration contract. Before an installed upgrade, preserve a private backup of the existing configuration and identity/trust state for rollback. Do not post that backup in an issue. Rolling back requires the compatible pre-upgrade state on both PCs or a build that understands the newer schema; do not edit the version fields to force an old binary to accept it.
+
+This is a source-change compatibility notice, not a claim that the hardening build has been published. Check [Project Status](../project-status.md) for the candidate's implementation and validation state.
 
 ## From Boundless V4 To V5
 
@@ -64,7 +72,7 @@ Migration steps:
 
 1. Install Boundless on each Windows machine.
 2. Pair machines through the tray dashboard using challenge confirmation.
-3. Recreate your layout in Layout Manager.
+3. Recreate your layout in Arrange PCs.
 4. Enable the specific features you want, such as Easy Mouse, clipboard sharing, wrap mouse, and corner blocking.
 5. Configure file receive policy explicitly. Trusted-peer auto-accept is global in v5; per-peer auto-accept remains future work.
 6. Keep Mouse Without Borders installed only while comparing behavior; avoid running both tools for active input sharing at the same time.

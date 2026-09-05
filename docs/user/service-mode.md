@@ -17,7 +17,7 @@ machine-wide MSI is the primary service installation path.
 - The service control named pipe uses an explicit ACL for `SYSTEM`, local Administrators, and the selected Windows user SID.
 - Service mode has separate LocalSystem runtime state from the normal per-user daemon. Pairing, layout, and feature settings should be configured while the service is the active daemon.
 - The service does not self-update, and tray-owned update application is unsupported/deferred.
-- Elevated-app and lock-screen input control still need Windows runtime evidence before they are release-grade claims in v5.
+- Ordinary elevated-app input is an explicit experimental capability, described below. Lock-screen and secure-desktop control are unsupported.
 
 ## User-Session Input Broker
 
@@ -29,7 +29,7 @@ session 0, so mouse/keyboard sharing in service mode is brokered by the tray:
 - When the tray runs on the allowed user's normal unlocked desktop and detects a
   service-mode daemon, it attaches as the input broker over the same
   ACL-restricted control pipe. Input status then reports
-  `user_session_broker` in the tray Settings tab and `boundlessctl` snapshots.
+  `user_session_broker` in the tray Sharing details and `boundlessctl` snapshots.
 - The service remains the trust, routing, and network authority. The broker only
   captures local input in the user session and injects authenticated incoming
   frames there.
@@ -42,9 +42,21 @@ session 0, so mouse/keyboard sharing in service mode is brokered by the tray:
   stale/replaced broker tokens; a rejected caller cannot replace a live
   allowed-user broker. The service reverts to `service_session_unsupported`
   within a few seconds if the broker goes silent.
-- Scope is the normal unlocked desktop of the selected allowed user only. Lock
-  screen, secure desktop, UAC prompts, elevated applications, and other users'
-  sessions are not captured or controlled.
+- The normal broker's scope is the unlocked desktop of the selected allowed user. Lock screen, secure desktop, UAC prompts, and other users' sessions are not captured or controlled. Ordinary elevated applications require the separate opt-in below.
+
+## File operations under the selected user
+
+The service owns machine-level startup and peer transport, but a user-selected file or export path is not an instruction to use LocalSystem filesystem permissions. The hardening implementation captures an unelevated token for the configured user's current console session and scopes filesystem access to that user. Missing, changed, or unauthorized sessions fail the user operation rather than falling back to System authority.
+
+This is a restricted file-operation boundary inside the existing service architecture. It is not a claim that the entire daemon has moved to an unprivileged process. See the [security model](../security-trust-model.md) for remaining boundaries and the [roadmap](../v5-roadmap.md) for further runtime separation.
+
+## Experimental elevated application input
+
+The packaged input injector can be enabled explicitly in Sharing for ordinary administrator-launched applications belonging to the same selected split-token administrator account. It has its own limited input/release protocol and Windows elevation prompt. It does not grant arbitrary remote commands or file access.
+
+Unsigned dogfood builds show **Unknown Publisher** in Windows and identify the feature as experimental in Boundless. Cancellation, a crash, sign-in, or automatic retry must not cause a new elevation prompt. A new explicit enable action is required. This does not support UAC consent/credential desktops, lock screen, other user sessions, or a standard user controlling a different administrator account.
+
+Process identity and lifetime matter: a newly started broker cannot inherit a dead process's uncertain input delivery. Boundless must release conservatively and require a fresh handoff before continuing. The exact contract and tests are in [User-session input broker](../architecture/user-session-input-broker.md). Installed Windows validation remains necessary before a public elevated-input claim.
 
 ## Commands
 

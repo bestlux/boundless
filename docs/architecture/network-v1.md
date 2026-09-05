@@ -57,7 +57,7 @@ Related design notes:
 - Header and payload offsets survive cancellation. A reader future runs alongside the session reactor even while a branch awaits egress; its mailbox is bounded by 2 MiB of payloads and 256 frames, plus one frame being assembled. The reader shares the session lifetime rather than spawning a detached task.
 - Startup bulk is deterministic and bounded: the transport initiator sends at most one ordinary four-payload bulk batch, hands the turn to the acceptor with `StartupSyncComplete`, and waits for the return marker before normal bulk ticks drain the remainder.
 - Non-canonical protocol peers are rejected at handshake and guarded again in outbound send paths.
-- Protocol 4.4 retains the 4.3 physical keyboard identity and adds credited clipboard-image chunks. The clean bincode shape change intentionally rejects 4.3 peers at handshake; older local runtime config is migrated to 4.4 on upgrade.
+- Protocol 4.5 retains physical keyboard identity and credited clipboard-image chunks, and adds consented diagnostic probe/reply messages. Exact-version handshakes reject older peers; both PCs need compatible builds. Configuration schema 6 migrates durable settings while excluding live connection observations.
 
 ## Authenticated session ownership
 
@@ -82,7 +82,7 @@ The opt-in `network::tests::transport_safety_benchmark` emits machine-readable s
 
 ## Paired diagnostics integration (protocol 4.5)
 
-The separately implemented paired-diagnostics lane advances the protocol to 4.5; both PCs must upgrade together. Its `state/paired_testing.rs` owns volatile peer consent, lease deadlines, request and byte budgets, one outstanding local run/request, reply correlation, and source/version/session evidence. Session input ticks and flush signals may emit one `DiagnosticProbe` after ordinary input egress. Inbound dispatch performs an in-memory echo only through the active authenticated session and a local consent lease of at most 600 seconds. Late replies and replies from a mismatched session cannot satisfy pending requests.
+`state/paired_testing.rs` owns volatile peer consent, lease deadlines, request and byte budgets, one outstanding local run/request, reply correlation, and source/version/session evidence. Session input ticks and flush signals may emit one `DiagnosticProbe` after ordinary input egress. Inbound dispatch performs an in-memory echo only through the active authenticated session and a local consent lease of at most 600 seconds. Late replies and replies from a mismatched session cannot satisfy pending requests.
 
 The diagnostic budget is 64 KiB per payload, 256 requests/16 MiB per lease, 100 samples per workload and 30 seconds per run. Probes do not log per request or perform file, clipboard, or input actions. Actual socket provenance distinguishes loopback from `real_paired`; the in-memory harness remains `synthetic`. The combined implementation and acceptance contract are documented in `docs/performance/paired-testing.md`; the transport safety benchmark above does not substitute for those paired tests.
 

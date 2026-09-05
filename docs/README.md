@@ -23,6 +23,7 @@ Boundless is a pre-release Windows multi-PC control app. Start with the guide fo
 
 ## Implement And Verify Changes
 
+- [Development and local validation](development.md): commands and meaningful evidence boundaries.
 - [Component map](architecture/component-map.md): ownership across the Rust workspace.
 - [Network architecture](architecture/network-v1.md): discovery, connection/session ownership, transport, and backpressure.
 - [User-session input broker](architecture/user-session-input-broker.md): interactive input and service boundaries.
@@ -30,6 +31,7 @@ Boundless is a pre-release Windows multi-PC control app. Start with the guide fo
 - [Trust model](security-trust-model.md): local/peer authority, sensitive data, and supported security boundaries.
 - [Release readiness](release/release-readiness.md): automated gate and artifact rules.
 - [Product scorecard](performance/product-scorecard.md) and [two-machine evidence](performance/two-machine-evidence-harness.md): distinguish source checks, actual transport measurements, and physical product evidence.
+- [Paired testing](performance/paired-testing.md): temporary consent and one-controller transport checks.
 
 ## Historical Evidence
 

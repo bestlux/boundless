@@ -153,14 +153,13 @@ function Invoke-DocsStatusCheck {
     }
 
     $componentRequired = @(
-        "component_id",
+        "Component ID",
         "Owner",
-        "Durable State",
-        "Ephemeral State",
-        "Locks, Queues, Tasks",
-        "IPC Surface",
-        "Sensitive Data",
-        "Required Tests"
+        "Durable state",
+        "Live state and responsibility",
+        "Verification boundary",
+        "Configuration versus observation",
+        "Service authority versus user data"
     )
     foreach ($item in Test-DocContains -Path $componentMapPath -RequiredPatterns $componentRequired) {
         $missing.Add($item)
