@@ -3,7 +3,11 @@ use super::*;
 
 impl AppState {
     pub(crate) async fn control_plane_snapshot_bundle(&self) -> ControlPlaneSnapshotBundle {
-        let config = self.snapshot().await;
+        let mut config = self.snapshot().await;
+        // Sharing/Open Folder and console diagnostics must show the same
+        // effective user destination as the dedicated file-config query.
+        // Projection failure preserves config; it never breaks daemon health.
+        config.file_transfer = self.file_transfer_config().await;
         let peers = config.peers.clone();
         let layout_matrix = config.layout_matrix.clone();
         let features = config.features.clone();

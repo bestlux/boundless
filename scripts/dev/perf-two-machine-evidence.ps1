@@ -20,6 +20,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+if ($ReleaseEvidence) {
+    throw "This metadata/fixture tool cannot certify runtime evidence. Collect the actual paired-test report and validate its build, session, sample and integrity contract instead."
+}
 if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
     $PSNativeCommandUseErrorActionPreference = $false
 }
@@ -109,11 +112,12 @@ function Get-BuildEvidence {
                 present = $present
                 path_class = "repo-target"
                 version_output = Redact-Text $versionOutput
+                sha256 = if ($present) { (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() } else { "" }
             })
     }
 
     return [pscustomobject]@{
-        source = "repo-worktree"
+        source = "repo-target-snapshot-not-running-process"
         binaries_probed = $true
         binary_paths_recorded = $false
         binaries = @($binaries.ToArray())
@@ -569,9 +573,7 @@ function Read-ObservationFile {
         }
 
         $status = (Redact-Text (Get-ObjectProperty -Object $source -Name "status")).ToLowerInvariant()
-        if ([string]::IsNullOrWhiteSpace($status)) {
-            $status = "passed"
-        }
+        if ([string]::IsNullOrWhiteSpace($status)) { throw "Observation status is required; omitted results cannot become passes." }
         if ($status -eq "success" -or $status -eq "succeeded") {
             $status = "passed"
         }
@@ -603,7 +605,7 @@ function Read-ObservationFile {
             LatencyMs = $latencyMs
             DurationMs = $durationMs
             Bytes = $bytes
-            MeasurementSource = "observation-file"
+            MeasurementSource = "unverified-observation-file"
             ObservationId = Redact-Text (Get-ObjectProperty -Object $source -Name "id")
             FailureKind = Redact-Text (Get-ObjectProperty -Object $source -Name "failure_kind")
             StartedAtUtc = Redact-Text (Get-ObjectProperty -Object $source -Name "started_at_utc")
@@ -812,32 +814,9 @@ function New-ScenarioSummary {
 
 function Get-ReleaseEvidenceEligibility {
     param([object[]]$ScenarioSummaries)
-
-    if (-not $ReleaseEvidence.IsPresent) {
-        return [pscustomobject]@{
-            eligible = $false
-            reason = "ReleaseEvidence was not set"
-        }
-    }
-    if ($Mode -eq "DryRun" -or $Mode -eq "Validate") {
-        return [pscustomobject]@{
-            eligible = $false
-            reason = "dry-run and validation output is developer diagnostics only"
-        }
-    }
-
-    $missing = @($ScenarioSummaries | Where-Object { $_.iterations -lt 1 })
-    if ($missing.Count -gt 0) {
-        $missingNames = ($missing | ForEach-Object { $_.scenario }) -join ", "
-        return [pscustomobject]@{
-            eligible = $false
-            reason = "missing observations for selected scenario(s): $missingNames"
-        }
-    }
-
     return [pscustomobject]@{
-        eligible = $true
-        reason = "caller marked real two-machine evidence candidate with observations for each selected scenario"
+        eligible = $false
+        reason = "Metadata fixtures and imported observations are diagnostics, not verified runtime measurements."
     }
 }
 
@@ -858,6 +837,7 @@ function New-EvidencePacket {
         schema_version = "boundless.performance.two_machine.v1"
         generated_at_utc = [DateTime]::UtcNow.ToString("o")
         mode = $Mode
+        measurement_scope = "fixture-or-unverified-manual-observations"
         evidence_class = $evidenceClass
         release_evidence = [pscustomobject]@{
             eligible = $eligibility.eligible
@@ -894,7 +874,7 @@ function New-EvidencePacket {
         notes = @(
             "This harness does not mutate pairing, firewall, service, trust, installer, clipboard contents, or file contents.",
             "DryRun and Validate output are developer diagnostics only, not release evidence.",
-            "Use release evidence only for real two-machine runs with sanitized observations from both roles."
+            "Use the actual paired-test report for authenticated transport measurement; physical desktop acceptance is separate."
         )
     }
 }
@@ -929,7 +909,7 @@ function Write-MarkdownSummary {
     $lines.Add("")
     $lines.Add("## Evidence Boundary")
     $lines.Add("")
-    $lines.Add("Dry-run and fixture output is developer diagnostics only. Release evidence requires a real two-machine run, matching sanitized role packets, and review of missing or failed scenario rows.")
+    $lines.Add("This packet contains fixtures or unverified imported observations. It does not prove running product behavior, even when rows are labeled passed. Use the paired-test report for actual authenticated transport measurement; physical desktop acceptance remains separate.")
     $lines | Set-Content -LiteralPath $markdownPath -Encoding utf8
 }
 
@@ -993,10 +973,6 @@ function Invoke-Validation {
     }
 
     Write-Host "fixture_validation=passed"
-}
-
-if ($ReleaseEvidence -and ($Mode -eq "DryRun" -or $Mode -eq "Validate")) {
-    throw "DryRun and Validate modes cannot be marked as release evidence."
 }
 
 switch ($Mode) {

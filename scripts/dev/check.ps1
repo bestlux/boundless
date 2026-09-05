@@ -141,29 +141,25 @@ function Invoke-DocsStatusCheck {
     $missing = New-Object System.Collections.Generic.List[string]
 
     $projectRequired = @(
-        "Current Stable Version",
+        "Release Baseline",
         "Support Posture",
         "Service Mode Boundary",
         "Canonical Release Flow",
         "Known Validation Gaps",
-        "Pro Oversight Item Accounting",
-        "landed",
-        "deferred",
-        "open"
+        "Current Work"
     )
     foreach ($item in Test-DocContains -Path $projectStatusPath -RequiredPatterns $projectRequired) {
         $missing.Add($item)
     }
 
     $componentRequired = @(
-        "component_id",
+        "Component ID",
         "Owner",
-        "Durable State",
-        "Ephemeral State",
-        "Locks, Queues, Tasks",
-        "IPC Surface",
-        "Sensitive Data",
-        "Required Tests"
+        "Durable state",
+        "Live state and responsibility",
+        "Verification boundary",
+        "Configuration versus observation",
+        "Service authority versus user data"
     )
     foreach ($item in Test-DocContains -Path $componentMapPath -RequiredPatterns $componentRequired) {
         $missing.Add($item)

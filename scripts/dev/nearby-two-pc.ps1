@@ -381,9 +381,9 @@ switch ($Action) {
     "start-daemon" {
         if ($Build -or -not (Test-Path $daemonExe) -or -not (Test-Path $cliExe)) {
             Write-Host "[nearby-two-pc] building debug binaries"
-            cargo build -p boundless-daemon -p boundless-cli | Out-Host
+            cargo build --locked -p boundless-daemon -p boundless-cli | Out-Host
             if ($LASTEXITCODE -ne 0) {
-                throw "cargo build failed with exit code $LASTEXITCODE"
+                throw "cargo build --locked failed with exit code $LASTEXITCODE"
             }
         }
 

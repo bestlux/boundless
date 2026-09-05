@@ -59,15 +59,25 @@ function Redact-FixtureLogLine {
 function Invoke-Harness {
     param(
         [string]$Name,
-        [string[]]$Arguments
+        [string[]]$Arguments,
+        [switch]$ExpectFailure
     )
 
     $caseRoot = Join-Path $OutputRoot $Name
     New-Item -ItemType Directory -Force -Path $caseRoot | Out-Null
     $logPath = Join-Path $caseRoot "$Name.log"
-    $captured = & powershell -NoProfile -ExecutionPolicy Bypass -File $harness @Arguments -OutputRoot $caseRoot *>&1
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $captured = & powershell -NoProfile -ExecutionPolicy Bypass -File $harness @Arguments -OutputRoot $caseRoot *>&1
+    }
+    finally { $ErrorActionPreference = $previousPreference }
     $exitCode = if ($null -eq $global:LASTEXITCODE) { 0 } else { $global:LASTEXITCODE }
     $captured | ForEach-Object { Redact-FixtureLogLine $_ } | Set-Content -LiteralPath $logPath -Encoding utf8
+    if ($ExpectFailure) {
+        if ($exitCode -eq 0) { throw "Harness fixture '$Name' accepted invalid evidence." }
+        return
+    }
     if ($exitCode -ne 0) {
         throw "Harness fixture '$Name' failed with exit code $exitCode; see generated fixture log"
     }
@@ -159,13 +169,18 @@ if ($validateSummary.throughput_mbps -ne 0.041) {
     throw "Validate fixture did not preserve expected throughput math."
 }
 
-$emptyCapturePacket = Invoke-Harness -Name "empty-capture-release-evidence" -Arguments @("-Mode", "Capture", "-Role", "coordinator", "-ReleaseEvidence")
+$emptyCapturePacket = Invoke-Harness -Name "empty-capture" -Arguments @("-Mode", "Capture", "-Role", "coordinator")
 if ($emptyCapturePacket.release_evidence.eligible -ne $false) {
     throw "Empty Capture fixture must not be eligible for release evidence."
 }
 if ($emptyCapturePacket.evidence_class -ne "developer-diagnostics") {
     throw "Empty Capture fixture must remain developer diagnostics."
 }
+Invoke-Harness -Name 'reject-empty-release-evidence' -ExpectFailure -Arguments @('-Mode', 'Capture', '-Role', 'coordinator', '-ReleaseEvidence')
+Invoke-Harness -Name 'reject-fixture-promotion' -ExpectFailure -Arguments @('-Mode', 'Summarize', '-Role', 'coordinator', '-ObservationPath', (Join-Path $OutputRoot 'validate/two-machine-evidence.json'), '-ReleaseEvidence')
+$missingStatus = Join-Path $OutputRoot 'missing-status.json'
+@{ scenario = 'text-clipboard'; latency_ms = 1; duration_ms = 1; bytes = 128 } | ConvertTo-Json | Set-Content -LiteralPath $missingStatus -Encoding utf8
+Invoke-Harness -Name 'reject-missing-status' -ExpectFailure -Arguments @('-Mode', 'Summarize', '-ObservationPath', $missingStatus)
 
 foreach ($artifact in Get-ChildItem -LiteralPath $OutputRoot -File -Recurse -Include "*.json", "*.md", "*.log") {
     $content = Get-Content -LiteralPath $artifact.FullName -Raw

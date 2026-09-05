@@ -16,6 +16,11 @@
         },
         {
           "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(!@.source && (@.name.value == 'adapter-ipc-grpc' || @.name.value == 'app-services' || @.name.value == 'boundless-cli' || @.name.value == 'boundless-daemon' || @.name.value == 'boundless-input-injector' || @.name.value == 'boundless-tray' || @.name.value == 'control-plane-client' || @.name.value == 'core-clipboard' || @.name.value == 'core-discovery' || @.name.value == 'core-input' || @.name.value == 'core-protocol' || @.name.value == 'core-security' || @.name.value == 'core-transfer' || @.name.value == 'daemon-host' || @.name.value == 'ipc-api' || @.name.value == 'peer-transport' || @.name.value == 'platform-windows'))].version"
+        },
+        {
+          "type": "toml",
           "path": "crates/adapter-ipc-grpc/Cargo.toml",
           "jsonpath": "$.package.version"
         },

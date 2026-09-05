@@ -7,6 +7,9 @@ param(
     [string]$InstallerPath = "",
     [string]$PreviousInstallerPath = "",
     [string]$InstallerSmokeSummaryPath = "",
+    [string]$PairedTestReportPath = "",
+    [string]$ExpectedDaemonSha256 = "",
+    [string]$ExpectedSourceRevision = "",
     [switch]$RequireSignature,
     [switch]$RequireReady,
     [switch]$IncludeServiceSmoke,
@@ -867,19 +870,45 @@ Invoke-Gate -Id "release_consistency" -Category "release" -Command "scripts/rele
 
 if ($SkipUnitGates) {
     Add-SkippedGate -Id "cargo_fmt" -Category "unit" -Command "cargo fmt --all -- --check" -Reason "SkipUnitGates was set" -Impact "format regressions must be covered by a separate CI or local gate"
-    Add-SkippedGate -Id "cargo_clippy" -Category "unit" -Command "cargo clippy --workspace --all-targets -- -D warnings" -Reason "SkipUnitGates was set" -Impact "lint regressions must be covered by a separate CI or local gate"
-    Add-SkippedGate -Id "cargo_test" -Category "unit" -Command "cargo test --workspace" -Reason "SkipUnitGates was set" -Impact "unit regressions must be covered by a separate CI or local gate"
+    Add-SkippedGate -Id "cargo_clippy" -Category "unit" -Command "cargo clippy --locked --workspace --all-targets -- -D warnings" -Reason "SkipUnitGates was set" -Impact "lint regressions must be covered by a separate CI or local gate"
+    Add-SkippedGate -Id "cargo_test" -Category "unit" -Command "cargo test --locked --workspace" -Reason "SkipUnitGates was set" -Impact "unit regressions must be covered by a separate CI or local gate"
 }
 else {
     Invoke-Gate -Id "cargo_fmt" -Category "unit" -Command "cargo fmt --all -- --check" -Action {
         cargo fmt --all -- --check
     }
-    Invoke-Gate -Id "cargo_clippy" -Category "unit" -Command "cargo clippy --workspace --all-targets -- -D warnings" -Action {
-        cargo clippy --workspace --all-targets -- -D warnings
+    Invoke-Gate -Id "cargo_clippy" -Category "unit" -Command "cargo clippy --locked --workspace --all-targets -- -D warnings" -Action {
+        cargo clippy --locked --workspace --all-targets -- -D warnings
     }
-    Invoke-Gate -Id "cargo_test" -Category "unit" -Command "cargo test --workspace" -Action {
-        cargo test --workspace
+    Invoke-Gate -Id "cargo_test" -Category "unit" -Command "cargo test --locked --workspace" -Action {
+        cargo test --locked --workspace
     }
+}
+
+$workspaceTests = $results | Where-Object { $_.id -eq "cargo_test" } | Select-Object -First 1
+Add-GateResult -Id "layout_topology_validation" -Category "unit" `
+    -Command "cargo test --locked --workspace (includes layout matrix validation)" `
+    -Status $workspaceTests.status -LogPath $workspaceTests.log_path `
+    -Reason "Covered by the workspace unit suite; validates layout data, not a four-PC runtime" `
+    -Impact "Physical multi-PC topology needs separate functional evidence"
+
+if ($PairedTestReportPath) {
+    Invoke-Gate -Id 'paired_transport_contract' -Category 'transport' -Command 'scripts/dev/validate-paired-test.ps1 -RequireRealPaired' -Action {
+        if ($Policy -eq 'stable' -and -not $ExpectedDaemonSha256) {
+            throw 'Stable candidate transport evidence requires -ExpectedDaemonSha256 from the candidate artifact.'
+        }
+        $pairedEvidencePath = Join-Path $evidenceRoot 'paired-test.json'
+        Copy-Item -LiteralPath $PairedTestReportPath -Destination $pairedEvidencePath -Force
+        & (Join-Path $PSScriptRoot 'validate-paired-test.ps1') -ReportPath $pairedEvidencePath `
+            -ExpectedDaemonSha256 $ExpectedDaemonSha256 -ExpectedSourceRevision $ExpectedSourceRevision `
+            -RequireRealPaired -MaxEvidenceAgeHours $MaxEvidenceAgeHours `
+            -OutputPath (Join-Path $evidenceRoot 'paired-transport-validation.json')
+    }
+}
+else {
+    Add-SkippedGate -Id 'paired_transport_contract' -Category 'transport' -Command 'scripts/dev/validate-paired-test.ps1 -RequireRealPaired' `
+        -Reason 'PairedTestReportPath was not supplied' `
+        -Impact 'Authenticated peer RTT and echo integrity remain unmeasured; physical desktop acceptance is separate'
 }
 
 if ($IncludeRuntimeGates) {
@@ -889,11 +918,8 @@ if ($IncludeRuntimeGates) {
     Invoke-Gate -Id "three_node_smoke" -Category "runtime" -Command "scripts/dev/three-node-smoke.ps1" -Action {
         & (Join-Path $repoRoot "scripts/dev/three-node-smoke.ps1") -TimeoutSeconds ([Math]::Max($RuntimeTimeoutSeconds, 90)) -KeepArtifacts
     }
-    Invoke-Gate -Id "four_node_topology" -Category "runtime" -Command "cargo test -p app-services layout_matrix_validation_accepts_four_remote_peers_plus_local" -Action {
-        cargo test -p app-services layout_matrix_validation_accepts_four_remote_peers_plus_local
-    }
-    Invoke-Gate -Id "edge_handoff_trace" -Category "runtime" -Command "scripts/dev/test-suite.ps1 -Profile trace" -Action {
-        & (Join-Path $repoRoot "scripts/dev/test-suite.ps1") -Profile trace -TimeoutSeconds $RuntimeTimeoutSeconds -EndpointA $EndpointA -EndpointB $EndpointB -KeepArtifacts
+    Invoke-Gate -Id "edge_handoff_latency" -Category "runtime" -Command "scripts/dev/test-suite.ps1 -Profile trace -TraceEnforceBudgets" -Action {
+        & (Join-Path $repoRoot "scripts/dev/test-suite.ps1") -Profile trace -TraceEnforceBudgets -TimeoutSeconds $RuntimeTimeoutSeconds -EndpointA $EndpointA -EndpointB $EndpointB -KeepArtifacts
     }
     if ([string]::IsNullOrWhiteSpace($EndpointB)) {
         Add-SkippedGate -Id "pairing_recovery_matrix" -Category "runtime" -Command "scripts/dev/test-suite.ps1 -Profile recovery" -Reason "EndpointB was not provided" -Impact "pairing recovery must be validated before release signoff"
@@ -907,8 +933,7 @@ if ($IncludeRuntimeGates) {
 else {
     Add-SkippedGate -Id "two_node_smoke" -Category "runtime" -Command "scripts/dev/two-node-smoke.ps1" -Reason "IncludeRuntimeGates was not set" -Impact "two-node runtime behavior remains release-candidate evidence"
     Add-SkippedGate -Id "three_node_smoke" -Category "runtime" -Command "scripts/dev/three-node-smoke.ps1" -Reason "IncludeRuntimeGates was not set" -Impact "three-node runtime behavior remains release-candidate evidence"
-    Add-SkippedGate -Id "four_node_topology" -Category "runtime" -Command "cargo test -p app-services layout_matrix_validation_accepts_four_remote_peers_plus_local" -Reason "IncludeRuntimeGates was not set" -Impact "four-machine deterministic topology evidence remains release-candidate evidence"
-    Add-SkippedGate -Id "edge_handoff_trace" -Category "runtime" -Command "scripts/dev/test-suite.ps1 -Profile trace" -Reason "IncludeRuntimeGates was not set" -Impact "input latency budgets remain release-candidate evidence"
+    Add-SkippedGate -Id "edge_handoff_latency" -Category "runtime" -Command "scripts/dev/test-suite.ps1 -Profile trace -TraceEnforceBudgets" -Reason "IncludeRuntimeGates was not set" -Impact "fresh input latency samples and enforced budgets remain release-candidate evidence"
     Add-SkippedGate -Id "pairing_recovery_matrix" -Category "runtime" -Command "scripts/dev/test-suite.ps1 -Profile recovery" -Reason "IncludeRuntimeGates was not set" -Impact "pairing recovery evidence remains release-candidate evidence"
 }
 
@@ -996,6 +1021,8 @@ $packet = [pscustomobject]@{
     git_commit = $gitCommit
     release_version = $effectiveReleaseVersion
     release_policy = $Policy
+    acceptance_scope = 'automated-gates-and-supplied-transport-evidence; physical-desktop-acceptance-not-certified'
+    expected_daemon_sha256 = $ExpectedDaemonSha256
     service_update_mode = $ServiceUpdateMode
     input_injector_signature_policy = $InputInjectorSignaturePolicy
     risk_classification = $risk

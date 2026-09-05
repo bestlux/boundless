@@ -10,6 +10,8 @@ const SYSTEM_SID: &str = "S-1-5-18";
 
 fn verified_client(user_sid: &str, session_id: u32) -> Option<InputBrokerClientIdentity> {
     Some(InputBrokerClientIdentity {
+        process_id: Some(100),
+        process_creation_time: Some(1),
         user_sid: Some(user_sid.to_string()),
         session_id: Some(session_id),
     })
@@ -17,6 +19,497 @@ fn verified_client(user_sid: &str, session_id: u32) -> Option<InputBrokerClientI
 
 fn allowed_client() -> Option<InputBrokerClientIdentity> {
     verified_client(ALLOWED_USER_SID, 2)
+}
+
+fn restarted_client() -> Option<InputBrokerClientIdentity> {
+    let mut client = allowed_client().expect("verified client");
+    // Deliberately reuse the PID: birth time, not PID equality, proves survival.
+    client.process_creation_time = Some(2);
+    Some(client)
+}
+
+async fn route_broker_test_events(
+    state: &AppState,
+    peer_id: &str,
+    sequence: u64,
+    events: Vec<InputEvent>,
+) -> RouteDecision {
+    state
+        .route_incoming_input_frame(
+            peer_id,
+            InputFrame {
+                source_peer_id: peer_id.to_string(),
+                sequence,
+                timestamp_unix_ms: Utc::now().timestamp_millis(),
+                events,
+            },
+        )
+        .await
+        .expect("route input")
+}
+
+#[tokio::test]
+async fn paused_broker_keeps_clipboard_live_and_allows_only_release_recovery() {
+    let (state, root) = service_mode_broker_state("boundless-broker-paused-clipboard").await;
+    let peer = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "broker".into(), true)
+        .await;
+    assert!(state.claim_input_owner(&peer, false).await.expect("claim"));
+    route_broker_test_events(
+        &state,
+        &peer,
+        1,
+        vec![InputEvent::Key {
+            scan_code: 30,
+            state: KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        }],
+    )
+    .await;
+    let uncertain = state
+        .exchange_input_broker(allowed_client(), &attach.broker_token, Default::default())
+        .await;
+    assert_ne!(uncertain.inject_batch_id, 0);
+    route_broker_test_events(
+        &state,
+        &peer,
+        2,
+        vec![InputEvent::MouseMove { dx: 9, dy: 9 }],
+    )
+    .await;
+    assert!(state.release_input_owner(&peer).await);
+    let cancelled = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                inject_backpressure: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(cancelled.accepted && cancelled.inject_batch_cancelled);
+    assert_eq!(cancelled.inject_batch_id, uncertain.inject_batch_id);
+    // The tray has a committed Down whose cleanup failed. It must keep this
+    // cancellation unacknowledged, allowing pause to preserve a recovery Up.
+    let paused = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                input_paused: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(paused.accepted);
+    assert!(
+        !paused.lock_should_be_active && !paused.capture_active && !paused.held_input_authorized
+    );
+    assert!(paused.inject_batch_id > uncertain.inject_batch_id);
+    assert_eq!(
+        paused.inject_frames[0].events,
+        vec![InputEvent::Key {
+            scan_code: 30,
+            state: KeyState::Up,
+            semantics: core_input::KeySemantics::Physical,
+        }]
+    );
+    assert_eq!(state.pending_inject_frame_stats().await.0, 0);
+    assert!(
+        !state
+            .claim_input_owner(&peer, true)
+            .await
+            .expect("paused claim rejected")
+    );
+    assert!(matches!(
+        route_broker_test_events(
+            &state,
+            &peer,
+            3,
+            vec![InputEvent::MouseMove { dx: 1, dy: 1 }]
+        )
+        .await,
+        RouteDecision::IgnoredFeatureDisabled
+    ));
+    // Continue beyond the attachment's normal three-second stale deadline.
+    // Clipboard never refreshes that deadline itself; paused input heartbeats do.
+    for _ in 0..17 {
+        let heartbeat = state
+            .exchange_input_broker(
+                allowed_client(),
+                &attach.broker_token,
+                InputBrokerExchangeObservations {
+                    input_paused: true,
+                    acked_inject_batch_id: paused.inject_batch_id,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(heartbeat.accepted && heartbeat.inject_frames.is_empty());
+        assert!(!heartbeat.lock_should_be_active && !heartbeat.capture_active);
+        assert!(
+            state
+                .exchange_clipboard_broker(allowed_client(), &attach.broker_token, None, None, None)
+                .await
+                .accepted
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let local = state
+        .exchange_clipboard_broker(
+            allowed_client(),
+            &attach.broker_token,
+            Some(ClipboardPayload::Text("local while paused".into())),
+            Some(1),
+            None,
+        )
+        .await;
+    assert!(local.accepted);
+    assert!(state.drain_outgoing(&peer).await.iter().any(|payload|
+        matches!(payload, OutboundPayload::ClipboardText { text } if text == "local while paused")));
+    state
+        .enqueue_remote_clipboard_text(&peer, "remote while paused".into())
+        .await
+        .expect("remote clipboard");
+    let remote = state
+        .exchange_clipboard_broker(allowed_client(), &attach.broker_token, None, None, None)
+        .await;
+    assert!(
+        matches!(remote.remote_payload.expect("clipboard receipt").payload,
+        ClipboardPayload::Text(text) if text == "remote while paused")
+    );
+    let resumed = state
+        .exchange_input_broker(
+            allowed_client(),
+            &attach.broker_token,
+            InputBrokerExchangeObservations {
+                acked_inject_batch_id: paused.inject_batch_id,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(resumed.accepted && resumed.inject_frames.is_empty());
+    assert!(state.input_owner().await.is_none());
+    assert!(matches!(
+        route_broker_test_events(
+            &state,
+            &peer,
+            4,
+            vec![InputEvent::MouseMove { dx: 1, dy: 1 }]
+        )
+        .await,
+        RouteDecision::IgnoredNoOwner
+    ));
+    assert!(
+        state
+            .claim_input_owner(&peer, false)
+            .await
+            .expect("fresh handoff")
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn broker_process_replacement_releases_possible_holds_and_requires_fresh_handoff() {
+    let (state, root) = service_mode_broker_state("boundless-broker-process-death").await;
+    let peer = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "before-death".into(), true)
+        .await;
+    assert!(state.claim_input_owner(&peer, false).await.expect("owner"));
+    let key = |scan_code, state| InputEvent::Key {
+        scan_code,
+        state,
+        semantics: core_input::KeySemantics::Physical,
+    };
+    route_broker_test_events(&state, &peer, 1, vec![key(29, KeyState::Down)]).await;
+    let confirmed_down = state
+        .exchange_input_broker(allowed_client(), &attach.broker_token, Default::default())
+        .await;
+    // The exact receipt confirms a hold even after the original frame is freed.
+    assert!(
+        state
+            .exchange_input_broker(
+                allowed_client(),
+                &attach.broker_token,
+                InputBrokerExchangeObservations {
+                    acked_inject_batch_id: confirmed_down.inject_batch_id,
+                    ..Default::default()
+                }
+            )
+            .await
+            .accepted
+    );
+    route_broker_test_events(
+        &state,
+        &peer,
+        2,
+        vec![
+            key(46, KeyState::Down),
+            key(29, KeyState::Up),
+            InputEvent::MouseMove { dx: 7, dy: 9 },
+            InputEvent::MouseWheel {
+                delta_x: 0,
+                delta_y: 120,
+            },
+        ],
+    )
+    .await;
+    let uncertain = state
+        .exchange_input_broker(allowed_client(), &attach.broker_token, Default::default())
+        .await;
+    assert_eq!(uncertain.inject_frames.len(), 1);
+    // This never-dispatched frame must also disappear at the process boundary.
+    route_broker_test_events(&state, &peer, 3, vec![key(30, KeyState::Down)]).await;
+    request_broker_capture(&state, &peer).await;
+    state.set_input_lock_runtime(true, true).await;
+
+    let replacement = state
+        .attach_input_broker(restarted_client(), "after-death".into(), true)
+        .await;
+    assert!(replacement.accepted);
+    assert_ne!(replacement.delivery_epoch, attach.delivery_epoch);
+    assert_eq!(state.input_capture_target().await, None);
+    assert_eq!(state.input_owner().await, None);
+    assert_eq!(state.input_lock_runtime().await, (false, false));
+    assert_eq!(state.pending_inject_frame_stats().await.0, 0);
+    let before_stolen_token = state.input_broker_relay().last_exchange_at_for_test();
+    assert!(
+        !state
+            .exchange_input_broker(
+                allowed_client(),
+                &replacement.broker_token,
+                Default::default()
+            )
+            .await
+            .accepted
+    );
+    assert_eq!(
+        state.input_broker_relay().last_exchange_at_for_test(),
+        before_stolen_token,
+        "a different process cannot extend liveness even with a copied token"
+    );
+    assert!(
+        !state
+            .exchange_input_broker(restarted_client(), &attach.broker_token, Default::default())
+            .await
+            .accepted
+    );
+
+    let cleanup = state
+        .exchange_input_broker(
+            restarted_client(),
+            &replacement.broker_token,
+            Default::default(),
+        )
+        .await;
+    assert!(cleanup.accepted);
+    let cleanup_events = cleanup
+        .inject_frames
+        .iter()
+        .flat_map(|frame| frame.events.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cleanup_events,
+        vec![key(29, KeyState::Up), key(46, KeyState::Up)],
+        "acknowledged holds and possible partial-send Downs need releases; no Down, motion, wheel, or queued payload may replay"
+    );
+    assert!(!cleanup.held_input_authorized);
+    let after_cleanup = state
+        .exchange_input_broker(
+            restarted_client(),
+            &replacement.broker_token,
+            InputBrokerExchangeObservations {
+                acked_inject_batch_id: cleanup.inject_batch_id,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(after_cleanup.accepted && after_cleanup.inject_frames.is_empty());
+    assert_eq!(
+        route_broker_test_events(&state, &peer, 4, vec![key(31, KeyState::Down)]).await,
+        RouteDecision::IgnoredNoOwner
+    );
+    assert!(
+        state
+            .claim_input_owner(&peer, false)
+            .await
+            .expect("fresh explicit handoff")
+    );
+    assert!(matches!(
+        route_broker_test_events(&state, &peer, 5, vec![key(32, KeyState::Down)]).await,
+        RouteDecision::Applied { .. }
+    ));
+    let fresh = state
+        .exchange_input_broker(
+            restarted_client(),
+            &replacement.broker_token,
+            Default::default(),
+        )
+        .await;
+    assert_eq!(fresh.inject_frames[0].events, vec![key(32, KeyState::Down)]);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn lost_recovery_reply_survives_cooperative_detach_and_reattach() {
+    let (state, root) = service_mode_broker_state("boundless-broker-lost-recovery").await;
+    let peer = join_connected_peer(&state).await;
+    let original = state
+        .attach_input_broker(allowed_client(), "original".into(), true)
+        .await;
+    assert!(state.claim_input_owner(&peer, false).await.expect("owner"));
+    route_broker_test_events(
+        &state,
+        &peer,
+        1,
+        vec![InputEvent::Key {
+            scan_code: 29,
+            state: KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        }],
+    )
+    .await;
+    let down = state
+        .exchange_input_broker(allowed_client(), &original.broker_token, Default::default())
+        .await;
+    assert!(!down.inject_frames.is_empty());
+    let mut replacement = state
+        .attach_input_broker(restarted_client(), "replacement".into(), true)
+        .await;
+    let mut cleanup = state
+        .exchange_input_broker(
+            restarted_client(),
+            &replacement.broker_token,
+            Default::default(),
+        )
+        .await;
+    let expected = vec![InputEvent::Key {
+        scan_code: 29,
+        state: KeyState::Up,
+        semantics: core_input::KeySemantics::Physical,
+    }];
+    for reset in [false, true] {
+        assert_eq!(
+            cleanup
+                .inject_frames
+                .iter()
+                .flat_map(|frame| frame.events.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        // The first cleanup response never reached the tray, so it has no
+        // active batch or local held state and detaches without a receipt.
+        assert!(
+            state
+                .detach_input_broker_with_reset(
+                    restarted_client(),
+                    &replacement.broker_token,
+                    &replacement.delivery_epoch,
+                    0,
+                    reset
+                )
+                .await
+        );
+        replacement = state
+            .attach_input_broker(restarted_client(), "same-process".into(), true)
+            .await;
+        cleanup = state
+            .exchange_input_broker(
+                restarted_client(),
+                &replacement.broker_token,
+                Default::default(),
+            )
+            .await;
+        assert!(cleanup.accepted);
+        assert_eq!(
+            cleanup
+                .inject_frames
+                .iter()
+                .flat_map(|frame| frame.events.clone())
+                .collect::<Vec<_>>(),
+            expected,
+            "unacknowledged recovery must remain in the release-only lane"
+        );
+        assert!(!cleanup.held_input_authorized);
+        assert_eq!(state.input_owner().await, None);
+    }
+    let completed = state
+        .exchange_input_broker(
+            restarted_client(),
+            &replacement.broker_token,
+            InputBrokerExchangeObservations {
+                acked_inject_batch_id: cleanup.inject_batch_id,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(completed.accepted && completed.inject_frames.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn broker_process_replacement_unlocks_before_blocked_config_or_peer_queue() {
+    let (state, root) = service_mode_broker_state("boundless-broker-unlock-before-io").await;
+    let peer = join_connected_peer(&state).await;
+    let attach = state
+        .attach_input_broker(allowed_client(), "first".into(), true)
+        .await;
+    authorize_broker_capture(&state, &peer, &attach.broker_token).await;
+    state.input_broker_relay().push_broker_observations(
+        vec![InputEvent::Key {
+            scan_code: 29,
+            state: KeyState::Down,
+            semantics: core_input::KeySemantics::Physical,
+        }],
+        None,
+        None,
+        0,
+        0,
+        0,
+        None,
+        true,
+        0,
+    );
+    state.set_input_lock_runtime(true, true).await;
+    let config_busy = state.config.write().await;
+    let replacement_state = state.clone();
+    let replacement = tokio::spawn(async move {
+        replacement_state
+            .attach_input_broker(restarted_client(), "replacement".into(), true)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while state.input_lock_runtime().await.0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("local unlock cannot wait for config or peer queue");
+    assert!(!state.input_broker_relay().desired_lock_active());
+    assert_eq!(state.input_capture_target().await, None);
+    assert!(
+        !replacement.is_finished(),
+        "test must exercise genuinely blocked queue access"
+    );
+    drop(config_busy);
+    assert!(replacement.await.expect("join replacement").accepted);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn broker_missing_process_birth_time_cannot_claim_delivery_continuity() {
+    let (state, root) = service_mode_broker_state("boundless-broker-missing-incarnation").await;
+    let mut identity = allowed_client().expect("identity");
+    identity.process_creation_time = None;
+    let attach = state
+        .attach_input_broker(Some(identity), "unverified-process".into(), true)
+        .await;
+    assert!(!attach.accepted);
+    assert!(attach.message.contains("unverified_process_incarnation"));
+    let _ = std::fs::remove_dir_all(root);
 }
 
 async fn broker_state(prefix: &str) -> (AppState, std::path::PathBuf) {
@@ -154,6 +647,8 @@ async fn attach_fails_closed_without_verified_client_identity() {
     assert_attach_rejected_event(&state, "unverified_client").await;
 
     let partially_verified = Some(InputBrokerClientIdentity {
+        process_id: Some(100),
+        process_creation_time: Some(1),
         user_sid: None,
         session_id: Some(2),
     });
@@ -717,62 +1212,86 @@ async fn replacement_attach_fails_open_existing_capture_target() {
 }
 
 #[tokio::test]
-async fn replacement_attach_queue_failure_preserves_prior_broker_and_pressed_state() {
-    let (state, root) =
-        service_mode_broker_state("boundless-broker-replace-queue-failure-test").await;
-    let peer_id = join_connected_peer(&state).await;
+async fn removed_capture_peer_does_not_block_broker_replacement_for_remaining_peers() {
+    let (state, root) = service_mode_broker_state("boundless-broker-removed-release-test").await;
+    let removed_peer = join_connected_peer(&state).await;
+    let remaining_peer = join_connected_peer(&state).await;
     let first = state
-        .attach_input_broker(allowed_client(), "first-broker".to_string(), true)
+        .attach_input_broker(allowed_client(), "first-broker".into(), true)
         .await;
     assert!(first.accepted);
-    authorize_broker_capture(&state, &peer_id, &first.broker_token).await;
-    let observed = state
-        .exchange_input_broker(
-            allowed_client(),
-            &first.broker_token,
-            InputBrokerExchangeObservations {
-                captured_events: vec![InputEvent::Key {
-                    scan_code: 30,
-                    state: KeyState::Down,
-                    semantics: core_input::KeySemantics::Physical,
-                }],
-                lock_active: true,
-                ..Default::default()
-            },
-        )
-        .await;
-    assert!(observed.accepted);
-
-    // Force queue_input_events to fail after replacement has identified a
-    // target, without mutating the old attachment itself.
-    *state.input.control.capture_target_peer_id.write().await = Some("missing-peer".to_string());
-    let replacement = state
-        .attach_input_broker(allowed_client(), "replacement-broker".to_string(), true)
-        .await;
-    assert!(!replacement.accepted);
-    assert!(replacement.broker_token.is_empty());
-
-    let old_token_still_valid = state
-        .exchange_input_broker(
-            allowed_client(),
-            &first.broker_token,
-            InputBrokerExchangeObservations::default(),
-        )
-        .await;
-    assert!(old_token_still_valid.accepted);
-    assert_eq!(
-        state.input_broker_relay().release_events_snapshot(),
-        vec![InputEvent::Key {
-            scan_code: 30,
-            state: KeyState::Up,
-            semantics: core_input::KeySemantics::Physical,
-        }],
-        "failed replacement must preserve authoritative pressed state for retry"
+    authorize_broker_capture(&state, &removed_peer, &first.broker_token).await;
+    assert!(
+        state
+            .exchange_input_broker(
+                allowed_client(),
+                &first.broker_token,
+                InputBrokerExchangeObservations {
+                    captured_events: vec![InputEvent::Key {
+                        scan_code: 30,
+                        state: KeyState::Down,
+                        semantics: core_input::KeySemantics::Physical,
+                    }],
+                    lock_active: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .accepted
     );
-
+    // Replacement may have remembered the old release target before peer
+    // removal finished its asynchronous cleanup. Preserve that exact state.
+    assert!(
+        state
+            .input_broker
+            .prepare_capture_release(Some(&removed_peer))
+            .is_some()
+    );
+    assert!(state.remove_peer(&removed_peer).await.expect("forget peer"));
+    state.input_broker.reset_capture_stream();
+    let replacement = state
+        .attach_input_broker(allowed_client(), "replacement".into(), true)
+        .await;
+    assert!(replacement.accepted, "{}", replacement.message);
+    assert!(state.get_peer(&removed_peer).await.is_none());
+    assert!(state.input_broker.prepare_capture_release(None).is_none());
+    assert!(state.input_broker.release_events_snapshot().is_empty());
+    assert!(state.input_capture_target().await.is_none());
+    assert!(
+        state
+            .exchange_input_broker(
+                allowed_client(),
+                &replacement.broker_token,
+                InputBrokerExchangeObservations::default()
+            )
+            .await
+            .accepted
+    );
+    authorize_broker_capture(&state, &remaining_peer, &replacement.broker_token).await;
+    assert!(
+        state
+            .exchange_input_broker(
+                allowed_client(),
+                &replacement.broker_token,
+                InputBrokerExchangeObservations {
+                    captured_events: vec![InputEvent::Key {
+                        scan_code: 31,
+                        state: KeyState::Down,
+                        semantics: core_input::KeySemantics::Physical,
+                    }],
+                    lock_active: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .accepted
+    );
+    assert_eq!(
+        state.input_capture_target().await.as_deref(),
+        Some(remaining_peer.as_str())
+    );
     let _ = std::fs::remove_dir_all(root);
 }
-
 #[tokio::test]
 async fn stale_broker_fails_closed_until_reattach() {
     let (state, root) = service_mode_broker_state("boundless-broker-stale-test").await;

@@ -9,6 +9,8 @@ anyhow.workspace = true
 tokio.workspace = true
 tokio-stream = "0.1"
 tonic.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 app-services = { path = "../app-services" }
 core-clipboard = { path = "../core-clipboard" }

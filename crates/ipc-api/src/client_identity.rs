@@ -11,6 +11,9 @@
 pub struct ControlClientIdentity {
     /// Process id resolved from the connected pipe handle, when available.
     pub process_id: Option<u32>,
+    /// Creation time (Windows FILETIME ticks) from the same verified process.
+    /// Together with the PID this distinguishes a surviving process from PID reuse.
+    pub process_creation_time: Option<u64>,
     /// String SID of the account owning the client process, when resolvable.
     pub user_sid: Option<String>,
     /// Windows session id of the pipe client, when resolvable.

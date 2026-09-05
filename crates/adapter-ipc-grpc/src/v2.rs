@@ -64,6 +64,52 @@ impl ControlPlaneApi {
 impl ControlPlaneService for ControlPlaneApi {
     type WatchUiStream = ReceiverStream<Result<UiSnapshotReply, Status>>;
 
+    async fn paired_test_consent(
+        &self,
+        request: Request<ipc_api::boundless::v1::PairedTestConsentRequest>,
+    ) -> Result<Response<ipc_api::boundless::v1::PairedTestJsonReply>, Status> {
+        require_local_test_caller(&request)?;
+        let request = request.into_inner();
+        let result = self
+            .app
+            .paired_test_consent(request.peer_id, request.duration_seconds)
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        paired_test_json(&result)
+    }
+
+    async fn get_paired_test_consent(
+        &self,
+        request: Request<Empty>,
+    ) -> Result<Response<ipc_api::boundless::v1::PairedTestJsonReply>, Status> {
+        require_local_test_caller(&request)?;
+        let result = self
+            .app
+            .get_paired_test_consent()
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        paired_test_json(&result)
+    }
+
+    async fn run_paired_test(
+        &self,
+        request: Request<ipc_api::boundless::v1::PairedTestRunRequest>,
+    ) -> Result<Response<ipc_api::boundless::v1::PairedTestJsonReply>, Status> {
+        require_local_test_caller(&request)?;
+        let request = request.into_inner();
+        let result = self
+            .app
+            .run_paired_test(app_services::paired_testing::PairedTestOptions {
+                peer_id: request.peer_id,
+                samples: request.samples,
+                payload_bytes: request.payload_bytes,
+                timeout_ms: request.timeout_ms,
+            })
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        paired_test_json(&result)
+    }
+
     async fn get_ui_snapshot(
         &self,
         _request: Request<Empty>,
@@ -820,6 +866,7 @@ impl ControlPlaneService for ControlPlaneApi {
                 inject_backpressure: request.inject_backpressure,
                 acked_inject_batch_id: request.acked_inject_batch_id,
                 failed_inject_batch_id: request.failed_inject_batch_id,
+                input_paused: request.input_paused,
                 held_input_authorization_generation: request.held_input_authorization_generation,
                 raw_device_wheel_event_count: request.raw_device_wheel_event_count,
                 raw_system_wheel_event_count: request.raw_system_wheel_event_count,
@@ -1094,11 +1141,38 @@ impl ControlPlaneService for ControlPlaneApi {
 /// server as tonic `ConnectInfo`. Returns `None` when the transport supplied
 /// no verified identity (for example TCP), so identity-gated commands fail
 /// closed instead of trusting request payload claims.
+fn require_local_test_caller<T>(request: &Request<T>) -> Result<(), Status> {
+    // Pairing does not grant consent. Only the local control transport can grant a lease.
+    // Named-pipe callers passed its Windows ACL; TCP development endpoints must be loopback.
+    if verified_control_client(request).is_some_and(|client| client.user_sid.is_some())
+        || request
+            .remote_addr()
+            .is_some_and(|address| address.ip().is_loopback())
+    {
+        return Ok(());
+    }
+    Err(Status::permission_denied(
+        "paired testing requires a verified local control client",
+    ))
+}
+
+fn paired_test_json(
+    value: &impl serde::Serialize,
+) -> Result<Response<ipc_api::boundless::v1::PairedTestJsonReply>, Status> {
+    let json = serde_json::to_string(value)
+        .map_err(|_| Status::internal("serialize paired test report"))?;
+    Ok(Response::new(ipc_api::boundless::v1::PairedTestJsonReply {
+        json,
+    }))
+}
+
 fn verified_control_client<T>(request: &Request<T>) -> Option<app_commands::VerifiedControlClient> {
     request
         .extensions()
         .get::<ipc_api::client_identity::ControlClientIdentity>()
         .map(|identity| app_commands::VerifiedControlClient {
+            process_id: identity.process_id,
+            process_creation_time: identity.process_creation_time,
             user_sid: identity.user_sid.clone(),
             session_id: identity.session_id,
         })
@@ -1459,10 +1533,34 @@ mod tests {
         request.extensions_mut().insert(ControlClientIdentity {
             user_sid: Some("S-1-5-21-1-2-3-1001".to_string()),
             session_id: Some(2),
-            process_id: None,
+            process_id: Some(123),
+            process_creation_time: Some(456),
         });
         let verified = verified_control_client(&request).expect("verified identity");
         assert_eq!(verified.user_sid.as_deref(), Some("S-1-5-21-1-2-3-1001"));
         assert_eq!(verified.session_id, Some(2));
+        assert_eq!(verified.process_id, Some(123));
+        assert_eq!(verified.process_creation_time, Some(456));
+    }
+
+    #[test]
+    fn paired_test_permission_requires_transport_identity_not_metadata_claims() {
+        let mut request = Request::new(Empty {});
+        request
+            .metadata_mut()
+            .insert("x-user-sid", "S-1-5-21-1-2-3-1001".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
+        assert_eq!(
+            require_local_test_caller(&request).unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+        request.extensions_mut().insert(ControlClientIdentity {
+            user_sid: Some("S-1-5-21-1-2-3-1001".into()),
+            session_id: Some(2),
+            ..Default::default()
+        });
+        require_local_test_caller(&request).expect("verified local transport identity");
     }
 }

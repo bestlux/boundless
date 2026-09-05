@@ -71,6 +71,80 @@ impl Default for ElevatedInjectorStatus {
 pub struct InputBrokerAttachment {
     pub broker_token: String,
     pub lock_supported: bool,
+    pub(crate) process: InputBrokerProcessIdentity,
+}
+
+/// A PID alone may be reused after exit. Only a verified process creation time,
+/// account, and session can prove continuity of the broker's in-memory receipts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InputBrokerProcessIdentity {
+    pub process_id: u32,
+    pub creation_time: u64,
+    pub user_sid: String,
+    pub session_id: u32,
+}
+
+#[derive(Debug, Default)]
+struct DeliveredHeldInput {
+    keys: std::collections::BTreeMap<u16, KeySemantics>,
+    buttons: Vec<MouseButton>,
+}
+
+impl DeliveredHeldInput {
+    fn observe(&mut self, event: &InputEvent, confirmed: bool) {
+        match event {
+            InputEvent::Key {
+                scan_code,
+                state: KeyState::Down,
+                semantics,
+            } => {
+                self.keys.entry(*scan_code).or_insert(*semantics);
+            }
+            InputEvent::Key {
+                scan_code,
+                state: KeyState::Up,
+                ..
+            } if confirmed => {
+                self.keys.remove(scan_code);
+            }
+            InputEvent::MouseButton {
+                button,
+                state: KeyState::Down,
+            } => {
+                if !self.buttons.contains(button) {
+                    self.buttons.push(*button);
+                }
+            }
+            InputEvent::MouseButton {
+                button,
+                state: KeyState::Up,
+            } if confirmed => {
+                self.buttons.retain(|held| held != button);
+            }
+            _ => {}
+        }
+    }
+
+    fn releases(&self) -> Vec<InputEvent> {
+        let mut buttons = self.buttons.clone();
+        buttons.sort_by_key(|button| mouse_button_order(*button));
+        buttons
+            .into_iter()
+            .map(|button| InputEvent::MouseButton {
+                button,
+                state: KeyState::Up,
+            })
+            .chain(
+                self.keys
+                    .iter()
+                    .map(|(scan_code, semantics)| InputEvent::Key {
+                        scan_code: *scan_code,
+                        semantics: *semantics,
+                        state: KeyState::Up,
+                    }),
+            )
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -84,8 +158,12 @@ pub(crate) struct SafetyUnlockCounts {
 struct InputBrokerRelayInner {
     delivery_epoch: String,
     service_session_input: bool,
+    input_paused: bool,
     allowed_user_sid: Option<String>,
     attachment: Option<InputBrokerAttachment>,
+    delivery_process: Option<InputBrokerProcessIdentity>,
+    delivered_held_input: DeliveredHeldInput,
+    recovery_releases: VecDeque<InputEvent>,
     last_exchange_at: Option<Instant>,
     captured_events: VecDeque<InputEvent>,
     safety_unlock_pending: SafetyUnlockCounts,
@@ -102,6 +180,7 @@ struct InputBrokerRelayInner {
     last_accepted_clipboard_sequence: Option<u64>,
     pressed_keys: Vec<(u16, KeySemantics)>,
     pressed_buttons: Vec<MouseButton>,
+    pending_capture_release: Option<(String, Vec<InputEvent>)>,
     next_inject_batch_id: u64,
     last_acked_inject_batch_id: u64,
     inflight_inject_batch: Option<InputBrokerInjectBatch>,
@@ -113,6 +192,9 @@ pub(crate) struct InputBrokerInjectBatch {
     pub authorization_generation: u64,
     pub frames: Vec<PendingInjectInputFrame>,
     pub cancelled: bool,
+    /// Only the relay can create this lane, from synthesized release events.
+    /// It never contains a peer-supplied Down, move, wheel, or payload frame.
+    pub recovery_cleanup: bool,
     delivery_uncertain_reported: bool,
 }
 
@@ -163,6 +245,7 @@ impl InputBrokerRelay {
 
     pub(crate) fn attach(&self, attachment: InputBrokerAttachment) {
         let mut inner = self.lock();
+        inner.delivery_process = Some(attachment.process.clone());
         inner.attachment = Some(attachment);
         inner.last_exchange_at = Some(Instant::now());
         inner.captured_events.clear();
@@ -187,6 +270,104 @@ impl InputBrokerRelay {
 
     pub(crate) fn delivery_epoch(&self) -> String {
         self.lock().delivery_epoch.clone()
+    }
+
+    pub(crate) fn process_replaced(&self, process: &InputBrokerProcessIdentity) -> bool {
+        self.lock()
+            .delivery_process
+            .as_ref()
+            .is_some_and(|previous| previous != process)
+    }
+
+    pub(crate) fn attached_process_matches(&self, process: &InputBrokerProcessIdentity) -> bool {
+        self.lock()
+            .attachment
+            .as_ref()
+            .is_some_and(|attachment| &attachment.process == process)
+    }
+
+    /// Hard process replacement has no trustworthy delivery receipt. Preserve
+    /// only a conservative release set; discard all uncertain interactive work.
+    pub(crate) fn reset_replaced_process_delivery(&self) -> usize {
+        let mut inner = self.lock();
+        if let Some(batch) = inner.inflight_inject_batch.take() {
+            for event in batch.frames.iter().flat_map(|frame| &frame.events) {
+                inner.delivered_held_input.observe(event, false);
+            }
+        }
+        inner.recovery_releases = inner.delivered_held_input.releases().into();
+        inner.delivery_epoch = uuid::Uuid::new_v4().to_string();
+        inner.next_inject_batch_id = 0;
+        inner.last_acked_inject_batch_id = 0;
+        inner.recovery_releases.len()
+    }
+
+    pub(crate) fn reset_delivery_for_pause(&self) {
+        let mut inner = self.lock();
+        if let Some(batch) = inner.inflight_inject_batch.take() {
+            for event in batch.frames.iter().flat_map(|frame| &frame.events) {
+                inner.delivered_held_input.observe(event, false);
+            }
+        }
+        inner.recovery_releases = inner.delivered_held_input.releases().into();
+        // The same process may have a completed receipt. Keep its epoch and
+        // monotonically increasing batch IDs while replacing uncertain work
+        // with conservative releases only.
+    }
+
+    pub(crate) fn input_paused(&self) -> bool {
+        self.lock().input_paused
+    }
+
+    pub(crate) fn set_input_paused(&self, paused: bool) {
+        let mut inner = self.lock();
+        inner.input_paused = paused;
+        if paused {
+            inner.desired_lock_active = false;
+            inner.reported_lock_active = false;
+            inner.capture_forwarding_authorized = false;
+            inner.captured_events.clear();
+            inner.handoff_probe_dx = 0;
+            inner.handoff_probe_dy = 0;
+        }
+    }
+
+    /// Cleanup has a bounded ordinary batch shape but no remote owner. The only
+    /// input source is the daemon's release synthesis above.
+    pub(crate) fn stage_recovery_cleanup(
+        &self,
+        authorization_generation: u64,
+    ) -> Option<InputBrokerInjectBatch> {
+        let mut inner = self.lock();
+        if inner.inflight_inject_batch.is_some() || inner.recovery_releases.is_empty() {
+            return None;
+        }
+        let count = inner
+            .recovery_releases
+            .len()
+            .min(core_input::MAX_EVENTS_PER_FRAME);
+        let events = inner.recovery_releases.drain(..count).collect();
+        inner.next_inject_batch_id = inner.next_inject_batch_id.wrapping_add(1).max(1);
+        let batch = InputBrokerInjectBatch {
+            batch_id: inner.next_inject_batch_id,
+            authorization_generation,
+            frames: vec![PendingInjectInputFrame {
+                peer_id: String::new(),
+                sequence: 0,
+                authorization_generation,
+                capture_timestamp_unix_ms: 0,
+                received_timestamp_unix_ms: 0,
+                queued_timestamp_unix_ms: 0,
+                retry_count: 0,
+                next_retry_at: None,
+                events,
+            }],
+            cancelled: false,
+            delivery_uncertain_reported: false,
+            recovery_cleanup: true,
+        };
+        inner.inflight_inject_batch = Some(batch.clone());
+        Some(batch)
     }
 
     /// Atomically validates the attachment and daemon delivery epoch, commits
@@ -235,6 +416,9 @@ impl InputBrokerRelay {
         inner.next_inject_batch_id = 0;
         inner.last_acked_inject_batch_id = 0;
         inner.inflight_inject_batch = None;
+        inner.delivered_held_input = DeliveredHeldInput::default();
+        inner.recovery_releases.clear();
+        inner.pending_capture_release = None;
         was_attached
     }
 
@@ -360,6 +544,7 @@ impl InputBrokerRelay {
     /// state the broker reported as actually applied in its session.
     pub(crate) fn set_desired_lock_active(&self, active: bool) -> bool {
         let mut inner = self.lock();
+        let active = active && !inner.input_paused;
         if inner.desired_lock_active != active || !active {
             inner.capture_forwarding_authorized = false;
         }
@@ -471,8 +656,31 @@ impl InputBrokerRelay {
         events
     }
 
+    #[cfg(test)]
     pub(crate) fn release_events_snapshot(&self) -> Vec<InputEvent> {
         release_events_for_pressed_state(&self.lock())
+    }
+
+    /// Capture authority can be cleared immediately while its old target and
+    /// exact releases survive a failed queue attempt or capture-stream reset.
+    pub(crate) fn prepare_capture_release(
+        &self,
+        target: Option<&str>,
+    ) -> Option<(String, Vec<InputEvent>)> {
+        let mut inner = self.lock();
+        if inner.pending_capture_release.is_none() {
+            let events = release_events_for_pressed_state(&inner);
+            if let Some(target) = target
+                && !events.is_empty()
+            {
+                inner.pending_capture_release = Some((target.to_string(), events));
+            }
+        }
+        inner.pending_capture_release.clone()
+    }
+
+    pub(crate) fn complete_capture_release(&self) {
+        self.lock().pending_capture_release = None;
     }
 
     pub(crate) fn clear_pressed_state(&self) {
@@ -511,7 +719,15 @@ impl InputBrokerRelay {
         if inflight.batch_id != batch_id {
             return Err("out-of-order inject batch acknowledgement");
         }
-        inner.inflight_inject_batch = None;
+        let completed = inner
+            .inflight_inject_batch
+            .take()
+            .expect("validated batch exists");
+        if !completed.cancelled {
+            for event in completed.frames.iter().flat_map(|frame| &frame.events) {
+                inner.delivered_held_input.observe(event, true);
+            }
+        }
         inner.last_acked_inject_batch_id = batch_id;
         Ok(())
     }
@@ -533,6 +749,7 @@ impl InputBrokerRelay {
             authorization_generation,
             frames,
             cancelled: false,
+            recovery_cleanup: false,
             delivery_uncertain_reported: false,
         };
         inner.inflight_inject_batch = Some(batch.clone());
@@ -577,12 +794,32 @@ impl InputBrokerRelay {
     }
 
     pub(crate) fn take_inflight_inject_frames(&self) -> Vec<PendingInjectInputFrame> {
-        self.lock()
-            .inflight_inject_batch
-            .take()
-            .filter(|batch| !batch.cancelled)
-            .map(|batch| batch.frames)
-            .unwrap_or_default()
+        let mut inner = self.lock();
+        let Some(batch) = inner.inflight_inject_batch.take() else {
+            return Vec::new();
+        };
+        if batch.recovery_cleanup {
+            // Recovery has no remote owner and must never enter the ordinary
+            // authorization queue. A lost response or partial cleanup keeps
+            // these idempotent Ups pending until an exact completed receipt.
+            for event in batch
+                .frames
+                .into_iter()
+                .rev()
+                .flat_map(|frame| frame.events.into_iter().rev())
+            {
+                inner.recovery_releases.push_front(event);
+            }
+            return Vec::new();
+        }
+        for event in batch.frames.iter().flat_map(|frame| &frame.events) {
+            inner.delivered_held_input.observe(event, false);
+        }
+        if batch.cancelled {
+            Vec::new()
+        } else {
+            batch.frames
+        }
     }
 }
 
@@ -712,6 +949,125 @@ fn release_events_for_pressed_state(inner: &InputBrokerRelayInner) -> Vec<InputE
 mod tests {
     use super::*;
 
+    fn benchmark_frame(events: Vec<InputEvent>) -> PendingInjectInputFrame {
+        PendingInjectInputFrame {
+            peer_id: "benchmark-peer".into(),
+            sequence: 1,
+            authorization_generation: 1,
+            capture_timestamp_unix_ms: 0,
+            received_timestamp_unix_ms: 0,
+            queued_timestamp_unix_ms: 0,
+            retry_count: 0,
+            next_retry_at: None,
+            events,
+        }
+    }
+
+    /// Pure in-memory measurement: no OS input, networking, or filesystem work.
+    /// Run explicitly in one profile and compare like-for-like on the same host.
+    #[test]
+    #[ignore = "manual input-delivery state benchmark; run with --ignored --nocapture"]
+    fn broker_delivery_state_benchmark() {
+        const ITERATIONS: usize = 10_000;
+        let frame = benchmark_frame(vec![
+            InputEvent::Key {
+                scan_code: 29,
+                state: KeyState::Down,
+                semantics: KeySemantics::Physical,
+            },
+            InputEvent::MouseMove { dx: 1, dy: -1 },
+            InputEvent::Key {
+                scan_code: 29,
+                state: KeyState::Up,
+                semantics: KeySemantics::Physical,
+            },
+        ]);
+        let relay = InputBrokerRelay::default();
+        for (name, recovery) in [
+            ("stage_ack_64_frames", false),
+            ("process_loss_release_recovery", true),
+        ] {
+            let mut samples = Vec::with_capacity(ITERATIONS);
+            for _ in 0..ITERATIONS {
+                let start = Instant::now();
+                let batch = relay.stage_inject_batch(vec![frame.clone(); 64], 1);
+                if recovery {
+                    assert_eq!(relay.reset_replaced_process_delivery(), 1);
+                    let cleanup = relay.stage_recovery_cleanup(2).expect("cleanup");
+                    relay
+                        .acknowledge_inject_batch(cleanup.batch_id)
+                        .expect("receipt");
+                } else {
+                    relay
+                        .acknowledge_inject_batch(std::hint::black_box(batch.batch_id))
+                        .expect("receipt");
+                }
+                samples.push(start.elapsed().as_nanos());
+            }
+            samples.sort_unstable();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "benchmark": name, "iterations": ITERATIONS,
+                    "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+                    "frames_per_iteration": 64, "events_per_frame": 3,
+                    "p50_ns": samples[ITERATIONS / 2], "p95_ns": samples[ITERATIONS * 95 / 100],
+                    "p99_ns": samples[ITERATIONS * 99 / 100], "max_ns": samples[ITERATIONS - 1],
+                    "mean_ns": samples.iter().sum::<u128>() / ITERATIONS as u128,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn process_recovery_releases_are_bounded_and_survive_another_lost_cleanup_receipt() {
+        let relay = InputBrokerRelay::default();
+        let downs = (0..600)
+            .map(|scan_code| InputEvent::Key {
+                scan_code,
+                state: KeyState::Down,
+                semantics: KeySemantics::Physical,
+            })
+            .collect::<Vec<_>>();
+        // Multiple valid frames build a hold set larger than one cleanup batch.
+        let frames = downs
+            .chunks(core_input::MAX_EVENTS_PER_FRAME)
+            .map(|events| benchmark_frame(events.to_vec()))
+            .collect();
+        relay.stage_inject_batch(frames, 1);
+        assert_eq!(relay.reset_replaced_process_delivery(), 600);
+        let first = relay.stage_recovery_cleanup(2).expect("first cleanup");
+        assert_eq!(
+            first.frames[0].events.len(),
+            core_input::MAX_EVENTS_PER_FRAME
+        );
+        // Hard death after an uncertain cleanup may require the same Ups again,
+        // but must never produce the original Downs.
+        assert_eq!(relay.reset_replaced_process_delivery(), 600);
+        let mut released = Vec::new();
+        while let Some(batch) = relay.stage_recovery_cleanup(3) {
+            assert!(batch.recovery_cleanup);
+            assert!(batch.frames[0].events.len() <= core_input::MAX_EVENTS_PER_FRAME);
+            released.extend(batch.frames[0].events.clone());
+            relay
+                .acknowledge_inject_batch(batch.batch_id)
+                .expect("cleanup receipt");
+        }
+        assert_eq!(released.len(), 600);
+        assert!(released.iter().all(|event| matches!(
+            event,
+            InputEvent::Key {
+                state: KeyState::Up,
+                ..
+            }
+        )));
+        assert_eq!(
+            relay.reset_replaced_process_delivery(),
+            0,
+            "confirmed cleanup clears conservative holds"
+        );
+    }
+
     #[test]
     fn wheel_source_diagnostics_emit_only_on_mode_transitions() {
         let relay = InputBrokerRelay::default();
@@ -740,6 +1096,12 @@ mod tests {
         relay.attach(InputBrokerAttachment {
             broker_token: "test".to_string(),
             lock_supported: true,
+            process: InputBrokerProcessIdentity {
+                process_id: 1,
+                creation_time: 1,
+                user_sid: "user".to_string(),
+                session_id: 1,
+            },
         });
         assert_eq!(
             relay.observe_wheel_source_counts(1, 0, 0),

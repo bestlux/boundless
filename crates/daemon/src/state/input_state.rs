@@ -22,6 +22,8 @@ pub(super) struct InputAuthorizationState {
     generation: u64,
     owner_last_changed_at: Option<Instant>,
     auto_claim_quarantined_peers: HashSet<String>,
+    explicit_handoff_required: bool,
+    broker_paused: bool,
 }
 
 impl InputAuthorizationState {
@@ -31,6 +33,8 @@ impl InputAuthorizationState {
             generation: generation.max(1),
             owner_last_changed_at: None,
             auto_claim_quarantined_peers: HashSet::new(),
+            explicit_handoff_required: false,
+            broker_paused: false,
         }
     }
 
@@ -48,7 +52,7 @@ impl InputAuthorizationState {
     }
 
     pub(super) fn allows_peer(&self, peer_id: &str) -> bool {
-        self.router.is_enabled() && self.router.owner() == Some(peer_id)
+        !self.broker_paused && self.router.is_enabled() && self.router.owner() == Some(peer_id)
     }
 
     pub(super) fn authorizes_peer_generation(&self, peer_id: &str, generation: u64) -> bool {
@@ -59,6 +63,7 @@ impl InputAuthorizationState {
         generation != 0
             && generation == self.generation
             && self.router.is_enabled()
+            && !self.broker_paused
             && self.router.owner().is_some()
     }
 
@@ -71,10 +76,16 @@ impl InputAuthorizationState {
         frame: &InputFrame,
         sink: &mut S,
     ) -> Result<RouteDecision, core_input::InputRouteError> {
+        if self.broker_paused {
+            return Ok(RouteDecision::IgnoredFeatureDisabled);
+        }
         self.router.route_frame(frame, sink)
     }
 
     pub(super) fn claim_owner(&mut self, peer_id: &str, force: bool) -> (bool, bool) {
+        if self.broker_paused {
+            return (false, false);
+        }
         let previous_owner = self.router.owner().map(str::to_string);
         let claimed = self.router.claim_owner(peer_id, force);
         let owner_changed = claimed && previous_owner.as_deref() != self.router.owner();
@@ -87,13 +98,24 @@ impl InputAuthorizationState {
     pub(super) fn claim_owner_explicit(&mut self, peer_id: &str, force: bool) -> (bool, bool) {
         let outcome = self.claim_owner(peer_id, force);
         if outcome.0 {
+            self.explicit_handoff_required = false;
             self.auto_claim_quarantined_peers.remove(peer_id);
         }
         outcome
     }
 
     pub(super) fn auto_claim_quarantined(&self, peer_id: &str) -> bool {
-        self.auto_claim_quarantined_peers.contains(peer_id)
+        self.explicit_handoff_required || self.auto_claim_quarantined_peers.contains(peer_id)
+    }
+
+    /// A broker process died without a trustworthy side-effect receipt. Stop
+    /// every automatic owner claim until a new explicit remote handoff.
+    pub(super) fn require_explicit_handoff(&mut self) {
+        if let Some(owner) = self.router.owner().map(str::to_string) {
+            self.router.release_owner(&owner);
+        }
+        self.explicit_handoff_required = true;
+        self.record_owner_transition();
     }
 
     pub(super) fn quarantine_auto_claim_peers(
@@ -118,6 +140,16 @@ impl InputAuthorizationState {
     pub(super) fn set_enabled(&mut self, enabled: bool) {
         self.router.set_enabled(enabled);
         self.advance_generation();
+    }
+
+    pub(super) fn set_broker_paused(&mut self, paused: bool) -> bool {
+        if self.broker_paused == paused {
+            return false;
+        }
+        self.broker_paused = paused;
+        // Resume restores capability, never the previous remote owner's claim.
+        self.require_explicit_handoff();
+        true
     }
 
     pub(super) fn owner_last_changed_at(&self) -> Option<Instant> {

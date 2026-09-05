@@ -1,94 +1,57 @@
-# Boundless V5 Quickstart
+# Set up two Windows PCs
 
-This guide covers the normal Windows tray flow for installing, pairing, arranging, using, and uninstalling Boundless.
+Install the same Boundless build on both PCs, open the tray dashboard, pair them, and arrange their positions. Boundless is currently a development preview; start with two PCs on a trusted local network.
 
 ## Install
 
-1. Download the Windows MSI and matching `Boundless-<version>-windows-x64-install.ps1` helper into the same folder.
-2. From the intended desktop user's normal, non-elevated PowerShell session, run:
+1. Download `Boundless-<version>-windows-x64.zip` from the release, copy it to each PC, and choose **Extract All**. The ZIP includes the complete MSI and matching helper, so installation does not download another package.
+2. Sign in as the intended desktop user and double-click **Install.cmd** in the extracted folder. Approve the Windows elevation prompt and leave the window open until the checks finish.
 
-   ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File .\Boundless-<version>-windows-x64-install.ps1
-   ```
+   The launcher runs the matching helper, which identifies the desktop user before elevation and verifies the installed service, API, and tray. Unsigned preview builds may display **Unknown publisher**. See [Service Mode](service-mode.md) for the administrative fallback.
 
-   The helper captures that user's SID before the UAC prompt and passes it to the elevated MSI. If you are already in an elevated shell, use the fallback in [Service Mode](service-mode.md) and pass the intended SID explicitly.
+3. Launch Boundless from the Start Menu or desktop shortcut. Choose **Dashboard** from its tray icon if the window is hidden.
+4. Check **Home**. If the background runtime is unavailable, open **Support** before attempting pairing.
 
-3. Launch Boundless from the Start Menu, Desktop shortcut, or `boundlesstray.exe`.
-4. Open the tray icon and choose `Dashboard`.
-5. Confirm the daemon is reachable on the Status & Pairing tab.
+The installer puts binaries in `%ProgramFiles%\Boundless` and installs `BoundlessService`. Keep one service-owned runtime; starting a second per-user daemon is not a repair step. The MSI does not add the CLI to `PATH`.
 
-The default machine-wide install root is `%ProgramFiles%\Boundless`. The tray is the primary entrypoint and starts `boundlessd` when needed.
+Existing MSI installs are upgraded. Recognized old per-user installs are retired with a recovery copy, and supported old configs migrate with a backup. Moving from a per-user daemon to the machine service requires pairing again. See [Migration](migration.md) for the exact preservation and rollback behavior.
 
-Installed CLI examples use the full executable path because the MSI does not add Boundless to `PATH`:
+## Pair
+
+The default transport and nearby pairing ports are TCP **16100** and **16200**. If Windows Firewall blocks pairing, follow the scoped Private-network instructions in [Troubleshooting](troubleshooting.md#firewall-or-network-reachability); this preview does not add firewall rules automatically. Disable Mouse Without Borders input sharing while qualifying Boundless, even though their default ports now differ.
+
+On both PCs, open Boundless. From **Home → Add a PC**, choose the other PC from discovery or enter its host address. Follow the code-entry flow shown by Boundless and verify the intended PC before completing it. Pairing establishes trust; it does not imply the peer is online or ready to accept input.
+
+Once Home shows the paired PC as connected, open **Arrange PCs**. An offline paired PC keeps its trust and reconnects when available. Do not forget or reset it merely because it is asleep.
+
+## Arrange and use
+
+Arrange the PCs to match their physical positions, keep **This PC** in the layout exactly once, and apply the layout. Adjacent edges determine where input moves. In **Sharing**, enable input sharing and Easy Mouse as needed, then move across the corresponding screen edge.
+
+To return control locally, press **Ctrl twice on the local keyboard**. In the normal installed service + tray-broker mode, **Pause input** on Home releases the local capture hook immediately and requests input sharing to stop; that local release does not wait for a working daemon connection. A standalone developer daemon owns its own hooks, so its pause requires daemon acknowledgment. Resume deliberately when ready.
+
+The normal supported desktop is the selected user's unlocked Windows session. An administrator-launched application has additional input restrictions; see [Service Mode](service-mode.md). UAC prompts and the lock screen are outside the supported control surface.
+
+## Clipboard and files
+
+Enable clipboard sharing in **Sharing**. Use **Files** for explicit sends and transfer progress. Receiving files requires a receive folder and an explicit receive-policy opt-in. See [Clipboard and File Workflows](clipboard-file-workflows.md) before enabling it.
+
+## Get help
+
+**Support** shows versions, connection help, and redacted report export. It also exposes the temporary permission used for [paired testing](../performance/paired-testing.md). No report is sent automatically.
+
+CLI fallback:
 
 ```powershell
 $BoundlessCtl = "$env:ProgramFiles\Boundless\boundlessctl.exe"
+& $BoundlessCtl --json daemon status
+& $BoundlessCtl diagnostics dump --open-folder
 ```
 
-## Pair Two Machines
+Use `diagnostics dump --offline --open-folder` if the background runtime cannot be reached. See [Troubleshooting](troubleshooting.md) for the next check.
 
-On both machines, open the tray dashboard.
+## Exit or uninstall
 
-1. On the machine you want to connect from, use Status & Pairing to choose a discovered peer or manual host.
-2. Start the guided pairing request.
-3. On the target machine, compare the displayed 6-digit code.
-4. Approve only if the code and machine identity match what you expect.
-5. Return to Status & Pairing and confirm the peer is trusted and connected.
+Closing the dashboard hides it to the tray. Use the tray's **Quit** action to exit the interactive app. The installed service has its own lifetime.
 
-CLI fallback:
-
-```powershell
-& $BoundlessCtl pair discover
-& $BoundlessCtl pair request <index|machine_id|display-name>
-& $BoundlessCtl pair pending
-& $BoundlessCtl pair approve <request_id>
-```
-
-## Arrange Devices
-
-Use Layout Manager in the tray dashboard.
-
-1. Drag devices onto the grid.
-2. Keep `This PC` in the layout exactly once.
-3. Use only connected cardinal neighbors for edge switching.
-4. Apply the layout.
-
-CLI fallback:
-
-```powershell
-& $BoundlessCtl layout set "left,self,right"
-& $BoundlessCtl layout preview
-```
-
-## Use Input Sharing
-
-Enable Easy Mouse in Settings. Move across a configured screen edge to switch capture target. Use the release/escape hotkey or Settings controls to return control locally if input ownership gets stuck.
-
-Boundless supports hook capture with polling fallback. The tray reports capture mode as hook, polling fallback, unsupported, disabled, or unavailable where the daemon can determine it.
-
-## Clipboard And Files
-
-Enable clipboard sharing in Settings. Text and bitmap clipboard payloads are supported through the clipboard workflow. File transfer has explicit receive-folder and receive-policy controls and defaults to conservative receive behavior.
-
-See [Clipboard And File Workflows](clipboard-file-workflows.md).
-
-## Troubleshooting
-
-Start with:
-
-```powershell
-& $BoundlessCtl daemon status
-& $BoundlessCtl diagnostics dump
-```
-
-Then use [Troubleshooting](troubleshooting.md) for discovery, firewall, stale daemon, named pipe, service, input capture, clipboard, and file transfer cases.
-
-## Uninstall
-
-Use Windows Apps & Features or:
-
-```powershell
-Start-Process msiexec.exe -Wait -ArgumentList @('/x', '<path-to-boundless-msi>', '/qn', '/norestart')
-```
-
-The MSI uninstall removes the machine-wide install root, shortcuts, and uninstall registry entry. User config and trust state are not silently destroyed by ordinary uninstall; use the packaged reset helper when you intentionally want to reset local state.
+Uninstall through Windows Installed Apps. Ordinary uninstall preserves configuration and trust; use the reset workflow only when you intend to remove that state. The [migration guide](migration.md) explains upgrades and older installation layouts.

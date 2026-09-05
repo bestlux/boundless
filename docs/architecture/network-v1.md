@@ -33,6 +33,7 @@ Related design notes:
     - `FileChunk`
     - `FileEnd`
   - Handles temporary-file staging, size validation, and store-finalization.
+  - The user-file IO integration keeps OS file handles and user leases in daemon-owned inbound state; `peer-transport` retains protocol flow policy. See [user file IO authority](user-file-io.md) for impersonation and expired-lease cleanup constraints.
 - `crates/daemon/src/network/inbound_payload.rs`
   - Handles inbound clipboard and input payload processing:
     - `ClipboardText`
@@ -53,20 +54,37 @@ Related design notes:
 - Only `outbound.rs` drains/requeues outgoing payload queues.
 - Session-level chunk credit bookkeeping is isolated to `outbound_transfer_flow`.
 - Session-level inbound transfer staging is isolated to `inbound_transfers`.
-- Header and payload offsets survive `select!` cancellation so timer or egress branches cannot restart a partially consumed frame at the wrong byte.
-- Startup bulk is deterministic: the transport initiator drains its immediately-sendable queue, hands the turn to the acceptor with `StartupSyncComplete`, and waits for the return marker before normal bulk ticks begin.
+- Header and payload offsets survive cancellation. A reader future runs alongside the session reactor even while a branch awaits egress; its mailbox is bounded by 2 MiB of payloads and 256 frames, plus one frame being assembled. The reader shares the session lifetime rather than spawning a detached task.
+- Startup bulk is deterministic and bounded: the transport initiator sends at most one ordinary four-payload bulk batch, hands the turn to the acceptor with `StartupSyncComplete`, and waits for the return marker before normal bulk ticks drain the remainder.
 - Non-canonical protocol peers are rejected at handshake and guarded again in outbound send paths.
-- Protocol 4.4 retains the 4.3 physical keyboard identity and adds credited clipboard-image chunks. The clean bincode shape change intentionally rejects 4.3 peers at handshake; older local runtime config is migrated to 4.4 on upgrade.
+- Protocol 4.5 retains physical keyboard identity and credited clipboard-image chunks, and adds consented diagnostic probe/reply messages. Exact-version handshakes reject older peers; both PCs need compatible builds. Configuration schema 7 migrates durable settings while excluding live connection observations. Transport defaults to TCP 16100 and nearby pairing to TCP 16200. Old schemas using former default 15100 migrate once, including manual peer endpoints; custom ports remain unchanged. Migration validates the config and creates a byte-exact `config.json.pre-v7.bak` before rewriting.
 
 ## Authenticated session ownership
 
 - A trusted peer may reach the daemon through either a locally initiated outbound connection or a reverse-initiated inbound connection. A nonpreferred direction is accepted when it is the only authenticated route, preserving one-sided LAN reachability.
 - When both physical directions race, both peers derive the same preferred connection: the lexicographically smaller machine id initiates it. The preferred authenticated session replaces and cancels an already claimed nonpreferred session; later nonpreferred duplicates cannot displace it.
 - Outbound worker registration ids and inbound task registration ids are also the ownership ids used by the session registry, so replacement can cancel the exact displaced task instead of aborting an unrelated peer session.
-- Session claim, close, and outbound-failure transitions are serialized. Queue drain/write/flush holds the same ownership transition guard, so a replacement cannot drain later input or bulk payloads while the superseded lane still owns an earlier batch. A superseded session may clean up its private transfer state, but only the session that still owns the registry claim can publish `connected=false`; stale teardown or a delayed failed dial cannot disconnect or clear a replacement session.
+- Session claim, close, and outbound-failure transitions are serialized per peer. Queue drain/write/flush holds that peer's ownership transition guard, so a replacement cannot drain later input or bulk payloads while the superseded lane still owns an earlier batch. A superseded session may clean up its private transfer state, but only the session that still owns the registry claim can publish `connected=false`; stale teardown or a delayed failed dial cannot disconnect or clear a replacement session.
 - Input and bulk queues remain peer-owned rather than direction-owned. Either the preferred connection or a sole-reachable nonpreferred connection must flush payloads after `Hello` negotiation.
 - Socket frame writes and flushes are individually bounded. A timed-out partial frame makes that connection unusable and returns the payload to peer-owned state before replacement can drain later work.
-- Protocol 4.4 does not claim generic live full-duplex bulk liveness. BND-NEXT-43 owns continuously serviced reads during simultaneous post-startup file or maximum-text egress.
+- Continuously serviced bounded reads now have an in-memory regression for repeated simultaneous post-startup maximum-size text over a 4 KiB duplex stream. This is a runtime contract test, not physical-network latency or complete file-transfer endurance evidence.
+
+## Retry, admission, and durable state
+
+- Each outbound worker owns an absolute retry deadline: 1, 2, 4 seconds up to 30 seconds. A failed dial or short authenticated-session exit schedules the next deadline; unrelated/shared reconciliation notifications cannot shorten it. A session lasting at least 10 seconds resets the next delay to one second. Explicit reconnect cancels and recreates the worker.
+- Failed-connect warnings are emitted on the first failure and then at most once per minute per worker with the accumulated attempt count. Bounded in-memory diagnostics retain failed-attempt metadata; the disk-log sink must enforce its separate retention budget.
+- At most 16 address candidates race for one peer, with 75 ms staggering and a configured-address slot preserved. TCP connection is limited to four seconds; TLS to five seconds; the entire outgoing establishment future to eight seconds.
+- Both listener families share a 32-session admission budget. Incoming TLS expires after five seconds. Scoped task sets own accepted sessions, outbound workers and racing candidates. Registration guards clean up early errors and cancellation, including cancellation before a child first polls.
+- Runtime peer `connected` and `last_seen` observations are excluded from config since schema 6. Older schemas migrate while preserving durable identity, layout and features, with schema 7's old-default endpoint migration above. Peer transitions do not write settings or wait for disk IO. Repeated disconnected observations retain idempotent safety cleanup but do not repeat lifecycle notifications unless input capture or ownership is actually released. Settings saves preserve concurrent in-memory peer observations when publishing their new snapshot.
+- Downgrading across the schema/protocol boundary requires a pre-upgrade configuration backup or a compatible newer build. The migration does not create or claim a backup, and old runtime connectivity must never be restored as authority.
+
+The opt-in `network::tests::transport_safety_benchmark` emits machine-readable synthetic measurements for worker retry cadence under unrelated wake traffic and healthy-peer input egress while another peer's bulk writer is stalled. It asserts its budgets and does not open an installed runtime, generate physical input, or claim a hardware latency measurement.
+
+## Paired diagnostics integration (protocol 4.5)
+
+`state/paired_testing.rs` owns volatile peer consent, lease deadlines, request and byte budgets, one outstanding local run/request, reply correlation, and source/version/session evidence. Session input ticks and flush signals may emit one `DiagnosticProbe` after ordinary input egress. Inbound dispatch performs an in-memory echo only through the active authenticated session and a local consent lease of at most 600 seconds. Late replies and replies from a mismatched session cannot satisfy pending requests.
+
+The diagnostic budget is 64 KiB per payload, 256 requests/16 MiB per lease, 100 samples per workload and 30 seconds per run. Probes do not log per request or perform file, clipboard, or input actions. Actual socket provenance distinguishes loopback from `real_paired`; the in-memory harness remains `synthetic`. The combined implementation and acceptance contract are documented in `docs/performance/paired-testing.md`; the transport safety benchmark above does not substitute for those paired tests.
 
 ## Slice 1 regression focus
 
@@ -95,14 +113,12 @@ Fault-harness status:
 
 - PR #89 landed a narrow post-auth in-memory harness that can drive the real session loop after TLS authentication has already established peer identity.
 - The harness covers read, write, flush, disconnect, delayed-frame, and reconnect-pair scenarios used by the BND-NEXT-7 behavior-preserving slices.
-- Broader multi-peer, multi-process, and full runtime fault coverage remains deferred test infrastructure.
+- The hardening regressions add two-peer stalled-egress isolation and simultaneous bounded-stream maximum-text exchange. Multi-process, physical-network, and complete file-transfer fault/endurance coverage remain acceptance work.
 
 Deferred reactor work:
 
 - A full `SessionEvent` enum and `SessionPhase` state machine are not implemented. They remain future options if later behavior changes need explicit transition rules beyond the current private branch helpers.
-- Graceful per-session join/drain lifecycle is still separate reliability work; BND-NEXT-7 did not change task supervision, registration cleanup semantics, or transport shutdown policy.
+- The hardening changes add scoped task sets and cancellation-safe registration cleanup after BND-NEXT-7. Graceful draining of file-transfer state after abrupt cancellation remains separate reliability work.
 - Retry/resume behavior, product UX, diagnostics expansion, TLS/auth changes, public APIs, and transport protocol semantics remain out of scope.
 
-Next backlog step:
-
-- After BND-NEXT-8A, the deferred clipboard image quality item is inbound/apply full-buffer streaming or spooling if future evidence warrants it; otherwise BND-NEXT-9 service updater and N-1 MSI planning is the next backlog item needing human decision.
+Current work priorities and physical acceptance requirements are maintained in `docs/backlog.md` and `docs/project-status.md`; this ownership map is not a release-readiness claim.

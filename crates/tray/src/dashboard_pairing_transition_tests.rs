@@ -166,7 +166,7 @@ fn apply_pairing_complete_clears_pairing_state_and_shows_success_banner() {
     assert!(
         app.toasts
             .iter()
-            .any(|t| t.message.contains("Pairing successful") && !t.is_error),
+            .any(|t| t.message.contains("Paired with") && !t.is_error),
         "completion should push a success toast"
     );
     assert!(

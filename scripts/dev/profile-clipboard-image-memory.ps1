@@ -29,7 +29,7 @@ $outputDir = Split-Path -Parent $OutputPath
 New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 
 $buildLog = [System.IO.Path]::ChangeExtension($OutputPath, ".build.log")
-$cargoArgs = @("test", "-p", "boundless-daemon", "--lib", "--no-run", "--message-format", "json")
+$cargoArgs = @("test", "--locked", "-p", "boundless-daemon", "--lib", "--no-run", "--message-format", "json")
 $previousErrorActionPreference = $ErrorActionPreference
 try {
     $ErrorActionPreference = "Continue"
@@ -40,7 +40,7 @@ finally {
     $ErrorActionPreference = $previousErrorActionPreference
 }
 if ($cargoExitCode -ne 0) {
-    throw "cargo test --no-run failed with exit code $cargoExitCode; see $buildLog"
+    throw "cargo test --locked --no-run failed with exit code $cargoExitCode; see $buildLog"
 }
 
 $testExecutable = ""

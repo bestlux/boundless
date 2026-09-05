@@ -20,7 +20,7 @@ Set-Location $repoRoot
 $cliExe = Join-Path $repoRoot "target/debug/boundlessctl.exe"
 
 if (-not (Test-Path $cliExe)) {
-    throw "boundlessctl binary not found at $cliExe; run cargo build -p boundless-cli first"
+    throw "boundlessctl binary not found at $cliExe; run cargo build --locked -p boundless-cli first"
 }
 
 if ($EventsLimit -le 0) {

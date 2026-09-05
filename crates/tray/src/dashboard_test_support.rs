@@ -5,12 +5,25 @@ pub(super) fn test_app() -> DashboardApp {
 
     DashboardApp {
         ctx: Arc::new(AppContext {
-            endpoint: "npipe://./pipe/boundlessd-api".to_string(),
+            endpoint: "fixture://disabled".to_string(),
             start_daemon: false,
             daemon_candidates: Vec::new(),
         }),
         _tray_icon: None,
         snapshot: UiSnapshot::default(),
+        task_runner: DashboardTaskRunner::recording(),
+        snapshot_error: None,
+        pending_peer_removal: None,
+        support_status: None,
+        input_pause_requested: false,
+        input_change_pending: false,
+        paired_testing: None,
+        paired_testing_updated_at: None,
+        paired_testing_pending: false,
+        paired_testing_error: None,
+        paired_testing_peer: String::new(),
+        file_send_peer: String::new(),
+        file_send_pending: false,
         tx,
         rx,
         toasts: Vec::new(),
@@ -22,7 +35,7 @@ pub(super) fn test_app() -> DashboardApp {
         pairing_role_reversal_message: None,
         selected_tab: Tab::Status,
         manual_host: String::new(),
-        manual_port: "15200".to_string(),
+        manual_port: app_services::desktop::DEFAULT_PAIRING_PORT.to_string(),
         pairing_flow: None,
         pairing_challenge: None,
         pairing_code: String::new(),
@@ -45,6 +58,7 @@ pub(super) fn test_app() -> DashboardApp {
         layout_grid: HashMap::new(),
         layout_unassigned: Vec::new(),
         layout_initialized: false,
+        layout_selected_peer: String::new(),
         dragging_peer: None,
         last_layout_matrix: String::new(),
         last_layout_peer_ids: Vec::new(),
@@ -92,7 +106,6 @@ pub(super) fn sample_pairing_result() -> GuidedPairingResult {
     GuidedPairingResult {
         peer_machine_id: "peer-machine-1234".to_string(),
         orientation_selector: "Office Desktop".to_string(),
-        message: "nearby pairing trust established; connectivity pending".to_string(),
     }
 }
 
@@ -100,6 +113,7 @@ pub(super) fn sample_first_run_snapshot() -> UiSnapshot {
     UiSnapshot {
         generated_at: "2026-03-03T18:00:00Z".to_string(),
         daemon_online: true,
+        daemon_version: "5.0.16".to_string(),
         machine_id: "local-machine-1234".to_string(),
         layout_matrix: "self".to_string(),
         features: BTreeMap::from([

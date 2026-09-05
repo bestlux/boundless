@@ -54,10 +54,10 @@ function Invoke-SmokeBinaryBuild {
     Assert-SmokeHarnessInitialized
 
     Write-Host "$script:SmokeHarnessLogPrefix building debug binaries"
-    cargo build -p boundless-daemon -p boundless-cli | Out-Host
+    cargo build --locked -p boundless-daemon -p boundless-cli | Out-Host
     $buildExitCode = $LASTEXITCODE
     if ($buildExitCode -ne 0) {
-        throw "cargo build failed with exit code $buildExitCode"
+        throw "cargo build --locked failed with exit code $buildExitCode"
     }
 
     if (-not (Test-Path $script:SmokeHarnessDaemonExe) -or -not (Test-Path $script:SmokeHarnessCliExe)) {

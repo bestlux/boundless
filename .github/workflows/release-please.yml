@@ -1,4 +1,9 @@
-name: Release
+name: Release Preview
+
+# This lane validates builds and installers, not physical desktop acceptance.
+# A numeric tag does not promote these artifacts to stable/public-ready status.
+env:
+  RELEASE_CHANNEL: preview
 
 on:
   push:
@@ -75,6 +80,12 @@ jobs:
             echo "source_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Describe release evidence scope
+        run: |
+          echo '### Preview release' >> "$GITHUB_STEP_SUMMARY"
+          echo 'This workflow publishes prereleases only. Build, unit, and MSI evidence does not certify physical two-PC input, clipboard, recovery, or endurance.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Stable promotion requires a separate claim-scoped review of the exact installed artifacts and physical desktop evidence. Signing remains governed by WINDOWS_SIGN_REQUIRED.' >> "$GITHUB_STEP_SUMMARY"
+
   build-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -106,7 +117,7 @@ jobs:
 
       - name: Build Linux binaries
         working-directory: source
-        run: cargo build --release -p boundless-daemon -p boundless-cli
+        run: cargo build --locked --release -p boundless-daemon -p boundless-cli
 
       - name: Package Linux release
         id: package
@@ -162,7 +173,7 @@ jobs:
       - name: Test CLI daemon status output contract
         working-directory: source
         shell: pwsh
-        run: cargo test -p boundless-cli commands::tests::daemon_status_output_matches_packaging_fixture
+        run: cargo test --locked -p boundless-cli commands::tests::daemon_status_output_matches_packaging_fixture
 
   build-windows:
     runs-on: windows-latest
@@ -199,7 +210,7 @@ jobs:
       - name: Build Windows binaries
         working-directory: source
         shell: pwsh
-        run: cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector
+        run: cargo build --locked --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector
 
       - name: Sign Windows binaries
         working-directory: source
@@ -267,9 +278,22 @@ jobs:
             -RequireSigning:$requireSigning `
             -Files @("${{ steps.package.outputs.installer_path }}")
 
+      - name: Package Windows transfer bundle
+        id: bundle
+        shell: pwsh
+        run: |
+          $version = "${{ needs.release-context.outputs.tag_name }}".TrimStart('v')
+          $bundlePath = Join-Path (Resolve-Path .).Path "Boundless-$version-windows-x64.zip"
+          ./.release-tooling/scripts/release/package-windows-bundle.ps1 `
+            -Version $version `
+            -InstallerPath "${{ steps.package.outputs.installer_path }}" `
+            -HelperPath "${{ steps.package.outputs.installer_helper_path }}" `
+            -OutputPath $bundlePath
+          "bundle_path=$bundlePath" >> $env:GITHUB_OUTPUT
+
       - name: Validate Windows asset name
         shell: pwsh
-        run: ./.release-tooling/scripts/release/assert-release-consistency.ps1 -RepoRoot (Resolve-Path source).Path -Tag "${{ needs.release-context.outputs.tag_name }}" -AssetPaths @("${{ steps.package.outputs.installer_path }}", "${{ steps.package.outputs.installer_helper_path }}") -CheckWindowsInstallerVersion
+        run: ./.release-tooling/scripts/release/assert-release-consistency.ps1 -RepoRoot (Resolve-Path source).Path -Tag "${{ needs.release-context.outputs.tag_name }}" -AssetPaths @("${{ steps.package.outputs.installer_path }}", "${{ steps.package.outputs.installer_helper_path }}", "${{ steps.bundle.outputs.bundle_path }}") -CheckWindowsInstallerVersion
 
       - name: Upload Windows release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -278,6 +302,7 @@ jobs:
           path: |
             ${{ steps.package.outputs.installer_path }}
             ${{ steps.package.outputs.installer_helper_path }}
+            ${{ steps.bundle.outputs.bundle_path }}
 
   validate-windows-installer:
     runs-on: windows-latest
@@ -350,13 +375,24 @@ jobs:
           }
           "installer_path=$($previousInstallers[0].FullName)" >> $env:GITHUB_OUTPUT
 
+      - name: Verify and extract the Windows transfer bundle
+        id: bundle
+        shell: pwsh
+        run: |
+          $version = "${{ needs.release-context.outputs.tag_name }}".TrimStart('v')
+          $bundlePath = Join-Path (Resolve-Path artifacts).Path "Boundless-$version-windows-x64.zip"
+          ./.release-tooling/scripts/release/assert-windows-bundle.ps1 `
+            -Version $version -BundlePath $bundlePath `
+            -InstallerPath "artifacts/Boundless-$version-windows-x64.msi" `
+            -HelperPath "artifacts/Boundless-$version-windows-x64-install.ps1"
+          $extracted = Join-Path (Resolve-Path artifacts).Path 'extracted bundle'
+          Expand-Archive -LiteralPath $bundlePath -DestinationPath $extracted
+          "installer_path=$(Join-Path $extracted "Boundless-$version-windows-x64.msi")" >> $env:GITHUB_OUTPUT
+
       - name: Validate Windows installer
         shell: pwsh
         run: |
-          $installer = (Get-ChildItem -LiteralPath artifacts -Filter *.msi -File | Select-Object -First 1).FullName
-          if (-not $installer) {
-            throw "Downloaded installer artifact was not found."
-          }
+          $installer = "${{ steps.bundle.outputs.installer_path }}"
           $stableRelease = [System.Convert]::ToBoolean('${{ !contains(needs.release-context.outputs.tag_name, '-') }}')
           $signingRequiredByPolicy = [System.Convert]::ToBoolean('${{ vars.WINDOWS_SIGN_REQUIRED == 'true' }}')
           $requireSignature = $stableRelease -and $signingRequiredByPolicy
@@ -447,12 +483,14 @@ jobs:
           find dist -mindepth 2 -type f -exec mv -t dist {} +
           find dist -mindepth 1 -type d -empty -delete
           windows_installer="$(find dist -maxdepth 1 -type f -name 'Boundless-*.msi' | head -n 1)"
+          windows_bundle="$(find dist -maxdepth 1 -type f -name 'Boundless-*-windows-x64.zip' | head -n 1)"
           linux_archive="$(find dist -maxdepth 1 -type f -name 'boundless-*-linux-x64.tar.gz' | head -n 1)"
-          if [[ -z "$windows_installer" || -z "$linux_archive" ]]; then
+          if [[ -z "$windows_installer" || -z "$windows_bundle" || -z "$linux_archive" ]]; then
             echo "Expected release artifacts were not found in dist/" >&2
             exit 1
           fi
           echo "windows_installer=$windows_installer" >> "$GITHUB_OUTPUT"
+          echo "windows_bundle=$windows_bundle" >> "$GITHUB_OUTPUT"
           echo "linux_archive=$linux_archive" >> "$GITHUB_OUTPUT"
 
       - name: Validate release metadata
@@ -481,6 +519,16 @@ jobs:
             exit 1
           fi
           gh pr view "${pr_number}" --json body --jq .body > release-notes.md
+          cat >> release-notes.md <<'NOTES'
+
+          ## Windows qualification preview
+
+          Download **Boundless-<version>-windows-x64.zip**, copy it to each Windows PC, extract all files, then double-click **Install.cmd** as the intended desktop user. The ZIP includes the complete MSI and its matching installer helper. Recognized legacy per-user installs are retired with a recovery copy; supported config migrations retain a byte-for-byte backup. A transition from a per-user daemon to the machine service requires pairing again.
+
+          New transport/pairing defaults are **TCP 16100/16200**, avoiding Mouse Without Borders' common 15100/15101 listeners. Existing custom ports are preserved. Install the same version on both PCs and disable competing input sharing while testing.
+
+          This is a prerelease for physical two-PC qualification. Automated build and installer checks do not establish input, clipboard, recovery, or endurance on the actual PCs. Windows signing remains optional for this preview.
+          NOTES
           echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
 
       - name: Recreate draft release with tag
@@ -496,17 +544,11 @@ jobs:
               echo "Release $tag already exists and is published; refusing to overwrite it." >&2
               exit 1
             fi
-            edit_args=(release edit "$tag" --draft --title "$tag" --notes-file release-notes.md --target "$source_ref")
-            if [[ "$tag" == *-* ]]; then
-              edit_args+=(--prerelease)
-            fi
+            edit_args=(release edit "$tag" --draft --prerelease --latest=false --title "$tag" --notes-file release-notes.md --target "$source_ref")
             gh "${edit_args[@]}"
             exit 0
           fi
-          create_args=(release create "$tag" --draft --title "$tag" --target "$source_ref" --notes-file release-notes.md)
-          if [[ "$tag" == *-* ]]; then
-            create_args+=(--prerelease)
-          fi
+          create_args=(release create "$tag" --draft --prerelease --latest=false --title "$tag" --target "$source_ref" --notes-file release-notes.md)
           gh "${create_args[@]}"
 
       - name: Attest Windows installer
@@ -521,6 +563,12 @@ jobs:
         with:
           subject-path: ${{ steps.assets.outputs.linux_archive }}
 
+      - name: Attest Windows transfer bundle
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-path: ${{ steps.assets.outputs.windows_bundle }}
+
       - name: Attest checksum manifest
         if: ${{ !github.event.repository.private }}
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
@@ -532,18 +580,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
         run: gh release upload "${{ needs.release-context.outputs.tag_name }}" dist/* --clobber
 
-      - name: Publish draft release
+      - name: Publish preview prerelease
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           tag="${{ needs.release-context.outputs.tag_name }}"
-          if [[ "$tag" == *-* ]]; then
-            gh release edit "$tag" --draft=false --prerelease
-          else
-            gh release edit "$tag" --draft=false --latest
-          fi
+          gh release edit "$tag" --draft=false --prerelease --latest=false
 
       - name: Close superseded autorelease pull requests
         env:

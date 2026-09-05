@@ -436,7 +436,7 @@ async fn handle_console_pair_command(
             }
             let host = args[1].to_string();
             let code = args[2].to_string();
-            let mut port = 15200_u16;
+            let mut port = app_services::desktop::DEFAULT_PAIRING_PORT;
             let mut alias = None;
             if let Some(arg) = args.get(3) {
                 if let Ok(parsed) = arg.parse::<u16>() {

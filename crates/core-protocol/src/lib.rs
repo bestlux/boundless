@@ -6,7 +6,7 @@ use thiserror::Error;
 pub const PROTOCOL_NAME: &str = "boundless";
 pub const PROTOCOL_CURRENT: ProtocolVersion = ProtocolVersion {
     major: 4,
-    minor: 4,
+    minor: 5,
     patch: 0,
 };
 pub const MAX_WIRE_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -132,6 +132,18 @@ pub enum WireMessage {
     /// side has taken the first bulk turn. This prevents symmetric large
     /// clipboard replay writes from filling both TCP send windows at once.
     StartupSyncComplete,
+    /// In-memory diagnostic echo; requires a separate local, expiring consent lease.
+    DiagnosticProbe {
+        request_id: String,
+        payload: Vec<u8>,
+    },
+    DiagnosticReply {
+        request_id: String,
+        status: String,
+        payload: Vec<u8>,
+        metadata_json: String,
+        session_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

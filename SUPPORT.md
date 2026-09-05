@@ -1,48 +1,21 @@
 # Support
 
-Boundless is maintained as a small public project. There is no guaranteed SLA, private support channel, or real-time help desk.
+Boundless is a small public project without a guaranteed response time. Use GitHub Issues for reproducible bugs, feature requests, and documentation problems. Report suspected vulnerabilities privately through [SECURITY.md](SECURITY.md).
 
-## Where to ask
+## Report a problem
 
-- Bug reports: open a GitHub issue with the bug template
-- Feature requests: open a GitHub issue with the feature template
-- Security concerns: follow [SECURITY.md](SECURITY.md) and keep the report private
-
-## Before opening an issue
-
-Please check the current documentation first:
-
-- [README.md](README.md)
-- [docs/user/troubleshooting.md](docs/user/troubleshooting.md)
-- [docs/user/migration.md](docs/user/migration.md)
-- relevant scripts under `scripts/dev`
-
-If you are reporting a bug, gather the smallest useful set of evidence:
+Start with [Troubleshooting](docs/user/troubleshooting.md). From PowerShell:
 
 ```powershell
-cargo test --workspace
-./scripts/dev/test-suite.ps1 -Profile quick
-$BoundlessCtl = "$env:LOCALAPPDATA\Programs\Boundless\boundlessctl.exe"
-& $BoundlessCtl daemon status
-& $BoundlessCtl diagnostics dump
+$BoundlessCtl = "$env:ProgramFiles\Boundless\boundlessctl.exe"
+& $BoundlessCtl --json daemon status
+& $BoundlessCtl diagnostics dump --open-folder
 ```
 
-For release-candidate issues, attach the `scripts/dev/v5-readiness.ps1` packet when available instead of hand-picking raw logs. Review diagnostics, logs, screenshots, and shell transcripts before posting them publicly. Keep suspected security issues private through [SECURITY.md](SECURITY.md).
+If the daemon cannot be reached, use `diagnostics dump --offline --open-folder`. Offline exports cannot contain the daemon's live peer state. You do not need to build Boundless or run its developer test suite to report a bug.
 
-Include these details when relevant:
+Include the Windows version, Boundless version on each affected PC, installation/source-build mode, steps to reproduce, expected behavior, and what happened. For input problems, include display arrangement, DPI, and whether the affected app is elevated. For disk growth, include the log path, file size, timestamps, and a small relevant excerpt if available; avoid uploading an entire large log.
 
-- Windows version or other OS details
-- whether you are running from `main`, a tagged release, or a local fork
-- which component is affected (`boundlessd`, `boundlessctl`, `boundlesstray`, packaging, pairing, input routing, clipboard, transfer)
-- exact commands you ran
-- logs, diagnostics, screenshots, or reproduction steps
+Diagnostic exports are redacted, but review any attachment before posting it publicly. Do not include private keys, trust stores, clipboard contents, pairing codes, or credentials. The [security model](docs/security-trust-model.md) describes the diagnostic boundary.
 
-## What issue tracker support is for
-
-GitHub issues work best for:
-
-- reproducible bugs
-- narrowly scoped feature requests
-- documentation gaps tied to a concrete workflow
-
-Issues may be closed when they are incomplete, out of scope, duplicates, or general support requests without actionable reproduction details.
+Release contributors should also attach the candidate's [readiness packet](docs/release/release-readiness.md), including missing or failed checks. Ordinary users do not need to produce one.

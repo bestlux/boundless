@@ -23,10 +23,7 @@ mod service_entry {
     use std::{
         env,
         ffi::OsString,
-        fs::{self, OpenOptions},
-        io::{self, Write},
-        panic,
-        path::PathBuf,
+        io, panic,
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -51,10 +48,11 @@ mod service_entry {
             runtime_task_health_json, shutdown_runtime, start_runtime_tasks,
         },
         input::InputRuntimeMode,
-        logging, shared_control_plane_app,
+        logging::{self, append_service_startup_diagnostic},
+        shared_control_plane_app,
     };
     use platform_windows::runtime::{
-        named_pipe_incoming_for_allowed_user, validate_allowed_user_sid_shape,
+        named_pipe_incoming_for_service_user, validate_allowed_user_sid_shape,
     };
 
     const SERVICE_NAME: &str = "BoundlessService";
@@ -72,6 +70,7 @@ mod service_entry {
     }
 
     fn service_main(arguments: Vec<OsString>) {
+        let _startup_logging = logging::init_service_startup_logging();
         install_service_panic_hook();
         if let Err(error) = run_service(startup_arguments(arguments)) {
             append_service_startup_diagnostic("service_main_failed", &format!("{error:#}"));
@@ -253,7 +252,7 @@ mod service_entry {
                 runtime.snapshot.api_pipe_name
             ),
         );
-        let incoming = named_pipe_incoming_for_allowed_user(
+        let incoming = named_pipe_incoming_for_service_user(
             &runtime.snapshot.api_pipe_name,
             &allowed_user_sid,
         )
@@ -398,38 +397,12 @@ mod service_entry {
         }
     }
 
-    fn append_service_startup_diagnostic(stage: &str, detail: &str) {
-        let log_dir = service_diagnostic_log_dir();
-        if fs::create_dir_all(&log_dir).is_err() {
-            return;
-        }
-        let path = log_dir.join("boundless-service-startup.log");
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
-            return;
-        };
-        let _ = writeln!(
-            file,
-            "{} stage={} pid={} detail={}",
-            chrono::Utc::now().to_rfc3339(),
-            stage,
-            std::process::id(),
-            detail.replace(['\r', '\n'], " ")
-        );
-    }
-
     fn install_service_panic_hook() {
         let previous = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             append_service_startup_diagnostic("panic", &format!("{info}"));
             previous(info);
         }));
-    }
-
-    fn service_diagnostic_log_dir() -> PathBuf {
-        let root = env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-        root.join("Boundless").join("logs")
     }
 
     #[cfg(test)]

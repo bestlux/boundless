@@ -2170,6 +2170,8 @@ mod tests {
 
     fn allowed_broker_client() -> Option<crate::state::InputBrokerClientIdentity> {
         Some(crate::state::InputBrokerClientIdentity {
+            process_id: Some(100),
+            process_creation_time: Some(1),
             user_sid: Some("S-1-5-21-1000-2000-3000-1001".to_string()),
             session_id: Some(2),
         })

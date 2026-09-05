@@ -41,6 +41,7 @@ use windows_sys::{
                 ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, GetSystemPowerStatus,
                 SYSTEM_POWER_STATUS, SetThreadExecutionState,
             },
+            RemoteDesktop::WTSGetActiveConsoleSessionId,
             Shutdown::LockWorkStation,
             Threading::{
                 GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -70,6 +71,46 @@ impl Stream for NamedPipeIncoming {
 pub struct NamedPipeIo {
     inner: NamedPipeServer,
     client_identity: ControlClientIdentity,
+    service_user: Option<String>,
+    administrative_client: bool,
+}
+
+#[cfg(windows)]
+impl NamedPipeIo {
+    fn authorize(&self) -> io::Result<()> {
+        if let Some(allowed_sid) = &self.service_user
+            && !self.administrative_client
+            && !console_client_authorized(
+                &self.client_identity,
+                allowed_sid,
+                active_console_session_id(),
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "configured desktop user is not in the active console session",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn console_client_authorized(
+    identity: &ControlClientIdentity,
+    allowed_sid: &str,
+    console: Option<u32>,
+) -> bool {
+    identity.user_sid.as_deref() == Some(allowed_sid)
+        && identity
+            .session_id
+            .is_some_and(|session| session != 0 && Some(session) == console)
+}
+
+#[cfg(windows)]
+pub fn active_console_session_id() -> Option<u32> {
+    let session = unsafe { WTSGetActiveConsoleSessionId() };
+    (session != u32::MAX && session != 0).then_some(session)
 }
 
 #[cfg(windows)]
@@ -88,6 +129,9 @@ impl AsyncRead for NamedPipeIo {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if let Err(error) = self.authorize() {
+            return Poll::Ready(Err(error));
+        }
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
@@ -99,6 +143,9 @@ impl AsyncWrite for NamedPipeIo {
         cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Err(error) = self.authorize() {
+            return Poll::Ready(Err(error));
+        }
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
@@ -122,14 +169,36 @@ pub fn named_pipe_incoming_for_allowed_user(
     pipe_name: &str,
     allowed_user_sid: &str,
 ) -> io::Result<NamedPipeIncoming> {
+    named_pipe_incoming_with_policy(pipe_name, allowed_user_sid, false)
+}
+
+/// Service-only control endpoint: recheck console-session access on subsequent
+/// reads and writes, not just when an HTTP/2 connection was first accepted.
+#[cfg(windows)]
+pub fn named_pipe_incoming_for_service_user(
+    pipe_name: &str,
+    allowed_user_sid: &str,
+) -> io::Result<NamedPipeIncoming> {
+    named_pipe_incoming_with_policy(pipe_name, allowed_user_sid, true)
+}
+
+#[cfg(windows)]
+fn named_pipe_incoming_with_policy(
+    pipe_name: &str,
+    allowed_user_sid: &str,
+    console_only: bool,
+) -> io::Result<NamedPipeIncoming> {
     let pipe_path = pipe_path_for_name(pipe_name)?;
     let (sender, receiver) = mpsc::channel(32);
-    let security_sddl = control_pipe_sddl_for_allowed_user(allowed_user_sid)?;
+    let privileged_server =
+        console_only || process_handle_is_administrative(unsafe { GetCurrentProcess() })?;
+    let security_sddl = control_pipe_sddl_for_server(allowed_user_sid, privileged_server)?;
     let security_descriptor = PipeSecurityDescriptor::from_sddl(&security_sddl)?;
     let first_server = create_server(&pipe_path, true, &security_descriptor)?;
 
+    let service_user = console_only.then(|| allowed_user_sid.to_string());
     tokio::spawn(async move {
-        accept_loop(pipe_path, first_server, sender, security_sddl).await;
+        accept_loop(pipe_path, first_server, sender, security_sddl, service_user).await;
     });
 
     Ok(NamedPipeIncoming { receiver })
@@ -174,7 +243,7 @@ pub fn current_user_sid_string() -> io::Result<String> {
 }
 
 #[cfg(windows)]
-fn process_handle_user_sid_string(process: HANDLE) -> io::Result<String> {
+pub(crate) fn process_handle_user_sid_string(process: HANDLE) -> io::Result<String> {
     let mut token: HANDLE = std::ptr::null_mut();
     let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
     if opened == 0 {
@@ -182,13 +251,18 @@ fn process_handle_user_sid_string(process: HANDLE) -> io::Result<String> {
     }
     let _token_guard = HandleGuard(token);
 
+    token_user_sid_string(token)
+}
+
+#[cfg(windows)]
+pub(crate) fn token_user_sid_string(token: HANDLE) -> io::Result<String> {
     let mut required_len = 0_u32;
     let _ = unsafe { GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut required_len) };
     if required_len == 0 {
         return Err(io::Error::last_os_error());
     }
 
-    let mut buffer = vec![0_u8; required_len as usize];
+    let mut buffer = vec![0usize; (required_len as usize).div_ceil(mem::size_of::<usize>())];
     let ok = unsafe {
         GetTokenInformation(
             token,
@@ -221,11 +295,12 @@ pub fn process_id_user_sid_string(process_id: u32) -> io::Result<String> {
 /// identity-gated handlers (input broker attach/exchange) fail closed instead
 /// of trusting anything the client reports about itself.
 #[cfg(windows)]
-fn named_pipe_client_identity(server: &NamedPipeServer) -> ControlClientIdentity {
+fn named_pipe_client_identity(server: &NamedPipeServer) -> (ControlClientIdentity, bool) {
     use std::os::windows::io::AsRawHandle;
 
     let handle = server.as_raw_handle() as HANDLE;
     let mut identity = ControlClientIdentity::default();
+    let mut administrative = false;
 
     let mut session_id = 0_u32;
     if unsafe { GetNamedPipeClientSessionId(handle, &mut session_id) } != 0 {
@@ -240,11 +315,12 @@ fn named_pipe_client_identity(server: &NamedPipeServer) -> ControlClientIdentity
     let mut process_id = 0_u32;
     if unsafe { GetNamedPipeClientProcessId(handle, &mut process_id) } != 0 {
         identity.process_id = Some(process_id);
-        match process_id_user_sid_string(process_id) {
-            Ok(user_sid) => identity.user_sid = Some(user_sid),
-            Err(error) => {
-                tracing::warn!(%error, "failed to resolve named-pipe client user SID");
-            }
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+        if !process.is_null() {
+            let _process_guard = HandleGuard(process);
+            identity.user_sid = process_handle_user_sid_string(process).ok();
+            identity.process_creation_time = process_creation_time(process);
+            administrative = process_handle_is_administrative(process).unwrap_or(false);
         }
     } else {
         tracing::warn!(
@@ -253,11 +329,74 @@ fn named_pipe_client_identity(server: &NamedPipeServer) -> ControlClientIdentity
         );
     }
 
-    identity
+    (identity, administrative)
+}
+
+#[cfg(windows)]
+fn process_creation_time(process: HANDLE) -> Option<u64> {
+    use windows_sys::Win32::{Foundation::FILETIME, System::Threading::GetProcessTimes};
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    if unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    Some((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+}
+
+#[cfg(windows)]
+fn process_handle_is_administrative(process: HANDLE) -> io::Result<bool> {
+    use windows_sys::Win32::{
+        Security::{IsWellKnownSid, TOKEN_GROUPS, TokenGroups, WinBuiltinAdministratorsSid},
+        System::SystemServices::SE_GROUP_ENABLED,
+    };
+    let mut token = ptr::null_mut();
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _guard = HandleGuard(token);
+    if token_user_sid_string(token)? == "S-1-5-18" {
+        return Ok(true);
+    }
+    let mut required = 0;
+    unsafe { GetTokenInformation(token, TokenGroups, ptr::null_mut(), 0, &mut required) };
+    if required == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // usize storage satisfies TOKEN_GROUPS/SID_AND_ATTRIBUTES alignment.
+    let mut buffer = vec![0usize; (required as usize).div_ceil(mem::size_of::<usize>())];
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenGroups,
+            buffer.as_mut_ptr().cast(),
+            required,
+            &mut required,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let groups = unsafe { &*buffer.as_ptr().cast::<TOKEN_GROUPS>() };
+    let entries =
+        unsafe { std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize) };
+    Ok(entries.iter().any(|group| {
+        group.Attributes & SE_GROUP_ENABLED as u32 != 0
+            && unsafe { IsWellKnownSid(group.Sid, WinBuiltinAdministratorsSid) } != 0
+    }))
 }
 
 #[cfg(windows)]
 pub fn control_pipe_sddl_for_allowed_user(allowed_user_sid: &str) -> io::Result<String> {
+    control_pipe_sddl_for_server(allowed_user_sid, true)
+}
+
+#[cfg(windows)]
+fn control_pipe_sddl_for_server(
+    allowed_user_sid: &str,
+    privileged_server: bool,
+) -> io::Result<String> {
     if !validate_allowed_user_sid_shape(allowed_user_sid) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -265,8 +404,12 @@ pub fn control_pipe_sddl_for_allowed_user(allowed_user_sid: &str) -> io::Result<
         ));
     }
 
+    // An unelevated per-user host and its clients have the same SID and
+    // authority. That host needs create-instance rights to accept/reconnect.
+    // SYSTEM/elevated hosts can create instances using their privileged ACE.
+    let user_access = if privileged_server { "0x12019b" } else { "GA" };
     Ok(format!(
-        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{allowed_user_sid})"
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;{user_access};;;{allowed_user_sid})"
     ))
 }
 
@@ -441,6 +584,7 @@ async fn accept_loop(
     mut server: NamedPipeServer,
     sender: mpsc::Sender<io::Result<NamedPipeIo>>,
     security_sddl: String,
+    service_user: Option<String>,
 ) {
     loop {
         if let Err(error) = server.connect().await {
@@ -460,10 +604,17 @@ async fn accept_loop(
             }
         };
 
+        let (client_identity, administrative_client) = named_pipe_client_identity(&server);
         let io = NamedPipeIo {
-            client_identity: named_pipe_client_identity(&server),
+            client_identity,
             inner: server,
+            service_user: service_user.clone(),
+            administrative_client,
         };
+        if io.authorize().is_err() {
+            server = next_server;
+            continue;
+        }
         if sender.send(Ok(io)).await.is_err() {
             break;
         }
@@ -479,6 +630,7 @@ fn create_server(
     security_descriptor: &PipeSecurityDescriptor,
 ) -> io::Result<NamedPipeServer> {
     let mut options = ServerOptions::new();
+    options.reject_remote_clients(true);
     if first_instance {
         options.first_pipe_instance(true);
     }
@@ -601,6 +753,148 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
+    fn console_user_policy_rejects_missing_foreign_and_changed_sessions() {
+        let identity = ControlClientIdentity {
+            user_sid: Some("S-1-5-21-1-2-3-1001".to_string()),
+            session_id: Some(7),
+            ..Default::default()
+        };
+        let sid = identity.user_sid.as_deref().unwrap();
+        assert!(console_client_authorized(&identity, sid, Some(7)));
+        assert!(!console_client_authorized(&identity, sid, None));
+        assert!(!console_client_authorized(&identity, sid, Some(8)));
+        assert!(!console_client_authorized(
+            &identity,
+            "S-1-5-21-1-2-3-1002",
+            Some(7)
+        ));
+        let session_zero = ControlClientIdentity {
+            session_id: Some(0),
+            ..identity
+        };
+        assert!(!console_client_authorized(
+            &session_zero,
+            "S-1-5-21-1-2-3-1001",
+            Some(0)
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn pipe_acl_separates_privileged_clients_from_unelevated_per_user_hosts() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Security::{
+            CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
+            ImpersonateLoggedOnUser, RevertToSelf, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE,
+            WinBuiltinAdministratorsSid,
+        };
+
+        let path = format!(
+            r"\\.\pipe\boundless-authority-fixture-{}",
+            uuid::Uuid::new_v4()
+        );
+        let user_sid = current_user_sid_string().expect("user SID");
+        let sddl = control_pipe_sddl_for_allowed_user(&user_sid).expect("fixture ACL");
+        let descriptor = PipeSecurityDescriptor::from_sddl(&sddl).expect("fixture descriptor");
+        let server = create_server(&path, true, &descriptor).expect("first fixture instance");
+        tokio::task::spawn_blocking(move || {
+            let mut process_token = ptr::null_mut();
+            assert_ne!(
+                unsafe {
+                    OpenProcessToken(
+                        GetCurrentProcess(),
+                        TOKEN_DUPLICATE | TOKEN_QUERY,
+                        &mut process_token,
+                    )
+                },
+                0
+            );
+            let process_token = HandleGuard(process_token);
+            let mut admin_sid = [0u64; 12];
+            let mut sid_size = mem::size_of_val(&admin_sid) as u32;
+            assert_ne!(
+                unsafe {
+                    CreateWellKnownSid(
+                        WinBuiltinAdministratorsSid,
+                        ptr::null_mut(),
+                        admin_sid.as_mut_ptr().cast(),
+                        &mut sid_size,
+                    )
+                },
+                0
+            );
+            let deny_admin = SID_AND_ATTRIBUTES {
+                Sid: admin_sid.as_mut_ptr().cast(),
+                Attributes: 0,
+            };
+            let mut restricted = ptr::null_mut();
+            assert_ne!(
+                unsafe {
+                    CreateRestrictedToken(
+                        process_token.0,
+                        DISABLE_MAX_PRIVILEGE,
+                        1,
+                        &deny_admin,
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        &mut restricted,
+                    )
+                },
+                0
+            );
+            let restricted = HandleGuard(restricted);
+            assert_ne!(unsafe { ImpersonateLoggedOnUser(restricted.0) }, 0);
+            struct Revert;
+            impl Drop for Revert {
+                fn drop(&mut self) {
+                    if unsafe { RevertToSelf() } == 0 {
+                        std::process::abort();
+                    }
+                }
+            }
+            let _revert = Revert;
+            let descriptor = PipeSecurityDescriptor::from_sddl(&sddl).expect("fixture descriptor");
+            let error = create_server(&path, false, &descriptor)
+                .expect_err("ordinary client cannot host another pipe instance");
+            assert_eq!(error.raw_os_error(), Some(5));
+            let client = std::fs::OpenOptions::new()
+                .access_mode(0x0012_019b)
+                .custom_flags(0x0010_0000 | 0x0001_0000)
+                .open(&path)
+                .expect("ordinary user can open the existing pipe with narrow data rights");
+            drop(client);
+
+            let per_user_path = format!("{path}-per-user");
+            let per_user_acl =
+                control_pipe_sddl_for_server(&user_sid, false).expect("per-user ACL");
+            let descriptor =
+                PipeSecurityDescriptor::from_sddl(&per_user_acl).expect("per-user descriptor");
+            let first = create_server(&per_user_path, true, &descriptor)
+                .expect("unelevated first instance");
+            let client = std::fs::OpenOptions::new()
+                .access_mode(0x0012_019b)
+                .open(&per_user_path)
+                .expect("first per-user client");
+            let next = create_server(&per_user_path, false, &descriptor)
+                .expect("unelevated host can create its accept loop successor");
+            drop(client);
+            drop(first);
+            let client = std::fs::OpenOptions::new()
+                .access_mode(0x0012_019b)
+                .open(&per_user_path)
+                .expect("per-user client reconnects to successor");
+            drop(client);
+            drop(next);
+        })
+        .await
+        .expect("pipe fixture worker");
+        drop(server);
+    }
+
+    #[test]
     fn anti_idle_flags_clear_to_continuous_when_inactive() {
         #[cfg(windows)]
         assert_eq!(anti_idle_execution_state_flags(false, false), ES_CONTINUOUS);
@@ -656,7 +950,7 @@ mod tests {
         let sddl = control_pipe_sddl_for_allowed_user("S-1-5-21-1-2-3-1001").expect("sddl");
         assert_eq!(
             sddl,
-            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;S-1-5-21-1-2-3-1001)"
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019b;;;S-1-5-21-1-2-3-1001)"
         );
     }
 

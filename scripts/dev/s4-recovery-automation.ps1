@@ -4,7 +4,7 @@ param(
     [string]$LabelA = "machine-a",
     [string]$LabelB = "machine-b",
     [string]$ResponderHost = "192.0.2.10",
-    [int]$ResponderPairingPort = 15200,
+    [int]$ResponderPairingPort = 16200,
     [int]$EventsLimit = 300,
     [string]$ScenarioPrefix = "s4_recovery",
     [int]$PendingWaitSeconds = 20,
@@ -27,7 +27,7 @@ $cliExe = Join-Path $repoRoot "target/debug/boundlessctl.exe"
 $captureScript = Join-Path $repoRoot "scripts/dev/multi-display-capture.ps1"
 
 if (-not (Test-Path $cliExe)) {
-    throw "boundlessctl binary not found at $cliExe; run cargo build -p boundlessctl first"
+    throw "boundlessctl binary not found at $cliExe; run cargo build --locked -p boundlessctl first"
 }
 if (-not (Test-Path $captureScript)) {
     throw "capture script not found at $captureScript"

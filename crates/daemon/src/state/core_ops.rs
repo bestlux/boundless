@@ -32,7 +32,8 @@ impl AppState {
         )?;
 
         let inbox_root = PathBuf::from(&config.file_transfer.receive_dir);
-        std::fs::create_dir_all(&inbox_root)?;
+        // Receive storage is created lazily using the user I/O authority. In
+        // service mode this startup code runs as SYSTEM before a user exists.
 
         let fingerprint = fingerprint(&secret);
 
@@ -52,13 +53,17 @@ impl AppState {
             clipboard: Arc::new(ClipboardState::default()),
             pairing: Arc::new(PairingState::default()),
             transport: Arc::new(TransportState::default()),
-            transport_session_transition: Arc::new(Mutex::new(())),
+            paired_testing: Arc::new(paired_testing::PairedTestingState::default()),
+            transport_session_transitions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             discovery: Arc::new(DiscoveryState::default()),
             input: Arc::new(InputState::new(input_enabled)),
             input_broker: Arc::new(InputBrokerRelay::default()),
             input_capture_transition: Arc::new(Mutex::new(())),
             anti_idle: Arc::new(AntiIdleState::default()),
             outbound_file_transfers: Arc::new(RwLock::new(HashMap::new())),
+            outbound_file_handle_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_OUTBOUND_FILE_HANDLES,
+            )),
             file_transfer_records: Arc::new(RwLock::new(VecDeque::new())),
             security_paths: Arc::new(paths),
             identity: Arc::new(identity),
@@ -153,30 +158,41 @@ impl AppState {
             },
         )?;
 
-        self.mutate_config_and_save(|config| {
-            self.ensure_trust_rotation_not_pending()?;
-            if let Some(peer) = config
-                .peers
-                .iter_mut()
-                .find(|p| p.peer_id == machine_id.as_str())
-            {
-                peer.address = normalized_address;
-                peer.display_name = alias.unwrap_or(display_name);
-                peer.connected = false;
-                peer.last_seen = Utc::now();
-            } else {
-                config.peers.push(PeerConfig {
-                    peer_id: machine_id,
-                    display_name: alias.unwrap_or(display_name),
-                    address: normalized_address,
-                    connected: false,
-                    last_seen: Utc::now(),
-                });
-            }
+        let reconnect_peer_id = machine_id.clone();
+        let replaced = self
+            .mutate_config_and_save(|config| {
+                self.ensure_trust_rotation_not_pending()?;
+                let replaced = if let Some(peer) = config
+                    .peers
+                    .iter_mut()
+                    .find(|p| p.peer_id == machine_id.as_str())
+                {
+                    peer.address = normalized_address;
+                    peer.display_name = alias.unwrap_or(display_name);
+                    true
+                } else {
+                    config.peers.push(PeerConfig {
+                        peer_id: machine_id,
+                        display_name: alias.unwrap_or(display_name),
+                        address: normalized_address,
+                        connected: false,
+                        last_seen: Utc::now(),
+                    });
+                    false
+                };
 
-            Ok(((), true))
-        })
-        .await
+                Ok((replaced, true))
+            })
+            .await?;
+        // Trust changes belong to durable state, but an existing authenticated
+        // route must end through runtime ownership and input-release paths.
+        if replaced {
+            self.request_peer_reconnect_and_reset(&reconnect_peer_id)
+                .await?;
+        } else {
+            self.notify_peer_reconcile_wake("peer_trust_imported");
+        }
+        Ok(())
     }
 
     pub async fn snapshot(&self) -> RuntimeConfig {

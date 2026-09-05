@@ -163,6 +163,8 @@ pub struct SendInputKeyCommand {
 /// could not verify the caller; identity-gated commands fail closed on it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedControlClient {
+    pub process_id: Option<u32>,
+    pub process_creation_time: Option<u64>,
     pub user_sid: Option<String>,
     pub session_id: Option<u32>,
 }
@@ -193,6 +195,7 @@ pub struct InputBrokerExchangeCommand {
     pub inject_backpressure: bool,
     pub acked_inject_batch_id: u64,
     pub failed_inject_batch_id: u64,
+    pub input_paused: bool,
     pub held_input_authorization_generation: u64,
     pub raw_device_wheel_event_count: u32,
     pub raw_system_wheel_event_count: u32,

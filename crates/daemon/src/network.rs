@@ -12,7 +12,6 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
     sync::oneshot,
-    task::JoinHandle,
     time,
 };
 use tokio_rustls::{
@@ -43,6 +42,8 @@ mod control;
 mod inbound;
 mod inbound_payload;
 mod outbound;
+#[cfg(test)]
+mod paired_testing_tests;
 mod runtime;
 mod session;
 mod tls;
@@ -80,6 +81,21 @@ const MAX_BACKOFF_SECONDS: u64 = 30;
 const MAX_WIRE_FRAME_BYTES: usize = MAX_WIRE_PAYLOAD_BYTES;
 const LISTEN_BACKLOG: i32 = 1024;
 const PORT_ZERO_SPLIT_STACK_RETRIES: usize = 8;
+
+// File handles and Windows user authority belong to the runtime adapter,
+// rather than the shared peer-transport policy crate.
+#[derive(Debug)]
+struct InboundTransfer {
+    peer_id: String,
+    file_name: String,
+    total_bytes: u64,
+    bytes_received: u64,
+    remaining_chunk_credits: u32,
+    final_path: std::path::PathBuf,
+    temp_path: std::path::PathBuf,
+    temp_file: tokio::fs::File,
+    user_io: platform_windows::user_io::UserIoLease,
+}
 
 pub fn start(state: AppState, listeners: Vec<TcpListener>) {
     if !listeners.is_empty() {
@@ -3770,7 +3786,7 @@ mod tests {
         assert!(matches!(
             decode_written_frames(&writer.bytes).as_slice(),
             [WireMessage::Error { message }]
-                if message.contains("remote=4.3.0") && message.contains("expected=4.4.0")
+                if message.contains("remote=4.3.0") && message.contains(&format!("expected={PROTOCOL_CURRENT}"))
         ));
 
         let _ = std::fs::remove_dir_all(root);
@@ -4353,6 +4369,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_feature_revocation_discards_active_receive_and_rejects_new_start() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let receive_dir = root.join("received");
+        let mut config = state.file_transfer_config().await;
+        config.auto_accept_trusted_peers = true;
+        config.receive_dir = receive_dir.display().to_string();
+        state
+            .update_file_transfer_config(config)
+            .await
+            .expect("receive config");
+        let mut inbound = HashMap::new();
+        let mut writer = CaptureWriter::default();
+        let mut buffer = Vec::new();
+        handle_file_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            "active".to_string(),
+            "file.txt".to_string(),
+            3,
+            &mut inbound,
+            &mut writer,
+            &mut buffer,
+        )
+        .await
+        .expect("start");
+        assert_eq!(inbound.len(), 1);
+        state
+            .set_feature("transfer_file".to_string(), false)
+            .await
+            .expect("disable file sharing");
+        handle_file_chunk(
+            &state,
+            "active".to_string(),
+            b"abc".to_vec(),
+            &mut inbound,
+            &mut writer,
+            &mut buffer,
+        )
+        .await
+        .expect("revoked chunk");
+        assert!(inbound.is_empty());
+        assert!(!receive_dir.join("file.txt").exists());
+        assert!(!receive_dir.join(".file.txt.boundless.part").exists());
+        handle_file_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            "new".to_string(),
+            "new.txt".to_string(),
+            3,
+            &mut inbound,
+            &mut writer,
+            &mut buffer,
+        )
+        .await
+        .expect("rejected start");
+        assert!(inbound.is_empty());
+        assert_eq!(
+            std::fs::read_dir(&receive_dir)
+                .expect("receive folder")
+                .count(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn inbound_file_chunks_replenish_credit_at_low_watermark() {
         let (state, peer_id, root) = state_with_peer_for_queue_test().await;
         let receive_dir = root.join("received");
@@ -4500,5 +4586,212 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+    async fn measure_unrelated_peer_egress() -> serde_json::Value {
+        let (state, blocked_peer, root) = state_with_peer_for_queue_test().await;
+        let (code, _) = state.create_pairing_code(120).await;
+        let healthy_peer = state
+            .join_peer(code, "127.0.0.2:15100".into(), None)
+            .await
+            .unwrap();
+        state
+            .claim_transport_session(
+                &blocked_peer,
+                501,
+                true,
+                Arc::new(crate::state::RuntimeWakeSignal::default()),
+            )
+            .await;
+        state
+            .queue_clipboard_text(&blocked_peer, "blocked bulk".repeat(512))
+            .await
+            .unwrap();
+        let (writer, entered) = PartialWriteBlockingWriter::new();
+        let blocked_state = state.clone();
+        let blocked_id = blocked_peer.clone();
+        let blocked = tokio::spawn(async move {
+            let _guard = blocked_state
+                .acquire_transport_session_egress(&blocked_id, 501)
+                .await
+                .unwrap();
+            let mut writer = writer;
+            let mut flow = HashMap::new();
+            let mut buffer = Vec::new();
+            super::outbound::flush_outgoing_bulk_payloads_with_buffer(
+                &blocked_state,
+                "local",
+                Some(&blocked_id),
+                PROTOCOL_CURRENT,
+                4,
+                &mut flow,
+                &mut writer,
+                &mut buffer,
+            )
+            .await
+        });
+        time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("bulk writer stalls");
+        let started = time::Instant::now();
+        let healthy_result = time::timeout(Duration::from_millis(250), async {
+            assert_eq!(
+                state
+                    .claim_transport_session(
+                        &healthy_peer,
+                        502,
+                        true,
+                        Arc::new(crate::state::RuntimeWakeSignal::default())
+                    )
+                    .await,
+                crate::state::TransportSessionClaim::Claimed
+            );
+            state
+                .queue_input_events(
+                    &healthy_peer,
+                    vec![InputEvent::MouseButton {
+                        button: MouseButton::Left,
+                        state: KeyState::Up,
+                    }],
+                )
+                .await
+                .unwrap();
+            let _guard = state
+                .acquire_transport_session_egress(&healthy_peer, 502)
+                .await
+                .unwrap();
+            let mut writer = CaptureWriter::default();
+            let mut flow = HashMap::new();
+            let mut buffer = Vec::new();
+            super::outbound::flush_outgoing_input_payloads_with_buffer(
+                &state,
+                "local",
+                Some(&healthy_peer),
+                PROTOCOL_CURRENT,
+                &mut flow,
+                &mut writer,
+                &mut buffer,
+            )
+            .await
+            .unwrap();
+            assert!(
+                !writer.bytes.is_empty(),
+                "unrelated peer receives serialized input"
+            );
+        })
+        .await;
+        let elapsed_us = started.elapsed().as_micros();
+        let blocked_still_waiting = !blocked.is_finished();
+        blocked.abort();
+        let _ = blocked.await;
+        let _ = std::fs::remove_dir_all(root);
+        healthy_result
+            .expect("one peer's stalled bulk must not hold unrelated input or session claims");
+        assert!(
+            blocked_still_waiting,
+            "measurement must finish while other writer is still blocked"
+        );
+        serde_json::json!({"kind":"synthetic_transport", "scenario":"unrelated_peer_input_during_stalled_bulk", "unrelated_peer_elapsed_us":elapsed_us, "stalled_peer_pending":blocked_still_waiting, "deadline_ms":250})
+    }
+
+    #[tokio::test]
+    async fn stalled_bulk_peer_does_not_block_unrelated_peer_input() {
+        measure_unrelated_peer_egress().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "opt-in repeatable synthetic transport benchmark; does not measure hardware input latency"]
+    async fn transport_safety_benchmark() {
+        for closed in [false, true] {
+            let metric =
+                super::runtime::measure_worker_retry_cadence(closed, Duration::from_millis(3250))
+                    .await;
+            assert_eq!(
+                metric["attempts"], 3,
+                "one, two and four second retry cadence: {metric}"
+            );
+            println!("boundless_transport_benchmark={metric}");
+        }
+        for _ in 0..10 {
+            let metric = measure_unrelated_peer_egress().await;
+            println!("boundless_transport_benchmark={metric}");
+        }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_post_startup_maximum_text_remains_live() {
+        use core_clipboard::ClipboardPayload;
+        let (state_a, peer_b, root_a) = state_with_ordered_peer_for_queue_test("a-live", "b-live");
+        let (state_b, peer_a, root_b) = state_with_ordered_peer_for_queue_test("b-live", "a-live");
+        let (a, b) = tokio::io::duplex(4096);
+        let mut sessions = tokio::task::JoinSet::new();
+        sessions.spawn(run_authenticated_session(
+            state_a.clone(),
+            peer_b.clone(),
+            a,
+            true,
+            None,
+        ));
+        sessions.spawn(run_authenticated_session(
+            state_b.clone(),
+            peer_a.clone(),
+            b,
+            false,
+            None,
+        ));
+        time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state_a.get_peer(&peer_b).await.unwrap().connected
+                    && state_b.get_peer(&peer_a).await.unwrap().connected
+                {
+                    break;
+                }
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial handshake");
+        // Ensure this is live egress after both startup turns, not replay.
+        time::sleep(Duration::from_millis(100)).await;
+        for round in 0..3 {
+            state_a
+                .queue_clipboard_text(
+                    &peer_b,
+                    format!(
+                        "{round}{}",
+                        "a".repeat(peer_transport::MAX_CLIPBOARD_TEXT_BYTES - 1)
+                    ),
+                )
+                .await
+                .unwrap();
+            state_b
+                .queue_clipboard_text(
+                    &peer_a,
+                    format!(
+                        "{round}{}",
+                        "b".repeat(peer_transport::MAX_CLIPBOARD_TEXT_BYTES - 1)
+                    ),
+                )
+                .await
+                .unwrap();
+            let received = time::timeout(Duration::from_secs(1), async {
+                let mut got_a = false;
+                let mut got_b = false;
+                loop {
+                    if let Some(item) = state_a.dequeue_remote_clipboard_payload().await { got_a |= matches!(item.payload, ClipboardPayload::Text(ref text) if text.len() == peer_transport::MAX_CLIPBOARD_TEXT_BYTES); }
+                    if let Some(item) = state_b.dequeue_remote_clipboard_payload().await { got_b |= matches!(item.payload, ClipboardPayload::Text(ref text) if text.len() == peer_transport::MAX_CLIPBOARD_TEXT_BYTES); }
+                    if got_a && got_b { break; }
+                    time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await;
+            if received.is_err() {
+                sessions.shutdown().await;
+            }
+            received.unwrap_or_else(|_| {
+                panic!("post-startup full-duplex maximum text stalled in round {round}")
+            });
+        }
+        sessions.shutdown().await;
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
     }
 }

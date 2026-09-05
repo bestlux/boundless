@@ -1,10 +1,10 @@
 use eframe::egui;
+#[cfg(windows)]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-#[cfg(windows)]
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
 #[cfg(windows)]
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
@@ -13,14 +13,19 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 #[cfg(windows)]
-use windows_sys::core::BOOL;
-#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FLASHWINFO, FLASHW_TIMERNOFG, FLASHW_TRAY, FlashWindowEx, GetForegroundWindow,
+    EnumWindows, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, GetForegroundWindow,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, MB_ICONERROR,
     MB_OK, MB_SETFOREGROUND, MessageBoxW, PostMessageW, SW_HIDE, SW_RESTORE, SW_SHOW,
     SetForegroundWindow, ShowWindow, WM_CLOSE,
 };
+#[cfg(windows)]
+use windows_sys::core::BOOL;
+
+mod dashboard_product {
+    include!("dashboard/product.rs");
+}
+use dashboard_product::configure_dashboard_style;
 
 mod dashboard_layout {
     include!("dashboard/layout.rs");
@@ -41,7 +46,7 @@ mod dashboard_workflow {
     include!("dashboard/workflow.rs");
 }
 
-use dashboard_model::{AppMsg, DashboardApp, Tab, TOAST_ERROR_SECS, TOAST_SUCCESS_SECS};
+use dashboard_model::{AppMsg, DashboardApp, TOAST_ERROR_SECS, TOAST_SUCCESS_SECS, Tab};
 use dashboard_task_runner::{
     DashboardTaskRunner, StartRoleReversalPairingTask, SubmitPairingCodeTask,
 };
@@ -73,7 +78,11 @@ pub(super) fn run() -> Result<()> {
         let requested = SingleInstanceGuard::request_shutdown(&event_name, &user_sid)?;
         eprintln!(
             "boundless_tray_shutdown={}",
-            if requested { "requested" } else { "not_running" }
+            if requested {
+                "requested"
+            } else {
+                "not_running"
+            }
         );
         return Ok(());
     }
@@ -84,7 +93,9 @@ pub(super) fn run() -> Result<()> {
     }
     if let Some(hwnd) = find_existing_dashboard_window(session_id, &user_sid)? {
         if !activate_existing_dashboard_window(hwnd) {
-            show_tray_startup_error("The existing Boundless tray could not be brought forward. Close it from Task Manager, then launch Boundless again.");
+            show_tray_startup_error(
+                "The existing Boundless tray could not be brought forward. Close it from Task Manager, then launch Boundless again.",
+            );
             anyhow::bail!("existing legacy tray dashboard could not be shown");
         }
         eprintln!("boundless_tray_single_instance=legacy_existing_activated");
@@ -106,12 +117,19 @@ pub(super) fn run() -> Result<()> {
                 session_id,
                 &user_sid,
                 Duration::from_secs(3),
-            )? else {
-                show_tray_startup_error("Boundless is already starting or running, but its dashboard did not become available. Close boundlesstray.exe from Task Manager, then launch Boundless again.");
-                anyhow::bail!("existing tray accepted activation but its dashboard window was unavailable");
+            )?
+            else {
+                show_tray_startup_error(
+                    "Boundless is already starting or running, but its dashboard did not become available. Close boundlesstray.exe from Task Manager, then launch Boundless again.",
+                );
+                anyhow::bail!(
+                    "existing tray accepted activation but its dashboard window was unavailable"
+                );
             };
             if !activate_existing_dashboard_window(hwnd) {
-                show_tray_startup_error("The existing Boundless dashboard could not be brought forward. Close it from Task Manager, then launch Boundless again.");
+                show_tray_startup_error(
+                    "The existing Boundless dashboard could not be brought forward. Close it from Task Manager, then launch Boundless again.",
+                );
                 anyhow::bail!("existing tray dashboard could not be shown");
             }
             eprintln!("boundless_tray_single_instance=existing_activated");
@@ -129,8 +147,9 @@ pub(super) fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_visible(false)
-            .with_inner_size([800.0, 600.0])
-            .with_resizable(false)
+            .with_inner_size([920.0, 700.0])
+            .with_min_inner_size([680.0, 480.0])
+            .with_resizable(true)
             .with_icon(make_window_icon()?)
             .with_title(DASHBOARD_WINDOW_TITLE),
         ..Default::default()
@@ -140,7 +159,7 @@ pub(super) fn run() -> Result<()> {
         DASHBOARD_WINDOW_TITLE,
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            configure_dashboard_style(&cc.egui_ctx);
             Ok(Box::new(DashboardApp::new(
                 cc,
                 ctx,
@@ -170,9 +189,7 @@ fn find_existing_dashboard_window_with_retry(
 }
 
 fn tray_single_instance_event_name(user_sid: &str, session_id: u32) -> String {
-    format!(
-        "{TRAY_SINGLE_INSTANCE_EVENT_PREFIX}.{user_sid}.{session_id}"
-    )
+    format!("{TRAY_SINGLE_INSTANCE_EVENT_PREFIX}.{user_sid}.{session_id}")
 }
 
 fn tray_upgrade_quiescence_sentinel_name(user_sid: &str, session_id: u32) -> String {
@@ -267,6 +284,12 @@ impl eframe::App for DashboardApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.render_content(ui);
+    }
+}
+
+impl DashboardApp {
+    pub(super) fn render_content(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.render_pairing_dialog(&ctx);
 
@@ -278,33 +301,53 @@ impl eframe::App for DashboardApp {
         }
         self.render_toast_overlay(&ctx);
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Boundless");
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(24.0))
+            .show_inside(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.heading("Boundless");
+                    ui.separator();
+                    ui.selectable_value(&mut self.selected_tab, Tab::Status, "Home");
+                    ui.selectable_value(&mut self.selected_tab, Tab::Layout, "Arrange PCs");
+                    ui.selectable_value(&mut self.selected_tab, Tab::TransferCenter, "Files");
+                    ui.selectable_value(&mut self.selected_tab, Tab::Settings, "Sharing");
+                    ui.selectable_value(&mut self.selected_tab, Tab::Support, "Support");
+                });
                 ui.separator();
-                ui.selectable_value(&mut self.selected_tab, Tab::Status, "Status & Pairing");
-                ui.selectable_value(&mut self.selected_tab, Tab::Layout, "Layout Manager");
-                ui.selectable_value(&mut self.selected_tab, Tab::TransferCenter, "Transfer Center");
-                ui.selectable_value(&mut self.selected_tab, Tab::Settings, "Settings");
+
+                self.render_service_recovery_banner(ui, &ctx);
+                if !self.snapshot.daemon_online && self.selected_tab != Tab::Status {
+                    ui.strong("Status unavailable. Saved information may be out of date.");
+                    ui.add_space(8.0);
+                }
+
+                let pairing_modal_visible =
+                    self.pairing_in_progress || self.pairing_challenge.is_some();
+                if !pairing_modal_visible && self.pairing_last_error.is_some() {
+                    self.render_pairing_error(ui, &ctx);
+                    ui.separator();
+                }
+
+                match self.selected_tab {
+                    Tab::Status => self.render_home(ui, &ctx),
+                    Tab::Layout => {
+                        ui.add_enabled_ui(self.snapshot.daemon_online, |ui| {
+                            self.render_layout_tab(ui, &ctx)
+                        });
+                    }
+                    Tab::TransferCenter => {
+                        ui.add_enabled_ui(self.snapshot.daemon_online, |ui| {
+                            self.render_transfer_center_tab(ui)
+                        });
+                    }
+                    Tab::Settings => {
+                        ui.add_enabled_ui(self.snapshot.daemon_online, |ui| {
+                            self.render_settings_tab(ui)
+                        });
+                    }
+                    Tab::Support => self.render_support(ui),
+                }
             });
-            ui.separator();
-
-            self.render_service_recovery_banner(ui, &ctx);
-
-            let pairing_modal_visible =
-                self.pairing_in_progress || self.pairing_challenge.is_some();
-            if !pairing_modal_visible && self.pairing_last_error.is_some() {
-                self.render_pairing_error(ui, &ctx);
-                ui.separator();
-            }
-
-            match self.selected_tab {
-                Tab::Status => self.render_status_tab(ui, &ctx),
-                Tab::Layout => self.render_layout_tab(ui, &ctx),
-                Tab::TransferCenter => self.render_transfer_center_tab(ui),
-                Tab::Settings => self.render_settings_tab(ui),
-            }
-        });
     }
 }
 
@@ -339,22 +382,19 @@ impl DashboardApp {
                             .color(egui::Color32::from_rgb(235, 225, 195)),
                         );
                     });
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            let label = if recovery.in_progress {
-                                "Starting..."
-                            } else {
-                                &recovery.offer.action_label
-                            };
-                            if ui
-                                .add_enabled(!recovery.in_progress, egui::Button::new(label))
-                                .clicked()
-                            {
-                                start_requested = true;
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = if recovery.in_progress {
+                            "Starting..."
+                        } else {
+                            &recovery.offer.action_label
+                        };
+                        if ui
+                            .add_enabled(!recovery.in_progress, egui::Button::new(label))
+                            .clicked()
+                        {
+                            start_requested = true;
+                        }
+                    });
                 });
             });
         ui.add_space(8.0);
@@ -404,15 +444,45 @@ impl DashboardApp {
                 for (id, message, is_error, alpha) in &toast_data {
                     let (bg, border, text_color) = if *is_error {
                         (
-                            egui::Color32::from_rgba_unmultiplied(100, 30, 30, (220.0 * alpha) as u8),
-                            egui::Color32::from_rgba_unmultiplied(180, 60, 60, (200.0 * alpha) as u8),
-                            egui::Color32::from_rgba_unmultiplied(255, 180, 180, (255.0 * alpha) as u8),
+                            egui::Color32::from_rgba_unmultiplied(
+                                100,
+                                30,
+                                30,
+                                (220.0 * alpha) as u8,
+                            ),
+                            egui::Color32::from_rgba_unmultiplied(
+                                180,
+                                60,
+                                60,
+                                (200.0 * alpha) as u8,
+                            ),
+                            egui::Color32::from_rgba_unmultiplied(
+                                255,
+                                180,
+                                180,
+                                (255.0 * alpha) as u8,
+                            ),
                         )
                     } else {
                         (
-                            egui::Color32::from_rgba_unmultiplied(25, 80, 50, (220.0 * alpha) as u8),
-                            egui::Color32::from_rgba_unmultiplied(50, 160, 90, (200.0 * alpha) as u8),
-                            egui::Color32::from_rgba_unmultiplied(180, 255, 200, (255.0 * alpha) as u8),
+                            egui::Color32::from_rgba_unmultiplied(
+                                25,
+                                80,
+                                50,
+                                (220.0 * alpha) as u8,
+                            ),
+                            egui::Color32::from_rgba_unmultiplied(
+                                50,
+                                160,
+                                90,
+                                (200.0 * alpha) as u8,
+                            ),
+                            egui::Color32::from_rgba_unmultiplied(
+                                180,
+                                255,
+                                200,
+                                (255.0 * alpha) as u8,
+                            ),
                         )
                     };
                     egui::Frame::new()
@@ -424,9 +494,7 @@ impl DashboardApp {
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(message)
-                                            .color(text_color)
-                                            .size(12.5),
+                                        egui::RichText::new(message).color(text_color).size(12.5),
                                     )
                                     .wrap(),
                                 );
@@ -434,11 +502,14 @@ impl DashboardApp {
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         if ui
-                                            .add(egui::Button::new(
-                                                egui::RichText::new("x")
-                                                    .color(text_color)
-                                                    .size(11.0),
-                                            ).frame(false))
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new("x")
+                                                        .color(text_color)
+                                                        .size(11.0),
+                                                )
+                                                .frame(false),
+                                            )
                                             .clicked()
                                         {
                                             dismissed_id = Some(*id);
@@ -471,18 +542,16 @@ fn format_timestamp(iso: &str) -> &str {
 
 fn build_dashboard_tray_icon() -> Result<TrayIcon> {
     let menu = Menu::new();
-    menu
-        .append(&MenuItem::with_id(
-            ACTION_DASHBOARD,
-            "Dashboard",
-            true,
-            None,
-        ))
-        .context("add dashboard menu item")?;
+    menu.append(&MenuItem::with_id(
+        ACTION_DASHBOARD,
+        "Dashboard",
+        true,
+        None,
+    ))
+    .context("add dashboard menu item")?;
     menu.append(&PredefinedMenuItem::separator())
         .context("add tray separator")?;
-    menu
-        .append(&MenuItem::with_id(ACTION_QUIT, "Quit", true, None))
+    menu.append(&MenuItem::with_id(ACTION_QUIT, "Quit", true, None))
         .context("add quit menu item")?;
 
     let icon = make_tray_icon().context("build tray icon image")?;

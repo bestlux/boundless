@@ -1,5 +1,9 @@
 # Release Readiness Packet
 
+The automatic release workflow is a **preview channel**. Future artifacts from that lane are published as GitHub prereleases with `--latest=false`, including plain numeric version tags. Its build/unit/installer evidence does not certify the physical Windows desktop. Existing release objects are not changed by this policy. Windows signing remains optional unless the configured signing policy requires it.
+
+Stable promotion is a separate claim-scoped review of exact installed candidate artifacts, physical input/clipboard/recovery behavior, and unattended host safety. Passing this packet generator—even with `-Policy stable`—is necessary automated evidence where applicable, not a certificate for the whole product. See the [product acceptance scorecard](../performance/product-scorecard.md).
+
 `scripts/dev/release-readiness.ps1` writes a release evidence packet under `artifacts/release-readiness/` by default.
 
 The packet contains:
@@ -27,6 +31,9 @@ Skipped gates are never hidden. A release reviewer must either provide the missi
 
 - `-Policy prerelease` records skipped gates as `at-risk` evidence and exits non-zero only for failed gates unless `-RequireReady` is also supplied.
 - `-Policy stable` is the release-blocking policy. It exits non-zero for failed, skipped, missing, or stale evidence that this packet can evaluate.
+- `layout_topology_validation` is a unit result covered by the workspace suite. The former `four_node_topology` runtime label was removed: validating a layout matrix does not execute four PCs.
+- `edge_handoff_latency` runs the trace profile with budget enforcement. It requires fresh samples for every measured stage and rejects missing samples or suspected clock skew instead of substituting a receiver-only metric.
+- `paired_transport_contract` validates a saved report from the actual paired-test controller. It checks raw sample math, integrity counts, endpoint/process/session identity, and executable hashes. Stable policy additionally requires `-ExpectedDaemonSha256` from the selected candidate. This gate is transport evidence, not physical keyboard/mouse, clipboard, or hardware attestation.
 - Installer-smoke summary freshness is checked from the evidence file timestamp by default. Evidence older than `-MaxEvidenceAgeHours` fails stable policy.
 - Service update evidence is MSI-owned by default with `-ServiceUpdateMode msi-owned`. `service-self-update` and `tray-self-update` are accepted only as explicit unsupported/deferred modes and fail readiness when selected.
 - Full-service installer coverage requires installer-smoke evidence for MSI-owned service registration, repair recovery, and uninstall cleanup. Missing repair or stale-service cleanup evidence blocks readiness.
@@ -35,6 +42,8 @@ Skipped gates are never hidden. A release reviewer must either provide the missi
 - N-1 MSI upgrade coverage requires a prior MSI path passed to installer smoke. The summary must prove both app payload and service payload replacement, Program Files ownership of the current payloads, and the active service path after upgrade. Missing prior-MSI coverage is recorded as skipped evidence, which fails `-Policy stable`.
 
 Physical two-machine performance labs are release evidence, not default PR gates. Keep them out of ordinary PR validation until the scenarios are stable, fast, non-disruptive, and supported by repeated real runs. Fixture packets may validate artifact shape, but real product scorecard thresholds stay provisional until at least two real two-PC runs exist for the scenario.
+
+Metadata fixture packets can no longer be promoted with `perf-two-machine-evidence.ps1 -ReleaseEvidence`; that option fails explicitly. Use [functional measurements](../performance/two-machine-evidence-harness.md) for the actual paired controller, runtime/logging benchmarks, and evidence boundaries.
 
 Release reviewers should classify readiness in three separate levels:
 
@@ -45,6 +54,24 @@ Release reviewers should classify readiness in three separate levels:
 | parity claim supported | Current parity-matrix and release-readiness evidence for the exact claim, plus matching scorecard evidence. The scorecard alone is not claim evidence for desktop security boundaries, elevated contexts, prompts, self-update behavior, or broad third-party behavior. |
 
 ## Common Commands
+
+Fast measurement-contract fixtures (no installed product or paired PCs):
+
+```powershell
+./scripts/dev/functional-validation-fixtures.ps1
+./scripts/dev/perf-two-machine-fixtures.ps1
+```
+
+Packet using an already collected authenticated transport report:
+
+```powershell
+./scripts/dev/release-readiness.ps1 `
+  -PairedTestReportPath artifacts/paired-test.json `
+  -ExpectedDaemonSha256 <candidate-executable-sha256> `
+  -InstallerSmokeSummaryPath artifacts/installer-validation/installer-smoke.json
+```
+
+The generator does not contact the remote PC to consume that saved report. A hash identifies the actual executable hosting each daemon (`boundless-service.exe` in service mode or `boundlessd.exe` in direct mode); do not substitute the CLI, MSI, or current checkout hash. Exploratory prerelease packets may omit the expected hash, and their transport validation explicitly records that the candidate is unbound. An optional `-ExpectedSourceRevision <full-commit-sha>` also requires matching build-time revisions, when present.
 
 Local unit and release metadata packet:
 
@@ -69,6 +96,8 @@ Runtime candidate packet:
 ```
 
 The runtime packet still records service smoke as skipped unless `-IncludeServiceSmoke` is supplied from an elevated Windows shell.
+
+Runtime smoke starts same-host processes and is not a two-physical-PC acceptance run. The trace step needs live supported input samples; invoking it on idle or unreachable endpoints fails its measurement contract. Use the separate saved paired report for transport RTT, which measures on one monotonic clock.
 
 Release-blocking packet:
 
@@ -130,7 +159,7 @@ A future installer-owned local-subnet firewall rule can contribute to release re
 - The rule is created only through an explicit user-visible installer/helper option, not silently during pairing, diagnostics, reset, role reversal, daemon startup, or service startup.
 - The rule is program-scoped to `%ProgramFiles%\Boundless\boundless-service.exe` and fail-closed when that Program Files service binary, service registration, intended user SID, or MSI ownership cannot be verified.
 - The rule is scoped to Private profile plus local-subnet remote scope, or a narrower user-approved remote scope. Evidence must prove no Public-profile rule and no `remoteip=any profile=any` fallback are created.
-- The default approved ports are TCP `15100` and TCP `15200`. TCP `15101` remains a side-by-side diagnostics probe and must not be opened unless a future alternate-port implementation explicitly asks for the selected transport port and derived pairing port.
+- The default approved ports are TCP `16100` and TCP `16200`. Legacy/MWB ports `15100`/`15101`/`15200` remain diagnostic probes and must not be opened unless a future alternate-port implementation explicitly asks for the selected transport port and derived pairing port.
 - Repair recreates only the MSI-owned approved rule, upgrade preserves ownership for the current Program Files service path, and uninstall removes the MSI-owned Boundless rule without deleting unrelated user-created firewall rules.
 - Static inspection and Windows installer lab evidence both show the expected program path, ports, profile, remote scope, and rollback behavior.
 - Real two-PC Private-network evidence shows pairing and transport success without manual firewall edits, with diagnostics confirming the expected rule shape on both machines.

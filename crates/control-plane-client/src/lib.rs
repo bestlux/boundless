@@ -9,12 +9,15 @@ use {
     std::{
         future::Future,
         io,
-        os::windows::io::AsRawHandle,
+        os::windows::{
+            fs::OpenOptionsExt,
+            io::{AsRawHandle, IntoRawHandle},
+        },
         pin::Pin,
         task::{Context as TaskContext, Poll},
         time::Duration,
     },
-    tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient},
+    tokio::net::windows::named_pipe::NamedPipeClient,
     tonic::{codegen::Service, transport::Uri},
     windows_sys::Win32::{Foundation::HANDLE, System::Pipes::GetNamedPipeServerProcessId},
 };
@@ -209,7 +212,7 @@ async fn open_named_pipe_with_retry(pipe_path: String) -> io::Result<NamedPipeCl
     let mut attempt = 0_u32;
 
     loop {
-        match ClientOptions::new().open(pipe_path.as_str()) {
+        match open_client_pipe(&pipe_path) {
             Ok(client) => return Ok(client),
             Err(error) if is_pipe_busy_error(&error) && attempt < PIPE_BUSY_MAX_RETRIES => {
                 attempt += 1;
@@ -218,6 +221,21 @@ async fn open_named_pipe_with_retry(pipe_path: String) -> io::Result<NamedPipeCl
             Err(error) => return Err(error),
         }
     }
+}
+
+#[cfg(windows)]
+fn open_client_pipe(pipe_path: &str) -> io::Result<NamedPipeClient> {
+    // Individual client rights exclude FILE_CREATE_PIPE_INSTANCE (aliased to
+    // FILE_APPEND_DATA). GENERIC_WRITE would inadvertently request that right.
+    const CLIENT_ACCESS: u32 = 0x0012_019b;
+    const OVERLAPPED_IDENTIFICATION: u32 = 0x4000_0000 | 0x0010_0000 | 0x0001_0000;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(CLIENT_ACCESS)
+        .custom_flags(OVERLAPPED_IDENTIFICATION)
+        .open(pipe_path)?;
+    // The open uses FILE_FLAG_OVERLAPPED as required by Tokio. Identification
+    // QoS prevents an untrusted server from impersonating the connecting user.
+    unsafe { NamedPipeClient::from_raw_handle(file.into_raw_handle()) }
 }
 
 #[cfg(windows)]

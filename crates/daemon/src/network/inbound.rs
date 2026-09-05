@@ -9,10 +9,11 @@ use tracing::{info, warn};
 
 use crate::state::{AppState, TransportEventRecord};
 use peer_transport::{
-    FILE_TRANSFER_INITIAL_CHUNK_CREDITS, InboundClipboardImageTransfer, InboundTransfer,
+    FILE_TRANSFER_INITIAL_CHUNK_CREDITS, InboundClipboardImageTransfer,
     MAX_INBOUND_TRANSFERS_PER_PEER,
 };
 
+use super::InboundTransfer;
 use super::codec::flush_transport_writer;
 use super::inbound_payload::enqueue_clipboard_image_payload;
 use super::outbound::{send_file_chunk_credit, send_message};
@@ -96,7 +97,9 @@ where
         return Ok(());
     }
 
-    if !state.file_transfer_auto_accept_trusted_peers().await {
+    if state.ensure_file_transfer_enabled().await.is_err()
+        || !state.file_transfer_auto_accept_trusted_peers().await
+    {
         state
             .record_incoming_file_transfer_failed(
                 transfer_id.clone(),
@@ -188,6 +191,7 @@ where
             final_path: reserved.final_path,
             temp_path: reserved.temp_path,
             temp_file: reserved.temp_file,
+            user_io: reserved.user_io,
         },
     );
     state
@@ -336,6 +340,16 @@ where
     };
 
     let chunk = data;
+
+    if let Err(error) = validate_transfer_authority(state, &transfer).await {
+        state
+            .mark_file_transfer_failed(&transfer_id, &format!("user_authority_revoked: {error}"))
+            .await;
+        discard_inbound_transfer(transfer).await;
+        send_file_transfer_rejected(writer, frame_buffer, &transfer_id, "user_authority_revoked")
+            .await?;
+        return Ok(());
+    }
 
     let next_size = transfer.bytes_received.saturating_add(chunk.len() as u64);
     if let Err(error) = core_transfer::validate_transfer_size_with_limit(
@@ -499,6 +513,14 @@ pub(super) async fn handle_file_end(
         return Ok(());
     };
 
+    if let Err(error) = validate_transfer_authority(state, &transfer).await {
+        state
+            .mark_file_transfer_failed(&transfer_id, &format!("user_authority_revoked: {error}"))
+            .await;
+        discard_inbound_transfer(transfer).await;
+        return Ok(());
+    }
+
     if transfer.bytes_received != transfer.total_bytes {
         warn!(
             transfer_id = %transfer_id,
@@ -560,6 +582,7 @@ pub(super) async fn handle_file_end(
             &transfer.temp_path,
             &transfer.final_path,
             transfer.bytes_received,
+            &transfer.user_io,
         )
         .await
     {
@@ -593,7 +616,7 @@ pub(super) async fn handle_file_end(
                 error = ?error,
                 "failed to store inbound file payload"
             );
-            let _ = tokio::fs::remove_file(&transfer.temp_path).await;
+            let _ = transfer.user_io.remove_file(transfer.temp_path).await;
         }
     }
 
@@ -660,10 +683,19 @@ pub(super) async fn discard_inbound_transfer(transfer: InboundTransfer) {
     let InboundTransfer {
         temp_path,
         temp_file,
+        user_io,
         ..
     } = transfer;
     drop(temp_file);
-    let _ = tokio::fs::remove_file(temp_path).await;
+    let _ = user_io.remove_file(temp_path).await;
+}
+
+async fn validate_transfer_authority(state: &AppState, transfer: &InboundTransfer) -> Result<()> {
+    state.ensure_file_transfer_enabled().await?;
+    if !state.file_transfer_auto_accept_trusted_peers().await {
+        anyhow::bail!("file receive permission was revoked");
+    }
+    transfer.user_io.validate().await
 }
 
 async fn send_file_transfer_rejected<W>(

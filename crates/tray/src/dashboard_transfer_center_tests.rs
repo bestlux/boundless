@@ -72,6 +72,6 @@ fn transfer_summary_counts_visible_states() {
 
     assert_eq!(
         dashboard_transfer_center::transfer_summary(&snapshot.file_transfers),
-        "queued 1 | active 1 | completed 1 | failed 1 | cancelled 1"
+        "2 in progress; 1 needs attention"
     );
 }

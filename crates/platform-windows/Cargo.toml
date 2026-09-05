@@ -19,3 +19,4 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Graphic
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4.1"
+windows-sys = { workspace = true, features = ["Win32_System_Com", "Win32_System_IO", "Win32_Storage_FileSystem"] }

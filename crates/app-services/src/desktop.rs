@@ -15,6 +15,10 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const PAIRING_PORT_OFFSET: u16 = 100;
 
+/// Product defaults avoid the 15100/15101 listeners used by Mouse Without Borders.
+pub const DEFAULT_NETWORK_PORT: u16 = 16100;
+pub const DEFAULT_PAIRING_PORT: u16 = DEFAULT_NETWORK_PORT + PAIRING_PORT_OFFSET;
+
 pub const CANONICAL_LOCAL_LAYOUT_TOKEN: &str = "self";
 pub const MAX_LAYOUT_REMOTE_PEERS: usize = 4;
 

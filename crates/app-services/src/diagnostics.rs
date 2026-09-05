@@ -16,7 +16,13 @@ const REDACTED_SECRET: &str = "[redacted-secret]";
 const REDACTED_ID: &str = "[redacted-id]";
 const REDACTED_FILE_NAME: &str = "[redacted-file-name]";
 const REDACTED_PATH: &str = "[redacted-path]";
-const BOUNDLESS_RELATED_TCP_PORTS: &[u16] = &[15100, 15101, 15200];
+const BOUNDLESS_RELATED_TCP_PORTS: &[u16] = &[
+    15100,
+    15101,
+    15200,
+    crate::desktop::DEFAULT_NETWORK_PORT,
+    crate::desktop::DEFAULT_PAIRING_PORT,
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticExportOptions {
@@ -456,7 +462,7 @@ fn suggested_listener_mitigation(owner_kind: &str, port: u16) -> String {
             "TCP {port} is owned by Boundless; this is expected when the daemon is running."
         ),
         "mouse-without-borders" => format!(
-            "Mouse Without Borders or PowerToys is listening on TCP {port}; stop MWB during Boundless dogfood or move Boundless to an alternate network_port before pairing."
+            "Mouse Without Borders or PowerToys is listening on TCP {port}; current Boundless defaults are TCP 16100/16200. Pause MWB input sharing during Boundless qualification so both apps do not control the same input."
         ),
         "other" => format!(
             "Another local process is listening on TCP {port}; identify the owner, stop it if appropriate, or move Boundless to an alternate network_port for side-by-side testing."
@@ -470,7 +476,7 @@ fn suggested_listener_mitigation(owner_kind: &str, port: u16) -> String {
 fn port_listener_summary(listeners: &[PortListenerDiagnostic]) -> Vec<String> {
     if listeners.is_empty() {
         return vec![
-            "No local listeners were found on Boundless-related TCP ports 15100, 15101, or 15200."
+            "No local listeners were found on current Boundless TCP ports 16100/16200 or legacy comparison ports 15100/15101/15200."
                 .to_string(),
         ];
     }
@@ -539,29 +545,68 @@ pub async fn write_diagnostic_bundle(
     bundle: Value,
     options: DiagnosticExportOptions,
 ) -> Result<DiagnosticExportResult> {
+    tokio::task::spawn_blocking(move || write_diagnostic_bundle_sync(bundle, options))
+        .await
+        .context("join diagnostic bundle export")?
+}
+
+/// All filesystem operations finish on the calling thread. A privileged host
+/// must call this inside its user-authority scope and supply that user's default
+/// output path; the async wrapper is for ordinary process-authority callers.
+pub fn write_diagnostic_bundle_sync(
+    bundle: Value,
+    options: DiagnosticExportOptions,
+) -> Result<DiagnosticExportResult> {
+    use std::{
+        io::Write,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    static EXPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     let target = options
         .output_path
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(default_diagnostics_dir);
-    tokio::fs::create_dir_all(&target)
-        .await
-        .with_context(|| format!("create diagnostics directory {}", target.display()))?;
-
-    let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+    let stamp = format!(
+        "{}-{}-{}",
+        Utc::now().format("%Y%m%d-%H%M%S-%f"),
+        std::process::id(),
+        EXPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
     let file_path = target.join(format!("bundle-{stamp}.json"));
     let manifest_path = target.join(format!("bundle-{stamp}.redaction.txt"));
     let redacted = redact_sensitive_json(bundle, options.include_filenames);
     let bundle_json = serde_json::to_string_pretty(&redacted).context("serialize diagnostics")?;
-    tokio::fs::write(&file_path, bundle_json)
-        .await
-        .with_context(|| format!("write diagnostic bundle {}", file_path.display()))?;
-    tokio::fs::write(
-        &manifest_path,
-        redaction_manifest(options.include_filenames),
-    )
-    .await
-    .with_context(|| format!("write redaction manifest {}", manifest_path.display()))?;
+    std::fs::create_dir_all(&target)
+        .with_context(|| format!("create diagnostics directory {}", target.display()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&file_path)
+        .with_context(|| format!("create diagnostic bundle {}", file_path.display()))?;
+    let mut manifest = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&manifest_path)
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            drop(file);
+            let _ = std::fs::remove_file(&file_path);
+            return Err(error).context("create diagnostic redaction manifest");
+        }
+    };
+    let write_result = file.write_all(bundle_json.as_bytes()).and_then(|()| {
+        manifest.write_all(redaction_manifest(options.include_filenames).as_bytes())
+    });
+    drop(file);
+    drop(manifest);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_file(&manifest_path);
+        return Err(error).context("write diagnostic export");
+    }
 
     Ok(DiagnosticExportResult {
         bundle_path: file_path.display().to_string(),
@@ -1000,6 +1045,39 @@ fn looks_like_clipboard_secret(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn offline_async_writer_preserves_redaction_and_creates_distinct_exports() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-offline-export-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let options = DiagnosticExportOptions {
+            output_path: Some(root.display().to_string()),
+            include_filenames: false,
+        };
+        let first = write_diagnostic_bundle(json!({"runtime": {"mode": "offline"}, "peer_id": "fixture-peer", "local_path": "C:/fixture/report.txt"}), options.clone()).await.expect("offline export");
+        let first_bytes = std::fs::read(&first.bundle_path).expect("first bundle");
+        let json: Value = serde_json::from_slice(&first_bytes).expect("real JSON");
+        assert_eq!(json["runtime"]["mode"], "offline");
+        assert_ne!(json["peer_id"], "fixture-peer");
+        assert_eq!(json["local_path"], REDACTED_PATH);
+        assert!(
+            std::fs::read_to_string(&first.manifest_path)
+                .expect("sidecar")
+                .contains("filenames_included=false")
+        );
+        let second = write_diagnostic_bundle(json!({"safe_count": 2}), options)
+            .await
+            .expect("second export");
+        assert_ne!(first.bundle_path, second.bundle_path);
+        assert_eq!(
+            std::fs::read(&first.bundle_path).expect("first preserved"),
+            first_bytes
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn input_runtime_diagnostics_include_content_free_elevated_injector_status() {
         let diagnostics = input_runtime_diagnostics(
@@ -1058,7 +1136,7 @@ mod tests {
 
         assert_eq!(snapshot.platform, "windows");
         assert!(snapshot.read_only);
-        assert_eq!(snapshot.ports, vec![15100, 15101, 15200]);
+        assert_eq!(snapshot.ports, vec![15100, 15101, 15200, 16100, 16200]);
         assert_eq!(snapshot.listeners.len(), 3);
         assert_eq!(snapshot.listeners[0].address_family, "ipv4");
         assert_eq!(snapshot.listeners[0].bind_scope, "any");

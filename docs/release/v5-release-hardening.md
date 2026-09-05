@@ -1,5 +1,7 @@
 # V5 Release Hardening
 
+> Historical release-hardening record retained for earlier candidate evidence. Its version, sequencing, and capability statements are not current status. Use [Project Status](../project-status.md), the [Windows roadmap](../v5-roadmap.md), and [Release Readiness](release-readiness.md) for the current contract.
+
 This document records the release-hardening contract for the Boundless v5 Windows artifact.
 
 ## Implemented Controls
@@ -16,7 +18,7 @@ This document records the release-hardening contract for the Boundless v5 Window
 - The WiX installer is configured to close tray, daemon, and service executable names during upgrade/uninstall.
 - `installer-smoke.ps1` validates machine-wide install under `%ProgramFiles%\Boundless`, HKLM installer/uninstall evidence, shortcut targets/icons, installed executable signatures including the service host, MSI-owned service registration, AutoStart, service daemon health, repair recovery after deleting `BoundlessService`, optional upgrade-while-running behavior, N-1 app and service payload replacement when a previous MSI is supplied, service stop before uninstall, uninstall cleanup, absence of Boundless processes before harness cleanup, absence of a registered Boundless service after uninstall, and removal of the Program Files service binary.
 - MSI-owned packaged-payload updates are the supported update model. The MSI installer owns install, upgrade, repair, and uninstall of tray, daemon, service payloads, and `BoundlessService`; service and tray self-update flows are unsupported/deferred.
-- The release workflow packages the Windows MSI as `Boundless-<version>-windows-x64.msi`, emits the SID-selecting helper as `Boundless-<version>-windows-x64-install.ps1`, uploads both under the `boundless-windows-x64` workflow artifact, and publishes both as GitHub Release assets.
+- The release workflow packages `Boundless-<version>-windows-x64.zip` after optional MSI signing. It contains the exact MSI, matching SID-selecting helper, `Install.cmd`, README, and per-file checksums. CI verifies/extracts that bundle before the actual installer smoke. ZIP, standalone MSI/helper, and outer checksums are published together; public releases attest the ZIP as well. The release lane remains a qualification prerelease.
 - Windows code signing remains policy-driven:
   - stable releases require signing only when `WINDOWS_SIGN_REQUIRED=true`,
   - unsigned artifacts are explicit when signing variables are not configured,

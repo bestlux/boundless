@@ -431,7 +431,7 @@ pub(super) async fn pair_discover(endpoint: &str) -> Result<()> {
     for (index, peer) in discovered.iter().enumerate() {
         let pairing_port = host_and_pairing_port_from_endpoint(&peer.endpoint)
             .map(|(_, port)| port)
-            .unwrap_or(15200);
+            .unwrap_or(app_services::desktop::DEFAULT_PAIRING_PORT);
         println!(
             "[{}] name={} endpoint={} machine_id={} pairing_port={} mdns=discovered pairing_reachability=unchecked transport_reachability=unchecked transport_candidates=[{}] pairing_candidates=[{}]",
             index + 1,
@@ -567,7 +567,7 @@ pub(super) async fn pair_request(endpoint: &str, args: PairRequestArgs) -> Resul
         if host.is_empty() {
             bail!("--host must not be empty");
         }
-        let pairing_port = port_override.unwrap_or(15200);
+        let pairing_port = port_override.unwrap_or(app_services::desktop::DEFAULT_PAIRING_PORT);
         (
             host.clone(),
             pairing_port,
@@ -712,7 +712,10 @@ pub(super) async fn setup_wizard(endpoint: &str, start_daemon: bool) -> Result<(
     let (host, pairing_port, default_alias, endpoint_candidates) = if discovered.is_empty() {
         println!("No discovered peers yet. Falling back to manual host entry.");
         let host = prompt_required("Peer host/IP")?;
-        let port = prompt_u16_with_default("Peer nearby pairing port", 15200)?;
+        let port = prompt_u16_with_default(
+            "Peer nearby pairing port",
+            app_services::desktop::DEFAULT_PAIRING_PORT,
+        )?;
         (host, port, None, Vec::new())
     } else {
         println!("Discovered peers:");
@@ -729,7 +732,10 @@ pub(super) async fn setup_wizard(endpoint: &str, start_daemon: bool) -> Result<(
         let selector = prompt_required("Peer selector")?;
         if selector.eq_ignore_ascii_case("manual") {
             let host = prompt_required("Peer host/IP")?;
-            let port = prompt_u16_with_default("Peer nearby pairing port", 15200)?;
+            let port = prompt_u16_with_default(
+                "Peer nearby pairing port",
+                app_services::desktop::DEFAULT_PAIRING_PORT,
+            )?;
             (host, port, None, Vec::new())
         } else {
             let selected = resolve_discovered_peer_record(&discovered, &selector)?;

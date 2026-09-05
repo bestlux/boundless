@@ -1,13 +1,36 @@
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use std::io::{Read, Seek};
 
 use super::*;
+
+// A started blocking operation cannot be cancelled with its awaiting RPC.
+// Keep its slot on that worker until the opened handle can take ownership.
+pub(super) async fn open_outbound_source_with_capacity<F>(
+    user_io: &platform_windows::user_io::UserIoLease,
+    handle_permit: tokio::sync::OwnedSemaphorePermit,
+    open: F,
+) -> Result<(
+    std::fs::File,
+    std::fs::Metadata,
+    tokio::sync::OwnedSemaphorePermit,
+)>
+where
+    F: FnOnce() -> Result<(std::fs::File, std::fs::Metadata)> + Send + 'static,
+{
+    user_io
+        .run_sync(move || {
+            let (file, metadata) = open()?;
+            Ok((file, metadata, handle_permit))
+        })
+        .await
+}
 
 pub(crate) struct ReservedIncomingFile {
     pub(crate) sanitized_name: String,
     pub(crate) final_path: PathBuf,
     pub(crate) temp_path: PathBuf,
     pub(crate) temp_file: tokio::fs::File,
+    pub(crate) user_io: platform_windows::user_io::UserIoLease,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -800,9 +823,15 @@ impl AppState {
         file_path: &Path,
         previous_transfer_id: Option<String>,
     ) -> Result<String> {
+        self.ensure_file_transfer_enabled().await?;
         let Some(_peer) = self.get_peer(peer_id).await else {
             anyhow::bail!("unknown peer {peer_id}");
         };
+        let handle_permit = self
+            .outbound_file_handle_slots
+            .clone()
+            .try_acquire_owned()
+            .context("outbound file capacity reached; finish or cancel a queued transfer")?;
 
         let file_name = file_path
             .file_name()
@@ -819,17 +848,34 @@ impl AppState {
             source_path: source_path.clone(),
             total_bytes,
         };
-        let metadata = match tokio::fs::metadata(file_path).await {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                self.record_outgoing_file_transfer_failed(
-                    outgoing_projection(0),
-                    format!("source_unavailable: {error}"),
-                )
-                .await;
-                return Err(anyhow::Error::from(error));
-            }
-        };
+        let user_io = self.user_io_lease().await?;
+        let open_path = source_path.clone();
+        let (source_file, metadata, handle_permit) =
+            match open_outbound_source_with_capacity(&user_io, handle_permit, move || {
+                let file = std::fs::File::open(&open_path).map_err(|error| {
+                    // Windows File::open rejects directories before metadata is
+                    // available. Classify this error under the same user token.
+                    if std::fs::metadata(&open_path).is_ok_and(|metadata| !metadata.is_file()) {
+                        anyhow::anyhow!("file path must reference a regular file")
+                    } else {
+                        anyhow::Error::from(error)
+                    }
+                })?;
+                let metadata = file.metadata()?;
+                Ok((file, metadata))
+            })
+            .await
+            {
+                Ok(opened) => opened,
+                Err(error) => {
+                    self.record_outgoing_file_transfer_failed(
+                        outgoing_projection(0),
+                        format!("source_unavailable: {error}"),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
         if !metadata.is_file() {
             self.record_outgoing_file_transfer_failed(
                 outgoing_projection(metadata.len()),
@@ -837,14 +883,6 @@ impl AppState {
             )
             .await;
             anyhow::bail!("file path must reference a regular file");
-        }
-        if let Err(error) = tokio::fs::File::open(file_path).await {
-            self.record_outgoing_file_transfer_failed(
-                outgoing_projection(metadata.len()),
-                format!("source_open_failed: {error}"),
-            )
-            .await;
-            return Err(anyhow::Error::from(error));
         }
         let total_bytes = metadata.len();
         let source_modified = metadata.modified().ok();
@@ -859,6 +897,8 @@ impl AppState {
             return Err(anyhow::Error::from(error));
         }
 
+        self.ensure_file_transfer_enabled().await?;
+        user_io.validate().await?;
         self.record_outgoing_file_transfer_queued(outgoing_projection(total_bytes))
             .await;
         self.outbound_file_transfers.write().await.insert(
@@ -870,7 +910,11 @@ impl AppState {
                 total_bytes,
                 source_modified,
                 offset_bytes: 0,
-                source_file: None,
+                source: Arc::new(OutboundFileSource {
+                    file: std::sync::Mutex::new(source_file),
+                    _handle_permit: handle_permit,
+                }),
+                user_io,
             },
         );
         {
@@ -907,80 +951,99 @@ impl AppState {
         peer_id: &str,
         transfer_id: &str,
     ) -> Result<OutboundFileChunk> {
-        let mut transfers = self.outbound_file_transfers.write().await;
-        let Some(transfer) = transfers.get_mut(transfer_id) else {
+        self.materialize_outbound_file_chunk_with_reader(
+            peer_id,
+            transfer_id,
+            |file, offset, length| {
+                file.seek(std::io::SeekFrom::Start(offset))?;
+                let mut data = vec![0u8; length];
+                file.read_exact(&mut data)?;
+                Ok(data)
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn materialize_outbound_file_chunk_with_reader<F>(
+        &self,
+        peer_id: &str,
+        transfer_id: &str,
+        read: F,
+    ) -> Result<OutboundFileChunk>
+    where
+        F: FnOnce(&mut std::fs::File, u64, usize) -> Result<Vec<u8>> + Send + 'static,
+    {
+        self.ensure_file_transfer_enabled().await?;
+        let transfers = self.outbound_file_transfers.read().await;
+        let Some(transfer) = transfers.get(transfer_id) else {
             anyhow::bail!("unknown outbound file transfer {transfer_id}");
         };
         if transfer.peer_id != peer_id {
             anyhow::bail!("outbound file transfer {transfer_id} does not belong to peer {peer_id}");
         }
 
-        let metadata = tokio::fs::metadata(&transfer.source_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "inspect outbound file source {}",
-                    transfer.source_path.display()
-                )
-            })?;
-        if !metadata.is_file() {
-            anyhow::bail!("outbound file source is no longer a regular file");
-        }
-        if metadata.len() != transfer.total_bytes
-            || (transfer.source_modified.is_some()
-                && metadata.modified().ok() != transfer.source_modified)
-        {
-            anyhow::bail!("outbound file source changed after transfer was queued");
-        }
-
-        if transfer.source_file.is_none() {
-            let source_file = tokio::fs::File::open(&transfer.source_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "open outbound file source {}",
-                        transfer.source_path.display()
-                    )
-                })?;
-            transfer.source_file = Some(source_file);
-        }
-
+        let source = transfer.source.clone();
+        let source_path = transfer.source_path.clone();
+        let source_modified = transfer.source_modified;
+        let total_bytes = transfer.total_bytes;
+        let user_io = transfer.user_io.clone();
         let remaining = transfer.total_bytes.saturating_sub(transfer.offset_bytes);
         let length_bytes = (remaining as usize).min(FILE_TRANSFER_CHUNK_BYTES);
         let offset_bytes = transfer.offset_bytes;
-        let mut data = vec![0u8; length_bytes];
-        if length_bytes > 0 {
-            let source_file = transfer
-                .source_file
-                .as_mut()
-                .expect("outbound source file should be open before reading");
-            source_file
-                .seek(std::io::SeekFrom::Start(offset_bytes))
-                .await
-                .with_context(|| {
-                    format!(
-                        "seek outbound file source {} to offset {}",
-                        transfer.source_path.display(),
-                        offset_bytes
-                    )
+        drop(transfers);
+        let data = user_io
+            .run_sync(move || {
+                let mut file = source
+                    .file
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("outbound source lock poisoned"))?;
+                let metadata = file.metadata().with_context(|| {
+                    format!("inspect outbound file source {}", source_path.display())
                 })?;
-            source_file.read_exact(&mut data).await.with_context(|| {
-                format!(
-                    "read outbound file source {} offset {} length {}",
-                    transfer.source_path.display(),
-                    offset_bytes,
-                    length_bytes
-                )
-            })?;
-        }
+                if !metadata.is_file() {
+                    anyhow::bail!("outbound file source is no longer a regular file");
+                }
+                if metadata.len() != total_bytes
+                    || (source_modified.is_some() && metadata.modified().ok() != source_modified)
+                {
+                    anyhow::bail!("outbound file source changed after transfer was queued");
+                }
+                read(&mut file, offset_bytes, length_bytes).with_context(|| {
+                    format!(
+                        "read outbound file source {} offset {} length {}",
+                        source_path.display(),
+                        offset_bytes,
+                        length_bytes
+                    )
+                })
+            })
+            .await?;
 
         let next_offset = offset_bytes.saturating_add(length_bytes as u64);
         Ok(OutboundFileChunk {
             transfer_id: transfer_id.to_string(),
             offset_bytes,
             data,
-            finished: next_offset >= transfer.total_bytes,
+            finished: next_offset >= total_bytes,
         })
+    }
+
+    pub(crate) async fn validate_outbound_user_authority(
+        &self,
+        peer_id: &str,
+        transfer_id: &str,
+    ) -> Result<()> {
+        let lease = {
+            let transfers = self.outbound_file_transfers.read().await;
+            let transfer = transfers
+                .get(transfer_id)
+                .context("outbound user transfer missing")?;
+            if transfer.peer_id != peer_id {
+                anyhow::bail!("outbound user transfer belongs to another peer");
+            }
+            transfer.user_io.clone()
+        };
+        lease.validate().await
     }
 
     pub(crate) async fn commit_outbound_file_chunk(
@@ -1434,10 +1497,17 @@ impl AppState {
         tokio::io::AsyncWriteExt::write_all(&mut reserved.temp_file, &bytes).await?;
         reserved.temp_file.sync_all().await?;
         drop(reserved.temp_file);
-        if let Err(error) =
-            complete_reserved_incoming_file(&reserved.temp_path, &reserved.final_path).await
+        if let Err(error) = complete_reserved_incoming_file(
+            &reserved.user_io,
+            &reserved.temp_path,
+            &reserved.final_path,
+        )
+        .await
         {
-            let _ = tokio::fs::remove_file(&reserved.temp_path).await;
+            let _ = reserved
+                .user_io
+                .remove_file(reserved.temp_path.clone())
+                .await;
             return Err(error);
         }
 
@@ -1447,7 +1517,7 @@ impl AppState {
             kind: "file".to_string(),
             peer_id: peer_id.to_string(),
             detail: reserved.sanitized_name,
-            size_bytes: tokio::fs::metadata(&reserved.final_path).await?.len(),
+            size_bytes: bytes.len() as u64,
         });
 
         Ok(reserved.final_path)
@@ -1459,15 +1529,22 @@ impl AppState {
         file_name: &str,
         size_bytes: u64,
     ) -> Result<ReservedIncomingFile> {
+        self.ensure_file_transfer_enabled().await?;
         validate_transfer_size_with_limit(size_bytes, self.file_transfer_max_bytes().await)?;
         let sanitized_name = sanitize_incoming_file_name(file_name)?;
-
-        let peer_dir = self.receive_dir_for_peer(peer_id).await;
-        tokio::fs::create_dir_all(&peer_dir).await?;
-
-        reserve_incoming_file_path(&peer_dir, sanitized_name).await
+        let user_io = self.user_io_lease().await?;
+        let peer_dir = self.receive_dir_for_peer(peer_id, &user_io).await?;
+        let retained_lease = user_io.clone();
+        self.ensure_file_transfer_enabled().await?;
+        user_io
+            .run_sync(move || {
+                std::fs::create_dir_all(&peer_dir)?;
+                reserve_incoming_file_path(&peer_dir, sanitized_name, retained_lease)
+            })
+            .await
     }
 
+    #[cfg(test)]
     pub async fn store_incoming_file_from_temp(
         &self,
         peer_id: &str,
@@ -1475,31 +1552,34 @@ impl AppState {
         temp_path: &Path,
         size_bytes: u64,
     ) -> Result<PathBuf> {
-        let reserved = self
+        self.ensure_file_transfer_enabled().await?;
+        let lease = self.user_io_lease().await?;
+        let source_path = temp_path.to_path_buf();
+        let source = lease
+            .run_sync(move || std::fs::File::open(source_path).context("open user temp source"))
+            .await?;
+        let mut source = tokio::fs::File::from_std(source);
+        let mut reserved = self
             .reserve_incoming_file(peer_id, file_name, size_bytes)
             .await?;
         let sanitized_name = reserved.sanitized_name;
         let final_path = reserved.final_path;
         let part_path = reserved.temp_path;
+        let copied = tokio::io::copy(&mut source, &mut reserved.temp_file).await;
+        let synced = reserved.temp_file.sync_all().await;
         drop(reserved.temp_file);
-
-        match tokio::fs::rename(temp_path, &part_path).await {
-            Ok(()) => {
-                sync_file_at(&part_path).await?;
-            }
-            Err(_) => {
-                if let Err(error) = copy_file_to_reserved_part(temp_path, &part_path).await {
-                    let _ = tokio::fs::remove_file(&part_path).await;
-                    return Err(error);
-                }
-                let _ = tokio::fs::remove_file(temp_path).await;
-            }
+        drop(source);
+        if let Err(error) = copied.and(synced) {
+            let _ = reserved.user_io.remove_file(part_path).await;
+            return Err(error.into());
         }
-
-        if let Err(error) = complete_reserved_incoming_file(&part_path, &final_path).await {
-            let _ = tokio::fs::remove_file(&part_path).await;
+        if let Err(error) =
+            complete_reserved_incoming_file(&reserved.user_io, &part_path, &final_path).await
+        {
+            let _ = reserved.user_io.remove_file(part_path).await;
             return Err(error);
         }
+        let _ = lease.remove_file(temp_path.to_path_buf()).await;
 
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
@@ -1520,8 +1600,10 @@ impl AppState {
         temp_path: &Path,
         final_path: &Path,
         size_bytes: u64,
+        user_io: &platform_windows::user_io::UserIoLease,
     ) -> Result<PathBuf> {
-        complete_reserved_incoming_file(temp_path, final_path).await?;
+        self.ensure_file_transfer_enabled().await?;
+        complete_reserved_incoming_file(user_io, temp_path, final_path).await?;
 
         self.record_transport_event(TransportEventRecord {
             timestamp: Utc::now(),
@@ -1535,14 +1617,20 @@ impl AppState {
         Ok(final_path.to_path_buf())
     }
 
-    async fn receive_dir_for_peer(&self, peer_id: &str) -> PathBuf {
+    async fn receive_dir_for_peer(
+        &self,
+        peer_id: &str,
+        lease: &platform_windows::user_io::UserIoLease,
+    ) -> Result<PathBuf> {
         let file_transfer = self.config.read().await.file_transfer.clone();
-        let receive_dir = PathBuf::from(file_transfer.receive_dir);
-        if file_transfer.organize_by_peer {
+        let receive_dir = self
+            .user_receive_dir(lease, file_transfer.receive_dir)
+            .await?;
+        Ok(if file_transfer.organize_by_peer {
             receive_dir.join(filesystem_safe_peer_dir_name(peer_id))
         } else {
             receive_dir
-        }
+        })
     }
 
     pub async fn record_outgoing_file(&self, peer_id: &str, file_name: &str, size_bytes: u64) {
@@ -1593,32 +1681,33 @@ fn filesystem_safe_peer_dir_name(peer_id: &str) -> String {
     format!("peer-{}", bytes_to_hex(&digest[..16]))
 }
 
-async fn reserve_incoming_file_path(
+fn reserve_incoming_file_path(
     peer_dir: &Path,
     sanitized_name: String,
+    user_io: platform_windows::user_io::UserIoLease,
 ) -> Result<ReservedIncomingFile> {
     for suffix in 0..=9_999u32 {
         let final_path = peer_dir.join(conflict_file_name(&sanitized_name, suffix));
         if !final_path.starts_with(peer_dir) {
             anyhow::bail!("incoming file path escaped inbox root");
         }
-        if tokio::fs::try_exists(&final_path).await? {
+        if final_path.try_exists()? {
             continue;
         }
 
         let temp_path = incoming_part_path(&final_path)?;
-        match tokio::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp_path)
-            .await
         {
             Ok(temp_file) => {
                 return Ok(ReservedIncomingFile {
                     sanitized_name,
                     final_path,
                     temp_path,
-                    temp_file,
+                    temp_file: tokio::fs::File::from_std(temp_file),
+                    user_io,
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -1633,18 +1722,18 @@ async fn reserve_incoming_file_path(
     );
     let final_path = peer_dir.join(fallback_name);
     let temp_path = incoming_part_path(&final_path)?;
-    let temp_file = tokio::fs::OpenOptions::new()
+    let temp_file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp_path)
-        .await
         .context("reserve fallback inbound file part path")?;
 
     Ok(ReservedIncomingFile {
         sanitized_name,
         final_path,
         temp_path,
-        temp_file,
+        temp_file: tokio::fs::File::from_std(temp_file),
+        user_io,
     })
 }
 
@@ -1681,46 +1770,18 @@ fn incoming_part_path(final_path: &Path) -> Result<PathBuf> {
     Ok(final_path.with_file_name(format!(".{final_name}.boundless.part")))
 }
 
-async fn copy_file_to_reserved_part(source_path: &Path, part_path: &Path) -> Result<()> {
-    let mut source = tokio::fs::File::open(source_path)
+async fn complete_reserved_incoming_file(
+    lease: &platform_windows::user_io::UserIoLease,
+    temp_path: &Path,
+    final_path: &Path,
+) -> Result<()> {
+    let temp_path = temp_path.to_path_buf();
+    let final_path = final_path.to_path_buf();
+    lease
+        .run_sync(move || {
+            platform_windows::user_io::publish_without_replace(&temp_path, &final_path)
+        })
         .await
-        .with_context(|| format!("open inbound temp source {}", source_path.display()))?;
-    let mut target = tokio::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(part_path)
-        .await
-        .with_context(|| format!("open inbound reserved part {}", part_path.display()))?;
-    tokio::io::copy(&mut source, &mut target)
-        .await
-        .with_context(|| format!("copy inbound temp payload to {}", part_path.display()))?;
-    target
-        .sync_all()
-        .await
-        .with_context(|| format!("sync inbound reserved part {}", part_path.display()))
-}
-
-async fn sync_file_at(path: &Path) -> Result<()> {
-    let file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .open(path)
-        .await
-        .with_context(|| format!("open inbound part for sync {}", path.display()))?;
-    file.sync_all()
-        .await
-        .with_context(|| format!("sync inbound part {}", path.display()))
-}
-
-async fn complete_reserved_incoming_file(temp_path: &Path, final_path: &Path) -> Result<()> {
-    if tokio::fs::try_exists(final_path).await? {
-        anyhow::bail!(
-            "incoming file destination already exists: {}",
-            final_path.display()
-        );
-    }
-    tokio::fs::rename(temp_path, final_path)
-        .await
-        .with_context(|| format!("finalize inbound file {}", final_path.display()))
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {

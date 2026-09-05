@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 
 use app_services::desktop::{TcpEndpointCandidate, TcpEndpointSource, tcp_endpoint_candidate};
-use peer_transport::{
-    outbound_target_candidates as transport_outbound_target_candidates,
-    wait_for_runtime_wake_or_backoff,
-};
+use peer_transport::outbound_target_candidates as transport_outbound_target_candidates;
+#[cfg(test)]
+use peer_transport::wait_for_runtime_wake_or_backoff;
 
 use super::session::{connect_outbound_authenticated, run_authenticated_outbound_session};
 use super::*;
 
 const OUTBOUND_FAILURE_CONNECTED_GRACE: Duration = Duration::from_secs(10);
 const TRANSPORT_CANDIDATE_STAGGER: Duration = Duration::from_millis(75);
+const MAX_INCOMING_SESSIONS: usize = 32;
+const MAX_ENDPOINT_CANDIDATES: usize = 16;
 
 pub(super) async fn listener_loop(state: AppState, mut listeners: Vec<TcpListener>) {
     if listeners.is_empty() {
@@ -18,55 +19,63 @@ pub(super) async fn listener_loop(state: AppState, mut listeners: Vec<TcpListene
         return;
     }
 
+    let admission = Arc::new(tokio::sync::Semaphore::new(MAX_INCOMING_SESSIONS));
     let first = listeners.remove(0);
     if listeners.is_empty() {
-        accept_loop(state, first).await;
+        accept_loop(state, first, admission).await;
         return;
     }
 
     let second = listeners.remove(0);
     tokio::select! {
-        _ = accept_loop(state.clone(), first) => {}
-        _ = accept_loop(state, second) => {}
+        _ = accept_loop(state.clone(), first, admission.clone()) => {}
+        _ = accept_loop(state, second, admission) => {}
     }
 }
 
-async fn accept_loop(state: AppState, listener: TcpListener) {
-    let bind = listener
-        .local_addr()
-        .map(|addr| addr.to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
-    info!(bind = %bind, "transport listener started");
-
+async fn accept_loop(
+    state: AppState,
+    listener: TcpListener,
+    admission: Arc<tokio::sync::Semaphore>,
+) {
+    let mut sessions = tokio::task::JoinSet::new();
     loop {
-        match listener.accept().await {
-            Ok((socket, remote)) => {
-                let task_state = state.clone();
-                let registration_state = state.clone();
-                let (session_id_tx, session_id_rx) = oneshot::channel::<u64>();
-                let task = tokio::spawn(async move {
-                    let session_id = session_id_rx.await.ok();
-                    if let Err(error) =
-                        handle_incoming_connection(task_state, socket, session_id).await
-                    {
-                        warn!(error = ?error, remote = %remote, "incoming session ended with error");
+        tokio::select! {
+            _ = sessions.join_next(), if !sessions.is_empty() => {}
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((socket, _remote)) => {
+                        let Ok(permit) = admission.clone().try_acquire_owned() else {
+                            // Admission rejection must remain cheap and quiet
+                            // even when an unauthenticated source floods it.
+                            drop(socket);
+                            continue;
+                        };
+                        let task_state = state.clone();
+                        let (registration_tx, registration_rx) = oneshot::channel::<crate::state::TransportSessionRegistrationGuard>();
+                        let abort = sessions.spawn(async move {
+                            let _permit = permit;
+                            let Ok(registration) = registration_rx.await else { return; };
+                            if let Err(error) = handle_incoming_connection(task_state, socket, Some(registration.session_id)).await {
+                                tracing::debug!(error = %transport_error_summary(Some(&error)), "incoming session ended");
+                            }
+                        });
+                        let session_id = state.register_pending_transport_session(abort);
+                        let _ = registration_tx.send(state.transport_session_registration_guard(session_id));
                     }
-                });
-
-                let session_id =
-                    registration_state.register_pending_transport_session(task.abort_handle());
-                let _ = session_id_tx.send(session_id);
-            }
-            Err(error) => {
-                warn!(%error, "transport accept failed");
-                time::sleep(Duration::from_millis(250)).await;
+                    Err(error) => {
+                        warn!(%error, "transport accept failed");
+                        time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
             }
         }
     }
 }
 
 pub(super) async fn supervisor_loop(state: AppState) {
-    let mut workers: HashMap<String, JoinHandle<()>> = HashMap::new();
+    let mut workers: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
+    let mut worker_tasks = tokio::task::JoinSet::new();
     let mut worker_session_ids: HashMap<String, u64> = HashMap::new();
     let reconcile_wake = state.peer_reconcile_wake_signal();
     let mut safety_ticker = time::interval(SUPERVISOR_TICK);
@@ -90,6 +99,7 @@ pub(super) async fn supervisor_loop(state: AppState) {
             }
         }
 
+        while worker_tasks.try_join_next().is_some() {}
         let snapshot = state.snapshot().await;
         for peer in snapshot.peers {
             if peer.peer_id == snapshot.machine_id {
@@ -109,14 +119,18 @@ pub(super) async fn supervisor_loop(state: AppState) {
             let worker_state = state.clone();
             let registration_state = state.clone();
             let peer_id = peer.peer_id.clone();
-            let (session_id_tx, session_id_rx) = oneshot::channel::<u64>();
-            let handle = tokio::spawn(async move {
-                let session_id = session_id_rx.await.ok();
-                peer_worker(worker_state, peer_id, session_id).await;
+            let (registration_tx, registration_rx) =
+                oneshot::channel::<crate::state::TransportSessionRegistrationGuard>();
+            let handle = worker_tasks.spawn(async move {
+                let Ok(registration) = registration_rx.await else {
+                    return;
+                };
+                peer_worker(worker_state, peer_id, Some(registration.session_id)).await;
             });
             let session_id = registration_state
-                .register_transport_session_for_peer(&peer.peer_id, handle.abort_handle());
-            let _ = session_id_tx.send(session_id);
+                .register_transport_session_for_peer(&peer.peer_id, handle.clone());
+            let _ = registration_tx
+                .send(registration_state.transport_session_registration_guard(session_id));
             workers.insert(peer.peer_id.clone(), handle);
             worker_session_ids.insert(peer.peer_id, session_id);
         }
@@ -137,37 +151,70 @@ pub(super) async fn supervisor_loop(state: AppState) {
 }
 
 async fn peer_worker(state: AppState, peer_id: String, session_registration_id: Option<u64>) {
-    let mut backoff_secs: u64 = 1;
-    let reconcile_wake = state.peer_reconcile_wake_signal();
+    peer_worker_with_connector(
+        state,
+        peer_id,
+        session_registration_id,
+        |state, peer_id, candidates, registration| async move {
+            connect_and_run_outbound_to_candidates(state, &peer_id, &candidates, registration).await
+        },
+    )
+    .await;
+}
+
+async fn peer_worker_with_connector<F, Fut>(
+    state: AppState,
+    peer_id: String,
+    session_registration_id: Option<u64>,
+    mut connect: F,
+) where
+    F: FnMut(AppState, String, Vec<TcpEndpointCandidate>, Option<u64>) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut backoff_secs = 1;
+    let mut next_attempt_at = time::Instant::now();
+    let mut last_warning_at: Option<time::Instant> = None;
+    let mut failures_since_warning = 0u64;
 
     loop {
+        // This deadline belongs to this peer. Reconcile/activity notifications
+        // cannot shorten it. Explicit reconnect already cancels/recreates the
+        // registered worker; ordinary peer/discovery changes do not.
+        time::sleep_until(next_attempt_at).await;
         let Some(peer) = state.get_peer(&peer_id).await else {
-            info!(peer_id = %peer_id, "peer worker exiting; peer removed");
             return;
         };
-
         if state.has_active_transport_session(&peer_id) {
-            wait_for_reconcile_or_backoff(&reconcile_wake, Duration::from_secs(1)).await;
-            backoff_secs = 1;
+            next_attempt_at = time::Instant::now() + Duration::from_secs(1);
             continue;
         }
 
         let discovered_endpoints = state.discovered_endpoint_candidates(&peer_id).await;
         let target_candidates = outbound_transport_candidates(&peer.address, &discovered_endpoints);
         if target_candidates.is_empty() {
-            wait_for_reconcile_or_backoff(&reconcile_wake, Duration::from_secs(backoff_secs)).await;
+            next_attempt_at = time::Instant::now() + Duration::from_secs(backoff_secs);
             backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECONDS);
             continue;
         }
 
-        if let Err(error) = connect_and_run_outbound_to_candidates(
+        let attempt_started = time::Instant::now();
+        let result = connect(
             state.clone(),
-            &peer_id,
-            &target_candidates,
+            peer_id.clone(),
+            target_candidates.clone(),
             session_registration_id,
         )
-        .await
-        {
+        .await;
+        if attempt_started.elapsed() >= Duration::from_secs(10) {
+            backoff_secs = 1;
+        }
+        // A successfully authenticated peer that immediately closes is still
+        // a failed availability attempt, not permission for an unbounded loop.
+        next_attempt_at = time::Instant::now() + Duration::from_secs(backoff_secs);
+        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECONDS);
+
+        if let Err(error) = result {
+            failures_since_warning = failures_since_warning.saturating_add(1);
             state.record_transport_event(crate::state::TransportEventRecord {
                 timestamp: chrono::Utc::now(),
                 direction: "outbound".to_string(),
@@ -176,46 +223,29 @@ async fn peer_worker(state: AppState, peer_id: String, session_registration_id: 
                 detail: transport_reachability_failure_detail(&target_candidates, Some(&error)),
                 size_bytes: 0,
             });
-            warn!(
-                peer_id = %peer_id,
-                configured_address = %app_services::desktop::redacted_tcp_endpoint_label(&peer.address),
-                target_candidates = %redacted_tcp_endpoint_labels_for_runtime(&target_candidates),
-                discovered_endpoint_count = discovered_endpoints.len(),
-                discovered_endpoints = %redacted_tcp_socketaddr_labels_for_runtime(&discovered_endpoints),
-                error = %transport_error_summary(Some(&error)),
-                "outbound connect failed"
-            );
+            if last_warning_at.is_none_or(|last| last.elapsed() >= Duration::from_secs(60)) {
+                warn!(
+                    peer_id = %peer_id,
+                    target_candidates = %redacted_tcp_endpoint_labels_for_runtime(&target_candidates),
+                    error = %transport_error_summary(Some(&error)),
+                    failed_attempts = failures_since_warning,
+                    retry_after_ms = next_attempt_at.saturating_duration_since(time::Instant::now()).as_millis(),
+                    "outbound connection unavailable; repeated failures are summarized"
+                );
+                last_warning_at = Some(time::Instant::now());
+                failures_since_warning = 0;
+            }
             let keep_recent_connected = state
                 .get_peer(&peer_id)
                 .await
                 .is_some_and(|peer| should_preserve_connected_after_outbound_failure(&peer));
-            if keep_recent_connected {
-                info!(
-                    peer_id = %peer_id,
-                    "outbound connect failed but recent connected session state is preserved"
-                );
-            } else {
-                match state
+            if !keep_recent_connected
+                && let Err(error) = state
                     .mark_peer_disconnected_if_no_active_transport_session(&peer_id)
                     .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        info!(
-                            peer_id = %peer_id,
-                            "stale outbound failure cannot disconnect the active reverse session"
-                        );
-                    }
-                    Err(mark_error) => {
-                        warn!(%mark_error, "failed to mark peer disconnected");
-                    }
-                }
+            {
+                warn!(%error, "failed to update peer runtime state");
             }
-
-            wait_for_reconcile_or_backoff(&reconcile_wake, Duration::from_secs(backoff_secs)).await;
-            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECONDS);
-        } else {
-            backoff_secs = 1;
         }
     }
 }
@@ -253,38 +283,32 @@ async fn connect_first_authenticated_outbound_candidate(
         anyhow::bail!("transport has no endpoint candidates");
     }
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(target_candidates.len());
-    let mut handles = Vec::with_capacity(target_candidates.len());
-    for (ordinal, candidate) in target_candidates.iter().cloned().enumerate() {
-        let tx = tx.clone();
+    let mut tasks = tokio::task::JoinSet::new();
+    for (ordinal, candidate) in target_candidates
+        .iter()
+        .take(MAX_ENDPOINT_CANDIDATES)
+        .cloned()
+        .enumerate()
+    {
         let peer_id = peer_id.to_string();
         let state = state.clone();
-        handles.push(tokio::spawn(async move {
+        tasks.spawn(async move {
             if ordinal > 0 {
                 time::sleep(stagger_delay(TRANSPORT_CANDIDATE_STAGGER, ordinal)).await;
             }
             let result = connect_outbound_authenticated(state, &peer_id, &candidate.endpoint).await;
-            let _ = tx.send((ordinal, candidate, result)).await;
-        }));
+            (ordinal, candidate, result)
+        });
     }
-    drop(tx);
-
     let mut failures = Vec::new();
-    while let Some((ordinal, candidate, result)) = rx.recv().await {
+    while let Some(joined) = tasks.join_next().await {
+        let (ordinal, candidate, result) = joined.context("outbound candidate task failed")?;
         match result {
             Ok(stream) => {
-                for handle in handles {
-                    handle.abort();
-                }
+                tasks.shutdown().await;
                 return Ok((stream, candidate));
             }
             Err(error) => failures.push((ordinal, candidate, error)),
-        }
-    }
-
-    for handle in handles {
-        if !handle.is_finished() {
-            handle.abort();
         }
     }
 
@@ -320,6 +344,7 @@ fn should_preserve_connected_after_outbound_failure(peer: &crate::config::PeerCo
     age <= OUTBOUND_FAILURE_CONNECTED_GRACE
 }
 
+#[cfg(test)]
 pub(super) async fn wait_for_reconcile_or_backoff(
     reconcile_wake: &std::sync::Arc<crate::state::RuntimeWakeSignal>,
     backoff: Duration,
@@ -331,10 +356,22 @@ fn outbound_transport_candidates(
     configured_address: &str,
     discovered_endpoints: &[SocketAddr],
 ) -> Vec<TcpEndpointCandidate> {
-    let target_endpoints =
+    let mut target_endpoints =
         transport_outbound_target_candidates(configured_address, discovered_endpoints);
+    if target_endpoints.len() > MAX_ENDPOINT_CANDIDATES {
+        target_endpoints.truncate(MAX_ENDPOINT_CANDIDATES);
+        let configured = configured_address.trim();
+        if !configured.is_empty()
+            && !target_endpoints
+                .iter()
+                .any(|candidate| candidate == configured)
+        {
+            target_endpoints[MAX_ENDPOINT_CANDIDATES - 1] = configured.to_string();
+        }
+    }
     target_endpoints
         .iter()
+        .take(MAX_ENDPOINT_CANDIDATES)
         .enumerate()
         .map(|(ordinal, endpoint)| {
             let source = if discovered_endpoints
@@ -386,6 +423,7 @@ fn redacted_tcp_endpoint_labels_for_runtime(candidates: &[TcpEndpointCandidate])
         .join(", ")
 }
 
+#[cfg(test)]
 fn redacted_tcp_socketaddr_labels_for_runtime(candidates: &[SocketAddr]) -> String {
     if candidates.is_empty() {
         return "none".to_string();
@@ -433,8 +471,70 @@ fn transport_error_summary(error: Option<&anyhow::Error>) -> &'static str {
 }
 
 #[cfg(test)]
+pub(super) async fn measure_worker_retry_cadence(
+    early_close: bool,
+    observation: Duration,
+) -> serde_json::Value {
+    let root =
+        std::env::temp_dir().join(format!("boundless-retry-cadence-{}", uuid::Uuid::new_v4()));
+    let state =
+        AppState::load_or_create_with_paths(root.join("config.json"), root.join("security"))
+            .unwrap();
+    let (code, _) = state.create_pairing_code(120).await;
+    let peer = state
+        .join_peer(code, "127.0.0.42:15100".into(), None)
+        .await
+        .unwrap();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempt_count = attempts.clone();
+    let worker_state = state.clone();
+    let started = time::Instant::now();
+    let worker = tokio::spawn(peer_worker_with_connector(
+        worker_state,
+        peer,
+        None,
+        move |_, _, _, _| {
+            attempt_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if early_close {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "synthetic unavailable peer",
+                    )
+                    .into())
+                }
+            }
+        },
+    ));
+    let until = started + observation;
+    while time::Instant::now() < until {
+        // Neither fresh unrelated events nor a stored Notify permit may
+        // shorten this worker's retry deadline.
+        state.notify_peer_reconcile_wake("unrelated_peer_noise");
+        time::sleep(Duration::from_millis(1)).await;
+    }
+    worker.abort();
+    let _ = worker.await;
+    let elapsed_ms = started.elapsed().as_millis();
+    let attempts = attempts.load(std::sync::atomic::Ordering::SeqCst);
+    let _ = std::fs::remove_dir_all(root);
+    serde_json::json!({"kind": "synthetic_worker", "scenario": if early_close {"immediate_session_close"} else {"connection_refused"}, "attempts": attempts, "elapsed_ms": elapsed_ms, "noisy_reconcile": true})
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn peer_worker_deadlines_survive_noisy_wakes_and_immediate_session_close() {
+        for early_close in [false, true] {
+            let metric =
+                measure_worker_retry_cadence(early_close, Duration::from_millis(250)).await;
+            assert_eq!(metric["attempts"], 1, "retry deadline bypassed: {metric}");
+        }
+    }
 
     #[test]
     fn transport_reachability_failure_detail_redacts_candidates() {
@@ -511,6 +611,17 @@ mod tests {
         );
         assert_eq!(candidates[2].port, Some(15100));
         assert_eq!(candidates[2].ordinal, 2);
+    }
+
+    #[test]
+    fn endpoint_candidate_budget_preserves_configured_fallback() {
+        let discovered = (1..=40)
+            .map(|host| format!("10.0.0.{host}:15100").parse().unwrap())
+            .collect::<Vec<SocketAddr>>();
+        let candidates = outbound_transport_candidates("manual.example:15100", &discovered);
+        assert_eq!(candidates.len(), MAX_ENDPOINT_CANDIDATES);
+        assert_eq!(candidates.last().unwrap().endpoint, "manual.example:15100");
+        assert_eq!(candidates[0].endpoint, "10.0.0.1:15100");
     }
 
     #[test]
@@ -641,6 +752,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_worker_honors_backoff_after_immediate_connection_refusal() {
+        const MAX_FAILED_ATTEMPTS: usize = 10_000;
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_attempts = attempts.clone();
+        let _hook = super::session::install_test_tcp_connect_hook(
+            Duration::from_secs(30),
+            move |_address| {
+                let attempt = hook_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    // Independently cap the repro even if the runtime's timer is starved.
+                    if attempt >= MAX_FAILED_ATTEMPTS {
+                        std::future::pending::<std::io::Result<tokio::net::TcpStream>>().await
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "bounded audit: paired peer is unavailable",
+                        ))
+                    }
+                })
+            },
+        );
+        let root = std::env::temp_dir().join(format!(
+            "boundless-peer-worker-refusal-rate-audit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state =
+            AppState::load_or_create_with_paths(root.join("config.json"), root.join("security"))
+                .expect("load isolated audit state");
+        let (code, _) = state.create_pairing_code(120).await;
+        let peer_id = state
+            .join_peer(
+                code,
+                "127.0.0.42:15100".to_string(),
+                Some("unreachable-audit-peer".to_string()),
+            )
+            .await
+            .expect("join isolated audit peer");
+
+        // Pairing sets both pending state and a Notify permit. Drain both so the
+        // observation only measures the worker's own failed-connect behavior.
+        let wake = state.peer_reconcile_wake_signal();
+        assert!(
+            wake.take_pending(),
+            "pairing should have queued reconciliation"
+        );
+        time::timeout(Duration::from_millis(100), wake.notified())
+            .await
+            .expect("drain pairing notification permit");
+        assert!(!wake.take_pending(), "reconcile signal should start clear");
+
+        let started = std::time::Instant::now();
+        let worker = tokio::spawn(peer_worker(state, peer_id, None));
+        time::sleep(Duration::from_millis(250)).await;
+        worker.abort();
+        let _ = worker.await;
+        let elapsed = started.elapsed();
+        let attempt_count = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(root);
+
+        println!(
+            "bounded_refusal_audit attempts={attempt_count} elapsed_ms={} observation_ms=250 failed_attempt_guard={MAX_FAILED_ATTEMPTS}",
+            elapsed.as_millis()
+        );
+        assert_eq!(
+            attempt_count,
+            1,
+            "a refused connection must wait at least the initial 1-second backoff before retrying; observed {attempt_count} attempts in {}ms",
+            elapsed.as_millis()
+        );
+    }
+
+    #[tokio::test]
     async fn peer_worker_bounds_stalled_candidate_and_records_reachability_failure() {
         let stalled_endpoint = "127.0.0.41:15100";
         let fallback_endpoint = "127.0.0.42:15100";
@@ -722,6 +905,89 @@ mod tests {
                 .contains("source=configured-peer tcp ipv4 port 15100")
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[tokio::test]
+    async fn inbound_admission_is_bounded_and_listener_cancellation_releases_registrations() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-inbound-admission-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state =
+            AppState::load_or_create_with_paths(root.join("config.json"), root.join("security"))
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving_state = state.clone();
+        let server = tokio::spawn(listener_loop(serving_state, vec![listener]));
+        let mut clients = Vec::new();
+        for _ in 0..MAX_INCOMING_SESSIONS + 8 {
+            clients.push(TcpStream::connect(addr).await.unwrap());
+        }
+        time::timeout(Duration::from_secs(2), async {
+            while state.transport_session_registration_count() < MAX_INCOMING_SESSIONS {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("admission reaches cap");
+        assert_eq!(
+            state.transport_session_registration_count(),
+            MAX_INCOMING_SESSIONS
+        );
+        server.abort();
+        let _ = server.await;
+        time::timeout(Duration::from_secs(1), async {
+            while state.transport_session_registration_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation clears every pending registration");
+        drop(clients);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn invalid_and_silent_tls_connections_release_registration() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-inbound-deadline-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state =
+            AppState::load_or_create_with_paths(root.join("config.json"), root.join("security"))
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(listener_loop(state.clone(), vec![listener]));
+        let mut invalid = TcpStream::connect(addr).await.unwrap();
+        invalid.write_all(b"not a TLS handshake").await.unwrap();
+        invalid.shutdown().await.unwrap();
+        drop(invalid);
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            state.transport_session_registration_count(),
+            0,
+            "TLS rejection must not retain completed abort handles"
+        );
+        let silent = TcpStream::connect(addr).await.unwrap();
+        time::timeout(Duration::from_secs(1), async {
+            while state.transport_session_registration_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        time::timeout(Duration::from_secs(6), async {
+            while state.transport_session_registration_count() > 0 {
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("silent TLS connection must expire");
+        server.abort();
+        let _ = server.await;
+        drop(silent);
         let _ = std::fs::remove_dir_all(root);
     }
 }

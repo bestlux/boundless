@@ -432,6 +432,39 @@ where
         );
     }
 
+    let file_transfer_id = match payload {
+        OutboundPayload::FileStart { transfer_id, .. }
+        | OutboundPayload::FileChunk { transfer_id, .. }
+        | OutboundPayload::FileTransferCursor { transfer_id }
+        | OutboundPayload::FileEnd { transfer_id, .. } => Some(transfer_id),
+        _ => None,
+    };
+    if let Some(id) = file_transfer_id
+        && state.ensure_file_transfer_enabled().await.is_err()
+    {
+        remove_outbound_transfer_flow(writer_ctx.outbound_transfer_flow, id);
+        state
+            .cancel_outbound_file_transfer(peer_id, id, "file_transfer_disabled")
+            .await;
+        return Ok(SendPayloadOutcome::Dropped);
+    }
+    if let Some(id) = file_transfer_id
+        && state.clipboard_uses_broker()
+        && matches!(
+            payload,
+            OutboundPayload::FileStart { .. } | OutboundPayload::FileEnd { .. }
+        )
+        && state
+            .validate_outbound_user_authority(peer_id, id)
+            .await
+            .is_err()
+    {
+        remove_outbound_transfer_flow(writer_ctx.outbound_transfer_flow, id);
+        state
+            .cancel_outbound_file_transfer(peer_id, id, "user_authority_revoked")
+            .await;
+        return Ok(SendPayloadOutcome::Dropped);
+    }
     match payload {
         OutboundPayload::ClipboardText { text } => {
             let message = WireMessage::ClipboardText {
@@ -634,6 +667,20 @@ where
             offset_bytes,
             length_bytes,
         } => {
+            // This older internal path-only payload cannot carry the original
+            // Windows logon lease. Installed service transfers use the cursor
+            // variant and its already-authorized source handle exclusively.
+            if state.clipboard_uses_broker() {
+                remove_outbound_transfer_flow(writer_ctx.outbound_transfer_flow, transfer_id);
+                state
+                    .fail_outbound_file_transfer(
+                        peer_id,
+                        transfer_id,
+                        "path_only_service_transfer_has_no_user_authority",
+                    )
+                    .await;
+                return Ok(SendPayloadOutcome::Dropped);
+            }
             let Some(has_credit) =
                 has_available_outbound_chunk_credit(writer_ctx.outbound_transfer_flow, transfer_id)
             else {
@@ -649,9 +696,12 @@ where
                 return Ok(SendPayloadOutcome::DeferredForBackpressure);
             }
 
-            let mut source_file = tokio::fs::File::open(source_path).await.with_context(|| {
-                format!("open outbound file chunk source {}", source_path.display())
-            })?;
+            let user_io = state.user_io_lease().await?;
+            let path = source_path.clone();
+            let source_file = user_io
+                .run_sync(move || std::fs::File::open(path).context("open user file chunk source"))
+                .await?;
+            let mut source_file = tokio::fs::File::from_std(source_file);
             source_file
                 .seek(std::io::SeekFrom::Start(*offset_bytes))
                 .await

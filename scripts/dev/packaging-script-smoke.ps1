@@ -133,15 +133,14 @@ if (
 $releaseWorkflowPath = Join-Path $RepoRoot ".github\workflows\release-please.yml"
 $releaseWorkflowText = Get-Content -LiteralPath $releaseWorkflowPath -Raw
 if (
-    $releaseWorkflowText -notmatch 'cargo build --release[^\r\n]*-p boundless-input-injector' -or
+    $releaseWorkflowText -notmatch 'cargo build --locked --release[^\r\n]*-p boundless-input-injector' -or
     $releaseWorkflowText -notmatch '"target/release/boundless-input-injector\.exe"' -or
     $releaseWorkflowText -notmatch '-InputInjectorPath "source/target/release/boundless-input-injector\.exe"' -or
     $releaseWorkflowText -notmatch '-InputInjectorSignaturePolicy \$inputInjectorSignaturePolicy' -or
     $releaseWorkflowText -notmatch 'gh release download \$previous\.tag' -or
-    $releaseWorkflowText -notmatch '-PreviousInstallerPath "\$\{\{ steps\.previous-installer\.outputs\.installer_path \}\}"' -or
-    $releaseWorkflowText -notmatch '-Policy prerelease'
+    $releaseWorkflowText -notmatch '-PreviousInstallerPath "\$\{\{ steps\.previous-installer\.outputs\.installer_path \}\}"'
 ) {
-    throw "The Windows release workflow must build, sign, package, run N-1 upgrade smoke, and explicitly select dogfood readiness policy."
+    throw "The Windows release workflow must build, sign, package, and run N-1 upgrade smoke."
 }
 
 $ciWorkflowPath = Join-Path $RepoRoot ".github\workflows\ci.yml"
@@ -150,7 +149,7 @@ foreach ($requiredInstallerIntegrationContract in @(
         'windows-installer-integration:',
         "if: github.event_name == 'pull_request'",
         'needs: packaging-scripts',
-        'cargo build --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector',
+        'cargo build --locked --release -p boundless-daemon -p boundless-cli -p boundless-tray -p boundless-input-injector',
         './scripts/release/package-windows.ps1',
         './scripts/dev/installer-smoke.ps1',
         'Validate installer evidence contract',
@@ -620,6 +619,13 @@ finally {
 }
 
 $fixtureHosts = @()
+$legacyFixtureArguments = @('-HelperPath', $installScript)
+$fixturePrincipal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+if ($fixturePrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    # Hosted Windows CI is elevated. The fixture first checks the production
+    # rejection, then models desktop-user authority only in its temporary roots.
+    $legacyFixtureArguments += '-SimulateUnelevatedAuthority'
+}
 foreach ($hostName in @("powershell.exe", "pwsh.exe")) {
     $hostCommand = Get-Command $hostName -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $hostCommand) { continue }
@@ -633,6 +639,14 @@ foreach ($hostName in @("powershell.exe", "pwsh.exe")) {
     Invoke-PackagingScript `
         -ScriptPath $installerSmoke `
         -Arguments @("-SelfTest") `
+        -PowerShellExe $hostCommand.Source | Out-Null
+    Invoke-PackagingScript `
+        -ScriptPath (Join-Path $RepoRoot 'scripts/dev/windows-bundle-fixtures.ps1') `
+        -Arguments @('-RepoRoot', $RepoRoot) `
+        -PowerShellExe $hostCommand.Source | Out-Null
+    Invoke-PackagingScript `
+        -ScriptPath (Join-Path $RepoRoot 'scripts/dev/legacy-install-migration-fixtures.ps1') `
+        -Arguments $legacyFixtureArguments `
         -PowerShellExe $hostCommand.Source | Out-Null
 }
 

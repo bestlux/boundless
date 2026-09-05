@@ -110,7 +110,7 @@ async fn store_incoming_file_from_temp_error_leaves_no_visible_partial() {
         .await
         .expect_err("missing temp source should fail");
     assert!(
-        err.to_string().contains("open inbound temp source"),
+        err.to_string().contains("open user temp source"),
         "unexpected error: {err:?}"
     );
 
@@ -118,13 +118,9 @@ async fn store_incoming_file_from_temp_error_leaves_no_visible_partial() {
         !receive_dir.join("report.txt").exists(),
         "failed fallback copy must not expose final path"
     );
-    let leftovers = std::fs::read_dir(&receive_dir)
-        .expect("receive dir")
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .expect("list receive dir");
     assert!(
-        leftovers.is_empty(),
-        "failed fallback copy should remove reserved .part files"
+        !receive_dir.exists(),
+        "failed source open should not create receive storage"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -183,6 +179,7 @@ async fn reserve_incoming_file_allocates_same_name_conflicts_exclusively() {
             &first.temp_path,
             &first.final_path,
             3,
+            &first.user_io,
         )
         .await
         .expect("complete first");
@@ -193,6 +190,7 @@ async fn reserve_incoming_file_allocates_same_name_conflicts_exclusively() {
             &second.temp_path,
             &second.final_path,
             3,
+            &second.user_io,
         )
         .await
         .expect("complete second");

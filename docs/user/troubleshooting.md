@@ -23,7 +23,7 @@ Filenames are redacted by default. Passing `--include-filenames` is an explicit 
 
 Symptoms:
 
-- peer does not appear in Status & Pairing,
+- peer does not appear under Home → Add a PC,
 - manual host works but discovery does not,
 - discovered host is stale.
 
@@ -54,18 +54,18 @@ Checks:
 
 Transport events are a bounded in-memory diagnostic ring, not durable history. State transitions and failures take precedence over high-rate activity. Repeated wake, input-frame, injection, anti-idle, reconcile, and transfer-progress activity is represented by bounded summaries with `sample_count`, `first_seen`, and `last_seen` rather than one retained record per sample. Use `--limit 0` to print the full retained ring. Use `--kind <substring>` and `--exclude-kind <substring>` to focus the view; filters are applied before the limit, for example `transport events --limit 100 --exclude-kind input_runtime`.
 
-The connectivity diagnostics script is read-only. It reports the active Windows network profiles, local listener/process ownership for TCP `15100`, `15101`, and `15200`, and remote TCP reachability for those ports when `-RemoteHost` is supplied. TCP `15200` is the nearby pairing listener; TCP `15100` is the transport listener used after trust is established. TCP `15101` is included to make side-by-side dogfood with Mouse Without Borders or other tools easier to diagnose.
+The connectivity diagnostics script is read-only. It reports the active Windows network profiles, local listener/process ownership for TCP `16100` and `16200`, and remote TCP reachability when `-RemoteHost` is supplied. TCP `16200` is the nearby pairing listener; TCP `16100` is the transport listener used after trust is established. Legacy ports `15100`/`15200` and Mouse Without Borders port `15101` remain diagnostic observations.
 
-In JSON output, `firewall_hint` reports read-only evidence for the expected policy shape: enabled inbound allow rules for `%ProgramFiles%\Boundless\boundless-service.exe`, Private profile, TCP `15100` and `15200`, and `LocalSubnet`-or-narrower remote scope. It also flags broad, Public, or Any-style matching rules. TCP `15101` remains diagnostics-only, not a default firewall requirement.
+In JSON output, `firewall_hint` reports read-only evidence for the expected policy shape: enabled inbound allow rules for `%ProgramFiles%\Boundless\boundless-service.exe`, Private profile, TCP `16100` and `16200`, and `LocalSubnet`-or-narrower remote scope. It also flags broad, Public, or Any-style matching rules. Legacy/MWB ports remain diagnostics-only, not default firewall requirements.
 
-Boundless v5 does not silently add firewall rules. If pairing fails with a message such as `connect nearby pairing endpoint 10.10.0.187:15200 timed out`, treat it as a target reachability or firewall problem for remote TCP `15200` before debugging trust or code entry.
+Boundless v5 does not silently add firewall rules. If pairing fails with a message such as `connect nearby pairing endpoint 10.10.0.187:16200 timed out`, treat it as a target reachability or firewall problem for remote TCP `16200` before debugging trust or code entry.
 
-If manual host pairing works only after local firewall changes, verify inbound TCP `15100` and `15200` reachability for `%ProgramFiles%\Boundless\boundless-service.exe` on the Private network profile. Any firewall change should be run from an elevated shell only after explicit approval. Keep rules scoped to the Private profile and the Boundless service executable, for example:
+If manual host pairing works only after local firewall changes, verify inbound TCP `16100` and `16200` reachability for `%ProgramFiles%\Boundless\boundless-service.exe` on the Private network profile. Any firewall change should be run from an elevated shell only after explicit approval. Keep rules scoped to the Private profile and the Boundless service executable, for example:
 
 ```powershell
 $ServiceExe = "$env:ProgramFiles\Boundless\boundless-service.exe"
-New-NetFirewallRule -DisplayName "Boundless TCP 15100 Private" -Direction Inbound -Action Allow -Profile Private -Protocol TCP -LocalPort 15100 -Program $ServiceExe
-New-NetFirewallRule -DisplayName "Boundless TCP 15200 Private" -Direction Inbound -Action Allow -Profile Private -Protocol TCP -LocalPort 15200 -Program $ServiceExe
+New-NetFirewallRule -DisplayName "Boundless TCP 16100 Private" -Direction Inbound -Action Allow -Profile Private -Protocol TCP -LocalPort 16100 -Program $ServiceExe -RemoteAddress LocalSubnet
+New-NetFirewallRule -DisplayName "Boundless TCP 16200 Private" -Direction Inbound -Action Allow -Profile Private -Protocol TCP -LocalPort 16200 -Program $ServiceExe -RemoteAddress LocalSubnet
 ```
 
 If you add firewall rules manually, restrict them to trusted private LAN profiles and known peer IPs. Do not port-forward or expose Boundless control, pairing, or transport ports to the internet or public networks.
@@ -75,7 +75,7 @@ If you add firewall rules manually, restrict them to trusted private LAN profile
 Symptoms:
 
 - Mouse Without Borders or PowerToys is running during Boundless dogfood,
-- diagnostics show another process listening on required TCP `15100` or `15200`, or diagnostics-only TCP `15101`,
+- diagnostics show another process listening on required TCP `16100` or `16200`, or legacy/MWB TCP `15100`/`15101`/`15200`,
 - pairing or transport failures are ambiguous because both products are installed.
 
 Checks:
@@ -87,7 +87,7 @@ Checks:
 
 The diagnostics bundle reports local listener ownership under `port_listeners` with address family, bind scope, port, process owner, and mitigation text. Support bundles redact endpoint-style addresses and full local paths by default; pass `--include-filenames` only when support explicitly asks for basename-level path context.
 
-Prefer stopping Mouse Without Borders/PowerToys before pairing Boundless machines when it owns required Boundless TCP `15100` or `15200`. MWB/PowerToys on diagnostics-only TCP `15101` is side-by-side evidence, not a Boundless pairing or transport port collision by itself. If you need side-by-side dogfood and a required Boundless port is actually owned by another process, Boundless already supports changing the daemon `network_port`; the nearby pairing listener is derived from that port with an offset of `+100`, so `network_port = 16100` pairs on TCP `16200`. Apply the same alternate port plan to every participating Boundless machine before pairing. Do not reset trust just because a local listener collision is detected.
+Boundless now defaults to TCP `16100`/`16200`, avoiding MWB's common `15100`/`15101` listeners. Old supported configs using 15100 migrate once; see [Migration](migration.md). Stop competing input sharing during qualification even when ports differ. If another process owns a required Boundless port, `network_port` can be changed; the nearby pairing listener is derived with an offset of `+100`. Apply the same port plan to every participating machine and adjust only the matching scoped firewall rules. Do not reset trust because of a listener collision.
 
 For installed builds, stop the tray/service, locate the daemon config, edit `network_port`, then restart Boundless:
 
@@ -149,7 +149,7 @@ Checks:
 & $BoundlessCtl input capture-stop
 ```
 
-Confirm Easy Mouse, wrap, corner blocking, and the active layout in Settings or:
+Press Ctrl twice on the local keyboard to return control. Home also offers Pause input. Confirm Easy Mouse, wrap, and corner blocking in Sharing, then the active arrangement in Arrange PCs or:
 
 ```powershell
 & $BoundlessCtl layout preview
@@ -170,4 +170,21 @@ Checks:
 & $BoundlessCtl file-transfer config
 ```
 
-File transfer is default-deny unless the user accepts the transfer or enables trusted-peer auto-accept and the transfer passes path, size, hash, and temp-file validation. Per-peer auto-accept remains follow-up work.
+File receipt is default-deny. Enable file transfer and trusted-peer auto-accept explicitly, and use a receive folder accessible to the selected user. There is currently no individual-transfer approval inbox. Per-peer auto-accept remains follow-up work. A changed or unavailable Windows user session can reject file operations even while the service and network remain healthy.
+
+## Log storage and disk growth
+
+The hardening implementation bounds both disk log streams independently:
+
+| Stream | Active file | Segment size | Files retained | Maximum retained bytes |
+| --- | --- | --- | --- | --- |
+| Runtime | `boundlessd.log` | 10 MiB | 10 including active | 100 MiB |
+| Service startup | `boundless-service-startup.log` | 1 MiB | 4 including active | 4 MiB |
+
+Each stream also limits a record to 16 KiB and queues at most 256 records. Older daily runtime files matching the logger's exact legacy naming pattern participate in cleanup. Rotation and initialization run away from input/control execution; a storage failure suspends disk writes for a cooldown instead of growing an unbounded fallback file. Redacted diagnostic exports include `component_health.logging`: configured budgets, readiness, written/dropped/oversized record counts, and storage failures. Counters reset per process and do not require disk access to read. See [Project Status](../project-status.md) for validation of the hardening build.
+
+Runtime logs live under `Boundless\logs` in the account's local application-data directory. A per-user daemon typically uses `%LOCALAPPDATA%\Boundless\logs`; the LocalSystem service has a separate system-profile data directory. Service startup logs are under `%ProgramData%\Boundless\logs`. App size in Windows Installed Apps may exclude these locations.
+
+These budgets apply per stream and security context. An older installed binary can still have the original unbounded logger, and another account's log directory is separate. Check installed/runtime versions before assuming a source fix is active. Do not grant broad access to protected service-profile folders to inspect them.
+
+For a report, preserve the path, size, timestamps, installed version, and a small excerpt. If disk space is critically low, stop the affected Boundless runtime first so it cannot keep growing the file, then remove only positively identified log files you intend to discard. Configuration, identity, and trust files are not logs. A working retry backoff and a bounded log sink are both required; changing the log level alone is insufficient.

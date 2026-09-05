@@ -25,6 +25,64 @@ fn should_rebuild_layout_model(
 }
 
 impl DashboardApp {
+    fn render_keyboard_arrangement(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing("Arrange without dragging", |ui| {
+            if self.layout_selected_peer.is_empty() {
+                self.layout_selected_peer = self
+                    .snapshot
+                    .paired_peers
+                    .first()
+                    .map(|peer| peer.peer_id.clone())
+                    .unwrap_or_else(|| self.snapshot.machine_id.clone());
+            }
+            let selected_name = self
+                .snapshot
+                .paired_peers
+                .iter()
+                .find(|peer| peer.peer_id == self.layout_selected_peer)
+                .map(|peer| peer.display_name.as_str())
+                .unwrap_or("This PC");
+            egui::ComboBox::from_label("PC to move")
+                .selected_text(selected_name)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.layout_selected_peer,
+                        self.snapshot.machine_id.clone(),
+                        "This PC",
+                    );
+                    for peer in &self.snapshot.paired_peers {
+                        ui.selectable_value(
+                            &mut self.layout_selected_peer,
+                            peer.peer_id.clone(),
+                            &peer.display_name,
+                        );
+                    }
+                });
+            ui.horizontal_wrapped(|ui| {
+                for (label, direction) in [
+                    ("Move left", (-1, 0)),
+                    ("Move right", (1, 0)),
+                    ("Move up", (0, -1)),
+                    ("Move down", (0, 1)),
+                ] {
+                    if ui.button(label).clicked() {
+                        self.stash_layout_for_undo();
+                        if let Err(error) = move_layout_peer(
+                            &mut self.layout_grid,
+                            &mut self.layout_unassigned,
+                            &self.layout_selected_peer,
+                            &self.snapshot.machine_id,
+                            direction,
+                        ) {
+                            self.push_toast(error.to_string(), true);
+                        }
+                    }
+                }
+            });
+            ui.label("Unassigned PCs are placed beside This PC. Apply Layout when you are ready.");
+        });
+    }
+
     pub(super) fn render_layout_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let current_peer_ids = layout_peer_ids(&self.snapshot.paired_peers);
         if should_rebuild_layout_model(
@@ -100,8 +158,7 @@ impl DashboardApp {
 
             let all_placed: Vec<String> = self.layout_grid.values().cloned().collect();
             for p in peers {
-                if !all_placed.contains(&p.peer_id)
-                    && !self.layout_unassigned.contains(&p.peer_id)
+                if !all_placed.contains(&p.peer_id) && !self.layout_unassigned.contains(&p.peer_id)
                 {
                     self.layout_unassigned.push(p.peer_id.clone());
                 }
@@ -134,8 +191,12 @@ impl DashboardApp {
                 .is_some_and(|p| p.connected)
         };
 
-        ui.heading("Layout Manager");
-        ui.label("Drag devices onto the grid to arrange your multi-machine layout.");
+        ui.heading("Arrange your PCs");
+        ui.label("Match the way your PCs sit on your desk. Drag a PC, or use the buttons below.");
+        self.render_keyboard_arrangement(ui);
+        ui.label(
+            "To send files, drop them onto a connected PC. Receiving must be allowed on that PC.",
+        );
         ui.add_space(8.0);
 
         let mut drag_stopped = false;
@@ -165,6 +226,13 @@ impl DashboardApp {
                         let (rect, response) =
                             ui.allocate_exact_size(cell_size, egui::Sense::click_and_drag());
 
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                true,
+                                format!("{}: unassigned PC", get_display_name(peer_id)),
+                            )
+                        });
                         let is_being_dragged = self.dragging_peer.is_some() && response.dragged();
 
                         if response.drag_started() {
@@ -249,6 +317,9 @@ impl DashboardApp {
                                     cell_rects.push((rect, x, y));
 
                                     let has_device = self.layout_grid.contains_key(&(x, y));
+                                    if let Some(peer_id) = self.layout_grid.get(&(x, y)) {
+                                        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{} at column {}, row {}", get_display_name(peer_id), x + 1, y + 1)));
+                                    }
                                     let is_hovered = response.hovered() && is_dragging_any;
                                     let is_being_dragged = is_dragging_any && response.dragged();
 
@@ -417,9 +488,7 @@ impl DashboardApp {
         // egui never fires `drag_stopped` on those responses. Detect the
         // primary-button release globally and treat it as a drop so the
         // ghost doesn't stick to the cursor forever.
-        if !drag_stopped
-            && self.dragging_peer.is_some()
-            && ctx.input(|i| i.pointer.any_released())
+        if !drag_stopped && self.dragging_peer.is_some() && ctx.input(|i| i.pointer.any_released())
         {
             drag_stopped = true;
             pointer_pos_at_drop = ctx.pointer_interact_pos();
@@ -447,7 +516,9 @@ impl DashboardApp {
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
         });
-        if !dropped_file_paths.is_empty() && let Some(pos) = ctx.pointer_hover_pos() {
+        if !dropped_file_paths.is_empty()
+            && let Some(pos) = ctx.pointer_hover_pos()
+        {
             let mut target_peer_id = None;
             for (rect, x, y) in &cell_rects {
                 if rect.contains(pos)
@@ -460,7 +531,24 @@ impl DashboardApp {
 
             match target_peer_id {
                 Some(peer_id) if peer_id == local_id => {
-                    self.push_toast("Drop files on a connected peer to send them".to_string(), true);
+                    self.push_toast(
+                        "Drop files on a connected peer to send them".to_string(),
+                        true,
+                    );
+                }
+                Some(_)
+                    if !self
+                        .snapshot
+                        .features
+                        .get("transfer_file")
+                        .copied()
+                        .unwrap_or(false) =>
+                {
+                    self.push_toast(
+                        "File sharing is off. Turn on Share files in Sharing before sending."
+                            .to_string(),
+                        true,
+                    );
                 }
                 Some(peer_id) if is_peer_connected(&peer_id) => {
                     self.task_runner().send_files_to_peer(
@@ -472,7 +560,10 @@ impl DashboardApp {
                 }
                 Some(peer_id) => {
                     self.push_toast(
-                        format!("{} is offline; connect it before sending files", get_display_name(&peer_id)),
+                        format!(
+                            "{} is offline; connect it before sending files",
+                            get_display_name(&peer_id)
+                        ),
                         true,
                     );
                 }
@@ -521,7 +612,8 @@ impl DashboardApp {
         self.layout_unassigned = new_unassigned;
 
         // ── Drag ghost overlay ──────────────────────────────────────────
-        if let Some((peer_id, _)) = &self.dragging_peer && let Some(pos) = ctx.pointer_hover_pos()
+        if let Some((peer_id, _)) = &self.dragging_peer
+            && let Some(pos) = ctx.pointer_hover_pos()
         {
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Tooltip,
@@ -559,9 +651,7 @@ impl DashboardApp {
         // ── Action buttons ──────────────────────────────────────────────
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            let apply_btn = ui.add(
-                egui::Button::new("Apply Layout")
-            );
+            let apply_btn = ui.add(egui::Button::new("Apply Layout"));
             if apply_btn.clicked() {
                 let matrix_str =
                     serialize_layout_matrix(&self.layout_grid, &self.snapshot.machine_id);
@@ -588,13 +678,12 @@ impl DashboardApp {
                     }
                 }
             }
-            apply_btn.on_hover_text("Send this layout to the daemon for immediate use");
+            apply_btn.on_hover_text("Use this arrangement for screen-edge switching");
 
-            let reset_btn = ui.button("Reset Layout");
+            let reset_btn = ui.button("Discard changes");
             if reset_btn.clicked() {
                 self.stash_layout_for_undo();
                 self.layout_initialized = false;
-                self.snapshot.layout_matrix = String::new();
             }
             reset_btn.on_hover_text("Discard changes and reload from daemon");
 
@@ -630,7 +719,9 @@ impl DashboardApp {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
-                ui.label("Apply this layout to the daemon? Active connections will be reconfigured.");
+                ui.label(
+                    "Apply this arrangement? Screen edges will switch to the new neighboring PCs.",
+                );
                 ui.add_space(8.0);
 
                 // Show preview summary
@@ -667,6 +758,42 @@ impl DashboardApp {
 // ── Layout context menu actions ────────────────────────────────────────
 enum LayoutContextAction {
     RemoveFromGrid(i32, i32),
+}
+
+fn move_layout_peer(
+    grid: &mut HashMap<(i32, i32), String>,
+    unassigned: &mut Vec<String>,
+    peer_id: &str,
+    local_id: &str,
+    direction: (i32, i32),
+) -> Result<()> {
+    let previous = grid
+        .iter()
+        .find(|(_, id)| id.as_str() == peer_id)
+        .map(|(pos, _)| *pos);
+    if previous.is_none() && !unassigned.iter().any(|id| id == peer_id) {
+        bail!("Choose a PC in this arrangement first");
+    }
+    let origin = previous
+        .or_else(|| {
+            grid.iter()
+                .find(|(_, id)| id.as_str() == local_id)
+                .map(|(pos, _)| *pos)
+        })
+        .context("Place This PC before adding another PC")?;
+    let next = (origin.0 + direction.0, origin.1 + direction.1);
+    if !(0..7).contains(&next.0) || !(0..7).contains(&next.1) {
+        bail!("This PC is already at the edge of the arrangement");
+    }
+    if grid.contains_key(&next) {
+        bail!("That position is occupied. Move the other PC first");
+    }
+    if let Some(previous) = previous {
+        grid.remove(&previous);
+    }
+    unassigned.retain(|id| id != peer_id);
+    grid.insert(next, peer_id.to_string());
+    Ok(())
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -786,7 +913,7 @@ fn build_layout_summary(
     }
 }
 
-fn resolve_layout_token_peer<'a>(
+pub(super) fn resolve_layout_token_peer<'a>(
     token: &str,
     peers: &'a [UiPairedPeer],
 ) -> Option<&'a UiPairedPeer> {
