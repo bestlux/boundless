@@ -43,6 +43,8 @@ mod control;
 mod inbound;
 mod inbound_payload;
 mod outbound;
+#[cfg(test)]
+mod paired_testing_tests;
 mod runtime;
 mod session;
 mod tls;
@@ -3770,7 +3772,7 @@ mod tests {
         assert!(matches!(
             decode_written_frames(&writer.bytes).as_slice(),
             [WireMessage::Error { message }]
-                if message.contains("remote=4.3.0") && message.contains("expected=4.4.0")
+                if message.contains("remote=4.3.0") && message.contains(&format!("expected={PROTOCOL_CURRENT}"))
         ));
 
         let _ = std::fs::remove_dir_all(root);

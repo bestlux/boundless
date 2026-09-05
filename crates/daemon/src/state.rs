@@ -75,6 +75,7 @@ mod input_broker_ops;
 mod input_ops;
 mod input_state;
 mod layout_resolver;
+mod paired_testing;
 mod pairing_ops;
 mod pairing_state;
 mod peer_ops;
@@ -311,6 +312,7 @@ pub struct AppState {
     clipboard: Arc<ClipboardState>,
     pairing: Arc<PairingState>,
     transport: Arc<TransportState>,
+    paired_testing: Arc<paired_testing::PairedTestingState>,
     transport_session_transition: Arc<Mutex<()>>,
     discovery: Arc<DiscoveryState>,
     input: Arc<InputState>,

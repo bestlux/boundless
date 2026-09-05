@@ -1,5 +1,6 @@
 use std::{cmp::Ordering, collections::HashMap, sync::Arc, time::Instant};
 
+use app_services::paired_testing::EvidenceCategory;
 use chrono::Utc;
 use peer_transport::{
     CLIPBOARD_IMAGE_INITIAL_CHUNK_CREDITS, DEFAULT_TRANSPORT_TUNING, InboundClipboardImageTransfer,
@@ -37,10 +38,17 @@ struct AuthenticatedSession {
     is_outbound: bool,
     local_machine_id: String,
     local_device_name: String,
+    evidence_category: EvidenceCategory,
 }
 
 impl AuthenticatedSession {
-    async fn new(state: &AppState, session_id: u64, peer_id: String, is_outbound: bool) -> Self {
+    async fn new(
+        state: &AppState,
+        session_id: u64,
+        peer_id: String,
+        is_outbound: bool,
+        evidence_category: EvidenceCategory,
+    ) -> Self {
         let snapshot = state.snapshot().await;
         Self {
             session_id,
@@ -49,6 +57,7 @@ impl AuthenticatedSession {
             is_outbound,
             local_machine_id: snapshot.machine_id,
             local_device_name: snapshot.device_name,
+            evidence_category,
         }
     }
 
@@ -255,6 +264,7 @@ impl SessionRuntime {
         if let Some(remote_protocol) = self.remote_protocol {
             self.flush_outgoing_input(state, session, remote_protocol, writer)
                 .await?;
+            self.flush_diagnostic_probe(state, session, writer).await?;
         }
         Ok(SessionBranchOutcome::Continue)
     }
@@ -297,8 +307,36 @@ impl SessionRuntime {
         if let Some(remote_protocol) = self.remote_protocol {
             self.flush_outgoing_input(state, session, remote_protocol, writer)
                 .await?;
+            self.flush_diagnostic_probe(state, session, writer).await?;
         }
         Ok(SessionBranchOutcome::Continue)
+    }
+
+    async fn flush_diagnostic_probe<W>(
+        &mut self,
+        state: &AppState,
+        session: &AuthenticatedSession,
+        writer: &mut W,
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let Some(message) = state.take_diagnostic_probe(
+            &session.peer_id,
+            session.session_id,
+            session.evidence_category.clone(),
+        ) else {
+            return Ok(());
+        };
+        let Some(_egress) = state
+            .acquire_transport_session_egress(&session.peer_id, session.session_id)
+            .await
+        else {
+            return Ok(());
+        };
+        send_message(writer, &message, &mut self.write_frame_buffer).await?;
+        flush_transport_writer(writer, "flush diagnostic probe").await?;
+        Ok(())
     }
 
     async fn handle_inbound_read_result<W>(
@@ -398,6 +436,32 @@ impl SessionRuntime {
         }
 
         match message {
+            WireMessage::DiagnosticProbe {
+                request_id,
+                payload,
+            } => {
+                if let Some(reply) = state
+                    .diagnostic_probe_reply(
+                        &session.peer_id,
+                        session.session_id,
+                        request_id,
+                        payload,
+                    )
+                    .await
+                {
+                    let Some(_egress) = state
+                        .acquire_transport_session_egress(&session.peer_id, session.session_id)
+                        .await
+                    else {
+                        return Ok(SessionBranchOutcome::Exit(SessionExitReason::Superseded));
+                    };
+                    send_message(writer, &reply, &mut self.write_frame_buffer).await?;
+                    flush_transport_writer(writer, "flush diagnostic reply").await?;
+                }
+            }
+            reply @ WireMessage::DiagnosticReply { .. } => {
+                state.complete_diagnostic_probe(&session.peer_id, session.session_id, reply);
+            }
             WireMessage::Hello {
                 machine_id,
                 protocol,
@@ -924,7 +988,16 @@ pub(super) async fn run_authenticated_outbound_session(
     stream: tokio_rustls::TlsStream<TcpStream>,
     session_registration_id: Option<u64>,
 ) -> Result<()> {
-    run_authenticated_session(state, peer_id, stream, true, session_registration_id).await
+    let category = socket_evidence_category(stream.get_ref().0)?;
+    run_authenticated_session_with_category(
+        state,
+        peer_id,
+        stream,
+        true,
+        session_registration_id,
+        category,
+    )
+    .await
 }
 
 async fn tcp_connect_with_timeout(address: &str) -> Result<TcpStream> {
@@ -1040,16 +1113,14 @@ pub(super) fn configure_low_latency_socket(socket: &TcpStream) -> Result<()> {
     Ok(())
 }
 
-async fn run_session<S>(
+async fn run_session(
     state: AppState,
     peer_hint: Option<String>,
-    stream: tokio_rustls::TlsStream<S>,
+    stream: tokio_rustls::TlsStream<TcpStream>,
     is_outbound: bool,
     session_registration_id: Option<u64>,
-) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
+) -> Result<()> {
+    let category = socket_evidence_category(stream.get_ref().0)?;
     let authenticated_peer_id = authenticated_peer_machine_id(&state, &stream).await?;
     if let Some(expected_peer_id) = peer_hint.as_deref()
         && expected_peer_id != authenticated_peer_id
@@ -1061,22 +1132,54 @@ where
         );
     }
 
-    run_authenticated_session(
+    run_authenticated_session_with_category(
         state,
         authenticated_peer_id,
         stream,
         is_outbound,
         session_registration_id,
+        category,
     )
     .await
 }
 
+fn socket_evidence_category(socket: &TcpStream) -> Result<EvidenceCategory> {
+    Ok(if socket.peer_addr()?.ip().is_loopback() {
+        EvidenceCategory::Loopback
+    } else {
+        EvidenceCategory::RealPaired
+    })
+}
+
+#[cfg(test)]
 pub(super) async fn run_authenticated_session<S>(
     state: AppState,
     authenticated_peer_id: String,
     stream: S,
     is_outbound: bool,
     session_registration_id: Option<u64>,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    run_authenticated_session_with_category(
+        state,
+        authenticated_peer_id,
+        stream,
+        is_outbound,
+        session_registration_id,
+        EvidenceCategory::Synthetic,
+    )
+    .await
+}
+
+async fn run_authenticated_session_with_category<S>(
+    state: AppState,
+    authenticated_peer_id: String,
+    stream: S,
+    is_outbound: bool,
+    session_registration_id: Option<u64>,
+    evidence_category: EvidenceCategory,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1092,6 +1195,7 @@ where
         ownership_session_id,
         authenticated_peer_id,
         is_outbound,
+        evidence_category,
     )
     .await;
     let preferred = transport_session_direction_is_preferred(
@@ -1321,7 +1425,7 @@ pub(super) async fn handle_file_transfer_rejected(
     }
 }
 
-async fn authenticated_peer_machine_id<S>(
+pub(super) async fn authenticated_peer_machine_id<S>(
     state: &AppState,
     stream: &tokio_rustls::TlsStream<S>,
 ) -> Result<String> {

@@ -64,6 +64,28 @@ pub fn shared_control_plane_app(state: AppState) -> SharedControlPlaneApp {
 
 #[async_trait]
 impl ControlPlaneApp for DaemonControlPlaneApp {
+    async fn paired_test_consent(
+        &self,
+        peer_id: String,
+        duration_seconds: u32,
+    ) -> Result<app_services::paired_testing::PairedTestConsent> {
+        self.state
+            .set_paired_test_consent(peer_id, duration_seconds)
+            .await
+    }
+
+    async fn get_paired_test_consent(
+        &self,
+    ) -> Result<app_services::paired_testing::PairedTestConsent> {
+        Ok(self.state.paired_test_consent())
+    }
+
+    async fn run_paired_test(
+        &self,
+        options: app_services::paired_testing::PairedTestOptions,
+    ) -> Result<app_services::paired_testing::PairedTestReport> {
+        self.state.run_paired_test(options).await
+    }
     async fn status_snapshot(&self) -> Result<StatusSnapshot> {
         build_status_snapshot(&self.state).await
     }

@@ -418,7 +418,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.json && !command_supports_json(&cli.command) {
         anyhow::bail!(
-            "--json is supported by daemon status, peer list, feature list, transport events, and doctor --install"
+            "--json is supported by daemon status, peer list, feature list, transport events, doctor --install, and paired-test"
         );
     }
     let output = OutputFormat::from_json_flag(cli.json);
