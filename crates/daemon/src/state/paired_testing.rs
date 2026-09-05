@@ -248,6 +248,8 @@ impl AppState {
                     platform: std::env::consts::OS.into(),
                     architecture: std::env::consts::ARCH.into(),
                     debug_assertions: cfg!(debug_assertions),
+                    process_id: std::process::id(),
+                    capabilities: vec!["transport_rtt".into(), "bulk_echo_integrity".into()],
                     daemon_instance_id: self.paired_testing.instance_id.clone(),
                     binary_sha256,
                     source_revision: option_env!("BOUNDLESS_SOURCE_REVISION").map(str::to_owned),

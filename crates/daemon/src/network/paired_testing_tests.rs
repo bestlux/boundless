@@ -4,6 +4,22 @@ use core_security::{SecurityPaths, TrustRecord, upsert_trust_record};
 
 use super::*;
 
+#[test]
+fn paired_testing_mapped_loopback_cannot_masquerade_as_non_loopback_evidence() {
+    for address in ["127.1.2.3", "::1", "::ffff:127.0.0.1"] {
+        assert_eq!(
+            session::diagnostic_peer_address_category(address.parse().unwrap()),
+            EvidenceCategory::Loopback
+        );
+    }
+    for address in ["192.0.2.1", "2001:db8::1", "::ffff:192.0.2.1"] {
+        assert_eq!(
+            session::diagnostic_peer_address_category(address.parse().unwrap()),
+            EvidenceCategory::RealPaired
+        );
+    }
+}
+
 struct Fixture {
     state: AppState,
     root: std::path::PathBuf,

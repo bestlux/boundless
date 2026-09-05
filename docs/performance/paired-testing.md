@@ -2,7 +2,7 @@
 
 This suite lets a person or an AI tool on one PC measure an existing trusted connection, after someone explicitly permits testing on the other PC. It exercises the actual authenticated TCP/TLS session. It does not type, move the pointer, read or change the clipboard, transfer user files, execute commands, or interrupt a connection.
 
-Both PCs must run transport protocol **4.5**. Protocol 4.4 peers are rejected during negotiation; upgrade both PCs. Existing 4.4 local configuration migrates automatically. The application version alone is insufficient to identify a development build; reports include SHA-256 of the running executable when readable, the daemon instance, and the negotiated transport session IDs.
+Both PCs must run transport protocol **4.5**. Protocol 4.4 peers are rejected during negotiation; upgrade both PCs. Existing 4.4 local configuration migrates automatically. The application version alone is insufficient to identify a development build; reports include SHA-256 of the running executable when readable, the process ID, daemon instance, supported diagnostic capabilities, and the negotiated transport session IDs.
 
 ## One controller, explicit permission on the peer
 

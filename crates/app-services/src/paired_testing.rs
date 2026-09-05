@@ -69,6 +69,9 @@ pub struct PairedTestIdentity {
     pub platform: String,
     pub architecture: String,
     pub debug_assertions: bool,
+    pub process_id: u32,
+    /// Exact, non-invasive operations this daemon exposes under the diagnostic lease.
+    pub capabilities: Vec<String>,
     pub daemon_instance_id: String,
     pub binary_sha256: Option<String>,
     /// Set only when supplied by the build; absence is explicit, never inferred from a checkout.

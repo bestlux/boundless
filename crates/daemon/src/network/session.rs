@@ -1172,11 +1172,24 @@ async fn run_session(
 }
 
 fn socket_evidence_category(socket: &TcpStream) -> Result<EvidenceCategory> {
-    Ok(if socket.peer_addr()?.ip().is_loopback() {
+    Ok(diagnostic_peer_address_category(socket.peer_addr()?.ip()))
+}
+
+pub(super) fn diagnostic_peer_address_category(address: IpAddr) -> EvidenceCategory {
+    let loopback = match address {
+        IpAddr::V4(address) => address.is_loopback(),
+        IpAddr::V6(address) => {
+            address.is_loopback()
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| mapped.is_loopback())
+        }
+    };
+    if loopback {
         EvidenceCategory::Loopback
     } else {
         EvidenceCategory::RealPaired
-    })
+    }
 }
 
 #[cfg(test)]
