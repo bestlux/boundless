@@ -42,6 +42,8 @@ The service does not create the receive directory during daemon startup. An exac
 
 Diagnostic status/config queries remain available without a selected user token. Diagnostic filesystem exports require a valid selected user, even when the requesting pipe client is an administrator. Default exports go to that user's LocalAppData/Boundless/diagnostics.
 
+The current `DaemonControlPlaneApp::dump_diagnostics` RPC acquires a lease before collecting its bundle and invokes the shared synchronous JSON/redaction writer inside `run_sync`. The legacy text dump is also scoped. The shared asynchronous writer remains available for CLI offline export under its ordinary process authority; it must never be called inside an impersonation closure. UI and console snapshot bundles use the same effective receive-folder projection as the file-config query; without resolvable user authority they retain the persisted setting and remain queryable.
+
 ## Feature and consent behavior
 
 `transfer_file=false` prevents new source opens, retries and receive reservations. Disabling cancels known outbound transfers and their queued payloads. The outbound writer checks the feature again for payloads already drained into a local batch. An active incoming transfer is rejected and discarded at its next chunk/end boundary; no further chunk is written after that check. An idle incoming transfer can retain its existing handle/partial until another frame, session cleanup or shutdown.

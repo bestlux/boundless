@@ -18,7 +18,7 @@ use app_services::{
     },
     diagnostics::{
         DiagnosticExportOptions, ServiceDiagnosticSnapshot, build_online_bundle,
-        write_diagnostic_bundle,
+        write_diagnostic_bundle_sync,
     },
     queries::{
         AntiIdleConfigSnapshot, AntiIdleStatusSnapshot, ClipboardBrokerExchangeSnapshot,
@@ -375,6 +375,19 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
         &self,
         command: DiagnosticsDumpCommand,
     ) -> Result<DiagnosticsDumpReply> {
+        let user_io = self.state.user_io_lease().await?;
+        let output_path = command.output_path;
+        #[cfg(windows)]
+        let output_path = match output_path {
+            Some(path) => Some(path),
+            None => Some(
+                user_io
+                    .default_diagnostics_dir()
+                    .await?
+                    .display()
+                    .to_string(),
+            ),
+        };
         let snapshot = build_console_snapshot(&self.state).await?;
         let mut bundle = build_online_bundle(
             snapshot,
@@ -382,14 +395,17 @@ impl ControlPlaneApp for DaemonControlPlaneApp {
             command.include_filenames,
         );
         insert_runtime_task_health(&mut bundle, self.state.runtime_task_snapshots());
-        let export = write_diagnostic_bundle(
-            bundle,
-            DiagnosticExportOptions {
-                output_path: command.output_path,
-                include_filenames: command.include_filenames,
-            },
-        )
-        .await?;
+        let export = user_io
+            .run_sync(move || {
+                write_diagnostic_bundle_sync(
+                    bundle,
+                    DiagnosticExportOptions {
+                        output_path,
+                        include_filenames: command.include_filenames,
+                    },
+                )
+            })
+            .await?;
         Ok(DiagnosticsDumpReply {
             bundle_path: export.bundle_path,
             manifest_path: export.manifest_path,
@@ -1496,6 +1512,168 @@ mod tests {
         assert!(reply.ok);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_dump_rejects_missing_service_authority_before_creating_files() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-rpc-export-authority-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state =
+            AppState::load_or_create_with_paths(root.join("config.json"), root.join("security"))
+                .expect("fixture state");
+        state.input_broker_relay().mark_service_session_input();
+        let app = DaemonControlPlaneApp::new(state);
+        for output_path in [Some(root.join("export").display().to_string()), None] {
+            let error = app
+                .dump_diagnostics(DiagnosticsDumpCommand {
+                    output_path,
+                    include_filenames: false,
+                })
+                .await
+                .expect_err("missing selected service user");
+            assert!(error.to_string().contains("no configured allowed user"));
+        }
+        assert!(!root.join("export").exists());
+        assert!(
+            app.status_snapshot().await.is_ok(),
+            "health stays available without console authority"
+        );
+        let configured = app
+            .file_transfer_config()
+            .await
+            .expect("file configuration stays available");
+        assert_eq!(
+            app.ui_snapshot()
+                .await
+                .expect("UI snapshot")
+                .file_transfer_config
+                .receive_dir,
+            configured.receive_dir
+        );
+        assert_eq!(
+            app.console_snapshot()
+                .await
+                .expect("console snapshot")
+                .file_transfer_config
+                .receive_dir,
+            configured.receive_dir
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    fn set_export_fixture_acl(path: &Path, deny_create: bool) -> Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::{
+            Foundation::LocalFree,
+            Security::{
+                Authorization::{
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW, SE_FILE_OBJECT,
+                    SetNamedSecurityInfoW,
+                },
+                DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+                PROTECTED_DACL_SECURITY_INFORMATION,
+            },
+        };
+        let sid = platform_windows::runtime::current_user_sid_string()?;
+        let deny = if deny_create {
+            format!("(D;OICI;0x00000006;;;{sid})")
+        } else {
+            String::new()
+        };
+        let sddl = format!("D:P{deny}(A;OICI;FA;;;{sid})")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let mut descriptor = std::ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let result = (|| {
+            let mut present = 0;
+            let mut defaulted = 0;
+            let mut dacl = std::ptr::null_mut();
+            if unsafe {
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let path = path
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            let code = unsafe {
+                SetNamedSecurityInfoW(
+                    path.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    dacl,
+                    std::ptr::null_mut(),
+                )
+            };
+            if code == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(code as i32))
+            }
+        })();
+        unsafe { LocalFree(descriptor) };
+        Ok(result?)
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn diagnostics_dump_denied_directory_creates_neither_bundle_nor_sidecar() {
+        let root = std::env::temp_dir().join(format!(
+            "boundless-rpc-export-denied-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state =
+            AppState::load_or_create_with_paths(root.join("config.json"), root.join("security"))
+                .expect("fixture state");
+        let output = root.join("denied");
+        std::fs::create_dir(&output).expect("disposable output directory");
+        set_export_fixture_acl(&output, true).expect("deny fixture file/subdirectory creation");
+        struct Restore(std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = set_export_fixture_acl(&self.0, false);
+            }
+        }
+        let restore = Restore(output.clone());
+        assert!(
+            std::fs::write(output.join("probe"), b"fixture").is_err(),
+            "fixture denies writes"
+        );
+        let app = DaemonControlPlaneApp::new(state);
+        assert!(
+            app.dump_diagnostics(DiagnosticsDumpCommand {
+                output_path: Some(output.display().to_string()),
+                include_filenames: false
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(&output).expect("inspect fixture").count(),
+            0
+        );
+        drop(restore);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
