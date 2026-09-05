@@ -95,6 +95,7 @@ impl RecordSink {
         // The record limit is enforced before queue allocation: 256 x 16 KiB
         // gives at most 4 MiB queued payload plus one worker record.
         debug_assert!(bytes.len() <= MAX_RECORD_BYTES);
+        debug_assert!(bytes.capacity() <= MAX_RECORD_BYTES);
         if self
             .sender
             .as_ref()
@@ -118,6 +119,15 @@ impl Write for RecordWriter {
                 self.oversized = true;
                 self.bytes.clear();
             } else {
+                let required = self.bytes.len() + bytes.len();
+                if required > self.bytes.capacity() {
+                    // Vec's automatic geometric growth can exceed the record
+                    // budget even when its length fits (10k + 6k -> 20k).
+                    let capacity = required
+                        .max(self.bytes.capacity().saturating_mul(2))
+                        .min(MAX_RECORD_BYTES);
+                    self.bytes.reserve_exact(capacity - self.bytes.len());
+                }
                 self.bytes.extend_from_slice(bytes);
             }
         }
@@ -305,6 +315,52 @@ mod tests {
         }
         assert_eq!(counters.dropped.load(Ordering::Relaxed), 1000);
         assert_eq!(receiver.recv().expect("retained first record"), b"first\n");
+    }
+
+    #[test]
+    fn under_limit_fragments_and_full_queue_keep_allocated_payload_within_budget() {
+        let (sender, receiver) = mpsc::sync_channel(QUEUE_RECORDS);
+        let sink = RecordSink {
+            sender: Some(sender),
+            counters: Arc::new(Counters::default()),
+        };
+        let patterns: &[&[usize]] = &[
+            &[10_000, 6_000],
+            &[9_000, 4_000, 3_000],
+            &[6_000, 5_000, 5_000],
+            &[64, 7_000, 1_000, 7_936],
+            &[1, 2, 3],
+        ];
+        let fragment = [b'x'; MAX_RECORD_BYTES];
+        for index in 0..QUEUE_RECORDS {
+            let mut record = sink.record();
+            for length in patterns[index % patterns.len()] {
+                record
+                    .write_all(&fragment[..*length])
+                    .expect("under-limit fragment");
+                assert!(
+                    record.bytes.capacity() <= MAX_RECORD_BYTES,
+                    "record length={} capacity={} exceeds allocation budget={MAX_RECORD_BYTES}",
+                    record.bytes.len(),
+                    record.bytes.capacity()
+                );
+            }
+            let expected: usize = patterns[index % patterns.len()].iter().sum();
+            assert_eq!(record.bytes.len(), expected);
+            if expected < 16 {
+                assert!(record.bytes.capacity() < 16);
+            }
+        }
+        let mut queued_capacity = 0;
+        for index in 0..QUEUE_RECORDS {
+            let bytes = receiver.recv().expect("queued record");
+            let expected: usize = patterns[index % patterns.len()].iter().sum();
+            assert_eq!(bytes.len(), expected);
+            assert!(bytes.capacity() <= MAX_RECORD_BYTES);
+            queued_capacity += bytes.capacity();
+        }
+        assert!(queued_capacity <= QUEUE_RECORDS * MAX_RECORD_BYTES);
+        assert_eq!(sink.counters.dropped.load(Ordering::Relaxed), 0);
     }
 
     #[test]
