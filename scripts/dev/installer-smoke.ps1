@@ -77,6 +77,19 @@ function Wait-ForPathRemoval {
     throw "Timed out waiting for path removal or empty state: $Path (remaining: $remainingEntries)"
 }
 
+function ConvertTo-MsiProcessArgument {
+    param([AllowEmptyString()][string]$Value)
+
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') {
+        return $Value
+    }
+    # Start-Process joins its argument array into one Windows command line.
+    # Escape quotes and double the backslashes preceding quotes or the end.
+    $escaped = $Value -replace '(\\*)"', '$1$1\"'
+    $escaped = $escaped -replace '(\\+)$', '$1$1'
+    return '"' + $escaped + '"'
+}
+
 function Invoke-MsiExec {
     param(
         [string[]]$ArgumentList,
@@ -88,7 +101,10 @@ function Invoke-MsiExec {
         $arguments += @("/l*v", $LogPath)
     }
 
-    $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
+    $commandLine = ($arguments | ForEach-Object { ConvertTo-MsiProcessArgument -Value $_ }) -join ' '
+    Write-Host "installer_smoke_msiexec_start=$($ArgumentList -join ' ') log=$LogPath"
+    $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $commandLine -Wait -PassThru -WindowStyle Hidden
+    Write-Host "installer_smoke_msiexec_exit=$($process.ExitCode) log=$LogPath"
     if ($process.ExitCode -notin @(0, 3010)) {
         throw "msiexec.exe failed with exit code $($process.ExitCode). Log: $LogPath"
     }
@@ -917,6 +933,7 @@ function Wait-ForRuntimePresence {
 }
 
 if ($SelfTest) {
+    & (Join-Path $PSScriptRoot 'installer-msi-arguments-fixtures.ps1')
     Assert-BoundlessInstallHelperEvidenceParserFixtures
     Assert-AuthenticodeStatusSerializationFixtures
     Assert-WindowsServiceExecutablePathFixtures
