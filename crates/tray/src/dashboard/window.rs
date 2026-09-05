@@ -3,6 +3,43 @@ use super::*;
 pub(super) const DASHBOARD_WINDOW_TITLE: &str = "Boundless Dashboard";
 const TRAY_EXECUTABLE_NAME: &str = "boundlesstray.exe";
 
+pub(super) fn choose_file_to_send(owner: Option<isize>) -> Result<Option<String>> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        CommDlgExtendedError, GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
+        OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    let mut filename = vec![0_u16; 32_768];
+    let filter: Vec<u16> = "All files\0*.*\0\0".encode_utf16().collect();
+    let title: Vec<u16> = "Choose a file to send\0".encode_utf16().collect();
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner
+            .map(|value| value as HWND)
+            .unwrap_or(std::ptr::null_mut()),
+        lpstrFilter: filter.as_ptr(),
+        lpstrFile: filename.as_mut_ptr(),
+        nMaxFile: filename.len() as u32,
+        lpstrTitle: title.as_ptr(),
+        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    if unsafe { GetOpenFileNameW(&mut dialog) } == 0 {
+        let error = unsafe { CommDlgExtendedError() };
+        if error == 0 {
+            return Ok(None);
+        }
+        bail!("Windows could not open the file picker (0x{error:08x})");
+    }
+    let length = filename
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(filename.len());
+    Ok(Some(
+        String::from_utf16(&filename[..length])
+            .context("The selected filename is not valid Unicode")?,
+    ))
+}
+
 struct DashboardWindowSearch {
     session_id: u32,
     user_sid: String,
@@ -37,9 +74,7 @@ unsafe extern "system" fn find_dashboard_window_callback(hwnd: HWND, lparam: LPA
     unsafe {
         GetWindowThreadProcessId(hwnd, &mut process_id);
     }
-    if process_id == 0
-        || !process_matches_tray(process_id, search.session_id, &search.user_sid)
-    {
+    if process_id == 0 || !process_matches_tray(process_id, search.session_id, &search.user_sid) {
         return 1;
     }
 
@@ -57,16 +92,18 @@ fn window_title_matches(hwnd: HWND) -> bool {
     copied > 0 && String::from_utf16_lossy(&title[..copied as usize]) == DASHBOARD_WINDOW_TITLE
 }
 
-fn process_matches_tray(process_id: u32, expected_session_id: u32, expected_user_sid: &str) -> bool {
+fn process_matches_tray(
+    process_id: u32,
+    expected_session_id: u32,
+    expected_user_sid: &str,
+) -> bool {
     let mut session_id = 0_u32;
     if unsafe { ProcessIdToSessionId(process_id, &mut session_id) } == 0
         || session_id != expected_session_id
     {
         return false;
     }
-    if !process_id_user_sid_string(process_id)
-        .is_ok_and(|user_sid| user_sid == expected_user_sid)
-    {
+    if !process_id_user_sid_string(process_id).is_ok_and(|user_sid| user_sid == expected_user_sid) {
         return false;
     }
 
@@ -76,7 +113,8 @@ fn process_matches_tray(process_id: u32, expected_session_id: u32, expected_user
     }
     let mut path = vec![0_u16; 32_768];
     let mut path_len = path.len() as u32;
-    let queried = unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut path_len) };
+    let queried =
+        unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut path_len) };
     unsafe {
         CloseHandle(process);
     }

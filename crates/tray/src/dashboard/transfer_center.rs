@@ -2,10 +2,7 @@ use super::*;
 
 impl UiFileTransfer {
     pub(super) fn is_terminal(&self) -> bool {
-        matches!(
-            self.state.as_str(),
-            "completed" | "failed" | "cancelled"
-        )
+        matches!(self.state.as_str(), "completed" | "failed" | "cancelled")
     }
 
     pub(super) fn can_cancel(&self) -> bool {
@@ -35,6 +32,79 @@ impl UiFileTransfer {
 }
 
 impl DashboardApp {
+    fn render_file_send(&mut self, ui: &mut egui::Ui) {
+        let sharing_enabled = self
+            .snapshot
+            .features
+            .get("transfer_file")
+            .copied()
+            .unwrap_or(false);
+        let connected = self
+            .snapshot
+            .paired_peers
+            .iter()
+            .filter(|peer| peer.connected)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !connected
+            .iter()
+            .any(|peer| peer.peer_id == self.file_send_peer)
+        {
+            self.file_send_peer = connected
+                .first()
+                .map(|peer| peer.peer_id.clone())
+                .unwrap_or_default();
+        }
+        let name = connected
+            .iter()
+            .find(|peer| peer.peer_id == self.file_send_peer)
+            .map(|peer| peer.display_name.as_str())
+            .unwrap_or("No connected PC");
+        ui.horizontal_wrapped(|ui| {
+            let destination_label = ui.label("Send to");
+            egui::ComboBox::from_id_salt("file_send_peer")
+                .selected_text(name)
+                .show_ui(ui, |ui| {
+                    for peer in &connected {
+                        ui.selectable_value(
+                            &mut self.file_send_peer,
+                            peer.peer_id.clone(),
+                            &peer.display_name,
+                        );
+                    }
+                })
+                .response
+                .labelled_by(destination_label.id);
+            if ui
+                .add_enabled(
+                    sharing_enabled && !self.file_send_peer.is_empty() && !self.file_send_pending,
+                    egui::Button::new("Send file..."),
+                )
+                .clicked()
+            {
+                self.file_send_pending = true;
+                self.task_runner().choose_and_send_file(
+                    self.tx.clone(),
+                    self.ctx.endpoint.clone(),
+                    self.file_send_peer.clone(),
+                    self.native_window_handle,
+                );
+            }
+        });
+        if !sharing_enabled {
+            ui.label("File sharing is off. Turn on Share files in Sharing to send or receive.");
+            if ui.button("Open sharing settings").clicked() {
+                self.selected_tab = Tab::Settings;
+            }
+        } else if self.file_send_pending {
+            ui.label("Complete the file selection to send.");
+        } else if connected.is_empty() {
+            ui.label("Connect a paired PC before sending a file.");
+        } else {
+            ui.label("Choose a file using the Windows file picker. Receiving must be allowed on the other PC.");
+        }
+    }
+
     pub(super) fn render_transfer_center_tab(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let completed_count = self
@@ -44,53 +114,55 @@ impl DashboardApp {
                 .filter(|transfer| transfer.state == "completed")
                 .count();
 
-            ui.horizontal(|ui| {
-                ui.heading("Transfer Center");
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("Files");
                 ui.separator();
-                ui.label(egui::RichText::new(transfer_summary(&self.snapshot.file_transfers)).weak());
-                let clear = ui.add_enabled(
-                    completed_count > 0,
-                    egui::Button::new("Clear Completed"),
+                ui.label(
+                    egui::RichText::new(transfer_summary(&self.snapshot.file_transfers)).weak(),
                 );
-                let clear_clicked = clear.clicked();
-                clear.on_hover_text("Remove completed transfer entries from this session");
-                if clear_clicked {
-                    self.task_runner().clear_completed_file_transfers(
-                        self.tx.clone(),
-                        self.ctx.endpoint.clone(),
-                    );
+                if completed_count > 0
+                    && ui
+                        .button("Clear completed")
+                        .on_hover_text("Remove completed transfers from this list")
+                        .clicked()
+                {
+                    self.task_runner()
+                        .clear_completed_file_transfers(self.tx.clone(), self.ctx.endpoint.clone());
                 }
             });
             ui.add_space(8.0);
 
+            self.render_file_send(ui);
+            ui.add_space(16.0);
+
             if self.snapshot.file_transfers.is_empty() {
-                ui.label(egui::RichText::new("No recent file transfers.").italics());
+                ui.label("No files sent or received yet.");
+                ui.label(
+                    if !self
+                        .snapshot
+                        .features
+                        .get("transfer_file")
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        "File sharing is off."
+                    } else if self.snapshot.file_transfer_config.auto_accept_trusted_peers {
+                        "Incoming files from trusted PCs are allowed."
+                    } else {
+                        "Incoming files are blocked. Allow trusted PCs in Sharing before receiving."
+                    },
+                );
                 return;
             }
 
             let mut transfers = self.snapshot.file_transfers.clone();
             transfers.reverse();
 
-            egui::Grid::new("transfer_center_grid")
-                .striped(true)
-                .num_columns(8)
-                .spacing([10.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new("File").strong());
-                    ui.label(egui::RichText::new("Peer").strong());
-                    ui.label(egui::RichText::new("Direction").strong());
-                    ui.label(egui::RichText::new("State").strong());
-                    ui.label(egui::RichText::new("Progress").strong());
-                    ui.label(egui::RichText::new("Updated").strong());
-                    ui.label(egui::RichText::new("Reason").strong());
-                    ui.label("");
-                    ui.end_row();
-
-                    for transfer in transfers {
-                        self.render_transfer_row(ui, &transfer);
-                        ui.end_row();
-                    }
-                });
+            for transfer in transfers {
+                ui.separator();
+                self.render_transfer_row(ui, &transfer);
+                ui.add_space(8.0);
+            }
         });
     }
 
@@ -100,94 +172,86 @@ impl DashboardApp {
         } else {
             &transfer.file_name
         };
-        ui.label(file_label).on_hover_text(format!(
-            "Transfer ID: {}\nPrevious attempt: {}\nQueued: {}",
-            transfer.transfer_id,
-            empty_as_none(&transfer.previous_transfer_id),
-            format_timestamp(&transfer.queued_at)
-        ));
-
-        ui.label(peer_transfer_label(&transfer.peer_id, &self.snapshot.paired_peers))
-            .on_hover_text(&transfer.peer_id);
-        ui.label(transfer.direction.replace('_', " "));
-        ui.label(
-            egui::RichText::new(transfer.state.replace('_', " "))
-                .color(transfer_state_color(&transfer.state)),
-        );
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(file_label);
+            ui.label(format!(
+                "{} / {}",
+                peer_transfer_label(&transfer.peer_id, &self.snapshot.paired_peers),
+                transfer.direction
+            ));
+            ui.label(egui::RichText::new(transfer.state.replace('_', " ")));
+        });
         ui.add(
             egui::ProgressBar::new(transfer.progress_fraction())
-                .desired_width(130.0)
+                .desired_width(ui.available_width().min(360.0))
                 .text(format_transfer_progress(transfer)),
         );
-        ui.label(format_timestamp(&transfer.updated_at));
-        ui.label(failure_reason_label(&transfer.failure_reason))
-            .on_hover_text(&transfer.failure_reason);
+        if !transfer.failure_reason.trim().is_empty() {
+            ui.label(failure_reason_label(&transfer.failure_reason));
+        }
+        ui.collapsing(format!("Transfer details: {}", file_label), |ui| {
+            ui.label(format!("Queued: {}", format_timestamp(&transfer.queued_at)));
+            ui.label(format!(
+                "Updated: {}",
+                format_timestamp(&transfer.updated_at)
+            ));
+            ui.label(format!("Transfer: {}", transfer.transfer_id));
+            ui.label(format!(
+                "Previous attempt: {}",
+                empty_as_none(&transfer.previous_transfer_id)
+            ));
+        });
 
-        ui.horizontal(|ui| {
-            let cancel = ui.add_enabled(transfer.can_cancel(), egui::Button::new("Cancel"));
-            let cancel_clicked = cancel.clicked();
-            cancel.on_hover_text("Cancel this outgoing transfer attempt");
-            if cancel_clicked {
+        ui.horizontal_wrapped(|ui| {
+            if transfer.can_cancel() && ui.button("Cancel").clicked() {
                 self.task_runner().cancel_file_transfer(
                     self.tx.clone(),
                     self.ctx.endpoint.clone(),
                     transfer.transfer_id.clone(),
                 );
             }
-
-            let retry = ui.add_enabled(transfer.can_retry(), egui::Button::new("Retry"));
-            let retry_clicked = retry.clicked();
-            retry.on_hover_text(if transfer.source_path.trim().is_empty() {
-                "Retry source path is unavailable"
-            } else {
-                "Retry this outgoing transfer from the beginning"
-            });
-            if retry_clicked {
+            if transfer.can_retry()
+                && self
+                    .snapshot
+                    .features
+                    .get("transfer_file")
+                    .copied()
+                    .unwrap_or(false)
+                && ui.button("Retry").clicked()
+            {
                 self.task_runner().retry_file_transfer(
                     self.tx.clone(),
                     self.ctx.endpoint.clone(),
                     transfer.transfer_id.clone(),
                 );
             }
-
-            let open = ui.add_enabled(transfer.can_open_location(), egui::Button::new("Open"));
-            let open_clicked = open.clicked();
-            open.on_hover_text("Open the received file location");
-            if open_clicked {
-                self.task_runner().open_received_file_location(
-                    self.tx.clone(),
-                    transfer.final_path.clone(),
-                );
+            if transfer.can_open_location() && ui.button("Open folder").clicked() {
+                self.task_runner()
+                    .open_received_file_location(self.tx.clone(), transfer.final_path.clone());
             }
         });
     }
 }
 
 pub(super) fn transfer_summary(transfers: &[UiFileTransfer]) -> String {
-    let queued = transfers
-        .iter()
-        .filter(|transfer| transfer.state == "queued")
-        .count();
     let active = transfers
         .iter()
-        .filter(|transfer| transfer.state == "active")
-        .count();
-    let completed = transfers
-        .iter()
-        .filter(|transfer| transfer.state == "completed")
+        .filter(|transfer| matches!(transfer.state.as_str(), "active" | "queued"))
         .count();
     let failed = transfers
         .iter()
         .filter(|transfer| transfer.state == "failed")
         .count();
-    let cancelled = transfers
-        .iter()
-        .filter(|transfer| transfer.state == "cancelled")
-        .count();
-
-    format!(
-        "queued {queued} | active {active} | completed {completed} | failed {failed} | cancelled {cancelled}"
-    )
+    if failed > 0 {
+        format!(
+            "{active} in progress; {failed} {} attention",
+            if failed == 1 { "needs" } else { "need" }
+        )
+    } else if active > 0 {
+        format!("{active} in progress")
+    } else {
+        "No transfers in progress".to_string()
+    }
 }
 
 fn peer_transfer_label(peer_id: &str, peers: &[UiPairedPeer]) -> String {
@@ -196,17 +260,6 @@ fn peer_transfer_label(peer_id: &str, peers: &[UiPairedPeer]) -> String {
         .find(|peer| peer.peer_id == peer_id)
         .map(|peer| peer.display_name.clone())
         .unwrap_or_else(|| short_token(peer_id).to_string())
-}
-
-fn transfer_state_color(state: &str) -> egui::Color32 {
-    match state {
-        "queued" => egui::Color32::LIGHT_YELLOW,
-        "active" => egui::Color32::LIGHT_BLUE,
-        "completed" => egui::Color32::LIGHT_GREEN,
-        "failed" => egui::Color32::LIGHT_RED,
-        "cancelled" => egui::Color32::GRAY,
-        _ => egui::Color32::WHITE,
-    }
 }
 
 fn format_transfer_progress(transfer: &UiFileTransfer) -> String {

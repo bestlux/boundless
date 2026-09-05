@@ -100,6 +100,7 @@ mod windows_app {
     struct UiSnapshot {
         generated_at: String,
         daemon_online: bool,
+        daemon_version: String,
         machine_id: String,
         layout_matrix: String,
         features: BTreeMap<String, bool>,
@@ -258,13 +259,11 @@ mod windows_app {
     struct GuidedPairingResult {
         peer_machine_id: String,
         orientation_selector: String,
-        message: String,
     }
 
     #[derive(Debug, Clone)]
     struct PairingSubmitResult {
         peer_machine_id: String,
-        message: String,
     }
 
     struct NearbyRoleReversalRequest {
@@ -306,6 +305,11 @@ mod windows_app {
 
     #[cfg(test)]
     #[allow(dead_code)]
+    mod dashboard_render_tests {
+        include!("dashboard_render_tests.rs");
+    }
+
+    #[cfg(test)]
     mod dashboard_test_support {
         include!("dashboard_test_support.rs");
     }
@@ -358,11 +362,17 @@ mod windows_app {
     {
         block_on_result(async move {
             let mut client = connect_control_plane(endpoint).await?;
+            let daemon_version = client
+                .get_status(ipc_api::boundless::v1::StatusRequest {})
+                .await?
+                .into_inner()
+                .daemon_version;
             let mut stream = client.watch_ui(Empty {}).await?.into_inner();
             while let Some(snapshot) = stream.message().await? {
                 on_snapshot(UiSnapshot {
                     generated_at: snapshot.generated_at,
                     daemon_online: snapshot.daemon_online,
+                    daemon_version: daemon_version.clone(),
                     machine_id: snapshot.machine_id,
                     layout_matrix: snapshot.layout_matrix,
                     features: snapshot.features.into_iter().collect(),
@@ -1013,7 +1023,6 @@ mod windows_app {
 
         Ok(PairingSubmitResult {
             peer_machine_id: response.peer_machine_id,
-            message: response.message,
         })
     }
 
@@ -1087,7 +1096,6 @@ mod windows_app {
                     }
                     return Ok(PairingSubmitResult {
                         peer_machine_id: response.peer_machine_id,
-                        message: response.message,
                     });
                 }
                 "pending" => {

@@ -2,7 +2,7 @@ use super::*;
 
 impl DashboardApp {
     pub(super) fn task_runner(&self) -> DashboardTaskRunner {
-        DashboardTaskRunner::new()
+        self.task_runner.clone()
     }
 
     pub(super) fn start_pairing(&mut self, flow: GuidedPairingFlow, egui_ctx: egui::Context) {
@@ -30,16 +30,17 @@ impl DashboardApp {
             };
 
             self.pairing_in_progress = true;
-            self.task_runner().submit_pairing_code(SubmitPairingCodeTask {
-                tx: self.tx.clone(),
-                endpoint: self.ctx.endpoint.clone(),
-                attempt_id,
-                challenge,
-                flow,
-                code,
-                alias,
-                egui_ctx,
-            });
+            self.task_runner()
+                .submit_pairing_code(SubmitPairingCodeTask {
+                    tx: self.tx.clone(),
+                    endpoint: self.ctx.endpoint.clone(),
+                    attempt_id,
+                    challenge,
+                    flow,
+                    code,
+                    alias,
+                    egui_ctx,
+                });
         }
     }
 
@@ -149,8 +150,14 @@ impl DashboardApp {
                 .min_width(360.0)
                 .show(ctx, |ui| {
                     ui.add_space(4.0);
-                    ui.label(format!("Request ID: {}", short_token(&challenge.request_id)));
-                    ui.label(format!("Expires at: {}", format_timestamp(&challenge.expires_at)));
+                    ui.label(format!(
+                        "Request ID: {}",
+                        short_token(&challenge.request_id)
+                    ));
+                    ui.label(format!(
+                        "Expires at: {}",
+                        format_timestamp(&challenge.expires_at)
+                    ));
                     ui.add_space(8.0);
 
                     self.render_pairing_error(ui, ctx);
@@ -232,299 +239,137 @@ impl DashboardApp {
         ui.add_space(8.0);
     }
 
-    pub(super) fn render_status_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if should_offer_first_run_onboarding(&self.snapshot) {
-                ui.group(|ui| {
-                    ui.heading("Get Started");
-                    ui.label("Boundless is ready for first-run setup on this machine.");
-                    if self.snapshot.discovered_peers.is_empty() {
-                        ui.label("Waiting for a peer on the local network. If discovery stays empty, use Manual Setup with the other machine's host/IP.");
-                    } else {
-                        ui.label("Choose a discovered peer below to begin guided pairing.");
-                    }
-                    ui.label("Next steps: pair with the other machine, approve the verification code there, then arrange the layout in Layout Manager.");
-                });
-                ui.add_space(16.0);
-            }
-
-            ui.heading("Discovered Peers");
-            if self.snapshot.discovered_peers.is_empty() {
-                ui.label(egui::RichText::new("No peers discovered on local network.").italics());
-            } else {
-                egui::Grid::new("discovered_peers")
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("Name").strong());
-                        ui.label(egui::RichText::new("ID").strong());
-                        ui.label(egui::RichText::new("Address").strong());
-                        ui.label("");
-                        ui.end_row();
-                        for peer in self.snapshot.discovered_peers.clone() {
-                            ui.label(&peer.display_name);
-                            ui.label(short_token(&peer.machine_id));
-                            ui.label(&peer.endpoint);
-                            let btn = ui.button("Connect");
-                            if btn.clicked() {
-                                match guided_flow_from_discovered_peer(&peer) {
-                                    Ok(flow) => self.start_pairing(flow, ctx.clone()),
-                                    Err(error) => {
-                                        self.push_toast(error.to_string(), true);
-                                    }
-                                }
-                            }
-                            btn.on_hover_text("Start guided pairing with this peer");
-                            ui.end_row();
+    pub(super) fn render_pairing_setup(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(
+            "Open Boundless on both PCs. Choose the other PC, then enter the code displayed there.",
+        );
+        ui.add_space(8.0);
+        if self.snapshot.discovered_peers.is_empty() {
+            ui.label("No nearby PCs found yet. You can also connect by name or IP address.");
+        } else {
+            for peer in self.snapshot.discovered_peers.clone() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(&peer.display_name);
+                    if ui
+                        .button("Connect")
+                        .on_hover_text(format!(
+                            "PC identity: {}\nAddress: {}",
+                            peer.machine_id, peer.endpoint
+                        ))
+                        .clicked()
+                    {
+                        match guided_flow_from_discovered_peer(&peer) {
+                            Ok(flow) => self.start_pairing(flow, ctx.clone()),
+                            Err(error) => self.push_toast(error.to_string(), true),
                         }
-                    });
+                    }
+                });
             }
-
-            ui.add_space(16.0);
-            ui.heading("Manual Setup");
-            ui.horizontal(|ui| {
-                ui.label("Host/IP:");
-                let host_response = ui.text_edit_singleline(&mut self.manual_host);
-                // Inline validation: red border on empty host when focused
-                if self.manual_host.trim().is_empty() && host_response.lost_focus() {
-                    ui.label(
-                        egui::RichText::new("Required")
-                            .color(egui::Color32::from_rgb(255, 120, 100))
-                            .size(11.0),
-                    );
+        }
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new("Connect by address")
+            .default_open(self.snapshot.discovered_peers.is_empty())
+            .show(ui, |ui| {
+                ui.label("PC name or IP address");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.manual_host)
+                        .desired_width(ui.available_width().min(360.0)),
+                );
+                ui.collapsing("Port", |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.manual_port).desired_width(90.0));
+                    ui.label("Use 15200 unless you changed the pairing port on the other PC.");
+                });
+                let port_valid = self
+                    .manual_port
+                    .trim()
+                    .parse::<u16>()
+                    .is_ok_and(|port| port > 0);
+                if !port_valid {
+                    ui.label("Enter a port from 1 to 65535.");
                 }
-
-                ui.label("Port:");
-                let port_response = ui.text_edit_singleline(&mut self.manual_port);
-                // Inline validation: show error for non-numeric port
-                let port_valid = self.manual_port.trim().parse::<u16>().is_ok_and(|p| p > 0);
-                if !port_valid
-                    && !self.manual_port.is_empty()
-                    && port_response.lost_focus()
+                if ui
+                    .add_enabled(
+                        !self.manual_host.trim().is_empty() && port_valid,
+                        egui::Button::new("Connect by address"),
+                    )
+                    .clicked()
                 {
-                    ui.label(
-                        egui::RichText::new("Invalid port")
-                            .color(egui::Color32::from_rgb(255, 120, 100))
-                            .size(11.0),
-                    );
+                    match guided_flow_from_manual_input(&self.manual_host, &self.manual_port) {
+                        Ok(flow) => self.start_pairing(flow, ctx.clone()),
+                        Err(error) => self.push_toast(error.to_string(), true),
+                    }
                 }
-
-                let connect_enabled =
-                    !self.manual_host.trim().is_empty() && port_valid;
-                let btn = ui.add_enabled(connect_enabled, egui::Button::new("Connect"));
-                if btn.clicked()
-                    && let Ok(flow) =
-                        guided_flow_from_manual_input(&self.manual_host, &self.manual_port)
-                {
-                    self.start_pairing(flow, ctx.clone());
-                }
-                btn.on_hover_text("Start pairing with this host and port");
             });
+        if !self.snapshot.pending_requests.is_empty() {
+            ui.strong("Pairing requests");
 
-            ui.add_space(16.0);
-            ui.heading("Paired Peers");
-            if self.snapshot.paired_peers.is_empty() {
-                ui.label(egui::RichText::new("No paired peers.").italics());
-            } else {
-                egui::Grid::new("paired_peers").striped(true).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Name").strong());
-                    ui.label(egui::RichText::new("ID").strong());
-                    ui.label(egui::RichText::new("Trust").strong());
-                    ui.label(egui::RichText::new("Status").strong());
-                    ui.label(egui::RichText::new("Address").strong());
-                    ui.label(egui::RichText::new("Action").strong());
-                    ui.end_row();
-                    for peer in &self.snapshot.paired_peers {
-                        let color = if peer.connected {
-                            egui::Color32::LIGHT_GREEN
+            for req in &self.snapshot.pending_requests {
+                ui.group(|ui| {
+                    ui.label(format!("From: {}", req.requester_display_name));
+                    ui.label(format!(
+                        "Requester: {}",
+                        short_token(&req.requester_machine_id)
+                    ));
+                    ui.label(format!("ID: {}", short_token(&req.request_id)));
+                    if req.requires_verification_code {
+                        if req.verification_code.trim().is_empty() {
+                            ui.label("Code: hidden on this endpoint");
+                            ui.label("Expires: hidden on this endpoint");
                         } else {
-                            egui::Color32::DARK_GRAY
-                        };
-                        ui.label(egui::RichText::new(&peer.display_name).color(color));
-                        ui.label(short_token(&peer.peer_id));
-                        let trust_label = peer.trust_state.replace('_', " ");
-                        ui.label(trust_label).on_hover_text(format!(
-                            "Device: {}\nTrusted since: {}\nFingerprint: {}",
-                            empty_as_none(&peer.device_identity),
-                            empty_as_none(&peer.trusted_since),
-                            empty_as_none(&peer.trust_fingerprint)
-                        ));
-                        ui.label(peer.health_state.replace('_', " "))
-                            .on_hover_text(&peer.health_reason);
-                        ui.label(&peer.address);
-                        let remove = ui
-                            .button("Remove")
-                            .on_hover_text("Revoke trust and remove this peer");
-                        if remove.clicked() {
-                            self.task_runner().remove_peer(
+                            ui.label(format!("Code: {}", req.verification_code));
+                            ui.label(format!("Expires: {}", req.verification_expires_at));
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if !req.requires_verification_code && ui.button("Approve").clicked() {
+                            self.task_runner().approve_request(
                                 self.tx.clone(),
                                 self.ctx.endpoint.clone(),
-                                peer.peer_id.clone(),
+                                req.request_id.clone(),
                             );
                         }
-                        ui.end_row();
-                    }
+                        if ui
+                            .button(if req.requires_verification_code {
+                                "Cancel"
+                            } else {
+                                "Reject"
+                            })
+                            .clicked()
+                        {
+                            self.task_runner().reject_request(
+                                self.tx.clone(),
+                                self.ctx.endpoint.clone(),
+                                req.request_id.clone(),
+                            );
+                        }
+                    });
                 });
             }
-
-            ui.add_space(16.0);
-            ui.heading("Pending Requests");
-            if self.snapshot.pending_requests.is_empty() {
-                ui.label(egui::RichText::new("No pending requests.").italics());
-            } else {
-                for req in &self.snapshot.pending_requests {
-                    ui.group(|ui| {
-                        ui.label(format!("From: {}", req.requester_display_name));
-                        ui.label(format!(
-                            "Requester: {}",
-                            short_token(&req.requester_machine_id)
-                        ));
-                        ui.label(format!("ID: {}", short_token(&req.request_id)));
-                        if req.requires_verification_code {
-                            if req.verification_code.trim().is_empty() {
-                                ui.label("Code: hidden on this endpoint");
-                                ui.label("Expires: hidden on this endpoint");
-                            } else {
-                                ui.label(format!("Code: {}", req.verification_code));
-                                ui.label(format!("Expires: {}", req.verification_expires_at));
-                            }
-                        }
-                        ui.horizontal(|ui| {
-                            if !req.requires_verification_code && ui.button("Approve").clicked() {
-                                self.task_runner().approve_request(
-                                    self.tx.clone(),
-                                    self.ctx.endpoint.clone(),
-                                    req.request_id.clone(),
-                                );
-                            }
-                            if ui
-                                .button(if req.requires_verification_code {
-                                    "Cancel"
-                                } else {
-                                    "Reject"
-                                })
-                                .clicked()
-                            {
-                                self.task_runner().reject_request(
-                                    self.tx.clone(),
-                                    self.ctx.endpoint.clone(),
-                                    req.request_id.clone(),
-                                );
-                            }
-                        });
-                    });
-                }
-            }
-        });
+        }
     }
 
     pub(super) fn render_settings_tab(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
-            // ── Identity ───────────────────────────────────────────────
-            ui.heading("Identity");
+            ui.heading("Sharing");
             ui.add_space(4.0);
-            egui::Grid::new("settings_identity")
-                .num_columns(3)
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new("Machine ID:").strong());
-                    let id_short = short_token(&self.snapshot.machine_id);
-                    ui.label(id_short)
-                        .on_hover_text(&self.snapshot.machine_id);
-                    if ui
-                        .small_button("Copy")
-                        .on_hover_text("Copy full machine ID to clipboard")
-                        .clicked()
-                    {
-                        ui.ctx().copy_text(self.snapshot.machine_id.clone());
-                        self.push_toast("Machine ID copied to clipboard".to_string(), false);
-                    }
-                    ui.end_row();
-
-                    ui.label(egui::RichText::new("PC Name:").strong());
-                    let hostname = std::env::var("COMPUTERNAME")
-                        .unwrap_or_else(|_| "Unknown".to_string());
-                    ui.label(&hostname);
-                    ui.label(""); // empty column
-                    ui.end_row();
-                });
-
-            ui.add_space(16.0);
-            ui.separator();
-
-            // ── Daemon ─────────────────────────────────────────────────
-            ui.add_space(8.0);
-            ui.heading("Daemon");
-            ui.add_space(4.0);
-            egui::Grid::new("settings_daemon")
-                .num_columns(2)
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new("Status:").strong());
-                    if self.snapshot.daemon_online {
-                        ui.label(
-                            egui::RichText::new("Online")
-                                .color(egui::Color32::LIGHT_GREEN),
-                        );
-                    } else {
-                        ui.label(
-                            egui::RichText::new("Offline")
-                                .color(egui::Color32::LIGHT_RED),
-                        );
-                    }
-                    ui.end_row();
-
-                    ui.label(egui::RichText::new("API Endpoint:").strong());
-                    ui.label(&self.ctx.endpoint);
-                    ui.end_row();
-
-                    ui.label(egui::RichText::new("Last Snapshot:").strong());
-                    if self.snapshot.generated_at.is_empty() {
-                        ui.label(
-                            egui::RichText::new("No data yet").weak().italics(),
-                        );
-                    } else {
-                        ui.label(format_timestamp(&self.snapshot.generated_at));
-                    }
-                    ui.end_row();
-                });
-
-            ui.add_space(16.0);
-            ui.separator();
-
-            // ── Product Controls ──────────────────────────────────────
-            ui.add_space(8.0);
-            ui.heading("Product Controls");
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new("These match the effective daemon feature flags.").weak());
-            for (name, label, reason) in [
-                ("share_input", "Share keyboard and mouse", None),
-                ("share_clipboard", "Share clipboard", None),
-                ("transfer_file", "Transfer files", None),
-                ("easy_mouse", "Switch at screen edge", None),
-                ("wrap_mouse", "Wrap across layout edges", None),
-                (
-                    "same_subnet_only",
-                    "Same subnet only",
-                    Some("Network policy enforcement is not implemented yet"),
-                ),
-                (
-                    "validate_remote_ip",
-                    "Validate remote IP",
-                    Some("Reverse-DNS warning/enforcement is not implemented yet"),
-                ),
+            ui.label("Choose what you share with your trusted PCs.");
+            for (name, label) in [
+                ("share_input", "Share keyboard and mouse"),
+                ("share_clipboard", "Share clipboard"),
+                ("transfer_file", "Share files"),
+                ("easy_mouse", "Switch at screen edge"),
+                ("wrap_mouse", "Wrap across layout edges"),
             ] {
-                let enabled = if reason.is_some() {
-                    false
-                } else {
-                    self.snapshot.features.get(name).copied().unwrap_or(false)
-                };
+                let enabled = self.snapshot.features.get(name).copied().unwrap_or(false)
+                    && (name != "share_input" || !self.input_pause_requested);
                 let mut next = enabled;
-                let response = ui.add_enabled(
-                    reason.is_none(),
-                    egui::Checkbox::new(&mut next, label),
-                );
-                if let Some(reason) = reason {
-                    response.on_hover_text(reason);
+                let response = ui.add_enabled(name != "share_input" || !self.input_change_pending, egui::Checkbox::new(&mut next, label));
+                if response.clicked() && name == "share_input" {
+                    if enabled {
+                        self.pause_input();
+                    } else {
+                        self.resume_input();
+                    }
                 } else if response.clicked() {
                     self.task_runner().set_feature(
                         self.tx.clone(),
@@ -556,7 +401,7 @@ impl DashboardApp {
                 self.task_runner().set_file_transfer_config(
                     self.tx.clone(),
                     self.ctx.endpoint.clone(),
-                    self.file_receive_dir_edit.clone(),
+                    file_transfer_config.receive_dir.clone(),
                     !file_transfer_config.organize_by_peer,
                     file_transfer_config.auto_accept_trusted_peers,
                     file_transfer_config.max_file_bytes,
@@ -570,7 +415,7 @@ impl DashboardApp {
                 self.task_runner().set_file_transfer_config(
                     self.tx.clone(),
                     self.ctx.endpoint.clone(),
-                    self.file_receive_dir_edit.clone(),
+                    file_transfer_config.receive_dir.clone(),
                     file_transfer_config.organize_by_peer,
                     !file_transfer_config.auto_accept_trusted_peers,
                     file_transfer_config.max_file_bytes,
@@ -614,10 +459,11 @@ impl DashboardApp {
 
             // ── Input Handoff ─────────────────────────────────────────
             ui.add_space(8.0);
-            ui.heading("Input Handoff");
+            ui.heading("Keyboard and mouse");
             ui.add_space(4.0);
             let handoff = self.snapshot.input_handoff_config.clone();
             let runtime = self.snapshot.input_runtime.clone();
+            ui.collapsing("Input details and administrator apps", |ui| {
             ui.label(
                 egui::RichText::new(format!(
                     "Capture: {}  |  Backend: {}  |  Queue: {}/{}",
@@ -817,6 +663,8 @@ impl DashboardApp {
                         .italics(),
                 );
             }
+            });
+            ui.collapsing("Pointer behavior", |ui| {
             let mut block_screen_corners = handoff.block_screen_corners;
             if ui
                 .checkbox(&mut block_screen_corners, "Block screen corners")
@@ -897,7 +745,8 @@ impl DashboardApp {
 
             // ── Peer Availability ─────────────────────────────────────
             ui.add_space(8.0);
-            ui.heading("Peer Availability");
+            });
+            ui.collapsing("Keep PCs awake", |ui| {
             ui.add_space(4.0);
             let anti_idle_config = self.snapshot.anti_idle_config.clone();
             let anti_idle_status = self.snapshot.anti_idle_status.clone();
@@ -1010,7 +859,8 @@ impl DashboardApp {
 
             // ── Hotkeys ───────────────────────────────────────────────
             ui.add_space(8.0);
-            ui.heading("Hotkeys");
+            });
+            ui.collapsing("Keyboard shortcuts", |ui| {
             ui.add_space(4.0);
             for (action, label) in [
                 ("toggle_easy_mouse", "Toggle edge switching"),
@@ -1048,117 +898,7 @@ impl DashboardApp {
             ui.add_space(16.0);
             ui.separator();
 
-            // ── Actions ────────────────────────────────────────────────
-            ui.add_space(8.0);
-            ui.heading("Actions");
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .button("Reconnect All Peers")
-                    .on_hover_text(
-                        "Trigger the daemon to reconnect all paired peers",
-                    )
-                    .clicked()
-                {
-                    self.task_runner()
-                        .reconnect_all_peers(self.tx.clone(), self.ctx.endpoint.clone());
-                }
-                let network_reset_label = if self.confirm_network_reset_pending {
-                    "Confirm Network Reset"
-                } else {
-                    "Reset Network"
-                };
-                if ui.button(network_reset_label).on_hover_text(
-                    "Clear paired peers and runtime network state without deleting local identity or live discovery results",
-                ).clicked() {
-                    if !self.confirm_network_reset_pending {
-                        self.confirm_network_reset_pending = true;
-                        self.push_toast(
-                            "Click Confirm Network Reset to clear peer/network state".to_string(),
-                            false,
-                        );
-                        return;
-                    }
-                    self.confirm_network_reset_pending = false;
-                    self.task_runner().safe_reset(
-                        self.tx.clone(),
-                        self.ctx.endpoint.clone(),
-                        true,
-                        false,
-                        format!("safe-reset-network:{}", self.snapshot.machine_id),
-                    );
-                }
-                let safe_reset_label = if self.confirm_safe_reset_pending {
-                    "Confirm Safe Reset"
-                } else {
-                    "Safe Reset"
-                };
-                if ui.button(safe_reset_label).on_hover_text(
-                    "Reset daemon config/runtime state while preserving installed app files and local identity",
-                ).clicked() {
-                    if !self.confirm_safe_reset_pending {
-                        self.confirm_safe_reset_pending = true;
-                        self.push_toast(
-                            "Click Confirm Safe Reset to reset daemon config/runtime state"
-                                .to_string(),
-                            false,
-                        );
-                        return;
-                    }
-                    self.confirm_safe_reset_pending = false;
-                    self.task_runner().safe_reset(
-                        self.tx.clone(),
-                        self.ctx.endpoint.clone(),
-                        false,
-                        true,
-                        format!("safe-reset-all:{}", self.snapshot.machine_id),
-                    );
-                }
             });
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(
-                    "Service mode actions are admin-owned and available through boundlessctl.",
-                )
-                .weak()
-                .size(12.0),
-            );
-
-            ui.add_space(16.0);
-            ui.separator();
-
-            // ── Diagnostics ────────────────────────────────────────────
-            ui.add_space(8.0);
-            ui.heading("Diagnostics");
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(format!(
-                    "Paired: {}  |  Discovered: {}  |  Pending: {}",
-                    self.snapshot.paired_peers.len(),
-                    self.snapshot.discovered_peers.len(),
-                    self.snapshot.pending_requests.len(),
-                ))
-                .weak()
-                .size(12.0),
-            );
-            ui.label(
-                egui::RichText::new(format!(
-                    "Layout matrix: {}",
-                    if self.snapshot.layout_matrix.is_empty() {
-                        "(none)"
-                    } else {
-                        &self.snapshot.layout_matrix
-                    }
-                ))
-                .weak()
-                .size(12.0),
-            );
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(format!("Boundless v{}", env!("CARGO_PKG_VERSION")))
-                    .weak()
-                    .size(11.0),
-            );
         });
     }
 }
@@ -1188,11 +928,11 @@ fn clipboard_sharing_health(backend_mode: &str) -> SharingHealth {
 
 fn render_sharing_health(ui: &mut egui::Ui, label: &str, health: SharingHealth) {
     let (status, color) = match health {
-        SharingHealth::Healthy => ("healthy", egui::Color32::LIGHT_GREEN),
+        SharingHealth::Healthy => ("available", egui::Color32::LIGHT_GREEN),
         SharingHealth::Degraded => ("degraded", egui::Color32::LIGHT_RED),
         SharingHealth::Unknown => ("unknown", egui::Color32::GRAY),
     };
-    ui.label(egui::RichText::new(format!("{label} {status}")).color(color));
+    ui.label(egui::RichText::new(format!("{label} backend {status}")).color(color));
 }
 
 #[cfg(test)]

@@ -17,6 +17,13 @@ pub(super) enum AppMsg {
     },
     ActionComplete(String),
     ActionFailed(String),
+    SupportExportComplete(String),
+    InputSharingComplete(bool),
+    InputSharingFailed(String),
+    FileSendComplete(std::result::Result<Option<String>, String>),
+    PairedTestingUpdated(
+        std::result::Result<app_services::paired_testing::PairedTestConsent, String>,
+    ),
     ServiceRecoveryRequired(ServiceRecoveryOffer),
     ServiceRecoveryComplete(String),
     ServiceRecoveryFailed(String),
@@ -34,6 +41,7 @@ pub(super) enum Tab {
     Layout,
     TransferCenter,
     Settings,
+    Support,
 }
 
 // ── Toast notification system ──────────────────────────────────────────
@@ -51,6 +59,19 @@ pub(super) struct DashboardApp {
     pub(super) ctx: Arc<AppContext>,
     pub(super) _tray_icon: Option<TrayIcon>,
     pub(super) snapshot: UiSnapshot,
+    pub(super) task_runner: DashboardTaskRunner,
+    pub(super) snapshot_error: Option<String>,
+    pub(super) pending_peer_removal: Option<String>,
+    pub(super) support_status: Option<String>,
+    pub(super) input_pause_requested: bool,
+    pub(super) input_change_pending: bool,
+    pub(super) paired_testing: Option<app_services::paired_testing::PairedTestConsent>,
+    pub(super) paired_testing_updated_at: Option<Instant>,
+    pub(super) paired_testing_pending: bool,
+    pub(super) paired_testing_error: Option<String>,
+    pub(super) paired_testing_peer: String,
+    pub(super) file_send_peer: String,
+    pub(super) file_send_pending: bool,
     pub(super) tx: Sender<AppMsg>,
     pub(super) rx: Receiver<AppMsg>,
 
@@ -91,6 +112,7 @@ pub(super) struct DashboardApp {
     pub(super) layout_grid: HashMap<(i32, i32), String>,
     pub(super) layout_unassigned: Vec<String>,
     pub(super) layout_initialized: bool,
+    pub(super) layout_selected_peer: String,
     pub(super) dragging_peer: Option<(String, (i32, i32))>,
     pub(super) last_layout_matrix: String,
     pub(super) last_layout_peer_ids: Vec<String>,
@@ -162,11 +184,7 @@ impl DashboardApp {
             },
         )?;
 
-        DashboardTaskRunner::spawn_snapshot_watch(
-            app_ctx.clone(),
-            tx.clone(),
-            cc.egui_ctx.clone(),
-        );
+        DashboardTaskRunner::spawn_snapshot_watch(app_ctx.clone(), tx.clone(), cc.egui_ctx.clone());
 
         let menu_ctx = cc.egui_ctx.clone();
         let menu_exit_requested = exit_requested_signal.clone();
@@ -207,6 +225,19 @@ impl DashboardApp {
             ctx: app_ctx,
             _tray_icon: tray_icon,
             snapshot: UiSnapshot::default(),
+            task_runner: DashboardTaskRunner::new(),
+            snapshot_error: None,
+            pending_peer_removal: None,
+            support_status: None,
+            input_pause_requested: false,
+            input_change_pending: false,
+            paired_testing: None,
+            paired_testing_updated_at: None,
+            paired_testing_pending: false,
+            paired_testing_error: None,
+            paired_testing_peer: String::new(),
+            file_send_peer: String::new(),
+            file_send_pending: false,
             tx,
             rx,
             toasts,
@@ -241,6 +272,7 @@ impl DashboardApp {
             layout_grid: HashMap::new(),
             layout_unassigned: Vec::new(),
             layout_initialized: false,
+            layout_selected_peer: String::new(),
             dragging_peer: None,
             last_layout_matrix: String::new(),
             last_layout_peer_ids: Vec::new(),
@@ -337,9 +369,7 @@ impl DashboardApp {
             AppMsg::SnapshotUpdated(snap) => {
                 let snap = *snap;
                 let receive_dir = snap.file_transfer_config.receive_dir.clone();
-                if self.file_receive_dir_edit.trim().is_empty()
-                    || self.file_receive_dir_edit == self.file_receive_dir_last_snapshot
-                {
+                if self.file_receive_dir_edit == self.file_receive_dir_last_snapshot {
                     self.file_receive_dir_edit = receive_dir.clone();
                 }
                 self.file_receive_dir_last_snapshot = receive_dir;
@@ -348,6 +378,7 @@ impl DashboardApp {
                 }
                 self.hotkey_last_snapshot = snap.hotkeys.clone();
                 self.snapshot = snap;
+                self.snapshot_error = None;
                 self.service_recovery = None;
                 if should_offer_first_run_onboarding(&self.snapshot) && !self.onboarding_focus_shown
                 {
@@ -355,17 +386,49 @@ impl DashboardApp {
                 }
             }
             AppMsg::SnapshotError(err) => {
-                // Deduplicate: if the most recent toast is also a snapshot
-                // error, replace it instead of stacking (the snapshot watcher
-                // retries every ~1s, so without this we'd flood the overlay).
-                if let Some(last) = self.toasts.last_mut()
-                    && last.is_error
-                {
-                    last.message = err;
-                    last.created_at = Instant::now();
-                    return;
+                self.snapshot.daemon_online = false;
+                for peer in &mut self.snapshot.paired_peers {
+                    peer.connected = false;
+                    peer.health_state = "unknown".to_string();
+                    peer.health_reason = "Waiting for current status from this PC".to_string();
                 }
-                self.push_toast(err, true);
+                self.snapshot_error = Some(err);
+            }
+            AppMsg::PairedTestingUpdated(result) => {
+                self.paired_testing_pending = false;
+                match result {
+                    Ok(status) => {
+                        self.paired_testing = Some(status);
+                        self.paired_testing_updated_at = Some(Instant::now());
+                        self.paired_testing_error = None;
+                    }
+                    Err(error) => self.paired_testing_error = Some(error),
+                }
+            }
+            AppMsg::FileSendComplete(result) => {
+                self.file_send_pending = false;
+                match result {
+                    Ok(Some(message)) => self.push_toast(message, false),
+                    Ok(None) => {}
+                    Err(error) => self.push_toast(error, true),
+                }
+            }
+            AppMsg::InputSharingComplete(enabled) => {
+                self.input_change_pending = false;
+                self.snapshot
+                    .features
+                    .insert("share_input".to_string(), enabled);
+                self.input_pause_requested = !enabled;
+                if enabled && let Some(supervisor) = &self._input_broker_supervisor {
+                    supervisor.pause_control().resume();
+                }
+            }
+            AppMsg::InputSharingFailed(error) => {
+                self.input_change_pending = false;
+                self.push_toast(error, true);
+            }
+            AppMsg::SupportExportComplete(message) => {
+                self.support_status = Some(message);
             }
             AppMsg::PairingChallenge {
                 attempt_id,
@@ -386,12 +449,11 @@ impl DashboardApp {
                 self.pairing_flow = None;
                 self.active_pairing_attempt_id = None;
                 self.selected_tab = Tab::Layout;
+                self.layout_selected_peer = result.peer_machine_id;
                 self.push_toast(
                     format!(
-                        "Pairing successful with {} (selector: {}): {}",
-                        short_token(&result.peer_machine_id),
-                        result.orientation_selector,
-                        result.message
+                        "Paired with {}. Arrange your PCs to start sharing.",
+                        result.orientation_selector
                     ),
                     false,
                 );
