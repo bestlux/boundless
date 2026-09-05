@@ -8,6 +8,7 @@ Current context for implementers and release reviewers. Use the [docs index](REA
 - Workspace, release-please, and Windows package manifests remain 5.0.16 during this hardening train. A source branch is not evidence of an installed version.
 - Boundless remains pre-release software. A published numeric release is not a qualified public Windows product or full Mouse Without Borders parity.
 - The active peer-test protocol work targets wire 4.5 and is incompatible with 4.4; both peers must use compatible builds. This does not change the historical 5.0.16 release artifact.
+- Configuration schema 6 drops live connection/last-seen observations while migrating durable schema-5 data. Rollback requires a private pre-upgrade state backup and compatible old peers; see [migration guidance](user/migration.md).
 - No new publication, installed-app change, or physical two-PC validation is implied by this status update.
 
 ## Support Posture
@@ -51,5 +52,6 @@ The smallest applicable checks remain the preferred development loop. Rust behav
 | Topology and displays | Four-PC, mixed-DPI, and multi-display runtime qualification remains open. The validator's four-remote-peers-plus-local limit is only a configuration capability. |
 | File product flow | Default-deny/global trusted-peer opt-in is not per-peer consent. Explorer copy/paste and public drag/drop claims remain incomplete or deferred. |
 | Peer testing | A passing bounded, peer-approved test demonstrates measured transport behavior only; it cannot prove physical capture/injection, clipboard integration, or full product readiness. |
+| Performance and UX | Local real-sink, input-stage, duplex, paired-TLS, and warmed egui-frame measurements exist. Actual Windows release-build idle CPU/private bytes, connect/handoff/recovery, contention, frame CPU, and logging baselines/regression budgets remain required. No competitor speed advantage is proven. |
 
 Keep [the launch ledger](release/launch-ledger.md) as dated evidence. Earlier oversight accounting and release-train status are [archived](history/2026-09-04/project-status.md), not additional current-state requirements.

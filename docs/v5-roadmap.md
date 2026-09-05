@@ -15,6 +15,7 @@ The first public beta target is two Windows PCs. Four computers total is a later
 | 5. Installation is a normal Windows workflow | Product-owned health checks, runtime desktop-user authorization, plain MSI, helper deletion, and an explicit firewall policy | Fresh install, running-product upgrade, repair, and uninstall work without shell choreography; trust/layout recover as documented. Authorization remains narrow across user switching. Signing and distribution policy are resolved before public promotion. |
 | 6. Everyday workflows are complete | Text and supported-size images, visible file receipt/consent, one local Explorer file, simple two-PC layout | Physical two-PC input/clipboard tests and user workflows pass on a known candidate. Receipt uses a user-visible folder and an actionable consent policy; unsupported formats have a visible outcome. |
 | 7. Support claims match real use | Repeated installed evidence, multi-monitor/mixed-DPI coverage, elevated-app scope, and four-PC topology | Each public claim has exact-build Windows evidence. Four-PC handoff/reconnect and peer failure are exercised before advertising four-PC support. Support bundles are bounded and redacted. |
+| 8. Fast, light daily use is measured | Idle resources, connection/handoff/recovery latency, bulk contention, UI frame CPU, and logging cost | Establish actual Windows release-build baselines and explicit regression budgets on supported hardware. Repeat the same scenarios after changes; comparative speed claims require equivalent competitor measurements. |
 
 Outcomes 1–4 are the active hardening train. Their implementation and local tests do not close the installed or physical acceptance in this table. The current installation-time selected-user SID remains in place until outcome 5 replaces that contract deliberately.
 
@@ -26,9 +27,22 @@ Keep the tray focused on interaction. It should present supported capabilities a
 
 This direction does not require a new networking stack or UI framework. Replace a module when its current ownership prevents a tested invariant; preserve useful behavior and regression evidence around that replacement.
 
+## Performance And UX Acceptance
+
+The fastest/lightest goal requires reproducible measurements of the actual Windows product. Use [the product scorecard](performance/product-scorecard.md) to record build identity, hardware, Windows/session context, scenario, measurement method, sample distribution, and the chosen regression budget.
+
+- Measure idle CPU and private bytes for every participating process, including the offline-peer state.
+- Measure connection, handoff, and recovery latency, plus input progress while another peer stalls or bulk traffic is active.
+- Measure warmed UI frame CPU and visible responsiveness during refresh, transfer progress, and degraded states.
+- Measure peak retained log bytes, bounded queue use, dropped-record counters, and sink cost under normal and repeated-failure load.
+
+The current local evidence includes a real logging-sink throughput benchmark over a 256 MiB cached workload, full-duplex/stalled-peer transport tests, input-broker stage measurements, paired TLS RTT/echo-integrity probes, and warmed egui frame CPU measurements. These establish useful implementation baselines. They do not establish physical handoff latency, whole-product idle footprint, or comparative speed against another app. Actual Windows release-build runs and explicit regression budgets remain required before performance claims.
+
 ## Release And Evidence Boundary
 
 The manifests remain at 5.0.16 while this source work is being integrated. The peer-approved test protocol change targets wire 4.5; it is incompatible with 4.4 and requires both peers to run compatible builds. It does not establish that either PC has been upgraded.
+
+Configuration schema 6 deliberately stops persisting live observations such as connected state and last-seen time. Migration from schema 5 preserves durable configuration/trust data while dropping those observations. Rollback requires a private pre-upgrade state backup and compatible old peers; see the [migration guide](user/migration.md) and [network architecture](architecture/network-v1.md).
 
 Use [release readiness](release/release-readiness.md) for automated gate policy and [the product scorecard](performance/product-scorecard.md) for the meaning of measured results. A generated fixture, layout unit test, or successful transport probe cannot prove physical input capture, Windows injection, clipboard integration, or installed-product readiness.
 

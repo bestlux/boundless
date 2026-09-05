@@ -23,6 +23,7 @@ All rows remain part of candidate integration until the coordinating change reco
 Run one coherent matrix against compatible, identified builds on both PCs. Record exact versions/hashes, Windows/session context, scenario, outcome, and remaining risk. The [launch ledger](release/launch-ledger.md) preserves older observations; do not silently upgrade them to proof of the new candidate.
 
 - Leave a paired peer unavailable and verify bounded logs, CPU, memory, task count, quiet UI, and recovery when it returns. Include sleep/resume and repeated service/tray restarts in the planned reliability evidence.
+- Establish actual Windows release-build baselines for per-process idle CPU/private bytes, connect/handoff/recovery latency, input progress under bulk contention, warmed UI frame CPU, and peak log bytes/drop counters. Define and enforce regression budgets before claiming fastest/lightest behavior or comparing another app.
 - Exercise emergency escape, local pause, forced tray/broker/injector loss, held keys/buttons, Quit/relaunch, and the next successful handoff.
 - Prove touchpad wheel behavior, conventional wheel, numpad with opposite Num Lock states, mixed-DPI/multi-display handoff, and ordinary elevated-window capability within its supported scope.
 - Test text, small bitmap, policy-boundary bitmap, oversized image rejection, feature isolation, continuous input during clipboard failure, and redacted diagnostic output.
@@ -52,6 +53,8 @@ Add actionable receipt consent or per-peer opt-in, a user-visible receive folder
 ### 5. Qualify The Public Windows Contract
 
 Define the supported Windows/session/display matrix, resolve signed distribution and public support policy, and complete repeated installed evidence. Prove four computers total before claiming that topology. Consider automatic layout and extra settings only when actual onboarding/use evidence supports the added complexity.
+
+Treat measured efficiency as part of this qualification. Current sink-throughput, broker-stage, duplex, paired-TLS, and egui-frame measurements are local implementation evidence. They do not establish the full Windows release-build resource/latency baseline or a competitor advantage; those need comparable actual-product runs and explicit regression budgets.
 
 ### 6. Shrink CI And Release Orchestration — BND-NEXT-32
 
