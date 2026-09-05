@@ -278,7 +278,7 @@ async fn paired_testing_real_tls_denies_then_measures_then_revokes_without_user_
         .unwrap();
     let before = b.state.paired_test_consent();
     let report = a.state.run_paired_test(options(b_id)).await.unwrap();
-    assert!(report.passed, "{report:?}");
+    assert!(report.passed, "consented paired test failed");
     assert_eq!(report.evidence_category, Some(EvidenceCategory::Loopback));
     assert_eq!(report.remote.as_ref().unwrap().machine_id, b_id);
     assert_ne!(
@@ -389,7 +389,7 @@ async fn paired_testing_real_tls_enforces_request_budget_and_lease_expiry() {
         ..options(b_id)
     };
     let first = a.state.run_paired_test(options.clone()).await.unwrap();
-    assert!(first.passed, "{first:?}");
+    assert!(first.passed, "initial paired test failed");
     let exhausted = a.state.run_paired_test(options.clone()).await.unwrap();
     assert!(!exhausted.passed);
     assert_eq!(
@@ -490,7 +490,10 @@ async fn paired_testing_replacement_cannot_complete_old_request_and_new_session_
         })
         .await
         .unwrap();
-    assert!(recovered.passed, "{recovered:?}");
+    assert!(
+        recovered.passed,
+        "paired test after session recovery failed"
+    );
     assert_ne!(recovered.local_transport_session_id.unwrap(), old_session);
     for handle in [old_client, old_server, client, server] {
         handle.abort();
