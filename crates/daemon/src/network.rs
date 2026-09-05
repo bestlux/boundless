@@ -82,6 +82,21 @@ const MAX_WIRE_FRAME_BYTES: usize = MAX_WIRE_PAYLOAD_BYTES;
 const LISTEN_BACKLOG: i32 = 1024;
 const PORT_ZERO_SPLIT_STACK_RETRIES: usize = 8;
 
+// File handles and Windows user authority belong to the runtime adapter,
+// rather than the shared peer-transport policy crate.
+#[derive(Debug)]
+struct InboundTransfer {
+    peer_id: String,
+    file_name: String,
+    total_bytes: u64,
+    bytes_received: u64,
+    remaining_chunk_credits: u32,
+    final_path: std::path::PathBuf,
+    temp_path: std::path::PathBuf,
+    temp_file: tokio::fs::File,
+    user_io: platform_windows::user_io::UserIoLease,
+}
+
 pub fn start(state: AppState, listeners: Vec<TcpListener>) {
     if !listeners.is_empty() {
         let listener_state = state.clone();
@@ -4350,6 +4365,76 @@ mod tests {
         for transfer in inbound_transfers.into_values() {
             inbound::discard_inbound_transfer(transfer).await;
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn file_feature_revocation_discards_active_receive_and_rejects_new_start() {
+        let (state, peer_id, root) = state_with_peer_for_queue_test().await;
+        let receive_dir = root.join("received");
+        let mut config = state.file_transfer_config().await;
+        config.auto_accept_trusted_peers = true;
+        config.receive_dir = receive_dir.display().to_string();
+        state
+            .update_file_transfer_config(config)
+            .await
+            .expect("receive config");
+        let mut inbound = HashMap::new();
+        let mut writer = CaptureWriter::default();
+        let mut buffer = Vec::new();
+        handle_file_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            "active".to_string(),
+            "file.txt".to_string(),
+            3,
+            &mut inbound,
+            &mut writer,
+            &mut buffer,
+        )
+        .await
+        .expect("start");
+        assert_eq!(inbound.len(), 1);
+        state
+            .set_feature("transfer_file".to_string(), false)
+            .await
+            .expect("disable file sharing");
+        handle_file_chunk(
+            &state,
+            "active".to_string(),
+            b"abc".to_vec(),
+            &mut inbound,
+            &mut writer,
+            &mut buffer,
+        )
+        .await
+        .expect("revoked chunk");
+        assert!(inbound.is_empty());
+        assert!(!receive_dir.join("file.txt").exists());
+        assert!(!receive_dir.join(".file.txt.boundless.part").exists());
+        handle_file_start(
+            &state,
+            &peer_id,
+            Some(&peer_id),
+            peer_id.clone(),
+            "new".to_string(),
+            "new.txt".to_string(),
+            3,
+            &mut inbound,
+            &mut writer,
+            &mut buffer,
+        )
+        .await
+        .expect("rejected start");
+        assert!(inbound.is_empty());
+        assert_eq!(
+            std::fs::read_dir(&receive_dir)
+                .expect("receive folder")
+                .count(),
+            0
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

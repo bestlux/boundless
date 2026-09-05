@@ -52,7 +52,7 @@ mod service_entry {
         shared_control_plane_app,
     };
     use platform_windows::runtime::{
-        named_pipe_incoming_for_allowed_user, validate_allowed_user_sid_shape,
+        named_pipe_incoming_for_service_user, validate_allowed_user_sid_shape,
     };
 
     const SERVICE_NAME: &str = "BoundlessService";
@@ -252,7 +252,7 @@ mod service_entry {
                 runtime.snapshot.api_pipe_name
             ),
         );
-        let incoming = named_pipe_incoming_for_allowed_user(
+        let incoming = named_pipe_incoming_for_service_user(
             &runtime.snapshot.api_pipe_name,
             &allowed_user_sid,
         )

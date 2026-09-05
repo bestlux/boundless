@@ -51,6 +51,7 @@ const MAX_PENDING_NEARBY_CODE_CHALLENGES: usize = 64;
 const MAX_PENDING_NEARBY_PAIRING_REQUESTS_PER_PEER: usize = 2;
 const MAX_PENDING_NEARBY_PAIRING_REQUESTS_PER_SOURCE: usize = 8;
 const MAX_FILE_TRANSFER_RECORDS: usize = 128;
+const MAX_OUTBOUND_FILE_HANDLES: usize = 64;
 const INPUT_OWNER_AUTO_STEAL_COOLDOWN_MS: u64 = 1_000;
 const NEARBY_PAIRING_PENDING_REQUEST_TTL_SECONDS: i64 = 600;
 const NEARBY_PAIRING_DECISION_RETENTION_MINUTES: i64 = 10;
@@ -84,6 +85,7 @@ mod transfer_center_ops;
 mod transport_ops;
 pub(crate) use transport_ops::TransportSessionRegistrationGuard;
 mod transport_state;
+mod user_io;
 mod validation;
 
 pub(crate) use anti_idle_state::AntiIdleRuntimeState;
@@ -155,7 +157,9 @@ struct OutboundFileTransfer {
     total_bytes: u64,
     source_modified: Option<SystemTime>,
     offset_bytes: u64,
-    source_file: Option<tokio::fs::File>,
+    source_file: tokio::fs::File,
+    user_io: platform_windows::user_io::UserIoLease,
+    _handle_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +326,7 @@ pub struct AppState {
     pub(crate) input_capture_transition: Arc<Mutex<()>>,
     anti_idle: Arc<AntiIdleState>,
     outbound_file_transfers: Arc<RwLock<HashMap<String, OutboundFileTransfer>>>,
+    outbound_file_handle_slots: Arc<tokio::sync::Semaphore>,
     file_transfer_records: Arc<RwLock<VecDeque<FileTransferRecord>>>,
     security_paths: Arc<SecurityPaths>,
     identity: Arc<DeviceIdentity>,

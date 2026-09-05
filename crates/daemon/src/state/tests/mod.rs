@@ -16,3 +16,4 @@ mod layout_and_validation;
 mod pairing_admission;
 mod peer_and_capture;
 mod trust_and_diagnostics;
+mod user_file_authority;

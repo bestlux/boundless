@@ -32,7 +32,8 @@ impl AppState {
         )?;
 
         let inbox_root = PathBuf::from(&config.file_transfer.receive_dir);
-        std::fs::create_dir_all(&inbox_root)?;
+        // Receive storage is created lazily using the user I/O authority. In
+        // service mode this startup code runs as SYSTEM before a user exists.
 
         let fingerprint = fingerprint(&secret);
 
@@ -60,6 +61,9 @@ impl AppState {
             input_capture_transition: Arc::new(Mutex::new(())),
             anti_idle: Arc::new(AntiIdleState::default()),
             outbound_file_transfers: Arc::new(RwLock::new(HashMap::new())),
+            outbound_file_handle_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_OUTBOUND_FILE_HANDLES,
+            )),
             file_transfer_records: Arc::new(RwLock::new(VecDeque::new())),
             security_paths: Arc::new(paths),
             identity: Arc::new(identity),

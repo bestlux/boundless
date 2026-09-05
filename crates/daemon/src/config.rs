@@ -256,7 +256,7 @@ fn default_file_max_bytes() -> u64 {
     MAX_TRANSFER_BYTES
 }
 
-fn default_file_receive_dir() -> String {
+pub(crate) fn default_file_receive_dir() -> String {
     dirs::download_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("."))

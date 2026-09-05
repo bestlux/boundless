@@ -4,9 +4,8 @@ use app_services::paired_testing::EvidenceCategory;
 use chrono::Utc;
 use peer_transport::{
     CLIPBOARD_IMAGE_INITIAL_CHUNK_CREDITS, DEFAULT_TRANSPORT_TUNING, InboundClipboardImageTransfer,
-    InboundTransfer, OutboundTransferFlows, OutboundTransferKind,
-    apply_outbound_chunk_credits_for_kind, reconnect_generation_advanced,
-    remove_outbound_transfer_flow,
+    OutboundTransferFlows, OutboundTransferKind, apply_outbound_chunk_credits_for_kind,
+    reconnect_generation_advanced, remove_outbound_transfer_flow,
 };
 
 use crate::state::{RuntimeWakeSignal, TransportEventRecord};

@@ -60,18 +60,28 @@ impl AppState {
     }
 
     pub async fn diagnostics_dump(&self, output_path: Option<String>) -> Result<String> {
-        let target = output_path
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
+        let lease = self.user_io_lease().await?;
+        let target = if let Some(path) = output_path {
+            PathBuf::from(path)
+        } else {
+            #[cfg(windows)]
+            {
+                lease.default_diagnostics_dir().await?
+            }
+            #[cfg(not(windows))]
+            {
                 dirs::data_local_dir()
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
                     .join("Boundless")
                     .join("diagnostics")
-            });
+            }
+        };
 
-        tokio::fs::create_dir_all(&target).await?;
-
-        let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+        let stamp = format!(
+            "{}-{}",
+            Utc::now().format("%Y%m%d-%H%M%S"),
+            uuid::Uuid::new_v4()
+        );
         let file_path = target.join(format!("dump-{stamp}.txt"));
         let manifest_path = target.join(format!("dump-{stamp}.redaction.txt"));
 
@@ -121,9 +131,36 @@ impl AppState {
         );
         let manifest = "default_redaction=true\nredacted=machine_id,fingerprint,api_bind,peer_ids,request_ids,lockout_ips,local_paths,trust_material\nfull_diagnostics_opt_in=not_enabled\n";
 
-        tokio::fs::write(&file_path, report).await?;
-        tokio::fs::write(&manifest_path, manifest).await?;
-        Ok(file_path.display().to_string())
+        let output = file_path.display().to_string();
+        lease
+            .run_sync(move || {
+                use std::io::Write;
+                std::fs::create_dir_all(&target)?;
+                // Exclusive creates prevent replacing a prior export or following
+                // an attacker-created final-file link. Parent traversal is still
+                // checked under the captured user's token by Windows.
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&file_path)?;
+                let mut sidecar = match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&manifest_path)
+                {
+                    Ok(file) => file,
+                    Err(error) => {
+                        drop(file);
+                        let _ = std::fs::remove_file(&file_path);
+                        return Err(error.into());
+                    }
+                };
+                file.write_all(report.as_bytes())?;
+                sidecar.write_all(manifest.as_bytes())?;
+                Ok(())
+            })
+            .await?;
+        Ok(output)
     }
 
     async fn pairing_diagnostics_report(&self) -> String {
