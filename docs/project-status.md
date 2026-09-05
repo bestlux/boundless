@@ -5,10 +5,10 @@ Current context for implementers and release reviewers. Use the [docs index](REA
 ## Release Baseline
 
 - Baseline source: `9bad1b5c36e31aa81f8764e72fed66785f85c05a`, release 5.0.16, dated 2026-07-15 in [CHANGELOG.md](../CHANGELOG.md).
-- Workspace, release-please, and Windows package manifests remain 5.0.16 during this hardening train. A source branch is not evidence of an installed version.
+- Read the current candidate version from the workspace and Windows package manifests, and identify downloaded builds by their release tag and checksums. A source branch is not evidence of an installed version.
 - Boundless remains pre-release software. A published numeric release is not a qualified public Windows product or full Mouse Without Borders parity.
 - The active peer-test protocol work targets wire 4.5 and is incompatible with 4.4; both peers must use compatible builds. This does not change the historical 5.0.16 release artifact.
-- Configuration schema 6 drops live connection/last-seen observations while migrating durable schema-5 data. Rollback requires a private pre-upgrade state backup and compatible old peers; see [migration guidance](user/migration.md).
+- Configuration schema 7 moves historical default transport/pairing ports to TCP 16100/16200, with an exact backup before migrating supported old configs. Schema 6 already stopped persisting live connection/last-seen observations. Rollback requires the private pre-upgrade state and compatible old peers; see [migration guidance](user/migration.md).
 - No new publication, installed-app change, or physical two-PC validation is implied by this status update.
 
 ## Support Posture
@@ -28,6 +28,8 @@ Ordinary elevated-application input has an explicit helper/capability boundary. 
 ## Current Work
 
 The locally validated hardening candidate implements bounded logs, per-peer retry/session ownership and duplex progress, user-authorized file I/O, verified input process lifetime, a smaller truthful tray flow with local pause, peer-approved transport testing, and evidence/release-policy accuracy. These are targeted refactors of the existing Rust architecture.
+
+The Windows qualification ZIP includes the matching MSI, install helper, launcher, and checksums. Its helper archives recognized legacy per-user installs while preserving private state; moving from per-user mode to the service requires pairing again. See [installation guidance](user/quickstart.md).
 
 The [dated verification record](validation/windows-hardening-2026-09-04.md) identifies implementation `5fa97d8`, 773 passing workspace tests, the three review rounds, optimized local benchmarks and the built unsigned MSI. The candidate has not been installed or physically qualified. The remaining outcome and acceptance list lives in [the backlog](backlog.md), rather than a duplicated completion table here.
 

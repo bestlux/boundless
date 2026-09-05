@@ -40,9 +40,9 @@ The current local evidence includes a real logging-sink throughput benchmark ove
 
 ## Release And Evidence Boundary
 
-The manifests remain at 5.0.16 while this source work is being integrated. The peer-approved test protocol change targets wire 4.5; it is incompatible with 4.4 and requires both peers to run compatible builds. It does not establish that either PC has been upgraded.
+Use current manifests and published release checksums to identify the qualification candidate. The peer-approved test protocol change targets wire 4.5; it is incompatible with 4.4 and requires both peers to run compatible builds. It does not establish that either PC has been upgraded.
 
-Configuration schema 6 deliberately stops persisting live observations such as connected state and last-seen time. Migration from schema 5 preserves durable configuration/trust data while dropping those observations. Rollback requires a private pre-upgrade state backup and compatible old peers; see the [migration guide](user/migration.md) and [network architecture](architecture/network-v1.md).
+Configuration schema 7 moves historical default transport/pairing ports to TCP 16100/16200 and backs up supported old configs before migration. Schema 6 already stopped persisting live observations such as connected state and last-seen time while preserving durable configuration/trust data. Rollback requires a private pre-upgrade state backup and compatible old peers; see the [migration guide](user/migration.md) and [network architecture](architecture/network-v1.md).
 
 Use [release readiness](release/release-readiness.md) for automated gate policy and [the product scorecard](performance/product-scorecard.md) for the meaning of measured results. A generated fixture, layout unit test, or successful transport probe cannot prove physical input capture, Windows injection, clipboard integration, or installed-product readiness.
 
