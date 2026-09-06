@@ -51,7 +51,7 @@ jobs:
 
       - name: Checkout main
         if: github.event_name == 'push'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -95,14 +95,14 @@ jobs:
       contents: read
     steps:
       - name: Checkout release tooling
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           path: .release-tooling
           ref: ${{ github.sha }}
 
       - name: Checkout release source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           path: source
@@ -150,14 +150,14 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - name: Checkout release tooling
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           path: .release-tooling
           ref: ${{ github.sha }}
 
       - name: Checkout release source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           path: source
@@ -187,14 +187,14 @@ jobs:
     environment: release
     steps:
       - name: Checkout release tooling
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           path: .release-tooling
           ref: ${{ github.sha }}
 
       - name: Checkout release source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           path: source
@@ -315,14 +315,14 @@ jobs:
       contents: read
     steps:
       - name: Checkout release tooling
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           path: .release-tooling
           ref: ${{ github.sha }}
 
       - name: Checkout release source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           path: source
@@ -450,14 +450,14 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Checkout release tooling
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           path: .release-tooling
           ref: ${{ github.sha }}
 
       - name: Checkout release source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           path: source
@@ -553,25 +553,25 @@ jobs:
 
       - name: Attest Windows installer
         if: ${{ !github.event.repository.private }}
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-path: ${{ steps.assets.outputs.windows_installer }}
 
       - name: Attest Linux tarball
         if: ${{ !github.event.repository.private }}
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-path: ${{ steps.assets.outputs.linux_archive }}
 
       - name: Attest Windows transfer bundle
         if: ${{ !github.event.repository.private }}
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-path: ${{ steps.assets.outputs.windows_bundle }}
 
       - name: Attest checksum manifest
         if: ${{ !github.event.repository.private }}
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-path: dist/SHA256SUMS.txt
 
